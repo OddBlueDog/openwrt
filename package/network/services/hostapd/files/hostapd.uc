@@ -522,7 +522,10 @@ function iface_reload_config(name, phydev, config, old_config)
 	if (!old_config || !is_equal(old_config.radio, config.radio))
 		return false;
 
-	if (is_equal(old_config.bss, config.bss))
+	// A configuration whose restart failed has no interface. Only a
+	// running or pending one is up to date.
+	if (is_equal(old_config.bss, config.bss) &&
+	    (hostapd.interfaces[name] || hostapd.data.pending_config[name]))
 		return true;
 
 	if (hostapd.data.pending_config[name])
