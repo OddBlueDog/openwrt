@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 19 Oct 2026 22:04:40 +0100
+Subject: [PATCH] net/sched: sch_cake: keep the hot fields together
+
+struct cake_sched_data has the 16 KB overflow heap (used only when the
+buffer limit is hit) and plain cake's own copy of the config between the
+pointers at its start and the shaper and queue state used on every
+packet. Move both to the end, so the hot fields share cache lines.
+
+The cake_mq resync, which reads the other sub-queues' state, gets
+cheaper with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/sch_cake.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 44b1386..ac896fd 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -221,9 +221,6 @@ struct cake_sched_data {
+ 	struct tcf_block *block;
+ 	struct cake_tin_data *tins;
+ 	struct cake_sched_config *config;
+-	struct cake_sched_config initial_config;
+-
+-	struct cake_heap_entry overflow_heap[CAKE_QUEUES * CAKE_MAX_TINS];
+ 
+ 	/* time_next = time_this + ((len * rate_ns) >> rate_shft) */
+ 	ktime_t		time_next_packet;
+@@ -266,6 +263,14 @@ struct cake_sched_data {
+ 	u64		last_active;
+ 	u64		synced_rate;
+ 	u32		active_queues;
++
++	/* Cold, so last: plain cake's own config (cake_mq's sub-queues share
++	 * their parent's) and the 16 KB heap only used when the buffer limit
++	 * is hit. In the middle, they put the hot fields above 16 KB from
++	 * the ones before them.
++	 */
++	struct cake_sched_config initial_config;
++	struct cake_heap_entry overflow_heap[CAKE_QUEUES * CAKE_MAX_TINS];
+ };
+ 
+ enum {

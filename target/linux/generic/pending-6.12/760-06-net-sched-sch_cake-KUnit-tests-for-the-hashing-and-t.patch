@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 19 Oct 2026 22:04:40 +0100
+Subject: [PATCH] net/sched: sch_cake: KUnit tests for the hashing and the
+ quanta
+
+A KUnit suite built into sch_cake.ko with CONFIG_NET_SCH_CAKE_KUNIT_TEST
+and run when it loads:
+
+- cake_hash() in every flow mode, for TCP and UDP over IPv4 and IPv6,
+  with and without an RPS hash: the queue's tag and its host tags are
+  those of the eager hashing it replaced, for a flow's first packet, the
+  ones after it, a flow back from idle and a tc filter's flow override;
+- a host's only bulk flow gets exactly the quantum, more share it with
+  the dither between its floor and ceiling;
+- the bulk quantum: the MTU one with split-gso, 244 us at the tin's rate
+  with no-split-gso, with its floor and its 64 KB cap, shared like it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/Kconfig         |  10 ++
+ net/sched/sch_cake.c      |   4 +
+ net/sched/sch_cake_test.c | 367 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 381 insertions(+)
+ create mode 100644 net/sched/sch_cake_test.c
+
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+index 8180d0c..4f0b7f5 100644
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -296,6 +296,16 @@ config NET_SCH_CAKE
+ 
+ 	  If unsure, say N.
+ 
++config NET_SCH_CAKE_KUNIT_TEST
++	bool "KUnit tests for CAKE" if !KUNIT_ALL_TESTS
++	depends on NET_SCH_CAKE && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for CAKE's flow and host hashing and its DRR quanta,
++	  built into the sch_cake module and run when it loads.
++
++	  If unsure, say N.
++
+ config NET_SCH_FQ
+ 	tristate "Fair Queue"
+ 	help
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index ac896fd..0af18cd 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -3452,3 +3452,7 @@ MODULE_AUTHOR("Jonathan Morton");
+ MODULE_LICENSE("Dual BSD/GPL");
+ MODULE_DESCRIPTION("The CAKE shaper.");
+ MODULE_IMPORT_NS(NET_SCHED_INTERNAL);
++
++#if IS_ENABLED(CONFIG_NET_SCH_CAKE_KUNIT_TEST)
++#include "sch_cake_test.c"
++#endif
+diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
+new file mode 100644
+index 0000000..7b7f71d
+--- /dev/null
++++ b/net/sched/sch_cake_test.c
+@@ -0,0 +1,367 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++/* KUnit tests for sch_cake's flow hashing and DRR quanta. Built into
++ * sch_cake.ko (#included at the end of sch_cake.c) when
++ * CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs when it loads.
++ */
++#include <kunit/test.h>
++#include <linux/ipv6.h>
++#include <net/net_namespace.h>
++
++static void cake_test_kvfree(void *p)
++{
++	kvfree(p);
++}
++
++static void *cake_test_alloc(struct kunit *test, size_t size)
++{
++	void *p = kvzalloc(size, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_kvfree, p));
++	return p;
++}
++
++static void cake_test_free_skb(void *skb)
++{
++	kfree_skb(skb);
++}
++
++/* An Ethernet frame as CAKE sees it from ingress: data at the MAC header.
++ * @v6: IPv6 rather than IPv4; @host and @sport pick the source,
++ * @l4_hash: the hash RPS would have set, or none.
++ */
++static struct sk_buff *cake_test_skb(struct kunit *test, bool v6, u8 proto,
++				     u8 host, u16 sport, u32 l4_hash)
++{
++	struct sk_buff *skb = alloc_skb(256, GFP_KERNEL);
++	struct ethhdr *eth;
++	int l3;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_free_skb, skb));
++	skb->dev = init_net.loopback_dev;
++
++	eth = skb_put_zero(skb, ETH_HLEN);
++	skb_reset_mac_header(skb);
++	skb_set_network_header(skb, ETH_HLEN);
++	if (v6) {
++		struct ipv6hdr *ip6 = skb_put_zero(skb, sizeof(*ip6));
++
++		eth->h_proto = htons(ETH_P_IPV6);
++		ip6->version = 6;
++		ip6->nexthdr = proto;
++		ip6->hop_limit = 64;
++		ip6->saddr.s6_addr32[0] = htonl(0x20010db8);
++		ip6->saddr.s6_addr[15] = host;
++		ip6->daddr.s6_addr32[0] = htonl(0x20010db8);
++		ip6->daddr.s6_addr32[1] = htonl(1);
++		ip6->daddr.s6_addr[15] = 1;
++		l3 = sizeof(*ip6);
++	} else {
++		struct iphdr *ip = skb_put_zero(skb, sizeof(*ip));
++
++		eth->h_proto = htons(ETH_P_IP);
++		ip->version = 4;
++		ip->ihl = 5;
++		ip->ttl = 64;
++		ip->protocol = proto;
++		ip->saddr = htonl(0xc0a80100 | host);	/* 192.168.1.host */
++		ip->daddr = htonl(0x01010101);		/* 1.1.1.1 */
++		l3 = sizeof(*ip);
++	}
++	skb->protocol = eth->h_proto;
++	skb_set_transport_header(skb, ETH_HLEN + l3);
++
++	if (proto == IPPROTO_TCP) {
++		struct tcphdr *th = skb_put_zero(skb, sizeof(*th));
++
++		th->source = htons(sport);
++		th->dest = htons(443);
++		th->doff = sizeof(*th) / 4;
++	} else if (proto == IPPROTO_UDP) {
++		struct udphdr *uh = skb_put_zero(skb, sizeof(*uh));
++
++		uh->source = htons(sport);
++		uh->dest = htons(53);
++		uh->len = htons(sizeof(*uh));
++	}
++	if (v6)
++		ipv6_hdr(skb)->payload_len = htons(skb->len - ETH_HLEN - l3);
++	else
++		ip_hdr(skb)->tot_len = htons(skb->len - ETH_HLEN);
++
++	if (l4_hash)
++		skb_set_hash(skb, l4_hash, PKT_HASH_TYPE_L4);
++	return skb;
++}
++
++/* What cake_hash() computed for every packet before the host hashes waited
++ * for a queue allocation: the flow tag and both host tags, eagerly.
++ */
++static void cake_test_ref_hashes(const struct sk_buff *skb, int flow_mode,
++				 u32 *flow_hash, u32 *srchost_hash,
++				 u32 *dsthost_hash)
++{
++	struct flow_keys keys, host_keys;
++
++	skb_flow_dissect_flow_keys(skb, &keys,
++				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
++	host_keys = keys;
++	host_keys.ports.ports = 0;
++	host_keys.basic.ip_proto = 0;
++	host_keys.keyid.keyid = 0;
++	host_keys.tags.flow_label = 0;
++
++	switch (host_keys.control.addr_type) {
++	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
++		host_keys.addrs.v4addrs.src = 0;
++		*dsthost_hash = flow_hash_from_keys(&host_keys);
++		host_keys.addrs.v4addrs.src = keys.addrs.v4addrs.src;
++		host_keys.addrs.v4addrs.dst = 0;
++		*srchost_hash = flow_hash_from_keys(&host_keys);
++		break;
++	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
++		memset(&host_keys.addrs.v6addrs.src, 0,
++		       sizeof(host_keys.addrs.v6addrs.src));
++		*dsthost_hash = flow_hash_from_keys(&host_keys);
++		host_keys.addrs.v6addrs.src = keys.addrs.v6addrs.src;
++		memset(&host_keys.addrs.v6addrs.dst, 0,
++		       sizeof(host_keys.addrs.v6addrs.dst));
++		*srchost_hash = flow_hash_from_keys(&host_keys);
++		break;
++	default:
++		*dsthost_hash = 0;
++		*srchost_hash = 0;
++	}
++
++	if (flow_mode & CAKE_FLOW_FLOWS) {
++		*flow_hash = skb->l4_hash ? skb->hash : flow_hash_from_keys(&keys);
++	} else {
++		*flow_hash = 0;
++		if (flow_mode & CAKE_FLOW_SRC_IP)
++			*flow_hash ^= *srchost_hash;
++		if (flow_mode & CAKE_FLOW_DST_IP)
++			*flow_hash ^= *dsthost_hash;
++	}
++}
++
++/* The queue, its tag and its host tags are those of the eager algorithm */
++static void cake_test_check_flow(struct kunit *test, struct cake_tin_data *q,
++				 const struct sk_buff *skb, int flow_mode,
++				 u32 idx)
++{
++	u32 flow_hash, srchost_hash, dsthost_hash;
++
++	cake_test_ref_hashes(skb, flow_mode, &flow_hash, &srchost_hash,
++			     &dsthost_hash);
++	KUNIT_ASSERT_LT(test, idx, CAKE_QUEUES);
++	KUNIT_EXPECT_EQ(test, q->tags[idx], flow_hash);
++	if (cake_dsrc(flow_mode))
++		KUNIT_EXPECT_EQ(test, q->hosts[q->flows[idx].srchost].srchost_tag,
++				srchost_hash);
++	if (cake_ddst(flow_mode))
++		KUNIT_EXPECT_EQ(test, q->hosts[q->flows[idx].dsthost].dsthost_tag,
++				dsthost_hash);
++}
++
++static const int cake_test_modes[] = {
++	CAKE_FLOW_SRC_IP, CAKE_FLOW_DST_IP, CAKE_FLOW_HOSTS, CAKE_FLOW_FLOWS,
++	CAKE_FLOW_DUAL_SRC, CAKE_FLOW_DUAL_DST, CAKE_FLOW_TRIPLE,
++};
++
++/* First packet (queue allocated), next packets (direct hit), for 3 hosts x
++ * 4 ports, TCP and UDP, IPv4 and IPv6, with and without an RPS hash.
++ */
++static void cake_test_hash_matches_eager(struct kunit *test)
++{
++	int m, v6, proto, host, port, l4;
++
++	for (m = 0; m < ARRAY_SIZE(cake_test_modes); m++) {
++		int flow_mode = cake_test_modes[m];
++		struct cake_tin_data *q = cake_test_alloc(test, sizeof(*q));
++
++		for (v6 = 0; v6 < 2; v6++)
++		for (proto = 0; proto < 2; proto++)
++		for (l4 = 0; l4 < 2; l4++)
++		for (host = 2; host < 5; host++)
++		for (port = 0; port < 4; port++) {
++			u8 p = proto ? IPPROTO_UDP : IPPROTO_TCP;
++			u16 sport = 40000 + port;
++			u32 rps = l4 ? jhash_3words(host, sport, v6 * 2 + proto, 0) | 1 : 0;
++			struct sk_buff *skb = cake_test_skb(test, v6, p, host,
++							    sport, rps);
++			u32 idx = cake_hash(q, skb, flow_mode, 0, 0);
++			u16 src, dst;
++
++			cake_test_check_flow(test, q, skb, flow_mode, idx);
++			/* what cake_enqueue() does with a new flow */
++			q->flows[idx].set = CAKE_SET_SPARSE;
++			src = q->flows[idx].srchost;
++			dst = q->flows[idx].dsthost;
++
++			KUNIT_EXPECT_EQ(test, cake_hash(q, skb, flow_mode, 0, 0), idx);
++			KUNIT_EXPECT_EQ(test, q->flows[idx].srchost, src);
++			KUNIT_EXPECT_EQ(test, q->flows[idx].dsthost, dst);
++		}
++	}
++}
++
++/* A flow whose queue went idle (set cleared, tag kept) gets it back, and
++ * its host tags are worked out again from the packet.
++ */
++static void cake_test_hash_reallocates_idle_flow(struct kunit *test)
++{
++	struct cake_tin_data *q = cake_test_alloc(test, sizeof(*q));
++	int host;
++
++	for (host = 2; host < 12; host++) {
++		struct sk_buff *skb = cake_test_skb(test, false, IPPROTO_TCP,
++						    host, 50000, 0);
++		u32 idx = cake_hash(q, skb, CAKE_FLOW_TRIPLE, 0, 0);
++
++		/* idle: the queue is free but keeps its tag; forget the hosts */
++		q->hosts[q->flows[idx].srchost].srchost_tag = 0;
++		q->hosts[q->flows[idx].dsthost].dsthost_tag = 0;
++		q->flows[idx].srchost = 0;
++		q->flows[idx].dsthost = 0;
++
++		KUNIT_EXPECT_EQ(test, cake_hash(q, skb, CAKE_FLOW_TRIPLE, 0, 0), idx);
++		cake_test_check_flow(test, q, skb, CAKE_FLOW_TRIPLE, idx);
++	}
++}
++
++/* A tc filter's flow override: no flow hash from the packet, but the host
++ * tags still come from it when the queue is allocated.
++ */
++static void cake_test_hash_flow_override(struct kunit *test)
++{
++	struct cake_tin_data *q = cake_test_alloc(test, sizeof(*q));
++	struct sk_buff *skb = cake_test_skb(test, false, IPPROTO_TCP, 7, 40000, 0);
++	u32 flow_hash, srchost_hash, dsthost_hash;
++	u32 idx = cake_hash(q, skb, CAKE_FLOW_TRIPLE, 42, 0);
++
++	cake_test_ref_hashes(skb, CAKE_FLOW_TRIPLE, &flow_hash, &srchost_hash,
++			     &dsthost_hash);
++	KUNIT_EXPECT_EQ(test, idx, 41);
++	KUNIT_EXPECT_EQ(test, q->tags[idx], 41);
++	KUNIT_EXPECT_EQ(test, q->hosts[q->flows[idx].srchost].srchost_tag,
++			srchost_hash);
++	KUNIT_EXPECT_EQ(test, q->hosts[q->flows[idx].dsthost].dsthost_tag,
++			dsthost_hash);
++}
++
++/* Point a flow at a host with @n bulk flows, in both directions */
++static struct cake_flow *cake_test_host_load(struct cake_tin_data *q, u16 n)
++{
++	struct cake_flow *flow = &q->flows[3];
++
++	flow->srchost = 5;
++	flow->dsthost = 9;
++	q->hosts[5].srchost_bulk_flow_count = n;
++	q->hosts[9].dsthost_bulk_flow_count = n;
++	return flow;
++}
++
++static void cake_test_quantum_one_flow_exact(struct kunit *test)
++{
++	struct cake_tin_data *q = cake_test_alloc(test, sizeof(*q));
++	struct cake_flow *flow;
++	u16 n;
++	int i;
++
++	q->flow_quantum = 1514;
++	for (n = 0; n <= 1; n++) {
++		flow = cake_test_host_load(q, n);
++		for (i = 0; i < 1000; i++)
++			KUNIT_ASSERT_EQ(test, cake_get_flow_quantum(q, flow, CAKE_FLOW_TRIPLE),
++					1514);
++	}
++}
++
++/* More bulk flows: the quantum over n, dithered between its floor and ceiling */
++static void cake_test_quantum_shared(struct kunit *test)
++{
++	struct cake_tin_data *q = cake_test_alloc(test, sizeof(*q));
++	u16 n;
++
++	q->flow_quantum = 1514;
++	for (n = 2; n <= 12; n++) {
++		struct cake_flow *flow = cake_test_host_load(q, n);
++		u32 lo = 1514 * quantum_div[n] >> 16;
++		u64 sum = 0;
++		int i;
++
++		for (i = 0; i < 4096; i++) {
++			u16 v = cake_get_flow_quantum(q, flow, CAKE_FLOW_TRIPLE);
++
++			KUNIT_ASSERT_GE(test, v, lo);
++			KUNIT_ASSERT_LE(test, v, lo + 1);
++			sum += v;
++		}
++		/* the mean is 1514 / n, to within the u16 table's rounding */
++		KUNIT_EXPECT_LE(test, abs((int)(sum / 4096) - 1514 / n), 1);
++	}
++}
++
++static u16 cake_test_bulk(struct kunit *test, u64 rate_bps, u16 flags, u16 n)
++{
++	struct cake_sched_data *qd = cake_test_alloc(test, sizeof(*qd));
++	struct cake_sched_config *cfg = cake_test_alloc(test, sizeof(*cfg));
++	struct cake_tin_data *b = cake_test_alloc(test, sizeof(*b));
++	struct cake_flow *flow = cake_test_host_load(b, n);
++
++	qd->config = cfg;
++	cfg->flow_mode = CAKE_FLOW_TRIPLE;
++	cfg->rate_flags = flags;
++	b->flow_quantum = 1514;
++	b->tin_rate_bps = rate_bps;
++	return cake_get_bulk_quantum(qd, b, flow);
++}
++
++static void cake_test_bulk_quantum(struct kunit *test)
++{
++	u16 v;
++
++	/* split-gso: MTU-sized packets, MTU-sized quantum, as before */
++	KUNIT_EXPECT_EQ(test, cake_test_bulk(test, 100000000, CAKE_FLAG_SPLIT_GSO, 1), 1514);
++	/* no-split-gso at 800 Mbit/s (100 MB/s): 244 us worth */
++	KUNIT_EXPECT_EQ(test, cake_test_bulk(test, 100000000, 0, 1), 100000000 >> 12);
++	/* slow links keep the MTU quantum; fast ones stop at the u16 limit */
++	KUNIT_EXPECT_EQ(test, cake_test_bulk(test, 1000000, 0, 1), 1514);
++	KUNIT_EXPECT_EQ(test, cake_test_bulk(test, 2000000000, 0, 1), U16_MAX);
++	/* unlimited (no rate): the MTU quantum */
++	KUNIT_EXPECT_EQ(test, cake_test_bulk(test, 0, 0, 1), 1514);
++	/* shared out between a host's bulk flows like the MTU quantum */
++	v = cake_test_bulk(test, 100000000, 0, 12);
++	KUNIT_EXPECT_GE(test, v, (24414 * quantum_div[12]) >> 16);
++	KUNIT_EXPECT_LE(test, v, ((24414 * quantum_div[12]) >> 16) + 1);
++}
++
++static int cake_test_init(struct kunit *test)
++{
++	int i;
++
++	/* as cake_init() fills it in, for a module with no qdisc yet */
++	quantum_div[0] = ~0;
++	for (i = 1; i <= CAKE_QUEUES; i++)
++		quantum_div[i] = 65535 / i;
++	return 0;
++}
++
++static struct kunit_case cake_test_cases[] = {
++	KUNIT_CASE(cake_test_hash_matches_eager),
++	KUNIT_CASE(cake_test_hash_reallocates_idle_flow),
++	KUNIT_CASE(cake_test_hash_flow_override),
++	KUNIT_CASE(cake_test_quantum_one_flow_exact),
++	KUNIT_CASE(cake_test_quantum_shared),
++	KUNIT_CASE(cake_test_bulk_quantum),
++	{}
++};
++
++static struct kunit_suite cake_test_suite = {
++	.name = "sch_cake",
++	.init = cake_test_init,
++	.test_cases = cake_test_cases,
++};
++
++kunit_test_suite(cake_test_suite);

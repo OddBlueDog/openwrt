@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 19 Oct 2026 22:04:40 +0100
+Subject: [PATCH] net/sched: sch_cake: a bigger bulk quantum with no-split-gso
+
+With no-split-gso, CAKE schedules GSO packets of up to 64 KB whole, but
+flows in the bulk rotation still got an MTU-sized quantum back on each
+pass, shared between the host's bulk flows with host isolation. A host
+with 12 bulk flows got 126 bytes per pass, so a GRO packet of ~5 KB took
+dozens of passes round the flow list to dequeue, each with a
+get_random_u16().
+
+Give bulk flows ~244 us at the tin's rate per pass instead (rate >> 12:
+24 KB at 800 Mbit/s, never less than the MTU quantum, at most 64 KB).
+DRR shares out the same for any quantum, so flows and hosts get what
+they did; new flows keep the MTU-sized quantum, so what counts as sparse
+doesn't change. split-gso (the default) is unchanged.
+
+A GRO packet now takes a few passes, for much less of CAKE's CPU time at
+the same rate, with latency through CAKE unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/sch_cake.c | 41 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 25c70e5..44b1386 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -677,9 +677,9 @@ static void cake_inc_dsthost_bulk_flow_count(struct cake_tin_data *q,
+ 		q->hosts[flow->dsthost].dsthost_bulk_flow_count++;
+ }
+ 
+-static u16 cake_get_flow_quantum(struct cake_tin_data *q,
+-				 struct cake_flow *flow,
+-				 int flow_mode)
++/* A flow's part of @quantum: shared out between its host's bulk flows */
++static u16 cake_host_share(struct cake_tin_data *q, struct cake_flow *flow,
++			   int flow_mode, u32 quantum)
+ {
+ 	u16 host_load = 1;
+ 
+@@ -695,13 +695,40 @@ static u16 cake_get_flow_quantum(struct cake_tin_data *q,
+ 	 * with one bulk flow gives it the whole quantum, no dither needed.
+ 	 */
+ 	if (host_load == 1)
+-		return q->flow_quantum;
++		return quantum;
+ 
+ 	/* The get_random_u16() is a way to apply dithering to avoid
+ 	 * accumulating roundoff errors
+ 	 */
+-	return (q->flow_quantum * quantum_div[host_load] +
+-		get_random_u16()) >> 16;
++	return (quantum * quantum_div[host_load] + get_random_u16()) >> 16;
++}
++
++static u16 cake_get_flow_quantum(struct cake_tin_data *q,
++				 struct cake_flow *flow,
++				 int flow_mode)
++{
++	return cake_host_share(q, flow, flow_mode, q->flow_quantum);
++}
++
++/* The deficit a flow in the bulk rotation gets back on each pass. With
++ * no-split-gso, packets of up to 64 KB are scheduled whole, and with host
++ * isolation a host's bulk flows share one quantum: at 1514 bytes, a host
++ * with 12 bulk flows got 126 bytes per pass, and each 5 KB GRO packet took
++ * some 40 passes round the flow list. Give them ~244 us at the tin's rate
++ * instead (24 KB at 800 Mbit/s). DRR shares out the same for any quantum;
++ * new flows keep the MTU-sized one, so what counts as sparse is unchanged.
++ */
++static u16 cake_get_bulk_quantum(struct cake_sched_data *qd,
++				 struct cake_tin_data *b,
++				 struct cake_flow *flow)
++{
++	u32 quantum = b->flow_quantum;
++
++	if (!(qd->config->rate_flags & CAKE_FLAG_SPLIT_GSO))
++		quantum = max_t(u64, quantum,
++				min_t(u64, b->tin_rate_bps >> 12, U16_MAX));
++
++	return cake_host_share(b, flow, qd->config->flow_mode, quantum);
+ }
+ 
+ static void cake_keys_host_hashes(const struct flow_keys *keys,
+@@ -2209,7 +2236,7 @@ retry:
+ 			}
+ 		}
+ 
+-		flow->deficit += cake_get_flow_quantum(b, flow, q->config->flow_mode);
++		flow->deficit += cake_get_bulk_quantum(q, b, flow);
+ 		list_move_tail(&flow->flowchain, &b->old_flows);
+ 
+ 		goto retry;

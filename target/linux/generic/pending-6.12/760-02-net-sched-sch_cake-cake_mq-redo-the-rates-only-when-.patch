@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 19 Oct 2026 22:04:40 +0100
+Subject: [PATCH] net/sched: sch_cake: cake_mq: redo the rates only when the
+ share changes
+
+Every sub-queue resynced its share of the rate every 200 us, and each
+time redid every tin's rate (a division and a shift loop per tin) even
+when the share hadn't changed, which it seldom does. Only redo them when
+the rate to set differs from the one set last (synced_rate, set again by
+cake_reconfigure() when the config changes, so a "tc change" or an
+autorate update is still shared out), and only look at the device's real
+transmit queues. Stop writing last_active on every packet for plain cake,
+which never reads it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/sch_cake.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 73fc285..5ee4558 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -264,6 +264,7 @@ struct cake_sched_data {
+ 	/* mq sync state */
+ 	u64		last_checked_active;
+ 	u64		last_active;
++	u64		synced_rate;
+ 	u32		active_queues;
+ };
+ 
+@@ -2054,7 +2055,7 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ 		u32 num_active_qs = 1;
+ 		unsigned int ntx;
+ 
+-		for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
++		for (ntx = 0; ntx < dev->real_num_tx_queues; ntx++) {
+ 			other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+ 			other_priv = qdisc_priv(other_sch);
+ 
+@@ -2071,7 +2072,13 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ 		if (num_active_qs > 1)
+ 			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
+ 
+-		cake_configure_rates(sch, new_rate, true);
++		/* Every 200 us, but the share seldom changes: only redo each
++		 * tin's rate (a division and a shift loop per tin) when it does.
++		 */
++		if (new_rate != q->synced_rate) {
++			cake_configure_rates(sch, new_rate, true);
++			q->synced_rate = new_rate;
++		}
+ 		q->last_checked_active = now;
+ 		q->active_queues = num_active_qs;
+ 	}
+@@ -2275,7 +2282,8 @@ retry:
+ 
+ 	b->tin_ecn_mark += !!flow->cvars.ecn_marked;
+ 	qdisc_bstats_update(sch, skb);
+-	WRITE_ONCE(q->last_active, now);
++	if (q->config->is_shared)
++		WRITE_ONCE(q->last_active, now);
+ 
+ 	/* collect delay stats */
+ 	delay = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
+@@ -2647,6 +2655,7 @@ static void cake_reconfigure(struct Qdisc *sch)
+ 	struct cake_sched_config *q = qd->config;
+ 
+ 	cake_configure_rates(sch, qd->config->rate_bps, false);
++	qd->synced_rate = qd->config->rate_bps;
+ 
+ 	if (q->buffer_config_limit) {
+ 		qd->buffer_limit = q->buffer_config_limit;
