@@ -1,0 +1,410 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Tue, 20 Oct 2026 17:58:55 +0100
+Subject: [PATCH] net/sched: sch_cake: cake_mq: count only the sub-cakes that
+ had a packet
+
+Every sync_time (200 us), a busy cake_mq sub-cake counts the active ones
+to take its share of the rate. It read the queue length and the last
+dequeue time of the sub-cake on each of the device's real tx queues,
+though most of them never carry a packet: on the GL-MT6000 all of eth1's
+traffic leaves on one tx queue of 16, and the ifb that shapes the
+download uses one of 4.
+
+Keep a bitmap of the sub-cakes that ever had a packet: used_qs in the
+shared config, allocated by cake_mq_init() for the device's tx queues
+and freed by cake_mq_destroy(). A sub-cake sets its bit when a packet
+reaches its empty queue, testing it first so that the shared word is
+written once, and the count (now cake_mq_active_queues()) walks only the
+set bits below real_num_tx_queues. A bit is never cleared, so a sub-cake
+back from idle is counted as before. A sub-cake can only be counted
+(packets queued, or sent since the last count) after a packet reached
+it, so the count is the one that read every queue. The exception is a
+sub-cake's very first packet arriving while another counts; that one
+sees it at its next count, 200 us later. The reads stay lockless, the
+rates are still redone only when the share changes, and plain cake has
+no bitmap and is unchanged.
+
+KUnit cases, on an unregistered 16-queue device: each sub-cake marks its
+own queue; a sub-cake that goes idle and comes back is counted again;
+only the real tx queues count, as their number shrinks and grows; and
+2000 random mixes of never-used, idle, queued and just-sent sub-cakes
+give the count that read every queue.
+
+Before this, a resync on the GL-MT6000's egress read 15 idle sub-cakes,
+and 3 on its ingress.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/sch_cake.c      |  80 ++++++++++----
+ net/sched/sch_cake_test.c | 214 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 271 insertions(+), 23 deletions(-)
+
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 0af18cd..c9eb71a 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -203,6 +203,8 @@ struct cake_sched_config {
+ 	u64		interval;
+ 	u64		target;
+ 	u64		sync_time;
++	/* cake_mq: the tx queues whose sub-cake ever had a packet */
++	unsigned long	*used_qs;
+ 	u32		buffer_config_limit;
+ 	u32		fwmark_mask;
+ 	u16		fwmark_shft;
+@@ -1821,6 +1823,52 @@ hash:
+ 
+ static void cake_reconfigure(struct Qdisc *sch);
+ 
++/* cake_mq's sub-cakes share the rate between the active ones, and each
++ * counts them again every sync_time. Only one that has had a packet can be
++ * active, so a sub-cake marks its tx queue in the shared used_qs when a
++ * packet finds it empty, and the count reads only the marked ones: a NIC
++ * often carries all the traffic on one or two of its tx queues. A mark is
++ * never cleared, so a sub-cake back from idle is counted again. Lockless,
++ * like the queue lengths: a mark set during another sub-cake's count shows
++ * at its next one.
++ */
++static void cake_mq_mark_used(struct Qdisc *sch, struct cake_sched_data *q)
++{
++	unsigned long *used = q->config->used_qs;
++	unsigned int ntx = sch->dev_queue - netdev_get_tx_queue(qdisc_dev(sch), 0);
++
++	if (!test_bit(ntx, used))
++		set_bit(ntx, used);
++}
++
++/* The sub-cakes sharing the rate with @q, @q included: those on the
++ * device's real tx queues with packets queued, or sent since @q last counted.
++ */
++static u32 cake_mq_active_queues(struct Qdisc *sch, struct cake_sched_data *q)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	unsigned int ntx, real_txqs = dev->real_num_tx_queues;
++	struct cake_sched_data *other_priv;
++	u64 other_qlen, other_last_active;
++	struct Qdisc *other_sch;
++	u32 num_active_qs = 1;
++
++	for_each_set_bit(ntx, q->config->used_qs, real_txqs) {
++		other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
++		other_priv = qdisc_priv(other_sch);
++
++		if (other_priv == q)
++			continue;
++
++		other_qlen = READ_ONCE(other_sch->q.qlen);
++		other_last_active = READ_ONCE(other_priv->last_active);
++
++		if (other_qlen || other_last_active > q->last_checked_active)
++			num_active_qs++;
++	}
++	return num_active_qs;
++}
++
+ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			struct sk_buff **to_free)
+ {
+@@ -1851,6 +1899,9 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			b->time_next_packet = now;
+ 
+ 		if (!sch->q.qlen) {
++			if (q->config->is_shared)
++				cake_mq_mark_used(sch, q);
++
+ 			if (ktime_before(q->time_next_packet, now)) {
+ 				q->failsafe_next_packet = now;
+ 				q->time_next_packet = now;
+@@ -2085,27 +2136,8 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ 
+ 	if (q->config->is_shared && q->rate_ns &&
+ 	    now - q->last_checked_active >= q->config->sync_time) {
+-		struct net_device *dev = qdisc_dev(sch);
+-		struct cake_sched_data *other_priv;
++		u32 num_active_qs = cake_mq_active_queues(sch, q);
+ 		u64 new_rate = q->config->rate_bps;
+-		u64 other_qlen, other_last_active;
+-		struct Qdisc *other_sch;
+-		u32 num_active_qs = 1;
+-		unsigned int ntx;
+-
+-		for (ntx = 0; ntx < dev->real_num_tx_queues; ntx++) {
+-			other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+-			other_priv = qdisc_priv(other_sch);
+-
+-			if (other_priv == q)
+-				continue;
+-
+-			other_qlen = READ_ONCE(other_sch->q.qlen);
+-			other_last_active = READ_ONCE(other_priv->last_active);
+-
+-			if (other_qlen || other_last_active > q->last_checked_active)
+-				num_active_qs++;
+-		}
+ 
+ 		if (num_active_qs > 1)
+ 			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
+@@ -3324,7 +3356,10 @@ struct cake_mq_sched {
+ 
+ static void cake_mq_destroy(struct Qdisc *sch)
+ {
++	struct cake_mq_sched *priv = qdisc_priv(sch);
++
+ 	mq_destroy_common(sch);
++	bitmap_free(priv->cake_config.used_qs);
+ }
+ 
+ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+@@ -3342,6 +3377,11 @@ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+ 			return ret;
+ 	}
+ 
++	/* freed by cake_mq_destroy(), which also runs if init fails */
++	priv->cake_config.used_qs = bitmap_zalloc(dev->num_tx_queues, GFP_KERNEL);
++	if (!priv->cake_config.used_qs)
++		return -ENOMEM;
++
+ 	ret = mq_init_common(sch, opt, extack, &cake_qdisc_ops);
+ 	if (ret)
+ 		return ret;
+diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
+index 7b7f71d..8dd767d 100644
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1,10 +1,13 @@
+ // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+-/* KUnit tests for sch_cake's flow hashing and DRR quanta. Built into
+- * sch_cake.ko (#included at the end of sch_cake.c) when
+- * CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs when it loads.
++/* KUnit tests for sch_cake's flow hashing, DRR quanta and cake_mq's count
++ * of active sub-cakes. Built into sch_cake.ko (#included at the end of
++ * sch_cake.c) when CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs
++ * when it loads.
+  */
+ #include <kunit/test.h>
++#include <linux/etherdevice.h>
+ #include <linux/ipv6.h>
++#include <linux/prandom.h>
+ #include <net/net_namespace.h>
+ 
+ static void cake_test_kvfree(void *p)
+@@ -337,6 +340,207 @@ static void cake_test_bulk_quantum(struct kunit *test)
+ 	KUNIT_EXPECT_LE(test, v, ((24414 * quantum_div[12]) >> 16) + 1);
+ }
+ 
++/* cake_mq on a device with 16 tx queues, not registered. Each queue's
++ * sub-cake is a Qdisc with only what the count reads: its queue length and
++ * when it last sent a packet.
++ */
++#define CAKE_TEST_TXQS	16
++
++struct cake_test_mq {
++	struct net_device *dev;
++	struct Qdisc *sch[CAKE_TEST_TXQS];
++	struct cake_sched_config *cfg;
++};
++
++static void cake_test_free_netdev(void *dev)
++{
++	free_netdev(dev);
++}
++
++static struct cake_test_mq *cake_test_mq_alloc(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_alloc(test, sizeof(*mq));
++	int i;
++
++	mq->dev = alloc_netdev_mqs(0, "caketest", NET_NAME_UNKNOWN, ether_setup,
++				   CAKE_TEST_TXQS, 1);
++	KUNIT_ASSERT_NOT_NULL(test, mq->dev);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_free_netdev,
++							   mq->dev));
++
++	mq->cfg = cake_test_alloc(test, sizeof(*mq->cfg));
++	mq->cfg->is_shared = 1;
++	mq->cfg->used_qs = cake_test_alloc(test, BITS_TO_LONGS(CAKE_TEST_TXQS) *
++						 sizeof(unsigned long));
++
++	for (i = 0; i < CAKE_TEST_TXQS; i++) {
++		struct netdev_queue *txq = netdev_get_tx_queue(mq->dev, i);
++		struct Qdisc *sch = cake_test_alloc(test, sizeof(*sch) +
++							  sizeof(struct cake_sched_data));
++		struct cake_sched_data *q = qdisc_priv(sch);
++
++		sch->dev_queue = txq;
++		q->config = mq->cfg;
++		rcu_assign_pointer(txq->qdisc_sleeping, sch);
++		mq->sch[i] = sch;
++	}
++	return mq;
++}
++
++static struct cake_sched_data *cake_test_mq_q(struct cake_test_mq *mq, int i)
++{
++	return qdisc_priv(mq->sch[i]);
++}
++
++/* A packet to sub-cake @i's empty queue, as cake_enqueue() marks it */
++static void cake_test_mq_enqueue(struct cake_test_mq *mq, int i)
++{
++	if (!mq->sch[i]->q.qlen)
++		cake_mq_mark_used(mq->sch[i], cake_test_mq_q(mq, i));
++	mq->sch[i]->q.qlen++;
++}
++
++static u32 cake_test_mq_count(struct cake_test_mq *mq, int self)
++{
++	u32 n;
++
++	rcu_read_lock();
++	n = cake_mq_active_queues(mq->sch[self], cake_test_mq_q(mq, self));
++	rcu_read_unlock();
++	return n;
++}
++
++/* The count before used_qs: every real tx queue read */
++static u32 cake_test_mq_count_all(struct cake_test_mq *mq, int self)
++{
++	struct cake_sched_data *q = cake_test_mq_q(mq, self);
++	u32 n = 1;
++	int i;
++
++	for (i = 0; i < mq->dev->real_num_tx_queues; i++)
++		if (i != self && (mq->sch[i]->q.qlen ||
++				  cake_test_mq_q(mq, i)->last_active > q->last_checked_active))
++			n++;
++	return n;
++}
++
++/* Each sub-cake marks its own tx queue, once */
++static void cake_test_mq_marks_its_queue(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++
++	cake_test_mq_enqueue(mq, 1);
++	cake_test_mq_enqueue(mq, 1);
++	KUNIT_EXPECT_TRUE(test, test_bit(1, mq->cfg->used_qs));
++	KUNIT_EXPECT_EQ(test, bitmap_weight(mq->cfg->used_qs, CAKE_TEST_TXQS), 1);
++
++	cake_test_mq_enqueue(mq, 0);
++	cake_test_mq_enqueue(mq, CAKE_TEST_TXQS - 1);
++	KUNIT_EXPECT_TRUE(test, test_bit(0, mq->cfg->used_qs));
++	KUNIT_EXPECT_TRUE(test, test_bit(CAKE_TEST_TXQS - 1, mq->cfg->used_qs));
++	KUNIT_EXPECT_EQ(test, bitmap_weight(mq->cfg->used_qs, CAKE_TEST_TXQS), 3);
++}
++
++/* Sub-cake 1 is busy, as eth1's upload is; sub-cake 4 comes and goes */
++static void cake_test_mq_count_back_from_idle(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *self = cake_test_mq_q(mq, 1);
++	struct cake_sched_data *other = cake_test_mq_q(mq, 4);
++
++	/* alone, its own queue counted once */
++	cake_test_mq_enqueue(mq, 1);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 1);
++
++	/* 4 has a packet queued */
++	cake_test_mq_enqueue(mq, 4);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
++
++	/* 4 sent it since 1 last counted */
++	self->last_checked_active = 1000;
++	mq->sch[4]->q.qlen = 0;
++	other->last_active = 2000;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
++
++	/* 1 counts again later: 4 is idle, still marked but not counted */
++	self->last_checked_active = 3000;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 1);
++	KUNIT_EXPECT_TRUE(test, test_bit(4, mq->cfg->used_qs));
++
++	/* back from idle: counted again, queued or just sent */
++	cake_test_mq_enqueue(mq, 4);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
++	mq->sch[4]->q.qlen = 0;
++	other->last_active = 4000;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
++	self->last_checked_active = 5000;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 1);
++}
++
++/* Only the real tx queues count, as the device changes how many it has */
++static void cake_test_mq_count_real_queues(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	int i;
++
++	for (i = 10; i < CAKE_TEST_TXQS; i++)
++		cake_test_mq_enqueue(mq, i);
++
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 7);
++	/* what netif_set_real_num_tx_queues() changes */
++	mq->dev->real_num_tx_queues = 8;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 1);
++	mq->dev->real_num_tx_queues = 11;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 2);
++	mq->dev->real_num_tx_queues = CAKE_TEST_TXQS;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 7);
++}
++
++/* Any mix of never used, idle, queued and just-sent sub-cakes, and of real
++ * tx queues: the count is the one that read every queue.
++ */
++static void cake_test_mq_count_matches_all(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct rnd_state rnd;
++	int round, i;
++
++	prandom_seed_state(&rnd, 760);
++	for (round = 0; round < 2000; round++) {
++		int self = prandom_u32_state(&rnd) % CAKE_TEST_TXQS;
++		u64 since = 1000 + prandom_u32_state(&rnd) % 1000;
++
++		bitmap_zero(mq->cfg->used_qs, CAKE_TEST_TXQS);
++		mq->dev->real_num_tx_queues = 1 + prandom_u32_state(&rnd) % CAKE_TEST_TXQS;
++		for (i = 0; i < CAKE_TEST_TXQS; i++) {
++			struct cake_sched_data *q = cake_test_mq_q(mq, i);
++
++			mq->sch[i]->q.qlen = 0;
++			q->last_active = 0;
++			q->last_checked_active = since;
++			switch (prandom_u32_state(&rnd) % 4) {
++			case 0:	/* never had a packet */
++				break;
++			case 1:	/* idle */
++				cake_test_mq_enqueue(mq, i);
++				mq->sch[i]->q.qlen = 0;
++				q->last_active = since - prandom_u32_state(&rnd) % since;
++				break;
++			case 2:	/* packets queued */
++				cake_test_mq_enqueue(mq, i);
++				break;
++			case 3:	/* sent since @self last counted */
++				cake_test_mq_enqueue(mq, i);
++				mq->sch[i]->q.qlen = 0;
++				q->last_active = since + 1 + prandom_u32_state(&rnd) % 1000;
++				break;
++			}
++		}
++		KUNIT_ASSERT_EQ(test, cake_test_mq_count(mq, self),
++				cake_test_mq_count_all(mq, self));
++	}
++}
++
+ static int cake_test_init(struct kunit *test)
+ {
+ 	int i;
+@@ -355,6 +559,10 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_quantum_one_flow_exact),
+ 	KUNIT_CASE(cake_test_quantum_shared),
+ 	KUNIT_CASE(cake_test_bulk_quantum),
++	KUNIT_CASE(cake_test_mq_marks_its_queue),
++	KUNIT_CASE(cake_test_mq_count_back_from_idle),
++	KUNIT_CASE(cake_test_mq_count_real_queues),
++	KUNIT_CASE(cake_test_mq_count_matches_all),
+ 	{}
+ };
+ 
