@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
 Date: Thu, 22 Oct 2026 16:52:02 +0000
-Subject: [PATCH 5/5] net: ethernet: mtk_eth_soc: RSS off until asked, per-ring
+Subject: [PATCH] net: ethernet: mtk_eth_soc: RSS off until asked, per-ring
  DIM, 6.12 ethtool
 
 MilkFlint changes on top of the MT7986 RSS port:
@@ -14,16 +14,19 @@ MilkFlint changes on top of the MT7986 RSS port:
 - the rings share one interrupt delay and one RX DIM, which four NAPIs
   fed through unlocked shared counters: count per ring, and sample the
   sum under a trylock (another ring skips that sample).
+- keep the MT7986 TX ring (unused with QDMA) and the MT7987 RX ring at
+  their sizes: the SDK changes them for its SRAM allocator, which this
+  tree does not have.
 - only ring 0s NAPI (and TX, as before) handles the GDM counter status.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- drivers/net/ethernet/mediatek/mtk_eth_soc.c | 86 ++++++++++++++-------
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 90 ++++++++++++++-------
  drivers/net/ethernet/mediatek/mtk_eth_soc.h |  7 ++
- 2 files changed, 67 insertions(+), 26 deletions(-)
+ 2 files changed, 69 insertions(+), 28 deletions(-)
 
 diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index d9e6abb..0c36e04 100644
+index d9e6abb..dac0f95 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 @@ -2600,11 +2600,24 @@ rx_done:
@@ -207,6 +210,24 @@ index d9e6abb..0c36e04 100644
  
  	eth->rx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
  	INIT_WORK(&eth->rx_dim.work, mtk_dim_rx);
+@@ -6346,7 +6380,7 @@ static const struct mtk_soc_data mt7986_data = {
+ 		DESC_SIZE(struct mtk_tx_dma_v2),
+ 		.dma_max_len = MTK_TX_DMA_BUF_LEN_V2,
+ 		.dma_len_offset = 8,
+-		.dma_size = MTK_DMA_SIZE(4K),
++		.dma_size = MTK_DMA_SIZE(2K),
+ 		.fq_dma_size = MTK_DMA_SIZE(2K),
+ 	},
+ 	.rx = {
+@@ -6384,7 +6418,7 @@ static const struct mtk_soc_data mt7987_data = {
+ 		.dma_l4_valid = RX_DMA_L4_VALID_V2,
+ 		.dma_max_len = MTK_TX_DMA_BUF_LEN_V2,
+ 		.dma_len_offset = 8,
+-		.dma_size = MTK_DMA_SIZE(1K),
++		.dma_size = MTK_DMA_SIZE(2K),
+ 	},
+ };
+ 
 diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.h b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 index a567327..462e540 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
