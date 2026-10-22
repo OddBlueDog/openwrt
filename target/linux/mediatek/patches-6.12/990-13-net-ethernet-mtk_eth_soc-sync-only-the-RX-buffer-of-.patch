@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:24:25 +0100
+Subject: [PATCH] net: ethernet: mtk_eth_soc: sync only the RX buffer of a
+ recycled page
+
+The page_pool syncs max_len bytes of every page it recycles for the
+device, and max_len was MTK_PP_MAX_BUF_SIZE: 3520 bytes with 4K pages.
+The DMA engine writes at most the length given in rxd2, ring->buf_size,
+which is 2048 on the MT7986. The Ethernet isn't DMA-coherent there, so
+each recycled RX page cleaned 55 cache lines where 32 are written.
+
+Pass the ring's buf_size to mtk_create_page_pool() and use it for
+max_len, bounded by MTK_PP_MAX_BUF_SIZE. The window the device writes,
+[MTK_PP_HEADROOM, MTK_PP_HEADROOM + buf_size), is cache-line aligned at
+both ends here (256 and 2304), so lines the CPU dirtied beyond it (an XDP
+tail adjustment, a trailer) never overlap what the device writes.
+
+This is what pesa1234's 999-2725 (MediaTek: RX buffer length 2K ->
+1.5K) gains on the page_pool path, where every buffer is a whole page,
+without lowering max_mtu to 1518.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index f3f82aa..0c3f820 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2125,7 +2125,8 @@ static bool mtk_page_pool_enabled(struct mtk_eth *eth)
+ 
+ static struct page_pool *mtk_create_page_pool(struct mtk_eth *eth,
+ 					      struct xdp_rxq_info *xdp_q,
+-					      int id, int size)
++					      int id, int size,
++					      unsigned int buf_size)
+ {
+ 	struct page_pool_params pp_params = {
+ 		.order = 0,
+@@ -2134,7 +2135,11 @@ static struct page_pool *mtk_create_page_pool(struct mtk_eth *eth,
+ 		.nid = NUMA_NO_NODE,
+ 		.dev = eth->dma_dev,
+ 		.offset = MTK_PP_HEADROOM,
+-		.max_len = MTK_PP_MAX_BUF_SIZE,
++		/* The DMA engine writes at most the length given in rxd2
++		 * (ring->buf_size), so a recycled page only needs that much
++		 * synced for the device.
++		 */
++		.max_len = min_t(unsigned int, buf_size, MTK_PP_MAX_BUF_SIZE),
+ 	};
+ 	struct page_pool *pp;
+ 	int err;
+@@ -3086,7 +3091,7 @@ static int mtk_rx_alloc(struct mtk_eth *eth, int ring_no, int rx_flag)
+ 		struct page_pool *pp;
+ 
+ 		pp = mtk_create_page_pool(eth, &ring->xdp_q, ring_no,
+-					  rx_dma_size);
++					  rx_dma_size, ring->buf_size);
+ 		if (IS_ERR(pp))
+ 			return PTR_ERR(pp);
+ 

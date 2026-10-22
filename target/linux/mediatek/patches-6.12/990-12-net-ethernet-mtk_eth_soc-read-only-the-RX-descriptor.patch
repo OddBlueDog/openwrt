@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:40:38 +0100
+Subject: [PATCH] net: ethernet: mtk_eth_soc: read only the RX descriptor words
+ used
+
+On the MT7986 the RX rings are in the frame engine's SRAM, inside the
+ioremap()ed register window: device memory, so each descriptor word
+mtk_rx_get_desc() reads is a separate uncached bus read, which stalls
+an in-order Cortex-A53. It read rxd1-rxd4 for every packet (rxd1-rxd7
+on v3), but mtk_poll_rx() uses fewer:
+- rxd1, the buffer address, only on the path without a page_pool
+  (netsys v1; v2 and later always have one);
+- rxd3 only on v1 (the VLAN port of a DSA frame) and v3 (checksum);
+- rxd4 only up to v2 (source port, special tag, PPE reason, FOE entry,
+  checksum), which rxd5 carries on v3;
+- rxd6 and rxd7 not at all.
+So read those only where they are used: on the MT7986, two reads per
+packet (rxd2 and rxd4) instead of four.
+
+Also add a dma_rmb() after the RX_DMA_DONE check, so that the other
+words cannot be read before the ownership word on a ring in normal
+memory (dma_alloc_coherent(), or an SRAM pool mapped write-combining).
+Device memory is not read speculatively, so this changes nothing for
+the SRAM rings here, apart from the cost of the barrier.
+
+[Based on pesa1234 999-9919 (SmartWRT), which reads SRAM descriptors
+ with two 64-bit readq_relaxed() instead, adds the dma_rmb() and stops
+ reading rxd6/rxd7. Reworked and ported to OpenWrt 6.12 for MilkFlint
+ by OddBlueDog: the same two reads per packet on the MT7986, but of
+ the two words used and at the access width the driver already uses,
+ for every ring (no in_sram path, nothing new for the bus); it holds
+ for the four RSS rings, which are all in SRAM with a page_pool.]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 31 ++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index 560b056..f3f82aa 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -1358,20 +1358,37 @@ static inline int mtk_max_buf_size(int frag_size)
+ 	return buf_size;
+ }
+ 
+-static bool mtk_rx_get_desc(struct mtk_eth *eth, struct mtk_rx_dma_v2 *rxd,
++static bool mtk_rx_get_desc(struct mtk_eth *eth, struct mtk_rx_ring *ring,
++			    struct mtk_rx_dma_v2 *rxd,
+ 			    struct mtk_rx_dma_v2 *dma_rxd)
+ {
+ 	rxd->rxd2 = READ_ONCE(dma_rxd->rxd2);
+ 	if (!(rxd->rxd2 & RX_DMA_DONE))
+ 		return false;
+ 
+-	rxd->rxd1 = READ_ONCE(dma_rxd->rxd1);
+-	rxd->rxd3 = READ_ONCE(dma_rxd->rxd3);
+-	rxd->rxd4 = READ_ONCE(dma_rxd->rxd4);
++	/* Read the other words only after the DMA engine has handed the
++	 * descriptor back. A ring in the frame engine's SRAM is device
++	 * memory, which is never read speculatively, but a ring from
++	 * dma_alloc_coherent() is normal memory.
++	 */
++	dma_rmb();
++
++	/* Every word read from the frame engine's SRAM is an uncached bus
++	 * read: read only what mtk_poll_rx() uses. rxd1, the buffer
++	 * address, only without a page_pool; rxd3, the VLAN port on v1 and
++	 * the checksum on v3; rxd4 up to v2 and rxd5 on v3, the source
++	 * port, PPE reason and FOE entry (and the checksum on v1/v2).
++	 */
++	if (!ring->page_pool)
++		rxd->rxd1 = READ_ONCE(dma_rxd->rxd1);
++
+ 	if (mtk_is_netsys_v3_or_greater(eth)) {
++		rxd->rxd3 = READ_ONCE(dma_rxd->rxd3);
+ 		rxd->rxd5 = READ_ONCE(dma_rxd->rxd5);
+-		rxd->rxd6 = READ_ONCE(dma_rxd->rxd6);
+-		rxd->rxd7 = READ_ONCE(dma_rxd->rxd7);
++	} else {
++		if (mtk_is_netsys_v1(eth))
++			rxd->rxd3 = READ_ONCE(dma_rxd->rxd3);
++		rxd->rxd4 = READ_ONCE(dma_rxd->rxd4);
+ 	}
+ 
+ 	return true;
+@@ -2441,7 +2458,7 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
+ 		rxd = ring->dma + RX_DESC_OFS(eth, idx);
+ 		data = ring->data[idx];
+ 
+-		if (!mtk_rx_get_desc(eth, &trxd, rxd))
++		if (!mtk_rx_get_desc(eth, ring, &trxd, rxd))
+ 			break;
+ 
+ 		/* find out which mac the packet come from. values start at 1 */
