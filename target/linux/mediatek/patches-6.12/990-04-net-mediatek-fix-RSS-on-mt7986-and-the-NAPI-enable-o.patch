@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frank Wunderlich <frank-w@public-files.de>
+Date: Thu, 22 Oct 2026 16:49:01 +0000
+Subject: [PATCH 4/5] net: mediatek: fix RSS on mt7986, and the NAPI enable
+ order
+
+pesa1234 999-9901 (Frank Wunderlich: CDMP STAG for every NETSYS version)
+and 999-9910 (pesa1234: register the netdevs only once every NAPI
+exists), from next-r4.12.0.rss.mtk 69334c2, with OpenWrt 702s threaded
+NAPI kept.
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 68 +++++++++++++--------
+ 1 file changed, 42 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index e9cc262..d9e6abb 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -4690,12 +4690,12 @@ static int mtk_hw_init(struct mtk_eth *eth, bool reset)
+ 	 */
+ 	val = mtk_r32(eth, MTK_CDMQ_IG_CTRL);
+ 	mtk_w32(eth, val | MTK_CDMQ_STAG_EN, MTK_CDMQ_IG_CTRL);
+-	if (mtk_is_netsys_v1(eth)) {
+-		val = mtk_r32(eth, MTK_CDMP_IG_CTRL);
+-		mtk_w32(eth, val | MTK_CDMP_STAG_EN, MTK_CDMP_IG_CTRL);
+ 
++	val = mtk_r32(eth, MTK_CDMP_IG_CTRL);
++	mtk_w32(eth, val | MTK_CDMP_STAG_EN, MTK_CDMP_IG_CTRL);
++
++	if (mtk_is_netsys_v1(eth))
+ 		mtk_w32(eth, 1, MTK_CDMP_EG_CTRL);
+-	}
+ 
+ 	/* set interrupt delays based on current Net DIM sample */
+ 	mtk_dim_rx(&eth->rx_dim.work);
+@@ -4973,6 +4973,22 @@ static void mtk_pending_work(struct work_struct *work)
+ 	rtnl_unlock();
+ }
+ 
++static void mtk_napi_del(struct mtk_eth *eth)
++{
++	int i;
++
++	if (!eth->dummy_dev)
++		return;
++
++	netif_napi_del(&eth->tx_napi);
++	netif_napi_del(&eth->rx_napi[0].napi);
++
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
++		for (i = 1; i < MTK_RX_RSS_NUM; i++)
++			netif_napi_del(&eth->rx_napi[MTK_RSS_RING(i)].napi);
++	}
++}
++
+ static int mtk_free_dev(struct mtk_eth *eth)
+ {
+ 	int i;
+@@ -6054,20 +6070,6 @@ static int mtk_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
+-	for (i = 0; i < MTK_MAX_DEVS; i++) {
+-		if (!eth->netdev[i])
+-			continue;
+-
+-		err = register_netdev(eth->netdev[i]);
+-		if (err) {
+-			dev_err(eth->dev, "error bringing up device\n");
+-			goto err_unreg_netdev;
+-		} else
+-			netif_info(eth, probe, eth->netdev[i],
+-				   "mediatek frame engine at 0x%08lx, irq %d\n",
+-				   eth->netdev[i]->base_addr, eth->irq_fe[MTK_FE_IRQ_SHARED]);
+-	}
+-
+ 	/* we run 2 devices on the same DMA ring so we need a dummy device
+ 	 * for NAPI to work
+ 	 */
+@@ -6075,8 +6077,10 @@ static int mtk_probe(struct platform_device *pdev)
+ 	if (!eth->dummy_dev) {
+ 		err = -ENOMEM;
+ 		dev_err(eth->dev, "failed to allocate dummy device\n");
+-		goto err_unreg_netdev;
++		goto err_deinit_ppe;
+ 	}
++	eth->dummy_dev->threaded = 1;
++	strcpy(eth->dummy_dev->name, "mtk_eth");
+ 	netif_napi_add(eth->dummy_dev, &eth->tx_napi, mtk_napi_tx);
+ 	netif_napi_add(eth->dummy_dev, &eth->rx_napi[0].napi, mtk_napi_rx);
+ 
+@@ -6086,6 +6090,21 @@ static int mtk_probe(struct platform_device *pdev)
+ 					   mtk_napi_rx);
+ 	}
+ 
++	for (i = 0; i < MTK_MAX_DEVS; i++) {
++		if (!eth->netdev[i])
++			continue;
++
++		err = register_netdev(eth->netdev[i]);
++		if (err) {
++			dev_err(eth->dev, "error bringing up device\n");
++			goto err_unreg_netdev;
++		}
++
++		netif_info(eth, probe, eth->netdev[i],
++			   "mediatek frame engine at 0x%08lx, irq %d\n",
++			   eth->netdev[i]->base_addr, eth->irq_fe[0]);
++	}
++
+ 	platform_set_drvdata(pdev, eth);
+ 	schedule_delayed_work(&eth->reset.monitor_work,
+ 			      MTK_DMA_MONITOR_TIMEOUT);
+@@ -6094,6 +6113,9 @@ static int mtk_probe(struct platform_device *pdev)
+ 
+ err_unreg_netdev:
+ 	mtk_unreg_dev(eth);
++	mtk_napi_del(eth);
++	free_netdev(eth->dummy_dev);
++	eth->dummy_dev = NULL;
+ err_deinit_ppe:
+ 	mtk_ppe_deinit(eth);
+ 	mtk_mdio_cleanup(eth);
+@@ -6132,13 +6154,7 @@ static void mtk_remove(struct platform_device *pdev)
+ 	mtk_wed_exit();
+ 	mtk_hw_deinit(eth);
+ 
+-	netif_napi_del(&eth->tx_napi);
+-	netif_napi_del(&eth->rx_napi[0].napi);
+-
+-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+-		for (i = 1; i < MTK_RX_RSS_NUM; i++)
+-			netif_napi_del(&eth->rx_napi[MTK_RSS_RING(i)].napi);
+-	}
++	mtk_napi_del(eth);
+ 	mtk_cleanup(eth);
+ 	free_netdev(eth->dummy_dev);
+ 	mtk_mdio_cleanup(eth);

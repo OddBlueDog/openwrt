@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Frank Wunderlich <frank-w@public-files.de>
+Date: Thu, 22 Oct 2026 16:45:08 +0000
+Subject: [PATCH 1/5] arm64: dts: mediatek: mt7986: add interrupts for RSS and
+ interrupt names (upstream 93e435336ab4)
+
+---
+ arch/arm64/boot/dts/mediatek/mt7986a.dtsi | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt7986a.dtsi b/arch/arm64/boot/dts/mediatek/mt7986a.dtsi
+index 1965333..6b3376c 100644
+--- a/arch/arm64/boot/dts/mediatek/mt7986a.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7986a.dtsi
+@@ -534,7 +534,13 @@
+ 			interrupts = <GIC_SPI 196 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 197 IRQ_TYPE_LEVEL_HIGH>,
+ 				     <GIC_SPI 198 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 199 IRQ_TYPE_LEVEL_HIGH>;
++				     <GIC_SPI 199 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 189 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 190 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 191 IRQ_TYPE_LEVEL_HIGH>,
++				     <GIC_SPI 192 IRQ_TYPE_LEVEL_HIGH>;
++			interrupt-names = "fe0", "fe1", "fe2", "fe3", "pdma0",
++					  "pdma1", "pdma2", "pdma3";
+ 			clocks = <&ethsys CLK_ETH_FE_EN>,
+ 				 <&ethsys CLK_ETH_GP2_EN>,
+ 				 <&ethsys CLK_ETH_GP1_EN>,

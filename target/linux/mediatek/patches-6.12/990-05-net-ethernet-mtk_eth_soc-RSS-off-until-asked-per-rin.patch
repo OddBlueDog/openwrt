@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:52:02 +0000
+Subject: [PATCH 5/5] net: ethernet: mtk_eth_soc: RSS off until asked, per-ring
+ DIM, 6.12 ethtool
+
+MilkFlint changes on top of the MT7986 RSS port:
+- every flow starts on ring 0, as without RSS: ethtool -X spreads them.
+  The key and table are set once at probe and programmed as they stand
+  by mtk_rss_init(), so a DMA reset keeps a table set at runtime.
+- set_rxfh pauses the RSS engine (RSS_CFG_REQ) around the key and table
+  writes, as mtk_rss_init() does, and checks every entry first.
+- kernel 6.12 has no .get_rx_ring_count: answer ETHTOOL_GRXRINGS.
+- the rings share one interrupt delay and one RX DIM, which four NAPIs
+  fed through unlocked shared counters: count per ring, and sample the
+  sum under a trylock (another ring skips that sample).
+- only ring 0s NAPI (and TX, as before) handles the GDM counter status.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 86 ++++++++++++++-------
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h |  7 ++
+ 2 files changed, 67 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index d9e6abb..0c36e04 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2600,11 +2600,24 @@ rx_done:
+ 		mtk_update_rx_cpu_idx(eth, ring);
+ 	}
+ 
+-	eth->rx_packets += done;
+-	eth->rx_bytes += bytes;
+-	dim_update_sample(eth->rx_events, eth->rx_packets, eth->rx_bytes,
+-			  &dim_sample);
+-	net_dim(&eth->rx_dim, dim_sample);
++	WRITE_ONCE(rx_napi->rx_packets, rx_napi->rx_packets + done);
++	WRITE_ONCE(rx_napi->rx_bytes, rx_napi->rx_bytes + bytes);
++	/* The rings share one interrupt delay, so one DIM samples them all:
++	 * whichever ring's NAPI gets here first, the others skip a sample.
++	 */
++	if (spin_trylock(&eth->rx_dim_sample_lock)) {
++		u32 events = 0, packets = 0, rbytes = 0;
++		int i;
++
++		for (i = 0; i < MTK_RX_NAPI_NUM; i++) {
++			events += READ_ONCE(eth->rx_napi[i].rx_events);
++			packets += READ_ONCE(eth->rx_napi[i].rx_packets);
++			rbytes += READ_ONCE(eth->rx_napi[i].rx_bytes);
++		}
++		dim_update_sample(events, packets, rbytes, &dim_sample);
++		net_dim(&eth->rx_dim, dim_sample);
++		spin_unlock(&eth->rx_dim_sample_lock);
++	}
+ 
+ 	if (xdp_flush)
+ 		xdp_do_flush();
+@@ -2812,7 +2825,8 @@ static int mtk_napi_rx(struct napi_struct *napi, int budget)
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+ 	int rx_done_total = 0;
+ 
+-	mtk_handle_status_irq(eth);
++	if (!ring->ring_no)
++		mtk_handle_status_irq(eth);
+ 
+ 	do {
+ 		int rx_done;
+@@ -3442,23 +3456,12 @@ static int mtk_rss_init(struct mtk_eth *eth)
+ {
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+ 	struct mtk_rss_params *rss_params = &eth->rss_params;
+-	static u8 hash_key[MTK_RSS_HASH_KEYSIZE] = {
+-		0xfa, 0x01, 0xac, 0xbe, 0x3b, 0xb7, 0x42, 0x6a,
+-		0x0c, 0xf2, 0x30, 0x80, 0xa3, 0x2d, 0xcb, 0x77,
+-		0xb4, 0x30, 0x7b, 0xae, 0xcb, 0x2b, 0xca, 0xd0,
+-		0xb0, 0x8f, 0xa3, 0x43, 0x3d, 0x25, 0x67, 0x41,
+-		0xc2, 0x0e, 0x5b, 0x25, 0xda, 0x56, 0x5a, 0x6d};
+ 	u32 val;
+ 	int i;
+ 
+ 	if (!eth->soc->rss_num)
+ 		return -EINVAL;
+ 
+-	memcpy(rss_params->hash_key, hash_key, MTK_RSS_HASH_KEYSIZE);
+-
+-	for (i = 0; i < MTK_RSS_MAX_INDIRECTION_TABLE; i++)
+-		rss_params->indirection_table[i] = i % eth->soc->rss_num;
+-
+ 	if (RX_DESC_OFS(eth, 1) == sizeof(struct mtk_rx_dma)) {
+ 		/* Set RSS rings to PSE modes */
+ 		for (i = 1; i <= MTK_HW_LRO_RING_NUM; i++) {
+@@ -3782,7 +3785,7 @@ static irqreturn_t mtk_handle_irq_rx(int irq, void *priv)
+ 	struct mtk_eth *eth = rx_napi->eth;
+ 	struct mtk_rx_ring *ring = rx_napi->rx_ring;
+ 
+-	eth->rx_events++;
++	WRITE_ONCE(rx_napi->rx_events, rx_napi->rx_events + 1);
+ 	if (unlikely(!(mtk_r32(eth, eth->soc->reg_map->pdma.irq_status) &
+ 		       mtk_r32(eth, eth->soc->reg_map->pdma.irq_mask) &
+ 		       MTK_RX_DONE_INT(ring->ring_no))))
+@@ -4584,12 +4587,26 @@ out:
+ 
+ static int mtk_napi_init(struct mtk_eth *eth)
+ {
++	static const u8 hash_key[MTK_RSS_HASH_KEYSIZE] = {
++		0xfa, 0x01, 0xac, 0xbe, 0x3b, 0xb7, 0x42, 0x6a,
++		0x0c, 0xf2, 0x30, 0x80, 0xa3, 0x2d, 0xcb, 0x77,
++		0xb4, 0x30, 0x7b, 0xae, 0xcb, 0x2b, 0xca, 0xd0,
++		0xb0, 0x8f, 0xa3, 0x43, 0x3d, 0x25, 0x67, 0x41,
++		0xc2, 0x0e, 0x5b, 0x25, 0xda, 0x56, 0x5a, 0x6d};
+ 	struct mtk_napi *rx_napi = &eth->rx_napi[0];
+ 	int i;
+ 
+ 	rx_napi->eth = eth;
+ 	rx_napi->rx_ring = &eth->rx_ring[0];
+ 
++	/* RSS starts with every flow on ring 0, as without it: ethtool -X
++	 * spreads them. mtk_rss_init() programs these at every DMA start, so
++	 * a reset keeps what was set.
++	 */
++	memcpy(eth->rss_params.hash_key, hash_key, MTK_RSS_HASH_KEYSIZE);
++	memset(eth->rss_params.indirection_table, 0,
++	       sizeof(eth->rss_params.indirection_table));
++
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
+ 		for (i = 1; i < MTK_RX_RSS_NUM; i++) {
+ 			rx_napi = &eth->rx_napi[MTK_RSS_RING(i)];
+@@ -5211,6 +5228,10 @@ static int mtk_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
+ 	int ret = -EOPNOTSUPP;
+ 
+ 	switch (cmd->cmd) {
++	case ETHTOOL_GRXRINGS:
++		cmd->data = mtk_get_rx_ring_count(dev);
++		ret = cmd->data ? 0 : -EOPNOTSUPP;
++		break;
+ 	case ETHTOOL_GRXCLSRLCNT:
+ 		if (dev->hw_features & NETIF_F_LRO) {
+ 			struct mtk_mac *mac = netdev_priv(dev);
+@@ -5379,6 +5400,7 @@ static int mtk_set_rxfh(struct net_device *dev,
+ 	struct mtk_eth *eth = mac->hw;
+ 	struct mtk_rss_params *rss_params = &eth->rss_params;
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
++	u32 val;
+ 	int i;
+ 
+ 	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS) || !eth->soc->rss_num) {
+@@ -5392,6 +5414,22 @@ static int mtk_set_rxfh(struct net_device *dev,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (rxfh->indir) {
++		for (i = 0; i < MTK_RSS_MAX_INDIRECTION_TABLE; i++) {
++			if (rxfh->indir[i] >= eth->soc->rss_num) {
++				NL_SET_ERR_MSG_MOD(extack,
++						   "RSS indirection table entry out of range");
++				return -EINVAL;
++			}
++		}
++	}
++
++	if (!rxfh->key && !rxfh->indir)
++		return 0;
++
++	val = mtk_r32(eth, reg_map->pdma.rss_glo_cfg);
++	mtk_w32(eth, val | MTK_RSS_CFG_REQ, reg_map->pdma.rss_glo_cfg);
++
+ 	if (rxfh->key) {
+ 		memcpy(rss_params->hash_key, rxfh->key,
+ 		       sizeof(rss_params->hash_key));
+@@ -5401,19 +5439,15 @@ static int mtk_set_rxfh(struct net_device *dev,
+ 	}
+ 
+ 	if (rxfh->indir) {
+-		for (i = 0; i < MTK_RSS_MAX_INDIRECTION_TABLE; i++) {
+-			if (rxfh->indir[i] >= eth->soc->rss_num) {
+-				NL_SET_ERR_MSG_MOD(extack,
+-						   "RSS indirection table entry out of range");
+-				return -EINVAL;
+-			}
++		for (i = 0; i < MTK_RSS_MAX_INDIRECTION_TABLE; i++)
+ 			rss_params->indirection_table[i] = rxfh->indir[i];
+-		}
+ 		for (i = 0; i < MTK_RSS_MAX_INDIRECTION_TABLE / 16; i++)
+ 			mtk_w32(eth, mtk_rss_indr_table(rss_params, i),
+ 				MTK_RSS_INDR_TABLE_DW(i));
+ 	}
+ 
++	mtk_w32(eth, val & ~MTK_RSS_CFG_REQ, reg_map->pdma.rss_glo_cfg);
++
+ 	return 0;
+ }
+ 
+@@ -5447,7 +5481,6 @@ static const struct ethtool_ops mtk_ethtool_ops = {
+ 	.get_ethtool_stats	= mtk_get_ethtool_stats,
+ 	.get_pauseparam		= mtk_get_pauseparam,
+ 	.set_pauseparam		= mtk_set_pauseparam,
+-	.get_rx_ring_count	= mtk_get_rx_ring_count,
+ 	.get_rxnfc		= mtk_get_rxnfc,
+ 	.set_rxnfc		= mtk_set_rxnfc,
+ 	.get_rxfh_key_size	= mtk_get_rxfh_key_size,
+@@ -5841,6 +5874,7 @@ static int mtk_probe(struct platform_device *pdev)
+ 	spin_lock_init(&eth->tx_irq_lock);
+ 	spin_lock_init(&eth->rx_irq_lock);
+ 	spin_lock_init(&eth->dim_lock);
++	spin_lock_init(&eth->rx_dim_sample_lock);
+ 
+ 	eth->rx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+ 	INIT_WORK(&eth->rx_dim.work, mtk_dim_rx);
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.h b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+index a567327..462e540 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1060,6 +1060,12 @@ struct mtk_napi {
+ 	struct napi_struct	napi;
+ 	struct mtk_eth		*eth;
+ 	struct mtk_rx_ring	*rx_ring;
++	/* Net DIM counters of this ring, summed for the one RX DIM: each is
++	 * written only by its ring's IRQ handler or NAPI
++	 */
++	u32			rx_events;
++	u32			rx_packets;
++	u32			rx_bytes;
+ };
+ 
+ enum mkt_eth_capabilities {
+@@ -1475,6 +1481,7 @@ struct mtk_eth {
+ 	const struct mtk_soc_data	*soc;
+ 
+ 	spinlock_t			dim_lock;
++	spinlock_t			rx_dim_sample_lock;
+ 
+ 	u32				rx_events;
+ 	u32				rx_packets;
