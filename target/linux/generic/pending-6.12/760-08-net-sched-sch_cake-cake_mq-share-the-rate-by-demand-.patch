@@ -1,0 +1,1960 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 22 Oct 2026 23:45:00 +0100
+Subject: [PATCH] net/sched: sch_cake: cake_mq: share the rate by demand and
+ weight
+
+cake_mq gave each active sub-cake rate / n, counted every sync_time
+(200 us). A sub-cake that can't use its share can't lend it, and the
+split follows the number of busy tx queues, not the flows in them: with
+80% of the traffic on one queue and 20% on another, both get half and
+the total is 70% (Netdevconf 0x19's own case); one flow on a queue gets
+as much as seven on another; with host isolation, a host's share
+depends on how many queues its flows hash to. Spreading flows over the
+queues (RSS, an ifb flow hash, XPS) then costs throughput and fairness.
+
+Each sub-cake now publishes, at its resync, what it uses (an average of
+the bytes charged to its shaper, all of them and its sparse flows'
+part), its bulk weight, and whether it wants more than its share. A
+busy sub-cake reads the others that are active and takes
+
+	share = sparse + (rate - used) * bid / (bid + saturated bids)
+
+- An unsaturated sub-cake keeps what it uses: that comes off the rate
+  ("used"), and the others share out the rest, so a share one can't
+  use goes to those that can.
+- The saturated ones split what's left by bid, after each one's sparse
+  flows, which go first as in one CAKE. A sub-cake bids its bulk
+  weight: each flow in its bulk rotation weighs 65535 / its host load,
+  set at each refill of its deficit, which is how one CAKE's DRR shares
+  the rate out. A sub-cake with no bulk flow bids as one host's only
+  flow, so it can grow into a share.
+- Saturated means it used 31/32 of its share, or 7/8 with its shaper
+  holding packets back lately: a TCP flow held back by its share
+  averages 85-95% of it, while a stream below its share never waits.
+- Never above the rate, and never below what it would get if every
+  sub-cake wanted more (its sparse flows plus its bid's part of what
+  everyone's sparse flows leave), which holds it up while another's
+  average catches up with that one slowing down.
+
+The shares add up to the rate, give or take how far the averages lag,
+and the flows get what one CAKE would give them, wherever they're
+queued. Only a move of more than 1/256 redoes the tins' rates.
+
+Each sub-cake has its own time scale: four of its packet intervals,
+from 2 ms to 100 ms. Its usage is averaged over it, and with no packet
+queued it stays active that long after its last one. A flow of
+5 Mbit/s sends a packet every 2.4 ms, often with nothing queued in
+between, and counting only a sub-cake that sent within the last resync
+(200 us) left most such flows out of the others' sums. Counting one
+after it stops holds back at most four packets' worth.
+
+A new share also applies to what the shaper still waits for, both
+ways: a packet sent at a small share could otherwise hold a sub-cake
+for seconds once its share recovered, and one sent at a larger share
+would let a share that moves up and down send at the higher one. A
+sub-cake waiting for its shaper wakes at least every 2 ms to work its
+share out again.
+
+With host isolation, a host's flows can be in several sub-cakes. The
+host loads now come from all of them: cake_mq keeps, for each tin, a
+table of bulk flows per host tag (source and destination), and each
+sub-cake mirrors every change of its own counts into it, atomically.
+A host slot taken over with flows still counted moves them to the new
+tag's bucket, as it does locally. In the host-only modes (srchost,
+dsthost, hosts) each queue is a host's, and the table counts each
+tag's bulk queues instead. Hosts whose tags meet in a bucket (1024 per
+tin and side) are counted together while both have bulk flows. Plain
+cake has no table and counts as before.
+
+So that an idle sub-cake doesn't keep its flows in those loads, one
+that has sent nothing for its time scale retires its bulk rotation, as
+its next dequeue would (its watchdog wakes it); so do a reset and a
+reconfigure that drops tins. A flow between bursts stays bulk, as in
+one CAKE.
+
+Replacing a cake_mq with another multi-queue qdisc destroys it before
+its sub-cakes, which stay on the tx queues until the new qdisc's attach
+puts them. cake_mq_destroy() now gives each of them a private copy of
+the config, as plain cake, before freeing the shared config's table.
+
+KUnit, 17 new cases (27 in all): the share alone, by weight (one flow
+against seven with one server, two hosts, the 80/20 imbalance), lent
+by unsaturated sub-cakes, with sparse flows, its floor, any rate and
+usage at random; the usage average; saturation; the time scale; the
+shaper's wait rescaled and the wake; 200 random mixes of idle,
+held-back and saturated sub-cakes resyncing every 200 us, which settle
+on weighted max-min shares within 2% of the rate; a host's flows over
+two sub-cakes giving one host load, the host-only modes, a retag, the
+retire on idle with the watchdog, and 3000 random flow changes over
+four sub-cakes keeping the table equal to their counts. The 760-07
+count cases follow the new activity rule.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/sch_cake.c      | 623 ++++++++++++++++++++++----
+ net/sched/sch_cake_test.c | 910 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 1415 insertions(+), 118 deletions(-)
+
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index c9eb71a..f0afea0 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -135,6 +135,7 @@ struct cake_flow {
+ 	u16		  srchost; /* index into cake_host table */
+ 	u16		  dsthost;
+ 	u8		  set;
++	u16		  mq_weight; /* cake_mq: its part of the tin's mq_weight */
+ }; /* please try to keep this structure <= 64 bytes */
+ 
+ struct cake_host {
+@@ -154,6 +155,13 @@ struct cake_tin_data {
+ 	u32	tags[CAKE_QUEUES]; /* for set association */
+ 	u16	overflow_idx[CAKE_QUEUES];
+ 	struct cake_host hosts[CAKE_QUEUES]; /* for triple isolation */
++	/* cake_mq: every sub-cake's bulk flows per host, in this tin, by host
++	 * tag; NULL for plain cake
++	 */
++	atomic_t *mq_srcload;
++	atomic_t *mq_dstload;
++	/* cake_mq: the bulk rotation's flows, each 65535 / its host load */
++	u32	mq_weight;
+ 	u16	flow_quantum;
+ 
+ 	struct cobalt_params cparams;
+@@ -205,6 +213,10 @@ struct cake_sched_config {
+ 	u64		sync_time;
+ 	/* cake_mq: the tx queues whose sub-cake ever had a packet */
+ 	unsigned long	*used_qs;
++	/* cake_mq: bulk flows per host over all the sub-cakes, for each tin
++	 * a source and a destination table of CAKE_QUEUES
++	 */
++	atomic_t	*mq_hosts;
+ 	u32		buffer_config_limit;
+ 	u32		fwmark_mask;
+ 	u16		fwmark_shft;
+@@ -265,6 +277,22 @@ struct cake_sched_data {
+ 	u64		last_active;
+ 	u64		synced_rate;
+ 	u32		active_queues;
++	/* what the other sub-cakes read at their resync, written at ours:
++	 * bytes/s charged to the shaper, all of it and the sparse flows'
++	 * part, averaged over CAKE_MQ_TAU; the bulk weight; whether we
++	 * used (nearly) all of our share
++	 */
++	u64		mq_usage;
++	u64		mq_sparse;
++	u64		mq_idle;	/* ns without a packet until we count as idle */
++	u32		mq_weight;
++	bool		mq_saturated;
++	/* charged to the shaper since our last resync */
++	u64		mq_bytes;
++	u64		mq_sparse_bytes;
++	u32		mq_packets;
++	/* when the shaper last held packets back */
++	u64		mq_held_at;
+ 
+ 	/* Cold, so last: plain cake's own config (cake_mq's sub-queues share
+ 	 * their parent's) and the 16 KB heap only used when the buffer limit
+@@ -648,55 +676,152 @@ static bool cake_ddst(int flow_mode)
+ 	return (flow_mode & CAKE_FLOW_DUAL_DST) == CAKE_FLOW_DUAL_DST;
+ }
+ 
++/* cake_mq's sub-cakes each count their own hosts' bulk flows, as plain cake
++ * does, but a host's flows can be spread over several of them: its share
++ * has to come from all of them. Each local count is mirrored, change for
++ * change, in the cake_mq's table for its tin, at the bucket of its host
++ * tag; the bucket holds every sub-cake's flows of that host. Hosts whose
++ * tags meet in a bucket are counted together, sharing one host's share
++ * while both have bulk flows. Atomic: the sub-cakes don't share a lock.
++ */
++static atomic_t *cake_mq_host_bucket(atomic_t *load, u32 tag)
++{
++	return &load[tag % CAKE_QUEUES];
++}
++
++/* A host slot taken over by another host's tag with flows still counted:
++ * they move to the new tag's bucket, as they did locally.
++ */
++static void cake_mq_host_retag(atomic_t *load, u32 old_tag, u32 new_tag,
++			       u16 count)
++{
++	if (!load || !count || old_tag == new_tag)
++		return;
++	atomic_sub(count, cake_mq_host_bucket(load, old_tag));
++	atomic_add(count, cake_mq_host_bucket(load, new_tag));
++}
++
++/* In the host-only modes (srchost, dsthost, hosts) each queue is a host's,
++ * or a pair's, and its tag is the host's: a host spread over sub-cakes has
++ * a queue in each. The source table then counts each tag's bulk queues
++ * over all of them, so they share one host's share.
++ */
++static bool cake_mq_host_queues(const struct cake_tin_data *q, int flow_mode)
++{
++	return q->mq_srcload && !(flow_mode & CAKE_FLOW_FLOWS) &&
++	       (flow_mode & CAKE_FLOW_HOSTS);
++}
++
++static atomic_t *cake_mq_queue_bucket(struct cake_tin_data *q,
++				      struct cake_flow *flow)
++{
++	return cake_mq_host_bucket(q->mq_srcload, q->tags[flow - q->flows]);
++}
++
+ static void cake_dec_srchost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
+-	if (likely(cake_dsrc(flow_mode) &&
+-		   q->hosts[flow->srchost].srchost_bulk_flow_count))
+-		q->hosts[flow->srchost].srchost_bulk_flow_count--;
++	struct cake_host *h = &q->hosts[flow->srchost];
++
++	if (likely(cake_dsrc(flow_mode) && h->srchost_bulk_flow_count)) {
++		h->srchost_bulk_flow_count--;
++		if (q->mq_srcload)
++			atomic_dec(cake_mq_host_bucket(q->mq_srcload,
++						       h->srchost_tag));
++	} else if (cake_mq_host_queues(q, flow_mode)) {
++		atomic_dec(cake_mq_queue_bucket(q, flow));
++	}
+ }
+ 
+ static void cake_inc_srchost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
++	struct cake_host *h = &q->hosts[flow->srchost];
++
+ 	if (likely(cake_dsrc(flow_mode) &&
+-		   q->hosts[flow->srchost].srchost_bulk_flow_count < CAKE_QUEUES))
+-		q->hosts[flow->srchost].srchost_bulk_flow_count++;
++		   h->srchost_bulk_flow_count < CAKE_QUEUES)) {
++		h->srchost_bulk_flow_count++;
++		if (q->mq_srcload)
++			atomic_inc(cake_mq_host_bucket(q->mq_srcload,
++						       h->srchost_tag));
++	} else if (cake_mq_host_queues(q, flow_mode)) {
++		atomic_inc(cake_mq_queue_bucket(q, flow));
++	}
+ }
+ 
+ static void cake_dec_dsthost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
+-	if (likely(cake_ddst(flow_mode) &&
+-		   q->hosts[flow->dsthost].dsthost_bulk_flow_count))
+-		q->hosts[flow->dsthost].dsthost_bulk_flow_count--;
++	struct cake_host *h = &q->hosts[flow->dsthost];
++
++	if (likely(cake_ddst(flow_mode) && h->dsthost_bulk_flow_count)) {
++		h->dsthost_bulk_flow_count--;
++		if (q->mq_dstload)
++			atomic_dec(cake_mq_host_bucket(q->mq_dstload,
++						       h->dsthost_tag));
++	}
+ }
+ 
+ static void cake_inc_dsthost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
++	struct cake_host *h = &q->hosts[flow->dsthost];
++
+ 	if (likely(cake_ddst(flow_mode) &&
+-		   q->hosts[flow->dsthost].dsthost_bulk_flow_count < CAKE_QUEUES))
+-		q->hosts[flow->dsthost].dsthost_bulk_flow_count++;
++		   h->dsthost_bulk_flow_count < CAKE_QUEUES)) {
++		h->dsthost_bulk_flow_count++;
++		if (q->mq_dstload)
++			atomic_inc(cake_mq_host_bucket(q->mq_dstload,
++						       h->dsthost_tag));
++	}
+ }
+ 
+-/* A flow's part of @quantum: shared out between its host's bulk flows */
+-static u16 cake_host_share(struct cake_tin_data *q, struct cake_flow *flow,
+-			   int flow_mode, u32 quantum)
++/* A host's bulk flows: in this CAKE, or with cake_mq in all its sub-cakes */
++static u16 cake_host_count(atomic_t *load, u32 tag, u16 local)
++{
++	if (!load)
++		return local;
++	return clamp(atomic_read(cake_mq_host_bucket(load, tag)), 1, CAKE_QUEUES);
++}
++
++/* The number of bulk flows a flow's quantum is shared out between: its
++ * source host's, its destination host's, or the larger, by flow mode
++ */
++static u16 cake_host_load(struct cake_tin_data *q, struct cake_flow *flow,
++			  int flow_mode)
+ {
+ 	u16 host_load = 1;
+ 
+-	if (cake_dsrc(flow_mode))
++	if (cake_mq_host_queues(q, flow_mode))
++		return cake_host_count(q->mq_srcload, q->tags[flow - q->flows], 1);
++
++	if (cake_dsrc(flow_mode)) {
++		struct cake_host *h = &q->hosts[flow->srchost];
++
+ 		host_load = max(host_load,
+-				q->hosts[flow->srchost].srchost_bulk_flow_count);
++				cake_host_count(q->mq_srcload, h->srchost_tag,
++						h->srchost_bulk_flow_count));
++	}
++
++	if (cake_ddst(flow_mode)) {
++		struct cake_host *h = &q->hosts[flow->dsthost];
+ 
+-	if (cake_ddst(flow_mode))
+ 		host_load = max(host_load,
+-				q->hosts[flow->dsthost].dsthost_bulk_flow_count);
++				cake_host_count(q->mq_dstload, h->dsthost_tag,
++						h->dsthost_bulk_flow_count));
++	}
++	return host_load;
++}
++
++/* A flow's part of @quantum: shared out between its host's bulk flows */
++static u16 cake_host_share(struct cake_tin_data *q, struct cake_flow *flow,
++			   int flow_mode, u32 quantum)
++{
++	u16 host_load = cake_host_load(q, flow, flow_mode);
+ 
+ 	/* quantum_div[1] stands for 65536, which doesn't fit in a u16: a host
+ 	 * with one bulk flow gives it the whole quantum, no dither needed.
+@@ -738,6 +863,21 @@ static u16 cake_get_bulk_quantum(struct cake_sched_data *qd,
+ 	return cake_host_share(b, flow, qd->config->flow_mode, quantum);
+ }
+ 
++/* cake_mq: what a flow in the bulk rotation adds to its sub-cake's bid for
++ * the rate. It's the flow's part of a DRR pass, 65535 / its host load, so
++ * the sub-cakes' weights compare as plain cake shares the rate out: per
++ * flow, and with host isolation per host, whichever sub-cakes the flows
++ * are in. Set at each refill of the flow's deficit, cleared when it leaves
++ * the rotation.
++ */
++static void cake_mq_set_weight(struct cake_tin_data *b, struct cake_flow *flow,
++			       u16 weight)
++{
++	b->mq_weight += weight;
++	b->mq_weight -= flow->mq_weight;
++	flow->mq_weight = weight;
++}
++
+ static void cake_keys_host_hashes(const struct flow_keys *keys,
+ 				  u32 *srchost_hash, u32 *dsthost_hash)
+ {
+@@ -918,6 +1058,11 @@ skip_hash:
+ 		if (q->flows[outer_hash + k].set == CAKE_SET_BULK) {
+ 			cake_dec_srchost_bulk_flow_count(q, &q->flows[outer_hash + k], flow_mode);
+ 			cake_dec_dsthost_bulk_flow_count(q, &q->flows[outer_hash + k], flow_mode);
++			/* a host-only queue's count goes with its tag */
++			if (cake_mq_host_queues(q, flow_mode)) {
++				q->tags[outer_hash + k] = flow_hash;
++				cake_inc_srchost_bulk_flow_count(q, &q->flows[outer_hash + k], flow_mode);
++			}
+ 		}
+ found:
+ 		/* reserve queue for future packets in same flow */
+@@ -943,6 +1088,10 @@ found:
+ 				if (!q->hosts[outer_hash + k].srchost_bulk_flow_count)
+ 					break;
+ 			}
++			cake_mq_host_retag(q->mq_srcload,
++					   q->hosts[outer_hash + k].srchost_tag,
++					   srchost_hash,
++					   q->hosts[outer_hash + k].srchost_bulk_flow_count);
+ 			q->hosts[outer_hash + k].srchost_tag = srchost_hash;
+ found_src:
+ 			srchost_idx = outer_hash + k;
+@@ -967,6 +1116,10 @@ found_src:
+ 				if (!q->hosts[outer_hash + k].dsthost_bulk_flow_count)
+ 					break;
+ 			}
++			cake_mq_host_retag(q->mq_dstload,
++					   q->hosts[outer_hash + k].dsthost_tag,
++					   dsthost_hash,
++					   q->hosts[outer_hash + k].dsthost_bulk_flow_count);
+ 			q->hosts[outer_hash + k].dsthost_tag = dsthost_hash;
+ found_dst:
+ 			dsthost_idx = outer_hash + k;
+@@ -1626,6 +1779,10 @@ static int cake_advance_shaper(struct cake_sched_data *q,
+ 			q->failsafe_next_packet = \
+ 				ktime_add_ns(q->failsafe_next_packet,
+ 					     failsafe_dur);
++		if (q->config->is_shared) {
++			q->mq_bytes += len;
++			q->mq_packets++;
++		}
+ 	}
+ 	return len;
+ }
+@@ -1841,19 +1998,147 @@ static void cake_mq_mark_used(struct Qdisc *sch, struct cake_sched_data *q)
+ 		set_bit(ntx, used);
+ }
+ 
++/* cake_mq's share of the rate. At each resync, a busy sub-cake reads the
++ * other active ones and takes
++ *
++ *	share = sparse + (rate - used) * bid / (bid + the saturated's bids)
++ *
++ * - An unsaturated sub-cake, one that used less than its share lately
++ *   (averaged over cake_mq_idle_after()), keeps what it uses: that's taken off the rate
++ *   ("used"), and the others share out the rest. So a share one can't use
++ *   goes to those that can, within a few milliseconds.
++ * - The saturated ones, and this one, split what's left by their bulk
++ *   weights (cake_mq_set_weight()), after each one's sparse flows, which
++ *   are served first as in one CAKE. The flows then get what one CAKE
++ *   would give them.
++ * - A sub-cake with no bulk flow bids as one host's only flow, so it can
++ *   grow into a share; what it doesn't use stays with the others.
++ *
++ * Each sub-cake takes its own share; together they add up to the rate,
++ * give or take how far the averages lag. A share is never above the rate,
++ * and never below what it would be if every sub-cake wanted more: its
++ * sparse flows and its bid's part of what everyone's sparse flows leave.
++ * That's the least one CAKE would give the same flows, and holds a share
++ * up while another sub-cake's average catches up with it slowing down.
++ * Everything is read lockless, as the queue lengths are.
++ */
++#define CAKE_MQ_UNIT	65535			/* a host's only bulk flow */
++#define CAKE_MQ_TAU	(2 * NSEC_PER_MSEC)	/* the shortest time scale */
++
++struct cake_mq_peers {
++	u64	unsat_usage;	/* bytes/s the unsaturated use */
++	u64	sat_sparse;	/* bytes/s of the saturated's sparse flows */
++	u64	sparse;		/* everyone's, for the floor */
++	u64	sat_bids;
++	u64	bids;		/* everyone's, for the floor */
++	u32	count;		/* active sub-cakes, ours included */
++};
++
++static u64 cake_mq_bid(u32 weight)
++{
++	return weight ?: CAKE_MQ_UNIT;
++}
++
++static u64 cake_mq_share(u64 rate, u32 weight, u64 sparse,
++			 const struct cake_mq_peers *p)
++{
++	u64 bid = cake_mq_bid(weight);
++	u64 used = p->unsat_usage + p->sat_sparse + sparse;
++	u64 all_sparse = p->sparse + sparse;
++	u64 share = sparse, floor = sparse;
++
++	if (p->count <= 1 || !rate)
++		return rate;
++	if (used < rate)
++		share += mul_u64_u64_div_u64(rate - used, bid, bid + p->sat_bids);
++	if (all_sparse < rate)
++		floor += mul_u64_u64_div_u64(rate - all_sparse, bid, bid + p->bids);
++	return clamp(max(share, floor), 1ULL, rate);
++}
++
++/* @bytes over the last @dt ns, as bytes/s, folded into @avg: an average
++ * over @tau ns, which a gap that long starts again.
++ */
++static u64 cake_mq_ewma(u64 avg, u64 bytes, u64 dt, u64 tau)
++{
++	s64 delta;
++
++	if (dt >= tau)
++		return mul_u64_u64_div_u64(bytes, NSEC_PER_SEC, dt);
++	/* avg += (bytes / dt - avg) * dt / tau */
++	delta = (s64)(bytes * NSEC_PER_SEC) - (s64)(avg * dt);
++	return avg + div64_s64(delta, tau);
++}
++
++/* A sub-cake's time scale: four of its packet intervals, from 2 ms to
++ * 100 ms. A flow of 2 Mbit/s sends a full-sized packet every 6 ms: its use
++ * of the rate is averaged over that long (a rate needs a few packets to
++ * be seen), and it counts as idle only after that long without one.
++ * Counting it after it stops holds back at most four packets' worth.
++ */
++#define CAKE_MQ_TAU_MAX	(100 * NSEC_PER_MSEC)
++
++static u64 cake_mq_idle_after(u64 idle, u64 bytes, u32 packets, u64 usage)
++{
++	if (!packets || !usage)
++		return idle ?: CAKE_MQ_TAU;
++	idle = mul_u64_u64_div_u64(4 * div_u64(bytes, packets), NSEC_PER_SEC, usage);
++	return clamp_t(u64, idle, CAKE_MQ_TAU, CAKE_MQ_TAU_MAX);
++}
++
++/* At a resync: what @q used since the last one and its bulk weight, for
++ * the other sub-cakes to read, and whether it wants more than its share:
++ * it used 31/32 of it, or 7/8 with its shaper holding packets back lately.
++ * A TCP flow held back by its share averages 85-95% of it; a stream below
++ * its share never waits.
++ */
++static void cake_mq_publish(struct cake_sched_data *q, u64 now)
++{
++	u64 dt = now - q->last_checked_active;
++	u64 tau = q->mq_idle ?: CAKE_MQ_TAU;
++	u64 usage, sparse, idle;
++	u32 weight = 0;
++	u16 tin;
++
++	for (tin = 0; tin < q->tin_cnt; tin++)
++		weight += q->tins[tin].mq_weight;
++	usage = cake_mq_ewma(q->mq_usage, q->mq_bytes, dt, tau);
++	sparse = cake_mq_ewma(q->mq_sparse, q->mq_sparse_bytes, dt, tau);
++	idle = cake_mq_idle_after(q->mq_idle, q->mq_bytes, q->mq_packets, usage);
++	q->mq_bytes = 0;
++	q->mq_sparse_bytes = 0;
++	q->mq_packets = 0;
++
++	WRITE_ONCE(q->mq_usage, usage);
++	WRITE_ONCE(q->mq_sparse, min(sparse, usage));
++	WRITE_ONCE(q->mq_idle, idle);
++	WRITE_ONCE(q->mq_weight, weight);
++	WRITE_ONCE(q->mq_saturated,
++		   usage >= q->synced_rate - (q->synced_rate >> 5) ||
++		   (now - q->mq_held_at < tau &&
++		    usage >= q->synced_rate - (q->synced_rate >> 3)));
++}
++
+ /* The sub-cakes sharing the rate with @q, @q included: those on the
+- * device's real tx queues with packets queued, or sent since @q last counted.
++ * device's real tx queues with packets queued, or not yet idle
++ * (cake_mq_idle_after()). A stream alone on its tx queue often has none
++ * queued between packets; it's still using its part of the rate. Their
++ * count, and what they use and bid, go in @p.
+  */
+-static u32 cake_mq_active_queues(struct Qdisc *sch, struct cake_sched_data *q)
++static void cake_mq_read_peers(struct Qdisc *sch, struct cake_sched_data *q,
++			       u64 now, struct cake_mq_peers *p)
+ {
+ 	struct net_device *dev = qdisc_dev(sch);
+ 	unsigned int ntx, real_txqs = dev->real_num_tx_queues;
+ 	struct cake_sched_data *other_priv;
+ 	u64 other_qlen, other_last_active;
+ 	struct Qdisc *other_sch;
+-	u32 num_active_qs = 1;
+ 
++	memset(p, 0, sizeof(*p));
++	p->count = 1;
+ 	for_each_set_bit(ntx, q->config->used_qs, real_txqs) {
++		u64 bid, sparse;
++
+ 		other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+ 		other_priv = qdisc_priv(other_sch);
+ 
+@@ -1863,10 +2148,63 @@ static u32 cake_mq_active_queues(struct Qdisc *sch, struct cake_sched_data *q)
+ 		other_qlen = READ_ONCE(other_sch->q.qlen);
+ 		other_last_active = READ_ONCE(other_priv->last_active);
+ 
+-		if (other_qlen || other_last_active > q->last_checked_active)
+-			num_active_qs++;
++		/* signed: another CPU's last send can be later than our now */
++		if (!other_qlen && (s64)(now - other_last_active) >=
++				   (s64)(READ_ONCE(other_priv->mq_idle) ?: CAKE_MQ_TAU))
++			continue;
++
++		p->count++;
++		bid = cake_mq_bid(READ_ONCE(other_priv->mq_weight));
++		sparse = READ_ONCE(other_priv->mq_sparse);
++		p->bids += bid;
++		p->sparse += sparse;
++		if (READ_ONCE(other_priv->mq_saturated)) {
++			p->sat_bids += bid;
++			p->sat_sparse += sparse;
++		} else {
++			p->unsat_usage += READ_ONCE(other_priv->mq_usage);
++		}
+ 	}
+-	return num_active_qs;
++}
++
++/* Whether the share moved enough to redo the tins' rates (a division and a
++ * shift loop each): the averages wobble from one resync to the next. The
++ * whole rate is always taken back exactly.
++ */
++static bool cake_mq_share_moved(u64 share, u64 synced, u64 rate)
++{
++	u64 band = synced >> 8;
++
++	if (share == synced)
++		return false;
++	return share == rate || share > synced + band || share + band < synced;
++}
++
++/* A new share also applies to what the shaper still waits for, both ways:
++ * a packet sent while the share was small may have pushed the next send
++ * far ahead, and one sent at a larger share must not keep its short wait
++ * (that would let a share that moves up and down send at the higher one).
++ * A second at most: the sub-cake wakes within CAKE_MQ_TAU anyway
++ * (cake_mq_wake_by()) and works it out again.
++ */
++static ktime_t cake_mq_rescale_wait(ktime_t next, ktime_t now, u64 old, u64 share)
++{
++	s64 left = ktime_to_ns(ktime_sub(next, now));
++
++	if (left <= 0 || share == old || !share)
++		return next;
++	return ktime_add_ns(now, min_t(u64, mul_u64_u64_div_u64(left, old, share),
++				       NSEC_PER_SEC));
++}
++
++/* While a sub-cake waits for its shaper it also wakes every CAKE_MQ_TAU,
++ * so its share is worked out again: one that grows is then used.
++ */
++static u64 cake_mq_wake_by(struct cake_sched_data *q, u64 next, ktime_t now)
++{
++	if (!q->config->is_shared)
++		return next;
++	return min_t(u64, next, ktime_to_ns(now) + CAKE_MQ_TAU);
+ }
+ 
+ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+@@ -2122,6 +2460,99 @@ static void cake_clear_tin(struct Qdisc *sch, u16 tin)
+ 			kfree_skb(skb);
+ }
+ 
++/* A flow found with no packets leaves its rotation: to the decaying flows
++ * while its AQM state is still active, or out of the flowchain.
++ */
++static void cake_flow_emptied(struct cake_sched_data *q,
++			      struct cake_tin_data *b,
++			      struct cake_flow *flow, ktime_t now)
++{
++	if (flow->mq_weight)
++		cake_mq_set_weight(b, flow, 0);
++
++	if (cobalt_queue_empty(&flow->cvars, &b->cparams, now))
++		b->unresponsive_flow_count--;
++
++	if (flow->cvars.p_drop || flow->cvars.count ||
++	    ktime_before(now, flow->cvars.drop_next)) {
++		/* keep in the flowchain until the state has
++		 * decayed to rest
++		 */
++		list_move_tail(&flow->flowchain,
++			       &b->decaying_flows);
++		if (flow->set == CAKE_SET_BULK) {
++			b->bulk_flow_count--;
++
++			cake_dec_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
++			cake_dec_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
++
++			b->decaying_flow_count++;
++		} else if (flow->set == CAKE_SET_SPARSE ||
++			   flow->set == CAKE_SET_SPARSE_WAIT) {
++			b->sparse_flow_count--;
++			b->decaying_flow_count++;
++		}
++		flow->set = CAKE_SET_DECAYING;
++	} else {
++		/* remove empty queue from the flowchain */
++		list_del_init(&flow->flowchain);
++		if (flow->set == CAKE_SET_SPARSE ||
++		    flow->set == CAKE_SET_SPARSE_WAIT)
++			b->sparse_flow_count--;
++		else if (flow->set == CAKE_SET_BULK) {
++			b->bulk_flow_count--;
++
++			cake_dec_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
++			cake_dec_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
++		} else
++			b->decaying_flow_count--;
++
++		flow->set = CAKE_SET_NONE;
++	}
++}
++
++/* cake_mq: retire a tin's bulk rotation, every flow in it empty, as the
++ * next dequeue would find each one
++ */
++static void cake_mq_retire_tin(struct cake_sched_data *q,
++			       struct cake_tin_data *b, ktime_t now)
++{
++	struct cake_flow *flow;
++
++	while (!list_empty(&b->old_flows)) {
++		flow = list_first_entry(&b->old_flows, struct cake_flow,
++					flowchain);
++		if (flow->head)
++			break;
++		cake_flow_emptied(q, b, flow, now);
++	}
++}
++
++/* cake_mq: a sub-cake out of packets. A flow between bursts stays in the
++ * bulk rotation, as in one CAKE: a lone TCP flow empties its sub-cake
++ * often. Once it has sent nothing for a while (cake_mq_idle_after()), the
++ * sub-cake is idle and might not dequeue again for a long time: it retires
++ * its rotation then (the watchdog wakes it), so its flows leave the host
++ * loads the busy sub-cakes share out by.
++ */
++static void cake_mq_drained(struct cake_sched_data *q, ktime_t now)
++{
++	u64 idle_at = q->last_active + (q->mq_idle ?: CAKE_MQ_TAU);
++	bool bulk = false;
++	u16 tin;
++
++	for (tin = 0; tin < q->tin_cnt; tin++)
++		bulk |= !list_empty(&q->tins[tin].old_flows);
++	if (!bulk)
++		return;
++	if (ktime_to_ns(now) < idle_at) {
++		qdisc_watchdog_schedule_ns(&q->watchdog, idle_at);
++		return;
++	}
++	for (tin = 0; tin < q->tin_cnt; tin++)
++		cake_mq_retire_tin(q, &q->tins[tin], now);
++}
++
+ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ {
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+@@ -2136,26 +2567,35 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ 
+ 	if (q->config->is_shared && q->rate_ns &&
+ 	    now - q->last_checked_active >= q->config->sync_time) {
+-		u32 num_active_qs = cake_mq_active_queues(sch, q);
+-		u64 new_rate = q->config->rate_bps;
+-
+-		if (num_active_qs > 1)
+-			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
+-
+-		/* Every 200 us, but the share seldom changes: only redo each
+-		 * tin's rate (a division and a shift loop per tin) when it does.
+-		 */
+-		if (new_rate != q->synced_rate) {
++		struct cake_mq_peers peers;
++		u64 new_rate;
++
++		cake_mq_publish(q, now);
++		cake_mq_read_peers(sch, q, now, &peers);
++		new_rate = cake_mq_share(q->config->rate_bps, q->mq_weight,
++					 q->mq_sparse, &peers);
++
++		if (cake_mq_share_moved(new_rate, q->synced_rate,
++					q->config->rate_bps)) {
++			q->time_next_packet =
++				cake_mq_rescale_wait(q->time_next_packet, now,
++						     q->synced_rate, new_rate);
++			q->failsafe_next_packet =
++				cake_mq_rescale_wait(q->failsafe_next_packet, now,
++						     q->synced_rate, new_rate);
+ 			cake_configure_rates(sch, new_rate, true);
+ 			q->synced_rate = new_rate;
+ 		}
+ 		q->last_checked_active = now;
+-		q->active_queues = num_active_qs;
++		q->active_queues = peers.count;
+ 	}
+ 
+ begin:
+-	if (!sch->q.qlen)
++	if (!sch->q.qlen) {
++		if (q->config->is_shared)
++			cake_mq_drained(q, now);
+ 		return NULL;
++	}
+ 
+ 	/* global hard shaper */
+ 	if (ktime_after(q->time_next_packet, now) &&
+@@ -2164,7 +2604,9 @@ begin:
+ 			       ktime_to_ns(q->failsafe_next_packet));
+ 
+ 		sch->qstats.overlimits++;
+-		qdisc_watchdog_schedule_ns(&q->watchdog, next);
++		if (q->config->is_shared)
++			q->mq_held_at = ktime_to_ns(now);
++		qdisc_watchdog_schedule_ns(&q->watchdog, cake_mq_wake_by(q, next, now));
+ 		return NULL;
+ 	}
+ 
+@@ -2274,6 +2716,10 @@ retry:
+ 		}
+ 
+ 		flow->deficit += cake_get_bulk_quantum(q, b, flow);
++		if (q->config->is_shared)
++			cake_mq_set_weight(b, flow,
++					   quantum_div[cake_host_load(b, flow,
++								      q->config->flow_mode)]);
+ 		list_move_tail(&flow->flowchain, &b->old_flows);
+ 
+ 		goto retry;
+@@ -2284,45 +2730,7 @@ retry:
+ 		skb = cake_dequeue_one(sch);
+ 		if (!skb) {
+ 			/* this queue was actually empty */
+-			if (cobalt_queue_empty(&flow->cvars, &b->cparams, now))
+-				b->unresponsive_flow_count--;
+-
+-			if (flow->cvars.p_drop || flow->cvars.count ||
+-			    ktime_before(now, flow->cvars.drop_next)) {
+-				/* keep in the flowchain until the state has
+-				 * decayed to rest
+-				 */
+-				list_move_tail(&flow->flowchain,
+-					       &b->decaying_flows);
+-				if (flow->set == CAKE_SET_BULK) {
+-					b->bulk_flow_count--;
+-
+-					cake_dec_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
+-					cake_dec_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
+-
+-					b->decaying_flow_count++;
+-				} else if (flow->set == CAKE_SET_SPARSE ||
+-					   flow->set == CAKE_SET_SPARSE_WAIT) {
+-					b->sparse_flow_count--;
+-					b->decaying_flow_count++;
+-				}
+-				flow->set = CAKE_SET_DECAYING;
+-			} else {
+-				/* remove empty queue from the flowchain */
+-				list_del_init(&flow->flowchain);
+-				if (flow->set == CAKE_SET_SPARSE ||
+-				    flow->set == CAKE_SET_SPARSE_WAIT)
+-					b->sparse_flow_count--;
+-				else if (flow->set == CAKE_SET_BULK) {
+-					b->bulk_flow_count--;
+-
+-					cake_dec_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
+-					cake_dec_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
+-				} else
+-					b->decaying_flow_count--;
+-
+-				flow->set = CAKE_SET_NONE;
+-			}
++			cake_flow_emptied(q, b, flow, now);
+ 			goto begin;
+ 		}
+ 
+@@ -2366,12 +2774,16 @@ retry:
+ 	len = cake_advance_shaper(q, b, skb, now, false);
+ 	flow->deficit -= len;
+ 	b->tin_deficit -= len;
++	if (q->config->is_shared && q->rate_ns && flow->set == CAKE_SET_SPARSE)
++		q->mq_sparse_bytes += len;
+ 
+ 	if (ktime_after(q->time_next_packet, now) && sch->q.qlen) {
+ 		u64 next = min(ktime_to_ns(q->time_next_packet),
+ 			       ktime_to_ns(q->failsafe_next_packet));
+ 
+-		qdisc_watchdog_schedule_ns(&q->watchdog, next);
++		if (q->config->is_shared)
++			q->mq_held_at = ktime_to_ns(now);
++		qdisc_watchdog_schedule_ns(&q->watchdog, cake_mq_wake_by(q, next, now));
+ 	} else if (!sch->q.qlen) {
+ 		int i;
+ 
+@@ -2402,8 +2814,11 @@ static void cake_reset(struct Qdisc *sch)
+ 	if (!q->tins)
+ 		return;
+ 
+-	for (c = 0; c < CAKE_MAX_TINS; c++)
++	for (c = 0; c < CAKE_MAX_TINS; c++) {
+ 		cake_clear_tin(sch, c);
++		if (q->config->is_shared)
++			cake_mq_retire_tin(q, &q->tins[c], ktime_get());
++	}
+ }
+ 
+ static const struct nla_policy cake_policy[TCA_CAKE_MAX + 1] = {
+@@ -2711,6 +3126,8 @@ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+ 	if (!rate_adjust) {
+ 		for (c = qd->tin_cnt; c < CAKE_MAX_TINS; c++) {
+ 			cake_clear_tin(sch, c);
++			if (q->is_shared)
++				cake_mq_retire_tin(qd, &qd->tins[c], ktime_get());
+ 			qd->tins[c].cparams.mtu_time = qd->tins[ft].cparams.mtu_time;
+ 		}
+ 	}
+@@ -2995,11 +3412,23 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 	return 0;
+ }
+ 
++/* cake_mq's host table for each tin's sources and destinations, or NULL */
++static void cake_mq_set_host_tables(struct cake_sched_data *qd, atomic_t *hosts)
++{
++	int i;
++
++	for (i = 0; i < CAKE_MAX_TINS; i++) {
++		qd->tins[i].mq_srcload = hosts ? hosts + (2 * i) * CAKE_QUEUES : NULL;
++		qd->tins[i].mq_dstload = hosts ? hosts + (2 * i + 1) * CAKE_QUEUES : NULL;
++	}
++}
++
+ static void cake_config_replace(struct Qdisc *sch, struct cake_sched_config *cfg)
+ {
+ 	struct cake_sched_data *qd = qdisc_priv(sch);
+ 
+ 	qd->config = cfg;
++	cake_mq_set_host_tables(qd, cfg->mq_hosts);
+ 	cake_reconfigure(sch);
+ }
+ 
+@@ -3354,12 +3783,48 @@ struct cake_mq_sched {
+ 	struct cake_sched_config cake_config;
+ };
+ 
++/* Replacing a cake_mq with another multi-queue qdisc destroys it before its
++ * sub-cakes: they stay on the device's tx queues until the new one's attach
++ * puts them, and resetting them then would reach the shared config and host
++ * table freed with it. Each gets a copy of the config to go with, as a
++ * plain cake with no host table, no longer counted with the others.
++ */
++static void cake_mq_orphan_children(struct Qdisc *sch)
++{
++	struct cake_mq_sched *priv = qdisc_priv(sch);
++	struct net_device *dev = qdisc_dev(sch);
++	unsigned int ntx;
++
++	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
++		struct Qdisc *chld = rtnl_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
++		struct cake_sched_data *qd;
++
++		if (!chld || chld->ops != &cake_qdisc_ops)
++			continue;
++		qd = qdisc_priv(chld);
++		if (qd->config != &priv->cake_config)
++			continue;
++
++		sch_tree_lock(chld);
++		qd->initial_config = priv->cake_config;
++		qd->initial_config.is_shared = 0;
++		qd->initial_config.used_qs = NULL;
++		qd->initial_config.mq_hosts = NULL;
++		qd->config = &qd->initial_config;
++		if (qd->tins)
++			cake_mq_set_host_tables(qd, NULL);
++		sch_tree_unlock(chld);
++	}
++}
++
+ static void cake_mq_destroy(struct Qdisc *sch)
+ {
+ 	struct cake_mq_sched *priv = qdisc_priv(sch);
+ 
+ 	mq_destroy_common(sch);
++	cake_mq_orphan_children(sch);
+ 	bitmap_free(priv->cake_config.used_qs);
++	kvfree(priv->cake_config.mq_hosts);
+ }
+ 
+ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+@@ -3381,6 +3846,10 @@ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+ 	priv->cake_config.used_qs = bitmap_zalloc(dev->num_tx_queues, GFP_KERNEL);
+ 	if (!priv->cake_config.used_qs)
+ 		return -ENOMEM;
++	priv->cake_config.mq_hosts = kvcalloc(2 * CAKE_MAX_TINS * CAKE_QUEUES,
++					      sizeof(atomic_t), GFP_KERNEL);
++	if (!priv->cake_config.mq_hosts)
++		return -ENOMEM;
+ 
+ 	ret = mq_init_common(sch, opt, extack, &cake_qdisc_ops);
+ 	if (ret)
+diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
+index 8dd767d..9ce4537 100644
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1,8 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+-/* KUnit tests for sch_cake's flow hashing, DRR quanta and cake_mq's count
+- * of active sub-cakes. Built into sch_cake.ko (#included at the end of
+- * sch_cake.c) when CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs
+- * when it loads.
++/* KUnit tests for sch_cake's flow hashing, DRR quanta, and cake_mq's count
++ * of active sub-cakes, share of the rate and host loads. Built into
++ * sch_cake.ko (#included at the end of sch_cake.c) when
++ * CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs when it loads.
+  */
+ #include <kunit/test.h>
+ #include <linux/etherdevice.h>
+@@ -400,27 +400,38 @@ static void cake_test_mq_enqueue(struct cake_test_mq *mq, int i)
+ 	mq->sch[i]->q.qlen++;
+ }
+ 
+-static u32 cake_test_mq_count(struct cake_test_mq *mq, int self)
+-{
+-	u32 n;
++/* some time after the start, for the counts */
++#define CAKE_TEST_NOW	(100 * NSEC_PER_MSEC)
+ 
++static void cake_test_mq_peers(struct cake_test_mq *mq, int self, u64 now,
++			       struct cake_mq_peers *p)
++{
+ 	rcu_read_lock();
+-	n = cake_mq_active_queues(mq->sch[self], cake_test_mq_q(mq, self));
++	cake_mq_read_peers(mq->sch[self], cake_test_mq_q(mq, self), now, p);
+ 	rcu_read_unlock();
+-	return n;
+ }
+ 
+-/* The count before used_qs: every real tx queue read */
+-static u32 cake_test_mq_count_all(struct cake_test_mq *mq, int self)
++static u32 cake_test_mq_count(struct cake_test_mq *mq, int self, u64 now)
++{
++	struct cake_mq_peers p;
++
++	cake_test_mq_peers(mq, self, now, &p);
++	return p.count;
++}
++
++/* The count without used_qs: every real tx queue read */
++static u32 cake_test_mq_count_all(struct cake_test_mq *mq, int self, u64 now)
+ {
+-	struct cake_sched_data *q = cake_test_mq_q(mq, self);
+ 	u32 n = 1;
+ 	int i;
+ 
+-	for (i = 0; i < mq->dev->real_num_tx_queues; i++)
++	for (i = 0; i < mq->dev->real_num_tx_queues; i++) {
++		struct cake_sched_data *q = cake_test_mq_q(mq, i);
++
+ 		if (i != self && (mq->sch[i]->q.qlen ||
+-				  cake_test_mq_q(mq, i)->last_active > q->last_checked_active))
++				  (s64)(now - q->last_active) < (s64)(q->mq_idle ?: CAKE_MQ_TAU)))
+ 			n++;
++	}
+ 	return n;
+ }
+ 
+@@ -445,36 +456,44 @@ static void cake_test_mq_marks_its_queue(struct kunit *test)
+ static void cake_test_mq_count_back_from_idle(struct kunit *test)
+ {
+ 	struct cake_test_mq *mq = cake_test_mq_alloc(test);
+-	struct cake_sched_data *self = cake_test_mq_q(mq, 1);
+ 	struct cake_sched_data *other = cake_test_mq_q(mq, 4);
++	const u64 now = CAKE_TEST_NOW, us = NSEC_PER_USEC;
+ 
+ 	/* alone, its own queue counted once */
+ 	cake_test_mq_enqueue(mq, 1);
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 1);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now), 1);
+ 
+ 	/* 4 has a packet queued */
+ 	cake_test_mq_enqueue(mq, 4);
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now), 2);
+ 
+-	/* 4 sent it since 1 last counted */
+-	self->last_checked_active = 1000;
++	/* 4 sent it, and has none queued between its packets */
+ 	mq->sch[4]->q.qlen = 0;
+-	other->last_active = 2000;
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
++	other->last_active = now;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + 200 * us), 2);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + CAKE_MQ_TAU - 1), 2);
+ 
+-	/* 1 counts again later: 4 is idle, still marked but not counted */
+-	self->last_checked_active = 3000;
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 1);
++	/* nothing for CAKE_MQ_TAU: 4 is idle, still marked but not counted */
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + CAKE_MQ_TAU), 1);
+ 	KUNIT_EXPECT_TRUE(test, test_bit(4, mq->cfg->used_qs));
+ 
+ 	/* back from idle: counted again, queued or just sent */
+ 	cake_test_mq_enqueue(mq, 4);
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + 5000 * us), 2);
+ 	mq->sch[4]->q.qlen = 0;
+-	other->last_active = 4000;
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 2);
+-	self->last_checked_active = 5000;
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1), 1);
++	other->last_active = now + 5000 * us;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + 6000 * us), 2);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + 5000 * us + CAKE_MQ_TAU), 1);
++
++	/* a send stamped on another CPU just after this one read the clock */
++	other->last_active = now + 9000 * us;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + 9000 * us - 1), 2);
++
++	/* a slow sender, idle only after four of its packet intervals */
++	other->mq_idle = 10 * NSEC_PER_MSEC;
++	other->last_active = now + 20000 * us;
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + 29000 * us), 2);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 1, now + 30000 * us), 1);
+ }
+ 
+ /* Only the real tx queues count, as the device changes how many it has */
+@@ -486,14 +505,14 @@ static void cake_test_mq_count_real_queues(struct kunit *test)
+ 	for (i = 10; i < CAKE_TEST_TXQS; i++)
+ 		cake_test_mq_enqueue(mq, i);
+ 
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 7);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0, CAKE_TEST_NOW), 7);
+ 	/* what netif_set_real_num_tx_queues() changes */
+ 	mq->dev->real_num_tx_queues = 8;
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 1);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0, CAKE_TEST_NOW), 1);
+ 	mq->dev->real_num_tx_queues = 11;
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 2);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0, CAKE_TEST_NOW), 2);
+ 	mq->dev->real_num_tx_queues = CAKE_TEST_TXQS;
+-	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0), 7);
++	KUNIT_EXPECT_EQ(test, cake_test_mq_count(mq, 0, CAKE_TEST_NOW), 7);
+ }
+ 
+ /* Any mix of never used, idle, queued and just-sent sub-cakes, and of real
+@@ -508,7 +527,7 @@ static void cake_test_mq_count_matches_all(struct kunit *test)
+ 	prandom_seed_state(&rnd, 760);
+ 	for (round = 0; round < 2000; round++) {
+ 		int self = prandom_u32_state(&rnd) % CAKE_TEST_TXQS;
+-		u64 since = 1000 + prandom_u32_state(&rnd) % 1000;
++		u64 now = CAKE_TEST_NOW + prandom_u32_state(&rnd) % CAKE_TEST_NOW;
+ 
+ 		bitmap_zero(mq->cfg->used_qs, CAKE_TEST_TXQS);
+ 		mq->dev->real_num_tx_queues = 1 + prandom_u32_state(&rnd) % CAKE_TEST_TXQS;
+@@ -517,28 +536,820 @@ static void cake_test_mq_count_matches_all(struct kunit *test)
+ 
+ 			mq->sch[i]->q.qlen = 0;
+ 			q->last_active = 0;
+-			q->last_checked_active = since;
+-			switch (prandom_u32_state(&rnd) % 4) {
++			q->mq_idle = prandom_u32_state(&rnd) % 2 ?
++				     prandom_u32_state(&rnd) % (8 * CAKE_MQ_TAU) : 0;
++			switch (prandom_u32_state(&rnd) % 5) {
+ 			case 0:	/* never had a packet */
+ 				break;
+ 			case 1:	/* idle */
+ 				cake_test_mq_enqueue(mq, i);
+ 				mq->sch[i]->q.qlen = 0;
+-				q->last_active = since - prandom_u32_state(&rnd) % since;
++				q->last_active = now - CAKE_MQ_TAU -
++						 prandom_u32_state(&rnd) % CAKE_TEST_NOW;
+ 				break;
+ 			case 2:	/* packets queued */
+ 				cake_test_mq_enqueue(mq, i);
+ 				break;
+-			case 3:	/* sent since @self last counted */
++			case 3:	/* sent within CAKE_MQ_TAU */
+ 				cake_test_mq_enqueue(mq, i);
+ 				mq->sch[i]->q.qlen = 0;
+-				q->last_active = since + 1 + prandom_u32_state(&rnd) % 1000;
++				q->last_active = now - prandom_u32_state(&rnd) % CAKE_MQ_TAU;
+ 				break;
++			case 4:	/* sent, stamped on another CPU after @now */
++				cake_test_mq_enqueue(mq, i);
++				mq->sch[i]->q.qlen = 0;
++				q->last_active = now + 1 + prandom_u32_state(&rnd) % 1000;
++				break;
++			}
++		}
++		KUNIT_ASSERT_EQ(test, cake_test_mq_count(mq, self, now),
++				cake_test_mq_count_all(mq, self, now));
++	}
++}
++
++/* cake_mq's share of the rate */
++
++#define CAKE_TEST_RATE	100000000ULL	/* 800 Mbit/s, in bytes/s */
++#define CAKE_TEST_UNIT	((u32)CAKE_MQ_UNIT)
++
++/* Alone, a sub-cake has the whole rate; unlimited stays unlimited */
++static void cake_test_mq_share_alone(struct kunit *test)
++{
++	struct cake_mq_peers p = { .count = 1 };
++
++	KUNIT_EXPECT_EQ(test, cake_mq_share(CAKE_TEST_RATE, 3 * CAKE_TEST_UNIT, 5000, &p),
++			CAKE_TEST_RATE);
++	p.count = 3;
++	p.bids = 2 * CAKE_TEST_UNIT;
++	p.sat_bids = 2 * CAKE_TEST_UNIT;
++	KUNIT_EXPECT_EQ(test, cake_mq_share(0, CAKE_TEST_UNIT, 0, &p), 0);
++}
++
++/* All saturated: the rate split by weight, all of it */
++static void cake_test_mq_share_by_weight(struct kunit *test)
++{
++	static const u32 cases[][4] = {
++		/* one flow against seven, one host (triple-isolate, one server) */
++		{ 65535 / 8, 7 * (65535 / 8) },
++		/* two LAN hosts, one flow against four (dual-dsthost) */
++		{ 65535, 4 * (65535 / 4) },
++		/* eight flows against two: the 80/20 imbalance */
++		{ 8 * 65535, 2 * 65535 },
++		/* even */
++		{ 65535, 65535, 65535, 65535 },
++	};
++	int c, i, j;
++
++	for (c = 0; c < ARRAY_SIZE(cases); c++) {
++		u64 total = 0, sum = 0;
++		int n = 0;
++
++		for (i = 0; i < 4 && cases[c][i]; i++, n++)
++			total += cases[c][i];
++		for (i = 0; i < n; i++) {
++			struct cake_mq_peers p = { .count = n };
++			u64 share, want;
++
++			for (j = 0; j < n; j++) {
++				if (j == i)
++					continue;
++				p.bids += cases[c][j];
++				p.sat_bids += cases[c][j];
+ 			}
++			share = cake_mq_share(CAKE_TEST_RATE, cases[c][i], 0, &p);
++			want = div64_u64(CAKE_TEST_RATE * cases[c][i], total);
++			KUNIT_EXPECT_LE(test, share, want);
++			KUNIT_EXPECT_GE(test, share + 1, want);
++			sum += share;
++		}
++		KUNIT_EXPECT_LE(test, sum, CAKE_TEST_RATE);
++		KUNIT_EXPECT_GE(test, sum + n, CAKE_TEST_RATE);
++	}
++}
++
++/* What an unsaturated sub-cake doesn't use goes to the others */
++static void cake_test_mq_share_lends(struct kunit *test)
++{
++	const u64 rate = CAKE_TEST_RATE;
++	struct cake_mq_peers p;
++	u64 used;
++
++	/* the 80/20 imbalance, a flood each: the other one uses 20%, this one
++	 * gets the 80% it brings, not half
++	 */
++	p = (struct cake_mq_peers){ .count = 2, .bids = CAKE_TEST_UNIT,
++				    .unsat_usage = rate / 5 };
++	KUNIT_EXPECT_EQ(test, cake_mq_share(rate, CAKE_TEST_UNIT, 0, &p), rate - rate / 5);
++	/* ... and the 20% one is offered half, room to grow */
++	p = (struct cake_mq_peers){ .count = 2, .bids = CAKE_TEST_UNIT,
++				    .sat_bids = CAKE_TEST_UNIT };
++	KUNIT_EXPECT_EQ(test, cake_mq_share(rate, CAKE_TEST_UNIT, 0, &p), rate / 2);
++
++	/* three unsaturated others: all the rest, whatever this one's weight */
++	used = rate / 10 + rate / 20 + rate / 4;
++	p = (struct cake_mq_peers){ .count = 4, .bids = 3 * CAKE_TEST_UNIT,
++				    .unsat_usage = used };
++	KUNIT_EXPECT_EQ(test, cake_mq_share(rate, CAKE_TEST_UNIT / 8, 0, &p), rate - used);
++
++	/* only sparse flows here (no bulk weight), 8 bulk flows saturated
++	 * elsewhere: offered what a ninth flow would get, on top of its own
++	 */
++	p = (struct cake_mq_peers){ .count = 2, .bids = 8 * CAKE_TEST_UNIT,
++				    .sat_bids = 8 * CAKE_TEST_UNIT };
++	KUNIT_EXPECT_EQ(test, cake_mq_share(rate, 0, rate / 100, &p),
++			rate / 100 + div64_u64(rate - rate / 100, 9));
++}
++
++/* Sparse flows first, as in one CAKE: here a stream at 10% next to 4 bulk
++ * flows, and 4 bulk flows in another sub-cake. One CAKE gives the stream
++ * its 10% and each bulk flow 11.25%.
++ */
++static void cake_test_mq_share_sparse(struct kunit *test)
++{
++	const u64 rate = CAKE_TEST_RATE, sparse = rate / 10;
++	struct cake_mq_peers pa = { .count = 2, .bids = 4 * CAKE_TEST_UNIT,
++				    .sat_bids = 4 * CAKE_TEST_UNIT };
++	struct cake_mq_peers pb = { .count = 2, .bids = 4 * CAKE_TEST_UNIT,
++				    .sat_bids = 4 * CAKE_TEST_UNIT, .sat_sparse = sparse,
++				    .sparse = sparse };
++	u64 a = cake_mq_share(rate, 4 * CAKE_TEST_UNIT, sparse, &pa);
++	u64 b = cake_mq_share(rate, 4 * CAKE_TEST_UNIT, 0, &pb);
++
++	KUNIT_EXPECT_EQ(test, a, sparse + (rate - sparse) / 2);
++	KUNIT_EXPECT_EQ(test, b, (rate - sparse) / 2);
++	KUNIT_EXPECT_EQ(test, a + b, rate);
++}
++
++/* An average that hasn't caught up: never below what every sub-cake
++ * wanting more would leave this one
++ */
++static void cake_test_mq_share_floor(struct kunit *test)
++{
++	const u64 rate = CAKE_TEST_RATE;
++	struct cake_mq_peers p;
++
++	/* two others still average 60% each */
++	p = (struct cake_mq_peers){ .count = 3, .bids = 2 * CAKE_TEST_UNIT,
++				    .unsat_usage = 2 * (rate * 3 / 5) };
++	KUNIT_EXPECT_EQ(test, cake_mq_share(rate, CAKE_TEST_UNIT, 0, &p), rate / 3);
++	/* one of them, a stream at 10%, all sparse: the floor leaves it out */
++	p = (struct cake_mq_peers){ .count = 3, .bids = 2 * CAKE_TEST_UNIT,
++				    .unsat_usage = rate / 10 + rate * 19 / 20,
++				    .sparse = rate / 10 };
++	KUNIT_EXPECT_EQ(test, cake_mq_share(rate, CAKE_TEST_UNIT, 0, &p),
++			(rate - rate / 10) / 3);
++	/* and this one's own sparse flows come first */
++	KUNIT_EXPECT_EQ(test, cake_mq_share(rate, CAKE_TEST_UNIT, rate / 20, &p),
++			rate / 20 + (rate - rate / 10 - rate / 20) / 3);
++}
++
++/* Any rate, weights and usage: a share from 1 to the rate, at least the
++ * split by bids, and no bulk weight bids as one flow
++ */
++static void cake_test_mq_share_limits(struct kunit *test)
++{
++	struct rnd_state rnd;
++	int round;
++
++	prandom_seed_state(&rnd, 7608);
++	for (round = 0; round < 5000; round++) {
++		u64 rate = (((u64)prandom_u32_state(&rnd) << 32) |
++			    prandom_u32_state(&rnd)) >> (4 + prandom_u32_state(&rnd) % 60);
++		u32 weight = prandom_u32_state(&rnd) % (8 * 1024 * 65536);
++		u64 sparse = rate ? prandom_u32_state(&rnd) % (rate + 1) : 0;
++		struct cake_mq_peers p = {
++			.count = 2 + prandom_u32_state(&rnd) % 15,
++			.sat_bids = prandom_u32_state(&rnd) % (16 * 1024 * 65536),
++			.unsat_usage = rate ? (u64)prandom_u32_state(&rnd) * 2 * (rate >> 32) +
++					      prandom_u32_state(&rnd) % (rate + 1) : 0,
++			.sat_sparse = rate ? prandom_u32_state(&rnd) % (rate + 1) : 0,
++		};
++		u64 share, floor = sparse;
++
++		p.bids = p.sat_bids + prandom_u32_state(&rnd) % (8 * 65536);
++		p.sparse = p.sat_sparse + (rate ? prandom_u32_state(&rnd) % (rate + 1) : 0);
++		share = cake_mq_share(rate, weight, sparse, &p);
++		if (!rate) {
++			KUNIT_ASSERT_EQ(test, share, 0);
++			continue;
++		}
++		if (p.sparse + sparse < rate)
++			floor += mul_u64_u64_div_u64(rate - p.sparse - sparse,
++						     cake_mq_bid(weight),
++						     cake_mq_bid(weight) + p.bids);
++		KUNIT_ASSERT_GE(test, share, 1);
++		KUNIT_ASSERT_LE(test, share, rate);
++		KUNIT_ASSERT_GE(test, share, min(floor, rate));
++		if (!weight)
++			KUNIT_ASSERT_EQ(test, share,
++					cake_mq_share(rate, CAKE_MQ_UNIT, sparse, &p));
++	}
++}
++
++/* The usage averages: they settle on a steady rate, start again after a
++ * gap, and don't overflow at 10 Gbit/s over their longest time scale
++ */
++static void cake_test_mq_ewma(struct kunit *test)
++{
++	const u64 us = NSEC_PER_USEC;
++	u64 avg = 0, prev;
++	int i;
++
++	/* 100 MB/s, 20 KB per 200 us: within 1% after 10 time constants */
++	for (i = 0; i < 100; i++)
++		avg = cake_mq_ewma(avg, 20000, 200 * us, CAKE_MQ_TAU);
++	KUNIT_EXPECT_LE(test, abs((s64)avg - 100000000), 1000000);
++	/* falls with nothing sent, never below 0 */
++	for (i = 0; i < 200; i++) {
++		prev = avg;
++		avg = cake_mq_ewma(avg, 0, 200 * us, CAKE_MQ_TAU);
++		KUNIT_ASSERT_LE(test, avg, prev);
++	}
++	KUNIT_EXPECT_LE(test, avg, 1000);
++	/* a gap of a time constant or more: the last window alone */
++	KUNIT_EXPECT_EQ(test, cake_mq_ewma(12345678, 1000, CAKE_MQ_TAU, CAKE_MQ_TAU), 500000);
++	KUNIT_EXPECT_EQ(test, cake_mq_ewma(12345678, 0, 10 * NSEC_PER_SEC, CAKE_MQ_TAU), 0);
++	/* 2 Mbit/s, a packet every 6 ms, resyncs every 2 ms in between: a
++	 * steady average over 24 ms, within 10%
++	 */
++	avg = 250000;
++	for (i = 0; i < 300; i++) {
++		avg = cake_mq_ewma(avg, i % 3 ? 0 : 1514, 2000 * us, 24000 * us);
++		if (i >= 30)
++			KUNIT_ASSERT_LE(test, abs((s64)avg - 252333), 25233);
++	}
++	/* 10 Gbit/s over the longest time scale */
++	avg = 0;
++	for (i = 0; i < 1000; i++)
++		avg = cake_mq_ewma(avg, 2500000, 2000 * us, CAKE_MQ_TAU_MAX);
++	KUNIT_EXPECT_LE(test, abs((s64)avg - 1250000000), 12500000);
++}
++
++/* Wanting more than its share: using all of it, or most of it with packets
++ * held back by the shaper
++ */
++static void cake_test_mq_saturated(struct kunit *test)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	const u64 dt = 200 * NSEC_PER_USEC, now = CAKE_TEST_NOW, share = CAKE_TEST_RATE;
++	static const struct {
++		u32 used;	/* per 1000 of the share */
++		bool held;
++		bool saturated;
++	} cases[] = {
++		{ 990, false, true },	/* all of it */
++		{ 900, true, true },	/* TCP held back by its share */
++		{ 900, false, false },	/* a stream just below it */
++		{ 800, true, false },	/* well below, a burst waited */
++		{ 500, false, false },
++	};
++	int c;
++
++	for (c = 0; c < ARRAY_SIZE(cases); c++) {
++		u64 usage = share * cases[c].used / 1000;
++
++		q->synced_rate = share;
++		q->mq_usage = usage;
++		q->mq_bytes = div64_u64(usage * dt, NSEC_PER_SEC);
++		q->mq_idle = CAKE_MQ_TAU;
++		q->last_checked_active = now - dt;
++		q->mq_held_at = cases[c].held ? now - dt / 2 : 0;
++		cake_mq_publish(q, now);
++		KUNIT_EXPECT_EQ_MSG(test, q->mq_saturated, cases[c].saturated, "case %d", c);
++	}
++}
++
++/* How long a sub-cake counts as active after its last packet */
++static void cake_test_mq_idle_after(struct kunit *test)
++{
++	const u64 usage = 5000000 / 8;	/* 5 Mbit/s */
++
++	/* full-sized packets 2.4 ms apart: idle after four of them */
++	KUNIT_EXPECT_EQ(test, cake_mq_idle_after(0, 3 * 1514, 3, usage),
++			div64_u64(4ULL * 1514 * NSEC_PER_SEC, usage));
++	/* fast: at least CAKE_MQ_TAU */
++	KUNIT_EXPECT_EQ(test, cake_mq_idle_after(0, 100 * 1514, 100, CAKE_TEST_RATE),
++			CAKE_MQ_TAU);
++	/* a ping a second: at most 100 ms */
++	KUNIT_EXPECT_EQ(test, cake_mq_idle_after(0, 98, 1, 98), CAKE_MQ_TAU_MAX);
++	/* nothing sent since the last resync: as it was */
++	KUNIT_EXPECT_EQ(test, cake_mq_idle_after(7 * NSEC_PER_MSEC, 0, 0, usage),
++			7 * NSEC_PER_MSEC);
++	KUNIT_EXPECT_EQ(test, cake_mq_idle_after(0, 0, 0, 0), CAKE_MQ_TAU);
++}
++
++/* A share that grows shortens the shaper's wait at once, and a waiting
++ * sub-cake wakes within CAKE_MQ_TAU to work its share out again
++ */
++static void cake_test_mq_rescale_wait(struct kunit *test)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	struct cake_sched_config *cfg = cake_test_alloc(test, sizeof(*cfg));
++	const ktime_t now = 1000 * NSEC_PER_MSEC, ms = NSEC_PER_MSEC;
++
++	/* 10 ms left at a share that then doubles: 5 ms */
++	KUNIT_EXPECT_EQ(test, cake_mq_rescale_wait(now + 10 * ms, now, 1000, 2000), now + 5 * ms);
++	/* one that halves: 20 ms, as the share now says */
++	KUNIT_EXPECT_EQ(test, cake_mq_rescale_wait(now + 10 * ms, now, 2000, 1000), now + 20 * ms);
++	/* up and down again: back where it was */
++	KUNIT_EXPECT_EQ(test, cake_mq_rescale_wait(cake_mq_rescale_wait(now + 10 * ms, now, 1000, 3000),
++						   now, 3000, 1000), now + 10 * ms - 1);
++	/* nothing left to wait: unchanged; nor beyond a second */
++	KUNIT_EXPECT_EQ(test, cake_mq_rescale_wait(now - 1, now, 1000, 2000), now - 1);
++	KUNIT_EXPECT_EQ(test, cake_mq_rescale_wait(now + 10 * ms, now, CAKE_TEST_RATE, 1),
++			now + NSEC_PER_SEC);
++	/* a packet sent at a near-zero share pushed the next one 10 s ahead */
++	KUNIT_EXPECT_EQ(test, cake_mq_rescale_wait(now + 10 * NSEC_PER_SEC, now, 10,
++						   CAKE_TEST_RATE), now + 1000);
++
++	q->config = cfg;
++	cfg->is_shared = 1;
++	KUNIT_EXPECT_EQ(test, cake_mq_wake_by(q, now + 50 * ms, now), now + CAKE_MQ_TAU);
++	KUNIT_EXPECT_EQ(test, cake_mq_wake_by(q, now + ms, now), now + ms);
++	/* plain cake waits for its shaper */
++	cfg->is_shared = 0;
++	KUNIT_EXPECT_EQ(test, cake_mq_wake_by(q, now + 50 * ms, now), now + 50 * ms);
++}
++
++/* Sub-cakes with uneven demands (bytes/s; 0: idle; U64_MAX: all it can
++ * get) and bulk weights, each resyncing every 200 us as cake_dequeue()
++ * does and sending at the lower of its demand and its share. What one
++ * CAKE's DRR would give them is weighted max-min: each gets what it asks
++ * for up to a level set by its weight, and the rate is all used if
++ * they ask for that much.
++ */
++static void cake_test_mq_fair_levels(const u64 *demand, const u32 *weight,
++				     int n, u64 rate, u64 *want)
++{
++	bool fixed[CAKE_TEST_TXQS] = {};
++	u64 left = rate;
++	bool again = true;
++	int i;
++
++	while (again) {
++		u64 w = 0;
++
++		again = false;
++		for (i = 0; i < n; i++)
++			if (!fixed[i] && demand[i])
++				w += cake_mq_bid(weight[i]);
++		for (i = 0; i < n; i++) {
++			if (fixed[i] || !demand[i])
++				continue;
++			want[i] = mul_u64_u64_div_u64(left, cake_mq_bid(weight[i]), w);
++			if (demand[i] <= want[i]) {
++				want[i] = demand[i];
++				fixed[i] = true;
++				left -= demand[i];
++				again = true;
++				break;
++			}
++		}
++	}
++	for (i = 0; i < n; i++)
++		if (!demand[i])
++			want[i] = 0;
++}
++
++static void cake_test_mq_converge(struct kunit *test, struct cake_test_mq *mq,
++				  const u64 *demand, const u32 *weight, int n,
++				  u64 rate)
++{
++	const u64 step = 200 * NSEC_PER_USEC;
++	u64 sent[CAKE_TEST_TXQS] = {}, want[CAKE_TEST_TXQS], got = 0, asked = 0;
++	u64 now = 10 * NSEC_PER_MSEC;
++	int t, k, i;
++
++	mq->dev->real_num_tx_queues = CAKE_TEST_TXQS;
++	bitmap_zero(mq->cfg->used_qs, CAKE_TEST_TXQS);
++	mq->cfg->rate_bps = rate;
++	for (i = 0; i < CAKE_TEST_TXQS; i++) {
++		struct cake_sched_data *q = cake_test_mq_q(mq, i);
++
++		mq->sch[i]->q.qlen = 0;
++		q->tin_cnt = 1;
++		q->tins[0].mq_weight = i < n ? weight[i] : 0;
++		q->synced_rate = rate;
++		q->last_checked_active = now - step;
++		q->last_active = 0;
++		q->mq_usage = q->mq_sparse = q->mq_bytes = q->mq_sparse_bytes = 0;
++		q->mq_idle = 0;
++		q->mq_packets = 0;
++		q->mq_held_at = 0;
++		q->mq_weight = 0;
++		q->mq_saturated = false;
++		if (i < n && demand[i]) {
++			cake_test_mq_enqueue(mq, i);
++			mq->sch[i]->q.qlen = 1;
++		}
++	}
++
++	for (t = 0; t < 150; t++) {
++		now += step;
++		for (k = 0; k < n; k++) {
++			/* not always in the same order */
++			int i = (k + t) % n;
++			struct cake_sched_data *q = cake_test_mq_q(mq, i);
++			struct cake_mq_peers p;
++			u64 rate_i, share;
++
++			if (!demand[i])
++				continue;
++			rate_i = min(demand[i], q->synced_rate);
++			/* asking for more than it may send: its shaper holds packets */
++			if (demand[i] > q->synced_rate)
++				q->mq_held_at = now - step / 2;
++			if (t >= 100)
++				sent[i] += rate_i;
++			q->mq_bytes = div64_u64(rate_i * step, NSEC_PER_SEC);
++			q->last_active = now;
++			cake_mq_publish(q, now);
++			cake_test_mq_peers(mq, i, now, &p);
++			share = cake_mq_share(rate, q->mq_weight, q->mq_sparse, &p);
++			if (cake_mq_share_moved(share, q->synced_rate, rate))
++				q->synced_rate = share;
++			q->last_checked_active = now;
++		}
++	}
++
++	cake_test_mq_fair_levels(demand, weight, n, rate, want);
++	for (i = 0; i < n; i++) {
++		sent[i] /= 50;
++		got += sent[i];
++		asked += min(demand[i], rate);
++		/* each within 3% of the rate of its fair level */
++		KUNIT_EXPECT_LE_MSG(test, abs((s64)sent[i] - (s64)want[i]), rate / 50,
++				    "sub-cake %d of %d: %llu, fair %llu (demand %llu, weight %u)",
++				    i, n, sent[i], want[i], demand[i], weight[i]);
++	}
++	/* all of the rate in use, when it's asked for */
++	KUNIT_EXPECT_LE(test, got, rate + rate / 100);
++	KUNIT_EXPECT_GE(test, got, min(asked, rate) - min(asked, rate) * 3 / 100);
++}
++
++static void cake_test_mq_alloc_tins(struct kunit *test, struct cake_test_mq *mq)
++{
++	int i;
++
++	for (i = 0; i < CAKE_TEST_TXQS; i++)
++		cake_test_mq_q(mq, i)->tins =
++			cake_test_alloc(test, sizeof(struct cake_tin_data));
++}
++
++/* The cases in the plan: uneven demand, sub-queues idle, weights by host */
++static void cake_test_mq_share_converges(struct kunit *test)
++{
++	const u64 r = CAKE_TEST_RATE;
++	const u32 u = CAKE_TEST_UNIT;
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	static const struct {
++		u64 demand[4];
++		u32 weight[4];
++	} cases[] = {
++		/* 1 bulk flow against 7, one server (triple-isolate) */
++		{ { U64_MAX, U64_MAX }, { 65535 / 8, 7 * (65535 / 8) } },
++		/* bulk flows next to a 10% video stream on another queue */
++		{ { U64_MAX, CAKE_TEST_RATE / 10 }, { 8 * 65535, 0 } },
++		/* two hosts on different queues, 1 flow against 4 */
++		{ { U64_MAX, U64_MAX }, { 65535, 4 * (65535 / 4) } },
++		/* the paper's 80/20 floods */
++		{ { CAKE_TEST_RATE * 4 / 5, CAKE_TEST_RATE / 5 }, { 65535, 65535 } },
++		/* a TCP flow held back by its own window, two saturated */
++		{ { U64_MAX, CAKE_TEST_RATE / 4, U64_MAX }, { 65535, 65535, 2 * 65535 } },
++		/* two idle sub-cakes in between */
++		{ { U64_MAX, 0, U64_MAX, 0 }, { 65535, 65535, 3 * 65535, 65535 } },
++		/* nobody asks for the rate */
++		{ { CAKE_TEST_RATE / 5, CAKE_TEST_RATE / 10, CAKE_TEST_RATE / 4 }, { 65535, 65535, 65535 } },
++	};
++	struct rnd_state rnd;
++	int c, round;
++
++	cake_test_mq_alloc_tins(test, mq);
++	for (c = 0; c < ARRAY_SIZE(cases); c++) {
++		int n = 0;
++
++		while (n < 4 && (cases[c].demand[n] || cases[c].weight[n]))
++			n++;
++		cake_test_mq_converge(test, mq, cases[c].demand, cases[c].weight, n, r);
++	}
++
++	/* and at random: up to 16 sub-cakes, idle, held back or saturated */
++	prandom_seed_state(&rnd, 7609);
++	for (round = 0; round < 200; round++) {
++		u64 demand[CAKE_TEST_TXQS];
++		u32 weight[CAKE_TEST_TXQS];
++		int n = 2 + prandom_u32_state(&rnd) % (CAKE_TEST_TXQS - 1), i;
++
++		for (i = 0; i < n; i++) {
++			switch (prandom_u32_state(&rnd) % 3) {
++			case 0:
++				demand[i] = 0;
++				break;
++			case 1:
++				demand[i] = r / 100 + prandom_u32_state(&rnd) % (r / 2);
++				break;
++			default:
++				demand[i] = U64_MAX;
++			}
++			weight[i] = prandom_u32_state(&rnd) % 4 ? (1 + prandom_u32_state(&rnd) % 8) *
++				    (u / (1 + prandom_u32_state(&rnd) % 8)) : 0;
++		}
++		cake_test_mq_converge(test, mq, demand, weight, n, r);
++	}
++}
++
++/* cake_mq's host loads: four sub-cakes' tin 0, one host table between them */
++struct cake_test_hosts {
++	struct cake_sched_config cfg;
++	struct cake_sched_data *q[4];
++	atomic_t *hosts;
++};
++
++static struct cake_test_hosts *cake_test_hosts_alloc(struct kunit *test)
++{
++	struct cake_test_hosts *h = cake_test_alloc(test, sizeof(*h));
++	int i;
++
++	h->cfg.is_shared = 1;
++	h->cfg.flow_mode = CAKE_FLOW_TRIPLE;
++	h->hosts = cake_test_alloc(test, 2 * CAKE_MAX_TINS * CAKE_QUEUES * sizeof(atomic_t));
++	h->cfg.mq_hosts = h->hosts;
++	for (i = 0; i < 4; i++) {
++		struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++		struct cake_tin_data *b;
++
++		q->tins = cake_test_alloc(test, CAKE_MAX_TINS * sizeof(*q->tins));
++		q->tin_cnt = 1;
++		q->config = &h->cfg;
++		b = &q->tins[0];
++		INIT_LIST_HEAD(&b->new_flows);
++		INIT_LIST_HEAD(&b->old_flows);
++		INIT_LIST_HEAD(&b->decaying_flows);
++		cake_mq_set_host_tables(q, h->hosts);
++		h->q[i] = q;
++	}
++	return h;
++}
++
++/* A packet from LAN host @host, port @sport, to 1.1.1.1 into tin @b, its
++ * flow then going bulk with a refill, as cake_dequeue() does
++ */
++static struct cake_flow *cake_test_bulk_flow(struct kunit *test,
++					     struct cake_tin_data *b, int mode,
++					     u8 host, u16 sport)
++{
++	struct sk_buff *skb = cake_test_skb(test, false, IPPROTO_TCP, host, sport, 0);
++	struct cake_flow *flow = &b->flows[cake_hash(b, skb, mode, 0, 0)];
++
++	if (flow->set == CAKE_SET_BULK)
++		return flow;
++	list_add_tail(&flow->flowchain, &b->old_flows);
++	flow->set = CAKE_SET_BULK;
++	b->bulk_flow_count++;
++	cake_inc_srchost_bulk_flow_count(b, flow, mode);
++	cake_inc_dsthost_bulk_flow_count(b, flow, mode);
++	cake_mq_set_weight(b, flow, quantum_div[cake_host_load(b, flow, mode)]);
++	return flow;
++}
++
++static struct cake_flow *cake_test_hosts_bulk(struct kunit *test,
++					      struct cake_test_hosts *h, int s,
++					      u8 host, u16 sport)
++{
++	return cake_test_bulk_flow(test, &h->q[s]->tins[0], h->cfg.flow_mode,
++				   host, sport);
++}
++
++/* Every bucket holds what the sub-cakes count under its tags */
++static void cake_test_hosts_check(struct kunit *test, struct cake_test_hosts *h)
++{
++	int (*sums)[CAKE_QUEUES] = kcalloc(2, sizeof(*sums), GFP_KERNEL);
++	int s, k;
++
++	KUNIT_ASSERT_NOT_NULL(test, sums);
++
++	for (s = 0; s < 4; s++) {
++		struct cake_tin_data *b = &h->q[s]->tins[0];
++		u32 weight = 0;
++
++		for (k = 0; k < CAKE_QUEUES; k++) {
++			sums[0][b->hosts[k].srchost_tag % CAKE_QUEUES] +=
++				b->hosts[k].srchost_bulk_flow_count;
++			sums[1][b->hosts[k].dsthost_tag % CAKE_QUEUES] +=
++				b->hosts[k].dsthost_bulk_flow_count;
++			weight += b->flows[k].mq_weight;
++		}
++		KUNIT_EXPECT_EQ(test, b->mq_weight, weight);
++	}
++	for (k = 0; k < CAKE_QUEUES; k++) {
++		KUNIT_EXPECT_EQ(test, atomic_read(&h->hosts[k]), sums[0][k]);
++		KUNIT_EXPECT_EQ(test, atomic_read(&h->hosts[CAKE_QUEUES + k]), sums[1][k]);
++	}
++	kfree(sums);
++}
++
++/* A host's flows in two sub-cakes are shared out as one host's */
++static void cake_test_mq_host_load_shared(struct kunit *test)
++{
++	struct cake_test_hosts *h = cake_test_hosts_alloc(test);
++	struct cake_flow *a[2], *b[3], *other;
++	int i;
++
++	for (i = 0; i < 2; i++)
++		a[i] = cake_test_hosts_bulk(test, h, 0, 5, 40000 + i);
++	for (i = 0; i < 3; i++)
++		b[i] = cake_test_hosts_bulk(test, h, 1, 5, 41000 + i);
++	cake_test_hosts_check(test, h);
++
++	/* host 5 has 2 bulk flows here and 3 there: 5 in all, as one CAKE sees */
++	KUNIT_EXPECT_EQ(test, h->q[0]->tins[0].hosts[a[0]->srchost].srchost_bulk_flow_count, 2);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], a[0], CAKE_FLOW_TRIPLE), 5);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[1]->tins[0], b[0], CAKE_FLOW_DUAL_SRC), 5);
++	/* plain cake, no host table: its own count */
++	h->q[0]->tins[0].mq_srcload = NULL;
++	h->q[0]->tins[0].mq_dstload = NULL;
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], a[0], CAKE_FLOW_TRIPLE), 2);
++	cake_mq_set_host_tables(h->q[0], h->hosts);
++
++	/* refills weigh each flow 1/5 of a host */
++	cake_mq_set_weight(&h->q[0]->tins[0], a[1], quantum_div[5]);
++	KUNIT_EXPECT_EQ(test, a[1]->mq_weight, 65535 / 5);
++
++	/* another LAN host's flow next to them: alone at its end, but the
++	 * server's sixth flow (triple-isolate); its own host's only one by
++	 * source alone (dual-srchost)
++	 */
++	other = cake_test_hosts_bulk(test, h, 0, 6, 40000);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], other, CAKE_FLOW_TRIPLE), 6);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], other, CAKE_FLOW_DUAL_SRC), 1);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], other, CAKE_FLOW_DUAL_DST), 6);
++
++	/* two of host 5's flows there go: 3 left for the ones here */
++	cake_flow_emptied(h->q[1], &h->q[1]->tins[0], b[0], 0);
++	cake_flow_emptied(h->q[1], &h->q[1]->tins[0], b[1], 0);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], a[0], CAKE_FLOW_DUAL_SRC), 3);
++	KUNIT_EXPECT_EQ(test, b[0]->mq_weight, 0);
++	cake_test_hosts_check(test, h);
++}
++
++/* The host-only modes: a host with a queue in two sub-cakes gets one host's
++ * share between them
++ */
++static void cake_test_mq_host_queues(struct kunit *test)
++{
++	struct cake_test_hosts *h = cake_test_hosts_alloc(test);
++	struct cake_tin_data *b0 = &h->q[0]->tins[0], *b1 = &h->q[1]->tins[0];
++	const int mode = CAKE_FLOW_SRC_IP;
++	struct cake_flow *a, *b, *c;
++	int i;
++
++	h->cfg.flow_mode = mode;
++	a = cake_test_hosts_bulk(test, h, 0, 5, 40000);
++	b = cake_test_hosts_bulk(test, h, 1, 5, 41000);
++	c = cake_test_hosts_bulk(test, h, 0, 6, 40000);
++	KUNIT_EXPECT_EQ(test, cake_host_load(b0, a, mode), 2);
++	KUNIT_EXPECT_EQ(test, cake_host_load(b1, b, mode), 2);
++	KUNIT_EXPECT_EQ(test, cake_host_load(b0, c, mode), 1);
++	/* at their next refills, half a host each against a whole one */
++	cake_mq_set_weight(b0, a, quantum_div[cake_host_load(b0, a, mode)]);
++	KUNIT_EXPECT_EQ(test, b0->mq_weight, 65535 / 2 + 65535);
++	b0->flow_quantum = 1514;
++	KUNIT_EXPECT_EQ(test, cake_get_flow_quantum(b0, c, mode), 1514);
++	KUNIT_EXPECT_LE(test, abs(cake_get_flow_quantum(b0, a, mode) - 1514 / 2), 1);
++
++	/* host 5's queue in sub-cake 1 goes: the one here has it all again */
++	cake_flow_emptied(h->q[1], b1, b, 0);
++	KUNIT_EXPECT_EQ(test, cake_host_load(b0, a, mode), 1);
++	/* plain cake: a queue is a host's, whatever */
++	b0->mq_srcload = NULL;
++	KUNIT_EXPECT_EQ(test, cake_host_load(b0, a, mode), 1);
++	cake_mq_set_host_tables(h->q[0], h->hosts);
++
++	cake_mq_retire_tin(h->q[0], b0, 0);
++	for (i = 0; i < 2 * CAKE_QUEUES; i++)
++		KUNIT_ASSERT_EQ(test, atomic_read(&h->hosts[i]), 0);
++	KUNIT_EXPECT_EQ(test, b0->mq_weight, 0);
++}
++
++/* A host slot taken over by another tag with flows still counted */
++static void cake_test_mq_host_retag(struct kunit *test)
++{
++	atomic_t *load = cake_test_alloc(test, CAKE_QUEUES * sizeof(atomic_t));
++
++	atomic_set(&load[17], 3);
++	cake_mq_host_retag(load, 17 + 5 * CAKE_QUEUES, 600, 3);
++	KUNIT_EXPECT_EQ(test, atomic_read(&load[17]), 0);
++	KUNIT_EXPECT_EQ(test, atomic_read(&load[600]), 3);
++	/* nothing counted, the same tag, or no table: nothing moves */
++	cake_mq_host_retag(load, 600, 17, 0);
++	cake_mq_host_retag(load, 600, 600, 3);
++	cake_mq_host_retag(NULL, 600, 17, 3);
++	KUNIT_EXPECT_EQ(test, atomic_read(&load[600]), 3);
++	KUNIT_EXPECT_EQ(test, atomic_read(&load[17]), 0);
++}
++
++/* A sub-cake out of packets retires its bulk rotation: its flows leave the
++ * host loads and its weight, the other sub-cakes' stay
++ */
++static void cake_test_mq_retire_on_idle(struct kunit *test)
++{
++	struct cake_test_hosts *h = cake_test_hosts_alloc(test);
++	struct cake_tin_data *b = &h->q[2]->tins[0];
++	struct cake_flow *keep;
++	int i;
++
++	keep = cake_test_hosts_bulk(test, h, 0, 5, 40000);
++	for (i = 0; i < 6; i++)
++		cake_test_hosts_bulk(test, h, 2, 5 + i % 2, 42000 + i);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], keep, CAKE_FLOW_DUAL_SRC), 4);
++	KUNIT_EXPECT_NE(test, b->mq_weight, 0);
++
++	cake_mq_retire_tin(h->q[2], b, 0);
++	KUNIT_EXPECT_TRUE(test, list_empty(&b->old_flows));
++	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 0);
++	KUNIT_EXPECT_EQ(test, b->mq_weight, 0);
++	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], keep, CAKE_FLOW_DUAL_SRC), 1);
++	KUNIT_EXPECT_NE(test, h->q[0]->tins[0].mq_weight, 0);
++	cake_test_hosts_check(test, h);
++}
++
++/* A sub-cake out of packets keeps its bulk rotation while it sent within
++ * CAKE_MQ_TAU, its watchdog set for when that runs out, and retires it then
++ */
++static void cake_test_mq_drained(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_mq_q(mq, 2);
++	/* the real clock: the watchdog is a real timer, cancelled before it fires */
++	u64 now = ktime_get_ns() + NSEC_PER_SEC;
++	struct cake_tin_data *b;
++	int i;
++
++	mq->cfg->flow_mode = CAKE_FLOW_TRIPLE;
++	mq->cfg->mq_hosts = cake_test_alloc(test, 2 * CAKE_MAX_TINS * CAKE_QUEUES *
++						  sizeof(atomic_t));
++	q->tins = cake_test_alloc(test, CAKE_MAX_TINS * sizeof(*q->tins));
++	q->tin_cnt = 1;
++	b = &q->tins[0];
++	INIT_LIST_HEAD(&b->new_flows);
++	INIT_LIST_HEAD(&b->old_flows);
++	INIT_LIST_HEAD(&b->decaying_flows);
++	cake_mq_set_host_tables(q, mq->cfg->mq_hosts);
++	qdisc_watchdog_init(&q->watchdog, mq->sch[2]);
++	for (i = 0; i < 3; i++)
++		cake_test_bulk_flow(test, b, CAKE_FLOW_TRIPLE, 5, 40000 + i);
++
++	/* between bursts: kept, and the watchdog will look again */
++	q->last_active = now - CAKE_MQ_TAU / 2;
++	cake_mq_drained(q, now);
++	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 3);
++	KUNIT_EXPECT_TRUE(test, hrtimer_is_queued(&q->watchdog.timer));
++	KUNIT_EXPECT_EQ(test, ktime_to_ns(hrtimer_get_softexpires(&q->watchdog.timer)),
++			now + CAKE_MQ_TAU / 2);
++	qdisc_watchdog_cancel(&q->watchdog);
++
++	/* idle for CAKE_MQ_TAU: retired */
++	cake_mq_drained(q, now + CAKE_MQ_TAU / 2);
++	KUNIT_EXPECT_TRUE(test, list_empty(&b->old_flows));
++	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 0);
++	KUNIT_EXPECT_EQ(test, b->mq_weight, 0);
++	for (i = 0; i < 2 * CAKE_QUEUES; i++)
++		KUNIT_ASSERT_EQ(test, atomic_read(&mq->cfg->mq_hosts[i]), 0);
++	KUNIT_EXPECT_FALSE(test, hrtimer_is_queued(&q->watchdog.timer));
++}
++
++/* Any mix of flows going bulk and empty in four sub-cakes, hosts spread
++ * over them: the table always holds what they count, and each tin's
++ * weight is its flows'
++ */
++static void cake_test_mq_host_table_matches(struct kunit *test)
++{
++	struct cake_test_hosts *h = cake_test_hosts_alloc(test);
++	struct rnd_state rnd;
++	int round;
++
++	prandom_seed_state(&rnd, 7610);
++	for (round = 0; round < 3000; round++) {
++		int s = prandom_u32_state(&rnd) % 4;
++		struct cake_tin_data *b = &h->q[s]->tins[0];
++		struct cake_flow *flow;
++
++		if (prandom_u32_state(&rnd) % 3 || list_empty(&b->old_flows)) {
++			cake_test_hosts_bulk(test, h, s, 2 + prandom_u32_state(&rnd) % 20,
++					     40000 + prandom_u32_state(&rnd) % 64);
++		} else {
++			flow = list_first_entry(&b->old_flows, struct cake_flow, flowchain);
++			cake_flow_emptied(h->q[s], b, flow, 0);
+ 		}
+-		KUNIT_ASSERT_EQ(test, cake_test_mq_count(mq, self),
+-				cake_test_mq_count_all(mq, self));
++		if (round % 100 == 0)
++			cake_test_hosts_check(test, h);
+ 	}
++	cake_test_hosts_check(test, h);
++	for (round = 0; round < 4; round++)
++		cake_mq_retire_tin(h->q[round], &h->q[round]->tins[0], 0);
++	cake_test_hosts_check(test, h);
++	for (round = 0; round < 2 * CAKE_QUEUES; round++)
++		KUNIT_ASSERT_EQ(test, atomic_read(&h->hosts[round]), 0);
+ }
+ 
+ static int cake_test_init(struct kunit *test)
+@@ -563,6 +1374,23 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_mq_count_back_from_idle),
+ 	KUNIT_CASE(cake_test_mq_count_real_queues),
+ 	KUNIT_CASE(cake_test_mq_count_matches_all),
++	KUNIT_CASE(cake_test_mq_share_alone),
++	KUNIT_CASE(cake_test_mq_share_by_weight),
++	KUNIT_CASE(cake_test_mq_share_lends),
++	KUNIT_CASE(cake_test_mq_share_sparse),
++	KUNIT_CASE(cake_test_mq_share_floor),
++	KUNIT_CASE(cake_test_mq_share_limits),
++	KUNIT_CASE(cake_test_mq_ewma),
++	KUNIT_CASE(cake_test_mq_saturated),
++	KUNIT_CASE(cake_test_mq_idle_after),
++	KUNIT_CASE(cake_test_mq_rescale_wait),
++	KUNIT_CASE(cake_test_mq_share_converges),
++	KUNIT_CASE(cake_test_mq_host_load_shared),
++	KUNIT_CASE(cake_test_mq_host_queues),
++	KUNIT_CASE(cake_test_mq_host_retag),
++	KUNIT_CASE(cake_test_mq_retire_on_idle),
++	KUNIT_CASE(cake_test_mq_drained),
++	KUNIT_CASE(cake_test_mq_host_table_matches),
+ 	{}
+ };
+ 
