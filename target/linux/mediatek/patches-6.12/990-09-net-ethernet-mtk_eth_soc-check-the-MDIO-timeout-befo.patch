@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:40:24 +0100
+Subject: [PATCH] net: ethernet: mtk_eth_soc: check the MDIO timeout before the
+ last read
+
+mtk_mdio_busy_wait() reads PHY_IAC_ACCESS and then checks the time. If
+the thread is held up between the two for longer than what is left of
+the timeout (by interrupts, or by preemption on a preemptible kernel),
+it reports a timeout for an access that finished in the meantime.
+
+Look at the clock before each read instead, so the last read is always
+made after the timeout has passed.
+
+[Based on neal.yen's (MediaTek) "fix spurious MDIO timeout", pesa1234's
+ 999-9921, which uses read_poll_timeout() and so sleeps 3-10 us between
+ reads. This keeps the busy loop, which suits an MDIO access of a few
+ tens of microseconds. On MilkFlint's kernel (PREEMPT_NONE) the window
+ takes a second of interrupts, so this is for correctness only.]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index 2d179f7..3ec4cd5 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -350,9 +350,15 @@ static int mtk_mdio_busy_wait(struct mtk_eth *eth)
+ 	unsigned long t_start = jiffies;
+ 
+ 	while (1) {
++		/* Look at the clock before reading, so the last read is made
++		 * after the timeout and an access that finished while this
++		 * thread was held up isn't reported as timed out.
++		 */
++		bool timed_out = time_after(jiffies, t_start + PHY_IAC_TIMEOUT);
++
+ 		if (!(mtk_r32(eth, MTK_PHY_IAC) & PHY_IAC_ACCESS))
+ 			return 0;
+-		if (time_after(jiffies, t_start + PHY_IAC_TIMEOUT))
++		if (timed_out)
+ 			break;
+ 		cond_resched();
+ 	}

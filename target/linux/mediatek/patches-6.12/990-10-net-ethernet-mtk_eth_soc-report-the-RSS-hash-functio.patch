@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:40:37 +0100
+Subject: [PATCH] net: ethernet: mtk_eth_soc: report the RSS hash function
+
+Since the ethtool_rxfh_param API, rxfh->hfunc is an output the core
+zeroes before calling .get_rxfh, so "if (rxfh->hfunc)" (left from the
+old u8 *hfunc pointer argument) never set it, and ethtool -x showed no
+hash function. Always report Toeplitz.
+
+[From pesa1234's tree (999-9903, which has no author line), ported to
+ OpenWrt 6.12 for MilkFlint unchanged.]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index 3ec4cd5..6060cfe 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5424,8 +5424,7 @@ static int mtk_get_rxfh(struct net_device *dev, struct ethtool_rxfh_param *rxfh)
+ 	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS) || !eth->soc->rss_num)
+ 		return -EOPNOTSUPP;
+ 
+-	if (rxfh->hfunc)
+-		rxfh->hfunc = ETH_RSS_HASH_TOP;	/* Toeplitz */
++	rxfh->hfunc = ETH_RSS_HASH_TOP;	/* Toeplitz */
+ 
+ 	if (rxfh->key)
+ 		memcpy(rxfh->key, rss_params->hash_key,

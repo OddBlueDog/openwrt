@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Mason Chang <mason-cw.chang@mediatek.com>
+Date: Fri, 2 Oct 2026 11:04:27 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: remove netsys v1 restriction for
+ small frag check
+
+All TX DMAs across all Netsys versions have a hardware limitation that
+SDL must not be less than 16, so the Netsys version check has to be
+removed.
+
+Without this patch, the TX DMA may behave unexpectedly when processing
+fragments shorter than 16 bytes.
+
+[pesa1234 999-9925, from MediaTek's SDK. Ported to OpenWrt 6.12 for
+ MilkFlint by OddBlueDog, unchanged. OpenWrt's 732-01 limited the check
+ to v1 because it treated a different symptom (QDMA FIFO overflow with
+ many small fragments), which MTK_RESV_BUF covers on MT7986. A GSO skb
+ with a fragment under 16 bytes is now segmented in software, and a
+ non-GSO skb linearized, as on v1: rare in forwarding (a GRO'd flow
+ whose last segment carried under 16 bytes of payload), and the check
+ itself is a walk over the fragments already in cache for mtk_tx_map().]
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index 6060cfe..560b056 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -1992,7 +1992,7 @@ static bool mtk_skb_has_small_frag(struct sk_buff *skb)
+ static bool mtk_skb_valid_gso(struct mtk_eth *eth, struct sk_buff *skb,
+ 			      unsigned int header_len)
+ {
+-	if (mtk_is_netsys_v1(eth) && mtk_skb_has_small_frag(skb))
++	if (mtk_skb_has_small_frag(skb))
+ 		return false;
+ 
+ 	if (!(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST))
+@@ -2074,8 +2074,7 @@ static netdev_tx_t mtk_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ send:
+ 	skb_list_walk_safe(skb, skb, next) {
+-		if ((mtk_is_netsys_v1(eth) &&
+-		     mtk_skb_has_small_frag(skb) && skb_linearize(skb)) ||
++		if ((mtk_skb_has_small_frag(skb) && skb_linearize(skb)) ||
+ 		    mtk_tx_map(skb, dev, tx_num, ring, gso, header_len) < 0) {
+ 				stats->tx_dropped++;
+ 				dev_kfree_skb_any(skb);
