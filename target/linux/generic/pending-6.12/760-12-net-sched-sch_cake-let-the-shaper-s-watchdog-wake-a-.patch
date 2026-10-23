@@ -1,0 +1,247 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 14:50:00 +0100
+Subject: [PATCH] net/sched: sch_cake: let the shaper's watchdog wake a little
+ late
+
+A shaper held back for each packet in turn takes a timer interrupt and a
+qdisc run per packet. cake_mq's sub-cakes, each at a share of the rate,
+wait for almost every packet, and more so once forwarding gets cheaper,
+as with software flow offloading.
+
+wake_slack_us (a module parameter, 0644, default 300; 0 is on time, as
+upstream) gives the watchdog's hrtimer that much slack. Woken a little
+late, a qdisc run sends every packet that came due meanwhile. The shaper
+still never sends ahead of its schedule, so the rate and cake_mq's share
+hold; a packet waits up to the slack longer (twice that if a later hold
+finds the timer already set within its range). Slack only batches packets
+that take less time than it at the rate.
+
+The default is 300 us. At a third of 800 Mbit/s, each of three cake_mq
+sub-cakes sends ~3.6 KB GRO skbs about 110 us apart, so 100 us of slack
+would rarely catch a second one.
+
+Letting the shaper send ahead of schedule instead (a window on the hold)
+batched as well, but cake_mq then ran over the rate now and then, its
+share misjudging sub-cakes that the window let drain, more so with a
+wider window.
+
+KUnit: the watchdog's hrtimer range, and a backlogged shaper driven by qdisc
+runs and late wakeups (one wakeup per packet on time, a fifth of them with
+100 us at 500 Mbit/s, none saved when a packet takes longer than the
+slack; no packet early or more than the slack late, none lost).
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2202,6 +2202,26 @@
+ 	if (!q->config->is_shared)
+ 		return next;
+ 	return min_t(u64, next, ktime_to_ns(now) + CAKE_MQ_TAU);
++}
++
++/* How late the shaper's watchdog may wake, in microseconds (hrtimer slack).
++ * A shaper held back for each packet in turn takes a timer interrupt and a
++ * qdisc run per packet: cake_mq's sub-cakes, each at a share of the rate,
++ * wait for almost every one. Woken a little late, a qdisc run sends every
++ * packet that came due meanwhile. The shaper never sends ahead of its
++ * schedule, so the rate and cake_mq's share hold: a packet just waits up to
++ * this much longer (twice, if a later hold finds the timer already set
++ * within its range). 0: on time, as upstream.
++ */
++static unsigned int wake_slack_us __read_mostly = 300;
++module_param(wake_slack_us, uint, 0644);
++MODULE_PARM_DESC(wake_slack_us, "how late the shaper's watchdog may wake (us, 0: on time)");
++
++/* Wake when the shaper lets the next packet go, give or take the slack */
++static void cake_watchdog(struct cake_sched_data *q, u64 expires)
++{
++	qdisc_watchdog_schedule_range_ns(&q->watchdog, expires,
++					 (u64)READ_ONCE(wake_slack_us) * NSEC_PER_USEC);
+ }
+ 
+ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+@@ -2247,7 +2267,7 @@
+ 					    ktime_to_ns(
+ 						   q->failsafe_next_packet));
+ 				sch->qstats.overlimits++;
+-				qdisc_watchdog_schedule_ns(&q->watchdog, next);
++				cake_watchdog(q, next);
+ 			}
+ 		}
+ 	}
+@@ -2603,7 +2623,7 @@
+ 		sch->qstats.overlimits++;
+ 		if (q->config->is_shared)
+ 			q->mq_held_at = ktime_to_ns(now);
+-		qdisc_watchdog_schedule_ns(&q->watchdog, cake_mq_wake_by(q, next, now));
++		cake_watchdog(q, cake_mq_wake_by(q, next, now));
+ 		return NULL;
+ 	}
+ 
+@@ -2780,7 +2800,7 @@
+ 
+ 		if (q->config->is_shared)
+ 			q->mq_held_at = ktime_to_ns(now);
+-		qdisc_watchdog_schedule_ns(&q->watchdog, cake_mq_wake_by(q, next, now));
++		cake_watchdog(q, cake_mq_wake_by(q, next, now));
+ 	} else if (!sch->q.qlen) {
+ 		int i;
+ 
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1505,11 +1505,125 @@
+ 	}
+ }
+ #endif
++
++/* The watchdog wakes no earlier than the shaper's next packet and at most
++ * the slack after it: an hrtimer set for that range
++ */
++static void cake_test_wake_slack(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_mq_q(mq, 0);
++	u64 at = ktime_get_ns() + 10 * NSEC_PER_SEC;
++
++	qdisc_watchdog_init(&q->watchdog, mq->sch[0]);
++	WRITE_ONCE(wake_slack_us, 100);
++	cake_watchdog(q, at);
++	KUNIT_EXPECT_TRUE(test, hrtimer_is_queued(&q->watchdog.timer));
++	KUNIT_EXPECT_EQ(test, hrtimer_get_softexpires_tv64(&q->watchdog.timer), at);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_expires_tv64(&q->watchdog.timer), at + 100 * NSEC_PER_USEC);
++
++	/* a later hold wanting it within the range leaves it be */
++	cake_watchdog(q, at - 50 * NSEC_PER_USEC);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_softexpires_tv64(&q->watchdog.timer), at);
++
++	/* on time: no slack */
++	WRITE_ONCE(wake_slack_us, 0);
++	cake_watchdog(q, at - NSEC_PER_MSEC);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_softexpires_tv64(&q->watchdog.timer), at - NSEC_PER_MSEC);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_expires_tv64(&q->watchdog.timer), at - NSEC_PER_MSEC);
++	qdisc_watchdog_cancel(&q->watchdog);
++}
++
++struct cake_test_shaped {
++	u32 wakeups;
++	u64 span;	/* first send to the last */
++	s64 early;	/* the most a packet went ahead of its schedule */
++	s64 late;	/* ... and behind it */
++};
++
++/* A backlogged shaper as qdisc runs drive it: each run sends what's due,
++ * and the watchdog, woken @slack after the next packet is due (the latest
++ * the hrtimer may fire), starts the next run. @n packets of @len bytes at
++ * @rate bytes/s.
++ */
++static struct cake_test_shaped cake_test_shape(struct kunit *test, u64 rate,
++					       u32 len, u32 n, u64 slack)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	struct cake_tin_data *b = cake_test_alloc(test, sizeof(*b));
++	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
++	struct cake_test_shaped r = {};
++	ktime_t now = CAKE_TEST_NOW, last = now;
++	u32 sent = 0;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_free_skb, skb));
++	get_cobalt_cb(skb)->adjusted_len = len;
++	q->config = cake_test_alloc(test, sizeof(*q->config));
++	cake_set_rate(b, rate, 1514, 5 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
++	q->rate_ns = b->tin_rate_ns;
++	q->rate_shft = b->tin_rate_shft;
++	q->time_next_packet = now;
++	q->failsafe_next_packet = now;
++
++	while (sent < n) {
++		r.wakeups++;
++		/* cake_dequeue()'s hard shaper */
++		while (sent < n && !(ktime_after(q->time_next_packet, now) &&
++				     ktime_after(q->failsafe_next_packet, now))) {
++			s64 ahead = ktime_to_ns(q->time_next_packet) - ktime_to_ns(now);
+ 
++			r.early = max(r.early, ahead);
++			r.late = max(r.late, -ahead);
++			cake_advance_shaper(q, b, skb, now, false);
++			last = now;
++			sent++;
++		}
++		now = ktime_add_ns(min(q->time_next_packet, q->failsafe_next_packet), slack);
++	}
++	r.span = ktime_to_ns(last) - CAKE_TEST_NOW;
++	return r;
++}
++
++/* Woken late, a run sends every packet that came due: at 500 Mbit/s a
++ * 1514-byte packet takes ~24 us, so 100 us of slack sends five a wakeup.
++ * No packet leaves early or more than the slack late, so the rate holds and
++ * none is lost. Slack shorter than a packet's time (cake_mq's share of 750
++ * Mbit/s, GRO packets of 9000 bytes: 288 us) saves nothing.
++ */
++static void cake_test_wake_slack_batches(struct kunit *test)
++{
++	u64 rate = 62500000, pkt = div64_u64(1514ULL * NSEC_PER_SEC, rate);
++	u64 slack = 100 * NSEC_PER_USEC;
++	u32 n = 3000;
++	struct cake_test_shaped r;
++
++	r = cake_test_shape(test, rate, 1514, n, 0);
++	KUNIT_EXPECT_EQ(test, r.wakeups, n);
++	KUNIT_EXPECT_EQ(test, r.early, 0);
++	KUNIT_EXPECT_EQ(test, r.late, 0);
++
++	r = cake_test_shape(test, rate, 1514, n, slack);
++	KUNIT_EXPECT_GE(test, r.wakeups, n / 5);
++	KUNIT_EXPECT_LE(test, r.wakeups, n / 5 + 1);
++	KUNIT_EXPECT_EQ(test, r.early, 0);
++	KUNIT_EXPECT_LE(test, r.late, slack);
++	KUNIT_EXPECT_GE(test, r.span, (n - 1) * (pkt - 1));
++	KUNIT_EXPECT_LE(test, r.span, (n - 1) * (pkt + 1) + slack);
++
++	r = cake_test_shape(test, 93750000 / 3, 9000, n, slack);
++	KUNIT_EXPECT_EQ(test, r.wakeups, n);
++}
++
++static unsigned int cake_test_slack;
++
+ static int cake_test_init(struct kunit *test)
+ {
+ 	int i;
+ 
++	/* the slack the module was loaded with, for after the test */
++	cake_test_slack = READ_ONCE(wake_slack_us);
++
+ 	/* as cake_init() fills it in, for a module with no qdisc yet */
+ 	quantum_div[0] = ~0;
+ 	for (i = 1; i <= CAKE_QUEUES; i++)
+@@ -1517,6 +1631,11 @@
+ 	return 0;
+ }
+ 
++static void cake_test_exit(struct kunit *test)
++{
++	WRITE_ONCE(wake_slack_us, cake_test_slack);
++}
++
+ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_hash_matches_eager),
+ 	KUNIT_CASE(cake_test_hash_reallocates_idle_flow),
+@@ -1528,6 +1647,8 @@
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ 	KUNIT_CASE(cake_test_nat_conntrack),
+ #endif
++	KUNIT_CASE(cake_test_wake_slack),
++	KUNIT_CASE(cake_test_wake_slack_batches),
+ 	KUNIT_CASE(cake_test_mq_marks_its_queue),
+ 	KUNIT_CASE(cake_test_mq_count_back_from_idle),
+ 	KUNIT_CASE(cake_test_mq_count_real_queues),
+@@ -1555,6 +1676,7 @@
+ static struct kunit_suite cake_test_suite = {
+ 	.name = "sch_cake",
+ 	.init = cake_test_init,
++	.exit = cake_test_exit,
+ 	.test_cases = cake_test_cases,
+ };
+ 
