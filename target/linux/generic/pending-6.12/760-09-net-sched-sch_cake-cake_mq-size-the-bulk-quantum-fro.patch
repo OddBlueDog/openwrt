@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 09:57:41 +0100
+Subject: [PATCH] net/sched: sch_cake: cake_mq: size the bulk quantum from the
+ whole rate
+
+760-04 gives a bulk flow's host ~244 us of the tin's rate per DRR pass with
+no-split-gso, and 760-08 shares that out between the host's bulk flows in
+all the sub-cakes. In a sub-cake the tin's rate is its share of the rate,
+so a pass shrank with the number of busy sub-cakes: with three busy
+sub-cakes, about a third of plain cake's, for about three times the
+passes per GRO packet, each with a random dither and two host loads.
+
+Work the bulk quantum out once per rate change, from the whole rate when
+the tin runs at a share. Each sub-cake then turns its flows over in the
+same ~244 us as one CAKE; DRR's ratios and the sub-cakes' weights, which
+set their shares, don't depend on it, and new flows keep the MTU quantum.
+
+KUnit: cake_test_bulk_quantum_mq.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/sch_cake.c      | 52 ++++++++++++++++++++++++++++-----------
+ net/sched/sch_cake_test.c | 45 +++++++++++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 14 deletions(-)
+
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index f0afea0..d497066 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -163,6 +163,8 @@ struct cake_tin_data {
+ 	/* cake_mq: the bulk rotation's flows, each 65535 / its host load */
+ 	u32	mq_weight;
+ 	u16	flow_quantum;
++	/* what a bulk flow's host gets back per pass: cake_set_bulk_quantum() */
++	u16	bulk_quantum;
+ 
+ 	struct cobalt_params cparams;
+ 	u32	drop_overlimit;
+@@ -842,25 +844,14 @@ static u16 cake_get_flow_quantum(struct cake_tin_data *q,
+ 	return cake_host_share(q, flow, flow_mode, q->flow_quantum);
+ }
+ 
+-/* The deficit a flow in the bulk rotation gets back on each pass. With
+- * no-split-gso, packets of up to 64 KB are scheduled whole, and with host
+- * isolation a host's bulk flows share one quantum: at 1514 bytes, a host
+- * with 12 bulk flows got 126 bytes per pass, and each 5 KB GRO packet took
+- * some 40 passes round the flow list. Give them ~244 us at the tin's rate
+- * instead (24 KB at 800 Mbit/s). DRR shares out the same for any quantum;
+- * new flows keep the MTU-sized one, so what counts as sparse is unchanged.
++/* The deficit a flow in the bulk rotation gets back on each pass: its
++ * host's part of the tin's bulk quantum (cake_set_bulk_quantum())
+  */
+ static u16 cake_get_bulk_quantum(struct cake_sched_data *qd,
+ 				 struct cake_tin_data *b,
+ 				 struct cake_flow *flow)
+ {
+-	u32 quantum = b->flow_quantum;
+-
+-	if (!(qd->config->rate_flags & CAKE_FLAG_SPLIT_GSO))
+-		quantum = max_t(u64, quantum,
+-				min_t(u64, b->tin_rate_bps >> 12, U16_MAX));
+-
+-	return cake_host_share(b, flow, qd->config->flow_mode, quantum);
++	return cake_host_share(b, flow, qd->config->flow_mode, b->bulk_quantum);
+ }
+ 
+ /* cake_mq: what a flow in the bulk rotation adds to its sub-cake's bid for
+@@ -3093,6 +3084,36 @@ static int cake_config_diffserv3(struct Qdisc *sch, u64 rate, u32 mtu)
+ 	return 0;
+ }
+ 
++/* The bulk rotation's quantum, before a host's flows share it out. With
++ * no-split-gso, packets of up to 64 KB are scheduled whole, and with host
++ * isolation a host's bulk flows share one quantum: at 1514 bytes, a host
++ * with 12 bulk flows got 126 bytes per pass, and each 5 KB GRO packet took
++ * some 40 passes round the flow list. Give them ~244 us at the tin's rate
++ * instead (24 KB at 800 Mbit/s). DRR shares out the same for any quantum;
++ * new flows keep the MTU-sized one, so what counts as sparse is unchanged.
++ *
++ * With cake_mq, @rate is this sub-cake's share, while host loads count a
++ * host's bulk flows in every sub-cake: sized from the share, a pass shrank
++ * with the number of busy sub-cakes (636 bytes for 12 flows over three,
++ * ~5.5 passes per GRO packet instead of ~1.9). Sized from the whole rate,
++ * each sub-cake turns its flows over in the same ~244 us as one CAKE. The
++ * sub-cakes' shares come from their weights, which don't depend on it.
++ */
++static void cake_set_bulk_quantum(struct cake_sched_config *q,
++				  struct cake_tin_data *b, u64 rate)
++{
++	u64 tin_rate = b->tin_rate_bps;
++
++	b->bulk_quantum = b->flow_quantum;
++	if (q->rate_flags & CAKE_FLAG_SPLIT_GSO)
++		return;
++
++	if (q->is_shared && rate && rate < q->rate_bps)
++		tin_rate = mul_u64_u64_div_u64(tin_rate, q->rate_bps, rate);
++	b->bulk_quantum = max_t(u64, b->flow_quantum,
++				min_t(u64, tin_rate >> 12, U16_MAX));
++}
++
+ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+ {
+ 	u32 mtu = likely(rate_adjust) ? 0 : psched_mtu(qdisc_dev(sch));
+@@ -3123,6 +3144,9 @@ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+ 		break;
+ 	}
+ 
++	for (c = 0; c < qd->tin_cnt; c++)
++		cake_set_bulk_quantum(q, &qd->tins[c], rate);
++
+ 	if (!rate_adjust) {
+ 		for (c = qd->tin_cnt; c < CAKE_MAX_TINS; c++) {
+ 			cake_clear_tin(sch, c);
+diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
+index 9ce4537..fcfaa88 100644
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -316,8 +316,10 @@ static u16 cake_test_bulk(struct kunit *test, u64 rate_bps, u16 flags, u16 n)
+ 	qd->config = cfg;
+ 	cfg->flow_mode = CAKE_FLOW_TRIPLE;
+ 	cfg->rate_flags = flags;
++	cfg->rate_bps = rate_bps;
+ 	b->flow_quantum = 1514;
+ 	b->tin_rate_bps = rate_bps;
++	cake_set_bulk_quantum(cfg, b, rate_bps);
+ 	return cake_get_bulk_quantum(qd, b, flow);
+ }
+ 
+@@ -340,6 +342,48 @@ static void cake_test_bulk_quantum(struct kunit *test)
+ 	KUNIT_EXPECT_LE(test, v, ((24414 * quantum_div[12]) >> 16) + 1);
+ }
+ 
++/* cake_mq: a sub-cake's tin runs at its share, but its bulk quantum is sized
++ * from the whole rate, so a host's flows spread over the sub-cakes get what
++ * they would get per pass in one CAKE
++ */
++static void cake_test_bulk_quantum_mq(struct kunit *test)
++{
++	struct cake_sched_config *cfg = cake_test_alloc(test, sizeof(*cfg));
++	struct cake_tin_data *b = cake_test_alloc(test, sizeof(*b));
++	u64 rate = 93750000, share = rate / 3;	/* 750 Mbit/s, a third each */
++
++	cfg->rate_bps = rate;
++	b->flow_quantum = 1514;
++	b->tin_rate_bps = share;
++
++	/* plain cake at the share's rate: its own */
++	cake_set_bulk_quantum(cfg, b, share);
++	KUNIT_EXPECT_EQ(test, b->bulk_quantum, share >> 12);
++
++	/* a sub-cake at a third of the rate: the whole rate's */
++	cfg->is_shared = 1;
++	cake_set_bulk_quantum(cfg, b, share);
++	KUNIT_EXPECT_EQ(test, b->bulk_quantum, rate >> 12);
++
++	/* the whole rate (one busy sub-cake): the same */
++	b->tin_rate_bps = rate;
++	cake_set_bulk_quantum(cfg, b, rate);
++	KUNIT_EXPECT_EQ(test, b->bulk_quantum, rate >> 12);
++
++	/* unlimited: the MTU quantum */
++	cfg->rate_bps = 0;
++	b->tin_rate_bps = 0;
++	cake_set_bulk_quantum(cfg, b, 0);
++	KUNIT_EXPECT_EQ(test, b->bulk_quantum, 1514);
++
++	/* split-gso keeps the MTU-sized quantum */
++	cfg->rate_bps = rate;
++	cfg->rate_flags = CAKE_FLAG_SPLIT_GSO;
++	b->tin_rate_bps = share;
++	cake_set_bulk_quantum(cfg, b, share);
++	KUNIT_EXPECT_EQ(test, b->bulk_quantum, 1514);
++}
++
+ /* cake_mq on a device with 16 tx queues, not registered. Each queue's
+  * sub-cake is a Qdisc with only what the count reads: its queue length and
+  * when it last sent a packet.
+@@ -1370,6 +1414,7 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_quantum_one_flow_exact),
+ 	KUNIT_CASE(cake_test_quantum_shared),
+ 	KUNIT_CASE(cake_test_bulk_quantum),
++	KUNIT_CASE(cake_test_bulk_quantum_mq),
+ 	KUNIT_CASE(cake_test_mq_marks_its_queue),
+ 	KUNIT_CASE(cake_test_mq_count_back_from_idle),
+ 	KUNIT_CASE(cake_test_mq_count_real_queues),

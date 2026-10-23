@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 09:58:52 +0100
+Subject: [PATCH] net/sched: sch_cake: nat mode: no flow dissection for
+ non-IPv4 with an L4 hash
+
+In nat mode every packet was dissected so cake_update_flowkeys() could put
+the conntrack tuple's addresses in its keys. That only rewrites IPv4: an
+IPv6 packet (or any other) carrying an L4 hash keeps using the hash, and
+since 760-01 the host hashes wait for a queue allocation, so its dissected
+keys went unused. The Ethernet sets an L4 hash on what it receives, so
+for IPv6 that was wasted work on every download packet.
+
+Skip the dissection for them; the flow and host tags are unchanged.
+
+KUnit: cake_test_hash_matches_eager now also runs the nat modes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/sched/sch_cake.c      | 6 ++++++
+ net/sched/sch_cake_test.c | 6 ++++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index d497066..ab4da23 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -953,6 +953,12 @@ static u32 cake_hash(struct cake_tin_data *q, const struct sk_buff *skb,
+ 	if ((!hash_flows || (use_skbhash && !nat_enabled)) && !hosts_now)
+ 		goto skip_hash;
+ 
++	/* nat mode only rewrites IPv4 keys (cake_update_flowkeys()): anything
++	 * else with an L4 hash keeps it, and its keys would go unused
++	 */
++	if (use_skbhash && !hosts_now && skb_protocol(skb, true) != htons(ETH_P_IP))
++		goto skip_hash;
++
+ 	skb_flow_dissect_flow_keys(skb, &keys,
+ 				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
+ 
+diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
+index fcfaa88..36809ec 100644
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -170,6 +170,12 @@ static void cake_test_check_flow(struct kunit *test, struct cake_tin_data *q,
+ static const int cake_test_modes[] = {
+ 	CAKE_FLOW_SRC_IP, CAKE_FLOW_DST_IP, CAKE_FLOW_HOSTS, CAKE_FLOW_FLOWS,
+ 	CAKE_FLOW_DUAL_SRC, CAKE_FLOW_DUAL_DST, CAKE_FLOW_TRIPLE,
++	/* nat: no conntrack here, so the keys stay the packet's; IPv6 (and
++	 * IPv4 without a conntrack entry) with an L4 hash keeps the hash
++	 */
++	CAKE_FLOW_FLOWS | CAKE_FLOW_NAT_FLAG,
++	CAKE_FLOW_DUAL_DST | CAKE_FLOW_NAT_FLAG,
++	CAKE_FLOW_TRIPLE | CAKE_FLOW_NAT_FLAG,
+ };
+ 
+ /* First packet (queue allocated), next packets (direct hit), for 3 hosts x
