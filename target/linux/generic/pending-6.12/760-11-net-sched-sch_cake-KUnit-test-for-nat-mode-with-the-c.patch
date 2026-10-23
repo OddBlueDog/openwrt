@@ -1,0 +1,139 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 12:30:00 +0100
+Subject: [PATCH] net/sched: sch_cake: KUnit test for nat mode with the
+ conntrack entry attached
+
+nat mode on a WAN port's root needs each masqueraded upload's conntrack
+entry to find its LAN host. Check that a packet after masquerade with its
+entry attached, as the slow path and (with 707) the flowtable's fast path
+forward it, gets the flow and host queues it had before NAT, with or
+without an RPS hash, in dual-srchost, triple-isolate and srchost; and
+that without one every LAN host gets the router's address.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1400,8 +1400,112 @@
+ 	cake_test_hosts_check(test, h);
+ 	for (round = 0; round < 2 * CAKE_QUEUES; round++)
+ 		KUNIT_ASSERT_EQ(test, atomic_read(&h->hosts[round]), 0);
++}
++
++#if IS_ENABLED(CONFIG_NF_CONNTRACK)
++#define CAKE_TEST_WAN	htonl(0xcb007101)	/* 203.0.113.1 */
++
++static void cake_test_ct_tuple(struct nf_conntrack_tuple *t, __be32 src,
++			       u16 sport, __be32 dst, u16 dport, u8 dir)
++{
++	t->src.l3num = NFPROTO_IPV4;
++	t->src.u3.ip = src;
++	t->src.u.tcp.port = htons(sport);
++	t->dst.u3.ip = dst;
++	t->dst.u.tcp.port = htons(dport);
++	t->dst.protonum = IPPROTO_TCP;
++	t->dst.dir = dir;
+ }
+ 
++/* @host's connection 192.168.1.host:40000 -> 1.1.1.1:443 after masquerade,
++ * out of 203.0.113.1:@wan_port, as wan's root CAKE gets it: with its
++ * conntrack entry attached (@ct, as the slow path and the flowtable's fast
++ * path forward it) or with none
++ */
++static struct sk_buff *cake_test_nat_skb(struct kunit *test, u8 host,
++					 u16 wan_port, bool ct, u32 l4_hash)
++{
++	struct nf_conn *c = kunit_kzalloc(test, sizeof(*c), GFP_KERNEL);
++	struct sk_buff *skb;
++
++	KUNIT_ASSERT_NOT_NULL(test, c);
++	/* the skb is freed first (last in, first out), dropping its reference */
++	skb = cake_test_skb(test, false, IPPROTO_TCP, host, 40000, l4_hash);
++	ip_hdr(skb)->saddr = CAKE_TEST_WAN;
++	tcp_hdr(skb)->source = htons(wan_port);
++	if (!ct)
++		return skb;
++
++	refcount_set(&c->ct_general.use, 1);
++	cake_test_ct_tuple(&c->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
++			   htonl(0xc0a80100 | host), 40000, htonl(0x01010101), 443,
++			   IP_CT_DIR_ORIGINAL);
++	cake_test_ct_tuple(&c->tuplehash[IP_CT_DIR_REPLY].tuple,
++			   htonl(0x01010101), 443, CAKE_TEST_WAN, wan_port,
++			   IP_CT_DIR_REPLY);
++	nf_conntrack_get(&c->ct_general);
++	nf_ct_set(skb, c, IP_CT_ESTABLISHED);
++	return skb;
++}
++
++/* The source host's tag: its host queue's, or with srchost alone (no host
++ * queues) the flow's, which is the host hash
++ */
++static u32 cake_test_src_tag(struct cake_tin_data *q, u32 idx, int flow_mode)
++{
++	return cake_dsrc(flow_mode) ? q->hosts[q->flows[idx].srchost].srchost_tag :
++				      q->tags[idx];
++}
++
++/* nat mode, upload: a masqueraded packet with its conntrack entry gets the
++ * flow and host queues it would have had before NAT, whatever its RPS hash.
++ * Without the entry (the flowtable's fast path before 707) the packet's own
++ * tuple isn't in conntrack, and every LAN host is the router's address.
++ */
++static void cake_test_nat_conntrack(struct kunit *test)
++{
++	static const int modes[] = {
++		CAKE_FLOW_DUAL_SRC | CAKE_FLOW_NAT_FLAG,
++		CAKE_FLOW_TRIPLE | CAKE_FLOW_NAT_FLAG,
++		CAKE_FLOW_SRC_IP | CAKE_FLOW_NAT_FLAG,
++	};
++	int m, host, l4;
++
++	if (!rcu_access_pointer(nf_ct_hook))
++		kunit_skip(test, "nf_conntrack isn't loaded");
++
++	for (m = 0; m < ARRAY_SIZE(modes); m++) {
++		int mode = modes[m];
++		struct cake_tin_data *pre = cake_test_alloc(test, sizeof(*pre));
++		struct cake_tin_data *post = cake_test_alloc(test, sizeof(*post));
++		struct cake_tin_data *bare = cake_test_alloc(test, sizeof(*bare));
++		u32 pre_src[2], bare_src[2];
++
++		for (host = 2; host < 4; host++)
++		for (l4 = 0; l4 < 2; l4++) {
++			u16 wan_port = 61000 + host;
++			struct sk_buff *orig = cake_test_skb(test, false, IPPROTO_TCP,
++							     host, 40000, 0);
++			struct sk_buff *nat = cake_test_nat_skb(test, host, wan_port, true,
++								l4 ? 0x5eed0000 | host : 0);
++			u32 a = cake_hash(pre, orig, mode, 0, 0);
++			u32 b = cake_hash(post, nat, mode, 0, 0);
++
++			KUNIT_EXPECT_EQ(test, post->tags[b], pre->tags[a]);
++			KUNIT_EXPECT_EQ(test, cake_test_src_tag(post, b, mode),
++					cake_test_src_tag(pre, a, mode));
++			pre_src[host - 2] = cake_test_src_tag(pre, a, mode);
++
++			nat = cake_test_nat_skb(test, host, wan_port, false, 0);
++			b = cake_hash(bare, nat, mode, 0, 0);
++			bare_src[host - 2] = cake_test_src_tag(bare, b, mode);
++		}
++		KUNIT_EXPECT_NE(test, pre_src[0], pre_src[1]);
++		KUNIT_EXPECT_EQ(test, bare_src[0], bare_src[1]);
++	}
++}
++#endif
++
+ static int cake_test_init(struct kunit *test)
+ {
+ 	int i;
+@@ -1421,6 +1525,9 @@
+ 	KUNIT_CASE(cake_test_quantum_shared),
+ 	KUNIT_CASE(cake_test_bulk_quantum),
+ 	KUNIT_CASE(cake_test_bulk_quantum_mq),
++#if IS_ENABLED(CONFIG_NF_CONNTRACK)
++	KUNIT_CASE(cake_test_nat_conntrack),
++#endif
+ 	KUNIT_CASE(cake_test_mq_marks_its_queue),
+ 	KUNIT_CASE(cake_test_mq_count_back_from_idle),
+ 	KUNIT_CASE(cake_test_mq_count_real_queues),

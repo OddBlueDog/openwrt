@@ -1,0 +1,278 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 12:30:00 +0100
+Subject: [PATCH] netfilter: flowtable: attach the conntrack entry to fast path
+ packets
+
+A packet the slow path forwards leaves with its conntrack entry attached;
+one the flowtable's software fast path forwards leaves with none. What
+comes after the flowtable then has to look the entry up from the packet's
+own tuple, and after NAT that tuple is in neither of the entry's
+directions. sch_cake's nat mode does that lookup to tell the LAN hosts
+behind masquerade apart: with uploads offloaded, every one of them looked
+like the router's own address, and dual-srchost, srchost and
+triple-isolate lost their per-host fairness on the WAN port (two hosts
+with 1 and 4 TCP flows got 20/80 instead of 50/50).
+
+Attach the flow's entry, established in its direction, as act_ct's flow
+table does, unless the packet already has conntrack state. It costs a
+reference taken and dropped per packet, as on the slow path.
+
+A KUnit suite (CONFIG_NF_FLOW_TABLE_KUNIT_TEST) checks the entry, its
+direction and reference, that existing state is kept, and that
+nf_ct_get_tuple_skb() gives the pre-NAT tuple of the packet's direction.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -734,6 +734,15 @@
+ 
+ 	  To compile it as a module, choose M here.
+ 
++config NF_FLOW_TABLE_KUNIT_TEST
++	bool "KUnit tests for the flow table's fast path" if !KUNIT_ALL_TESTS
++	depends on NF_FLOW_TABLE && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for what the flow table's software fast path leaves on
++	  a forwarded packet, built into the nf_flow_table module and run
++	  when it loads.
++
+ config NF_FLOW_TABLE_PROCFS
+ 	bool "Supply flow table statistics in procfs"
+ 	depends on NF_FLOW_TABLE
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -14,6 +14,7 @@
+ #include <net/ip6_route.h>
+ #include <net/neighbour.h>
+ #include <net/netfilter/nf_flow_table.h>
++#include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_acct.h>
+ /* For layer 4 checksum field offset. */
+ #include <linux/tcp.h>
+@@ -361,6 +362,25 @@
+ 		return NULL;
+ 
+ 	return flow_offload_lookup(flow_table, &tuple);
++}
++
++/* The slow path forwards a packet with its conntrack entry attached: give
++ * one that takes the fast path the same, as act_ct's flow table does. What
++ * comes after can't always look the entry up again: after NAT the packet's
++ * own tuple is in neither of its directions. sch_cake's nat mode, which
++ * tells the LAN hosts behind masquerade apart by the entry, would otherwise
++ * see every upload as coming from the router's own address.
++ */
++static void nf_flow_skb_set_ct(struct sk_buff *skb,
++			       const struct flow_offload *flow,
++			       enum flow_offload_tuple_dir dir)
++{
++	if (skb->_nfct)
++		return;
++
++	nf_conntrack_get(&flow->ct->ct_general);
++	nf_ct_set(skb, flow->ct, dir == FLOW_OFFLOAD_DIR_ORIGINAL ?
++		  IP_CT_ESTABLISHED : IP_CT_ESTABLISHED_REPLY);
+ }
+ 
+ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+@@ -407,6 +427,8 @@
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+ 		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
+ 
++	nf_flow_skb_set_ct(skb, flow, dir);
++
+ 	return 1;
+ }
+ 
+@@ -685,6 +707,8 @@
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+ 		nf_ct_acct_update(flow->ct, tuplehash->tuple.dir, skb->len);
+ 
++	nf_flow_skb_set_ct(skb, flow, dir);
++
+ 	return 1;
+ }
+ 
+@@ -766,3 +790,7 @@
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(nf_flow_offload_ipv6_hook);
++
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE_KUNIT_TEST)
++#include "nf_flow_table_ip_test.c"
++#endif
+--- /dev/null
++++ b/net/netfilter/nf_flow_table_ip_test.c
+@@ -0,0 +1,170 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* KUnit tests for the flow table's software fast path: a packet it forwards
++ * leaves with its conntrack entry attached, as one from the slow path does.
++ * Built into nf_flow_table.ko (#included at the end of nf_flow_table_ip.c)
++ * when CONFIG_NF_FLOW_TABLE_KUNIT_TEST is set; the suite runs when it loads.
++ */
++#include <kunit/test.h>
++
++#define NF_FLOW_TEST_LAN	htonl(0xc0a8010a)	/* 192.168.1.10 */
++#define NF_FLOW_TEST_SERVER	htonl(0x01010101)	/* 1.1.1.1 */
++#define NF_FLOW_TEST_WAN	htonl(0xcb007101)	/* 203.0.113.1 */
++
++static void nf_flow_test_tuple(struct nf_conntrack_tuple *t, __be32 src,
++			       u16 sport, __be32 dst, u16 dport, u8 dir)
++{
++	t->src.l3num = NFPROTO_IPV4;
++	t->src.u3.ip = src;
++	t->src.u.tcp.port = htons(sport);
++	t->dst.u3.ip = dst;
++	t->dst.u.tcp.port = htons(dport);
++	t->dst.protonum = IPPROTO_TCP;
++	t->dst.dir = dir;
++}
++
++/* A masqueraded TCP connection, 192.168.1.10:40000 -> 1.1.1.1:443 sent from
++ * 203.0.113.1:61000, held by its flow table entry: only what the fast path
++ * and the entry's users touch is filled in.
++ */
++static struct flow_offload *nf_flow_test_flow(struct kunit *test)
++{
++	struct flow_offload *flow = kunit_kzalloc(test, sizeof(*flow), GFP_KERNEL);
++	struct nf_conn *ct = kunit_kzalloc(test, sizeof(*ct), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, flow);
++	KUNIT_ASSERT_NOT_NULL(test, ct);
++	refcount_set(&ct->ct_general.use, 1);
++	nf_flow_test_tuple(&ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple,
++			   NF_FLOW_TEST_LAN, 40000, NF_FLOW_TEST_SERVER, 443,
++			   IP_CT_DIR_ORIGINAL);
++	nf_flow_test_tuple(&ct->tuplehash[IP_CT_DIR_REPLY].tuple,
++			   NF_FLOW_TEST_SERVER, 443, NF_FLOW_TEST_WAN, 61000,
++			   IP_CT_DIR_REPLY);
++	flow->ct = ct;
++	return flow;
++}
++
++static void nf_flow_test_free_skb(void *skb)
++{
++	kfree_skb(skb);
++}
++
++/* freed before the flow (test resources go last in, first out) */
++static struct sk_buff *nf_flow_test_skb(struct kunit *test)
++{
++	struct sk_buff *skb = alloc_skb(64, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, nf_flow_test_free_skb, skb));
++	return skb;
++}
++
++static unsigned int nf_flow_test_refs(const struct flow_offload *flow)
++{
++	return refcount_read(&flow->ct->ct_general.use);
++}
++
++/* Each direction gets the entry as established, the reply direction as
++ * such, with a reference of its own
++ */
++static void nf_flow_test_set_ct(struct kunit *test)
++{
++	struct flow_offload *flow = nf_flow_test_flow(test);
++	struct sk_buff *skb = nf_flow_test_skb(test);
++	enum ip_conntrack_info ctinfo;
++
++	nf_flow_skb_set_ct(skb, flow, FLOW_OFFLOAD_DIR_ORIGINAL);
++	KUNIT_EXPECT_PTR_EQ(test, nf_ct_get(skb, &ctinfo), flow->ct);
++	KUNIT_EXPECT_EQ(test, ctinfo, IP_CT_ESTABLISHED);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(flow), 2);
++
++	nf_reset_ct(skb);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(flow), 1);
++
++	nf_flow_skb_set_ct(skb, flow, FLOW_OFFLOAD_DIR_REPLY);
++	KUNIT_EXPECT_PTR_EQ(test, nf_ct_get(skb, &ctinfo), flow->ct);
++	KUNIT_EXPECT_EQ(test, ctinfo, IP_CT_ESTABLISHED_REPLY);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(flow), 2);
++}
++
++/* The packet's reference goes with it */
++static void nf_flow_test_put_with_skb(struct kunit *test)
++{
++	struct flow_offload *flow = nf_flow_test_flow(test);
++	struct sk_buff *skb = alloc_skb(64, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	nf_flow_skb_set_ct(skb, flow, FLOW_OFFLOAD_DIR_ORIGINAL);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(flow), 2);
++	kfree_skb(skb);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(flow), 1);
++}
++
++/* A packet that already has conntrack state (an entry of its own, or none
++ * on purpose) keeps it
++ */
++static void nf_flow_test_keeps_ct(struct kunit *test)
++{
++	struct flow_offload *flow = nf_flow_test_flow(test);
++	struct flow_offload *other = nf_flow_test_flow(test);
++	struct sk_buff *skb = nf_flow_test_skb(test);
++	enum ip_conntrack_info ctinfo;
++
++	nf_conntrack_get(&other->ct->ct_general);
++	nf_ct_set(skb, other->ct, IP_CT_NEW);
++	nf_flow_skb_set_ct(skb, flow, FLOW_OFFLOAD_DIR_ORIGINAL);
++	KUNIT_EXPECT_PTR_EQ(test, nf_ct_get(skb, &ctinfo), other->ct);
++	KUNIT_EXPECT_EQ(test, ctinfo, IP_CT_NEW);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(flow), 1);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(other), 2);
++
++	nf_reset_ct(skb);
++	nf_ct_set(skb, NULL, IP_CT_UNTRACKED);
++	nf_flow_skb_set_ct(skb, flow, FLOW_OFFLOAD_DIR_ORIGINAL);
++	KUNIT_EXPECT_NULL(test, nf_ct_get(skb, &ctinfo));
++	KUNIT_EXPECT_EQ(test, ctinfo, IP_CT_UNTRACKED);
++	KUNIT_EXPECT_EQ(test, nf_flow_test_refs(flow), 1);
++}
++
++/* What sch_cake's nat mode asks for, nf_ct_get_tuple_skb(), is then the
++ * tuple of the packet's own direction from before NAT: a masqueraded
++ * upload comes from its LAN host again, a download is to the router's
++ * address as it arrived
++ */
++static void nf_flow_test_tuple_skb(struct kunit *test)
++{
++	struct flow_offload *flow = nf_flow_test_flow(test);
++	struct sk_buff *skb = nf_flow_test_skb(test);
++	struct nf_conntrack_tuple t;
++
++	nf_flow_skb_set_ct(skb, flow, FLOW_OFFLOAD_DIR_ORIGINAL);
++	memset(&t, 0, sizeof(t));
++	KUNIT_ASSERT_TRUE(test, nf_ct_get_tuple_skb(&t, skb));
++	KUNIT_EXPECT_EQ(test, t.src.u3.ip, NF_FLOW_TEST_LAN);
++	KUNIT_EXPECT_EQ(test, t.src.u.tcp.port, htons(40000));
++	KUNIT_EXPECT_EQ(test, t.dst.u3.ip, NF_FLOW_TEST_SERVER);
++	KUNIT_EXPECT_EQ(test, t.dst.u.tcp.port, htons(443));
++
++	nf_reset_ct(skb);
++	nf_flow_skb_set_ct(skb, flow, FLOW_OFFLOAD_DIR_REPLY);
++	memset(&t, 0, sizeof(t));
++	KUNIT_ASSERT_TRUE(test, nf_ct_get_tuple_skb(&t, skb));
++	KUNIT_EXPECT_EQ(test, t.src.u3.ip, NF_FLOW_TEST_SERVER);
++	KUNIT_EXPECT_EQ(test, t.dst.u3.ip, NF_FLOW_TEST_WAN);
++	KUNIT_EXPECT_EQ(test, t.dst.u.tcp.port, htons(61000));
++}
++
++static struct kunit_case nf_flow_test_cases[] = {
++	KUNIT_CASE(nf_flow_test_set_ct),
++	KUNIT_CASE(nf_flow_test_put_with_skb),
++	KUNIT_CASE(nf_flow_test_keeps_ct),
++	KUNIT_CASE(nf_flow_test_tuple_skb),
++	{}
++};
++
++static struct kunit_suite nf_flow_test_suite = {
++	.name = "nf_flow_table",
++	.test_cases = nf_flow_test_cases,
++};
++
++kunit_test_suite(nf_flow_test_suite);

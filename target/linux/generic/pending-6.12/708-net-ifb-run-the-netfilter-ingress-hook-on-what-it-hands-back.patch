@@ -1,0 +1,253 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 12:30:00 +0100
+Subject: [PATCH] net: ifb: run the netfilter ingress hook on what it hands
+ back
+
+Ingress shaping redirects a packet to ifb from its device's tc ingress,
+which runs before the device's netfilter ingress hook, and the receive
+path skips both for what ifb hands back (tc_skip_classify). A flowtable's
+fast path, which lives on that hook, so never saw shaped traffic: with
+sqm-scripts' ifb shaping, software flow offloading only ever offloaded
+uploads, and every download took the slow path.
+
+Run the device's netfilter ingress hook on the packet before handing it
+back, when the device has one. It can't send the packet round again:
+netfilter's fwd and dup don't mark it redirected, and ifb_xmit() drops
+what isn't. Without a hook nothing changes.
+
+A KUnit suite (CONFIG_IFB_KUNIT_TEST) checks the hook runs once, on the
+packet's device and from its network header, and what ifb does when the
+hook accepts, steals or drops it.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -161,6 +161,15 @@
+ 	  'ifb1' etc.
+ 	  Look at the iproute2 documentation directory for usage etc
+ 
++config IFB_KUNIT_TEST
++	bool "KUnit tests for ifb" if !KUNIT_ALL_TESTS
++	depends on IFB && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for the netfilter ingress hook ifb runs on what it
++	  hands back to the receive path, built into the ifb module and run
++	  when it loads.
++
+ source "drivers/net/team/Kconfig"
+ 
+ config MACVLAN
+--- a/drivers/net/ifb.c
++++ b/drivers/net/ifb.c
+@@ -86,6 +86,27 @@
+ 	u64_stats_update_end(&stats->sync);
+ }
+ 
++/* tc's ingress redirected the packet here before its device's netfilter
++ * ingress hook saw it, and the receive path skips both for what ifb hands
++ * back (tc_skip_classify). Run that hook now, so a flowtable on the device
++ * can still take shaped traffic onto its fast path. It can't send the packet
++ * round again: netfilter's fwd and dup don't mark it redirected, and
++ * ifb_xmit() drops what isn't. Below zero: the hook took or dropped it.
++ */
++static int ifb_nf_ingress(struct sk_buff *skb)
++{
++	int ret;
++
++	if (!nf_hook_ingress_active(skb))
++		return 0;
++
++	skb_reset_network_header(skb);
++	rcu_read_lock();
++	ret = nf_hook_ingress(skb);
++	rcu_read_unlock();
++	return ret;
++}
++
+ static void ifb_ri_tasklet(struct tasklet_struct *t)
+ {
+ 	struct ifb_q_private *txp = from_tasklet(txp, t, ifb_tasklet);
+@@ -128,6 +149,8 @@
+ 			dev_queue_xmit(skb);
+ 		} else {
+ 			skb_pull_rcsum(skb, skb->mac_len);
++			if (ifb_nf_ingress(skb) < 0)
++				continue;
+ 			netif_receive_skb(skb);
+ 		}
+ 	}
+@@ -456,3 +479,7 @@
+ MODULE_DESCRIPTION("Intermediate Functional Block (ifb) netdevice driver for sharing of resources and ingress packet queuing");
+ MODULE_AUTHOR("Jamal Hadi Salim");
+ MODULE_ALIAS_RTNL_LINK("ifb");
++
++#if IS_ENABLED(CONFIG_IFB_KUNIT_TEST)
++#include "ifb_test.c"
++#endif
+--- /dev/null
++++ b/drivers/net/ifb_test.c
+@@ -0,0 +1,162 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/* KUnit tests for the netfilter ingress hook ifb runs on what it hands back
++ * to the receive path. Built into ifb.ko (#included at the end of ifb.c)
++ * when CONFIG_IFB_KUNIT_TEST is set; the suite runs when it loads.
++ */
++#include <kunit/test.h>
++#include <linux/ip.h>
++
++/* the tests' packets; anything else on lo is left alone */
++#define IFB_TEST_MARK	0x1fb0cafe
++
++struct ifb_test_hook {
++	struct nf_hook_ops ops;
++	unsigned int verdict;
++	int seen;
++	const struct net_device *in;
++	int network_offset;
++};
++
++static unsigned int ifb_test_hookfn(void *priv, struct sk_buff *skb,
++				    const struct nf_hook_state *state)
++{
++	struct ifb_test_hook *h = priv;
++
++	if (skb->mark != IFB_TEST_MARK)
++		return NF_ACCEPT;
++
++	h->seen++;
++	h->in = state->in;
++	h->network_offset = skb_network_offset(skb);
++	if (h->verdict == NF_STOLEN)
++		kfree_skb(skb);
++	return h->verdict;
++}
++
++static void ifb_test_unregister(void *h)
++{
++	nf_unregister_net_hook(&init_net, &((struct ifb_test_hook *)h)->ops);
++}
++
++/* A netfilter ingress hook on lo, as a flowtable's is on a WAN port */
++static struct ifb_test_hook *ifb_test_hook(struct kunit *test,
++					   unsigned int verdict)
++{
++	struct ifb_test_hook *h;
++
++	if (!IS_ENABLED(CONFIG_NETFILTER_INGRESS))
++		kunit_skip(test, "no netfilter ingress hook in this kernel");
++	h = kunit_kzalloc(test, sizeof(*h), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	h->verdict = verdict;
++	h->ops.hook = ifb_test_hookfn;
++	h->ops.priv = h;
++	h->ops.pf = NFPROTO_NETDEV;
++	h->ops.hooknum = NF_NETDEV_INGRESS;
++	h->ops.dev = init_net.loopback_dev;
++	KUNIT_ASSERT_EQ(test, 0, nf_register_net_hook(&init_net, &h->ops));
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, ifb_test_unregister, h));
++	return h;
++}
++
++static void ifb_test_free_skb(void *skb)
++{
++	kfree_skb(skb);
++}
++
++/* An IPv4 packet as ifb_ri_tasklet() has it: back on the device it came
++ * in on, its Ethernet header pulled, the network header left where a
++ * GSO split or a mirred push may have put it (here on the MAC header)
++ */
++static struct sk_buff *ifb_test_skb(struct kunit *test)
++{
++	struct sk_buff *skb = alloc_skb(128, GFP_KERNEL);
++	struct iphdr *iph;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	skb_reserve(skb, 32);
++	skb_reset_mac_header(skb);
++	skb_put_zero(skb, ETH_HLEN);
++	skb_pull(skb, ETH_HLEN);
++	iph = skb_put_zero(skb, sizeof(*iph));
++	iph->version = 4;
++	iph->ihl = 5;
++	iph->ttl = 64;
++	iph->protocol = IPPROTO_UDP;
++	iph->tot_len = htons(sizeof(*iph));
++	skb->protocol = htons(ETH_P_IP);
++	skb->dev = init_net.loopback_dev;
++	skb->mark = IFB_TEST_MARK;
++	skb_set_network_header(skb, -ETH_HLEN);
++	return skb;
++}
++
++static int ifb_test_run(struct sk_buff *skb)
++{
++	int ret;
++
++	/* as from ifb's tasklet */
++	local_bh_disable();
++	ret = ifb_nf_ingress(skb);
++	local_bh_enable();
++	return ret;
++}
++
++/* No hook on the device: nothing to run, the packet goes on */
++static void ifb_test_no_hook(struct kunit *test)
++{
++	struct sk_buff *skb = ifb_test_skb(test);
++
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, ifb_test_free_skb, skb));
++	KUNIT_EXPECT_EQ(test, ifb_test_run(skb), 0);
++}
++
++/* The hook sees the packet once, on its own device, from the network
++ * header; accepted, it goes on to the receive path
++ */
++static void ifb_test_accept(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_ACCEPT);
++	struct sk_buff *skb = ifb_test_skb(test);
++
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, ifb_test_free_skb, skb));
++	KUNIT_EXPECT_GT(test, ifb_test_run(skb), 0);
++	KUNIT_EXPECT_EQ(test, h->seen, 1);
++	KUNIT_EXPECT_PTR_EQ(test, h->in, init_net.loopback_dev);
++	KUNIT_EXPECT_EQ(test, h->network_offset, 0);
++}
++
++/* Taken by the hook (the flowtable's fast path sent it on): ifb mustn't
++ * touch it again
++ */
++static void ifb_test_stolen(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_STOLEN);
++
++	KUNIT_EXPECT_LT(test, ifb_test_run(ifb_test_skb(test)), 0);
++	KUNIT_EXPECT_EQ(test, h->seen, 1);
++}
++
++/* Dropped by the hook: netfilter freed it */
++static void ifb_test_drop(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_DROP);
++
++	KUNIT_EXPECT_LT(test, ifb_test_run(ifb_test_skb(test)), 0);
++	KUNIT_EXPECT_EQ(test, h->seen, 1);
++}
++
++static struct kunit_case ifb_test_cases[] = {
++	KUNIT_CASE(ifb_test_no_hook),
++	KUNIT_CASE(ifb_test_accept),
++	KUNIT_CASE(ifb_test_stolen),
++	KUNIT_CASE(ifb_test_drop),
++	{}
++};
++
++static struct kunit_suite ifb_test_suite = {
++	.name = "ifb",
++	.test_cases = ifb_test_cases,
++};
++
++kunit_test_suite(ifb_test_suite);
