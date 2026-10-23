@@ -751,7 +751,12 @@ function iface_reload_config(name, phydev, config, old_config)
 				hostapd.printf(`Could not update config data files for bss ${ifname}`);
 				return false;
 			} else {
-				bss.ctrl("RELOAD_WPA_PSK");
+				// RELOAD_WPA_PSK disconnects every station whose PMK is not
+				// in the PSK list, so every SAE station: only send it when a
+				// file's contents changed, not when only its path did (a
+				// renamed BSS)
+				if (!is_equal(config.bss[i].hash, bss_list_cfg[i].hash))
+					bss.ctrl("RELOAD_WPA_PSK");
 				continue;
 			}
 		}
