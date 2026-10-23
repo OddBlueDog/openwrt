@@ -1,0 +1,54 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 19:00:00 +0100
+Subject: [PATCH] wifi: mac80211: keep counting txq schedule rounds after a
+ blocked one
+
+ieee80211_txq_schedule_start() sets the AC's round to 0 when the AC is
+over its AQL budget (no txq is handed out), and the next start counted on
+from there, so rounds restarted at 1 after every blocked one. A txq
+served in an earlier round 1 then matched the new round at the head of
+the list, and ieee80211_next_txq() took it for served already and ended
+the round without handing out anything: it doesn't look past the head.
+
+With one station busy on an AC, every burst that fills the AQL budget
+blocks the next start, so this happened on about every third refill. A
+driver that stops at an empty round (mt76) then waits for its next
+wake-up, a new frame or a completion; when the skipped round came from
+the last completion, the frames left waited for unrelated traffic or the
+sender's retransmission timer.
+
+Keep the running count in last_schedule_round and leave 0 to mean
+"blocked", which is all ieee80211_next_txq() reads it for.
+
+---
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1421,6 +1421,7 @@ struct ieee80211_local {
+ 	spinlock_t active_txq_lock[IEEE80211_NUM_ACS];
+ 	struct list_head active_txqs[IEEE80211_NUM_ACS];
+ 	u16 schedule_round[IEEE80211_NUM_ACS];
++	u16 last_schedule_round[IEEE80211_NUM_ACS];
+ 
+ 	/* serializes ieee80211_handle_wake_tx_queue */
+ 	spinlock_t handle_wake_tx_queue_lock;
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -4326,9 +4326,16 @@ void ieee80211_txq_schedule_start(struct ieee80211_hw 
+ 	spin_lock_bh(&local->active_txq_lock[ac]);
+ 
+ 	if (ieee80211_txq_schedule_airtime_check(local, ac)) {
+-		local->schedule_round[ac]++;
++		/*
++		 * Count on from the last round that ran: restarting at 1
++		 * after a round the AC's limit blocked (0) would match the
++		 * round a txq was last served in, and next_txq() would take
++		 * it for served already and end the round without serving
++		 * anyone.
++		 */
++		local->schedule_round[ac] = ++local->last_schedule_round[ac];
+ 		if (!local->schedule_round[ac])
+-			local->schedule_round[ac]++;
++			local->schedule_round[ac] = ++local->last_schedule_round[ac];
+ 	} else {
+ 		local->schedule_round[ac] = 0;
+ 	}
