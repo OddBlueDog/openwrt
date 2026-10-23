@@ -1,0 +1,125 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 23 Oct 2026 19:00:00 +0100
+Subject: [PATCH] wifi: mac80211: aqm debugfs: right drop counters, CoDel's
+ target and interval
+
+The aqm file printed fq->overmemory as fq_overlimit and fq->overlimit as
+fq_overmemory. fq->overlimit counts every drop for space, fq->overmemory
+those for memory, so "fq_overmemory" showed all drops.
+
+CoDel's target (20 ms) and interval (100 ms) are fixed for every txq of a
+radio. With the radio as the bottleneck a bulk flow keeps up to the target
+of standing queue in mac80211 on top of the AQL limit. Make both readable
+and writable there, in us, to try other values at runtime:
+
+  echo "codel_target_us 5000" > /sys/kernel/debug/ieee80211/phy1/aqm
+
+The target must stay above 0 and below the interval, the interval at most
+a second. The defaults don't change.
+
+---
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -72,6 +72,12 @@ DEBUGFS_READONLY_FILE(rate_ctrl_alg, "%s",
+ DEBUGFS_READONLY_FILE(rate_ctrl_alg, "%s",
+ 	local->rate_ctrl ? local->rate_ctrl->ops->name : "hw/driver");
+ 
++/* CoDel's times are in units of 1.024 us: rounded both ways to round-trip */
++static u32 aqm_codel_to_us(codel_time_t t)
++{
++	return DIV_ROUND_CLOSEST_ULL((u64)t << CODEL_SHIFT, NSEC_PER_USEC);
++}
++
+ static ssize_t aqm_read(struct file *file,
+ 			char __user *user_buf,
+ 			size_t count,
+@@ -79,7 +85,7 @@ static ssize_t aqm_read(struct file *file,
+ {
+ 	struct ieee80211_local *local = file->private_data;
+ 	struct fq *fq = &local->fq;
+-	char buf[200];
++	char buf[400];
+ 	int len = 0;
+ 
+ 	spin_lock_bh(&local->fq.lock);
+@@ -94,16 +100,20 @@ static ssize_t aqm_read(struct file *file,
+ 			"R fq_memory_usage %u\n"
+ 			"RW fq_memory_limit %u\n"
+ 			"RW fq_limit %u\n"
+-			"RW fq_quantum %u\n",
++			"RW fq_quantum %u\n"
++			"RW codel_target_us %u\n"
++			"RW codel_interval_us %u\n",
+ 			fq->flows_cnt,
+ 			fq->backlog,
+-			fq->overmemory,
+ 			fq->overlimit,
++			fq->overmemory,
+ 			fq->collisions,
+ 			fq->memory_usage,
+ 			fq->memory_limit,
+ 			fq->limit,
+-			fq->quantum);
++			fq->quantum,
++			aqm_codel_to_us(local->cparams.target),
++			aqm_codel_to_us(local->cparams.interval));
+ 
+ 	spin_unlock_bh(&local->fq.lock);
+ 
+@@ -111,6 +121,31 @@ static ssize_t aqm_read(struct file *file,
+ 				       buf, len);
+ }
+ 
++/*
++ * CoDel's target and interval for every txq of the radio, in us: the target
++ * above 0 and below the interval, the interval up to a second.
++ */
++static int aqm_write_codel(struct ieee80211_local *local, bool target, u32 us)
++{
++	codel_time_t t = DIV_ROUND_CLOSEST_ULL((u64)us * NSEC_PER_USEC,
++					       1 << CODEL_SHIFT);
++	int ret = 0;
++
++	if (!t || us > USEC_PER_SEC)
++		return -EINVAL;
++
++	spin_lock_bh(&local->fq.lock);
++	if (target ? t >= local->cparams.interval : t <= local->cparams.target)
++		ret = -EINVAL;
++	else if (target)
++		local->cparams.target = t;
++	else
++		local->cparams.interval = t;
++	spin_unlock_bh(&local->fq.lock);
++
++	return ret;
++}
++
+ static ssize_t aqm_write(struct file *file,
+ 			 const char __user *user_buf,
+ 			 size_t count,
+@@ -118,6 +153,8 @@ static ssize_t aqm_write(struct file *file,
+ {
+ 	struct ieee80211_local *local = file->private_data;
+ 	char buf[100];
++	u32 us;
++	int ret;
+ 
+ 	if (count >= sizeof(buf))
+ 		return -EINVAL;
+@@ -136,8 +173,14 @@ static ssize_t aqm_write(struct file *file,
+ 		return count;
+ 	else if (sscanf(buf, "fq_quantum %u", &local->fq.quantum) == 1)
+ 		return count;
++	else if (sscanf(buf, "codel_target_us %u", &us) == 1)
++		ret = aqm_write_codel(local, true, us);
++	else if (sscanf(buf, "codel_interval_us %u", &us) == 1)
++		ret = aqm_write_codel(local, false, us);
++	else
++		ret = -EINVAL;
+ 
+-	return -EINVAL;
++	return ret ?: count;
+ }
+ 
+ static const struct file_operations aqm_ops = {
