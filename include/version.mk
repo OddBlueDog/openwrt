@@ -114,3 +114,10 @@ VERSION_SED_SCRIPT:=$(SED) 's,%U,$(call sed_escape,$(VERSION_REPO)),g' \
 	-e 's,%P,$(call sed_escape,$(VERSION_PRODUCT)),g' \
 	-e 's,%h,$(call sed_escape,$(VERSION_HWREV)),g' \
 	-e 's,%B,$(call sed_escape,$(SOURCE_DATE_EPOCH)),g'
+
+# MilkFlint: %O is " (OpenWrt 25.12.6)", the OpenWrt release under a build
+# with its own CONFIG_VERSION_NUMBER, read from the tree's release tag. It's
+# empty when the build keeps OpenWrt's version number.
+VERSION_OPENWRT:=$(patsubst v%,%,$(shell git -C "$(TOPDIR)" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null))
+VERSION_BASE:=$(if $(VERSION_OPENWRT),$(if $(filter-out $(VERSION_OPENWRT),$(VERSION_NUMBER)),$(space)(OpenWrt $(VERSION_OPENWRT))))
+VERSION_SED_SCRIPT += -e 's,%O,$(call sed_escape,$(VERSION_BASE)),g'
