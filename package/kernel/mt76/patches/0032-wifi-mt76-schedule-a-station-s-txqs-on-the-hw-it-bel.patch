@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:30:42 +0100
+Subject: [PATCH] wifi: mt76: schedule a station's txqs on the hw it belongs to
+
+mt76_tx_check_non_aql() re-armed a station's txqs on dev->hw. With DBDC
+chips such as MT7986 the second band is a separate ieee80211_hw, so a
+station on it was put on band 0's active txq list, under band 0's
+active_txq_lock, while band 1's mac80211 kept using the same txq with
+its own. mt76_txq_schedule_list() then switched phy to the station's
+and kept calling ieee80211_next_txq() on the other hw for the rest of
+the pass.
+
+Re-arm on the station's own hw, and keep iterating the hw the
+scheduling round was started on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tx.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/tx.c b/tx.c
+index 0060cfa8..05d73ac4 100644
+--- a/tx.c
++++ b/tx.c
+@@ -253,7 +253,8 @@ mt76_tx_check_non_aql(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 		if (!sta->txq[i])
+ 			continue;
+ 
+-		ieee80211_schedule_txq(dev->hw, sta->txq[i]);
++		ieee80211_schedule_txq(mt76_phy_hw(dev, wcid->phy_idx),
++				       sta->txq[i]);
+ 	}
+ }
+ 
+@@ -572,6 +573,7 @@ out:
+ static int
+ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
+ {
++	struct ieee80211_hw *hw = phy->hw;
+ 	struct mt76_dev *dev = phy->dev;
+ 	struct ieee80211_txq *txq;
+ 	struct mt76_txq *mtxq;
+@@ -582,7 +584,8 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
+ 	while (1) {
+ 		int n_frames = 0;
+ 
+-		txq = ieee80211_next_txq(phy->hw, qid);
++		/* keep iterating the hw that schedule_start() was called on */
++		txq = ieee80211_next_txq(hw, qid);
+ 		if (!txq)
+ 			break;
+ 

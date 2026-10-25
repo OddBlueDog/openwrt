@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:02:02 +0100
+Subject: [PATCH] wifi: mt76: mt7915: hold the driver mutex for station events
+ and settings
+
+mac80211 calls sta_event (association, authorization, disassociation)
+and the 4addr, decap offload and airtime weight ops under the band's
+own wiphy lock only. On the MT7986 the two bands are two wiphys, and
+the same station's firmware entry, WTBL and wcid flags are also written
+under the driver mutex by the other band's roaming check
+(__mt7915_drop_sta()) and by a reset. An association could send its
+firmware commands in the middle of an L1 recovery, and the other band
+could clear wcid.sta/tx_info while this one set them.
+
+Take dev->mt76.mutex around them, as mt7996 does for sta_event, 4addr
+and decap. mt7915_drop_other_sta() stays outside: it takes the mutex
+itself. The disassociation's TWT teardown no longer locks on its own.
+
+mt7915_main_test_sta_event_locked checks that every firmware command of
+these goes out with the mutex held (the fake firmware now records it).
+
+Reported as a suggestion by another review; checked in the code. The
+WTBL window register race it also named doesn't happen here: every
+caller passes a station wcid, and those are below 128 (group 0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/main.c            | 60 ++++++++++++++++++++++++++++------------
+ mt7915/tests/main-test.c | 44 +++++++++++++++++++++++++++++
+ tests/fake.h             |  2 ++
+ 3 files changed, 88 insertions(+), 18 deletions(-)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index afd358a9..22897c02 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -885,14 +885,16 @@ mt7915_drop_other_sta(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 	ieee80211_iterate_active_interfaces(data.hw, 0, __mt7915_drop_sta, &data);
+ }
+ 
+-int mt7915_mac_sta_event(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+-			 struct ieee80211_sta *sta, enum mt76_sta_event ev)
++static int
++__mt7915_mac_sta_event(struct mt7915_dev *dev, struct ieee80211_vif *vif,
++		       struct ieee80211_sta *sta, enum mt76_sta_event ev)
+ {
+-	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+ 	int i, ret;
+ 	u32 addr;
+ 
++	lockdep_assert_held(&dev->mt76.mutex);
++
+ 	switch (ev) {
+ 	case MT76_STA_EVENT_ASSOC:
+ 		ret = mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_CONNECT, true);
+@@ -913,14 +915,11 @@ int mt7915_mac_sta_event(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 		return 0;
+ 
+ 	case MT76_STA_EVENT_AUTHORIZE:
+-		mt7915_drop_other_sta(dev, vif, sta);
+ 		return mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_PORT_SECURE, false);
+ 
+ 	case MT76_STA_EVENT_DISASSOC:
+-		mutex_lock(&dev->mt76.mutex);
+ 		for (i = 0; i < ARRAY_SIZE(msta->twt.flow); i++)
+ 			mt7915_mac_twt_teardown_flow(dev, msta, i);
+-		mutex_unlock(&dev->mt76.mutex);
+ 
+ 		mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_DISCONNECT, false);
+ 		msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+@@ -932,6 +931,29 @@ int mt7915_mac_sta_event(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 	return 0;
+ }
+ 
++/*
++ * mac80211 calls this under the band's own wiphy lock, and the MT7986's
++ * two bands are two wiphys: the station's firmware entry, its WTBL and
++ * its wcid flags are also written by the other band's roaming check
++ * (__mt7915_drop_sta()) and by a reset, both under the driver mutex.
++ */
++int mt7915_mac_sta_event(struct mt76_dev *mdev, struct ieee80211_vif *vif,
++			 struct ieee80211_sta *sta, enum mt76_sta_event ev)
++{
++	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
++	int ret;
++
++	/* takes the mutex itself */
++	if (ev == MT76_STA_EVENT_AUTHORIZE)
++		mt7915_drop_other_sta(dev, vif, sta);
++
++	mutex_lock(&dev->mt76.mutex);
++	ret = __mt7915_mac_sta_event(dev, vif, sta, ev);
++	mutex_unlock(&dev->mt76.mutex);
++
++	return ret;
++}
++
+ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 			   struct ieee80211_sta *sta)
+ {
+@@ -1394,10 +1416,11 @@ static void mt7915_sta_set_4addr(struct ieee80211_hw *hw,
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed) && enabled)
+ 		mt7915_sta_wed_set_4addr(dev, vif, sta);
+ 
+-	if (!msta->wcid.sta)
+-		return;
+-
+-	mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
++	/* wcid.sta changes under the mutex (mt7915_mac_sta_event()) */
++	mutex_lock(&dev->mt76.mutex);
++	if (msta->wcid.sta)
++		mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ static void mt7915_sta_set_decap_offload(struct ieee80211_hw *hw,
+@@ -1413,10 +1436,11 @@ static void mt7915_sta_set_decap_offload(struct ieee80211_hw *hw,
+ 	else
+ 		clear_bit(MT_WCID_FLAG_HDR_TRANS, &msta->wcid.flags);
+ 
+-	if (!msta->wcid.sta)
+-		return;
+-
+-	mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
++	/* wcid.sta changes under the mutex (mt7915_mac_sta_event()) */
++	mutex_lock(&dev->mt76.mutex);
++	if (msta->wcid.sta)
++		mt76_connac_mcu_wtbl_update_hdr_trans(&dev->mt76, vif, sta);
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ static void mt7915_sta_set_airtime_weight(struct ieee80211_hw *hw,
+@@ -1434,11 +1458,11 @@ static void mt7915_sta_set_airtime_weight(struct ieee80211_hw *hw,
+ 	 * when it re-adds a station after a full reset, before the station
+ 	 * is associated again, and the msta outlives the reset.
+ 	 */
++	mutex_lock(&dev->mt76.mutex);
+ 	msta->airtime_weight = weight;
+-	if (!msta->wcid.sta)
+-		return;
+-
+-	mt7915_sta_vow_set_airtime_weight(dev, msta, weight);
++	if (msta->wcid.sta)
++		mt7915_sta_vow_set_airtime_weight(dev, msta, weight);
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ static int mt7915_sta_set_txpwr(struct ieee80211_hw *hw,
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 5e55d3cc..c80b8b3a 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -1956,6 +1956,49 @@ static void mt7915_main_test_sta_authorize(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
+ }
+ 
++/* The association steps' firmware commands go out under the driver mutex:
++ * the other band and a reset write the same station's state under it.
++ */
++static void mt7915_main_test_sta_event_locked(struct kunit *test)
++{
++	static const enum mt76_sta_event evs[] = {
++		MT76_STA_EVENT_ASSOC, MT76_STA_EVENT_AUTHORIZE,
++		MT76_STA_EVENT_DISASSOC,
++	};
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt76_test_msg *msg;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	int i;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	sta = mt7915_main_test_add_sta(test, hw, vif, 1);
++	for (i = 0; i < ARRAY_SIZE(evs); i++) {
++		mt7915_main_test_clear(fake);
++		KUNIT_EXPECT_EQ(test, mt7915_mac_sta_event(&dev->mt76, vif, sta,
++							   evs[i]), 0);
++		KUNIT_EXPECT_GT(test, fake->n_msgs, 0);
++		list_for_each_entry(msg, &fake->msgs, list)
++			KUNIT_EXPECT_TRUE_MSG(test, msg->locked,
++					      "event %d, command 0x%x",
++					      evs[i], msg->cmd);
++	}
++
++	/* and the per-station settings that depend on the association */
++	mt7915_main_test_msta(sta)->wcid.sta = 1;
++	mt7915_main_test_clear(fake);
++	mt7915_sta_set_4addr(hw, vif, sta, true);
++	mt7915_sta_set_decap_offload(hw, vif, sta, true);
++	mt7915_sta_set_airtime_weight(hw, vif, sta, 512);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 3);
++	list_for_each_entry(msg, &fake->msgs, list)
++		KUNIT_EXPECT_TRUE_MSG(test, msg->locked, "command 0x%x",
++				      msg->cmd);
++	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
++}
++
+ /* The roaming check itself: only other AP interfaces are searched. */
+ static void mt7915_main_test_drop_other_sta(struct kunit *test)
+ {
+@@ -3152,6 +3195,7 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_sta_assoc),
+ 	KUNIT_CASE(mt7915_main_test_sta_authorize),
+ 	KUNIT_CASE(mt7915_main_test_drop_other_sta),
++	KUNIT_CASE(mt7915_main_test_sta_event_locked),
+ 	KUNIT_CASE(mt7915_main_test_sta_disassoc),
+ 	KUNIT_CASE(mt7915_main_test_sta_remove),
+ 	KUNIT_CASE(mt7915_main_test_tx),
+diff --git a/tests/fake.h b/tests/fake.h
+index 816bd9de..5ece04ac 100644
+--- a/tests/fake.h
++++ b/tests/fake.h
+@@ -29,6 +29,7 @@ struct mt76_test_msg {
+ 	struct list_head list;
+ 	int cmd;
+ 	int len;
++	bool locked;			/* sent with the device mutex held */
+ 	u8 data[];			/* the payload the driver built */
+ };
+ 
+@@ -196,6 +197,7 @@ static inline int mt76_test_mcu_send(struct mt76_dev *dev, struct sk_buff *skb,
+ 	}
+ 	msg->cmd = cmd;
+ 	msg->len = skb->len;
++	msg->locked = mutex_is_locked(&dev->mutex);
+ 	memcpy(msg->data, skb->data, skb->len);
+ 	list_add_tail(&msg->list, &fake->msgs);
+ 	fake->n_msgs++;

@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 18:38:00 +0100
+Subject: [PATCH] milkflint tests: rx NAPI is off before its page pool goes
+
+Kernel 6.12's page_pool_destroy() warns about a pool whose NAPI is
+still enabled. OpenWrt 25.12.6's mt76 never disables the rx NAPI on
+removal, so the kernel logs six warnings, one per rx queue, when the
+driver is unloaded. The fork has upstream's
+a57185c5 ("wifi: mt7915: disable rx napi when removing device") since
+the sync to 467ae2e3, and mt76_dma_cleanup() disables the tx NAPI.
+
+mt7915_init_test_stop_hardware_napi checks that mt7915_stop_hardware(),
+which the failed probe and module unload share, leaves all six rx NAPI
+contexts and the tx one disabled and deleted. Without the rx
+napi_disable() loop it fails for each rx queue, and the VM's kernel
+logs those six warnings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/init-test.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 780f1b42..fb066215 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -1868,6 +1868,33 @@ static void mt7915_init_test_register_no_firmware_cleanup(struct kunit *test)
+ 			MT_CONN_INFRA_WF_SLP_PROT_MASK, 0);
+ }
+ 
++/* mt7915_stop_hardware(), on a failed probe as on module unload, disables
++ * each NAPI context before mt76_dma_cleanup() deletes it and destroys the
++ * page pool linked to it: the kernel's page_pool_destroy() warns about a
++ * pool whose NAPI is still enabled, once per rx queue, the MT7986's six.
++ * A disabled NAPI keeps NAPI_STATE_SCHED set; a deleted one isn't listed.
++ */
++static void mt7915_init_test_stop_hardware_napi(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_init_test_dead_fw(test);
++	struct napi_struct *napi;
++	int i, n = 0;
++
++	KUNIT_EXPECT_LT(test, mt7915_register_device(dev), 0);
++	mt76_for_each_q_rx(&dev->mt76, i) {
++		napi = &dev->mt76.napi[i];
++		KUNIT_EXPECT_TRUE_MSG(test, test_bit(NAPI_STATE_SCHED,
++				      &napi->state), "rx queue %d", i);
++		KUNIT_EXPECT_FALSE_MSG(test, test_bit(NAPI_STATE_LISTED,
++				       &napi->state), "rx queue %d", i);
++		n++;
++	}
++	KUNIT_EXPECT_EQ(test, n, 6);
++	napi = &dev->mt76.tx_napi;
++	KUNIT_EXPECT_TRUE(test, test_bit(NAPI_STATE_SCHED, &napi->state));
++	KUNIT_EXPECT_FALSE(test, test_bit(NAPI_STATE_LISTED, &napi->state));
++}
++
+ static struct kunit_case mt7915_init_test_cases[] = {
+ 	KUNIT_CASE(mt7915_init_test_band_config),
+ 	KUNIT_CASE(mt7915_init_test_alloc_ext_phy),
+@@ -1903,6 +1930,7 @@ static struct kunit_case mt7915_init_test_cases[] = {
+ 	KUNIT_CASE(mt7915_init_test_unregister_device),
+ 	KUNIT_CASE(mt7915_init_test_register_no_firmware),
+ 	KUNIT_CASE(mt7915_init_test_register_no_firmware_cleanup),
++	KUNIT_CASE(mt7915_init_test_stop_hardware_napi),
+ 	{}
+ };
+ 

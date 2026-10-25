@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:37:47 +0100
+Subject: [PATCH] wifi: mt76: connac: report the rx STBC stream count, not a
+ mask multiple
+
+mac80211 takes the number of STBC streams from the
+RX_ENC_FLAG_STBC_MASK bits of enc_flags (shifted by
+RX_ENC_FLAG_STBC_SHIFT). mt76_connac2_mac_fill_rx_rate() put in
+RX_ENC_FLAG_STBC_MASK * stbc instead: 3 streams for a frame with one,
+and for two, a value that spills into RX_ENC_FLAG_LDPC. Only radiotap
+(monitor mode) reports these.
+
+Shift the count in. Un-skip mt76_connac_test_rx_rate_stbc_flags.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c       | 2 +-
+ tests/connac-mac-test.c | 6 ++----
+ 2 files changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 93379112..c07f5399 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -1154,7 +1154,7 @@ int mt76_connac2_mac_fill_rx_rate(struct mt76_dev *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	status->enc_flags |= RX_ENC_FLAG_STBC_MASK * stbc;
++	status->enc_flags |= stbc << RX_ENC_FLAG_STBC_SHIFT;
+ 	if (*mode < MT_PHY_TYPE_HE_SU && gi)
+ 		status->enc_flags |= RX_ENC_FLAG_SHORT_GI;
+ 
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 486bc2a7..2eadce1a 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -1929,8 +1929,8 @@ static void mt76_connac_test_rx_rate_connac2(struct kunit *test)
+ }
+ 
+ /* With STBC, mac80211 wants the number of STBC streams in enc_flags
+- * (RX_ENC_FLAG_STBC_SHIFT); the driver puts in RX_ENC_FLAG_STBC_MASK *
+- * stbc, i.e. 3 for one, and for two it spills into RX_ENC_FLAG_LDPC.
++ * (RX_ENC_FLAG_STBC_SHIFT), not RX_ENC_FLAG_STBC_MASK * stbc: that is 3
++ * for one, and for two it spills into RX_ENC_FLAG_LDPC.
+  */
+ static void mt76_connac_test_rx_rate_stbc_flags(struct kunit *test)
+ {
+@@ -1938,8 +1938,6 @@ static void mt76_connac_test_rx_rate_stbc_flags(struct kunit *test)
+ 	struct mt76_rx_status status;
+ 	u8 mode;
+ 
+-	kunit_skip(test, "driver bug: rx STBC reported as RX_ENC_FLAG_STBC_MASK * stbc");
+-
+ 	dev = mt76_connac_test_dev(test);
+ 	KUNIT_ASSERT_EQ(test, mt76_connac_test_rx_rate(dev, &status,
+ 			&dev->phy.sband_5g.sband,

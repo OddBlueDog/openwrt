@@ -1,0 +1,210 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:26:52 +0100
+Subject: [PATCH] wifi: mt76: give a station's txqs back when mac80211 re-adds
+ it
+
+mt76_reset_device() unpublishes every wcid, and mac80211's restart work
+re-adds the stations later. In between, mt76_txq_schedule_list() skips
+any txq whose wcid it can't find (or finds on the other hw, once the
+index went to another band's station first) without returning it, and
+ieee80211_next_txq() had already taken it off the active list. mac80211
+lists it again only when a new frame is queued for it, so what it held
+across the reset waited for the next frame of the same TID: up to TCP's
+retransmit timeout, or for good for a flow's last packets. The same
+class as 0078's MT76_RESET/offchannel skip.
+
+Returning the txq there, as 0078 does, isn't safe for this skip: a
+station being removed looks the same (mt76_sta_pre_rcu_remove()
+unpublished its wcid), and mac80211 purges its txqs and frees them with
+no grace period after the driver's NONE -> NOTEXIST. A worker pass that
+took the txq from ieee80211_next_txq() before the purge and returned it
+after would leave freed memory on the active list:
+ieee80211_return_txq() relists even an empty txq whose station has a
+negative airtime deficit and was active in the last 100 ms
+(ieee80211_txq_keep_active()).
+
+So give them back at the other end: mt76_reset_device() marks the wcids
+it unpublishes (MT_WCID_FLAG_RESET), and mt76_sta_add() returns a marked
+station's txqs once its wcid is published again (mac80211 lists those
+holding frames) and kicks the tx worker. The frames couldn't have gone
+out before then anyway: the restarted firmware doesn't know the station
+until it is re-added. A new station is never marked. Of the other
+drivers, only mt7996 resets through mt76_reset_device(), and its own
+sta_state doesn't reach mt76_sta_add(): the mark is unused there.
+
+The interface's own txq (multicast) has the same skip and isn't covered:
+it is re-added through the driver's add_interface, and its next frame
+lists it again.
+
+mt76_test_sta_readd_after_reset, with __ieee80211_schedule_txq() stubbed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c        | 19 +++++++++++++
+ mt76.h            |  1 +
+ tests/core-test.c | 72 +++++++++++++++++++++++++++++++++++++++++++++++
+ tx.c              |  4 +++
+ 4 files changed, 96 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index 57c95308..aa7a3567 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -865,6 +865,8 @@ void mt76_reset_device(struct mt76_dev *dev)
+ 		 */
+ 		if (dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING)
+ 			clear_bit(MT_WCID_FLAG_PS, &wcid->flags);
++		/* for mt76_sta_add(), when mac80211 re-adds the station */
++		set_bit(MT_WCID_FLAG_RESET, &wcid->flags);
+ 		rcu_assign_pointer(dev->wcid[i], NULL);
+ 		mt76_wcid_cleanup(dev, wcid);
+ 	}
+@@ -1681,6 +1683,23 @@ mt76_sta_add(struct mt76_phy *phy, struct ieee80211_vif *vif,
+ 		wcid->phy_idx = phy->band_idx;
+ 	}
+ 
++	/*
++	 * Re-added after a full reset. While the wcid was unpublished,
++	 * mt76_txq_schedule_list() skipped the station's txqs it got from
++	 * ieee80211_next_txq(), which leaves them off mac80211's active
++	 * list: the frames they hold would wait for the next frame of their
++	 * TID. Give them back now. (Not there: without its wcid, a station
++	 * being removed looks the same, and mac80211 frees its txqs right
++	 * after purging them, while a returned one can stay listed.)
++	 */
++	if (test_and_clear_bit(MT_WCID_FLAG_RESET, &wcid->flags)) {
++		for (i = 0; i < ARRAY_SIZE(sta->txq); i++)
++			if (sta->txq[i])
++				ieee80211_return_txq(phy->hw, sta->txq[i],
++						     false);
++		mt76_worker_schedule(&dev->tx_worker);
++	}
++
+ 	phy->num_sta++;
+ 
+ out:
+diff --git a/mt76.h b/mt76.h
+index 929a88a1..e898feb6 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -376,6 +376,7 @@ enum mt76_wcid_flags {
+ 	MT_WCID_FLAG_4ADDR,
+ 	MT_WCID_FLAG_HDR_TRANS,
+ 	MT_WCID_FLAG_TDLS_PEER,
++	MT_WCID_FLAG_RESET,	/* unpublished by a full reset */
+ };
+ 
+ #define MT76_N_WCIDS 1088
+diff --git a/tests/core-test.c b/tests/core-test.c
+index df0cad07..649bafad 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -10,6 +10,7 @@
+  * it with mt76_hwt_new() (tests/core-hw.h).
+  */
+ #include <kunit/test.h>
++#include <kunit/static_stub.h>
+ #include "core-hw.h"
+ 
+ /* --- helpers ------------------------------------------------------------- */
+@@ -3276,6 +3277,76 @@ static void mt76_test_reset_device_hw_ps(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_HDR_TRANS, &wcid->flags));
+ }
+ 
++static struct {
++	int n;
++	struct ieee80211_hw *hw;
++	struct ieee80211_txq *txq[4];
++	bool force;
++} mt76_test_sched;
++
++/* stands in for mac80211's __ieee80211_schedule_txq() (static stub), which
++ * ieee80211_schedule_txq() and ieee80211_return_txq() call
++ */
++static void mt76_test_schedule_txq(struct ieee80211_hw *hw,
++				   struct ieee80211_txq *txq, bool force)
++{
++	if (mt76_test_sched.n < ARRAY_SIZE(mt76_test_sched.txq))
++		mt76_test_sched.txq[mt76_test_sched.n] = txq;
++	mt76_test_sched.n++;
++	mt76_test_sched.hw = hw;
++	mt76_test_sched.force |= force;
++}
++
++/* While a full reset has the wcids unpublished, the tx scheduler takes a
++ * station's txqs off mac80211's active list without serving them (it
++ * can't tell a station that comes back from one being removed). When
++ * mac80211 re-adds the station, its txqs are given back (mac80211 lists
++ * those holding frames) and the tx worker kicked. A new station has none
++ * to give back.
++ */
++static void mt76_test_sta_readd_after_reset(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct ieee80211_sta *sta = mt76_test_sta_txqs(test, 2);
++	struct mt76_wcid *wcid = mt76_test_sta_wcid(sta);
++	struct ieee80211_vif *vif = mt76_test_vif(test);
++	int runs, i;
++
++	memset(&mt76_test_sched, 0, sizeof(mt76_test_sched));
++	kunit_activate_static_stub(test, __ieee80211_schedule_txq,
++				   mt76_test_schedule_txq);
++	KUNIT_ASSERT_EQ(test, mt76_worker_setup(dev->hw, &dev->tx_worker,
++						mt76_test_idle_worker,
++						"mt76-test-tx"), 0);
++	mt76_test_drv.sta_add_idx = 9;
++
++	KUNIT_ASSERT_EQ(test, mt76_sta_state(dev->hw, vif, sta,
++					     IEEE80211_STA_NOTEXIST,
++					     IEEE80211_STA_NONE), 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_sched.n, 0);
++
++	mt76_reset_device(dev);
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(dev->wcid[9]));
++	KUNIT_EXPECT_EQ(test, mt76_test_sched.n, 0);
++
++	/* mac80211's restart work re-adds it */
++	runs = atomic_read(&mt76_test_worker_runs);
++	KUNIT_ASSERT_EQ(test, mt76_sta_state(dev->hw, vif, sta,
++					     IEEE80211_STA_NOTEXIST,
++					     IEEE80211_STA_NONE), 0);
++	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(dev->wcid[9]), wcid);
++	KUNIT_EXPECT_EQ(test, mt76_test_sched.n, 2);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_test_sched.txq[0], sta->txq[0]);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_test_sched.txq[1], sta->txq[1]);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_test_sched.hw, dev->hw);
++	/* only those with frames */
++	KUNIT_EXPECT_FALSE(test, mt76_test_sched.force);
++	for (i = 0; i < 100 && atomic_read(&mt76_test_worker_runs) == runs; i++)
++		msleep(10);
++	KUNIT_EXPECT_GT(test, atomic_read(&mt76_test_worker_runs), runs);
++	mt76_worker_teardown(&dev->tx_worker);
++}
++
+ /* A key conf with mac80211's ieee80211_key in front of it. That struct is
+  * private to mac80211, so the bytes before the conf are a known pattern
+  * (byte i is i) and the copied PNs show which counter was read.
+@@ -3403,6 +3474,7 @@ static struct kunit_case mt76_core_sta_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_wcid_add_poll),
+ 	KUNIT_CASE(mt76_test_reset_device),
+ 	KUNIT_CASE(mt76_test_reset_device_hw_ps),
++	KUNIT_CASE(mt76_test_sta_readd_after_reset),
+ 	KUNIT_CASE(mt76_test_wcid_key_setup),
+ 	KUNIT_CASE(mt76_test_offchannel_notify),
+ 	{}
+diff --git a/tx.c b/tx.c
+index ed962397..2bae1b3b 100644
+--- a/tx.c
++++ b/tx.c
+@@ -637,6 +637,10 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
+ 
+ 		mtxq = (struct mt76_txq *)txq->drv_priv;
+ 		wcid = __mt76_wcid_ptr(dev, mtxq->wcid);
++		/*
++		 * A station being removed, or one a full reset unpublished:
++		 * mt76_sta_add() returns those txqs when the station is back.
++		 */
+ 		if (!wcid)
+ 			continue;
+ 

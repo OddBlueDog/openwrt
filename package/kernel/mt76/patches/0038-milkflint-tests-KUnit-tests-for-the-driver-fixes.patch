@@ -1,0 +1,727 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 23:07:20 +0100
+Subject: [PATCH] milkflint tests: KUnit tests for the driver fixes
+
+Unit tests for the logic of fixes that can run without hardware. They
+call the real driver functions on zeroed fake devices; register access
+and DMA queue cleanup go to stubs that record what happened.
+
+  mt76-core        radar detection after a sw scan (0011), wcid
+                   allocation ranges
+  mt76-agg-rx      reorder release exactly at the timeout (0006)
+  mt76-connac-mac  fixed-rate TXS keeps the station rate (0005), token
+                   put clears the WED count (0007)
+  mt7915-mac       zero TWT wake interval (0013), TWT reset (0012), CCA
+                   register on mt7916/mt798x (0015), short and truncated
+                   tx-free events (0016), tx unblocked after the reset
+                   token reclaim (0007)
+  mt7915-mcu       firmware reply length checks (0018)
+
+Each test file is included at the end of the source file it tests, so
+static functions are reachable, and only when CONFIG_MT76_KUNIT_TEST is
+defined. Only a KUnit test build defines it; the image's
+modules don't contain the tests. The tx-free tests trigger the
+WARN_ON_ONCE() checks they exercise.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agg-rx.c                |   4 +
+ mac80211.c              |   4 +
+ mt76_connac_mac.c       |   4 +
+ mt7915/mac.c            |   4 +
+ mt7915/mcu.c            |   4 +
+ mt7915/tests/mac-test.c | 257 ++++++++++++++++++++++++++++++++++++++++
+ mt7915/tests/mcu-test.c |  75 ++++++++++++
+ tests/agg-rx-test.c     |  93 +++++++++++++++
+ tests/connac-mac-test.c |  79 ++++++++++++
+ tests/core-test.c       |  88 ++++++++++++++
+ 10 files changed, 612 insertions(+)
+ create mode 100644 mt7915/tests/mac-test.c
+ create mode 100644 mt7915/tests/mcu-test.c
+ create mode 100644 tests/agg-rx-test.c
+ create mode 100644 tests/connac-mac-test.c
+ create mode 100644 tests/core-test.c
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 90c8a92c..478ca4f7 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -301,3 +301,7 @@ void mt76_rx_aggr_stop(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tidno)
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(mt76_rx_aggr_stop);
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/agg-rx-test.c"
++#endif
+diff --git a/mac80211.c b/mac80211.c
+index a202c02b..48e71141 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -2392,3 +2392,7 @@ void mt76_beacon_mon_check(struct mt76_phy *phy)
+ 		mt76_beacon_mon_iter, phy);
+ }
+ EXPORT_SYMBOL_GPL(mt76_beacon_mon_check);
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/core-test.c"
++#endif
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index a938d49f..986e452e 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -1243,3 +1243,7 @@ void mt76_connac2_tx_token_put(struct mt76_dev *dev)
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac2_tx_token_put);
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/connac-mac-test.c"
++#endif
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index a76ab4b2..fe545c21 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2520,3 +2520,7 @@ void mt7915_mac_twt_teardown_flow(struct mt7915_dev *dev,
+ 	dev->twt.table_mask &= ~BIT(flow->table_id);
+ 	dev->twt.n_agrt--;
+ }
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/mac-test.c"
++#endif
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 6f984e9c..5400c50a 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -4405,3 +4405,7 @@ int mt7915_mcu_rf_regval(struct mt7915_dev *dev, u32 regidx, u32 *val, bool set)
+ 
+ 	return 0;
+ }
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/mcu-test.c"
++#endif
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+new file mode 100644
+index 00000000..477ac3f4
+--- /dev/null
++++ b/mt7915/tests/mac-test.c
+@@ -0,0 +1,257 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt7915 mac code. Included at the end of mt7915/mac.c when
++ * CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test build only).
++ * Nothing here touches hardware: register access and DMA queue cleanup go
++ * through stubs.
++ */
++#include <kunit/test.h>
++
++/* --- TWT ------------------------------------------------------------------ */
++
++static int mt7915_test_twt_check(u16 mantissa, u8 exp, u8 min_dur)
++{
++	u8 buf[sizeof(struct ieee80211_twt_setup) +
++	       sizeof(struct ieee80211_twt_params)] = {};
++	struct ieee80211_twt_setup *setup = (void *)buf;
++	struct ieee80211_twt_params *params = (void *)setup->params;
++
++	params->req_type = cpu_to_le16(IEEE80211_TWT_REQTYPE_IMPLICIT |
++				       FIELD_PREP(IEEE80211_TWT_REQTYPE_WAKE_INT_EXP,
++						  exp));
++	params->mantissa = cpu_to_le16(mantissa);
++	params->min_twt_dur = min_dur;
++
++	return mt7915_mac_check_twt_req(setup);
++}
++
++/* A station can't set up an agreement with a zero wake interval. */
++static void mt7915_test_twt_interval(struct kunit *test)
++{
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(0, 0, 0), -EOPNOTSUPP);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(0, 31, 0), -EOPNOTSUPP);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(1024, 10, 4), 0);
++	/* interval shorter than the minimum wake duration */
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(1, 0, 4), -EOPNOTSUPP);
++	/* intervals beyond 32 bits are valid requests */
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(2, 31, 4), 0);
++}
++
++static void mt7915_test_twt_link(struct mt7915_dev *dev,
++				 struct mt7915_sta *msta, u8 id, u8 table)
++{
++	struct mt7915_twt_flow *flow = &msta->twt.flow[id];
++
++	flow->id = id;
++	flow->table_id = table;
++	msta->twt.flowid_mask |= BIT(id);
++	dev->twt.table_mask |= BIT(table);
++	dev->twt.n_agrt++;
++	list_add_tail(&flow->list, &dev->twt_list);
++}
++
++/* A full reset drops every agreement and its bookkeeping. */
++static void mt7915_test_twt_reset(struct kunit *test)
++{
++	struct mt7915_sta *a, *b;
++	struct mt7915_dev *dev;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
++	b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, a);
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	mutex_init(&dev->mt76.mutex);
++	INIT_LIST_HEAD(&dev->twt_list);
++
++	mt7915_test_twt_link(dev, a, 0, 0);
++	mt7915_test_twt_link(dev, a, 2, 1);
++	mt7915_test_twt_link(dev, b, 1, 2);
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7915_mac_twt_reset(dev);
++	mutex_unlock(&dev->mt76.mutex);
++
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->twt_list));
++	KUNIT_EXPECT_EQ(test, a->twt.flowid_mask, 0);
++	KUNIT_EXPECT_EQ(test, b->twt.flowid_mask, 0);
++	KUNIT_EXPECT_EQ(test, dev->twt.table_mask, 0);
++	KUNIT_EXPECT_EQ(test, dev->twt.n_agrt, 0);
++	/* unlinked flows can be torn down or reused safely */
++	KUNIT_EXPECT_TRUE(test, list_empty(&a->twt.flow[0].list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&a->twt.flow[2].list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&b->twt.flow[1].list));
++}
++
++/* --- register access stub ---------------------------------------------- */
++
++static struct {
++	u32 addr[8];
++	int n;
++} mt7915_test_rmw;
++
++static u32 mt7915_test_rr(struct mt76_dev *mdev, u32 offset)
++{
++	return 0;
++}
++
++static void mt7915_test_wr(struct mt76_dev *mdev, u32 offset, u32 val)
++{
++}
++
++static u32 mt7915_test_rmw_rec(struct mt76_dev *mdev, u32 offset, u32 mask,
++			       u32 val)
++{
++	if (mt7915_test_rmw.n < ARRAY_SIZE(mt7915_test_rmw.addr))
++		mt7915_test_rmw.addr[mt7915_test_rmw.n] = offset;
++	mt7915_test_rmw.n++;
++	return 0;
++}
++
++static const struct mt76_bus_ops mt7915_test_bus = {
++	.rr = mt7915_test_rr,
++	.wr = mt7915_test_wr,
++	.rmw = mt7915_test_rmw_rec,
++};
++
++static void mt7915_test_cca_reset_band(struct kunit *test, u32 rev, u8 band,
++				       u32 expected)
++{
++	struct mt7915_phy *phy;
++	struct mt7915_dev *dev;
++	struct mt76_phy *mphy;
++	int i;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
++	mphy = kunit_kzalloc(test, sizeof(*mphy), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, phy);
++	KUNIT_ASSERT_NOT_NULL(test, mphy);
++	dev->mt76.rev = rev;
++	dev->mt76.bus = &mt7915_test_bus;
++	mphy->band_idx = band;
++	phy->mt76 = mphy;
++	phy->dev = dev;
++	memset(&mt7915_test_rmw, 0, sizeof(mt7915_test_rmw));
++
++	mt7915_mac_cca_stats_reset(phy);
++
++	KUNIT_ASSERT_GT(test, mt7915_test_rmw.n, 0);
++	for (i = 0; i < mt7915_test_rmw.n; i++)
++		KUNIT_EXPECT_EQ(test, mt7915_test_rmw.addr[i], expected);
++}
++
++/* MT7986 (mt7916 register layout) must not use mt7915's band 1 address. */
++static void mt7915_test_cca_reset_register(struct kunit *test)
++{
++	mt7915_test_cca_reset_band(test, 0x79860000, 1,
++				   MT_WF_PHY_RX_CTRL1_MT7916(1));
++	mt7915_test_cca_reset_band(test, 0x79860000, 0,
++				   MT_WF_PHY_RX_CTRL1_MT7916(0));
++	mt7915_test_cca_reset_band(test, 0x79150000, 1,
++				   MT_WF_PHY_RX_CTRL1(1));
++}
++
++/* --- tx-free events and token reclaim ---------------------------------- */
++
++static int mt7915_test_cleanups;
++
++static void mt7915_test_tx_cleanup(struct mt76_dev *mdev,
++				   struct mt76_queue *q, bool flush)
++{
++	mt7915_test_cleanups++;
++}
++
++static const struct mt76_queue_ops mt7915_test_queue_ops = {
++	.tx_cleanup = mt7915_test_tx_cleanup,
++};
++
++/* A device with tokens, an unblock-able tx queue and no hardware. */
++static struct mt7915_dev *mt7915_test_tx_dev(struct kunit *test)
++{
++	struct mt7915_dev *dev;
++	struct mt76_dev *mdev;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	mdev = &dev->mt76;
++	mdev->queue_ops = &mt7915_test_queue_ops;
++	mdev->phy.q_tx[0] = kunit_kzalloc(test, sizeof(struct mt76_queue),
++					  GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, mdev->phy.q_tx[0]);
++	spin_lock_init(&mdev->token_lock);
++	idr_init(&mdev->token);
++	init_waitqueue_head(&mdev->tx_wait);
++	spin_lock_init(&mdev->sta_poll_lock);
++	INIT_LIST_HEAD(&mdev->sta_poll_list);
++	mdev->token_size = 1024;
++	mt7915_test_cleanups = 0;
++
++	return dev;
++}
++
++/* An event too short for its header is dropped before anything else. */
++static void mt7915_test_tx_free_short_event(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_tx_dev(test);
++	u8 ev[4] = {};
++
++	mt7915_mac_tx_free(dev, ev, sizeof(ev));
++
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 0);
++}
++
++/* An event announcing more entries than it carries still completes: the
++ * pending tx wake-up from the entries it did process isn't lost.
++ */
++static void mt7915_test_tx_free_truncated_event(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_tx_dev(test);
++	struct mt76_queue *q = dev->mt76.phy.q_tx[0];
++	struct {
++		struct mt76_connac_tx_free hdr;
++		__le32 info[1];
++	} __packed ev = {};
++
++	ev.hdr.ctrl = cpu_to_le16(FIELD_PREP(MT_TX_FREE_MSDU_CNT, 2));
++	ev.info[0] = cpu_to_le32(FIELD_PREP(MT_TX_FREE_MSDU_ID, 5));
++	q->blocked = true;
++
++	mt7915_mac_tx_free(dev, &ev, sizeof(ev));
++
++	KUNIT_EXPECT_FALSE(test, q->blocked);
++}
++
++/* After a reset gives back all tokens, tx must not stay blocked. */
++static void mt7915_test_reset_tokens_unblocks(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_tx_dev(test);
++	struct mt76_queue *q = dev->mt76.phy.q_tx[0];
++
++	q->blocked = true;
++	dev->mt76.wed_token_count = 3;
++
++	mt7915_mac_reset_tokens(dev);
++
++	KUNIT_EXPECT_FALSE(test, q->blocked);
++	KUNIT_EXPECT_EQ(test, dev->mt76.wed_token_count, 0);
++}
++
++static struct kunit_case mt7915_mac_test_cases[] = {
++	KUNIT_CASE(mt7915_test_twt_interval),
++	KUNIT_CASE(mt7915_test_twt_reset),
++	KUNIT_CASE(mt7915_test_cca_reset_register),
++	KUNIT_CASE(mt7915_test_tx_free_short_event),
++	KUNIT_CASE(mt7915_test_tx_free_truncated_event),
++	KUNIT_CASE(mt7915_test_reset_tokens_unblocks),
++	{}
++};
++
++static struct kunit_suite mt7915_mac_test_suite = {
++	.name = "mt7915-mac",
++	.test_cases = mt7915_mac_test_cases,
++};
++
++kunit_test_suites(&mt7915_mac_test_suite);
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+new file mode 100644
+index 00000000..c671a23b
+--- /dev/null
++++ b/mt7915/tests/mcu-test.c
+@@ -0,0 +1,75 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt7915 firmware reply parsing. Included at the end of
++ * mt7915/mcu.c when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test
++ * build only).
++ */
++#include <kunit/test.h>
++
++/* A reply of @len bytes with sequence number @seq. The tailroom is zeroed,
++ * so reading past the reply is deterministic.
++ */
++static struct sk_buff *mt7915_test_reply(struct kunit *test, int len, u8 seq)
++{
++	struct mt76_connac2_mcu_rxd *rxd;
++	struct sk_buff *skb;
++
++	skb = alloc_skb(256, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memset(skb->data, 0, skb_tailroom(skb));
++	skb_put(skb, len);
++	if (len >= sizeof(*rxd)) {
++		rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
++		rxd->seq = seq;
++	}
++
++	return skb;
++}
++
++static void mt7915_test_reply_lengths(struct kunit *test)
++{
++	struct mt76_connac2_mcu_rxd *rxd;
++	struct mt7915_dev *dev;
++	struct sk_buff *skb;
++	int hdr = sizeof(*rxd);
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++
++	/* too short to hold a header: not a reply we can match */
++	skb = mt7915_test_reply(test, 8, 5);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_parse_response(&dev->mt76,
++			MCU_EXT_CMD(GET_MIB_INFO), skb, 5), -EAGAIN);
++	kfree_skb(skb);
++
++	/* THERMAL_CTRL reply with no room for its value */
++	skb = mt7915_test_reply(test, hdr + 4, 5);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_parse_response(&dev->mt76,
++			MCU_EXT_CMD(THERMAL_CTRL), skb, 5), -EINVAL);
++	kfree_skb(skb);
++
++	/* complete THERMAL_CTRL reply: the value comes back */
++	skb = mt7915_test_reply(test, hdr + 8, 5);
++	*(__le32 *)(skb->data + hdr + 4) = cpu_to_le32(42);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_parse_response(&dev->mt76,
++			MCU_EXT_CMD(THERMAL_CTRL), skb, 5), 42);
++	kfree_skb(skb);
++
++	/* wrong sequence number */
++	skb = mt7915_test_reply(test, hdr + 8, 6);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_parse_response(&dev->mt76,
++			MCU_EXT_CMD(THERMAL_CTRL), skb, 5), -EAGAIN);
++	kfree_skb(skb);
++}
++
++static struct kunit_case mt7915_mcu_test_cases[] = {
++	KUNIT_CASE(mt7915_test_reply_lengths),
++	{}
++};
++
++static struct kunit_suite mt7915_mcu_test_suite = {
++	.name = "mt7915-mcu",
++	.test_cases = mt7915_mcu_test_cases,
++};
++
++kunit_test_suites(&mt7915_mcu_test_suite);
+diff --git a/tests/agg-rx-test.c b/tests/agg-rx-test.c
+new file mode 100644
+index 00000000..60de3cfc
+--- /dev/null
++++ b/tests/agg-rx-test.c
+@@ -0,0 +1,93 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for the rx reorder buffer. Included at the end of agg-rx.c
++ * when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test build only).
++ */
++#include <kunit/test.h>
++
++#define MT76_TEST_REORDER_SIZE	8
++
++/* A hole at 100 and frame 101 buffered behind it at @age jiffies ago. */
++static struct mt76_rx_tid *
++mt76_test_reorder_tid(struct kunit *test, unsigned long age)
++{
++	struct mt76_rx_status *status;
++	struct mt76_rx_tid *tid;
++	struct sk_buff *skb;
++
++	tid = kunit_kzalloc(test, struct_size(tid, reorder_buf,
++					      MT76_TEST_REORDER_SIZE),
++			    GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, tid);
++	skb = alloc_skb(0, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++
++	tid->size = MT76_TEST_REORDER_SIZE;
++	tid->head = 100;
++	tid->num = 0;	/* best effort: 100 ms timeout */
++
++	status = (struct mt76_rx_status *)skb->cb;
++	status->seqno = 101;
++	status->reorder_time = jiffies - age;
++	tid->reorder_buf[101 % MT76_TEST_REORDER_SIZE] = skb;
++	tid->nframes = 1;
++
++	return tid;
++}
++
++static void mt76_test_reorder_free(struct mt76_rx_tid *tid,
++				   struct sk_buff_head *frames)
++{
++	int i;
++
++	__skb_queue_purge(frames);
++	for (i = 0; i < tid->size; i++)
++		kfree_skb(tid->reorder_buf[i]);
++}
++
++/* Once the timeout is reached, the hole is skipped and the frame released. */
++static void mt76_test_reorder_release_at_timeout(struct kunit *test)
++{
++	struct sk_buff_head frames;
++	struct mt76_rx_tid *tid;
++
++	tid = mt76_test_reorder_tid(test, mt76_aggr_tid_to_timeo(0));
++	__skb_queue_head_init(&frames);
++
++	mt76_rx_aggr_check_release(tid, &frames);
++
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&frames), 1);
++	KUNIT_EXPECT_EQ(test, tid->head, 102);
++	KUNIT_EXPECT_EQ(test, tid->nframes, 0);
++	mt76_test_reorder_free(tid, &frames);
++}
++
++/* Before the timeout, the frame keeps waiting for the hole. */
++static void mt76_test_reorder_hold_before_timeout(struct kunit *test)
++{
++	struct sk_buff_head frames;
++	struct mt76_rx_tid *tid;
++
++	tid = mt76_test_reorder_tid(test, 0);
++	__skb_queue_head_init(&frames);
++
++	mt76_rx_aggr_check_release(tid, &frames);
++
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&frames), 0);
++	KUNIT_EXPECT_EQ(test, tid->head, 100);
++	KUNIT_EXPECT_EQ(test, tid->nframes, 1);
++	mt76_test_reorder_free(tid, &frames);
++}
++
++static struct kunit_case mt76_agg_rx_test_cases[] = {
++	KUNIT_CASE(mt76_test_reorder_release_at_timeout),
++	KUNIT_CASE(mt76_test_reorder_hold_before_timeout),
++	{}
++};
++
++static struct kunit_suite mt76_agg_rx_test_suite = {
++	.name = "mt76-agg-rx",
++	.test_cases = mt76_agg_rx_test_cases,
++};
++
++kunit_test_suites(&mt76_agg_rx_test_suite);
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+new file mode 100644
+index 00000000..09d3282a
+--- /dev/null
++++ b/tests/connac-mac-test.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for connac2 mac helpers. Included at the end of
++ * mt76_connac_mac.c when CONFIG_MT76_KUNIT_TEST is defined (milkflint's
++ * QEMU test build only).
++ */
++#include <kunit/test.h>
++
++static __le32 mt76_test_txs0(bool fixed, u8 mcs, u8 nss, u8 bw)
++{
++	u32 txrate = FIELD_PREP(MT_TX_RATE_MODE, MT_PHY_TYPE_HE_SU) |
++		     FIELD_PREP(MT_TX_RATE_IDX, mcs) |
++		     FIELD_PREP(MT_TX_RATE_NSS, nss - 1);
++
++	return cpu_to_le32((fixed ? MT_TXS0_FIXED_RATE : 0) |
++			   FIELD_PREP(MT_TXS0_TX_RATE, txrate) |
++			   FIELD_PREP(MT_TXS0_BW, bw));
++}
++
++/* A fixed-rate frame's status is counted but doesn't replace the rate. */
++static void mt76_test_txs_fixed_rate_keeps_rate(struct kunit *test)
++{
++	struct mt76_wcid *wcid;
++	struct mt76_dev *dev;
++	__le32 txs[8] = {};
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++
++	/* rate-controlled data frame: HE MCS 9, 2 streams, 80 MHz */
++	txs[0] = mt76_test_txs0(false, 9, 2, IEEE80211_STA_RX_BW_80);
++	KUNIT_ASSERT_TRUE(test, mt76_connac2_mac_fill_txs(dev, wcid, txs));
++	KUNIT_EXPECT_EQ(test, wcid->rate.mcs, 9);
++	KUNIT_EXPECT_EQ(test, wcid->rate.nss, 2);
++	KUNIT_EXPECT_EQ(test, wcid->rate.bw, RATE_INFO_BW_80);
++	KUNIT_EXPECT_TRUE(test, wcid->rate.flags & RATE_INFO_FLAGS_HE_MCS);
++
++	/* fixed-rate frame (management/EAPOL): MCS 0, 1 stream, 20 MHz */
++	txs[0] = mt76_test_txs0(true, 0, 1, IEEE80211_STA_RX_BW_20);
++	KUNIT_ASSERT_TRUE(test, mt76_connac2_mac_fill_txs(dev, wcid, txs));
++	KUNIT_EXPECT_EQ(test, wcid->rate.mcs, 9);
++	KUNIT_EXPECT_EQ(test, wcid->rate.nss, 2);
++	KUNIT_EXPECT_EQ(test, wcid->rate.bw, RATE_INFO_BW_80);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_mcs[0], 1);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_mcs[9], 1);
++}
++
++/* Putting all tokens back leaves no WED tokens accounted either. */
++static void mt76_test_token_put_clears_wed_count(struct kunit *test)
++{
++	struct mt76_dev *dev;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	spin_lock_init(&dev->token_lock);
++	idr_init(&dev->token);
++	init_waitqueue_head(&dev->tx_wait);
++	dev->wed_token_count = 7;
++
++	mt76_connac2_tx_token_put(dev);
++
++	KUNIT_EXPECT_EQ(test, dev->wed_token_count, 0);
++	KUNIT_EXPECT_EQ(test, dev->token_count, 0);
++}
++
++static struct kunit_case mt76_connac_mac_test_cases[] = {
++	KUNIT_CASE(mt76_test_txs_fixed_rate_keeps_rate),
++	KUNIT_CASE(mt76_test_token_put_clears_wed_count),
++	{}
++};
++
++static struct kunit_suite mt76_connac_mac_test_suite = {
++	.name = "mt76-connac-mac",
++	.test_cases = mt76_connac_mac_test_cases,
++};
++
++kunit_test_suites(&mt76_connac_mac_test_suite);
+diff --git a/tests/core-test.c b/tests/core-test.c
+new file mode 100644
+index 00000000..231e4392
+--- /dev/null
++++ b/tests/core-test.c
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt76 core helpers. Included at the end of mac80211.c when
++ * CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test build only).
++ */
++#include <kunit/test.h>
++
++/* DFS state must only be off while the phy is actually on a scan channel. */
++static void mt76_test_dfs_state_during_scan(struct kunit *test)
++{
++	struct ieee80211_channel chan = {
++		.band = NL80211_BAND_5GHZ,
++		.center_freq = 5500,
++		.flags = IEEE80211_CHAN_RADAR,
++	};
++	struct ieee80211_hw *hw;
++	struct mt76_dev *dev;
++	struct mt76_phy *phy;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	hw = kunit_kzalloc(test, sizeof(*hw), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, hw);
++
++	phy = &dev->phy;
++	phy->dev = dev;
++	phy->hw = hw;
++	phy->chandef.chan = &chan;
++	dev->region = NL80211_DFS_ETSI;
++	/* monitor on a radar channel: active without needing a wiphy */
++	hw->conf.flags = IEEE80211_CONF_MONITOR;
++
++	KUNIT_EXPECT_EQ(test, mt76_phy_dfs_state(phy), MT_DFS_STATE_ACTIVE);
++
++	/* sw scan, back on the operating channel: detection stays on */
++	set_bit(MT76_SCANNING, &phy->state);
++	phy->offchannel = false;
++	KUNIT_EXPECT_EQ(test, mt76_phy_dfs_state(phy), MT_DFS_STATE_ACTIVE);
++
++	/* sw scan, on a scan channel: off */
++	phy->offchannel = true;
++	KUNIT_EXPECT_EQ(test, mt76_phy_dfs_state(phy), MT_DFS_STATE_DISABLED);
++
++	/* no DFS region: off */
++	clear_bit(MT76_SCANNING, &phy->state);
++	phy->offchannel = false;
++	dev->region = NL80211_DFS_UNSET;
++	KUNIT_EXPECT_EQ(test, mt76_phy_dfs_state(phy), MT_DFS_STATE_DISABLED);
++}
++
++static bool mt76_test_wcid_used(u32 *mask, int idx)
++{
++	return mask[idx / 32] & BIT(idx % 32);
++}
++
++/* Allocations stay inside [min, size), lowest free first. */
++static void mt76_test_wcid_alloc_ranges(struct kunit *test)
++{
++	u32 mask[DIV_ROUND_UP(MT76_N_WCIDS, 32)] = {};
++	int i;
++
++	KUNIT_EXPECT_EQ(test, mt76_wcid_alloc(mask, 288), 0);
++	KUNIT_EXPECT_EQ(test, mt76_wcid_alloc(mask, 288), 1);
++
++	/* an offset range returns absolute indices and marks them used */
++	for (i = 256; i < 272; i++) {
++		KUNIT_EXPECT_EQ(test, __mt76_wcid_alloc(mask, 256, 272), i);
++		KUNIT_EXPECT_TRUE(test, mt76_test_wcid_used(mask, i));
++	}
++	KUNIT_EXPECT_EQ(test, __mt76_wcid_alloc(mask, 256, 272), -1);
++
++	/* the low range is unaffected */
++	KUNIT_EXPECT_FALSE(test, mt76_test_wcid_used(mask, 2));
++	KUNIT_EXPECT_EQ(test, mt76_wcid_alloc(mask, 288), 2);
++}
++
++static struct kunit_case mt76_core_test_cases[] = {
++	KUNIT_CASE(mt76_test_dfs_state_during_scan),
++	KUNIT_CASE(mt76_test_wcid_alloc_ranges),
++	{}
++};
++
++static struct kunit_suite mt76_core_test_suite = {
++	.name = "mt76-core",
++	.test_cases = mt76_core_test_cases,
++};
++
++kunit_test_suites(&mt76_core_test_suite);

@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:22:42 +0100
+Subject: [PATCH] wifi: mt76: mt7915: only decode HE radiotap fields from a
+ C-RXV
+
+On chips other than mt7915 the rx mode is taken from the P-RXV, so the
+HE radiotap decoder also ran for frames without RXD group 5 and read
+its fields from the P-RXV and the frame contents instead. Group 5 is
+only enabled while a monitor interface exists; require it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 8489f015..7c8422bd 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -529,7 +529,11 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 				     *info);
+ 	}
+ 
+-	if (rxv && mode >= MT_PHY_TYPE_HE_SU && !(status->flag & RX_FLAG_8023))
++	/* the HE radiotap fields come from the C-RXV (group 5), which is
++	 * only enabled while a monitor interface is up
++	 */
++	if (rxv && (rxd1 & MT_RXD1_NORMAL_GROUP_5) &&
++	    mode >= MT_PHY_TYPE_HE_SU && !(status->flag & RX_FLAG_8023))
+ 		mt76_connac2_mac_decode_he_radiotap(&dev->mt76, skb, rxv, mode);
+ 
+ 	if (!status->wcid || !ieee80211_is_data_qos(fc))

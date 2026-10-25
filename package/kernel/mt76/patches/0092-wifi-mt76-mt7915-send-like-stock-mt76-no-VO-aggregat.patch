@@ -1,0 +1,498 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 11:07:55 +0100
+Subject: [PATCH] wifi: mt76: mt7915: send like stock mt76: no VO aggregation,
+ PS hold or VoW setup
+
+Where our fork sent more than stock OpenWrt's mt76 on normal traffic, go
+back to stock by default, each behind a module parameter:
+
+- vo_aggr (mt76-connac-lib, default off): no BA sessions on TIDs 6/7,
+  as before upstream f67ffb60.
+- ps_sync (default off): firmware PS sync events no longer hold a
+  dozing station's frames; the hardware buffers them, as stock does (with the
+  2026 firmware's event layout this was inert anyway).
+- vow_stock (default on): no VoW setup at all (feature control, DRR
+  quanta, deficit bound, per-station weights, VoW band); the firmware
+  keeps its boot defaults and stations get stock's BSS group. vow_atf
+  writes then fail with -EOPNOTSUPP.
+
+Two more switches, off, for alternative settings: vow_fw_quanta (ATF without
+WATF, the firmware's quantum table, station levels one down) and
+muru_ofdma_ul (UL OFDMA in STA_REC_MURU).
+
+KUnit: all mt76 suites pass (45).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c        |   6 ++
+ mt7915/debugfs.c         |   3 +
+ mt7915/init.c            |   5 +-
+ mt7915/main.c            |   6 +-
+ mt7915/mcu.c             |  52 +++++++++++++---
+ mt7915/mt7915.h          |   1 +
+ mt7915/tests/fake.h      |   2 +
+ mt7915/tests/mcu-test.c  |  21 ++++++-
+ mt7915/tests/mcu2-test.c | 125 +++++++++++++++++++++++++++++++++++++++
+ tests/connac-mac-test.c  |   5 ++
+ 10 files changed, 211 insertions(+), 15 deletions(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 1eda0c57..23587af9 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -1179,6 +1179,10 @@ int mt76_connac2_mac_fill_rx_rate(struct mt76_dev *dev,
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac2_mac_fill_rx_rate);
+ 
++static bool vo_aggr;
++module_param(vo_aggr, bool, 0644);
++MODULE_PARM_DESC(vo_aggr, "Aggregate voice traffic (TIDs 6 and 7); off, as in stock OpenWrt's mt76");
++
+ void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi)
+ {
+ 	struct mt76_wcid *wcid;
+@@ -1190,6 +1194,8 @@ void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi)
+ 		return;
+ 
+ 	tid = le32_get_bits(txwi[1], MT_TXD1_TID);
++	if (tid >= 6 && !READ_ONCE(vo_aggr)) /* skip VO queue */
++		return;
+ 
+ 	val = le32_to_cpu(txwi[2]);
+ 	fc = FIELD_GET(MT_TXD2_FRAME_TYPE, val) << 2 |
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 80cf52cb..b7fca26e 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -201,6 +201,9 @@ static int mt7915_vow_atf_set(void *data, u64 val)
+ {
+ 	struct mt7915_dev *dev = data;
+ 
++	if (mt7915_vow_stock)
++		return -EOPNOTSUPP;
++
+ 	dev->vow_atf_en = !!val;
+ 	mt7915_mcu_set_vow_feature_ctrl(dev);
+ 
+diff --git a/mt7915/init.c b/mt7915/init.c
+index eda62119..9523300f 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -670,6 +670,9 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
+ /* also after a full reset: keeps vow_atf_en as debugfs left it */
+ void mt7915_vow_init(struct mt7915_dev *dev)
+ {
++	if (mt7915_vow_stock)
++		return;
++
+ 	mt7915_mcu_set_vow_drr_ctrl(dev, NULL, VOW_DRR_CTRL_AIRTIME_DEFICIT_BOUND, 0);
+ 	mt7915_mcu_set_vow_drr_ctrl(dev, NULL, VOW_DRR_CTRL_AIRTIME_QUANTUM_ALL, 0);
+ 	mt7915_mcu_set_vow_feature_ctrl(dev);
+@@ -1332,7 +1335,7 @@ int mt7915_register_device(struct mt7915_dev *dev)
+ 
+ 	dev->dbdc_support = mt7915_band_config(dev);
+ 	/* on by default from the MT7916 on; the vow_atf debugfs file sets it */
+-	dev->vow_atf_en = !is_mt7915(&dev->mt76);
++	dev->vow_atf_en = !is_mt7915(&dev->mt76) && !mt7915_vow_stock;
+ 
+ 	phy2 = mt7915_alloc_ext_phy(dev);
+ 	if (IS_ERR(phy2))
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 0f5babcc..67ec8ac0 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -280,7 +280,7 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+-	if (!is_mt7915(&dev->mt76))
++	if (!is_mt7915(&dev->mt76) && !mt7915_vow_stock)
+ 		mt7915_mcu_set_vow_band(dev, mvif);
+ 
+ 	return 0;
+@@ -807,7 +807,7 @@ int mt7915_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+ 	mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_DISCONNECT, true);
+ 
+-	if (!is_mt7915(&dev->mt76)) {
++	if (!is_mt7915(&dev->mt76) && !mt7915_vow_stock) {
+ 		mt7915_mcu_set_vow_drr_ctrl(dev, msta, VOW_DRR_CTRL_STA_PAUSE, 0);
+ 		mt7915_sta_vow_set_airtime_weight(dev, msta,
+ 			msta->airtime_weight ?: IEEE80211_DEFAULT_AIRTIME_WEIGHT);
+@@ -1460,7 +1460,7 @@ static void mt7915_sta_set_airtime_weight(struct ieee80211_hw *hw,
+ 	 */
+ 	mutex_lock(&dev->mt76.mutex);
+ 	msta->airtime_weight = weight;
+-	if (msta->wcid.sta)
++	if (msta->wcid.sta && !mt7915_vow_stock)
+ 		mt7915_sta_vow_set_airtime_weight(dev, msta, weight);
+ 	mutex_unlock(&dev->mt76.mutex);
+ }
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 076d7c9f..19e370f8 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -39,6 +39,25 @@ static bool sr_scene_detect = true;
+ module_param(sr_scene_detect, bool, 0644);
+ MODULE_PARM_DESC(sr_scene_detect, "Enable firmware scene detection algorithm");
+ 
++/* stock mt76 does these differently; each is a switch
++ * for an A/B on the router, the first two set as stock
++ */
++static bool ps_sync;
++module_param(ps_sync, bool, 0644);
++MODULE_PARM_DESC(ps_sync, "Hold back a station's frames while the firmware reports it dozing (off: hand them to the hardware, as stock mt76 does)");
++
++bool mt7915_vow_stock = true;
++module_param_named(vow_stock, mt7915_vow_stock, bool, 0444);
++MODULE_PARM_DESC(vow_stock, "Send no airtime (VoW) setup, as stock mt76: the firmware keeps its own defaults (vow_atf and vow_fw_quanta then do nothing)");
++
++static bool vow_fw_quanta;
++module_param(vow_fw_quanta, bool, 0444);
++MODULE_PARM_DESC(vow_fw_quanta, "Alternative airtime (VoW) values: no WATF with ATF, the firmware's own quantum table, station quanta one level down");
++
++static bool muru_ofdma_ul;
++module_param(muru_ofdma_ul, bool, 0644);
++MODULE_PARM_DESC(muru_ofdma_ul, "Let the firmware schedule UL OFDMA for HE stations (the firmware keeps the first station's setting per band, so set it before stations join)");
++
+ static u8
+ mt7915_mcu_get_sta_nss(u16 mcs_map)
+ {
+@@ -443,7 +462,9 @@ mt7915_mcu_rx_ps_sync(struct mt7915_dev *dev, struct sk_buff *skb)
+ 	if (!wcid || !wcid_to_sta(wcid))
+ 		return;
+ 
+-	mt76_sta_ps_transition(&dev->mt76, wcid, !!p->ps_bit);
++	/* switched off, every event wakes the station: none stays held */
++	mt76_sta_ps_transition(&dev->mt76, wcid,
++			       READ_ONCE(ps_sync) && p->ps_bit);
+ }
+ 
+ static void
+@@ -981,6 +1002,7 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	if (!is_mt7915(&dev->mt76))
+ 		muru->cfg.mimo_ul_en = true;
+ 	muru->cfg.ofdma_dl_en = true;
++	muru->cfg.ofdma_ul_en = READ_ONCE(muru_ofdma_ul);
+ 
+ 	if (sta->deflink.vht_cap.vht_supported)
+ 		muru->mimo_dl.vht_mu_bfee =
+@@ -1762,7 +1784,7 @@ mt7915_mcu_add_group(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 		u8 rsv1[8];
+ 	} __packed req = {
+ 		.action = cpu_to_le32(MT_STA_BSS_GROUP),
+-		.val = cpu_to_le32(is_mt7915(&dev->mt76) ?
++		.val = cpu_to_le32(is_mt7915(&dev->mt76) || mt7915_vow_stock ?
+ 				   mvif->mt76.idx % 16 :
+ 				   mt7915_vow_sta_bss_grp(&mvif->mt76)),
+ 	};
+@@ -3736,6 +3758,16 @@ int mt7915_mcu_set_ser(struct mt7915_dev *dev, u8 action, u8 set, u8 band)
+ 				 &req, sizeof(req), false);
+ }
+ 
++/* an AC's quantum level for a station's airtime weight; vow_fw_quanta
++ * puts it one down, in its table of twice the airtime per level
++ */
++static u8 mt7915_vow_sta_quantum(u16 weight, u8 ac)
++{
++	u8 level = mt76_connac_vow_dwrr_quantum(weight, ac);
++
++	return vow_fw_quanta && level ? level - 1 : level;
++}
++
+ int mt7915_mcu_set_vow_drr_ctrl(struct mt7915_dev *dev, struct mt7915_sta *msta,
+ 				enum vow_drr_ctrl_id id, u16 weight)
+ {
+@@ -3763,13 +3795,13 @@ int mt7915_mcu_set_vow_drr_ctrl(struct mt7915_dev *dev, struct mt7915_sta *msta,
+ 		setting |= FIELD_PREP(VOW_DRR_STA_BSS_GRP_MASK,
+ 				      mt7915_vow_sta_bss_grp(&msta->vif->mt76));
+ 		setting |= FIELD_PREP(VOW_DRR_STA_AC0_QNTM_MASK,
+-				      mt76_connac_vow_dwrr_quantum(weight, IEEE80211_AC_BK));
++				      mt7915_vow_sta_quantum(weight, IEEE80211_AC_BK));
+ 		setting |= FIELD_PREP(VOW_DRR_STA_AC1_QNTM_MASK,
+-				      mt76_connac_vow_dwrr_quantum(weight, IEEE80211_AC_BE));
++				      mt7915_vow_sta_quantum(weight, IEEE80211_AC_BE));
+ 		setting |= FIELD_PREP(VOW_DRR_STA_AC2_QNTM_MASK,
+-				      mt76_connac_vow_dwrr_quantum(weight, IEEE80211_AC_VI));
++				      mt7915_vow_sta_quantum(weight, IEEE80211_AC_VI));
+ 		setting |= FIELD_PREP(VOW_DRR_STA_AC3_QNTM_MASK,
+-				      mt76_connac_vow_dwrr_quantum(weight, IEEE80211_AC_VO));
++				      mt7915_vow_sta_quantum(weight, IEEE80211_AC_VO));
+ 		setting |= UMAC_BWC_GROUP_MIN << 24;
+ 		req.air_time_ctrl.com_value = cpu_to_le32(setting);
+ 		break;
+@@ -3783,9 +3815,13 @@ int mt7915_mcu_set_vow_drr_ctrl(struct mt7915_dev *dev, struct mt7915_sta *msta,
+ 		break;
+ 	case VOW_DRR_CTRL_AIRTIME_QUANTUM_ALL: {
+ 		static const u8 quantum[VOW_DRR_QUANTUM_NUM] = VOW_DRR_QUANTUM_TABLE;
++		/* the firmware's own boot table */
++		static const u8 fw[VOW_DRR_QUANTUM_NUM] = {
++			6, 12, 16, 20, 24, 28, 32, 36
++		};
+ 
+ 		memcpy(req.air_time_ctrl.air_time_quantum_all.air_time_quantum,
+-		       quantum, sizeof(quantum));
++		       vow_fw_quanta ? fw : quantum, sizeof(quantum));
+ 		break;
+ 	}
+ 	default:
+@@ -3820,7 +3856,7 @@ int mt7915_mcu_set_vow_feature_ctrl(struct mt7915_dev *dev)
+ 	value |= VOW_REFILL_PERIOD_32US;
+ 	value |= 1 << 4;
+ 	value |= 1 << 5;
+-	value |= dev->vow_atf_en << 9;	/* WATF enable */
++	value |= (dev->vow_atf_en && !vow_fw_quanta) << 9;	/* WATF enable */
+ 	value |= 1 << 12;
+ 	value |= dev->vow_atf_en << 13;	/* ATF enable */
+ 	value |= 1 << 14;
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 0649bf80..45176156 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -556,6 +556,7 @@ int mt7915_mcu_set_vow_feature_ctrl(struct mt7915_dev *dev);
+ int mt7915_mcu_set_vow_band(struct mt7915_dev *dev, struct mt7915_vif *mvif);
+ void mt7915_vow_init(struct mt7915_dev *dev);
+ u8 mt7915_vow_sta_bss_grp(struct mt76_vif_link *mvif);
++extern bool mt7915_vow_stock;
+ int mt7915_mcu_set_sku_en(struct mt7915_phy *phy);
+ int mt7915_mcu_set_txpower_sku(struct mt7915_phy *phy);
+ int mt7915_mcu_get_txpower_sku(struct mt7915_phy *phy, s8 *txpower, int len,
+diff --git a/mt7915/tests/fake.h b/mt7915/tests/fake.h
+index a15002e7..1474ecae 100644
+--- a/mt7915/tests/fake.h
++++ b/mt7915/tests/fake.h
+@@ -50,6 +50,8 @@ static inline struct mt7915_dev *__mt7915_test_dev(struct kunit *test,
+ 	struct device *kdev;
+ 	void *mem;
+ 
++	/* the tests check our VoW setup; vow_stock's (none) has its own */
++	mt7915_vow_stock = false;
+ 	kdev = kunit_device_register(test, name);
+ 	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(kdev));
+ 	/* probing reads one register through MMIO before we can step in */
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 076be490..83654be4 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -2818,9 +2818,14 @@ static struct sta_rec_muru *mt7915_test_muru_tlv(struct kunit *test,
+ 				   struct sta_rec_muru);
+ }
+ 
+-/* MU settings for APs and stations: DL OFDMA always, UL MU-MIMO on this
+- * chip, DL MU-MIMO if we can MU beamform, and the station's HE MU
+- * capabilities.
++static void mt7915_test_muru_ofdma_ul_off(void *data)
++{
++	muru_ofdma_ul = false;
++}
++
++/* MU settings for APs and stations: DL OFDMA always, UL OFDMA with the
++ * muru_ofdma_ul switch, UL MU-MIMO on this chip, DL MU-MIMO if we can MU
++ * beamform, and the station's HE MU capabilities.
+  */
+ static void mt7915_test_sta_muru(struct kunit *test)
+ {
+@@ -2833,6 +2838,16 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_dl_en);
+ 	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_ul_en);
++
++	/* for every station */
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_test_muru_ofdma_ul_off, NULL), 0);
++	muru_ofdma_ul = true;
++	muru = mt7915_test_muru_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, muru);
++	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_ul_en);
++	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_dl_en);
++	muru_ofdma_ul = false;
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_dl_en);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_ul_en);
+ 	KUNIT_EXPECT_FALSE(test, muru->mimo_dl.vht_mu_bfee);
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 4feed76e..7fa10bfc 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -1152,12 +1152,22 @@ static void mt7915_mcu2_drop_wcids(void *data)
+  * WTBL index, split in two bytes; the station's power save flag follows.
+  * Entries that aren't stations are left alone.
+  */
++static void mt7915_mcu2_ps_sync_default(void *data)
++{
++	ps_sync = false;
++}
++
+ static void mt7915_mcu2_events_ps_sync(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev = mt7915_test_dev(test);
+ 	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
+ 	struct mt7915_sta *hi, *lo, *notsta;
+ 
++	/* the ps_sync switch on; off (the default) is checked below */
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_ps_sync_default, NULL), 0);
++	ps_sync = true;
++
+ 	hi = (void *)mt7915_mcu2_sta(test, vif, 0x123)->drv_priv;
+ 	lo = (void *)mt7915_mcu2_sta(test, vif, 0x23)->drv_priv;
+ 	notsta = (void *)mt7915_mcu2_sta(test, vif, 0x40)->drv_priv;
+@@ -1182,6 +1192,36 @@ static void mt7915_mcu2_events_ps_sync(struct kunit *test)
+ 	mt7915_mcu2_ps_event(test, dev, 0x124, true);
+ }
+ 
++/* With the ps_sync switch off (the default, as stock), a station the firmware reports dozing isn't
++ * held, and one already held is let go by its next event, dozing or not.
++ */
++static void mt7915_mcu2_events_ps_sync_off(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
++	struct mt7915_sta *msta;
++
++	msta = (void *)mt7915_mcu2_sta(test, vif, 0x23)->drv_priv;
++	rcu_assign_pointer(dev->mt76.wcid[0x23], &msta->wcid);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_drop_wcids, dev), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_ps_sync_default, NULL), 0);
++
++	ps_sync = false;
++	mt7915_mcu2_ps_event(test, dev, 0x23, true);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++
++	set_bit(MT_WCID_FLAG_PS, &msta->wcid.flags);
++	mt7915_mcu2_ps_event(test, dev, 0x23, true);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++
++	/* back on, it follows the firmware again */
++	ps_sync = true;
++	mt7915_mcu2_ps_event(test, dev, 0x23, true);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++}
++
+ static void mt7915_mcu2_log_event(struct kunit *test, struct mt7915_dev *dev,
+ 				  u8 s2d, const void *data, int len)
+ {
+@@ -1244,6 +1284,7 @@ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_thermal),
+ 	KUNIT_CASE(mt7915_mcu2_events_radar),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync),
++	KUNIT_CASE(mt7915_mcu2_events_ps_sync_off),
+ 	KUNIT_CASE(mt7915_mcu2_events_log),
+ 	KUNIT_CASE(mt7915_mcu2_events_csa_bcc),
+ 	{}
+@@ -3330,6 +3371,88 @@ static void mt7915_mcu2_vow_feature(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->sch_ctrl), BIT(6));
+ }
+ 
++static void mt7915_mcu2_vow_fw_quanta_off(void *data)
++{
++	vow_fw_quanta = false;
++}
++
++/* vow_fw_quanta: alternative airtime values. ATF without WATF, the firmware's
++ * own quantum table, and station levels one down in it; the rest as ours.
++ */
++static void mt7915_mcu2_vow_fw_quanta(struct kunit *test)
++{
++	static const u8 fw[VOW_DRR_QUANTUM_NUM] = {
++		6, 12, 16, 20, 24, 28, 32, 36
++	};
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	const struct mt7915_mcu2_vow_feature *feat;
++	const struct mt7915_mcu2_drr *req;
++	struct mt7915_sta *msta;
++
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_vow_fw_quanta_off, NULL), 0);
++	vow_fw_quanta = true;
++	mvif->mt76.band_idx = 1;
++	mvif->mt76.omac_idx = 1;
++	msta = (void *)mt7915_mcu2_sta(test, vif, 0x123)->drv_priv;
++
++	/* the per-station levels: BK 2, BE 2, VI 1, VO 0 */
++	req = mt7915_mcu2_drr(test, dev, msta, VOW_DRR_CTRL_STA_ALL, 256);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->com_value),
++			5 | 2 << 8 | 2 << 12 | 1 << 16 | 0 << 20 | 40 << 24);
++	req = mt7915_mcu2_drr(test, dev, msta, VOW_DRR_CTRL_STA_ALL, 1024);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->com_value),
++			5 | 4 << 8 | 4 << 12 | 3 << 16 | 2 << 20 | 40 << 24);
++	/* the lowest level stays the lowest */
++	req = mt7915_mcu2_drr(test, dev, msta, VOW_DRR_CTRL_STA_ALL, 1);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->com_value), 5 | 40 << 24);
++
++	req = mt7915_mcu2_drr(test, dev, NULL,
++			      VOW_DRR_CTRL_AIRTIME_QUANTUM_ALL, 0);
++	KUNIT_EXPECT_EQ(test, memcmp(req->quantum, fw, sizeof(fw)), 0);
++
++	/* the deficit bound is 0x40 already */
++	dev->vow_atf_en = true;
++	req = mt7915_mcu2_drr(test, dev, NULL,
++			      VOW_DRR_CTRL_AIRTIME_DEFICIT_BOUND, 0);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->com_value), 0x40);
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_set_vow_feature_ctrl(dev), 0);
++	feat = (const void *)mt7915_mcu2_msg(test, MCU_EXT_CMD(SET_FEATURE_CTRL),
++					     sizeof(*feat))->data;
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(feat->vow_ctrl_val), 0x7035);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(feat->tx_ctrl), 0x6bf69e1f);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(feat->sch_ctrl), BIT(6));
++
++	dev->vow_atf_en = false;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_set_vow_feature_ctrl(dev), 0);
++	feat = (const void *)mt7915_mcu2_msg(test, MCU_EXT_CMD(SET_FEATURE_CTRL),
++					     sizeof(*feat))->data;
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(feat->vow_ctrl_val), 0x5035);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(feat->tx_ctrl), 0);
++}
++
++static void mt7915_mcu2_vow_stock_off(void *data)
++{
++	mt7915_vow_stock = false;
++}
++
++/* vow_stock (the default): no VoW setup at all, as stock mt76 */
++static void mt7915_mcu2_vow_stock(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	unsigned int n;
++
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_vow_stock_off, NULL), 0);
++	mt7915_vow_stock = true;
++	n = mt76_test_fake->n_msgs;
++	mt7915_vow_init(dev);
++	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, n);
++}
++
+ /* An interface's BSS group on its band, for the airtime module: four per
+  * band for the hardware BSSIDs, extended BSSes after them.
+  */
+@@ -3671,6 +3794,8 @@ static struct kunit_case mt7915_mcu2_misc_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_vow_sta),
+ 	KUNIT_CASE(mt7915_mcu2_vow_global),
+ 	KUNIT_CASE(mt7915_mcu2_vow_feature),
++	KUNIT_CASE(mt7915_mcu2_vow_fw_quanta),
++	KUNIT_CASE(mt7915_mcu2_vow_stock),
+ 	KUNIT_CASE(mt7915_mcu2_vow_band),
+ 	KUNIT_CASE(mt7915_mcu2_muru_stats),
+ 	KUNIT_CASE(mt7915_mcu2_muru_stats_short),
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index c0874c38..c666b2d7 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -1704,6 +1704,11 @@ static void mt76_connac_test_tx_check_aggr(struct kunit *test)
+ 	wcid->ampdu_state = BIT(4);
+ 	mt76_connac2_tx_check_aggr(sta, txwi);
+ 	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, BIT(4));
++
++	/* voice (TIDs 6 and 7) isn't aggregated unless vo_aggr is on */
++	txwi[1] = cpu_to_le32(FIELD_PREP(MT_TXD1_TID, 6));
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, BIT(4));
+ }
+ 
+ /* --- rx rate -------------------------------------------------------------- */

@@ -1,0 +1,162 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 23:26:20 +0100
+Subject: [PATCH] wifi: mt76: mt7915: read twt_stats under the driver mutex
+
+The twt_stats debugfs file walked dev->twt_list with
+list_for_each_entry_rcu() under rcu_read_lock(), but nothing about the
+list is RCU: flows are added and removed with plain list ops under the
+driver mutex (mac.c), and a flow is part of its station
+(msta->twt.flow[]), which mac80211 can free once the flow is torn down
+at disassociation, with no grace period. A read at that moment could
+follow a freed flow, or, after list_del_init(), one that points at itself
+and never reaches the list head. Take the mutex instead; the file prints
+at most 16 rows.
+
+From pesa1234/openwrt next-r4.12.0.rss.mtk,
+2016-wifi-mt76-mt7915-refine-twt-mcu-update-flow (MediaTek), its debugfs
+part only: the rest stops sending the agreement's parameters with a
+DELETE, which fixes nothing the firmware does here.
+
+Test: mt7915_debugfs_test_twt_stats_locked (new mt7915-debugfs suite).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/debugfs.c            | 16 +++++--
+ mt7915/tests/debugfs-test.c | 86 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+), 3 deletions(-)
+ create mode 100644 mt7915/tests/debugfs-test.c
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 4a4b7867..4f4bf0be 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1253,11 +1253,17 @@ mt7915_twt_stats(struct seq_file *s, void *data)
+ 	struct mt7915_dev *dev = dev_get_drvdata(s->private);
+ 	struct mt7915_twt_flow *iter;
+ 
+-	rcu_read_lock();
++	/*
++	 * twt_list is changed with plain list ops under the driver mutex
++	 * (list_del_init() points a flow at itself, so an RCU walker on it
++	 * never reaches the head), and a flow is part of its station, which
++	 * may be freed with no grace period after the flow is unlinked.
++	 */
++	mutex_lock(&dev->mt76.mutex);
+ 
+ 	seq_puts(s, "     wcid |       id |    flags |      exp | mantissa");
+ 	seq_puts(s, " | duration |            tsf |\n");
+-	list_for_each_entry_rcu(iter, &dev->twt_list, list)
++	list_for_each_entry(iter, &dev->twt_list, list)
+ 		seq_printf(s,
+ 			"%9d | %8d | %5c%c%c%c | %8d | %8d | %8d | %14lld |\n",
+ 			iter->wcid, iter->id,
+@@ -1268,7 +1274,7 @@ mt7915_twt_stats(struct seq_file *s, void *data)
+ 			iter->exp, iter->mantissa,
+ 			iter->duration, iter->tsf);
+ 
+-	rcu_read_unlock();
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return 0;
+ }
+@@ -1525,3 +1531,7 @@ void mt7915_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ }
+ 
+ #endif
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/debugfs-test.c"
++#endif
+diff --git a/mt7915/tests/debugfs-test.c b/mt7915/tests/debugfs-test.c
+new file mode 100644
+index 00000000..caa83f6c
+--- /dev/null
++++ b/mt7915/tests/debugfs-test.c
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt7915 debugfs readers. Included at the end of
++ * mt7915/debugfs.c when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU
++ * test build only). No device is probed: a reader only needs the fields of
++ * struct mt7915_dev it reads.
++ */
++#include <kunit/test.h>
++#include <linux/completion.h>
++#include <linux/workqueue.h>
++
++struct mt7915_debugfs_test_twt {
++	struct work_struct work;
++	struct completion done;
++	struct seq_file s;
++	char buf[512];
++};
++
++static void mt7915_debugfs_test_twt_work(struct work_struct *work)
++{
++	struct mt7915_debugfs_test_twt *t =
++		container_of(work, struct mt7915_debugfs_test_twt, work);
++
++	mt7915_twt_stats(&t->s, NULL);
++	complete(&t->done);
++}
++
++/* twt_stats walks twt_list under the driver mutex, which every change to
++ * the list holds: a flow is part of its station, which can be freed with no
++ * grace period once the flow is unlinked, so an RCU walk isn't enough.
++ */
++static void mt7915_debugfs_test_twt_stats_locked(struct kunit *test)
++{
++	struct mt7915_debugfs_test_twt *t;
++	struct mt7915_twt_flow *flow;
++	struct mt7915_dev *dev;
++	struct device *d;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++	flow = kunit_kzalloc(test, sizeof(*flow), GFP_KERNEL);
++	d = kunit_kzalloc(test, sizeof(*d), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, t);
++	KUNIT_ASSERT_NOT_NULL(test, flow);
++	KUNIT_ASSERT_NOT_NULL(test, d);
++
++	mutex_init(&dev->mt76.mutex);
++	INIT_LIST_HEAD(&dev->twt_list);
++	dev_set_drvdata(d, dev);
++	flow->wcid = 5;
++	flow->id = 2;
++	list_add_tail(&flow->list, &dev->twt_list);
++
++	t->s.buf = t->buf;
++	t->s.size = sizeof(t->buf);
++	t->s.private = d;
++	init_completion(&t->done);
++	INIT_WORK(&t->work, mt7915_debugfs_test_twt_work);
++
++	/* while the mutex is held, the reader waits */
++	mutex_lock(&dev->mt76.mutex);
++	schedule_work(&t->work);
++	KUNIT_EXPECT_EQ(test, wait_for_completion_timeout(&t->done,
++							  msecs_to_jiffies(50)),
++			0UL);
++	mutex_unlock(&dev->mt76.mutex);
++
++	flush_work(&t->work);
++	KUNIT_ASSERT_TRUE(test, completion_done(&t->done));
++	KUNIT_EXPECT_NOT_NULL(test, strnstr(t->buf, "        5 |        2 |",
++					    t->s.count));
++	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
++}
++
++static struct kunit_case mt7915_debugfs_test_cases[] = {
++	KUNIT_CASE(mt7915_debugfs_test_twt_stats_locked),
++	{}
++};
++
++static struct kunit_suite mt7915_debugfs_test_suite = {
++	.name = "mt7915-debugfs",
++	.test_cases = mt7915_debugfs_test_cases,
++};
++
++kunit_test_suites(&mt7915_debugfs_test_suite);

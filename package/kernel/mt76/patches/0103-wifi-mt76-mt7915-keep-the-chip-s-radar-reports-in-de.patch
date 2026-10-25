@@ -1,0 +1,924 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:35:50 +0100
+Subject: [PATCH] wifi: mt76: mt7915: keep the chip's radar reports in debugfs
+
+The chip's radar report (MCU_EXT_EVENT_RDD_REPORT) says what it saw: the
+radar type it matched, which of its long, constant-PRF and staggered-PRF
+detectors fired, the PRIs it measured, its pulse counters and up to 32
+periodic, long and hardware pulses, each with its start, width and power.
+mt7915_mcu_rx_radar_detected() passes the detection on to mac80211 (or
+cfg80211, for the background chain), counts it in dfs_hw_pattern and
+throws the rest away. So when radar takes a DFS channel away there is no
+telling afterwards what the chip saw: a radar, or noise or a neighbour's
+transmission it took for one.
+
+Keep the last 8 reports, in a ring in mt7915_dev under a spinlock (the
+event comes in the MCU rx path, debugfs reads in process context). Each is
+numbered and has the real time and boottime it came at, the detector, the
+band index of the radio the detector maps to and that radio's channel
+(control channel, width and center_freq1; the background chain's own for
+the background detector), then the report's fields and pulses in host
+order. A new read-only debugfs file, rdd_reports, next to rdd_monitor,
+prints them oldest first: a line per report, then a line per pulse
+(periodic, long, then the hardware's), as space-separated key/value pairs
+in decimal, in the chip's own units, the 16-bit power signed. A script on
+the router parses it.
+
+Only what the event carries is read: a report cut short reads as zero past
+its end, and each pulse count is cut to 32 and to the pulses that arrived
+whole. The detector index is checked too, which the handler read before
+checking anything: an event too short to carry one is dropped with an
+error, as an unknown detector's is. Reports the handler drops (an unknown
+detector, no radio for it, too short) aren't kept. What reaches mac80211
+and cfg80211 is unchanged.
+
+mt7915_mcu2_events_rdd_report, _rdd_report_short, _rdd_report_ring and
+_rdd_report_dropped, and mt7915_debugfs_test_rdd_reports for the format.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/debugfs.c            |  61 +++++++
+ mt7915/mcu.c                | 144 +++++++++++++++-
+ mt7915/mcu.h                |  45 ++---
+ mt7915/mmio.c               |   1 +
+ mt7915/mt7915.h             |  59 +++++++
+ mt7915/tests/debugfs-test.c | 110 ++++++++++++
+ mt7915/tests/mcu2-test.c    | 326 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 722 insertions(+), 24 deletions(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 4f4bf0be..f3ca6843 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -465,6 +465,65 @@ exit:
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_muru_stats);
+ 
++static void
++mt7915_rdd_reports_pulses(struct seq_file *s, const char *kind,
++			  const struct mt7915_rdd_pulse *p, int n)
++{
++	int i;
++
++	for (i = 0; i < n; i++)
++		seq_printf(s, "pulse %s start %u width %u power %d\n", kind,
++			   p[i].start, p[i].width, p[i].power);
++}
++
++/* The chip's last radar reports, oldest first: a "report" line each, then
++ * a "pulse" line for each pulse it carried (periodic, long, then the
++ * hardware's). Numbers are in decimal and in the chip's own units. A
++ * script on the router parses this: keep the format.
++ */
++static int
++mt7915_rdd_reports_show(struct seq_file *s, void *data)
++{
++	struct mt7915_dev *dev = dev_get_drvdata(s->private);
++	struct mt7915_rdd_report *r;
++	int i, n;
++
++	r = kmalloc_array(MT7915_RDD_REPORTS, sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++
++	n = mt7915_rdd_reports_get(dev, r);
++	for (i = 0; i < n; i++) {
++		const struct mt7915_rdd_report *e = &r[i];
++
++		seq_printf(s, "report %u time %lld uptime_ms %llu rdd %u band %u",
++			   e->seq, e->time, e->uptime_ms, e->rdd_idx, e->band);
++		seq_printf(s, " freq %u width %u center %u",
++			   e->freq, e->width, e->center);
++		seq_printf(s, " type %u long %d constant %d staggered %d",
++			   e->radar_type_idx, !!e->long_detected,
++			   !!e->constant_prf_detected,
++			   !!e->staggered_prf_detected);
++		seq_printf(s, " periodic_pulses %u long_pulses %u hw_pulses %u",
++			   e->n_periodic, e->n_long, e->n_hw);
++		seq_printf(s, " pri_const %u pri_stg %u,%u,%u",
++			   e->out_pri_const, e->out_pri_stg[0],
++			   e->out_pri_stg[1], e->out_pri_stg[2]);
++		seq_printf(s, " lpn %u spn %u crpn %u crpw %u crbn %u",
++			   e->out_lpn, e->out_spn, e->out_crpn, e->out_crpw,
++			   e->out_crbn);
++		seq_printf(s, " stgpn %u stgpw %u\n",
++			   e->out_stgpn, e->out_stgpw);
++		mt7915_rdd_reports_pulses(s, "periodic", e->periodic,
++					  e->n_periodic);
++		mt7915_rdd_reports_pulses(s, "long", e->long_pulse, e->n_long);
++		mt7915_rdd_reports_pulses(s, "hw", e->hw, e->n_hw);
++	}
++	kfree(r);
++
++	return 0;
++}
++
+ static int
+ mt7915_rdd_monitor(struct seq_file *s, void *data)
+ {
+@@ -1355,6 +1414,8 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 				    &fops_radar_trigger);
+ 		debugfs_create_devm_seqfile(dev->mt76.dev, "rdd_monitor", dir,
+ 					    mt7915_rdd_monitor);
++		debugfs_create_devm_seqfile(dev->mt76.dev, "rdd_reports", dir,
++					    mt7915_rdd_reports_show);
+ 	}
+ 
+ 	if (!ext_phy)
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 247a0a3f..e369d5d3 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -355,16 +355,149 @@ mt7915_mcu_rx_thermal_notify(struct mt7915_dev *dev, struct sk_buff *skb)
+ 	phy->throttle_state = t->ctrl.duty.duty_cycle;
+ }
+ 
++/* how many of the @num pulses at @off, @size bytes each, arrived in a
++ * report of @len bytes
++ */
++static u8
++mt7915_mcu_rdd_pulses_in(unsigned int len, size_t off, size_t size, u8 num)
++{
++	size_t n = len > off ? (len - off) / size : 0;
++
++	return min3(n, (size_t)num, (size_t)MT7915_RDD_PULSES);
++}
++
++static void
++mt7915_mcu_rdd_pulse(struct mt7915_rdd_pulse *p, __le32 start, __le16 width,
++		     __le16 power)
++{
++	p->start = le32_to_cpu(start);
++	p->width = le16_to_cpu(width);
++	p->power = (s16)le16_to_cpu(power);
++}
++
++/* Keep radar report @r for debugfs "rdd_reports", with the channel
++ * @chandef its detector's radio @mphy was on. Only @len bytes of it
++ * arrived: @hdr is its fixed part (zero past the end), and only the pulses
++ * that arrived are read.
++ */
++static void
++mt7915_mcu_rdd_report_add(struct mt7915_dev *dev, struct mt76_phy *mphy,
++			  const struct cfg80211_chan_def *chandef,
++			  const struct mt7915_mcu_rdd_report *r,
++			  const struct mt7915_mcu_rdd_report_hdr *hdr,
++			  unsigned int len)
++{
++	time64_t now = ktime_get_real_seconds();
++	u64 uptime_ms = ktime_to_ms(ktime_get_boottime());
++	struct mt7915_rdd_report *e;
++	int i;
++
++	BUILD_BUG_ON(ARRAY_SIZE(r->long_pulse) != MT7915_RDD_PULSES ||
++		     ARRAY_SIZE(r->periodic_pulse) != MT7915_RDD_PULSES ||
++		     ARRAY_SIZE(r->hw_pulse) != MT7915_RDD_PULSES);
++
++	spin_lock(&dev->rdd_reports.lock);
++	dev->rdd_reports.seq++;
++	if (dev->rdd_reports.count < MT7915_RDD_REPORTS)
++		dev->rdd_reports.count++;
++	e = &dev->rdd_reports.ring[dev->rdd_reports.seq % MT7915_RDD_REPORTS];
++	memset(e, 0, sizeof(*e));
++
++	e->seq = dev->rdd_reports.seq;
++	e->time = now;
++	e->uptime_ms = uptime_ms;
++	e->rdd_idx = hdr->rdd_idx;
++	e->band = mphy->band_idx;
++	if (chandef->chan) {
++		e->freq = chandef->chan->center_freq;
++		e->width = max(cfg80211_chandef_get_width(chandef), 0);
++		e->center = chandef->center_freq1;
++	}
++
++	e->radar_type_idx = hdr->radar_type_idx;
++	e->long_detected = hdr->long_detected;
++	e->constant_prf_detected = hdr->constant_prf_detected;
++	e->staggered_prf_detected = hdr->staggered_prf_detected;
++	e->out_lpn = hdr->out_lpn;
++	e->out_spn = hdr->out_spn;
++	e->out_crpn = hdr->out_crpn;
++	e->out_crpw = hdr->out_crpw;
++	e->out_crbn = hdr->out_crbn;
++	e->out_stgpn = hdr->out_stgpn;
++	e->out_stgpw = hdr->out_stgpw;
++	e->out_pri_const = le32_to_cpu(hdr->out_pri_const);
++	for (i = 0; i < ARRAY_SIZE(e->out_pri_stg); i++)
++		e->out_pri_stg[i] = le32_to_cpu(hdr->out_pri_stg[i]);
++
++	e->n_periodic = mt7915_mcu_rdd_pulses_in(len,
++			offsetof(struct mt7915_mcu_rdd_report, periodic_pulse),
++			sizeof(r->periodic_pulse[0]), hdr->periodic_pulse_num);
++	for (i = 0; i < e->n_periodic; i++)
++		mt7915_mcu_rdd_pulse(&e->periodic[i],
++				     r->periodic_pulse[i].start,
++				     r->periodic_pulse[i].pulse_width,
++				     r->periodic_pulse[i].pulse_power);
++
++	e->n_long = mt7915_mcu_rdd_pulses_in(len,
++			offsetof(struct mt7915_mcu_rdd_report, long_pulse),
++			sizeof(r->long_pulse[0]), hdr->long_pulse_num);
++	for (i = 0; i < e->n_long; i++)
++		mt7915_mcu_rdd_pulse(&e->long_pulse[i], r->long_pulse[i].start,
++				     r->long_pulse[i].pulse_width,
++				     r->long_pulse[i].pulse_power);
++
++	e->n_hw = mt7915_mcu_rdd_pulses_in(len,
++			offsetof(struct mt7915_mcu_rdd_report, hw_pulse),
++			sizeof(r->hw_pulse[0]), hdr->hw_pulse_num);
++	for (i = 0; i < e->n_hw; i++)
++		mt7915_mcu_rdd_pulse(&e->hw[i], r->hw_pulse[i].start,
++				     r->hw_pulse[i].pulse_width,
++				     r->hw_pulse[i].pulse_power);
++	spin_unlock(&dev->rdd_reports.lock);
++}
++
++/* the radar reports kept, oldest first, into @r (room for
++ * MT7915_RDD_REPORTS of them); returns how many
++ */
++int mt7915_rdd_reports_get(struct mt7915_dev *dev,
++			   struct mt7915_rdd_report *r)
++{
++	int i, n;
++
++	spin_lock_bh(&dev->rdd_reports.lock);
++	n = dev->rdd_reports.count;
++	for (i = 0; i < n; i++) {
++		u32 seq = dev->rdd_reports.seq - (n - 1 - i);
++
++		r[i] = dev->rdd_reports.ring[seq % MT7915_RDD_REPORTS];
++	}
++	spin_unlock_bh(&dev->rdd_reports.lock);
++
++	return n;
++}
++
+ static void
+ mt7915_mcu_rx_radar_detected(struct mt7915_dev *dev, struct sk_buff *skb)
+ {
++	const size_t hdr_off = offsetof(struct mt7915_mcu_rdd_report, hdr);
++	struct mt7915_mcu_rdd_report_hdr hdr = {};
+ 	struct mt76_phy *mphy = &dev->mt76.phy;
+ 	struct mt7915_mcu_rdd_report *r;
+ 	u32 sku;
+ 
+ 	r = (struct mt7915_mcu_rdd_report *)skb->data;
++	/* one too short to say which detector heard it is dropped, as an
++	 * unknown detector's is; else a report cut short reads as zero past
++	 * its end
++	 */
++	if (skb->len <= hdr_off) {
++		dev_err(dev->mt76.dev, "RDD report too short (%u bytes)\n",
++			skb->len);
++		return;
++	}
++	memcpy(&hdr, &r->hdr, min(skb->len - hdr_off, sizeof(hdr)));
+ 
+-	switch (r->rdd_idx) {
++	switch (hdr.rdd_idx) {
+ 	case MT_RDD_IDX_BAND0:
+ 		break;
+ 	case MT_RDD_IDX_BAND1:
+@@ -381,14 +514,19 @@ mt7915_mcu_rx_radar_detected(struct mt7915_dev *dev, struct sk_buff *skb)
+ 		mphy = dev->rdd2_phy->mt76;
+ 		break;
+ 	default:
+-		dev_err(dev->mt76.dev, "Unknown RDD idx %d\n", r->rdd_idx);
++		dev_err(dev->mt76.dev, "Unknown RDD idx %d\n", hdr.rdd_idx);
+ 		return;
+ 	}
+ 
+ 	if (!mphy)
+ 		return;
+ 
+-	if (r->rdd_idx == MT_RDD_IDX_BACKGROUND)
++	mt7915_mcu_rdd_report_add(dev, mphy,
++				  hdr.rdd_idx == MT_RDD_IDX_BACKGROUND ?
++				  &dev->rdd2_chandef : &mphy->chandef,
++				  r, &hdr, skb->len);
++
++	if (hdr.rdd_idx == MT_RDD_IDX_BACKGROUND)
+ 		cfg80211_background_radar_event(mphy->hw->wiphy,
+ 						&dev->rdd2_chandef,
+ 						GFP_ATOMIC);
+diff --git a/mt7915/mcu.h b/mt7915/mcu.h
+index 3fc4ac79..0eba4619 100644
+--- a/mt7915/mcu.h
++++ b/mt7915/mcu.h
+@@ -79,27 +79,30 @@ struct mt7915_mcu_ps_notify_v2 {
+ struct mt7915_mcu_rdd_report {
+ 	struct mt76_connac2_mcu_rxd_hdr rxd;
+ 
+-	u8 rdd_idx;
+-	u8 long_detected;
+-	u8 constant_prf_detected;
+-	u8 staggered_prf_detected;
+-	u8 radar_type_idx;
+-	u8 periodic_pulse_num;
+-	u8 long_pulse_num;
+-	u8 hw_pulse_num;
+-
+-	u8 out_lpn;
+-	u8 out_spn;
+-	u8 out_crpn;
+-	u8 out_crpw;
+-	u8 out_crbn;
+-	u8 out_stgpn;
+-	u8 out_stgpw;
+-
+-	u8 rsv;
+-
+-	__le32 out_pri_const;
+-	__le32 out_pri_stg[3];
++	/* the fixed part, before the pulses */
++	__struct_group(mt7915_mcu_rdd_report_hdr, hdr, __packed,
++		u8 rdd_idx;
++		u8 long_detected;
++		u8 constant_prf_detected;
++		u8 staggered_prf_detected;
++		u8 radar_type_idx;
++		u8 periodic_pulse_num;
++		u8 long_pulse_num;
++		u8 hw_pulse_num;
++
++		u8 out_lpn;
++		u8 out_spn;
++		u8 out_crpn;
++		u8 out_crpw;
++		u8 out_crbn;
++		u8 out_stgpn;
++		u8 out_stgpw;
++
++		u8 rsv;
++
++		__le32 out_pri_const;
++		__le32 out_pri_stg[3];
++	);
+ 
+ 	struct {
+ 		__le32 start;
+diff --git a/mt7915/mmio.c b/mt7915/mmio.c
+index b8a247a4..ea4624af 100644
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -753,6 +753,7 @@ static int mt7915_mmio_init(struct mt76_dev *mdev,
+ 	dev = container_of(mdev, struct mt7915_dev, mt76);
+ 	mt76_mmio_init(&dev->mt76, mem_base);
+ 	spin_lock_init(&dev->reg_lock);
++	spin_lock_init(&dev->rdd_reports.lock);
+ 
+ 	switch (device_id) {
+ 	case 0x7915:
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index fcfc7976..a0f4ebf8 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -271,6 +271,53 @@ struct mt7915_phy {
+ #endif
+ };
+ 
++#define MT7915_RDD_REPORTS		8
++#define MT7915_RDD_PULSES		32
++
++/* a pulse of a radar report, in the chip's own units */
++struct mt7915_rdd_pulse {
++	u32 start;
++	u16 width;
++	s16 power;
++};
++
++/* A radar report from the chip (MCU_EXT_EVENT_RDD_REPORT), as debugfs
++ * "rdd_reports" shows it: when it came, the detector and the channel its
++ * radio was on, then what the event carried (zero where it was cut short;
++ * the pulse counts are those of the pulses that arrived).
++ */
++struct mt7915_rdd_report {
++	u32 seq;
++	time64_t time;		/* real time, seconds */
++	u64 uptime_ms;		/* boottime */
++	u8 rdd_idx;
++	u8 band;		/* the radio's band_idx */
++	u16 freq;		/* MHz: control channel, */
++	u16 width;		/* width */
++	u16 center;		/* and center_freq1 */
++
++	u8 radar_type_idx;
++	u8 long_detected;
++	u8 constant_prf_detected;
++	u8 staggered_prf_detected;
++	u8 n_periodic;
++	u8 n_long;
++	u8 n_hw;
++	u8 out_lpn;
++	u8 out_spn;
++	u8 out_crpn;
++	u8 out_crpw;
++	u8 out_crbn;
++	u8 out_stgpn;
++	u8 out_stgpw;
++	u32 out_pri_const;
++	u32 out_pri_stg[3];
++
++	struct mt7915_rdd_pulse periodic[MT7915_RDD_PULSES];
++	struct mt7915_rdd_pulse long_pulse[MT7915_RDD_PULSES];
++	struct mt7915_rdd_pulse hw[MT7915_RDD_PULSES];
++};
++
+ struct mt7915_dev {
+ 	union { /* must be first */
+ 		struct mt76_dev mt76;
+@@ -325,6 +372,16 @@ struct mt7915_dev {
+ 	spinlock_t reg_lock;
+ 
+ 	u32 hw_pattern;
++	/* the last radar reports, for debugfs "rdd_reports": written in the
++	 * MCU rx path, read in process context. The report numbered seq is
++	 * in ring[seq % MT7915_RDD_REPORTS]; @seq is the newest's.
++	 */
++	struct {
++		spinlock_t lock;
++		u32 seq;
++		u8 count;
++		struct mt7915_rdd_report ring[MT7915_RDD_REPORTS];
++	} rdd_reports;
+ 	u32 ple1_sts;
+ 	/* firmware events that spanned several rx buffers */
+ 	u32 rx_event_frags;
+@@ -597,6 +654,8 @@ struct mt7915_sta_ps_stats {
+ 
+ void mt7915_sta_ps_stats(struct mt7915_sta *msta,
+ 			 struct mt7915_sta_ps_stats *st);
++int mt7915_rdd_reports_get(struct mt7915_dev *dev,
++			   struct mt7915_rdd_report *r);
+ int mt7915_mcu_apply_group_cal(struct mt7915_dev *dev);
+ int mt7915_mcu_apply_tx_dpd(struct mt7915_phy *phy);
+ int mt7915_mcu_get_chan_mib_info(struct mt7915_phy *phy, bool chan_switch);
+diff --git a/mt7915/tests/debugfs-test.c b/mt7915/tests/debugfs-test.c
+index caa83f6c..5b56fe7b 100644
+--- a/mt7915/tests/debugfs-test.c
++++ b/mt7915/tests/debugfs-test.c
+@@ -73,8 +73,118 @@ static void mt7915_debugfs_test_twt_stats_locked(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
+ }
+ 
++/* "rdd_reports" for @dev, NUL-terminated */
++static const char *
++mt7915_debugfs_test_rdd_read(struct kunit *test, struct mt7915_dev *dev)
++{
++	struct seq_file *s;
++	struct device *d;
++	char *buf;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	d = kunit_kzalloc(test, sizeof(*d), GFP_KERNEL);
++	buf = kunit_kzalloc(test, 4096 + 1, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	KUNIT_ASSERT_NOT_NULL(test, d);
++	KUNIT_ASSERT_NOT_NULL(test, buf);
++
++	dev_set_drvdata(d, dev);
++	s->buf = buf;
++	s->size = 4096;
++	s->private = d;
++	KUNIT_ASSERT_EQ(test, mt7915_rdd_reports_show(s, NULL), 0);
++	KUNIT_ASSERT_LT(test, s->count, s->size);
++	return buf;
++}
++
++/* The radar reports, oldest first: a line each, then a line per pulse
++ * (periodic, long, hardware), in the format the router's script parses.
++ * The power is signed, the flags 0 or 1. Nothing at all with no reports.
++ */
++static void mt7915_debugfs_test_rdd_reports(struct kunit *test)
++{
++	static const char * const lines[] = {
++		"report 7 time 1761300000 uptime_ms 123456 rdd 1 band 1 freq 5300 width 80 center 5290 type 3 long 1 constant 1 staggered 0 periodic_pulses 1 long_pulses 1 hw_pulses 2 pri_const 1428 pri_stg 100,200,300 lpn 1 spn 2 crpn 3 crpw 4 crbn 5 stgpn 6 stgpw 7\n",
++		"pulse periodic start 4000000000 width 65535 power -60\n",
++		"pulse long start 12 width 3000 power 0\n",
++		"pulse hw start 1 width 2 power -32768\n",
++		"pulse hw start 7 width 8 power 32767\n",
++		"report 8 time 1761300060 uptime_ms 183456 rdd 2 band 0 freq 0 width 0 center 0 type 0 long 0 constant 0 staggered 1 periodic_pulses 0 long_pulses 0 hw_pulses 0 pri_const 4294967295 pri_stg 0,0,0 lpn 0 spn 0 crpn 0 crpw 0 crbn 0 stgpn 0 stgpw 255\n",
++	};
++	struct mt7915_rdd_report *e;
++	struct mt7915_dev *dev;
++	char *expect;
++	int i;
++
++	expect = kunit_kzalloc(test, 4096, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, expect);
++	for (i = 0; i < ARRAY_SIZE(lines); i++)
++		strlcat(expect, lines[i], 4096);
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	spin_lock_init(&dev->rdd_reports.lock);
++
++	KUNIT_EXPECT_STREQ(test, mt7915_debugfs_test_rdd_read(test, dev),
++			   "");
++
++	/* reports 7 and 8 of 8: the ring wrapped */
++	dev->rdd_reports.seq = 8;
++	dev->rdd_reports.count = 2;
++
++	e = &dev->rdd_reports.ring[7];
++	e->seq = 7;
++	e->time = 1761300000;
++	e->uptime_ms = 123456;
++	e->rdd_idx = MT_RDD_IDX_BAND1;
++	e->band = MT_BAND1;
++	e->freq = 5300;
++	e->width = 80;
++	e->center = 5290;
++	e->radar_type_idx = 3;
++	e->long_detected = 1;
++	e->constant_prf_detected = 4;	/* any non-zero value */
++	e->n_periodic = 1;
++	e->n_long = 1;
++	e->n_hw = 2;
++	e->out_pri_const = 1428;
++	e->out_pri_stg[0] = 100;
++	e->out_pri_stg[1] = 200;
++	e->out_pri_stg[2] = 300;
++	e->out_lpn = 1;
++	e->out_spn = 2;
++	e->out_crpn = 3;
++	e->out_crpw = 4;
++	e->out_crbn = 5;
++	e->out_stgpn = 6;
++	e->out_stgpw = 7;
++	e->periodic[0] = (struct mt7915_rdd_pulse){ 4000000000, 65535, -60 };
++	e->long_pulse[0] = (struct mt7915_rdd_pulse){ 12, 3000, 0 };
++	e->hw[0] = (struct mt7915_rdd_pulse){ 1, 2, -32768 };
++	e->hw[1] = (struct mt7915_rdd_pulse){ 7, 8, 32767 };
++	/* past the counts: not shown */
++	e->periodic[1] = (struct mt7915_rdd_pulse){ 9, 9, 9 };
++	e->hw[2] = (struct mt7915_rdd_pulse){ 9, 9, 9 };
++
++	e = &dev->rdd_reports.ring[0];
++	e->seq = 8;
++	e->time = 1761300060;
++	e->uptime_ms = 183456;
++	e->rdd_idx = MT_RDD_IDX_BACKGROUND;
++	e->staggered_prf_detected = 1;
++	e->out_pri_const = U32_MAX;
++	e->out_stgpw = 255;
++
++	/* an older report the ring no longer counts */
++	dev->rdd_reports.ring[6].seq = 6;
++
++	KUNIT_EXPECT_STREQ(test, mt7915_debugfs_test_rdd_read(test, dev),
++			   expect);
++}
++
+ static struct kunit_case mt7915_debugfs_test_cases[] = {
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_stats_locked),
++	KUNIT_CASE(mt7915_debugfs_test_rdd_reports),
+ 	{}
+ };
+ 
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 839c5ed8..0e90ce14 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -1128,6 +1128,328 @@ static void mt7915_mcu2_events_radar(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 4);
+ }
+ 
++/* A radar report from detector @rdd_idx with every field set and all 32
++ * entries of each pulse array filled (distinct, non-zero), saying it
++ * carries 3 periodic, 2 long and 4 hardware pulses.
++ */
++static struct mt7915_mcu_rdd_report *
++mt7915_mcu2_rdd_ev(struct kunit *test, u8 rdd_idx)
++{
++	struct mt7915_mcu_rdd_report *ev;
++	int i;
++
++	ev = kunit_kzalloc(test, sizeof(*ev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ev);
++	ev->rdd_idx = rdd_idx;
++	ev->long_detected = 0;
++	ev->constant_prf_detected = 1;
++	ev->staggered_prf_detected = 0;
++	ev->radar_type_idx = 5;
++	ev->periodic_pulse_num = 3;
++	ev->long_pulse_num = 2;
++	ev->hw_pulse_num = 4;
++	ev->out_lpn = 11;
++	ev->out_spn = 12;
++	ev->out_crpn = 13;
++	ev->out_crpw = 14;
++	ev->out_crbn = 15;
++	ev->out_stgpn = 16;
++	ev->out_stgpw = 17;
++	ev->out_pri_const = cpu_to_le32(1428);
++	ev->out_pri_stg[0] = cpu_to_le32(2500);
++	ev->out_pri_stg[1] = cpu_to_le32(3333);
++	ev->out_pri_stg[2] = cpu_to_le32(0x80000001);
++	for (i = 0; i < 32; i++) {
++		ev->periodic_pulse[i].start = cpu_to_le32(1000 + i);
++		ev->periodic_pulse[i].pulse_width = cpu_to_le16(10 + i);
++		ev->periodic_pulse[i].pulse_power = cpu_to_le16(0xffc4 - i);
++		ev->long_pulse[i].start = cpu_to_le32(2000 + i);
++		ev->long_pulse[i].pulse_width = cpu_to_le16(300 + i);
++		ev->long_pulse[i].pulse_power = cpu_to_le16(0xff00 + i);
++		ev->hw_pulse[i].start = cpu_to_le32(0xf0000000 + i);
++		ev->hw_pulse[i].pulse_width = cpu_to_le16(0xffe0 + i);
++		ev->hw_pulse[i].pulse_power = cpu_to_le16(20 + i);
++		ev->hw_pulse[i].sc_pass = 1;
++		ev->hw_pulse[i].mdrdy_flag = 1;
++	}
++	return ev;
++}
++
++/* radar report @ev, of which only @len bytes arrived: the skb holds all
++ * of it, so a driver reading past @len would see the rest
++ */
++static void mt7915_mcu2_rdd_send(struct kunit *test, struct mt7915_dev *dev,
++				 struct mt7915_mcu_rdd_report *ev, int len)
++{
++	struct sk_buff *skb;
++
++	skb = mt7915_mcu2_event(test, MCU_EVENT_EXT, MCU_EXT_EVENT_RDD_REPORT,
++				0, ev, sizeof(*ev));
++	skb_trim(skb, len);
++	mt7915_mcu2_rx_event(test, dev, skb);
++	mt7915_mcu2_run_wiphy_work(dev);
++}
++
++/* the radar reports the driver kept, oldest first; returns how many */
++static int mt7915_mcu2_rdd_kept(struct kunit *test, struct mt7915_dev *dev,
++				struct mt7915_rdd_report **r)
++{
++	*r = kunit_kcalloc(test, MT7915_RDD_REPORTS, sizeof(**r), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, *r);
++	return mt7915_rdd_reports_get(dev, *r);
++}
++
++static void mt7915_mcu2_expect_pulse(struct kunit *test,
++				     const struct mt7915_rdd_pulse *p,
++				     u32 start, u16 width, s16 power)
++{
++	KUNIT_EXPECT_EQ(test, p->start, start);
++	KUNIT_EXPECT_EQ(test, p->width, width);
++	KUNIT_EXPECT_EQ(test, p->power, power);
++}
++
++/* entries @from.. of @p are empty */
++static void mt7915_mcu2_expect_no_pulses(struct kunit *test,
++					 const struct mt7915_rdd_pulse *p,
++					 int from)
++{
++	int i;
++
++	for (i = from; i < MT7915_RDD_PULSES; i++)
++		mt7915_mcu2_expect_pulse(test, &p[i], 0, 0, 0);
++}
++
++/* A radar report is kept for debugfs with what it carried, in host order
++ * (the 16-bit power signed), and when and where it came: the channel of
++ * the radio its detector maps to, that radio's band. Only the pulses the
++ * report counts are kept. The report still goes to mac80211.
++ */
++static void mt7915_mcu2_events_rdd_report(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt7915_mcu_rdd_report *ev;
++	struct mt7915_rdd_report *r, *e;
++	struct mt7915_phy *phy2;
++	time64_t t0, t1;
++	u64 up0, up1;
++	int i;
++
++	mt7915_mcu2_bands(test, dev);
++	mt7915_mcu2_tune(test, dev, 5260, NL80211_CHAN_WIDTH_80, 5290);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 0);
++
++	ev = mt7915_mcu2_rdd_ev(test, MT_RDD_IDX_BAND0);
++	t0 = ktime_get_real_seconds();
++	up0 = ktime_to_ms(ktime_get_boottime());
++	mt7915_mcu2_rdd_send(test, dev, ev, sizeof(*ev));
++	t1 = ktime_get_real_seconds();
++	up1 = ktime_to_ms(ktime_get_boottime());
++	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 1);
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 1);
++	e = &r[0];
++	KUNIT_EXPECT_EQ(test, e->seq, 1);
++	KUNIT_EXPECT_GE(test, e->time, t0);
++	KUNIT_EXPECT_LE(test, e->time, t1);
++	KUNIT_EXPECT_GE(test, e->uptime_ms, up0);
++	KUNIT_EXPECT_LE(test, e->uptime_ms, up1);
++	KUNIT_EXPECT_EQ(test, e->rdd_idx, MT_RDD_IDX_BAND0);
++	KUNIT_EXPECT_EQ(test, e->band, dev->mphy.band_idx);
++	KUNIT_EXPECT_EQ(test, e->freq, 5260);
++	KUNIT_EXPECT_EQ(test, e->width, 80);
++	KUNIT_EXPECT_EQ(test, e->center, 5290);
++	KUNIT_EXPECT_EQ(test, e->radar_type_idx, 5);
++	KUNIT_EXPECT_EQ(test, e->long_detected, 0);
++	KUNIT_EXPECT_EQ(test, e->constant_prf_detected, 1);
++	KUNIT_EXPECT_EQ(test, e->staggered_prf_detected, 0);
++	KUNIT_EXPECT_EQ(test, e->n_periodic, 3);
++	KUNIT_EXPECT_EQ(test, e->n_long, 2);
++	KUNIT_EXPECT_EQ(test, e->n_hw, 4);
++	KUNIT_EXPECT_EQ(test, e->out_lpn, 11);
++	KUNIT_EXPECT_EQ(test, e->out_spn, 12);
++	KUNIT_EXPECT_EQ(test, e->out_crpn, 13);
++	KUNIT_EXPECT_EQ(test, e->out_crpw, 14);
++	KUNIT_EXPECT_EQ(test, e->out_crbn, 15);
++	KUNIT_EXPECT_EQ(test, e->out_stgpn, 16);
++	KUNIT_EXPECT_EQ(test, e->out_stgpw, 17);
++	KUNIT_EXPECT_EQ(test, e->out_pri_const, 1428);
++	KUNIT_EXPECT_EQ(test, e->out_pri_stg[0], 2500);
++	KUNIT_EXPECT_EQ(test, e->out_pri_stg[1], 3333);
++	KUNIT_EXPECT_EQ(test, e->out_pri_stg[2], 0x80000001);
++	for (i = 0; i < 3; i++)
++		mt7915_mcu2_expect_pulse(test, &e->periodic[i], 1000 + i,
++					 10 + i, -60 - i);
++	mt7915_mcu2_expect_no_pulses(test, e->periodic, 3);
++	for (i = 0; i < 2; i++)
++		mt7915_mcu2_expect_pulse(test, &e->long_pulse[i], 2000 + i,
++					 300 + i, -256 + i);
++	mt7915_mcu2_expect_no_pulses(test, e->long_pulse, 2);
++	for (i = 0; i < 4; i++)
++		mt7915_mcu2_expect_pulse(test, &e->hw[i], 0xf0000000 + i,
++					 0xffe0 + i, 20 + i);
++	mt7915_mcu2_expect_no_pulses(test, e->hw, 4);
++
++	/* band 1's detector, with a band 1 radio: its channel and band */
++	mt7915_mcu2_set_adie(dev, MT7975_DUAL_ADIE);
++	phy2 = mt7915_mcu2_band1_phy(test, dev);
++	mt7915_mcu2_chandef(test, dev, &phy2->mt76->chandef, 5300,
++			    NL80211_CHAN_WIDTH_40, 5310);
++	ev->rdd_idx = MT_RDD_IDX_BAND1;
++	ev->periodic_pulse_num = 32;
++	ev->long_pulse_num = 0;
++	ev->hw_pulse_num = 1;
++	mt7915_mcu2_rdd_send(test, dev, ev, sizeof(*ev));
++	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 2);
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 2);
++	KUNIT_EXPECT_EQ(test, r[0].seq, 1);
++	KUNIT_EXPECT_EQ(test, r[0].rdd_idx, MT_RDD_IDX_BAND0);
++	e = &r[1];
++	KUNIT_EXPECT_EQ(test, e->seq, 2);
++	KUNIT_EXPECT_EQ(test, e->rdd_idx, MT_RDD_IDX_BAND1);
++	KUNIT_EXPECT_EQ(test, e->band, MT_BAND1);
++	KUNIT_EXPECT_EQ(test, e->freq, 5300);
++	KUNIT_EXPECT_EQ(test, e->width, 40);
++	KUNIT_EXPECT_EQ(test, e->center, 5310);
++	KUNIT_EXPECT_EQ(test, e->n_periodic, 32);
++	KUNIT_EXPECT_EQ(test, e->n_long, 0);
++	KUNIT_EXPECT_EQ(test, e->n_hw, 1);
++	mt7915_mcu2_expect_pulse(test, &e->periodic[31], 1031, 41, -91);
++	mt7915_mcu2_expect_no_pulses(test, e->long_pulse, 0);
++	mt7915_mcu2_expect_pulse(test, &e->hw[0], 0xf0000000, 0xffe0, 20);
++	mt7915_mcu2_expect_no_pulses(test, e->hw, 1);
++}
++
++/* A report cut short is kept with what arrived: fields past its end read
++ * as zero, and each pulse count is cut to the pulses that arrived whole
++ * (and to 32). Nothing past the end is read.
++ */
++static void mt7915_mcu2_events_rdd_report_short(struct kunit *test)
++{
++	const int pulses = offsetof(struct mt7915_mcu_rdd_report, long_pulse);
++	const int hdr = offsetof(struct mt7915_mcu_rdd_report, hdr);
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt7915_mcu_rdd_report *ev;
++	struct mt7915_rdd_report *r, *e;
++
++	mt7915_mcu2_bands(test, dev);
++	mt7915_mcu2_tune(test, dev, 5260, NL80211_CHAN_WIDTH_80, 5290);
++	ev = mt7915_mcu2_rdd_ev(test, MT_RDD_IDX_BAND0);
++	ev->periodic_pulse_num = 10;
++	ev->long_pulse_num = 20;
++	ev->hw_pulse_num = 10;
++
++	/* the fixed part and 3 long pulses, half of a 4th */
++	mt7915_mcu2_rdd_send(test, dev, ev, pulses + 3 * 12 + 6);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 1);
++	e = &r[0];
++	KUNIT_EXPECT_EQ(test, e->radar_type_idx, 5);
++	KUNIT_EXPECT_EQ(test, e->out_stgpw, 17);
++	KUNIT_EXPECT_EQ(test, e->out_pri_stg[2], 0x80000001);
++	KUNIT_EXPECT_EQ(test, e->n_long, 3);
++	KUNIT_EXPECT_EQ(test, e->n_periodic, 0);
++	KUNIT_EXPECT_EQ(test, e->n_hw, 0);
++	mt7915_mcu2_expect_pulse(test, &e->long_pulse[2], 2002, 302, -254);
++	mt7915_mcu2_expect_no_pulses(test, e->long_pulse, 3);
++	mt7915_mcu2_expect_no_pulses(test, e->periodic, 0);
++	mt7915_mcu2_expect_no_pulses(test, e->hw, 0);
++	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 1);
++
++	/* all long pulses and 2 periodic ones; more than 32 long ones
++	 * claimed
++	 */
++	ev->long_pulse_num = 200;
++	mt7915_mcu2_rdd_send(test, dev, ev,
++			     offsetof(struct mt7915_mcu_rdd_report,
++				      periodic_pulse) + 2 * 12);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 2);
++	e = &r[1];
++	KUNIT_EXPECT_EQ(test, e->n_long, 32);
++	KUNIT_EXPECT_EQ(test, e->n_periodic, 2);
++	KUNIT_EXPECT_EQ(test, e->n_hw, 0);
++	mt7915_mcu2_expect_pulse(test, &e->long_pulse[31], 2031, 331, -225);
++	mt7915_mcu2_expect_pulse(test, &e->periodic[1], 1001, 11, -61);
++	mt7915_mcu2_expect_no_pulses(test, e->periodic, 2);
++	mt7915_mcu2_expect_no_pulses(test, e->hw, 0);
++
++	/* the whole report, more than 32 hardware pulses claimed */
++	ev->hw_pulse_num = 33;
++	mt7915_mcu2_rdd_send(test, dev, ev, sizeof(*ev));
++	KUNIT_ASSERT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 3);
++	KUNIT_EXPECT_EQ(test, r[2].n_hw, 32);
++	mt7915_mcu2_expect_pulse(test, &r[2].hw[31], 0xf000001f, 0xffff, 51);
++
++	/* the fixed part cut after the periodic pulse count */
++	mt7915_mcu2_rdd_send(test, dev, ev, hdr + 6);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 4);
++	e = &r[3];
++	KUNIT_EXPECT_EQ(test, e->rdd_idx, MT_RDD_IDX_BAND0);
++	KUNIT_EXPECT_EQ(test, e->constant_prf_detected, 1);
++	KUNIT_EXPECT_EQ(test, e->radar_type_idx, 5);
++	KUNIT_EXPECT_EQ(test, e->n_periodic, 0);
++	KUNIT_EXPECT_EQ(test, e->n_long, 0);
++	KUNIT_EXPECT_EQ(test, e->n_hw, 0);
++	KUNIT_EXPECT_EQ(test, e->out_lpn, 0);
++	KUNIT_EXPECT_EQ(test, e->out_stgpw, 0);
++	KUNIT_EXPECT_EQ(test, e->out_pri_const, 0);
++	KUNIT_EXPECT_EQ(test, e->out_pri_stg[2], 0);
++	KUNIT_EXPECT_EQ(test, e->freq, 5260);
++	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 4);
++}
++
++/* The last 8 reports are kept, oldest first, numbered in the order they
++ * came.
++ */
++static void mt7915_mcu2_events_rdd_report_ring(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt7915_mcu_rdd_report *ev;
++	struct mt7915_rdd_report *r;
++	int i;
++
++	mt7915_mcu2_bands(test, dev);
++	mt7915_mcu2_tune(test, dev, 5260, NL80211_CHAN_WIDTH_80, 5290);
++	ev = mt7915_mcu2_rdd_ev(test, MT_RDD_IDX_BAND0);
++	for (i = 0; i < 11; i++) {
++		ev->radar_type_idx = i;
++		mt7915_mcu2_rdd_send(test, dev, ev, sizeof(*ev));
++	}
++	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 11);
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r),
++			MT7915_RDD_REPORTS);
++	for (i = 0; i < MT7915_RDD_REPORTS; i++) {
++		KUNIT_EXPECT_EQ(test, r[i].seq, 4 + i);
++		KUNIT_EXPECT_EQ(test, r[i].radar_type_idx, 3 + i);
++		KUNIT_EXPECT_EQ(test, r[i].n_periodic, 3);
++	}
++}
++
++/* Reports the driver drops (an unknown detector, one without a radio, one
++ * too short to say which detector it's from) aren't kept either.
++ */
++static void mt7915_mcu2_events_rdd_report_dropped(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt7915_mcu_rdd_report *ev;
++	struct mt7915_rdd_report *r;
++
++	ev = mt7915_mcu2_rdd_ev(test, 3);
++	mt7915_mcu2_rdd_send(test, dev, ev, sizeof(*ev));
++	ev->rdd_idx = MT_RDD_IDX_BAND0;
++	mt7915_mcu2_rdd_send(test, dev, ev,
++			     offsetof(struct mt7915_mcu_rdd_report, hdr));
++	ev->rdd_idx = MT_RDD_IDX_BACKGROUND;
++	mt7915_mcu2_rdd_send(test, dev, ev, sizeof(*ev));
++	mt7915_mcu2_set_adie(dev, MT7976_DUAL_ADIE);
++	ev->rdd_idx = MT_RDD_IDX_BAND1;
++	mt7915_mcu2_rdd_send(test, dev, ev, sizeof(*ev));
++
++	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 0);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu2_rdd_kept(test, dev, &r), 0);
++	KUNIT_EXPECT_EQ(test, dev->rdd_reports.seq, 0);
++}
++
+ static void mt7915_mcu2_ps_event(struct kunit *test, struct mt7915_dev *dev,
+ 				 u16 wcid, bool ps)
+ {
+@@ -1389,6 +1711,10 @@ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_unsolicited),
+ 	KUNIT_CASE(mt7915_mcu2_events_thermal),
+ 	KUNIT_CASE(mt7915_mcu2_events_radar),
++	KUNIT_CASE(mt7915_mcu2_events_rdd_report),
++	KUNIT_CASE(mt7915_mcu2_events_rdd_report_short),
++	KUNIT_CASE(mt7915_mcu2_events_rdd_report_ring),
++	KUNIT_CASE(mt7915_mcu2_events_rdd_report_dropped),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync_off),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync_v2),

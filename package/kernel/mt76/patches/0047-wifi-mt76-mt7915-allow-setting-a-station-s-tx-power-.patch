@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:21:07 +0100
+Subject: [PATCH] wifi: mt76: mt7915: allow setting a station's tx power back
+ to automatic
+
+mac80211 passes 0 to sta_set_txpwr for NL80211_TX_POWER_AUTOMATIC.
+mt7915_mcu_set_txpower_frame() bounded that 0 with mt76_get_power_bound()
+first, which subtracts the multi-chain gain, and then refused the
+negative result with -EINVAL. So on any radio with more than one chain
+a station limit, once set, could never be cleared.
+
+Only bound a real limit; automatic sends the frame setting without
+offsets. Un-skip the two tests that check it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c             | 9 +++++----
+ mt7915/tests/main-test.c | 9 +++------
+ mt7915/tests/mcu2-test.c | 5 ++---
+ 3 files changed, 10 insertions(+), 13 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 738cad15..926fafd8 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -3413,13 +3413,14 @@ int mt7915_mcu_set_txpower_frame(struct mt7915_phy *phy,
+ 	if (ret)
+ 		return ret;
+ 
+-	txpower = mt76_get_power_bound(mphy, txpower);
+-	if (txpower > mphy->txpower_cur || txpower < 0)
+-		return -EINVAL;
+-
++	/* 0 is automatic: no limit, so no offsets and no bound to apply */
+ 	if (txpower) {
+ 		u32 offs, len, i;
+ 
++		txpower = mt76_get_power_bound(mphy, txpower);
++		if (txpower > mphy->txpower_cur || txpower < 0)
++			return -EINVAL;
++
+ 		if (sta->deflink.ht_cap.ht_supported) {
+ 			const u8 *sku_len = mt7915_sku_group_len;
+ 
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 05537c20..3e668d65 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2371,10 +2371,9 @@ static void mt7915_main_test_sta_txpwr(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 1);
+ }
+ 
+-/* "Automatic" tx power for a station means no limit: the firmware should
+- * get the frame setting without offsets. mt7915_mcu_set_txpower_frame()
+- * subtracts the multi-chain gain from 0 first, gets a negative power and
+- * refuses with -EINVAL on any device with more than one chain.
++/* "Automatic" tx power for a station means no limit: the firmware gets the
++ * frame setting without offsets, on a device with more than one chain too
++ * (bounding 0 by the multi-chain gain would give a negative power).
+  */
+ static void mt7915_main_test_sta_txpwr_auto(struct kunit *test)
+ {
+@@ -2385,8 +2384,6 @@ static void mt7915_main_test_sta_txpwr_auto(struct kunit *test)
+ 	struct ieee80211_hw *hw;
+ 	struct mt76_test_msg *msg;
+ 
+-	kunit_skip(test, "driver bug: automatic station tx power fails with -EINVAL on multi-chain devices");
+-
+ 	dev = mt7915_main_test_dev(test);
+ 	fake = mt76_test_fake;
+ 	hw = dev->mt76.hw;
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index ebefc550..771ea2a8 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -2471,14 +2471,13 @@ static void mt7915_mcu2_txpower_frame_errors(struct kunit *test)
+ }
+ 
+ /* Setting a station back to automatic power (0, what mac80211 passes for
+- * NL80211_TX_POWER_AUTOMATIC) should clear its offsets; on a radio with
+- * more than one chain the chain gain makes the bound negative and it fails.
++ * NL80211_TX_POWER_AUTOMATIC) clears its offsets, also on a radio with more
++ * than one chain, where bounding 0 by the chain gain would go negative.
+  */
+ static void mt7915_mcu2_txpower_frame_auto(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev;
+ 
+-	kunit_skip(test, "driver bug: txpower auto (0) for a station gives -EINVAL on multi-chain radios");
+ 	dev = mt7915_test_dev(test);
+ 	KUNIT_ASSERT_EQ(test, mt7915_mcu2_txpower_frame(test, dev, true, true,
+ 							true, 0), 0);

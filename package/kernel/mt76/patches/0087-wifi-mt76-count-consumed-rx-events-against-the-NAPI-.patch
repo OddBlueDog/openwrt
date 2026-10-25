@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 11:25:18 +0100
+Subject: [PATCH] wifi: mt76: count consumed rx events against the NAPI budget
+
+mt76_dma_rx_process() counted only the skbs it built. Buffers the
+driver consumes in rx_check (on mt7915 every tx-free and tx status
+event) were recycled without done++, so a poll of a tx-free ring never
+reached its budget: it ran until the ring was empty, up to 511 events
+of up to hundreds of MSDUs each, with BHs off and no cond_resched()
+(PREEMPT_NONE), and refilled the ring only at the end. After a burst
+that's milliseconds of BH-off time on a CPU that also runs RPS backlogs
+and the ifb tasklet.
+
+Count them like frames. A busy tx-free ring then gives NAPI its budget
+back after 64 events, the threaded NAPI loop lets softirqs run and
+resched between polls, and the ring is refilled every 64 events. The
+same events are processed, in the same order.
+
+mt76_dma_test_rx_process_rx_check now checks consumed events count, a
+poll stops at its budget and the next goes on from there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dma.c            |  9 ++++++++-
+ tests/dma-test.c | 16 ++++++++++++++--
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/dma.c b/dma.c
+index a2266245..2396e186 100644
+--- a/dma.c
++++ b/dma.c
+@@ -1075,9 +1075,16 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 			continue;
+ 		}
+ 
++		/*
++		 * Consumed by the driver (tx-free, tx status): work like a
++		 * frame, or a busy tx-free ring is polled until it's empty,
++		 * with BHs off and the ring refilled only at the end.
++		 */
+ 		if (!more && dev->drv->rx_check &&
+-		    !(dev->drv->rx_check(dev, data, len)))
++		    !(dev->drv->rx_check(dev, data, len))) {
++			done++;
+ 			goto free_frag;
++		}
+ 
+ 		skb = napi_build_skb(data, q->buf_size);
+ 		if (!skb)
+diff --git a/tests/dma-test.c b/tests/dma-test.c
+index 3f19f66b..bd1f1397 100644
+--- a/tests/dma-test.c
++++ b/tests/dma-test.c
+@@ -1411,13 +1411,15 @@ static void mt76_dma_test_rx_process_budget(struct kunit *test)
+ }
+ 
+ /* Frames the driver consumes in rx_check (tx-free events and the like) are
+- * recycled and don't count against the budget.
++ * recycled, and count against the budget like frames: a poll of a busy
++ * tx-free ring stops at its budget, and the next one goes on from there.
+  */
+ static void mt76_dma_test_rx_process_rx_check(struct kunit *test)
+ {
+ 	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
+ 	struct mt76_queue *q;
+ 	void *buf;
++	int i;
+ 
+ 	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
+ 	mt76_dma_rx_fill(t->dev, q, false);
+@@ -1425,13 +1427,23 @@ static void mt76_dma_test_rx_process_rx_check(struct kunit *test)
+ 	mt76_dma_test_rx_frame(t, q, 0, 24, 0x11);
+ 	t->rx_check_drop = true;
+ 
+-	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
+ 	KUNIT_EXPECT_EQ(test, t->n_rx_check, 1);
+ 	KUNIT_EXPECT_PTR_EQ(test, t->rx_check_data, buf);
+ 	KUNIT_EXPECT_EQ(test, t->rx_check_len, 24);
+ 	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
+ 	KUNIT_EXPECT_EQ(test, q->tail, 1);
+ 	KUNIT_EXPECT_EQ(test, q->queued, 7);
++
++	for (i = 1; i <= 6; i++)
++		mt76_dma_test_rx_frame(t, q, i, 24, 0x11);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 4), 4);
++	KUNIT_EXPECT_EQ(test, t->n_rx_check, 5);
++	KUNIT_EXPECT_EQ(test, q->tail, 5);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 4), 2);
++	KUNIT_EXPECT_EQ(test, t->n_rx_check, 7);
++	KUNIT_EXPECT_EQ(test, q->tail, 7);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
+ }
+ 
+ /* A frame over several buffers becomes one skb: the first buffer is its

@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:22:42 +0100
+Subject: [PATCH] wifi: mt76: mt7915: drop stale MCU replies before waiting for
+ one
+
+Commands sent without waiting still get an acknowledgement, which stays
+on mcu.res_q until the next waited command discards it by sequence
+mismatch. Sequence numbers are only 4 bits wide, so after 15 such
+commands an old acknowledgement carries the new command's sequence and
+is taken as its response.
+
+The caller holds mcu.mutex and is the only waiter, so anything still
+queued when a waited command is sent is stale: purge it first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index d8cdd414..6f984e9c 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -240,6 +240,14 @@ mt7915_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
+ 
+ 	mt7915_mcu_set_timeout(mdev, cmd);
+ 
++	/* We hold mcu.mutex and are about to wait for a reply, so whatever
++	 * is still queued is an ack for a fire-and-forget command or a
++	 * leftover from before a reset. Drop it: with a 4-bit seq, an old
++	 * entry can otherwise be taken as this command's response.
++	 */
++	if (wait_seq)
++		skb_queue_purge(&mdev->mcu.res_q);
++
+ 	return mt76_tx_queue_skb_raw(dev, mdev->q_mcu[qid], skb, 0);
+ }
+ 

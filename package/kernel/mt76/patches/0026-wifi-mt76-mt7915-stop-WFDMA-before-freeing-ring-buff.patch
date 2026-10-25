@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:27:47 +0100
+Subject: [PATCH] wifi: mt76: mt7915: stop WFDMA before freeing ring buffers on
+ reset
+
+mt7915_dma_reset() frees the tx and rx queue buffers before it disables
+WFDMA, and on a full reset after a firmware crash or MCU timeout nothing
+has stopped the engine yet on MT7986 (interrupts are only masked for
+PCIe devices). Rx DMA that is still running can then write into pages
+already returned to the allocator.
+
+Disable WFDMA and give it a moment to settle first, as
+mt7996_dma_reset() does.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/dma.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/mt7915/dma.c b/mt7915/dma.c
+index aabd3736..dd39fbad 100644
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -593,6 +593,12 @@ int mt7915_dma_reset(struct mt7915_dev *dev, bool force)
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	int i;
+ 
++	/* On a full reset nothing has stopped WFDMA yet: stop it before
++	 * freeing the buffers its descriptors still point to.
++	 */
++	mt7915_dma_disable(dev, false);
++	usleep_range(1000, 2000);
++
+ 	/* clean up hw queues */
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.phy.q_tx); i++) {
+ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], true);

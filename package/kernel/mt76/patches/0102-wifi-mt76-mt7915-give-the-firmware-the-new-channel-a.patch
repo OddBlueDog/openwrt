@@ -1,0 +1,252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:43:29 +0100
+Subject: [PATCH] wifi: mt76: mt7915: give the firmware the new channel after a
+ channel switch
+
+The firmware keeps the channel it was given when a BSS and its stations
+were added: in the BSS's BSS_INFO_RF_CH (primary channel, centre and
+width), in each station's STA_REC_RA (the channel number) and, for the
+width, in its beamforming record. mt7915 has no post_channel_switch.
+After a CSA mac80211 sends BSS_CHANGED_BANDWIDTH, which mt7915 ignores,
+and rate control updates only for the stations whose own width changed.
+So the firmware keeps the old channel in all three, and the old width
+wherever only the BSS's changed: a 160 MHz AP that radar moves to 80 MHz
+keeps 160 MHz in RF_CH.
+
+Add post_channel_switch, as mt7996 has: the BSS's RF_CH record again,
+alone in a BSS_INFO_UPDATE (no other BSS TLV follows the channel), and
+every station queued for the rate control work as for a new width, which
+sends STA_REC_BF (if it has one), STA_REC_HE and STA_REC_RA. A failure
+is only logged: an error from this hook makes mac80211 stop the AP.
+
+It runs on DFS channels, where radar makes a running AP switch channel,
+and on a channel change by CSA; never on a fixed channel. MediaTek's "add
+post channel switch for DFS channel switching" (StanleyYP Wang, 2023,
+carried in pesa1234's tree) runs mt7915_set_channel() again instead. On
+this base that adds nothing for radar: mac80211 6.18 passes the radar
+flag with the switch itself for a single-channel driver, and mt76 reads
+it from phy->radar_enabled, which only mt76_update_channel() sets.
+
+mt7915_main_test_post_channel_switch and _sta.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/main.c            |  32 +++++++++++++
+ mt7915/mcu.c             |  20 ++++++++
+ mt7915/mt7915.h          |   2 +
+ mt7915/tests/main-test.c | 100 +++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 154 insertions(+)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 0552bc0b..d75bd793 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1375,6 +1375,37 @@ mt7915_set_bitrate_mask(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	return 0;
+ }
+ 
++static int
++mt7915_post_channel_switch(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			   struct ieee80211_bss_conf *link_conf)
++{
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_dev *dev = phy->dev;
++	u32 changed = IEEE80211_RC_BW_CHANGED;
++	int ret;
++
++	/* The firmware keeps the channel it was given when the BSS and its
++	 * stations were added: in the BSS's RF_CH record, in each station's
++	 * STA_REC_RA, and the width in its beamforming record. mac80211 only
++	 * reports the stations whose own width changed, so all of them get
++	 * the rate control work's update for a new width. A failure is only
++	 * logged: an error here makes mac80211 stop the AP, and without the
++	 * update the BSS goes on as it did before this hook.
++	 */
++	mutex_lock(&dev->mt76.mutex);
++	ret = mt7915_mcu_update_bss_rfch(phy, vif);
++	mutex_unlock(&dev->mt76.mutex);
++	if (ret)
++		dev_warn(dev->mt76.dev,
++			 "BSS channel update after a channel switch failed: %d\n",
++			 ret);
++
++	ieee80211_iterate_stations_atomic(hw, mt7915_sta_rc_work, &changed);
++	ieee80211_queue_work(hw, &dev->rc_work);
++
++	return 0;
++}
++
+ static void mt7915_sta_wed_set_4addr(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 				     struct ieee80211_sta *sta)
+ {
+@@ -1958,6 +1989,7 @@ const struct ieee80211_ops mt7915_ops = {
+ 	.get_txpower = mt76_get_txpower,
+ 	.set_sar_specs = mt7915_set_sar_specs,
+ 	.channel_switch_beacon = mt7915_channel_switch_beacon,
++	.post_channel_switch = mt7915_post_channel_switch,
+ 	.get_stats = mt7915_get_stats,
+ 	.get_et_sset_count = mt7915_get_et_sset_count,
+ 	.get_et_stats = mt7915_get_et_stats,
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index a9da15a2..247a0a3f 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -855,6 +855,26 @@ out:
+ 				     MCU_EXT_CMD(BSS_INFO_UPDATE), true);
+ }
+ 
++/* RF_CH is the only part of a BSS's info that follows the channel */
++int mt7915_mcu_update_bss_rfch(struct mt7915_phy *phy,
++			       struct ieee80211_vif *vif)
++{
++	int len = sizeof(struct sta_req_hdr) + sizeof(struct bss_info_rf_ch);
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	struct mt7915_dev *dev = phy->dev;
++	struct sk_buff *skb;
++
++	skb = __mt76_connac_mcu_alloc_sta_req(&dev->mt76, &mvif->mt76,
++					      NULL, len);
++	if (IS_ERR(skb))
++		return PTR_ERR(skb);
++
++	mt7915_mcu_bss_rfch_tlv(skb, vif, phy);
++
++	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
++				     MCU_EXT_CMD(BSS_INFO_UPDATE), true);
++}
++
+ /** starec & wtbl **/
+ int mt7915_mcu_add_tx_ba(struct mt7915_dev *dev,
+ 			 struct ieee80211_ampdu_params *params,
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index f8785643..fcfc7976 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -514,6 +514,8 @@ int mt7915_mcu_add_dev_info(struct mt7915_phy *phy,
+ 			    struct ieee80211_vif *vif, bool enable);
+ int mt7915_mcu_add_bss_info(struct mt7915_phy *phy,
+ 			    struct ieee80211_vif *vif, int enable);
++int mt7915_mcu_update_bss_rfch(struct mt7915_phy *phy,
++			       struct ieee80211_vif *vif);
+ int __mt7915_mcu_add_sta(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 			 struct ieee80211_sta *sta, struct mt76_wcid *wcid,
+ 			 int conn_state, bool newly);
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index c80b8b3a..ba178279 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2674,6 +2674,104 @@ static void mt7915_main_test_set_bitrate_mask(struct kunit *test)
+ 			   &mask, sizeof(mask));
+ }
+ 
++/* @phy2 on channel 44 at 160 MHz (36-64, centred on 50) */
++static void mt7915_main_test_chan44_160(struct kunit *test,
++					struct mt7915_phy *phy2)
++{
++	struct ieee80211_supported_band *sband = &phy2->mt76->sband_5g.sband;
++	struct cfg80211_chan_def *chandef = &phy2->mt76->chandef;
++	int i;
++
++	for (i = 0; i < sband->n_channels; i++)
++		if (sband->channels[i].hw_value == 44)
++			break;
++	KUNIT_ASSERT_LT(test, i, sband->n_channels);
++	cfg80211_chandef_create(chandef, &sband->channels[i],
++				NL80211_CHAN_HT20);
++	chandef->width = NL80211_CHAN_WIDTH_160;
++	chandef->center_freq1 = 5250;
++}
++
++/* After a channel switch the BSS gets its new channel: its RF_CH record
++ * alone in a BSS_INFO_UPDATE, sent under the device mutex. A failed update
++ * is only logged, so mac80211 doesn't stop the AP over it.
++ */
++static void mt7915_main_test_post_channel_switch(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_phy *phy2 = mt7915_ext_phy(dev);
++	struct ieee80211_hw *hw = mt7915_main_test_hw2(dev);
++	struct cfg80211_chan_def old = phy2->mt76->chandef;
++	struct bss_info_rf_ch *ch;
++	struct ieee80211_vif *vif;
++	struct mt76_test_msg *msg;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	mt7915_main_test_clear(fake);
++	mt7915_main_test_chan44_160(test, phy2);
++
++	KUNIT_EXPECT_EQ(test, mt7915_post_channel_switch(hw, vif,
++							 &vif->bss_conf), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 1);
++	msg = mt76_test_msg(fake, 0);
++	KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(BSS_INFO_UPDATE));
++	KUNIT_EXPECT_TRUE(test, msg->locked);
++	KUNIT_EXPECT_EQ(test, msg->len,
++			(int)(sizeof(struct sta_req_hdr) + sizeof(*ch)));
++	ch = mt7915_main_test_tlv(msg, BSS_INFO_RF_CH);
++	KUNIT_ASSERT_NOT_NULL(test, ch);
++	KUNIT_EXPECT_EQ(test, ch->pri_ch, 44);
++	KUNIT_EXPECT_EQ(test, ch->center_ch0, 50);
++	KUNIT_EXPECT_EQ(test, ch->bw, CMD_CBW_160MHZ);
++	KUNIT_EXPECT_EQ(test, ch->he_all_disable, 1);
++	flush_work(&dev->rc_work);
++
++	mt7915_main_test_clear(fake);
++	fake->mcu_ret = -EIO;
++	KUNIT_EXPECT_EQ(test, mt7915_post_channel_switch(hw, vif,
++							 &vif->bss_conf), 0);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 1);
++	flush_work(&dev->rc_work);
++	fake->mcu_ret = 0;
++
++	phy2->mt76->chandef = old;
++}
++
++/* What the switch queues for each station (mac80211 iterates them; here
++ * the one is queued by hand): the rate control work sends its rate record
++ * again, which carries the new channel.
++ */
++static void mt7915_main_test_post_channel_switch_sta(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_phy *phy2 = mt7915_ext_phy(dev);
++	struct ieee80211_hw *hw = mt7915_main_test_hw2(dev);
++	struct cfg80211_chan_def old = phy2->mt76->chandef;
++	u32 changed = IEEE80211_RC_BW_CHANGED;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct sta_rec_ra *ra;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	sta = mt7915_main_test_add_sta(test, hw, vif, 1);
++	sta->deflink.bandwidth = IEEE80211_STA_RX_BW_80;
++	mt7915_main_test_clear(fake);
++	mt7915_main_test_chan44_160(test, phy2);
++
++	mt7915_sta_rc_work(&changed, sta);
++	ieee80211_queue_work(hw, &dev->rc_work);
++	flush_work(&dev->rc_work);
++	ra = mt7915_main_test_tlv(mt76_test_find_msg(fake,
++				  MCU_EXT_CMD(STA_REC_UPDATE)), STA_REC_RA);
++	KUNIT_ASSERT_NOT_NULL(test, ra);
++	KUNIT_EXPECT_EQ(test, ra->channel, 44);
++	KUNIT_EXPECT_EQ(test, ra->bw, IEEE80211_STA_RX_BW_80);
++
++	phy2->mt76->chandef = old;
++}
++
+ /* TWT teardown requested by mac80211 removes the agreement. */
+ static void mt7915_main_test_twt_teardown(struct kunit *test)
+ {
+@@ -3209,6 +3307,8 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_sta_statistics),
+ 	KUNIT_CASE(mt7915_main_test_sta_rc_update),
+ 	KUNIT_CASE(mt7915_main_test_set_bitrate_mask),
++	KUNIT_CASE(mt7915_main_test_post_channel_switch),
++	KUNIT_CASE(mt7915_main_test_post_channel_switch_sta),
+ 	KUNIT_CASE(mt7915_main_test_twt_teardown),
+ 	KUNIT_CASE(mt7915_main_test_rts_threshold),
+ 	KUNIT_CASE(mt7915_main_test_get_stats),

@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:40:41 +0100
+Subject: [PATCH] wifi: mt76: mt7915: keep airtime weights and the vow_atf
+ switch across resets
+
+Two hardware airtime fairness settings were lost on a full reset:
+
+- A station's airtime weight. mt7915_mac_sta_add() always sent the
+  default weight. mac80211 (390-...airtime-weight) re-sends a custom
+  weight when it re-adds a station after a reset, but that is before the
+  station is associated again, and mt7915_sta_set_airtime_weight()
+  ignored weights for stations that weren't associated. Keep the weight
+  in the msta, which outlives the reset, and send it from sta_add.
+
+- vow_atf_en. mt7915_vow_init() set it to true, and runs again from
+  mt7915_mac_init() on every full reset, so turning airtime fairness off
+  through debugfs lasted until the next reset. Set the default once, in
+  mt7915_register_device().
+
+mt7915_main_test_sta_add_keeps_weight checks the first; the vow_init
+test now checks that a switched-off vow_atf stays off. Three init tests
+set vow_atf_en the way mt7915_register_device() does now.
+
+The DRR value's BSS group mask and its BWC group (upstream pending
+5ed926a3) are left as MediaTek's original code has them: which layout
+the firmware wants can't be told from the driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c            |  5 +++--
+ mt7915/main.c            | 13 +++++++++++--
+ mt7915/mt7915.h          |  2 ++
+ mt7915/tests/init-test.c | 15 +++++++++++++++
+ mt7915/tests/main-test.c | 37 +++++++++++++++++++++++++++++++++++++
+ 5 files changed, 68 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 0ff15d27..0820e4dd 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -667,10 +667,9 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
+ 	}
+ }
+ 
++/* also after a full reset: keeps vow_atf_en as debugfs left it */
+ void mt7915_vow_init(struct mt7915_dev *dev)
+ {
+-	dev->vow_atf_en = true;
+-
+ 	mt7915_mcu_set_vow_drr_ctrl(dev, NULL, VOW_DRR_CTRL_AIRTIME_DEFICIT_BOUND, 0);
+ 	mt7915_mcu_set_vow_drr_ctrl(dev, NULL, VOW_DRR_CTRL_AIRTIME_QUANTUM_ALL, 0);
+ 	mt7915_mcu_set_vow_feature_ctrl(dev);
+@@ -1332,6 +1331,8 @@ int mt7915_register_device(struct mt7915_dev *dev)
+ 	mutex_init(&dev->dump_mutex);
+ 
+ 	dev->dbdc_support = mt7915_band_config(dev);
++	/* on by default from the MT7916 on; the vow_atf debugfs file sets it */
++	dev->vow_atf_en = !is_mt7915(&dev->mt76);
+ 
+ 	phy2 = mt7915_alloc_ext_phy(dev);
+ 	if (IS_ERR(phy2))
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 087c8620..afd358a9 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -810,7 +810,7 @@ int mt7915_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 	if (!is_mt7915(&dev->mt76)) {
+ 		mt7915_mcu_set_vow_drr_ctrl(dev, msta, VOW_DRR_CTRL_STA_PAUSE, 0);
+ 		mt7915_sta_vow_set_airtime_weight(dev, msta,
+-						  IEEE80211_DEFAULT_AIRTIME_WEIGHT);
++			msta->airtime_weight ?: IEEE80211_DEFAULT_AIRTIME_WEIGHT);
+ 	}
+ 
+ 	return 0;
+@@ -1426,7 +1426,16 @@ static void mt7915_sta_set_airtime_weight(struct ieee80211_hw *hw,
+ 	struct mt7915_dev *dev = mt7915_hw_dev(hw);
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+ 
+-	if (is_mt7915(&dev->mt76) || !msta->wcid.sta)
++	if (is_mt7915(&dev->mt76))
++		return;
++
++	/*
++	 * Kept for mt7915_mac_sta_add(): mac80211 re-sends a custom weight
++	 * when it re-adds a station after a full reset, before the station
++	 * is associated again, and the msta outlives the reset.
++	 */
++	msta->airtime_weight = weight;
++	if (!msta->wcid.sta)
+ 		return;
+ 
+ 	mt7915_sta_vow_set_airtime_weight(dev, msta, weight);
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 1b42d576..9be1d13f 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -151,6 +151,8 @@ struct mt7915_sta {
+ 
+ 	struct list_head rc_list;
+ 	u32 airtime_ac[8];
++	/* mac80211's airtime weight, 0 until it sets one */
++	u16 airtime_weight;
+ 
+ 	int ack_signal;
+ 	struct ewma_avg_signal avg_ack_signal;
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index fb066215..9c2258ed 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -113,6 +113,7 @@ static void mt7915_init_test_register(struct kunit *test,
+ 			mt7915_init_test_unexpedite, NULL), 0);
+ 
+ 	dev->dbdc_support = mt7915_band_config(dev);
++	dev->vow_atf_en = !is_mt7915(&dev->mt76);
+ 	phy2 = mt7915_alloc_ext_phy(dev);
+ 	KUNIT_ASSERT_FALSE(test, IS_ERR(phy2));
+ 	INIT_WORK(&dev->init_work, mt7915_init_work);
+@@ -994,6 +995,7 @@ static void mt7915_init_test_mac_init(struct kunit *test)
+ 	int band;
+ 
+ 	dev->dbdc_support = true;
++	dev->vow_atf_en = true;	/* as mt7915_register_device() sets it */
+ 	mt76_wr(dev, MT_MDP_DCR2, MT_MDP_DCR2_RX_TRANS_SHORT);
+ 	mt76_wr(dev, MT_DMA_DCR0(1), MT_DMA_DCR0_RXD_G5_EN);
+ 	mt76_wr(dev, MT_WTBLOFF_TOP_ACR(0), MT_WTBLOFF_TOP_ADM_BACKOFFTIME);
+@@ -1252,6 +1254,7 @@ static void mt7915_init_test_vow_init(struct kunit *test)
+ 	struct mt76_test_fake *fake = mt76_test_fake;
+ 	struct mt76_test_msg *msg;
+ 
++	dev->vow_atf_en = true;	/* as mt7915_register_device() sets it */
+ 	mt7915_vow_init(dev);
+ 	KUNIT_EXPECT_TRUE(test, dev->vow_atf_en);
+ 	KUNIT_ASSERT_EQ(test, fake->n_msgs, 3);
+@@ -1270,6 +1273,16 @@ static void mt7915_init_test_vow_init(struct kunit *test)
+ 	/* ATF and WATF enable */
+ 	KUNIT_EXPECT_NE(test, get_unaligned_le16(msg->data + 22) & BIT(13), 0);
+ 	KUNIT_EXPECT_NE(test, get_unaligned_le16(msg->data + 22) & BIT(9), 0);
++
++	/* turned off through debugfs: a full reset's vow_init keeps it off */
++	dev->vow_atf_en = false;
++	mt7915_init_test_clear(fake);
++	mt7915_vow_init(dev);
++	KUNIT_EXPECT_FALSE(test, dev->vow_atf_en);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(SET_FEATURE_CTRL));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le16(msg->data + 22) &
++			(BIT(13) | BIT(9)), 0);
+ }
+ 
+ /* The firmware's BSS groups: hw BSSIDs 0-3 of band 0 are 0-3, of band 1
+@@ -1829,6 +1842,8 @@ static void mt7915_init_test_register_no_firmware(struct kunit *test)
+ 	ret = mt7915_register_device(dev);
+ 	KUNIT_EXPECT_LT(test, ret, 0);
+ 	KUNIT_EXPECT_TRUE(test, dev->dbdc_support);
++	/* airtime fairness defaults to on, once, before the hardware */
++	KUNIT_EXPECT_TRUE(test, dev->vow_atf_en);
+ 	KUNIT_EXPECT_EQ(test, dev->mphy.band_idx, 0);
+ 	KUNIT_EXPECT_TRUE(test, test_bit(MT76_STATE_INITIALIZED,
+ 					 &dev->mphy.state));
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index d2d2d2d2..5e55d3cc 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2322,8 +2322,10 @@ static void mt7915_main_test_sta_airtime(struct kunit *test)
+ 	sta = mt7915_main_test_add_sta(test, hw, vif, 1);
+ 	mt7915_main_test_clear(fake);
+ 
++	/* not associated yet: kept for later, nothing sent */
+ 	mt7915_sta_set_airtime_weight(hw, vif, sta, 512);
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_msta(sta)->airtime_weight, 512);
+ 
+ 	mt7915_main_test_msta(sta)->wcid.sta = 1;
+ 	mt7915_sta_set_airtime_weight(hw, vif, sta, 128);
+@@ -2341,6 +2343,40 @@ static void mt7915_main_test_sta_airtime(struct kunit *test)
+ 			FIELD_GET(VOW_DRR_STA_AC1_QNTM_MASK, low));
+ }
+ 
++/* A station mac80211 re-adds after a full reset gets the airtime weight it
++ * had (mac80211 re-sends it only before the station is associated again),
++ * not the default.
++ */
++static void mt7915_main_test_sta_add_keeps_weight(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt76_test_msg *msg;
++	u32 val;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	sta = mt7915_main_test_sta(test, vif, 1);
++	mt7915_sta_set_airtime_weight(hw, vif, sta, 1024);
++	mt7915_main_test_clear(fake);
++
++	KUNIT_ASSERT_EQ(test, mt7915_mac_sta_add(&dev->mt76, vif, sta), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 3);
++	msg = mt76_test_msg(fake, 2);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(msg->data),
++			VOW_DRR_CTRL_STA_ALL);
++	val = get_unaligned_le32(msg->data + 12);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(VOW_DRR_STA_AC1_QNTM_MASK, val),
++			mt76_connac_vow_dwrr_quantum(1024, IEEE80211_AC_BE));
++	KUNIT_EXPECT_NE(test, mt76_connac_vow_dwrr_quantum(1024,
++							  IEEE80211_AC_BE),
++			mt76_connac_vow_dwrr_quantum(
++				IEEE80211_DEFAULT_AIRTIME_WEIGHT,
++				IEEE80211_AC_BE));
++}
++
+ /* Per-station tx power: the frame minimum goes to 0 first, then the
+  * station's limit, as half-dB offsets of the limit (after the 4 chain
+  * combining gain) from the per-rate powers the firmware reports, for the
+@@ -3123,6 +3159,7 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_ampdu_tx),
+ 	KUNIT_CASE(mt7915_main_test_sta_flags),
+ 	KUNIT_CASE(mt7915_main_test_sta_airtime),
++	KUNIT_CASE(mt7915_main_test_sta_add_keeps_weight),
+ 	KUNIT_CASE(mt7915_main_test_sta_txpwr),
+ 	KUNIT_CASE(mt7915_main_test_sta_txpwr_auto),
+ 	KUNIT_CASE(mt7915_main_test_sta_statistics),

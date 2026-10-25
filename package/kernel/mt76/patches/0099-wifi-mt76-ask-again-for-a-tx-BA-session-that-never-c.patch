@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:25:32 +0100
+Subject: [PATCH] wifi: mt76: ask again for a tx BA session that never came up
+
+mt76_connac2_tx_check_aggr() sets the TID's bit in wcid->ampdu_state
+before ieee80211_start_tx_ba_session() and clears it only when that call
+fails or at TX_STOP_* in the driver's ampdu_action. mac80211 queues the
+start for its BA work (tid_start_tx), and __ieee80211_stop_tx_ba_session()
+frees a start the work hasn't picked up yet without calling the driver.
+That happens on a PTK rekey without extended key ID (key.c tears the
+sessions down under BLOCK_BA) and on a DELBA from the station in that
+window. The bit then stays set, nothing asks again, and the TID sends
+every frame on its own until the station reassociates.
+
+Remember when the session was asked for (mt76_txq.aggr_asked) and ask
+again when it still isn't up 2 s later (twice mac80211's ADDBA response
+timeout; a normal setup is done well within it). The bit stays set
+whatever the answer: mac80211 refuses a request while a session is
+starting or up (-EAGAIN) and keeps its own back-off, so this costs one
+call per TID every 2 s while a session is pending or refused, and
+nothing once it is up. A first request mac80211 refuses still clears the
+bit, as before.
+
+mt76_connac_test_tx_check_aggr_ask_again covers the driver's side, with
+ieee80211_start_tx_ba_session() stubbed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76.h                  |   1 +
+ mt76_connac_mac.c       |  33 +++++++++++--
+ tests/connac-mac-test.c | 101 +++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 130 insertions(+), 5 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index 298d9a04..929a88a1 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -442,6 +442,7 @@ struct mt76_txq {
+ 	u16 agg_ssn;
+ 	bool send_bar;
+ 	bool aggr;
++	unsigned long aggr_asked;	/* jiffies: last tx BA session request */
+ };
+ 
+ /* data0 */
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 23587af9..95e13a68 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -1183,9 +1183,15 @@ static bool vo_aggr;
+ module_param(vo_aggr, bool, 0644);
+ MODULE_PARM_DESC(vo_aggr, "Aggregate voice traffic (TIDs 6 and 7); off, as in stock OpenWrt's mt76");
+ 
++/* a tx BA session asked for and not up this long is asked for again: twice
++ * mac80211's ADDBA response timeout
++ */
++#define MT76_CONNAC_AGGR_RETRY	(2 * HZ)
++
+ void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi)
+ {
+ 	struct mt76_wcid *wcid;
++	struct mt76_txq *mtxq;
+ 	u16 fc, tid;
+ 	u32 val;
+ 
+@@ -1204,10 +1210,31 @@ void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi)
+ 		return;
+ 
+ 	wcid = (struct mt76_wcid *)sta->drv_priv;
+-	if (!test_and_set_bit(tid, &wcid->ampdu_state)) {
+-		if (ieee80211_start_tx_ba_session(sta, tid, 0))
+-			clear_bit(tid, &wcid->ampdu_state);
++	mtxq = (struct mt76_txq *)sta->txq[tid]->drv_priv;
++	if (test_and_set_bit(tid, &wcid->ampdu_state)) {
++		/*
++		 * Asked for already. When a session is torn down before
++		 * mac80211's BA work picked up the start (a PTK rekey without
++		 * extended key ID, the station's DELBA), mac80211 drops the
++		 * start without a driver call and the bit stays set: no
++		 * aggregation on this TID until the station reassociates. Ask
++		 * again when nothing came of the last request. The bit stays:
++		 * mac80211 refuses a request while a session is starting or
++		 * up (-EAGAIN) and keeps its own back-off.
++		 */
++		if (READ_ONCE(mtxq->aggr) ||
++		    time_before(jiffies, READ_ONCE(mtxq->aggr_asked) +
++					 MT76_CONNAC_AGGR_RETRY))
++			return;
++
++		WRITE_ONCE(mtxq->aggr_asked, jiffies);
++		ieee80211_start_tx_ba_session(sta, tid, 0);
++		return;
+ 	}
++
++	WRITE_ONCE(mtxq->aggr_asked, jiffies);
++	if (ieee80211_start_tx_ba_session(sta, tid, 0))
++		clear_bit(tid, &wcid->ampdu_state);
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac2_tx_check_aggr);
+ 
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index c666b2d7..0b9da9ec 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -11,6 +11,7 @@
+  * reach other chips' branches of the same functions.
+  */
+ #include <kunit/test.h>
++#include <kunit/static_stub.h>
+ #include <linux/dma-mapping.h>
+ #include "fake.h"
+ 
+@@ -212,6 +213,21 @@ static struct mt76_wcid *mt76_connac_test_wcid(struct ieee80211_sta *sta)
+ 	return (struct mt76_wcid *)sta->drv_priv;
+ }
+ 
++/* @sta's txq for @tid: mt76's part behind a bare ieee80211_txq */
++static struct mt76_txq *mt76_connac_test_txq(struct kunit *test,
++					     struct ieee80211_sta *sta, u8 tid)
++{
++	struct ieee80211_txq *txq;
++
++	txq = kunit_kzalloc(test, sizeof(*txq) + sizeof(struct mt76_txq),
++			    GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, txq);
++	txq->sta = sta;
++	txq->tid = tid;
++	sta->txq[tid] = txq;
++	return (struct mt76_txq *)txq->drv_priv;
++}
++
+ static void mt76_connac_test_free_skb(void *skb)
+ {
+ 	kfree_skb(skb);
+@@ -1671,7 +1687,7 @@ static void mt76_connac_test_init_tx_queues(struct kunit *test)
+ 
+ /* A data frame to an HT/HE station starts a BA session on its TID once;
+  * here only the cases that don't reach mac80211 (which needs a real
+- * station): no station, no HT/HE, not QoS data, a session already on.
++ * station): no station, no HT/HE, not QoS data, a session already up.
+  */
+ static void mt76_connac_test_tx_check_aggr(struct kunit *test)
+ {
+@@ -1698,9 +1714,10 @@ static void mt76_connac_test_tx_check_aggr(struct kunit *test)
+ 	mt76_connac2_tx_check_aggr(sta, txwi);
+ 	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, 0);
+ 
+-	/* QoS data on a TID with a session (being) set up already */
++	/* QoS data on a TID with a session up already */
+ 	txwi[2] = cpu_to_le32(FIELD_PREP(MT_TXD2_FRAME_TYPE, 2) |
+ 			      FIELD_PREP(MT_TXD2_SUB_TYPE, 8));
++	mt76_connac_test_txq(test, sta, 4)->aggr = true;
+ 	wcid->ampdu_state = BIT(4);
+ 	mt76_connac2_tx_check_aggr(sta, txwi);
+ 	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, BIT(4));
+@@ -1711,6 +1728,85 @@ static void mt76_connac_test_tx_check_aggr(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, BIT(4));
+ }
+ 
++static struct {
++	int n;
++	struct ieee80211_sta *sta;
++	u16 tid;
++	int ret;
++} mt76_connac_test_ba;
++
++/* stands in for mac80211's ieee80211_start_tx_ba_session() (static stub) */
++static int mt76_connac_test_start_ba(struct ieee80211_sta *sta, u16 tid,
++				     u16 timeout)
++{
++	mt76_connac_test_ba.n++;
++	mt76_connac_test_ba.sta = sta;
++	mt76_connac_test_ba.tid = tid;
++	return mt76_connac_test_ba.ret;
++}
++
++/* mac80211 drops a BA session start its BA work hasn't picked up when the
++ * session is torn down in that window (a PTK rekey, the station's DELBA;
++ * mac80211's mf_agg_pending_start_stopped), without telling the driver. A
++ * TID asked for MT76_CONNAC_AGGR_RETRY ago with no session up is asked for
++ * again, and stays marked whatever mac80211 answers; one asked for
++ * recently, or with its session up, isn't. A first request mac80211
++ * refuses is unmarked, so the next frame asks again (as before).
++ */
++static void mt76_connac_test_tx_check_aggr_ask_again(struct kunit *test)
++{
++	struct ieee80211_sta *sta = mt76_connac_test_sta(test, 1);
++	struct mt76_wcid *wcid = mt76_connac_test_wcid(sta);
++	struct mt76_txq *mtxq = mt76_connac_test_txq(test, sta, 4);
++	__le32 txwi[8] = {};
++
++	memset(&mt76_connac_test_ba, 0, sizeof(mt76_connac_test_ba));
++	kunit_activate_static_stub(test, ieee80211_start_tx_ba_session,
++				   mt76_connac_test_start_ba);
++	sta->deflink.he_cap.has_he = true;
++	txwi[1] = cpu_to_le32(FIELD_PREP(MT_TXD1_TID, 4));
++	txwi[2] = cpu_to_le32(FIELD_PREP(MT_TXD2_FRAME_TYPE, 2) |
++			      FIELD_PREP(MT_TXD2_SUB_TYPE, 8));
++
++	/* the first QoS data frame asks; the next ones don't */
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.n, 1);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_connac_test_ba.sta, sta);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.tid, 4);
++	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, BIT(4));
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.n, 1);
++
++	/* nothing came of it: asked again, then not for a while */
++	mtxq->aggr_asked = jiffies - MT76_CONNAC_AGGR_RETRY - 1;
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.n, 2);
++	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, BIT(4));
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.n, 2);
++
++	/* a session being set up (mac80211 refuses a second): still marked */
++	mtxq->aggr_asked = jiffies - MT76_CONNAC_AGGR_RETRY - 1;
++	mt76_connac_test_ba.ret = -EAGAIN;
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.n, 3);
++	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, BIT(4));
++
++	/* the session is up: never asked again */
++	mtxq->aggr = true;
++	mtxq->aggr_asked = jiffies - MT76_CONNAC_AGGR_RETRY - 1;
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.n, 3);
++
++	/* refused at the first request (BA blocked during a rekey) */
++	mtxq->aggr = false;
++	wcid->ampdu_state = 0;
++	mt76_connac_test_ba.ret = -EINVAL;
++	mt76_connac2_tx_check_aggr(sta, txwi);
++	KUNIT_EXPECT_EQ(test, mt76_connac_test_ba.n, 4);
++	KUNIT_EXPECT_EQ(test, wcid->ampdu_state, 0);
++}
++
+ /* --- rx rate -------------------------------------------------------------- */
+ 
+ /* P-RXV dword 0 as the MT7986 reports it */
+@@ -2523,6 +2619,7 @@ static struct kunit_case mt76_connac_mac_test_cases[] = {
+ 	KUNIT_CASE(mt76_connac_test_token_put),
+ 	KUNIT_CASE(mt76_connac_test_init_tx_queues),
+ 	KUNIT_CASE(mt76_connac_test_tx_check_aggr),
++	KUNIT_CASE(mt76_connac_test_tx_check_aggr_ask_again),
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_legacy),
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_ht_vht),
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_he),

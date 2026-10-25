@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:51:25 +0100
+Subject: [PATCH] milkflint tests: disassoc frames go to the PSD queue
+
+The upstream backport "fix queue assignment for disassoc packets"
+(c488b587, from upstream's pending branch, kept verbatim so a
+rebase drops it once upstream merges it) sends disassocs to the ALTX
+queue like deauths. mt76_tx_test_schedule_mgmt_txq now queues one with
+the other management frames: before the fix it went to the VO queue
+with the bufferable action frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/tx-test.c | 26 ++++++++++++++++----------
+ 1 file changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/tests/tx-test.c b/tests/tx-test.c
+index 06efa373..145dc295 100644
+--- a/tests/tx-test.c
++++ b/tests/tx-test.c
+@@ -547,13 +547,14 @@ static void mt76_tx_test_schedule_held(struct kunit *test)
+ 
+ /* With a hardware management queue (the mt7915), management frames go to
+  * the PSD queue unless they are bufferable ones for a station with its
+- * rates set, still on the normal pending list; deauths always do, data and
+- * 802.3-offloaded frames never.
++ * rates set, still on the normal pending list; deauths and disassocs always
++ * do, data and 802.3-offloaded frames never.
+  */
+ static void mt76_tx_test_schedule_mgmt_txq(struct kunit *test)
+ {
+ 	struct mt76_tx_test *t;
+-	struct sk_buff *data, *action, *deauth, *resp, *off, *encap, *norate;
++	struct sk_buff *data, *action, *deauth, *disassoc, *resp, *off, *encap;
++	struct sk_buff *norate;
+ 	struct mt76_wcid *wcid, *wcid2;
+ 	struct mt76_phy *phy;
+ 
+@@ -568,6 +569,8 @@ static void mt76_tx_test_schedule_mgmt_txq(struct kunit *test)
+ 				    IEEE80211_AC_VO);
+ 	deauth = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(DEAUTH),
+ 				    IEEE80211_AC_VO);
++	disassoc = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(DISASSOC),
++				      IEEE80211_AC_VO);
+ 	resp = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(PROBE_RESP),
+ 				  IEEE80211_AC_VO);
+ 	off = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(ACTION),
+@@ -581,6 +584,7 @@ static void mt76_tx_test_schedule_mgmt_txq(struct kunit *test)
+ 	mt76_tx_test_pend(phy, wcid, data, &wcid->tx_pending);
+ 	mt76_tx_test_pend(phy, wcid, action, &wcid->tx_pending);
+ 	mt76_tx_test_pend(phy, wcid, deauth, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, disassoc, &wcid->tx_pending);
+ 	mt76_tx_test_pend(phy, wcid, resp, &wcid->tx_pending);
+ 	mt76_tx_test_pend(phy, wcid, encap, &wcid->tx_pending);
+ 	mt76_tx_test_pend(phy, wcid, off, &wcid->tx_offchannel);
+@@ -588,7 +592,7 @@ static void mt76_tx_test_schedule_mgmt_txq(struct kunit *test)
+ 
+ 	mt76_txq_schedule_pending(phy);
+ 
+-	KUNIT_ASSERT_EQ(test, t->n_queued, 7);
++	KUNIT_ASSERT_EQ(test, t->n_queued, 8);
+ 	/* off-channel list first */
+ 	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].skb, off);
+ 	KUNIT_EXPECT_EQ(test, t->rec[0].qid, MT_TXQ_PSD);
+@@ -598,14 +602,16 @@ static void mt76_tx_test_schedule_mgmt_txq(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, t->rec[2].qid, MT_TXQ_VO);
+ 	KUNIT_EXPECT_PTR_EQ(test, t->rec[3].skb, deauth);
+ 	KUNIT_EXPECT_EQ(test, t->rec[3].qid, MT_TXQ_PSD);
+-	KUNIT_EXPECT_PTR_EQ(test, t->rec[4].skb, resp);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[4].skb, disassoc);
+ 	KUNIT_EXPECT_EQ(test, t->rec[4].qid, MT_TXQ_PSD);
+-	KUNIT_EXPECT_PTR_EQ(test, t->rec[4].q, phy->q_tx[MT_TXQ_PSD]);
+-	KUNIT_EXPECT_PTR_EQ(test, t->rec[5].skb, encap);
+-	KUNIT_EXPECT_EQ(test, t->rec[5].qid, MT_TXQ_VI);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[5].skb, resp);
++	KUNIT_EXPECT_EQ(test, t->rec[5].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[5].q, phy->q_tx[MT_TXQ_PSD]);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[6].skb, encap);
++	KUNIT_EXPECT_EQ(test, t->rec[6].qid, MT_TXQ_VI);
+ 	/* no rates yet: not a station to buffer for */
+-	KUNIT_EXPECT_PTR_EQ(test, t->rec[6].skb, norate);
+-	KUNIT_EXPECT_EQ(test, t->rec[6].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[7].skb, norate);
++	KUNIT_EXPECT_EQ(test, t->rec[7].qid, MT_TXQ_PSD);
+ }
+ 
+ /* Without a hardware management queue, management frames stay on the

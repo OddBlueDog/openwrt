@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:28:31 +0100
+Subject: [PATCH] wifi: mt76: report pending tx status with the station before
+ a reset
+
+mt76_reset_device() unpublished each wcid and then cleaned it up, which
+flushes the frames still waiting for a tx status (status-requested
+frames whose DMA the reset completed but whose TXS the restarted firmware
+never sends: EAPOL, mac80211's client probes, frames with an ack
+report). mt76_tx_status_unlock() looks the station up through the
+published wcid, so they went to ieee80211_tx_status_ext() with no
+station, and mac80211 released their AQL airtime from the radio's totals
+only: the station's aql_tx_pending kept it, for as long as the station
+stays (it outlives the reset), a few hundred us per frame and more with
+each reset, all off the station's AQL budget.
+
+Report them first, with mt76_tx_status_check(dev, true), while every
+wcid still leads to its station. They are reported as not acked, as
+before; mac80211 now also counts them as the station's lost packets: a
+handful, where its CQM packet-loss event needs 50 and no ack for a
+second.
+
+mt76_test_reset_device_tx_status, with ieee80211_tx_status_ext() stubbed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c        |  8 +++++++
+ tests/core-test.c | 55 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index aa7a3567..9b712e98 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -849,6 +849,14 @@ void mt76_reset_device(struct mt76_dev *dev)
+ {
+ 	int i;
+ 
++	/*
++	 * The restarted firmware sends no status for the frames still
++	 * waiting for one. Report them while their wcid leads to the
++	 * station: mac80211 releases a station's AQL airtime only for frames
++	 * reported with it, and the station outlives the reset.
++	 */
++	mt76_tx_status_check(dev, true);
++
+ 	rcu_read_lock();
+ 	for (i = 0; i < ARRAY_SIZE(dev->wcid); i++) {
+ 		struct mt76_wcid *wcid;
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 649bafad..4c7686c5 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -3277,6 +3277,60 @@ static void mt76_test_reset_device_hw_ps(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_HDR_TRANS, &wcid->flags));
+ }
+ 
++static struct {
++	int n;
++	struct ieee80211_sta *sta;
++	struct sk_buff *skb;
++} mt76_test_txs;
++
++/* stands in for mac80211's ieee80211_tx_status_ext() (static stub) */
++static void mt76_test_tx_status_ext(struct ieee80211_hw *hw,
++				    struct ieee80211_tx_status *status)
++{
++	mt76_test_txs.n++;
++	mt76_test_txs.sta = status->sta;
++	mt76_test_txs.skb = status->skb;
++	dev_kfree_skb_any(status->skb);
++}
++
++/* A full reset reports the frames still waiting for a tx status (the
++ * restarted firmware sends none) with their station, before it
++ * unpublishes the wcid: mac80211 releases a station's AQL airtime only for
++ * frames reported with it, and the station outlives the reset.
++ */
++static void mt76_test_reset_device_tx_status(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct ieee80211_sta *sta = mt76_test_sta(test);
++	struct mt76_wcid *wcid = mt76_test_sta_wcid(sta);
++	struct sk_buff *skb;
++
++	memset(&mt76_test_txs, 0, sizeof(mt76_test_txs));
++	kunit_activate_static_stub(test, ieee80211_tx_status_ext,
++				   mt76_test_tx_status_ext);
++	mt76_wcid_init(wcid, MT_BAND0);
++	wcid->idx = 5;
++	wcid->sta = 1;
++	rcu_assign_pointer(dev->wcid[5], wcid);
++
++	skb = mt76_test_skb(test, 32);
++	IEEE80211_SKB_CB(skb)->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++	KUNIT_ASSERT_GE(test, mt76_tx_status_skb_add(dev, wcid, skb),
++			MT_PACKET_ID_FIRST);
++	/* its DMA is done (the reset gave the tokens back), its status not */
++	mt76_tx_skb_cb(skb)->flags |= MT_TX_CB_DMA_DONE;
++
++	mt76_reset_device(dev);
++
++	KUNIT_EXPECT_EQ(test, mt76_test_txs.n, 1);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_test_txs.skb, skb);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_test_txs.sta, sta);
++	KUNIT_EXPECT_EQ(test, atomic_read(&mt76_test_nfreed), 1);
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(dev->wcid[5]));
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&wcid->pktid));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->wcid_list));
++}
++
+ static struct {
+ 	int n;
+ 	struct ieee80211_hw *hw;
+@@ -3474,6 +3528,7 @@ static struct kunit_case mt76_core_sta_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_wcid_add_poll),
+ 	KUNIT_CASE(mt76_test_reset_device),
+ 	KUNIT_CASE(mt76_test_reset_device_hw_ps),
++	KUNIT_CASE(mt76_test_reset_device_tx_status),
+ 	KUNIT_CASE(mt76_test_sta_readd_after_reset),
+ 	KUNIT_CASE(mt76_test_wcid_key_setup),
+ 	KUNIT_CASE(mt76_test_offchannel_notify),

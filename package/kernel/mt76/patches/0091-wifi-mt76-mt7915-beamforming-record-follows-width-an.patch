@@ -1,0 +1,524 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 22:56:54 +0100
+Subject: [PATCH] wifi: mt76: mt7915: beamforming record follows width and
+ stream changes
+
+When a station changed width or stream count (an Operating Mode
+Notification), mt7915_mac_sta_rc_work() sent only STA_REC_RA and
+STA_REC_HE, so STA_REC_BF kept the width, the PFMU memory sized for it
+and the column count it got at association. Even sent again, its
+columns came from the station's MCS maps alone and wouldn't have
+followed a drop in streams.
+
+mt7915_mcu_add_rate_ctrl() now takes the rc work's IEEE80211_RC_*
+changes instead of a bool, and on a width or stream change adds
+mt7915_mcu_sta_bfer_tlv() first, as when the station is added. That
+function decides the same way as there: a station we beamform neither
+explicitly nor implicitly (debugfs implicit_txbf) gets no record. HE and
+VHT column counts (ncol, ibf_ncol, ncol_gt_bw80) are now also capped at
+rx_nss, the streams mac80211 says the station takes now; on 2.4 and
+5 GHz that is its map's count until an Operating Mode Notification
+lowers it (see the previous commit). HT stations can't send one, so HT
+is left as it was.
+
+The firmware already gets STA_REC_BF for a station it has a record of:
+at association and again at authorization (both mt7915_mcu_add_sta()).
+What's new is a different size for a PFMU it has, which hasn't been
+tried on hardware. With beamforming off, no station has a record and
+nothing changes.
+
+mt7915_test_add_rate_ctrl_bf checks which changes send STA_REC_BF,
+sized for the new width and streams, and that a station without one
+gets none; mt7915_test_bfer_nss that columns follow rx_nss for HE at
+and above 80 MHz and for VHT explicit and implicit; and
+mt7915_test_sta_rc_work_bf the rc work per change. All three fail
+without the fix. mt7915_test_bfer_he's 160 MHz station now takes the
+three streams its map gives it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            |   3 +-
+ mt7915/main.c           |   4 +-
+ mt7915/mcu.c            |  26 +++++--
+ mt7915/mt7915.h         |   2 +-
+ mt7915/tests/mac-test.c |  88 ++++++++++++++++++++-
+ mt7915/tests/mcu-test.c | 167 +++++++++++++++++++++++++++++++++++++++-
+ 6 files changed, 274 insertions(+), 16 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 2fbe21c0..a097b919 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2162,7 +2162,8 @@ void mt7915_mac_sta_rc_work(struct work_struct *work)
+ 		if (changed & (IEEE80211_RC_SUPP_RATES_CHANGED |
+ 			       IEEE80211_RC_NSS_CHANGED |
+ 			       IEEE80211_RC_BW_CHANGED))
+-			mt7915_mcu_add_rate_ctrl(dev, vif, sta, &msta->wcid, true);
++			mt7915_mcu_add_rate_ctrl(dev, vif, sta, &msta->wcid,
++						 changed);
+ 
+ 		if (changed & IEEE80211_RC_SMPS_CHANGED)
+ 			mt7915_mcu_add_smps(dev, vif, sta);
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 22897c02..0f5babcc 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -904,7 +904,7 @@ __mt7915_mac_sta_event(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, msta->wcid.idx, 30);
+ 		mt76_rmw_field(dev, addr, GENMASK(7, 0), 0xa0);
+ 
+-		ret = mt7915_mcu_add_rate_ctrl(dev, vif, sta, &msta->wcid, false);
++		ret = mt7915_mcu_add_rate_ctrl(dev, vif, sta, &msta->wcid, 0);
+ 		if (ret)
+ 			return ret;
+ 
+@@ -1388,7 +1388,7 @@ static void mt7915_sta_wed_set_4addr(struct mt7915_dev *dev, struct ieee80211_vi
+ 	wcid.idx = idx;
+ 	state = msta->wcid.sta ? CONN_STATE_PORT_SECURE : CONN_STATE_DISCONNECT;
+ 	__mt7915_mcu_add_sta(dev, vif, sta, &wcid, state, true);
+-	mt7915_mcu_add_rate_ctrl(dev, vif, sta, &wcid, false);
++	mt7915_mcu_add_rate_ctrl(dev, vif, sta, &wcid, 0);
+ 	rcu_assign_pointer(dev->mt76.wcid[idx], &msta->wcid);
+ 	msta->wcid.idx = idx;
+ 
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 45c54b94..076d7c9f 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -54,6 +54,16 @@ mt7915_mcu_get_sta_nss(u16 mcs_map)
+ 	return nss ? nss - 1 : 0;
+ }
+ 
++/* the streams of @mcs_map the station takes now: an Operating Mode
++ * Notification (rx_nss) can turn some off
++ */
++static u8
++mt7915_mcu_get_sta_bf_nss(struct ieee80211_sta *sta, u16 mcs_map)
++{
++	return min_t(u8, mt7915_mcu_get_sta_nss(mcs_map),
++		     sta->deflink.rx_nss - 1);
++}
++
+ static void
+ mt7915_mcu_set_sta_he_mcs(struct ieee80211_sta *sta, __le16 *he_mcs,
+ 			  u16 mcs_map)
+@@ -1188,7 +1198,7 @@ mt7915_mcu_sta_bfer_vht(struct ieee80211_sta *sta, struct mt7915_phy *phy,
+ 	struct ieee80211_sta_vht_cap *pc = &sta->deflink.vht_cap;
+ 	struct ieee80211_sta_vht_cap *vc = &phy->mt76->sband_5g.sband.vht_cap;
+ 	u16 mcs_map = le16_to_cpu(pc->vht_mcs.rx_mcs_map);
+-	u8 nss_mcs = mt7915_mcu_get_sta_nss(mcs_map);
++	u8 nss_mcs = mt7915_mcu_get_sta_bf_nss(sta, mcs_map);
+ 	u8 tx_ant = hweight8(phy->mt76->chainmask) - 1;
+ 
+ 	bf->tx_mode = MT_PHY_TYPE_VHT;
+@@ -1227,7 +1237,7 @@ mt7915_mcu_sta_bfer_he(struct ieee80211_sta *sta,
+ 	struct ieee80211_he_cap_elem *pe = &pc->he_cap_elem;
+ 	const struct ieee80211_he_cap_elem *ve = &vc->he_cap_elem;
+ 	u16 mcs_map = le16_to_cpu(pc->he_mcs_nss_supp.rx_mcs_80);
+-	u8 nss_mcs = mt7915_mcu_get_sta_nss(mcs_map);
++	u8 nss_mcs = mt7915_mcu_get_sta_bf_nss(sta, mcs_map);
+ 	u8 snd_dim, sts;
+ 
+ 	bf->tx_mode = MT_PHY_TYPE_HE_SU;
+@@ -1253,7 +1263,7 @@ mt7915_mcu_sta_bfer_he(struct ieee80211_sta *sta,
+ 	if (pe->phy_cap_info[0] &
+ 	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G) {
+ 		mcs_map = le16_to_cpu(pc->he_mcs_nss_supp.rx_mcs_160);
+-		nss_mcs = mt7915_mcu_get_sta_nss(mcs_map);
++		nss_mcs = mt7915_mcu_get_sta_bf_nss(sta, mcs_map);
+ 
+ 		bf->ncol_gt_bw80 = nss_mcs;
+ 	}
+@@ -1261,7 +1271,7 @@ mt7915_mcu_sta_bfer_he(struct ieee80211_sta *sta,
+ 	if (pe->phy_cap_info[0] &
+ 	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G) {
+ 		mcs_map = le16_to_cpu(pc->he_mcs_nss_supp.rx_mcs_80p80);
+-		nss_mcs = mt7915_mcu_get_sta_nss(mcs_map);
++		nss_mcs = mt7915_mcu_get_sta_bf_nss(sta, mcs_map);
+ 
+ 		if (bf->ncol_gt_bw80)
+ 			bf->ncol_gt_bw80 = min_t(u8, bf->ncol_gt_bw80, nss_mcs);
+@@ -1695,7 +1705,7 @@ mt7915_mcu_sta_rate_ctrl_tlv(struct sk_buff *skb, struct mt7915_dev *dev,
+ 
+ int mt7915_mcu_add_rate_ctrl(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 			     struct ieee80211_sta *sta, struct mt76_wcid *wcid,
+-			     bool changed)
++			     u32 changed)
+ {
+ 	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
+ 	struct sk_buff *skb;
+@@ -1705,6 +1715,12 @@ int mt7915_mcu_add_rate_ctrl(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 	if (IS_ERR(skb))
+ 		return PTR_ERR(skb);
+ 
++	/* the beamforming record (if the station has one) is sized for its
++	 * width and streams, so it follows them; first, as when it's added
++	 */
++	if (changed & (IEEE80211_RC_BW_CHANGED | IEEE80211_RC_NSS_CHANGED))
++		mt7915_mcu_sta_bfer_tlv(dev, skb, vif, sta);
++
+ 	/* firmware rc algorithm refers to sta_rec_he for HE control.
+ 	 * once dev->rc_work changes the settings driver should also
+ 	 * update sta_rec_he here.
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 9be1d13f..0649bf80 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -530,7 +530,7 @@ int mt7915_mcu_add_obss_spr(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 			    struct ieee80211_he_obss_pd *he_obss_pd);
+ int mt7915_mcu_add_rate_ctrl(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 			     struct ieee80211_sta *sta, struct mt76_wcid *wcid,
+-			     bool changed);
++			     u32 changed);
+ int mt7915_mcu_add_smps(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 			struct ieee80211_sta *sta);
+ int mt7915_set_channel(struct mt76_phy *mphy);
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index fdf67310..7bb74220 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -3885,7 +3885,9 @@ static void mt7915_test_dfs_errors(struct kunit *test)
+ 
+ /* --- rate control updates ----------------------------------------------- */
+ 
+-static bool mt7915_test_has_tlv(const struct mt76_test_msg *msg, u16 tag)
++/* the STA_REC TLV @tag in @msg, or NULL */
++static const struct tlv *mt7915_test_find_tlv(const struct mt76_test_msg *msg,
++					      u16 tag)
+ {
+ 	int off = sizeof(struct sta_req_hdr);
+ 
+@@ -3894,12 +3896,17 @@ static bool mt7915_test_has_tlv(const struct mt76_test_msg *msg, u16 tag)
+ 		u16 len = le16_to_cpu(t->len);
+ 
+ 		if (le16_to_cpu(t->tag) == tag)
+-			return true;
++			return t;
+ 		if (len < sizeof(*t))
+ 			break;
+ 		off += len;
+ 	}
+-	return false;
++	return NULL;
++}
++
++static bool mt7915_test_has_tlv(const struct mt76_test_msg *msg, u16 tag)
++{
++	return mt7915_test_find_tlv(msg, tag);
+ }
+ 
+ /* The rate control work sends what changed for each queued station:
+@@ -3958,6 +3965,80 @@ static void mt7915_test_sta_rc_work(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 3);
+ }
+ 
++/* A station we explicitly beamform gets its beamforming record
++ * (STA_REC_BF) again, sized for its new width, when that or its stream
++ * count changes; new rates alone don't send it, nor does a station we
++ * don't beamform.
++ */
++static void mt7915_test_sta_rc_work_bf(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *a = mt7915_test_sta(test, dev, 9, mvif);
++	struct mt7915_sta *b = mt7915_test_sta(test, dev, 10, mvif);
++	struct mt7915_sta *c = mt7915_test_sta(test, dev, 11, mvif);
++	struct mt7915_sta *d = mt7915_test_sta(test, dev, 12, mvif);
++	struct mt7915_sta *all[] = { a, b, c, d };
++	struct cfg80211_bitrate_mask *mask = &mvif->bitrate_mask;
++	const struct sta_rec_bf *bf;
++	struct mt76_test_msg *msg;
++	int i;
++
++	mask->control[NL80211_BAND_5GHZ].legacy = GENMASK(7, 0);
++	mask->control[NL80211_BAND_5GHZ].he_gi = GENMASK(7, 0);
++	mask->control[NL80211_BAND_5GHZ].he_ltf = GENMASK(7, 0);
++	mvif->cap.vht_su_ebfer = true;
++
++	/* VHT SU beamformees at 40 MHz, two streams; d is HT only */
++	for (i = 0; i < ARRAY_SIZE(all); i++) {
++		struct ieee80211_sta *sta = mt7915_test_to_sta(all[i]);
++
++		sta->deflink.ht_cap.ht_supported = true;
++		sta->deflink.ht_cap.mcs.rx_mask[0] = 0xff;
++		sta->deflink.ht_cap.mcs.rx_mask[1] = 0xff;
++		sta->deflink.rx_nss = 2;
++		sta->deflink.bandwidth = IEEE80211_STA_RX_BW_40;
++		if (all[i] == d)
++			continue;
++		sta->deflink.vht_cap.vht_supported = true;
++		sta->deflink.vht_cap.cap =
++			IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE;
++		sta->deflink.vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(0xfffa);
++	}
++
++	a->changed = IEEE80211_RC_BW_CHANGED;
++	b->changed = IEEE80211_RC_NSS_CHANGED;
++	c->changed = IEEE80211_RC_SUPP_RATES_CHANGED;
++	d->changed = IEEE80211_RC_BW_CHANGED | IEEE80211_RC_NSS_CHANGED;
++	for (i = 0; i < ARRAY_SIZE(all); i++)
++		list_add_tail(&all[i]->rc_list, &dev->sta_rc_list);
++
++	mt7915_mac_sta_rc_work(&dev->rc_work);
++
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->sta_rc_list));
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 4);
++	for (i = 0; i < ARRAY_SIZE(all); i++) {
++		msg = mt76_test_msg(fake, i);
++		KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(STA_REC_UPDATE));
++		KUNIT_EXPECT_EQ(test, msg->data[1], 9 + i);
++		KUNIT_EXPECT_TRUE(test, mt7915_test_has_tlv(msg, STA_REC_RA));
++	}
++
++	msg = mt76_test_msg(fake, 0);
++	bf = (const struct sta_rec_bf *)mt7915_test_find_tlv(msg, STA_REC_BF);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->bw, IEEE80211_STA_RX_BW_40);
++	KUNIT_EXPECT_EQ(test, bf->ibf_dbw, IEEE80211_STA_RX_BW_40);
++	KUNIT_EXPECT_TRUE(test, mt7915_test_has_tlv(mt76_test_msg(fake, 1),
++						     STA_REC_BF));
++	KUNIT_EXPECT_FALSE(test, mt7915_test_has_tlv(mt76_test_msg(fake, 2),
++						      STA_REC_BF));
++	KUNIT_EXPECT_FALSE(test, mt7915_test_has_tlv(mt76_test_msg(fake, 3),
++						      STA_REC_BF));
++}
++
+ /* --- beacons after a reset ---------------------------------------------- */
+ 
+ /* After a reset the beacon state of AP, mesh and IBSS interfaces is sent to
+@@ -5090,6 +5171,7 @@ static struct kunit_suite mt7915_mac_dfs_test_suite = {
+ 
+ static struct kunit_case mt7915_mac_reset_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_sta_rc_work),
++	KUNIT_CASE(mt7915_test_sta_rc_work_bf),
+ 	KUNIT_CASE(mt7915_test_sta_rc_reset),
+ 	KUNIT_CASE(mt7915_test_update_vif_beacon),
+ 	KUNIT_CASE(mt7915_test_reset_events),
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index a94bc296..076be490 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -3376,8 +3376,11 @@ static void mt7915_test_bfer_he(struct kunit *test)
+ 	KUNIT_ASSERT_NOT_NULL(test, bf);
+ 	KUNIT_EXPECT_EQ(test, bf->nrow, 3);
+ 
+-	/* 160 MHz with 80+80: columns from the smaller of the two maps */
++	/* 160 MHz with 80+80: columns from the smaller of the two maps (of
++	 * a station taking all three streams of its 160 MHz map)
++	 */
+ 	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_160;
++	c.sta->deflink.rx_nss = 3;
+ 	pe->phy_cap_info[0] =
+ 		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G |
+ 		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G;
+@@ -3607,6 +3610,83 @@ static void mt7915_test_bfer_he_ibf(struct kunit *test)
+ 	KUNIT_EXPECT_NULL(test, mt7915_test_bf_tlv(test, &c));
+ }
+ 
++/* Beamforming columns follow the streams the station takes now (rx_nss,
++ * which an Operating Mode Notification lowers), not only its MCS maps: HE
++ * at 80 and above 80 MHz, VHT explicit and implicit.
++ */
++static void mt7915_test_bfer_nss(struct kunit *test)
++{
++	struct ieee80211_he_cap_elem *pe;
++	struct mt7915_test_ctx c;
++	struct sta_rec_bf *bf;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_ht(c.sta);
++	mt7915_test_vht(c.sta);
++	mt7915_test_he(c.sta);
++	pe = &c.sta->deflink.he_cap.he_cap_elem;
++	pe->phy_cap_info[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
++		u8_encode_bits(3, IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_MASK) |
++		u8_encode_bits(3, IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_MASK);
++	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_80;
++
++	/* HE, four rows: 4x2, then 4x1 at one stream */
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->nrow, 3);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 1);
++	KUNIT_EXPECT_EQ(test, bf->mem_20m, 5);
++	c.sta->deflink.rx_nss = 1;
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->nrow, 3);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 0);
++	KUNIT_EXPECT_EQ(test, bf->ibf_ncol, 0);
++	KUNIT_EXPECT_EQ(test, bf->mem_20m, 3);
++	KUNIT_EXPECT_EQ(test, bf->mem_total, 6);
++
++	/* above 80 MHz the same, from both maps */
++	pe->phy_cap_info[0] =
++		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G |
++		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G;
++	c.sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(0xfffa);
++	c.sta->deflink.he_cap.he_mcs_nss_supp.rx_mcs_80p80 =
++		cpu_to_le16(0xfffa);
++	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_160;
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->ncol_gt_bw80, 0);
++	c.sta->deflink.rx_nss = 2;
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->ncol_gt_bw80, 1);
++
++	/* VHT explicit */
++	c.sta->deflink.he_cap.has_he = false;
++	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_80;
++	c.sta->deflink.rx_nss = 1;
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->tx_mode, MT_PHY_TYPE_VHT);
++	KUNIT_EXPECT_EQ(test, bf->bf_cap, 1);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 0);
++	KUNIT_EXPECT_EQ(test, bf->ibf_ncol, 0);
++
++	/* and implicit */
++	c.mvif->cap.vht_su_ebfer = false;
++	c.dev->ibf = true;
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->bf_cap, 2);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 0);
++	KUNIT_EXPECT_EQ(test, bf->ibf_ncol, 0);
++	c.sta->deflink.rx_nss = 2;
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 1);
++	KUNIT_EXPECT_EQ(test, bf->ibf_ncol, 1);
++}
++
+ /* @c's station's STA_REC_BFEE, built on its own */
+ static struct sta_rec_bfee *mt7915_test_bfee_tlv(struct kunit *test,
+ 						 struct mt7915_test_ctx *c)
+@@ -3862,7 +3942,7 @@ static void mt7915_test_add_rate_ctrl(struct kunit *test)
+ 	mt7915_test_he(c.sta);
+ 
+ 	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_rate_ctrl(c.dev, c.vif, c.sta,
+-			&c.msta->wcid, false), 0);
++			&c.msta->wcid, 0), 0);
+ 	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 1);
+ 	msg = mt76_test_msg(c.fake, 0);
+ 	KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(STA_REC_UPDATE));
+@@ -3870,7 +3950,7 @@ static void mt7915_test_add_rate_ctrl(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, tags[0], STA_REC_RA);
+ 
+ 	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_rate_ctrl(c.dev, c.vif, c.sta,
+-			&c.msta->wcid, true), 0);
++			&c.msta->wcid, IEEE80211_RC_SUPP_RATES_CHANGED), 0);
+ 	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 2);
+ 	msg = mt76_test_msg(c.fake, 1);
+ 	KUNIT_ASSERT_EQ(test, mt7915_test_tags(test, msg, tags, 4), 2);
+@@ -3879,10 +3959,87 @@ static void mt7915_test_add_rate_ctrl(struct kunit *test)
+ 
+ 	c.fake->mcu_ret = -EIO;
+ 	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_rate_ctrl(c.dev, c.vif, c.sta,
+-			&c.msta->wcid, false), -EIO);
++			&c.msta->wcid, 0), -EIO);
+ 	KUNIT_EXPECT_EQ(test, c.fake->n_msgs, 3);
+ }
+ 
++/* A station we beamform gets its STA_REC_BF again, first as when it's
++ * added, when its width or stream count changes (an Operating Mode
++ * Notification), sized for the new ones. New rates alone don't send it,
++ * and neither does a station without one.
++ */
++static void mt7915_test_add_rate_ctrl_bf(struct kunit *test)
++{
++	struct mt76_test_msg *msg;
++	struct mt7915_test_ctx c;
++	struct sta_rec_bf *bf;
++	struct sta_rec_he *he;
++	u16 tags[4];
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_ht(c.sta);
++	mt7915_test_vht(c.sta);
++	mt7915_test_he(c.sta);
++
++	/* from 80 to 40 MHz: 4x2 for one 20 MHz half, not two */
++	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_40;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_rate_ctrl(c.dev, c.vif, c.sta,
++			&c.msta->wcid, IEEE80211_RC_BW_CHANGED), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 1);
++	msg = mt76_test_msg(c.fake, 0);
++	KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(STA_REC_UPDATE));
++	KUNIT_ASSERT_EQ(test, mt7915_test_tags(test, msg, tags, 4), 3);
++	KUNIT_EXPECT_EQ(test, tags[0], STA_REC_BF);
++	KUNIT_EXPECT_EQ(test, tags[1], STA_REC_HE);
++	KUNIT_EXPECT_EQ(test, tags[2], STA_REC_RA);
++	bf = mt7915_test_tlv(test, msg, STA_REC_BF, struct sta_rec_bf);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->bw, IEEE80211_STA_RX_BW_40);
++	KUNIT_EXPECT_EQ(test, bf->ibf_dbw, IEEE80211_STA_RX_BW_40);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 1);
++	KUNIT_EXPECT_EQ(test, bf->mem_20m, 5);
++	KUNIT_EXPECT_EQ(test, bf->mem_total, 5);
++
++	/* down to one stream: one column (4x1), and one in STA_REC_HE */
++	c.sta->deflink.rx_nss = 1;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_rate_ctrl(c.dev, c.vif, c.sta,
++			&c.msta->wcid, IEEE80211_RC_NSS_CHANGED), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 2);
++	msg = mt76_test_msg(c.fake, 1);
++	KUNIT_ASSERT_EQ(test, mt7915_test_tags(test, msg, tags, 4), 3);
++	KUNIT_EXPECT_EQ(test, tags[0], STA_REC_BF);
++	bf = mt7915_test_tlv(test, msg, STA_REC_BF, struct sta_rec_bf);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 0);
++	KUNIT_EXPECT_EQ(test, bf->ibf_ncol, 0);
++	KUNIT_EXPECT_EQ(test, bf->mem_20m, 3);
++	KUNIT_EXPECT_EQ(test, bf->mem_total, 3);
++	he = mt7915_test_tlv(test, msg, STA_REC_HE, struct sta_rec_he);
++	KUNIT_ASSERT_NOT_NULL(test, he);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(he->max_nss_mcs[CMD_HE_MCS_BW80]),
++			0xfffe);
++
++	/* new rates alone leave it */
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_rate_ctrl(c.dev, c.vif, c.sta,
++			&c.msta->wcid, IEEE80211_RC_SUPP_RATES_CHANGED), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 3);
++	msg = mt76_test_msg(c.fake, 2);
++	KUNIT_ASSERT_EQ(test, mt7915_test_tags(test, msg, tags, 4), 2);
++	KUNIT_EXPECT_EQ(test, tags[0], STA_REC_HE);
++	KUNIT_EXPECT_EQ(test, tags[1], STA_REC_RA);
++
++	/* no beamforming record at add (we don't beamform it): none now */
++	c.mvif->cap.he_su_ebfer = false;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_rate_ctrl(c.dev, c.vif, c.sta,
++			&c.msta->wcid,
++			IEEE80211_RC_BW_CHANGED | IEEE80211_RC_NSS_CHANGED), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 4);
++	msg = mt76_test_msg(c.fake, 3);
++	KUNIT_ASSERT_EQ(test, mt7915_test_tags(test, msg, tags, 4), 2);
++	KUNIT_EXPECT_EQ(test, tags[0], STA_REC_HE);
++	KUNIT_EXPECT_EQ(test, tags[1], STA_REC_RA);
++}
++
+ /* the RA_UPDATE TLV of message @i, after checking it's for @c's station */
+ static struct sta_rec_ra_fixed *
+ mt7915_test_ra_fixed(struct kunit *test, struct mt7915_test_ctx *c, int i)
+@@ -4344,6 +4501,7 @@ static struct kunit_case mt7915_mcu_sta_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_bfer_vht_160_ibf),
+ 	KUNIT_CASE(mt7915_test_bfer_ht),
+ 	KUNIT_CASE(mt7915_test_bfer_he_ibf),
++	KUNIT_CASE(mt7915_test_bfer_nss),
+ 	KUNIT_CASE(mt7915_test_bfee),
+ 	{}
+ };
+@@ -4358,6 +4516,7 @@ static struct kunit_case mt7915_mcu_rate_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_rate_ctrl_tlv_5g),
+ 	KUNIT_CASE(mt7915_test_rate_ctrl_caps),
+ 	KUNIT_CASE(mt7915_test_add_rate_ctrl),
++	KUNIT_CASE(mt7915_test_add_rate_ctrl_bf),
+ 	KUNIT_CASE(mt7915_test_fixed_rate_ctrl),
+ 	KUNIT_CASE(mt7915_test_add_smps),
+ 	KUNIT_CASE(mt7915_test_rate_fixed_legacy),

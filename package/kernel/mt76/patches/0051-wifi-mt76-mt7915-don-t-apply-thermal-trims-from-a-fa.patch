@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:31:17 +0100
+Subject: [PATCH] wifi: mt76: mt7915: don't apply thermal trims from a failed
+ efuse read
+
+mt7986_wmac_adie_thermal_cal() applied the thermal ADC trims when the
+efuse read failed ("ret || enabled"), from a data word the read never
+filled in, and lost the error. And mt7986_wmac_adie_efuse_read() left
+the caller's word as it was when the efuse said the word isn't valid,
+so its callers tested an uninitialised word, or the previous word they
+read, for their enable bits.
+
+Return the error, and read a word that isn't valid as 0 (nothing
+enabled). Boards whose efuse words read back valid see no change. Un-skip
+mt7915_soc_test_thermal_cal_no_efuse and extend it to an invalid word.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/soc.c            | 12 ++++++++++--
+ mt7915/tests/soc-test.c | 14 ++++++++++----
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/soc.c b/mt7915/soc.c
+index 9883db00..da59412f 100644
+--- a/mt7915/soc.c
++++ b/mt7915/soc.c
+@@ -142,6 +142,8 @@ mt7986_wmac_adie_efuse_read(struct mt7915_dev *dev, u8 adie,
+ 	if (FIELD_GET(MT_ADIE_EFUSE_VALID_MASK, val) == 1)
+ 		ret = mt76_wmac_spi_read(dev, adie, MT_ADIE_EFUSE_RDATA0,
+ 					 data);
++	else
++		*data = 0;	/* not programmed: no enable bit set */
+ 
+ 	return ret;
+ }
+@@ -390,7 +392,10 @@ static int mt7986_wmac_adie_thermal_cal(struct mt7915_dev *dev, u8 adie)
+ 
+ 	ret = mt7986_wmac_adie_efuse_read(dev, adie, MT_ADIE_THADC_ANALOG,
+ 					  &data);
+-	if (ret || FIELD_GET(MT_ADIE_ANA_EN_MASK, data)) {
++	if (ret)
++		return ret;
++
++	if (FIELD_GET(MT_ADIE_ANA_EN_MASK, data)) {
+ 		val = FIELD_GET(MT_ADIE_VRPI_SEL_EFUSE_MASK, data);
+ 		ret = mt76_wmac_spi_rmw(dev, adie, MT_ADIE_RG_TOP_THADC_BG,
+ 					MT_ADIE_VRPI_SEL_CR_MASK,
+@@ -408,7 +413,10 @@ static int mt7986_wmac_adie_thermal_cal(struct mt7915_dev *dev, u8 adie)
+ 
+ 	ret = mt7986_wmac_adie_efuse_read(dev, adie, MT_ADIE_THADC_SLOP,
+ 					  &data);
+-	if (ret || FIELD_GET(MT_ADIE_ANA_EN_MASK, data)) {
++	if (ret)
++		return ret;
++
++	if (FIELD_GET(MT_ADIE_ANA_EN_MASK, data)) {
+ 		val = FIELD_GET(MT_ADIE_LDO_CTRL_EFUSE_MASK, data);
+ 
+ 		return mt76_wmac_spi_rmw(dev, adie, MT_ADIE_RG_TOP_THADC,
+diff --git a/mt7915/tests/soc-test.c b/mt7915/tests/soc-test.c
+index 7f507afe..a0e7d81a 100644
+--- a/mt7915/tests/soc-test.c
++++ b/mt7915/tests/soc-test.c
+@@ -324,11 +324,11 @@ static void mt7915_soc_test_efuse_read(struct kunit *test)
+ 			MT_ADIE_THADC_SLOP, &data), 0);
+ 	KUNIT_EXPECT_EQ(test, data, 0x17);
+ 
+-	/* a word that isn't valid is not returned */
++	/* a word that isn't valid reads as 0, not as what @data held */
+ 	data = 0xdead;
+ 	KUNIT_EXPECT_EQ(test, mt7986_wmac_adie_efuse_read(dev, 1,
+ 			MT_ADIE_XO_TRIM_FLOW, &data), 0);
+-	KUNIT_EXPECT_EQ(test, data, 0xdead);
++	KUNIT_EXPECT_EQ(test, data, 0);
+ }
+ 
+ /* --- A-die calibration ---------------------------------------------------- */
+@@ -416,13 +416,19 @@ static void mt7915_soc_test_thermal_cal_no_efuse(struct kunit *test)
+ 	struct mt7915_dev *dev;
+ 	struct mt7915_soc_test *t;
+ 
+-	kunit_skip(test, "driver bug: mt7986_wmac_adie_thermal_cal() applies its trims on an efuse read error (ret || ...) and tests an uninitialized word when the efuse word isn't valid");
+-
+ 	t = mt7915_soc_test_init(test, &dev);
+ 	t->efuse_stuck = true;
+ 	KUNIT_EXPECT_NE(test, mt7986_wmac_adie_thermal_cal(dev, 0), 0);
+ 	KUNIT_EXPECT_EQ(test, mt7915_soc_test_n_wr(t, 0,
+ 			MT_ADIE_RG_TOP_THADC_BG), 0);
++
++	/* words the efuse says aren't valid read as 0: nothing enabled */
++	t->efuse_stuck = false;
++	KUNIT_EXPECT_EQ(test, mt7986_wmac_adie_thermal_cal(dev, 0), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_n_wr(t, 0,
++			MT_ADIE_RG_TOP_THADC_BG), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_n_wr(t, 0, MT_ADIE_RG_TOP_THADC),
++			0);
+ }
+ 
+ /* The MT7976's crystal trim: 64 unless the efuse enables it; else the

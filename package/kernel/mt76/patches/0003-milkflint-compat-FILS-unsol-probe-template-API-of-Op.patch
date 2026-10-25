@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: milkflint <milkflint@localhost>
+Date: Sun, 18 Oct 2026 20:09:25 +0100
+Subject: [PATCH] milkflint compat: FILS/unsol probe template API of OpenWrt
+ 25.12 mac80211
+
+Newer mac80211 added a link_id argument; link 0 is what the older
+single-link API returns. Not for upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 1d845cfe..2690dcff 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -2012,11 +2012,11 @@ mt7915_mcu_add_inband_discov(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 
+ 	if (changed & BSS_CHANGED_FILS_DISCOVERY) {
+ 		interval = vif->bss_conf.fils_discovery.max_interval;
+-		skb = ieee80211_get_fils_discovery_tmpl(hw, vif, 0);
++		skb = ieee80211_get_fils_discovery_tmpl(hw, vif);
+ 	} else if (changed & BSS_CHANGED_UNSOL_BCAST_PROBE_RESP &&
+ 		   vif->bss_conf.unsol_bcast_probe_resp_interval) {
+ 		interval = vif->bss_conf.unsol_bcast_probe_resp_interval;
+-		skb = ieee80211_get_unsol_bcast_probe_resp_tmpl(hw, vif, 0);
++		skb = ieee80211_get_unsol_bcast_probe_resp_tmpl(hw, vif);
+ 	}
+ 
+ 	if (!skb) {

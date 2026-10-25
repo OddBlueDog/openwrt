@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:25:54 +0100
+Subject: [PATCH] wifi: mt76: order rx descriptor reads after the DMA done
+ check
+
+mt76_dma_dequeue() checks MT_DMA_CTL_DMA_DONE and mt76_dma_get_buf()
+then reads the length, info and buf1 words of the same descriptor, with
+nothing ordering the loads. Descriptor rings are coherent DMA memory,
+which on non-coherent SoCs such as MT7986 is mapped as normal
+non-cacheable memory, where loads may be reordered: the other fields
+could be read before the device's final write to them.
+
+Add the dma_rmb() Documentation/memory-barriers.txt prescribes after
+seeing the ownership bit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dma.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/dma.c b/dma.c
+index a67880a9..3aef3583 100644
+--- a/dma.c
++++ b/dma.c
+@@ -622,6 +622,8 @@ mt76_dma_dequeue(struct mt76_dev *dev, struct mt76_queue *q, bool flush,
+ 			 !(q->desc[idx].ctrl & cpu_to_le32(MT_DMA_CTL_M_DONE)))
+ 			return NULL;
+ #endif
++		/* read the rest of the descriptor only after DMA_DONE */
++		dma_rmb();
+ 	}
+ done:
+ 	q->tail = (q->tail + 1) % q->ndesc;

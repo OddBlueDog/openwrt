@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:18:07 +0100
+Subject: [PATCH] wifi: mt76: connac: don't take the station TX rate from
+ fixed-rate TXS
+
+mt7915 requests a TX status report for one frame per station every
+250 ms, and mac80211 requests them for various management frames.
+When that frame is sent at a fixed rate (management, multicast or
+IEEE80211_TX_CTL_USE_MINRATE frames such as EAPOL),
+mt76_connac2_mac_fill_txs() still stores the reported legacy rate in
+wcid->rate. That rate is reported to mac80211 as the last TX rate for
+the station, which shows up in station dumps and feeds the airtime
+estimates used by AQL, until the next status report replaces it.
+
+The TXS already says whether the frame used a fixed rate, so skip the
+wcid->rate update for those frames and keep the statistics.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 5fff968a..b80bdf0f 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -746,7 +746,14 @@ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 		stats->tx_bw[0]++;
+ 		break;
+ 	}
+-	wcid->rate = rate;
++
++	/* Management, multicast and min-rate frames go out at a fixed
++	 * rate that doesn't reflect rate control, so don't let their
++	 * status overwrite the rate used for reporting and airtime
++	 * estimation.
++	 */
++	if (!(txs & MT_TXS0_FIXED_RATE))
++		wcid->rate = rate;
+ 
+ 	return true;
+ }

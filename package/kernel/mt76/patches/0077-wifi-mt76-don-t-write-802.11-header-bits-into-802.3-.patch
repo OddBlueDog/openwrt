@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:30:58 +0100
+Subject: [PATCH] wifi: mt76: don't write 802.11 header bits into 802.3
+ power-save frames
+
+mt7915 sets SUPPORTS_TX_ENCAP_OFFLOAD, so the frames mac80211's txqs
+hold for a station are 802.3 (IEEE80211_TX_CTL_HW_80211_ENCAP) and the
+hardware builds the 802.11 header. mt76_release_buffered_frames()
+dequeues those for a PS-Poll or U-APSD trigger, and mt76_queue_ps_skb()
+treated skb->data as an 802.11 header anyway:
+
+- MOREDATA (frame control bit 13) went into bit 5 of the second byte of
+  the destination address: set on every frame but the last, cleared on
+  the last;
+- for the last frame of a U-APSD service period, a destination address
+  whose first byte reads as QoS data (first byte & 0x8c == 0x88) got
+  IEEE80211_QOS_CTL_EOSP ORed into byte 24 or 30 of the frame, which is
+  the IPv4 header checksum or an IPv6 source address byte.
+
+Leave 802.3 frames' bytes alone. mac80211 still ends the service period
+through IEEE80211_TX_STATUS_EOSP. On air, such frames carry neither
+MOREDATA nor the QoS EOSP bit from the driver, as before; whether the
+TXD's EEOSP bit (MT_TXD3_EEOSP, unused so far) should carry it needs
+checking on the hardware first.
+
+The tests follow the previous commit's new more_data argument:
+mt76_tx_test_queue_ps_skb_more_data checks it, and
+mt76_tx_test_queue_ps_skb_8023 checks that released 802.3 frames are
+unchanged and still end the service period.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/tx-test.c | 86 ++++++++++++++++++++++++++++++++++++++++++++++---
+ tx.c            | 12 +++++--
+ 2 files changed, 92 insertions(+), 6 deletions(-)
+
+diff --git a/tests/tx-test.c b/tests/tx-test.c
+index 145dc295..5a95e6e2 100644
+--- a/tests/tx-test.c
++++ b/tests/tx-test.c
+@@ -1268,11 +1268,13 @@ static void mt76_tx_test_queue_ps_skb(struct kunit *test)
+ 	pspoll = mt76_tx_test_frame(t, MT76_TX_TEST_QOS, 0);
+ 	plain = mt76_tx_test_data(t, 0);
+ 
+-	mt76_queue_ps_skb(phy, sta, mid, false, IEEE80211_FRAME_RELEASE_UAPSD);
+-	mt76_queue_ps_skb(phy, sta, last, true, IEEE80211_FRAME_RELEASE_UAPSD);
+-	mt76_queue_ps_skb(phy, sta, pspoll, true,
++	mt76_queue_ps_skb(phy, sta, mid, false, false,
++			  IEEE80211_FRAME_RELEASE_UAPSD);
++	mt76_queue_ps_skb(phy, sta, last, true, false,
++			  IEEE80211_FRAME_RELEASE_UAPSD);
++	mt76_queue_ps_skb(phy, sta, pspoll, true, false,
+ 			  IEEE80211_FRAME_RELEASE_PSPOLL);
+-	mt76_queue_ps_skb(phy, sta, plain, true,
++	mt76_queue_ps_skb(phy, sta, plain, true, false,
+ 			  IEEE80211_FRAME_RELEASE_UAPSD);
+ 
+ 	KUNIT_ASSERT_EQ(test, t->n_queued, 4);
+@@ -1315,6 +1317,80 @@ static void mt76_tx_test_queue_ps_skb(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, plain->data[25], 0);
+ }
+ 
++/* When mac80211 says more frames are buffered (other TIDs, or more than
++ * it asked for), the last frame of a service period still ends it but
++ * carries MOREDATA, so the client keeps polling.
++ */
++static void mt76_tx_test_queue_ps_skb_more_data(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct ieee80211_hdr *hdr;
++	struct ieee80211_sta *sta;
++	struct sk_buff *skb;
++
++	sta = wcid_to_sta(mt76_tx_test_wcid(t, 1, 0, true, true));
++	skb = mt76_tx_test_frame(t, MT76_TX_TEST_QOS, 0);
++	mt76_queue_ps_skb(phy, sta, skb, true, true,
++			  IEEE80211_FRAME_RELEASE_UAPSD);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 1);
++	hdr = (struct ieee80211_hdr *)skb->data;
++	KUNIT_EXPECT_TRUE(test, ieee80211_has_moredata(hdr->frame_control));
++	KUNIT_EXPECT_TRUE(test, IEEE80211_SKB_CB(skb)->flags &
++				IEEE80211_TX_STATUS_EOSP);
++	KUNIT_EXPECT_TRUE(test, *ieee80211_get_qos_ctl(hdr) &
++				IEEE80211_QOS_CTL_EOSP);
++}
++
++/* With tx encapsulation offload the released frames are 802.3: their
++ * bytes are left alone (no MOREDATA in the destination address, no EOSP in
++ * the IP header), and the service period still ends in mac80211. The
++ * address 8a:55:... reads as QoS data with MOREDATA clear when taken for
++ * a frame control field.
++ */
++static void mt76_tx_test_queue_ps_skb_8023(struct kunit *test)
++{
++	static const u8 eth[ETH_HLEN] = {
++		0x8a, 0x55, 0x4a, 0x55, 0x2e, 0xcc,	/* station */
++		0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x08, 0x00,
++	};
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct sk_buff *skb[2];
++	struct ieee80211_sta *sta;
++	u8 copy[64];
++	int i;
++
++	sta = wcid_to_sta(mt76_tx_test_wcid(t, 1, 0, true, true));
++	for (i = 0; i < 64; i++)
++		copy[i] = i < ETH_HLEN ? eth[i] : 0x40 + i;
++	for (i = 0; i < 2; i++) {
++		skb[i] = mt76_tx_test_data(t, 0);
++		memcpy(skb[i]->data, copy, sizeof(copy));
++		IEEE80211_SKB_CB(skb[i])->flags |=
++			IEEE80211_TX_CTL_HW_80211_ENCAP;
++	}
++
++	mt76_queue_ps_skb(phy, sta, skb[0], false, false,
++			  IEEE80211_FRAME_RELEASE_UAPSD);
++	mt76_queue_ps_skb(phy, sta, skb[1], true, false,
++			  IEEE80211_FRAME_RELEASE_UAPSD);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 2);
++	for (i = 0; i < 2; i++) {
++		KUNIT_EXPECT_EQ(test, skb[i]->len, sizeof(copy));
++		KUNIT_EXPECT_MEMEQ_MSG(test, skb[i]->data, copy, sizeof(copy),
++				       "frame %d", i);
++		KUNIT_EXPECT_TRUE(test, IEEE80211_SKB_CB(skb[i])->control.flags &
++					IEEE80211_TX_CTRL_PS_RESPONSE);
++	}
++	KUNIT_EXPECT_FALSE(test, IEEE80211_SKB_CB(skb[0])->flags &
++				 IEEE80211_TX_STATUS_EOSP);
++	KUNIT_EXPECT_TRUE(test, IEEE80211_SKB_CB(skb[1])->flags &
++				IEEE80211_TX_STATUS_EOSP);
++}
++
+ /* --- queues, blocking and tokens ------------------------------------------------- */
+ 
+ /* Completing a ring entry hands its frame to the driver and moves the
+@@ -1525,6 +1601,8 @@ static struct kunit_case mt76_tx_test_cases[] = {
+ 	KUNIT_CASE(mt76_tx_test_ps_rearm),
+ 	KUNIT_CASE(mt76_tx_test_ps_rearm_sw),
+ 	KUNIT_CASE(mt76_tx_test_queue_ps_skb),
++	KUNIT_CASE(mt76_tx_test_queue_ps_skb_more_data),
++	KUNIT_CASE(mt76_tx_test_queue_ps_skb_8023),
+ 	KUNIT_CASE(mt76_tx_test_queue_tx_complete),
+ 	KUNIT_CASE(mt76_tx_test_set_tx_blocked),
+ 	KUNIT_CASE(mt76_tx_test_token),
+diff --git a/tx.c b/tx.c
+index de6c93d3..4b57b07b 100644
+--- a/tx.c
++++ b/tx.c
+@@ -444,18 +444,26 @@ mt76_queue_ps_skb(struct mt76_phy *phy, struct ieee80211_sta *sta,
+ 	struct mt76_wcid *wcid = (struct mt76_wcid *)sta->drv_priv;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	/*
++	 * With tx encapsulation offload, mac80211's txqs hold 802.3 frames:
++	 * skb->data is an Ethernet header, and the hardware writes the
++	 * 802.11 one. Writing frame control or QoS bits here would change
++	 * the destination address or the IP header instead.
++	 */
++	bool is_8023 = info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP;
+ 
+ 	info->control.flags |= IEEE80211_TX_CTRL_PS_RESPONSE;
+ 	if (last) {
+ 		info->flags |= IEEE80211_TX_STATUS_EOSP |
+ 			       IEEE80211_TX_CTL_REQ_TX_STATUS;
+ 
+-		if (reason == IEEE80211_FRAME_RELEASE_UAPSD &&
++		if (!is_8023 && reason == IEEE80211_FRAME_RELEASE_UAPSD &&
+ 		    ieee80211_is_data_qos(hdr->frame_control))
+ 			*ieee80211_get_qos_ctl(hdr) |= IEEE80211_QOS_CTL_EOSP;
+ 	}
+ 
+-	mt76_skb_set_moredata(skb, !last || more_data);
++	if (!is_8023)
++		mt76_skb_set_moredata(skb, !last || more_data);
+ 	__mt76_tx_queue_skb(phy, MT_TXQ_PSD, skb, wcid, sta, NULL);
+ }
+ 

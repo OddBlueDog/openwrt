@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:27:47 +0100
+Subject: [PATCH] wifi: mt76: mt7915: reinit WED reset completions for each
+ cycle
+
+wed_reset and wed_reset_complete were initialised once. A cycle that
+failed or timed out left a completion behind, which ended the next
+cycle's wait immediately and let WED DMA restart while the ethernet
+side was still resetting. Reinitialise both before triggering the SER.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mmio.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/mt7915/mmio.c b/mt7915/mmio.c
+index 28377c96..8ef16ee0 100644
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -612,6 +612,12 @@ static int mt7915_mmio_wed_reset(struct mtk_wed_device *wed)
+ 	if (test_and_set_bit(MT76_STATE_WED_RESET, &mphy->state))
+ 		return -EBUSY;
+ 
++	/* drop completions left over from an earlier cycle that failed or
++	 * timed out, they would end this cycle's waits immediately
++	 */
++	reinit_completion(&mdev->mmio.wed_reset);
++	reinit_completion(&mdev->mmio.wed_reset_complete);
++
+ 	ret = mt7915_mcu_set_ser(dev, SER_RECOVER, SER_SET_RECOVER_L1,
+ 				 mphy->band_idx);
+ 	if (ret)

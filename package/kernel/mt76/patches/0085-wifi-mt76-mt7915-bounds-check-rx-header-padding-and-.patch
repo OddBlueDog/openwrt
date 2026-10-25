@@ -1,0 +1,176 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:07:38 +0100
+Subject: [PATCH] wifi: mt76: mt7915: bounds-check rx header padding and RF
+ register replies
+
+mt7915_mac_fill_rx() checks each rx descriptor group against the buffer,
+but adds the header padding (2 * HDR_OFFSET) after those checks. With
+more padding than bytes left, skb_pull() returned NULL without pulling
+and the frame was parsed starting inside the descriptor. A failed header
+translation also read the type at byte 12 and moved 16 bytes for a VLAN
+tag without checking the frame had them. Drop such frames.
+
+mt7915_mcu_rf_regval() (the rf_regval debugfs file) read byte 8 of the
+firmware's reply without checking its length, as 0018/0053 fixed for
+the other queries.
+
+mt7915_test_rx_short_frames and mt7915_mcu2_rf_regval_short check them.
+
+Reported as suggestions by another review; checked in the code. Neither
+can be set from the air: the descriptor and the reply come from the
+chip.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c             | 10 ++++++++++
+ mt7915/mcu.c             |  5 +++++
+ mt7915/tests/mac-test.c  | 37 +++++++++++++++++++++++++++++++++++++
+ mt7915/tests/mcu2-test.c | 21 +++++++++++++++++++++
+ 4 files changed, 73 insertions(+)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 6c88b928..fe3f4f73 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -476,6 +476,10 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	}
+ 
+ 	hdr_gap = (u8 *)rxd - skb->data + 2 * remove_pad;
++	/* the padding is counted after the bounds checks above */
++	if (hdr_gap > skb_headlen(skb))
++		return -EINVAL;
++
+ 	if (hdr_trans && ieee80211_has_morefrags(fc)) {
+ 		struct ieee80211_vif *vif;
+ 		int err;
+@@ -505,6 +509,9 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 			 * pattern did not match, or if a VLAN header was
+ 			 * detected.
+ 			 */
++			if (skb_headlen(skb) < ETH_HLEN)
++				return -EINVAL;
++
+ 			pad_start = 12;
+ 			if (get_unaligned_be16(skb->data + pad_start) == ETH_P_8021Q)
+ 				pad_start += 4;
+@@ -513,6 +520,9 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 		}
+ 
+ 		if (pad_start) {
++			if (skb_headlen(skb) < pad_start + 2)
++				return -EINVAL;
++
+ 			memmove(skb->data + 2, skb->data, pad_start);
+ 			skb_pull(skb, 2);
+ 		}
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index eb3154c1..defec5de 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -4419,6 +4419,11 @@ int mt7915_mcu_rf_regval(struct mt7915_dev *dev, u32 regidx, u32 *val, bool set)
+ 	if (ret)
+ 		return ret;
+ 
++	if (skb->len < 12) {
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
++
+ 	*val = le32_to_cpu(*(__le32 *)(skb->data + 8));
+ 	dev_kfree_skb(skb);
+ 
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 7d18e77c..b9394fca 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -1174,6 +1174,42 @@ static void mt7915_test_rx_8023_hdr_trans_error(struct kunit *test)
+ 	kfree_skb(skb);
+ }
+ 
++/* Frames too short for what the descriptor says comes before or in them
++ * are dropped, not parsed from the descriptor or past their end: header
++ * padding longer than the rest of the buffer, a failed header translation
++ * shorter than an Ethernet header, and a VLAN tag without its type.
++ */
++static void mt7915_test_rx_short_frames(struct kunit *test)
++{
++	static const u8 vlan_cut[] = {
++		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x81, 0x00, 0x00, 0x05,
++	};
++	static const u8 tiny[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_test_rxd d;
++	struct sk_buff *skb;
++
++	/* 6 bytes of padding announced, 2 there */
++	mt7915_test_rxd_init(&d, 0, 0, true);
++	d.rxd[2] |= MT_RXD2_NORMAL_HDR_TRANS |
++		    FIELD_PREP(MT_RXD2_NORMAL_HDR_OFFSET, 3);
++	skb = mt7915_test_rx_skb(test, &d, NULL, 0);
++	skb_trim(skb, skb->len - 4);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	mt7915_test_rxd_init(&d, 0, 0, true);
++	d.rxd[2] |= MT_RXD2_NORMAL_HDR_TRANS | MT_RXD2_NORMAL_HDR_TRANS_ERROR;
++	skb = mt7915_test_rx_skb(test, &d, tiny, sizeof(tiny));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	skb = mt7915_test_rx_skb(test, &d, vlan_cut, sizeof(vlan_cut));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++}
++
+ /* A-MSDU subframes are marked first/middle/last; the 2 bytes of padding the
+  * hardware puts after the 802.11 header of each subframe are removed.
+  */
+@@ -4918,6 +4954,7 @@ static struct kunit_case mt7915_mac_rx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_rx_drop),
+ 	KUNIT_CASE(mt7915_test_rx_8023),
+ 	KUNIT_CASE(mt7915_test_rx_8023_hdr_trans_error),
++	KUNIT_CASE(mt7915_test_rx_short_frames),
+ 	KUNIT_CASE(mt7915_test_rx_amsdu),
+ 	KUNIT_CASE(mt7915_test_rx_8023_fragment),
+ 	KUNIT_CASE(mt7915_test_rx_he_radiotap),
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 436851d2..4feed76e 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -2958,6 +2958,26 @@ static void mt7915_mcu2_get_eeprom_short(struct kunit *test)
+ 			-EINVAL);
+ }
+ 
++/* An RF register read takes the value from byte 8 of the reply; a reply
++ * too short for it is an error, not a read past its end.
++ */
++static void mt7915_mcu2_rf_regval_short(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	u8 reply[12] = { [8] = 0x78, 0x56, 0x34, 0x12 };
++	u32 val = 0;
++
++	mt7915_mcu2_reply(test, reply, sizeof(reply));
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_rf_regval(dev, 0x10, &val, false), 0);
++	KUNIT_EXPECT_EQ(test, val, 0x12345678);
++
++	val = 0;
++	mt7915_mcu2_reply(test, reply, 8);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_rf_regval(dev, 0x10, &val, false),
++			-EINVAL);
++	KUNIT_EXPECT_EQ(test, val, 0);
++}
++
+ /* WMM parameters go to the firmware's EDCA table per AC: the AC's queue in
+  * the interface's WMM set, AIFS, TXOP, and the contention windows as
+  * exponents (log2(cw + 1)), 15 and 1023 when unset.
+@@ -3641,6 +3661,7 @@ static struct kunit_case mt7915_mcu2_misc_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_get_eeprom),
+ 	KUNIT_CASE(mt7915_mcu2_get_eeprom_free_block),
+ 	KUNIT_CASE(mt7915_mcu2_get_eeprom_short),
++	KUNIT_CASE(mt7915_mcu2_rf_regval_short),
+ 	KUNIT_CASE(mt7915_mcu2_set_tx),
+ 	KUNIT_CASE(mt7915_mcu2_set_red),
+ 	KUNIT_CASE(mt7915_mcu2_set_red_errors),

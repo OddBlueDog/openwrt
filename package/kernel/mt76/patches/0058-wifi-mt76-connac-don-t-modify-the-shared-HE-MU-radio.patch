@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:39:41 +0100
+Subject: [PATCH] wifi: mt76: connac: don't modify the shared HE-MU radiotap
+ template
+
+mt76_connac2_mac_decode_he_mu_radiotap() ORed the connac2-only "known"
+bits (SIG-B compression, puncturing) into its function-static template.
+After one frame from a connac2 device (mt7921 and its kin), every other
+device's HE-MU radiotap header claimed them too, and devices on
+different CPUs wrote the static concurrently.
+
+Make the template const and set those bits in the frame's own copy.
+Un-skip mt76_connac_test_he_radiotap_mu_known, which needs a single
+fake device: it now plays both chips in turn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c       | 12 ++++++------
+ tests/connac-mac-test.c | 27 ++++++++++++++++-----------
+ 2 files changed, 22 insertions(+), 17 deletions(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index c07f5399..c98bbbb9 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -848,7 +848,7 @@ mt76_connac2_mac_decode_he_mu_radiotap(struct mt76_dev *dev, struct sk_buff *skb
+ 				       __le32 *rxv)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+-	static struct ieee80211_radiotap_he_mu mu_known = {
++	static const struct ieee80211_radiotap_he_mu mu_known = {
+ 		.flags1 = HE_BITS(MU_FLAGS1_SIG_B_MCS_KNOWN) |
+ 			  HE_BITS(MU_FLAGS1_SIG_B_DCM_KNOWN) |
+ 			  HE_BITS(MU_FLAGS1_CH1_RU_KNOWN) |
+@@ -857,16 +857,16 @@ mt76_connac2_mac_decode_he_mu_radiotap(struct mt76_dev *dev, struct sk_buff *skb
+ 	};
+ 	struct ieee80211_radiotap_he_mu *he_mu;
+ 
+-	if (is_connac2(dev)) {
+-		mu_known.flags1 |= HE_BITS(MU_FLAGS1_SIG_B_COMP_KNOWN);
+-		mu_known.flags2 |= HE_BITS(MU_FLAGS2_PUNC_FROM_SIG_A_BW_KNOWN);
+-	}
+-
+ 	status->flag |= RX_FLAG_RADIOTAP_HE_MU;
+ 
+ 	he_mu = skb_push(skb, sizeof(mu_known));
+ 	memcpy(he_mu, &mu_known, sizeof(mu_known));
+ 
++	if (is_connac2(dev)) {
++		he_mu->flags1 |= HE_BITS(MU_FLAGS1_SIG_B_COMP_KNOWN);
++		he_mu->flags2 |= HE_BITS(MU_FLAGS2_PUNC_FROM_SIG_A_BW_KNOWN);
++	}
++
+ #define MU_PREP(f, v)	le16_encode_bits(v, IEEE80211_RADIOTAP_HE_MU_##f)
+ 
+ 	he_mu->flags1 |= MU_PREP(FLAGS1_SIG_B_MCS, status->rate_idx);
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 2eadce1a..5b358db0 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -2247,30 +2247,35 @@ static void mt76_connac_test_he_radiotap_mu_bw(struct kunit *test)
+ 		le16_to_cpu(he_mu->flags2)), 1);
+ }
+ 
+-/* The HE-MU "known" template is a static the connac2 path adds bits to,
+- * so after a connac2 device decoded one frame every other device reports
+- * them too. (For the same reason no test here decodes HE-MU on a connac2
+- * device: it would change what the later suites see.)
++/* The connac2-only "known" bits go into the frame's own HE-MU header, not
++ * into the shared template: after a connac2 device decoded a frame, other
++ * chips don't report them.
+  */
+ static void mt76_connac_test_he_radiotap_mu_known(struct kunit *test)
+ {
++	struct mt76_dev *dev = mt76_connac_test_dev(test);
+ 	struct ieee80211_radiotap_he_mu *he_mu;
+-	struct mt76_dev *dev, *c2;
+ 	struct sk_buff *skb;
+ 	__le32 rxv[16] = {};
+ 
+-	kunit_skip(test, "driver bug: connac2 HE-MU known bits leak into a shared static");
++	/* one fake device at a time: it plays the connac2 one first */
++	dev->rev = MT76_CONNAC_TEST_C2_REV;
++	skb = mt76_connac_test_rx_skb(test);
++	mt76_connac2_mac_decode_he_radiotap(dev, skb, rxv, MT_PHY_TYPE_HE_MU);
++	he_mu = (struct ieee80211_radiotap_he_mu *)skb->data;
++	KUNIT_EXPECT_TRUE(test, le16_to_cpu(he_mu->flags1) &
++			  IEEE80211_RADIOTAP_HE_MU_FLAGS1_SIG_B_COMP_KNOWN);
++	KUNIT_EXPECT_TRUE(test, le16_to_cpu(he_mu->flags2) &
++			  IEEE80211_RADIOTAP_HE_MU_FLAGS2_PUNC_FROM_SIG_A_BW_KNOWN);
+ 
+-	dev = mt76_connac_test_dev(test);
+-	c2 = mt76_connac_test_dev(test);
+-	c2->rev = MT76_CONNAC_TEST_C2_REV;
+-	mt76_connac2_mac_decode_he_radiotap(c2, mt76_connac_test_rx_skb(test),
+-					    rxv, MT_PHY_TYPE_HE_MU);
++	dev->rev = MT76_CONNAC_TEST_REV;
+ 	skb = mt76_connac_test_rx_skb(test);
+ 	mt76_connac2_mac_decode_he_radiotap(dev, skb, rxv, MT_PHY_TYPE_HE_MU);
+ 	he_mu = (struct ieee80211_radiotap_he_mu *)skb->data;
+ 	KUNIT_EXPECT_FALSE(test, le16_to_cpu(he_mu->flags1) &
+ 			   IEEE80211_RADIOTAP_HE_MU_FLAGS1_SIG_B_COMP_KNOWN);
++	KUNIT_EXPECT_FALSE(test, le16_to_cpu(he_mu->flags2) &
++			   IEEE80211_RADIOTAP_HE_MU_FLAGS2_PUNC_FROM_SIG_A_BW_KNOWN);
+ }
+ 
+ /* --- 802.3 -> 802.11 for mesh -------------------------------------------- */

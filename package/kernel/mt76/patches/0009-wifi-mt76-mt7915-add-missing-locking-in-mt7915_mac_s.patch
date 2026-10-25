@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:25:02 +0100
+Subject: [PATCH] wifi: mt76: mt7915: add missing locking in
+ mt7915_mac_sta_rc_work()
+
+mt7915_mac_sta_rc_work() drops sta_poll_lock and then uses the station
+and its vif to send rate control and SMPS updates to the firmware.
+Station removal runs under dev->mt76.mutex and only takes the station
+off sta_rc_list, so it doesn't wait for an update that is already in
+progress and mac80211 can free the station while the work still uses
+it.
+
+Hold dev->mt76.mutex for the duration of the work, as
+mt7996_mac_sta_rc_work() already does.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index dcd44c05..b868cb26 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1983,6 +1983,8 @@ void mt7915_mac_sta_rc_work(struct work_struct *work)
+ 	u32 changed;
+ 	LIST_HEAD(list);
+ 
++	mutex_lock(&dev->mt76.mutex);
++
+ 	spin_lock_bh(&dev->mt76.sta_poll_lock);
+ 	list_splice_init(&dev->sta_rc_list, &list);
+ 
+@@ -2008,6 +2010,8 @@ void mt7915_mac_sta_rc_work(struct work_struct *work)
+ 	}
+ 
+ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
++
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ void mt7915_mac_work(struct work_struct *work)

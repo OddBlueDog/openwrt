@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:42:34 +0100
+Subject: [PATCH] wifi: mt76: mt7915: match the MT7916 by its chip id in the
+ LED mux
+
+mt7915_init_led_mux() switches on mt76_chip(), but listed the MT7916 as
+0x7916, which is the MT7915's second PCIe function. The MT7916's chip id
+is 0x7906 (is_mt7916()), so its LED pins were never muxed.
+
+Use 0x7906. Un-skip mt7915_init_test_led_mux_mt7916.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c            | 6 +++---
+ mt7915/tests/init-test.c | 7 ++-----
+ 2 files changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index e38245a3..18e932f9 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -615,7 +615,7 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX0,
+ 				       GENMASK(11, 8), 1);
+ 			break;
+-		case 0x7916:
++		case 0x7906:
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
+ 				       GENMASK(27, 24), 3);
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
+@@ -634,7 +634,7 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX0,
+ 				       GENMASK(11, 8), 1);
+ 			break;
+-		case 0x7916:
++		case 0x7906:
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
+ 				       GENMASK(31, 28), 3);
+ 			break;
+@@ -651,7 +651,7 @@ mt7915_init_led_mux(struct mt7915_dev *dev)
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX0,
+ 				       GENMASK(7, 4), 1);
+ 			break;
+-		case 0x7916:
++		case 0x7906:
+ 			mt76_rmw_field(dev, MT_LED_GPIO_MUX1,
+ 				       GENMASK(27, 24), 3);
+ 			break;
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 4002fb14..ae708b43 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -1145,16 +1145,13 @@ static void mt7915_init_test_led_mux(struct kunit *test)
+ 	dev->mt76.rev = 0x79860000;
+ }
+ 
+-/* The MT7916 muxes its LED pins on GPIO 14/15. mt7915_init_led_mux()
+- * matches its chip id as 0x7916, but the MT7916's is 0x7906 (is_mt7916()),
+- * so it never muxes them.
++/* The MT7916 muxes its LED pins on GPIO 14/15. Its chip id is 0x7906
++ * (is_mt7916()); 0x7916 is the MT7915's second PCIe function.
+  */
+ static void mt7915_init_test_led_mux_mt7916(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev;
+ 
+-	kunit_skip(test, "driver bug: mt7915_init_led_mux() checks chip 0x7916, the MT7916 is 0x7906");
+-
+ 	dev = mt7915_init_test_chip(test, 0);
+ 	dev->mt76.rev = 0x79060000;
+ 	dev->dbdc_support = true;

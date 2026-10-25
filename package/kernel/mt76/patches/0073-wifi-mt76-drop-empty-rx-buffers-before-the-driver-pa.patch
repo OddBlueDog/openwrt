@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:56:42 +0100
+Subject: [PATCH] wifi: mt76: drop empty rx buffers before the driver parses
+ them
+
+A completed rx descriptor with a length of 0 and the last-segment bit
+became a zero-length skb. rx_check and the driver's rx handler read
+their descriptor words from the start of the buffer regardless, so they
+parsed whatever an earlier frame had left in the recycled page.
+
+Recycle such a buffer instead. Only a frame of one empty buffer is
+dropped: an empty first buffer of a longer frame still starts it (else
+the rest would each be taken for a new frame), and an empty last
+fragment still ends its frame.
+
+mt76_dma_test_rx_process_empty checks both.
+
+Based on pesa1234/openwrt next-r4.12.0.rss.mtk,
+9051-len-check-mt76-dma-rx-process (Rany Hany), which drops every empty
+buffer; that would also drop the one that ends a multi-buffer frame and
+leave q->rx_head to swallow the next frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dma.c            |  4 ++++
+ tests/dma-test.c | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 32 insertions(+)
+
+diff --git a/dma.c b/dma.c
+index d28fcaff..dc8f872e 100644
+--- a/dma.c
++++ b/dma.c
+@@ -1051,6 +1051,10 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 		if (drop)
+ 			goto free_frag;
+ 
++		/* an empty frame: the buffer holds nothing for the driver */
++		if (!len && !more && !q->rx_head)
++			goto free_frag;
++
+ 		if (q->rx_head)
+ 			data_len = q->buf_size;
+ 		else
+diff --git a/tests/dma-test.c b/tests/dma-test.c
+index d2201d24..3f19f66b 100644
+--- a/tests/dma-test.c
++++ b/tests/dma-test.c
+@@ -1524,6 +1524,33 @@ static void mt76_dma_test_rx_process_drop(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, q->queued, 15);
+ }
+ 
++/* A completed single buffer with no data is recycled without reaching
++ * rx_check or the driver; an empty last fragment still ends its frame.
++ */
++static void mt76_dma_test_rx_process_empty(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	mt76_dma_rx_fill(t->dev, q, false);
++	mt76_dma_test_rx_frame(t, q, 0, 0, 0);
++	mt76_dma_test_rx_frame(t, q, 1, 60, 1);
++	mt76_dma_test_rx_desc(t, q, 2, 100, 2, 0, 0);
++	mt76_dma_test_rx_frame(t, q, 3, 0, 3);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 2);
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 2);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb_peek(&t->rx),
++							 0, 60, 1));
++	KUNIT_EXPECT_EQ(test, skb_peek_tail(&t->rx)->len, 100);
++	KUNIT_EXPECT_NULL(test, q->rx_head);
++	KUNIT_EXPECT_EQ(test, t->n_rx_check, 1);
++	KUNIT_EXPECT_EQ(test, t->rx_check_len, 60);
++	KUNIT_EXPECT_EQ(test, q->tail, 4);
++	KUNIT_EXPECT_EQ(test, q->queued, 7);
++}
++
+ /* A length the buffer can't hold is dropped; a fragment that long drops
+  * the frame it belongs to. The ring carries on with the next frame.
+  */
+@@ -2191,6 +2218,7 @@ static struct kunit_case mt76_dma_test_rx_cases[] = {
+ 	KUNIT_CASE(mt76_dma_test_rx_process_rx_check),
+ 	KUNIT_CASE(mt76_dma_test_rx_process_frags),
+ 	KUNIT_CASE(mt76_dma_test_rx_process_drop),
++	KUNIT_CASE(mt76_dma_test_rx_process_empty),
+ 	KUNIT_CASE(mt76_dma_test_rx_process_too_long),
+ 	KUNIT_CASE(mt76_dma_test_rx_process_frag_overflow),
+ 	KUNIT_CASE(mt76_dma_test_rx_cleanup),

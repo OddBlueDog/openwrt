@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:21:31 +0100
+Subject: [PATCH] wifi: mt76: mt7915: UL OFDMA on by default
+
+Set ofdma_ul_en in every station's STA_REC_MURU, so the firmware may
+schedule HE stations' uplink in trigger-based OFDMA: muru_ofdma_ul
+(added off with the other switches) is now on by default; 0 puts back
+DL OFDMA only.
+
+The firmware keeps the first station's setting per band until it
+restarts, so changing the switch needs a driver reload to take effect.
+
+mt7915_test_sta_muru checks the default and the switch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c            |  4 ++--
+ mt7915/tests/mcu-test.c | 23 ++++++++++++-----------
+ 2 files changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index f73a9ad0..93e4c4a7 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -54,9 +54,9 @@ static bool vow_fw_quanta;
+ module_param(vow_fw_quanta, bool, 0444);
+ MODULE_PARM_DESC(vow_fw_quanta, "Alternative airtime (VoW) values: no WATF with ATF, the firmware's own quantum table, station quanta one level down");
+ 
+-static bool muru_ofdma_ul;
++static bool muru_ofdma_ul = true;
+ module_param(muru_ofdma_ul, bool, 0644);
+-MODULE_PARM_DESC(muru_ofdma_ul, "Let the firmware schedule UL OFDMA for HE stations (the firmware keeps the first station's setting per band, so set it before stations join)");
++MODULE_PARM_DESC(muru_ofdma_ul, "Let the firmware schedule UL OFDMA for HE stations (default on; the firmware keeps the first station's setting per band, so set it before stations join)");
+ 
+ static int muru_platform_type = -1;
+ module_param(muru_platform_type, int, 0444);
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 83654be4..34a72984 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -2818,14 +2818,14 @@ static struct sta_rec_muru *mt7915_test_muru_tlv(struct kunit *test,
+ 				   struct sta_rec_muru);
+ }
+ 
+-static void mt7915_test_muru_ofdma_ul_off(void *data)
++static void mt7915_test_muru_ofdma_ul_on(void *data)
+ {
+-	muru_ofdma_ul = false;
++	muru_ofdma_ul = true;
+ }
+ 
+-/* MU settings for APs and stations: DL OFDMA always, UL OFDMA with the
+- * muru_ofdma_ul switch, UL MU-MIMO on this chip, DL MU-MIMO if we can MU
+- * beamform, and the station's HE MU capabilities.
++/* MU settings for APs and stations: DL OFDMA always, UL OFDMA unless the
++ * muru_ofdma_ul switch is off, UL MU-MIMO on this chip, DL MU-MIMO if we
++ * can MU beamform, and the station's HE MU capabilities.
+  */
+ static void mt7915_test_sta_muru(struct kunit *test)
+ {
+@@ -2833,21 +2833,22 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	struct sta_rec_muru *muru;
+ 	struct mt7915_test_ctx c;
+ 
++	/* by default for every station */
+ 	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
+ 	muru = mt7915_test_muru_tlv(test, &c);
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_dl_en);
+-	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_ul_en);
++	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_ul_en);
+ 
+-	/* for every station */
++	/* switched off: DL OFDMA only */
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+-			mt7915_test_muru_ofdma_ul_off, NULL), 0);
+-	muru_ofdma_ul = true;
++			mt7915_test_muru_ofdma_ul_on, NULL), 0);
++	muru_ofdma_ul = false;
+ 	muru = mt7915_test_muru_tlv(test, &c);
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+-	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_ul_en);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_ul_en);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_dl_en);
+-	muru_ofdma_ul = false;
++	muru_ofdma_ul = true;
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_dl_en);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_ul_en);
+ 	KUNIT_EXPECT_FALSE(test, muru->mimo_dl.vht_mu_bfee);

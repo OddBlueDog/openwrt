@@ -1,0 +1,1316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:29:15 +0100
+Subject: [PATCH] milkflint tools: record what the MT7986 and its firmware tell
+ the driver
+
+No fake can say what the real chip and its firmware answer, so let the
+driver record it. Built with MT76_RECORD=1 in the environment (which
+defines CONFIG_MT76_RECORD) and loaded with mt76.record=1 or 2, mt76
+records from module load into one buffer in RAM (mt76.record_kb, 16 MiB):
+- every register access through the MMIO bus ops: read, write,
+  read-modify-write (value read and written), copies; the address is the
+  offset in the register window, as the reg_rr/reg_wr tracepoints show
+  it (the router image has no ftrace);
+- every firmware command: id, payload, the raw reply skb and the
+  parser's result, firmware download chunks by their length only;
+- rx events other than data frames (tx-free, TXS, rx vectors, firmware
+  events), the MT798x SoC SKU word, the EEPROM at registration and each
+  channel change.
+
+debugfs mt76_record/data has the recording (format in record.h);
+mt76_record/control has the state and takes "up", "stop" and
+"mark <text>". Mode 1 stops when bring-up is over (record_settle seconds
+after the last channel change, or "up"), mode 2 records record_secs
+more seconds of traffic. A full buffer stops it.
+
+Without MT76_RECORD every hook is an empty inline, record.o is empty and
+the driver is unchanged; mt76_mmio_rmw() and __mt76_mcu_send_firmware()
+are restructured to have one place for a hook, with the same accesses,
+tracepoints and results. milkflint's KUnit build always has the
+recorder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Makefile        |   7 +-
+ mac80211.c      |   3 +
+ mcu.c           |  13 +-
+ mmio.c          |  13 +-
+ mt76.h          |   6 +
+ mt7915/Makefile |   3 +
+ mt7915/mac.c    |   8 +
+ mt7915/soc.c    |   2 +
+ record.c        | 714 ++++++++++++++++++++++++++++++++++++++++++++++++
+ record.h        | 311 +++++++++++++++++++++
+ 10 files changed, 1073 insertions(+), 7 deletions(-)
+ create mode 100644 record.c
+ create mode 100644 record.h
+
+diff --git a/Makefile b/Makefile
+index 4ba96d1c..da760841 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,5 +1,10 @@
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+ ccflags-y += -Werror -DCONFIG_MT76_LEDS
++# milkflint tools: the register/firmware recorder (record.h), only in builds
++# asked for it (MT76_RECORD=1 in the build environment)
++ifneq ($(MT76_RECORD),)
++ccflags-y += -DCONFIG_MT76_RECORD
++endif
+ obj-m := mt76.o
+ obj-$(CONFIG_MT76_USB) += mt76-usb.o
+ obj-$(CONFIG_MT76_SDIO) += mt76-sdio.o
+@@ -11,7 +16,7 @@ obj-$(CONFIG_MT792x_USB) += mt792x-usb.o
+ 
+ mt76-y := \
+ 	mmio.o util.o trace.o dma.o mac80211.o debugfs.o eeprom.o \
+-	tx.o agg-rx.o mcu.o wed.o scan.o channel.o
++	tx.o agg-rx.o mcu.o wed.o scan.o channel.o record.o
+ 
+ mt76-$(CONFIG_MT76_NPU) += npu.o
+ mt76-$(CONFIG_PCI) += pci.o
+diff --git a/mac80211.c b/mac80211.c
+index 48e71141..b2c0da94 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -800,6 +800,7 @@ int mt76_register_device(struct mt76_dev *dev, bool vht,
+ 	WARN_ON(mt76_worker_setup(hw, &dev->tx_worker, NULL, "tx"));
+ 	set_bit(MT76_STATE_REGISTERED, &phy->state);
+ 	sched_set_fifo_low(dev->tx_worker.task);
++	mt76_record_registered(dev);
+ 
+ 	return 0;
+ }
+@@ -822,6 +823,7 @@ EXPORT_SYMBOL_GPL(mt76_unregister_device);
+ 
+ void mt76_free_device(struct mt76_dev *dev)
+ {
++	mt76_record_dev_gone(dev);
+ 	mt76_worker_teardown(&dev->tx_worker);
+ 	if (dev->wq) {
+ 		destroy_workqueue(dev->wq);
+@@ -1080,6 +1082,7 @@ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
+ 	phy->chandef = *chandef;
+ 	phy->chan_state = mt76_channel_state(phy, chandef->chan);
+ 	phy->offchannel = offchannel;
++	mt76_record_channel(phy);
+ 
+ 	if (!offchannel)
+ 		phy->main_chandef = *chandef;
+diff --git a/mcu.c b/mcu.c
+index ad44136f..5cfbbc2a 100644
+--- a/mcu.c
++++ b/mcu.c
+@@ -91,6 +91,8 @@ int mt76_mcu_skb_send_and_get_msg(struct mt76_dev *dev, struct sk_buff *skb,
+ 		goto out;
+ 	}
+ 
++	mt76_record_mcu_cmd(dev, cmd, skb->data, skb->len, wait_resp);
++
+ 	if (dev->mcu_ops->mcu_skb_prepare_msg) {
+ 		orig_skb = skb;
+ 		ret = dev->mcu_ops->mcu_skb_prepare_msg(dev, skb, cmd, &seq);
+@@ -115,6 +117,7 @@ retry:
+ 
+ 	do {
+ 		skb = mt76_mcu_get_response(dev, expires);
++		mt76_record_mcu_resp(dev, cmd, seq, skb);
+ 		if (!skb && !test_bit(MT76_MCU_RESET, &dev->phy.state) &&
+ 		    orig_skb && retry++ < dev->mcu_ops->max_retry) {
+ 			dev_err(dev->dev, "Retry message %08x (seq %d)\n",
+@@ -129,7 +132,7 @@ retry:
+ 		else
+ 			dev_kfree_skb(skb);
+ 	} while (ret == -EAGAIN);
+-
++	mt76_record_mcu_ret(dev, cmd, seq, ret);
+ 
+ out:
+ 	dev_kfree_skb(orig_skb);
+@@ -142,14 +145,15 @@ EXPORT_SYMBOL_GPL(mt76_mcu_skb_send_and_get_msg);
+ int __mt76_mcu_send_firmware(struct mt76_dev *dev, int cmd, const void *data,
+ 			     int len, int max_len)
+ {
+-	int err, cur_len;
++	int err = 0, cur_len;
+ 
++	mt76_record_fw_download(dev, cmd, len, true);
+ 	while (len > 0) {
+ 		cur_len = min_t(int, max_len, len);
+ 
+ 		err = mt76_mcu_send_msg(dev, cmd, data, cur_len, false);
+ 		if (err)
+-			return err;
++			break;
+ 
+ 		data += cur_len;
+ 		len -= cur_len;
+@@ -159,8 +163,9 @@ int __mt76_mcu_send_firmware(struct mt76_dev *dev, int cmd, const void *data,
+ 						   dev->q_mcu[MT_MCUQ_FWDL],
+ 						   false);
+ 	}
++	mt76_record_fw_download(dev, cmd, len, false);
+ 
+-	return 0;
++	return err;
+ }
+ EXPORT_SYMBOL_GPL(__mt76_mcu_send_firmware);
+ 
+diff --git a/mmio.c b/mmio.c
+index 350cb42a..38f5d28e 100644
+--- a/mmio.c
++++ b/mmio.c
+@@ -13,6 +13,7 @@ static u32 mt76_mmio_rr(struct mt76_dev *dev, u32 offset)
+ 
+ 	val = readl(dev->mmio.regs + offset);
+ 	trace_reg_rr(dev, offset, val);
++	mt76_record_rr(dev, offset, val);
+ 
+ 	return val;
+ }
+@@ -20,13 +21,19 @@ static u32 mt76_mmio_rr(struct mt76_dev *dev, u32 offset)
+ static void mt76_mmio_wr(struct mt76_dev *dev, u32 offset, u32 val)
+ {
+ 	trace_reg_wr(dev, offset, val);
++	mt76_record_wr(dev, offset, val);
+ 	writel(val, dev->mmio.regs + offset);
+ }
+ 
+ static u32 mt76_mmio_rmw(struct mt76_dev *dev, u32 offset, u32 mask, u32 val)
+ {
+-	val |= mt76_mmio_rr(dev, offset) & ~mask;
+-	mt76_mmio_wr(dev, offset, val);
++	u32 cur = readl(dev->mmio.regs + offset);
++
++	trace_reg_rr(dev, offset, cur);
++	val |= cur & ~mask;
++	trace_reg_wr(dev, offset, val);
++	mt76_record_rmw(dev, offset, mask, cur, val);
++	writel(val, dev->mmio.regs + offset);
+ 	return val;
+ }
+ 
+@@ -45,6 +52,7 @@ static void mt76_mmio_write_copy(struct mt76_dev *dev, u32 offset,
+ 		memcpy(tmp, data + i, len - i);
+ 		writel(get_unaligned_le32(tmp), dev->mmio.regs + offset + i);
+ 	}
++	mt76_record_write_copy(dev, offset, data, len);
+ }
+ 
+ static void mt76_mmio_read_copy(struct mt76_dev *dev, u32 offset,
+@@ -62,6 +70,7 @@ static void mt76_mmio_read_copy(struct mt76_dev *dev, u32 offset,
+ 		put_unaligned_le32(readl(dev->mmio.regs + offset + i), tmp);
+ 		memcpy(data + i, tmp, len - i);
+ 	}
++	mt76_record_read_copy(dev, offset, data, len);
+ }
+ 
+ static int mt76_mmio_wr_rp(struct mt76_dev *dev, u32 base,
+diff --git a/mt76.h b/mt76.h
+index 63ba188d..8cfe0019 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -25,6 +25,12 @@
+ #include "util.h"
+ #include "testmode.h"
+ 
++/* milkflint's KUnit build always has the recorder */
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST) && !defined(CONFIG_MT76_RECORD)
++#define CONFIG_MT76_RECORD 1
++#endif
++#include "record.h"
++
+ #define MT_MCU_RING_SIZE	32
+ #define MT_RX_BUF_SIZE		2048
+ #define MT_SKB_HEAD_LEN		256
+diff --git a/mt7915/Makefile b/mt7915/Makefile
+index 7ea5b05c..410d81ac 100644
+--- a/mt7915/Makefile
++++ b/mt7915/Makefile
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+ 
+ ccflags-y += -DCONFIG_MT76_LEDS
++ifneq ($(MT76_RECORD),)
++ccflags-y += -DCONFIG_MT76_RECORD
++endif
+ obj-$(CONFIG_MT7915E) += mt7915e.o
+ 
+ mt7915e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index fe545c21..892d549f 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1046,6 +1046,12 @@ bool mt7915_rx_check(struct mt76_dev *mdev, void *data, int len)
+ 	enum rx_pkt_type type;
+ 
+ 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
++	/* the ones consumed here (the others go to mt7915_queue_rx_skb()) */
++	mt76_record_rx_if(mdev, type == PKT_TYPE_TXRX_NOTIFY ||
++			  type == PKT_TYPE_TXRX_NOTIFY_V0 ||
++			  type == PKT_TYPE_TXS ||
++			  type == PKT_TYPE_RX_FW_MONITOR,
++			  MT76_REC_RX_CHECK, data, len);
+ 
+ 	switch (type) {
+ 	case PKT_TYPE_TXRX_NOTIFY:
+@@ -1075,6 +1081,8 @@ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 	enum rx_pkt_type type;
+ 
+ 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
++	mt76_record_rx_if(mdev, type != PKT_TYPE_NORMAL, q, skb->data,
++			  skb->len);
+ 
+ 	switch (type) {
+ 	case PKT_TYPE_TXRX_NOTIFY:
+diff --git a/mt7915/soc.c b/mt7915/soc.c
+index df89b61c..d5c8b94d 100644
+--- a/mt7915/soc.c
++++ b/mt7915/soc.c
+@@ -180,6 +180,8 @@ static u8 mt798x_wmac_check_adie_type(struct mt7915_dev *dev)
+ 		return ADIE_DBDC;
+ 
+ 	val = readl(dev->sku + MT_TOP_POS_SKU);
++	mt76_record_soc_rr(&dev->mt76, MT76_REC_SPACE_SOC_TOP, MT_TOP_POS_SKU,
++			   val);
+ 
+ 	return FIELD_GET(MT_TOP_POS_SKU_ADIE_DBDC_MASK, val);
+ }
+diff --git a/record.c b/record.c
+new file mode 100644
+index 00000000..e733fcef
+--- /dev/null
++++ b/record.c
+@@ -0,0 +1,714 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * milkflint tools: the recorder of what the hardware and firmware tell the
++ * driver. See record.h for what it records and the format.
++ */
++#include <linux/debugfs.h>
++#include <linux/module.h>
++#include <linux/sched/clock.h>
++#include <linux/vmalloc.h>
++#include <linux/workqueue.h>
++#include "mt76.h"
++
++#if IS_ENABLED(CONFIG_MT76_RECORD)
++
++/* wifi/record.py reads these */
++static_assert(sizeof(struct mt76_rec_file_hdr) == 48);
++static_assert(sizeof(struct mt76_rec_hdr) == 8);
++static_assert(sizeof(struct mt76_rec_mcu) == 12);
++static_assert(sizeof(struct mt76_rec_rx) == 8);
++
++#define MT76_REC_MAX_DEVS	16
++#define MT76_REC_MAX_BODY	0xffff
++#define MT76_REC_MAX_RX		2048	/* bytes of an rx event kept */
++
++enum mt76_rec_state {
++	MT76_REC_RECORDING,
++	MT76_REC_TRAFFIC,	/* bring-up is over: record_secs more */
++	MT76_REC_STOPPED,
++};
++
++struct mt76_record {
++	spinlock_t lock;
++	u8 *buf;
++	size_t size, len;
++	u32 records, dropped, flags;
++	int mode;
++	enum mt76_rec_state state;
++	u64 start_ns;
++	/* the devices seen, by slot; NULL once freed (the slot stays taken) */
++	struct mt76_dev *devs[MT76_REC_MAX_DEVS];
++	unsigned int n_devs;
++	struct mt76_dev *fw_dev;	/* sending firmware chunks */
++	unsigned int channels;		/* channel changes seen */
++	struct delayed_work work;	/* the end of bring-up, then of traffic */
++	struct dentry *dir;
++};
++
++struct mt76_record *mt76_rec;
++EXPORT_SYMBOL_GPL(mt76_rec);
++
++static int record;
++module_param(record, int, 0444);
++MODULE_PARM_DESC(record, "milkflint: record register and firmware traffic into debugfs mt76_record/ (1: probe and bring-up, 2: plus record_secs of traffic)");
++
++static unsigned int record_kb = 16384;
++module_param(record_kb, uint, 0444);
++MODULE_PARM_DESC(record_kb, "milkflint: recording buffer size (KiB)");
++
++static unsigned int record_secs = 10;
++module_param(record_secs, uint, 0644);
++MODULE_PARM_DESC(record_secs, "milkflint: seconds recorded after bring-up with record=2");
++
++static unsigned int record_settle = 5;
++module_param(record_settle, uint, 0644);
++MODULE_PARM_DESC(record_settle, "milkflint: bring-up is over this many seconds after the last channel change");
++
++static void mt76_record_work(struct work_struct *work);
++
++struct mt76_record *mt76_record_alloc(size_t size, int mode)
++{
++	struct mt76_record *rec;
++
++	rec = kzalloc(sizeof(*rec), GFP_KERNEL);
++	if (!rec)
++		return NULL;
++
++	rec->buf = vzalloc(size);
++	if (!rec->buf) {
++		kfree(rec);
++		return NULL;
++	}
++	rec->size = size;
++	rec->mode = mode;
++	rec->start_ns = local_clock();
++	spin_lock_init(&rec->lock);
++	INIT_DELAYED_WORK(&rec->work, mt76_record_work);
++
++	return rec;
++}
++EXPORT_SYMBOL_GPL(mt76_record_alloc);
++
++void mt76_record_free(struct mt76_record *rec)
++{
++	if (!rec)
++		return;
++
++	mt76_record_detach(rec);
++	cancel_delayed_work_sync(&rec->work);
++	vfree(rec->buf);
++	kfree(rec);
++}
++EXPORT_SYMBOL_GPL(mt76_record_free);
++
++void mt76_record_attach(struct mt76_record *rec)
++{
++	WRITE_ONCE(mt76_rec, rec);
++}
++EXPORT_SYMBOL_GPL(mt76_record_attach);
++
++void mt76_record_detach(struct mt76_record *rec)
++{
++	if (READ_ONCE(mt76_rec) == rec)
++		WRITE_ONCE(mt76_rec, NULL);
++}
++EXPORT_SYMBOL_GPL(mt76_record_detach);
++
++static void mt76_record_fill_hdr(struct mt76_record *rec,
++				 struct mt76_rec_file_hdr *hdr, size_t len)
++{
++	memset(hdr, 0, sizeof(*hdr));
++	memcpy(hdr->magic, MT76_REC_MAGIC, sizeof(hdr->magic));
++	hdr->version = cpu_to_le32(MT76_REC_VERSION);
++	hdr->hdr_len = cpu_to_le32(sizeof(*hdr));
++	hdr->data_len = cpu_to_le32(len);
++	hdr->flags = cpu_to_le32(rec->flags);
++	hdr->mode = cpu_to_le32(rec->mode);
++	hdr->records = cpu_to_le32(rec->records);
++	hdr->dropped = cpu_to_le32(rec->dropped);
++	hdr->start_ns = cpu_to_le64(rec->start_ns);
++}
++
++void *mt76_record_copy(struct mt76_record *rec, size_t *len)
++{
++	struct mt76_rec_file_hdr hdr;
++	unsigned long flags;
++	size_t n;
++	u8 *buf;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	n = rec->len;
++	mt76_record_fill_hdr(rec, &hdr, n);
++	spin_unlock_irqrestore(&rec->lock, flags);
++
++	buf = kvmalloc(sizeof(hdr) + n, GFP_KERNEL);
++	if (!buf)
++		return NULL;
++
++	/* records are only ever appended: the first n bytes are final */
++	memcpy(buf, &hdr, sizeof(hdr));
++	memcpy(buf + sizeof(hdr), rec->buf, n);
++	*len = sizeof(hdr) + n;
++
++	return buf;
++}
++EXPORT_SYMBOL_GPL(mt76_record_copy);
++
++/* --- writing records (rec->lock held) -------------------------------------- */
++
++static void *__mt76_record_put(struct mt76_record *rec, int slot, u8 type,
++			       u8 space, size_t body);
++
++static void __mt76_record_stop(struct mt76_record *rec, const char *why)
++{
++	size_t n = strlen(why);
++	char *p;
++
++	if (rec->state == MT76_REC_STOPPED)
++		return;
++
++	rec->state = MT76_REC_STOPPED;
++	rec->flags |= MT76_REC_F_STOPPED;
++	/* the last record: it goes into the room kept for it */
++	p = __mt76_record_put(rec, MT76_REC_MAX_DEVS - 1, MT76_REC_MARK, 0,
++			      n);
++	if (p)
++		memcpy(p, why, n);
++}
++
++/* the body of a new record, or NULL if it doesn't fit (the recording then
++ * stops, with room kept for saying why). Once stopped, only that note.
++ */
++static void *__mt76_record_put(struct mt76_record *rec, int slot, u8 type,
++			       u8 space, size_t body)
++{
++	size_t need = sizeof(struct mt76_rec_hdr) + ALIGN(body, 4);
++	size_t reserve = rec->state == MT76_REC_STOPPED ? 0 : 64;
++	struct mt76_rec_hdr *hdr;
++
++	if (rec->state == MT76_REC_STOPPED && type != MT76_REC_MARK)
++		return NULL;
++
++	if (rec->len + need + reserve > rec->size) {
++		rec->dropped++;
++		if (rec->state != MT76_REC_STOPPED) {
++			rec->flags |= MT76_REC_F_FULL;
++			__mt76_record_stop(rec, "stopped: buffer full");
++		}
++		return NULL;
++	}
++
++	hdr = (struct mt76_rec_hdr *)(rec->buf + rec->len);
++	hdr->type = type;
++	hdr->dev = (slot & 0xf) | (space << 4);
++	hdr->len = cpu_to_le16(body);
++	hdr->ts = cpu_to_le32(div_u64(local_clock() - rec->start_ns, 1000));
++	memset((u8 *)(hdr + 1) + body, 0, ALIGN(body, 4) - body);
++	rec->len += need;
++	rec->records++;
++
++	return hdr + 1;
++}
++
++/* @dev's slot; the first time, a MT76_REC_DEV record with its name */
++static int mt76_record_slot(struct mt76_record *rec, struct mt76_dev *dev)
++{
++	const char *name;
++	unsigned int i;
++	size_t n;
++	char *p;
++
++	if (!dev)
++		return MT76_REC_MAX_DEVS - 1;
++
++	for (i = 0; i < rec->n_devs; i++)
++		if (rec->devs[i] == dev)
++			return i;
++
++	if (rec->n_devs == MT76_REC_MAX_DEVS - 1)
++		return MT76_REC_MAX_DEVS - 1;
++
++	i = rec->n_devs++;
++	rec->devs[i] = dev;
++	name = dev->dev ? dev_name(dev->dev) : "";
++	n = strlen(name);
++	p = __mt76_record_put(rec, i, MT76_REC_DEV, 0, n);
++	if (p)
++		memcpy(p, name, n);
++
++	return i;
++}
++
++static void *mt76_record_put(struct mt76_record *rec, struct mt76_dev *dev,
++			     u8 type, u8 space, size_t body)
++{
++	if (rec->state == MT76_REC_STOPPED) {
++		/* how much more room it would have needed */
++		if (rec->flags & MT76_REC_F_FULL)
++			rec->dropped++;
++		return NULL;
++	}
++
++	return __mt76_record_put(rec, mt76_record_slot(rec, dev), type, space,
++				 body);
++}
++
++/* --- hooks ------------------------------------------------------------------ */
++
++void __mt76_record_reg(struct mt76_dev *dev, u8 type, u8 space, u32 addr,
++		       const u32 *val, int n)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	unsigned long flags;
++	__le32 *p;
++	int i;
++
++	if (!rec)
++		return;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	p = mt76_record_put(rec, dev, type, space, 4 + 4 * n);
++	if (p) {
++		p[0] = cpu_to_le32(addr);
++		for (i = 0; i < n; i++)
++			p[i + 1] = cpu_to_le32(val[i]);
++	}
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_reg);
++
++void __mt76_record_copy(struct mt76_dev *dev, u8 type, u32 addr,
++			const void *data, int len)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	unsigned long flags;
++	__le32 *p;
++
++	if (!rec)
++		return;
++
++	len = clamp(len, 0, MT76_REC_MAX_BODY - 4);
++	spin_lock_irqsave(&rec->lock, flags);
++	p = mt76_record_put(rec, dev, type, MT76_REC_SPACE_BUS, 4 + len);
++	if (p) {
++		p[0] = cpu_to_le32(addr);
++		memcpy(p + 1, data, len);
++	}
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_copy);
++
++void __mt76_record_mcu(struct mt76_dev *dev, u8 type, int cmd, int seq,
++		       u8 mflags, const void *data, int len)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	struct mt76_rec_mcu *m;
++	unsigned long flags;
++	int keep = 0;
++
++	if (!rec)
++		return;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	if (type != MT76_REC_MCU_RET && data) {
++		/* firmware download chunks: only their length */
++		keep = rec->fw_dev == dev ? 0 : len;
++		keep = clamp(keep, 0, (int)(MT76_REC_MAX_BODY - sizeof(*m)));
++		if (keep < len)
++			mflags |= MT76_REC_MCU_CUT;
++	}
++	m = mt76_record_put(rec, dev, type, MT76_REC_SPACE_BUS,
++			    sizeof(*m) + keep);
++	if (m) {
++		m->cmd = cpu_to_le32(cmd);
++		m->seq = seq;
++		m->flags = mflags;
++		m->rsv = 0;
++		m->len = cpu_to_le32(len);
++		memcpy(m + 1, data, keep);
++	}
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_mcu);
++
++void __mt76_record_mcu_resp(struct mt76_dev *dev, int cmd, int seq,
++			    const struct sk_buff *skb)
++{
++	if (!skb)
++		__mt76_record_mcu(dev, MT76_REC_MCU_RESP, cmd, seq,
++				  MT76_REC_MCU_TIMEOUT, NULL, 0);
++	else
++		__mt76_record_mcu(dev, MT76_REC_MCU_RESP, cmd, seq, 0,
++				  skb->data, skb_headlen(skb));
++}
++EXPORT_SYMBOL_GPL(__mt76_record_mcu_resp);
++
++/* firmware chunks are only recorded by their length, between these */
++void __mt76_record_fw_download(struct mt76_dev *dev, int cmd, int len,
++			       bool start)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	unsigned long flags;
++
++	if (!rec)
++		return;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	rec->fw_dev = start ? dev : NULL;
++	spin_unlock_irqrestore(&rec->lock, flags);
++	if (start)
++		__mt76_record_mark(dev, "firmware download: %d bytes, cmd %08x",
++				   len, cmd);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_fw_download);
++
++void __mt76_record_rx(struct mt76_dev *dev, u8 q, const void *data, int len)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	int keep = clamp(len, 0, MT76_REC_MAX_RX);
++	struct mt76_rec_rx *r;
++	unsigned long flags;
++
++	if (!rec)
++		return;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	r = mt76_record_put(rec, dev, MT76_REC_RX, MT76_REC_SPACE_BUS,
++			    sizeof(*r) + keep);
++	if (r) {
++		r->q = q;
++		r->flags = keep < len ? MT76_REC_MCU_CUT : 0;
++		r->rsv = 0;
++		r->len = cpu_to_le32(len);
++		memcpy(r + 1, data, keep);
++	}
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_rx);
++
++void __mt76_record_blob(struct mt76_dev *dev, const char *name,
++			const void *data, int len)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	unsigned long flags;
++	char *p;
++
++	if (!rec)
++		return;
++
++	len = clamp(len, 0, MT76_REC_MAX_BODY - 16);
++	spin_lock_irqsave(&rec->lock, flags);
++	p = mt76_record_put(rec, dev, MT76_REC_BLOB, MT76_REC_SPACE_BUS,
++			    16 + len);
++	if (p) {
++		strscpy_pad(p, name, 16);
++		memcpy(p + 16, data, len);
++	}
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_blob);
++
++void __mt76_record_mark(struct mt76_dev *dev, const char *fmt, ...)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	unsigned long flags;
++	char text[128];
++	va_list args;
++	int n;
++	char *p;
++
++	if (!rec)
++		return;
++
++	va_start(args, fmt);
++	n = vscnprintf(text, sizeof(text), fmt, args);
++	va_end(args);
++
++	spin_lock_irqsave(&rec->lock, flags);
++	p = mt76_record_put(rec, dev, MT76_REC_MARK, MT76_REC_SPACE_BUS, n);
++	if (p)
++		memcpy(p, text, n);
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_mark);
++
++/* bring-up is over when nothing has changed channel for record_settle s */
++void __mt76_record_channel(struct mt76_phy *phy)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	unsigned long flags;
++
++	if (!rec)
++		return;
++
++	__mt76_record_mark(phy->dev, "channel: band %u, %u MHz, width %d%s",
++			   phy->band_idx, phy->chandef.chan->center_freq,
++			   phy->chandef.width,
++			   phy->offchannel ? " (off-channel)" : "");
++
++	spin_lock_irqsave(&rec->lock, flags);
++	rec->channels++;
++	if (rec->mode > 0 && rec->state == MT76_REC_RECORDING)
++		mod_delayed_work(system_wq, &rec->work, record_settle * HZ);
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_channel);
++
++void __mt76_record_registered(struct mt76_dev *dev)
++{
++	if (dev->eeprom.data)
++		__mt76_record_blob(dev, "eeprom", dev->eeprom.data,
++				   dev->eeprom.size);
++	__mt76_record_mark(dev, "registered");
++}
++EXPORT_SYMBOL_GPL(__mt76_record_registered);
++
++void __mt76_record_dev_gone(struct mt76_dev *dev)
++{
++	struct mt76_record *rec = READ_ONCE(mt76_rec);
++	unsigned long flags;
++	unsigned int i;
++
++	if (!rec)
++		return;
++
++	__mt76_record_mark(dev, "freed");
++	spin_lock_irqsave(&rec->lock, flags);
++	for (i = 0; i < rec->n_devs; i++)
++		if (rec->devs[i] == dev)
++			rec->devs[i] = NULL;
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(__mt76_record_dev_gone);
++
++/* --- bring-up, traffic, stop ------------------------------------------------- */
++
++void mt76_record_bringup_done(struct mt76_record *rec, bool automatic)
++{
++	unsigned long flags;
++	char *p;
++	const char *why = automatic ? "bring-up over: channels settled" :
++				      "bring-up over: user space said so";
++	size_t n = strlen(why);
++
++	spin_lock_irqsave(&rec->lock, flags);
++	if (rec->state != MT76_REC_RECORDING)
++		goto out;
++
++	rec->flags |= MT76_REC_F_UP | (automatic ? MT76_REC_F_UP_AUTO : 0);
++	p = __mt76_record_put(rec, MT76_REC_MAX_DEVS - 1, MT76_REC_MARK, 0, n);
++	if (p)
++		memcpy(p, why, n);
++	if (rec->mode >= 2) {
++		rec->state = MT76_REC_TRAFFIC;
++		mod_delayed_work(system_wq, &rec->work, record_secs * HZ);
++	} else {
++		__mt76_record_stop(rec, "stopped: probe and bring-up only");
++	}
++out:
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(mt76_record_bringup_done);
++
++void mt76_record_stop(struct mt76_record *rec)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	__mt76_record_stop(rec, "stopped");
++	spin_unlock_irqrestore(&rec->lock, flags);
++}
++EXPORT_SYMBOL_GPL(mt76_record_stop);
++
++static void mt76_record_work(struct work_struct *work)
++{
++	struct mt76_record *rec = container_of(to_delayed_work(work),
++					       struct mt76_record, work);
++	enum mt76_rec_state state;
++	unsigned long flags;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	state = rec->state;
++	if (state == MT76_REC_TRAFFIC)
++		__mt76_record_stop(rec, "stopped: traffic time is up");
++	spin_unlock_irqrestore(&rec->lock, flags);
++
++	if (state == MT76_REC_RECORDING && rec->channels)
++		mt76_record_bringup_done(rec, true);
++}
++
++/* --- debugfs ----------------------------------------------------------------- */
++
++struct mt76_record_reader {
++	struct mt76_rec_file_hdr hdr;
++	struct mt76_record *rec;
++	size_t len;
++};
++
++static int mt76_record_data_open(struct inode *inode, struct file *file)
++{
++	struct mt76_record *rec = inode->i_private;
++	struct mt76_record_reader *r;
++	unsigned long flags;
++
++	r = kzalloc(sizeof(*r), GFP_KERNEL);
++	if (!r)
++		return -ENOMEM;
++
++	r->rec = rec;
++	spin_lock_irqsave(&rec->lock, flags);
++	r->len = rec->len;
++	mt76_record_fill_hdr(rec, &r->hdr, r->len);
++	spin_unlock_irqrestore(&rec->lock, flags);
++	file->private_data = r;
++
++	return 0;
++}
++
++static ssize_t mt76_record_data_read(struct file *file, char __user *ubuf,
++				     size_t count, loff_t *ppos)
++{
++	struct mt76_record_reader *r = file->private_data;
++	size_t hlen = sizeof(r->hdr);
++	ssize_t done = 0, n;
++	loff_t pos;
++
++	if (*ppos < (loff_t)hlen) {
++		done = simple_read_from_buffer(ubuf, count, ppos, &r->hdr,
++					       hlen);
++		if (done < 0)
++			return done;
++	}
++	if (*ppos >= (loff_t)hlen && done < count) {
++		pos = *ppos - hlen;
++		n = simple_read_from_buffer(ubuf + done, count - done, &pos,
++					    r->rec->buf, r->len);
++		if (n < 0)
++			return done ?: n;
++		*ppos = pos + hlen;
++		done += n;
++	}
++
++	return done;
++}
++
++static int mt76_record_data_release(struct inode *inode, struct file *file)
++{
++	kfree(file->private_data);
++	return 0;
++}
++
++static const struct file_operations mt76_record_data_fops = {
++	.open = mt76_record_data_open,
++	.read = mt76_record_data_read,
++	.release = mt76_record_data_release,
++	.llseek = default_llseek,
++};
++
++static const char * const mt76_record_states[] = {
++	[MT76_REC_RECORDING] = "recording",
++	[MT76_REC_TRAFFIC] = "traffic",
++	[MT76_REC_STOPPED] = "stopped",
++};
++
++static ssize_t mt76_record_ctl_read(struct file *file, char __user *ubuf,
++				    size_t count, loff_t *ppos)
++{
++	struct mt76_record *rec = file->private_data;
++	unsigned long flags;
++	char buf[256];
++	int n;
++
++	spin_lock_irqsave(&rec->lock, flags);
++	n = scnprintf(buf, sizeof(buf),
++		      "state=%s mode=%d used=%zu size=%zu records=%u dropped=%u up=%s full=%d\n",
++		      mt76_record_states[rec->state], rec->mode, rec->len,
++		      rec->size, rec->records, rec->dropped,
++		      !(rec->flags & MT76_REC_F_UP) ? "no" :
++		      (rec->flags & MT76_REC_F_UP_AUTO) ? "auto" : "user",
++		      !!(rec->flags & MT76_REC_F_FULL));
++	spin_unlock_irqrestore(&rec->lock, flags);
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, n);
++}
++
++/* "up": bring-up is over; "stop"; "mark <text>": a note in the recording */
++static ssize_t mt76_record_ctl_write(struct file *file,
++				     const char __user *ubuf, size_t count,
++				     loff_t *ppos)
++{
++	struct mt76_record *rec = file->private_data;
++	char buf[128];
++	size_t n = min(count, sizeof(buf) - 1);
++
++	if (copy_from_user(buf, ubuf, n))
++		return -EFAULT;
++	buf[n] = 0;
++	strim(buf);
++
++	if (!strcmp(buf, "up")) {
++		mt76_record_bringup_done(rec, false);
++	} else if (!strcmp(buf, "stop")) {
++		mt76_record_stop(rec);
++	} else if (!strncmp(buf, "mark ", 5)) {
++		struct mt76_record *cur = READ_ONCE(mt76_rec);
++
++		if (cur == rec)
++			__mt76_record_mark(NULL, "user: %s", buf + 5);
++	} else {
++		return -EINVAL;
++	}
++
++	return count;
++}
++
++static const struct file_operations mt76_record_ctl_fops = {
++	.open = simple_open,
++	.read = mt76_record_ctl_read,
++	.write = mt76_record_ctl_write,
++	.llseek = default_llseek,
++};
++
++static struct mt76_record *mt76_record_global;
++
++static int __init mt76_record_init(void)
++{
++	struct mt76_record *rec;
++	size_t size;
++
++	if (record <= 0)
++		return 0;
++
++	size = (size_t)clamp(record_kb, 64U, 256U * 1024) * 1024;
++	rec = mt76_record_alloc(size, record);
++	if (!rec)
++		return -ENOMEM;
++
++	rec->dir = debugfs_create_dir("mt76_record", NULL);
++	debugfs_create_file("data", 0400, rec->dir, rec,
++			    &mt76_record_data_fops);
++	debugfs_create_file("control", 0600, rec->dir, rec,
++			    &mt76_record_ctl_fops);
++	mt76_record_global = rec;
++	mt76_record_attach(rec);
++	pr_info("mt76: recording (mode %d, %zu KiB) into debugfs mt76_record/\n",
++		record, size / 1024);
++
++	return 0;
++}
++module_init(mt76_record_init);
++
++static void __exit mt76_record_exit(void)
++{
++	struct mt76_record *rec = mt76_record_global;
++
++	if (!rec)
++		return;
++
++	mt76_record_detach(rec);
++	debugfs_remove_recursive(rec->dir);
++	mt76_record_free(rec);
++}
++module_exit(mt76_record_exit);
++
++#endif /* CONFIG_MT76_RECORD */
+diff --git a/record.h b/record.h
+new file mode 100644
+index 00000000..9a240240
+--- /dev/null
++++ b/record.h
+@@ -0,0 +1,311 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * milkflint tools: a recorder of what the hardware and its firmware tell
++ * the driver, for replaying it in the KUnit tests (tests/replay.h).
++ *
++ * Built only when asked for (MT76_RECORD=1 in the build's environment,
++ * which defines CONFIG_MT76_RECORD; milkflint's KUnit build always has it).
++ * Otherwise every hook below is an empty inline and the driver is the same
++ * as without this file.
++ *
++ * With mt76.record=1 (or 2) at module load, it records from then on, for
++ * every mt76 device, into one buffer of mt76.record_kb KiB:
++ * - register accesses through the MMIO bus ops: address (the offset in
++ *   the device's register window, after the driver's own remapping, as the
++ *   reg_rr/reg_wr tracepoints show it) and value; read-modify-writes with
++ *   the value read and the one written;
++ * - firmware commands: command id, payload, the raw reply (header
++ *   included) and what the driver's parser made of it;
++ * - rx events that aren't data frames: tx-free, TXS, rx vectors, firmware
++ *   events;
++ * - the EEPROM once the device registers, and each channel change.
++ * Mode 1 stops once bring-up is over; mode 2 goes on for mt76.record_secs
++ * seconds more. Bring-up is over mt76.record_settle seconds after the last
++ * channel change, or when user space says so; recording also stops when
++ * the buffer is full. It's all in debugfs: mt76_record/data (the
++ * recording, format below) and mt76_record/control (state; write "up",
++ * "stop" or "mark <text>").
++ *
++ * Not recorded: the DMA ring registers (dma.c reads and writes them
++ * directly, not through the bus ops), data frames, and firmware download
++ * chunks beyond their length.
++ *
++ * The format (all little endian): struct mt76_rec_file_hdr, then records,
++ * each a struct mt76_rec_hdr and its body, padded to 4 bytes. wifi/record.py
++ * in the milkflint repo decodes it.
++ */
++#ifndef __MT76_RECORD_H
++#define __MT76_RECORD_H
++
++#include <linux/types.h>
++
++#define MT76_REC_MAGIC		"MT76REC1"
++#define MT76_REC_VERSION	1
++
++struct mt76_rec_file_hdr {
++	char magic[8];
++	__le32 version;
++	__le32 hdr_len;		/* sizeof(this), where the records start */
++	__le32 data_len;	/* bytes of records */
++	__le32 flags;		/* MT76_REC_F_* */
++	__le32 mode;		/* mt76.record */
++	__le32 records;
++	__le32 dropped;		/* records that didn't fit */
++	__le32 rsv;
++	__le64 start_ns;	/* local_clock() (dmesg's clock) at ts 0 */
++} __packed;
++
++#define MT76_REC_F_FULL		BIT(0)	/* stopped because the buffer filled */
++#define MT76_REC_F_STOPPED	BIT(1)
++#define MT76_REC_F_UP		BIT(2)	/* bring-up was over */
++#define MT76_REC_F_UP_AUTO	BIT(3)	/* ... by the settle rule */
++#define MT76_REC_F_SCRUBBED	BIT(31)	/* set by wifi/record.py scrub */
++
++struct mt76_rec_hdr {
++	u8 type;		/* MT76_REC_* */
++	u8 dev;			/* low nibble: device slot; high: MT76_REC_SPACE_* */
++	__le16 len;		/* of the body */
++	__le32 ts;		/* microseconds since the recording started */
++} __packed;
++
++enum mt76_rec_type {
++	MT76_REC_DEV = 1,	/* a device's first record: its name (string) */
++	MT76_REC_RR,		/* __le32 addr, val */
++	MT76_REC_WR,		/* __le32 addr, val */
++	MT76_REC_RMW,		/* __le32 addr, mask, old, new */
++	MT76_REC_RD_COPY,	/* __le32 addr, then the data read */
++	MT76_REC_WR_COPY,	/* __le32 addr, then the data written */
++	MT76_REC_MCU_CMD,	/* struct mt76_rec_mcu, then the payload */
++	MT76_REC_MCU_RESP,	/* struct mt76_rec_mcu, then the raw reply */
++	MT76_REC_MCU_RET,	/* struct mt76_rec_mcu (len: the parser's result) */
++	MT76_REC_RX,		/* struct mt76_rec_rx, then the event */
++	MT76_REC_MARK,		/* a note (string) */
++	MT76_REC_BLOB,		/* char name[16], then the data */
++};
++
++/* register spaces: the device's own window, or one of the SoC's */
++enum {
++	MT76_REC_SPACE_BUS,
++	MT76_REC_SPACE_SOC_TOP,		/* MT798x top misc (mt7915 dev->sku) */
++	MT76_REC_SPACE_SOC_INFRA,	/* MT798x infracfg (mt7915 dev->dcm) */
++};
++
++struct mt76_rec_mcu {
++	__le32 cmd;
++	u8 seq;			/* 0 in MCU_CMD: it isn't known yet */
++	u8 flags;		/* MT76_REC_MCU_* */
++	__le16 rsv;
++	__le32 len;		/* payload/reply length (RET: the result) */
++} __packed;
++
++#define MT76_REC_MCU_WAIT	BIT(0)	/* CMD: the driver waits for a reply */
++#define MT76_REC_MCU_CUT	BIT(1)	/* only the first bytes are recorded */
++#define MT76_REC_MCU_TIMEOUT	BIT(2)	/* RESP: none came */
++
++struct mt76_rec_rx {
++	u8 q;			/* enum mt76_rxq_id, or MT76_REC_RX_CHECK */
++	u8 flags;		/* MT76_REC_MCU_CUT */
++	__le16 rsv;
++	__le32 len;
++} __packed;
++
++#define MT76_REC_RX_CHECK	0xff	/* the rx_check path (WED) */
++
++struct mt76_dev;
++struct mt76_phy;
++struct mt76_record;
++struct sk_buff;
++
++#if IS_ENABLED(CONFIG_MT76_RECORD)
++
++/* the recorder in use, if any */
++extern struct mt76_record *mt76_rec;
++
++struct mt76_record *mt76_record_alloc(size_t size, int mode);
++void mt76_record_free(struct mt76_record *rec);
++void mt76_record_attach(struct mt76_record *rec);
++void mt76_record_detach(struct mt76_record *rec);
++/* the recording so far (header included) in a fresh buffer: kvfree() it */
++void *mt76_record_copy(struct mt76_record *rec, size_t *len);
++void mt76_record_bringup_done(struct mt76_record *rec, bool automatic);
++void mt76_record_stop(struct mt76_record *rec);
++
++void __mt76_record_reg(struct mt76_dev *dev, u8 type, u8 space, u32 addr,
++		       const u32 *val, int n);
++void __mt76_record_copy(struct mt76_dev *dev, u8 type, u32 addr,
++			const void *data, int len);
++void __mt76_record_mcu(struct mt76_dev *dev, u8 type, int cmd, int seq,
++		       u8 flags, const void *data, int len);
++void __mt76_record_rx(struct mt76_dev *dev, u8 q, const void *data, int len);
++void __mt76_record_blob(struct mt76_dev *dev, const char *name,
++			const void *data, int len);
++void __mt76_record_mark(struct mt76_dev *dev, const char *fmt, ...)
++	__printf(2, 3);
++void __mt76_record_fw_download(struct mt76_dev *dev, int cmd, int len,
++			       bool start);
++void __mt76_record_channel(struct mt76_phy *phy);
++void __mt76_record_registered(struct mt76_dev *dev);
++void __mt76_record_dev_gone(struct mt76_dev *dev);
++
++#define __mt76_rec_on()	unlikely(READ_ONCE(mt76_rec))
++
++static inline void mt76_record_rr(struct mt76_dev *dev, u32 addr, u32 val)
++{
++	if (__mt76_rec_on())
++		__mt76_record_reg(dev, MT76_REC_RR, MT76_REC_SPACE_BUS, addr,
++				  &val, 1);
++}
++
++static inline void mt76_record_wr(struct mt76_dev *dev, u32 addr, u32 val)
++{
++	if (__mt76_rec_on())
++		__mt76_record_reg(dev, MT76_REC_WR, MT76_REC_SPACE_BUS, addr,
++				  &val, 1);
++}
++
++static inline void mt76_record_rmw(struct mt76_dev *dev, u32 addr, u32 mask,
++				   u32 old, u32 val)
++{
++	if (__mt76_rec_on()) {
++		u32 v[3] = { mask, old, val };
++
++		__mt76_record_reg(dev, MT76_REC_RMW, MT76_REC_SPACE_BUS, addr,
++				  v, 3);
++	}
++}
++
++/* an access to one of the SoC's own register windows */
++static inline void mt76_record_soc_rmw(struct mt76_dev *dev, u8 space,
++				       u32 addr, u32 mask, u32 old, u32 val)
++{
++	if (__mt76_rec_on()) {
++		u32 v[3] = { mask, old, val };
++
++		__mt76_record_reg(dev, MT76_REC_RMW, space, addr, v, 3);
++	}
++}
++
++static inline void mt76_record_soc_rr(struct mt76_dev *dev, u8 space,
++				      u32 addr, u32 val)
++{
++	if (__mt76_rec_on())
++		__mt76_record_reg(dev, MT76_REC_RR, space, addr, &val, 1);
++}
++
++static inline void mt76_record_read_copy(struct mt76_dev *dev, u32 addr,
++					 const void *data, int len)
++{
++	if (__mt76_rec_on())
++		__mt76_record_copy(dev, MT76_REC_RD_COPY, addr, data, len);
++}
++
++static inline void mt76_record_write_copy(struct mt76_dev *dev, u32 addr,
++					  const void *data, int len)
++{
++	if (__mt76_rec_on())
++		__mt76_record_copy(dev, MT76_REC_WR_COPY, addr, data, len);
++}
++
++static inline void mt76_record_mcu_cmd(struct mt76_dev *dev, int cmd,
++				       const void *data, int len, bool wait)
++{
++	if (__mt76_rec_on())
++		__mt76_record_mcu(dev, MT76_REC_MCU_CMD, cmd, 0,
++				  wait ? MT76_REC_MCU_WAIT : 0, data, len);
++}
++
++void __mt76_record_mcu_resp(struct mt76_dev *dev, int cmd, int seq,
++			    const struct sk_buff *skb);
++
++static inline void mt76_record_mcu_resp(struct mt76_dev *dev, int cmd,
++					int seq, const struct sk_buff *skb)
++{
++	if (__mt76_rec_on())
++		__mt76_record_mcu_resp(dev, cmd, seq, skb);
++}
++
++static inline void mt76_record_mcu_ret(struct mt76_dev *dev, int cmd,
++				       int seq, int ret)
++{
++	if (__mt76_rec_on())
++		__mt76_record_mcu(dev, MT76_REC_MCU_RET, cmd, seq, 0, NULL,
++				  ret);
++}
++
++/* firmware download chunks between start and !start: only their length */
++static inline void mt76_record_fw_download(struct mt76_dev *dev, int cmd,
++					   int len, bool start)
++{
++	if (__mt76_rec_on())
++		__mt76_record_fw_download(dev, cmd, len, start);
++}
++
++static inline void mt76_record_rx(struct mt76_dev *dev, u8 q,
++				  const void *data, int len)
++{
++	if (__mt76_rec_on())
++		__mt76_record_rx(dev, q, data, len);
++}
++
++/* the condition is here so that it's gone, with the hook, from builds
++ * without the recorder (an empty if before a switch still changes how
++ * the compiler lays out the switch)
++ */
++static inline void mt76_record_rx_if(struct mt76_dev *dev, bool cond, u8 q,
++				     const void *data, int len)
++{
++	if (cond && __mt76_rec_on())
++		__mt76_record_rx(dev, q, data, len);
++}
++
++static inline void mt76_record_channel(struct mt76_phy *phy)
++{
++	if (__mt76_rec_on())
++		__mt76_record_channel(phy);
++}
++
++static inline void mt76_record_registered(struct mt76_dev *dev)
++{
++	if (__mt76_rec_on())
++		__mt76_record_registered(dev);
++}
++
++static inline void mt76_record_dev_gone(struct mt76_dev *dev)
++{
++	if (__mt76_rec_on())
++		__mt76_record_dev_gone(dev);
++}
++
++#else
++
++static inline void mt76_record_rr(struct mt76_dev *dev, u32 addr, u32 val) {}
++static inline void mt76_record_wr(struct mt76_dev *dev, u32 addr, u32 val) {}
++static inline void mt76_record_rmw(struct mt76_dev *dev, u32 addr, u32 mask,
++				   u32 old, u32 val) {}
++static inline void mt76_record_soc_rmw(struct mt76_dev *dev, u8 space,
++				       u32 addr, u32 mask, u32 old, u32 val) {}
++static inline void mt76_record_soc_rr(struct mt76_dev *dev, u8 space,
++				      u32 addr, u32 val) {}
++static inline void mt76_record_read_copy(struct mt76_dev *dev, u32 addr,
++					 const void *data, int len) {}
++static inline void mt76_record_write_copy(struct mt76_dev *dev, u32 addr,
++					  const void *data, int len) {}
++static inline void mt76_record_mcu_cmd(struct mt76_dev *dev, int cmd,
++				       const void *data, int len, bool wait) {}
++static inline void mt76_record_mcu_resp(struct mt76_dev *dev, int cmd,
++					int seq, const struct sk_buff *skb) {}
++static inline void mt76_record_mcu_ret(struct mt76_dev *dev, int cmd,
++				       int seq, int ret) {}
++static inline void mt76_record_fw_download(struct mt76_dev *dev, int cmd,
++					   int len, bool start) {}
++static inline void mt76_record_rx(struct mt76_dev *dev, u8 q,
++				  const void *data, int len) {}
++static inline void mt76_record_rx_if(struct mt76_dev *dev, bool cond, u8 q,
++				     const void *data, int len) {}
++static inline void mt76_record_channel(struct mt76_phy *phy) {}
++static inline void mt76_record_registered(struct mt76_dev *dev) {}
++static inline void mt76_record_dev_gone(struct mt76_dev *dev) {}
++
++#endif
++
++#endif

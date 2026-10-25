@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:27:47 +0100
+Subject: [PATCH] wifi: mt76: mt7915: clear recovery state before accepting new
+ events
+
+The full reset cleared hw_full_reset, which makes mt7915_reset() act on
+firmware events again, before recovery.state and recovery.restart were
+reset in mt7915_mac_reset_work(). An event in that window was then
+overwritten, leaving MT76_MCU_RESET set with no recovery queued, and
+all MCU commands failing from then on.
+
+Reset state and restart first. Also make the recovery flags plain bools:
+the irq tasklet and process context update them without a common lock,
+and as bitfields in one byte an update could be lost.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c    | 9 ++++++---
+ mt7915/mt7915.h | 9 ++++++---
+ 2 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 1c7a36df..c5b37ee5 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1518,6 +1518,12 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ 	dev->mt76.global_wcid.idx = i;
+ 	/* mt76_reset_device() unpublished it */
+ 	rcu_assign_pointer(dev->mt76.wcid[i], &dev->mt76.global_wcid);
++
++	/* everything signalled so far is handled by this reset, so clear it
++	 * before mt7915_reset() starts acting on new events again
++	 */
++	dev->recovery.state = MT_MCU_CMD_NORMAL_STATE;
++	dev->recovery.restart = false;
+ 	dev->recovery.hw_full_reset = false;
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+@@ -1562,9 +1568,6 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 
+ 		/* enable WA/WM WDT */
+ 		mt76_set(dev, MT_WFDMA0_MCU_HOST_INT_ENA, MT_MCU_CMD_WDT_MASK);
+-
+-		dev->recovery.state = MT_MCU_CMD_NORMAL_STATE;
+-		dev->recovery.restart = false;
+ 		return;
+ 	}
+ 
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 7ee9bed8..4bc692bf 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -288,9 +288,12 @@ struct mt7915_dev {
+ 		u32 state;
+ 		u32 wa_reset_count;
+ 		u32 wm_reset_count;
+-		bool hw_full_reset:1;
+-		bool hw_init_done:1;
+-		bool restart:1;
++		/* not bitfields: written from the irq tasklet and from
++		 * process context without a common lock
++		 */
++		bool hw_full_reset;
++		bool hw_init_done;
++		bool restart;
+ 	} recovery;
+ 
+ 	/* protects coredump data */

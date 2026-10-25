@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 18:47:04 +0100
+Subject: [PATCH] wifi: mt76: mt7915: escalate an L1 SER stuck after RESET_DONE
+
+An L1 SER that never reached RESET_DONE already hands over to the full
+recovery. The two steps after it didn't: when the firmware had reset
+its side and the driver its rings, but RECOVERY_DONE or NORMAL_STATE
+never came, mt7915_mac_reset_work() waited 30 s for each with the
+driver mutex held (hostapd hangs meanwhile), then started DMA and woke
+the queues on firmware stuck part way through its own recovery.
+
+Hand over to the full recovery at whichever step times out, as for
+RESET_DONE. A firmware crash during a wait still leaves the full
+recovery to the dump work.
+
+The handshake timeout is a variable now, so the KUnit tests can wait
+it out: mt7915_test_reset_work_no_reset_done, _no_recovery_done and
+_no_normal_state. Without the fix the last two fail.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 48 +++++++++++++++-------------
+ mt7915/tests/mac-test.c | 69 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 21 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index a097b919..63f3363a 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1303,6 +1303,11 @@ mt7915_reset_aborted(struct mt7915_dev *dev)
+ 	return READ_ONCE(dev->recovery.state) & MT_MCU_CMD_WDT_MASK;
+ }
+ 
++/* how long each SER handshake step may take; a variable so the unit tests
++ * can wait out a step that never comes
++ */
++static unsigned long mt7915_reset_timeout = MT7915_RESET_TIMEOUT;
++
+ static bool
+ mt7915_wait_reset_state(struct mt7915_dev *dev, u32 state)
+ {
+@@ -1311,7 +1316,7 @@ mt7915_wait_reset_state(struct mt7915_dev *dev, u32 state)
+ 	ret = wait_event_timeout(dev->reset_wait,
+ 				 (READ_ONCE(dev->recovery.state) &
+ 				  (state | MT_MCU_CMD_WDT_MASK)),
+-				 MT7915_RESET_TIMEOUT);
++				 READ_ONCE(mt7915_reset_timeout));
+ 
+ 	if (mt7915_reset_aborted(dev))
+ 		return false;
+@@ -1678,30 +1683,25 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 
+ 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
+ 
+-	if (mt7915_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE)) {
+-		mt7915_dma_reset(dev, false);
++	/* A step that doesn't come hands over to the full recovery: without
++	 * RESET_DONE the rings were not reset and the tokens not reclaimed,
++	 * and without RECOVERY_DONE or NORMAL_STATE the firmware is stuck part
++	 * way through its own recovery. Don't resume on top of either.
++	 */
++	if (!mt7915_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE))
++		goto out_failed;
+ 
+-		mt7915_mac_reset_tokens(dev);
++	mt7915_dma_reset(dev, false);
+ 
+-		mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+-		mt7915_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
+-	} else if (!mt7915_reset_aborted(dev)) {
+-		/* No RESET_DONE: the rings were not reset and the tokens not
+-		 * reclaimed, don't resume on top of them.
+-		 */
+-		dev->recovery.restart = true;
+-		queue_work(dev->mt76.wq, &dev->reset_work);
+-		goto out_aborted;
+-	}
++	mt7915_mac_reset_tokens(dev);
+ 
+-	if (mt7915_reset_aborted(dev))
+-		goto out_aborted;
++	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
++	if (!mt7915_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE))
++		goto out_failed;
+ 
+ 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+-	mt7915_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
+-
+-	if (mt7915_reset_aborted(dev))
+-		goto out_aborted;
++	if (!mt7915_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE))
++		goto out_failed;
+ 
+ 	/* enable DMA Tx/Rx and interrupt */
+ 	mt7915_dma_start(dev, false, false);
+@@ -1746,7 +1746,13 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 					     MT7915_WATCHDOG_TIME);
+ 	return;
+ 
+-out_aborted:
++out_failed:
++	/* after a firmware crash the dump work queues the full reset */
++	if (!mt7915_reset_aborted(dev)) {
++		dev->recovery.restart = true;
++		queue_work(dev->mt76.wq, &dev->reset_work);
++	}
++
+ 	/* The full reset runs next on this ordered workqueue and expects
+ 	 * napi and the tx worker enabled, so only undo their disabling.
+ 	 * MT76_RESET, MT76_MCU_RESET and the stopped mac80211 queues stay
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 7bb74220..356e932d 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -4984,6 +4984,72 @@ static void mt7915_test_reset_work_ser(struct kunit *test)
+ 	kfree_skb(skb);
+ }
+ 
++static void mt7915_test_reset_timeout_restore(void *data)
++{
++	WRITE_ONCE(mt7915_reset_timeout, MT7915_RESET_TIMEOUT);
++}
++
++/* An L1 SER the firmware never finishes: @state has the handshake steps it
++ * reaches, @event is what the driver last told it, @rx_cleanups whether the
++ * rings were reset. The step that doesn't come is waited out once (50 ms
++ * here, 30 s on a router), then the full recovery is queued to take over:
++ * DMA isn't started on the half-recovered firmware, NAPI and the tx worker
++ * are enabled for the full reset, the reset flags and stopped queues are
++ * left to it and the watchdog isn't re-armed.
++ */
++static void mt7915_test_reset_work_stuck(struct kunit *test, u32 state,
++					 u32 event, int rx_cleanups)
++{
++	struct mt7915_test_env *env = mt7915_test_hw_env(test);
++	struct mt7915_dev *dev = env->dev;
++
++	mt7915_test_rings(test, dev);
++	mt7915_test_block_wq(test, dev);
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_test_reset_timeout_restore, NULL), 0);
++	WRITE_ONCE(mt7915_reset_timeout, HZ / 20);
++	dev->recovery.state = MT_MCU_CMD_STOP_DMA | state;
++
++	mt7915_mac_reset_work(&dev->reset_work);
++
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_MCU_INT_EVENT), event);
++	KUNIT_EXPECT_EQ(test, mt7915_test_rx_cleanups, rx_cleanups);
++	KUNIT_EXPECT_TRUE(test, dev->recovery.restart);
++	KUNIT_EXPECT_TRUE(test, work_pending(&dev->reset_work));
++	KUNIT_EXPECT_FALSE(test, mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
++			   MT_WFDMA0_GLO_CFG_TX_DMA_EN);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_RESET, &dev->mphy.state));
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_MCU_RESET, &dev->mphy.state));
++	KUNIT_EXPECT_TRUE(test, ieee80211_queue_stopped(dev->mt76.hw, 0));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_napi_enabled(&dev->mt76.tx_napi));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_napi_enabled(
++			  &dev->mt76.napi[MT_RXQ_MAIN]));
++	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
++	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dev->mphy.mac_work));
++}
++
++/* No RESET_DONE: the rings are left as they are */
++static void mt7915_test_reset_work_no_reset_done(struct kunit *test)
++{
++	mt7915_test_reset_work_stuck(test, 0, MT_MCU_INT_EVENT_DMA_STOPPED, 0);
++}
++
++/* No RECOVERY_DONE after the rings were reset: RESET_DONE isn't sent */
++static void mt7915_test_reset_work_no_recovery_done(struct kunit *test)
++{
++	mt7915_test_reset_work_stuck(test, MT_MCU_CMD_RESET_DONE,
++				     MT_MCU_INT_EVENT_DMA_INIT, 1);
++}
++
++/* No NORMAL_STATE after RESET_DONE was sent */
++static void mt7915_test_reset_work_no_normal_state(struct kunit *test)
++{
++	mt7915_test_reset_work_stuck(test, MT_MCU_CMD_RESET_DONE |
++				     MT_MCU_CMD_RECOVERY_DONE,
++				     MT_MCU_INT_EVENT_RESET_DONE, 1);
++}
++
+ /* A firmware crash: full recovery. The MCU watchdog interrupts are off
+  * while the chip restarts (here every attempt fails, the firmware can't
+  * be loaded), then everything the firmware knew is forgotten: interfaces'
+@@ -5194,6 +5260,9 @@ static struct kunit_suite mt7915_mac_reset_test_suite = {
+ static struct kunit_case mt7915_mac_hw_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_mac_work),
+ 	KUNIT_CASE(mt7915_test_reset_work_ser),
++	KUNIT_CASE(mt7915_test_reset_work_no_reset_done),
++	KUNIT_CASE(mt7915_test_reset_work_no_recovery_done),
++	KUNIT_CASE(mt7915_test_reset_work_no_normal_state),
+ 	KUNIT_CASE(mt7915_test_full_reset),
+ 	{}
+ };

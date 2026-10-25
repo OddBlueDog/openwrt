@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:32:10 +0100
+Subject: [PATCH] wifi: mt76: keep txqs scheduled while a reset or off-channel
+ time skips them
+
+mt76_txq_schedule_list() skipped a txq whose phy was resetting or off
+channel without returning it to mac80211. ieee80211_next_txq() had
+already taken it off the active list, and mac80211 only schedules it
+again when a new frame is queued for it or when a dequeue meets a
+stopped queue, which never happens here since nothing is dequeued.
+
+So frames already queued for a station when an L1 or full reset began
+(mt7915_mac_restart() schedules all txqs with MT76_RESET set; the L1
+path sets it before disabling the tx worker), or while the phy was
+scanning off channel, waited for the next frame of the same TID: up to
+TCP's retransmit timeout, or for good for the last packets of a flow.
+
+Return the txq before skipping it. ieee80211_next_txq()'s schedule
+round keeps the same pass from seeing it again.
+
+The skips for a missing wcid or one now on the other hw are left as
+they are: those stations are being removed.
+
+No unit test: this path needs mac80211's own txqs, which the fakes
+don't provide (as for 0067).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tx.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/tx.c b/tx.c
+index 4b57b07b..ed962397 100644
+--- a/tx.c
++++ b/tx.c
+@@ -649,8 +649,17 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
+ 		if (phy->hw != hw)
+ 			continue;
+ 
+-		if (test_bit(MT76_RESET, &phy->state) || phy->offchannel)
++		/*
++		 * ieee80211_next_txq() took the txq off the active list, and
++		 * mac80211 only puts it back when a new frame is queued for it
++		 * (or a dequeue hit a stopped queue). Return it, or what's
++		 * queued now waits for the next frame after the reset or the
++		 * off-channel time, which may never come.
++		 */
++		if (test_bit(MT76_RESET, &phy->state) || phy->offchannel) {
++			ieee80211_return_txq(phy->hw, txq, false);
+ 			continue;
++		}
+ 
+ 		q = phy->q_tx[qid];
+ 

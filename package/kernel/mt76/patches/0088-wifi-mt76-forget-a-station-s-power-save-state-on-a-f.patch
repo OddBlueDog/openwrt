@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:21:22 +0100
+Subject: [PATCH] wifi: mt76: forget a station's power save state on a full
+ reset
+
+With MT_DRV_HW_PS_BUFFERING (mt7915, mt7996) MT_WCID_FLAG_PS follows the
+firmware's PS sync events, and while it's set mt76_txq_send_burst() gives
+the firmware one frame per AC, only once the station has no airtime
+pending. mt76_reset_device() left the flag as it was, and mac80211's
+restart re-adds the same station with the same wcid. The restarted
+firmware has every station awake and reports only changes, so a station
+that was dozing at the reset stayed limited to one frame in flight after
+it woke, until it dozed and woke again; one that then stays awake stays
+slow. Clear the flag there for those drivers. Where mac80211 tracks power
+save itself, its state survives the restart and the flag is left alone.
+
+Stock OpenWrt's mt76 predates PS sync handling, so it never had this.
+Only a full reset (firmware crash recovery) reaches it.
+
+mt76_test_reset_device_hw_ps checks the flag is cleared (and that other
+wcid flags are left for the driver); mt76_test_reset_device now checks a
+driver without firmware power save keeps it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c        |  7 +++++++
+ tests/core-test.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 47 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index cd916d5b..57c95308 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -858,6 +858,13 @@ void mt76_reset_device(struct mt76_dev *dev)
+ 			continue;
+ 
+ 		wcid->sta = 0;
++		/*
++		 * The restarted firmware has every station awake and reports
++		 * only changes, so a station dozing now would stay limited to
++		 * one frame in flight once mac80211 re-adds it.
++		 */
++		if (dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING)
++			clear_bit(MT_WCID_FLAG_PS, &wcid->flags);
+ 		rcu_assign_pointer(dev->wcid[i], NULL);
+ 		mt76_wcid_cleanup(dev, wcid);
+ 	}
+diff --git a/tests/core-test.c b/tests/core-test.c
+index df09423c..df0cad07 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -165,6 +165,13 @@ static const struct mt76_driver_ops mt76_test_airtime_ops = {
+ 	.sta_add = mt76_test_drv_sta_add,
+ };
+ 
++/* a driver whose firmware tracks power save (mt7915, mt7996) */
++static const struct mt76_driver_ops mt76_test_hw_ps_ops = {
++	.drv_flags = MT_DRV_HW_PS_BUFFERING,
++	.set_channel = mt76_test_set_channel,
++	.sta_add = mt76_test_drv_sta_add,
++};
++
+ /* a driver whose firmware builds A-MSDUs */
+ static const struct mt76_driver_ops mt76_test_offload_ops = {
+ 	.drv_flags = MT_DRV_AMSDU_OFFLOAD,
+@@ -3199,6 +3206,8 @@ static void mt76_test_reset_device(struct kunit *test)
+ 	b->idx = 300;
+ 	a->sta = 1;
+ 	b->sta = 1;
++	/* mac80211 tracks power save here, and keeps it over the restart */
++	set_bit(MT_WCID_FLAG_PS, &a->flags);
+ 	rcu_assign_pointer(dev->wcid[3], a);
+ 	rcu_assign_pointer(dev->wcid[300], b);
+ 	mt76_wcid_mask_set(dev->wcid_mask, 3);
+@@ -3229,6 +3238,7 @@ static void mt76_test_reset_device(struct kunit *test)
+ 	KUNIT_EXPECT_NULL(test, dev->phy.chanctx);
+ 	KUNIT_EXPECT_EQ(test, band1->num_sta, 0);
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&band1->tx_list));
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &a->flags));
+ 
+ 	/* the station comes back: polling it doesn't trip over stale links */
+ 	a->sta = 1;
+@@ -3237,6 +3247,35 @@ static void mt76_test_reset_device(struct kunit *test)
+ 	dev->phys[MT_BAND1] = NULL;
+ }
+ 
++/* Where the firmware tracks power save (PS sync events), the firmware a
++ * full reset restarts has every station awake and reports only changes.
++ * A dozing station's PS flag kept over the reset would hold it to one frame
++ * in flight per AC (mt76_txq_send_burst()) after mac80211 re-adds it, until
++ * it dozes and wakes again: a station that stays awake would stay slow.
++ */
++static void mt76_test_reset_device_hw_ps(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_hw_ps_ops);
++	struct mt76_wcid *wcid;
++
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	mt76_wcid_init(wcid, MT_BAND0);
++	wcid->idx = 5;
++	wcid->sta = 1;
++	set_bit(MT_WCID_FLAG_PS, &wcid->flags);
++	set_bit(MT_WCID_FLAG_HDR_TRANS, &wcid->flags);
++	rcu_assign_pointer(dev->wcid[5], wcid);
++	mt76_wcid_mask_set(dev->wcid_mask, 5);
++
++	mt76_reset_device(dev);
++
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(dev->wcid[5]));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	/* the rest is the driver's to set again when it re-adds the station */
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_HDR_TRANS, &wcid->flags));
++}
++
+ /* A key conf with mac80211's ieee80211_key in front of it. That struct is
+  * private to mac80211, so the bytes before the conf are a known pattern
+  * (byte i is i) and the copied PNs show which counter was read.
+@@ -3363,6 +3402,7 @@ static struct kunit_case mt76_core_sta_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_wcid_cleanup),
+ 	KUNIT_CASE(mt76_test_wcid_add_poll),
+ 	KUNIT_CASE(mt76_test_reset_device),
++	KUNIT_CASE(mt76_test_reset_device_hw_ps),
+ 	KUNIT_CASE(mt76_test_wcid_key_setup),
+ 	KUNIT_CASE(mt76_test_offchannel_notify),
+ 	{}

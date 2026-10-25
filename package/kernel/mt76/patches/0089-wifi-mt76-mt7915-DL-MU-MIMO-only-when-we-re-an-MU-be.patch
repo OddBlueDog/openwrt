@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 22:24:49 +0100
+Subject: [PATCH] wifi: mt76: mt7915: DL MU-MIMO only when we're an MU
+ beamformer
+
+mt7915_mcu_sta_muru_tlv() enabled downlink MU-MIMO for a station when
+the interface was an HE or VHT MU beamformer, or a VHT MU beamformee.
+The last one is about receiving MU-MIMO, which an access point never
+does, and hostapd advertises it by default (mu_beamformee), so on 5 GHz
+setting mu_beamformer=0 and he_mu_beamformer=0 still left the firmware's
+MU-RU scheduler free to group every station for DL MU-MIMO. Only our
+beamformer capabilities count now.
+
+The beamformee term came with the capability rework of 655a6c65, next
+to a separate clause for HE stations; in station mode every capability
+bit is set (c50be0b5), so nothing changes there.
+
+mt7915_test_sta_muru expected the old behaviour; it now checks a VHT MU
+beamformee alone leaves DL MU-MIMO off (24/25 without the fix).
+
+Found while adding MilkFlint's MU-MIMO switch, which until now also had
+to clear mu_beamformee.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c            | 7 +++++--
+ mt7915/tests/mcu-test.c | 6 +++++-
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 27261502..68711660 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -959,9 +959,12 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 
+ 	muru = (struct sta_rec_muru *)tlv;
+ 
++	/* we send DL MU-MIMO, so it takes our MU beamformer capability; our
++	 * VHT MU beamformee bit (hostapd's mu_beamformee, on by default) is
++	 * about receiving it and doesn't count
++	 */
+ 	muru->cfg.mimo_dl_en = mvif->cap.he_mu_ebfer ||
+-			       mvif->cap.vht_mu_ebfer ||
+-			       mvif->cap.vht_mu_ebfee;
++			       mvif->cap.vht_mu_ebfer;
+ 	if (!is_mt7915(&dev->mt76))
+ 		muru->cfg.mimo_ul_en = true;
+ 	muru->cfg.ofdma_dl_en = true;
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 8c7a5f30..a6b644f2 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -2802,11 +2802,15 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	muru = mt7915_test_muru_tlv(test, &c);
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_dl_en);
++	/* being an MU beamformee ourselves doesn't: an AP advertises that by
++	 * default, and it left MU-MIMO on with mu_beamformer=0 and
++	 * he_mu_beamformer=0
++	 */
+ 	c.mvif->cap.vht_mu_ebfer = false;
+ 	c.mvif->cap.vht_mu_ebfee = true;
+ 	muru = mt7915_test_muru_tlv(test, &c);
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+-	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_dl_en);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.mimo_dl_en);
+ 
+ 	/* a VHT MU beamformee */
+ 	mt7915_test_vht(c.sta);

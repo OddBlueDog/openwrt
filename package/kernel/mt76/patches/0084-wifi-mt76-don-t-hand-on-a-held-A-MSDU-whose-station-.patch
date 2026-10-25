@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 09:05:34 +0100
+Subject: [PATCH] wifi: mt76: don't hand on a held A-MSDU whose station is gone
+
+An A-MSDU's subframes are held in phy->rx_amsdu[q] until its last one
+or the next frame on the queue, which can be a later NAPI poll. The
+head keeps status->wcid, a station pointer taken under the earlier
+poll's RCU read section. If the station was removed in between (its own
+deauth usually flushes the head first, but not always), releasing the
+A-MSDU went on to mt76_check_sta() with freed memory. And nothing freed
+a held head when the rx queue was reset or torn down.
+
+Note the head's wcid index, and drop the A-MSDU at release if that
+index no longer holds its station. Free held A-MSDUs in
+mt76_dma_rx_cleanup() (reset and teardown).
+
+mt76_test_rx_amsdu_stale checks both; mt76_test_rx_poll_complete now
+publishes its station, as drivers' rx paths only give published ones.
+
+Reported as a suggestion by another review; checked in the code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dma.c             |  3 +++
+ mac80211.c        | 31 +++++++++++++++++++++++++
+ mt76.h            |  2 ++
+ tests/core-test.c | 58 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 94 insertions(+)
+
+diff --git a/dma.c b/dma.c
+index dc8f872e..a2266245 100644
+--- a/dma.c
++++ b/dma.c
+@@ -928,6 +928,9 @@ mt76_dma_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ 	}
+ 
+ 	spin_unlock_bh(&q->lock);
++
++	/* and an A-MSDU it was assembling (a reset or teardown) */
++	mt76_rx_amsdu_flush(dev, q - dev->q_rx);
+ }
+ 
+ static void
+diff --git a/mac80211.c b/mac80211.c
+index 1ffb7e59..cd916d5b 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -901,6 +901,18 @@ static void mt76_rx_release_amsdu(struct mt76_phy *phy, enum mt76_rxq_id q)
+ 	phy->rx_amsdu[q].head = NULL;
+ 	phy->rx_amsdu[q].tail = NULL;
+ 
++	/*
++	 * The A-MSDU may have waited for its next frame since an earlier
++	 * poll, outside any RCU read section: if its station was removed
++	 * meanwhile, status->wcid points to freed memory.
++	 */
++	if (status->wcid &&
++	    rcu_access_pointer(dev->wcid[phy->rx_amsdu[q].wcid_idx]) !=
++	    status->wcid) {
++		dev_kfree_skb(skb);
++		return;
++	}
++
+ 	/*
+ 	 * Validate if the amsdu has a proper first subframe.
+ 	 * A single MSDU can be parsed as A-MSDU when the unauthenticated A-MSDU
+@@ -948,6 +960,7 @@ static void mt76_rx_release_burst(struct mt76_phy *phy, enum mt76_rxq_id q,
+ 	if (!phy->rx_amsdu[q].head) {
+ 		phy->rx_amsdu[q].tail = &skb_shinfo(skb)->frag_list;
+ 		phy->rx_amsdu[q].seqno = status->seqno;
++		phy->rx_amsdu[q].wcid_idx = status->wcid ? status->wcid->idx : 0;
+ 		phy->rx_amsdu[q].head = skb;
+ 	} else {
+ 		*phy->rx_amsdu[q].tail = skb;
+@@ -958,6 +971,24 @@ static void mt76_rx_release_burst(struct mt76_phy *phy, enum mt76_rxq_id q,
+ 		mt76_rx_release_amsdu(phy, q);
+ }
+ 
++/* Free the A-MSDUs queue @q was assembling, on every phy (NAPI is off). */
++void mt76_rx_amsdu_flush(struct mt76_dev *dev, enum mt76_rxq_id q)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
++		struct mt76_phy *phy = dev->phys[i];
++
++		if (!phy || !phy->rx_amsdu[q].head)
++			continue;
++
++		dev_kfree_skb(phy->rx_amsdu[q].head);
++		phy->rx_amsdu[q].head = NULL;
++		phy->rx_amsdu[q].tail = NULL;
++	}
++}
++EXPORT_SYMBOL_GPL(mt76_rx_amsdu_flush);
++
+ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+diff --git a/mt76.h b/mt76.h
+index 8cfe0019..298d9a04 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -930,6 +930,7 @@ struct mt76_phy {
+ 		struct sk_buff *head;
+ 		struct sk_buff **tail;
+ 		u16 seqno;
++		u16 wcid_idx;	/* the head's station, to check it's still there */
+ 	} rx_amsdu[__MT_RXQ_MAX];
+ 
+ 	struct mt76_freq_range_power *frp;
+@@ -1555,6 +1556,7 @@ static inline bool mt76_is_testmode_skb(struct mt76_dev *dev,
+ }
+ 
+ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb);
++void mt76_rx_amsdu_flush(struct mt76_dev *dev, enum mt76_rxq_id q);
+ void mt76_tx(struct mt76_phy *dev, struct ieee80211_sta *sta,
+ 	     struct mt76_wcid *wcid, struct sk_buff *skb);
+ void mt76_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq);
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 00761ebc..df09423c 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -2046,6 +2046,60 @@ static void mt76_test_rx_amsdu_reassembly(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, atomic_read(&mt76_test_nfreed), 3);
+ }
+ 
++/* An A-MSDU held while its station goes away is dropped when it completes,
++ * not handed on with a pointer to the freed station; and an A-MSDU still
++ * held when the queue is torn down or reset is freed.
++ */
++static void mt76_test_rx_amsdu_stale(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct sk_buff_head *rxq = &dev->rx_skb[MT_RXQ_MAIN];
++	struct mt76_phy *phy = &dev->phy;
++	struct mt76_wcid *wcid;
++	struct sk_buff *a, *b;
++
++	set_bit(MT76_STATE_RUNNING, &phy->state);
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	wcid->idx = 7;
++	rcu_assign_pointer(dev->wcid[7], wcid);
++	atomic_set(&mt76_test_nfreed, 0);
++
++	a = mt76_test_amsdu(test, 1, 5, true, false, mt76_hwt_addr);
++	b = mt76_test_amsdu(test, 2, 5, false, true, mt76_hwt_addr);
++	mt76_test_status(a)->wcid = wcid;
++	mt76_test_status(b)->wcid = wcid;
++	mt76_rx(dev, MT_RXQ_MAIN, a);
++	/* the station is removed before the last subframe comes */
++	RCU_INIT_POINTER(dev->wcid[7], NULL);
++	mt76_rx(dev, MT_RXQ_MAIN, b);
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(rxq));
++	KUNIT_EXPECT_NULL(test, phy->rx_amsdu[MT_RXQ_MAIN].head);
++	KUNIT_EXPECT_EQ(test, atomic_read(&mt76_test_nfreed), 2);
++
++	/* still there: handed on */
++	rcu_assign_pointer(dev->wcid[7], wcid);
++	a = mt76_test_amsdu(test, 3, 6, true, false, mt76_hwt_addr);
++	b = mt76_test_amsdu(test, 4, 6, false, true, mt76_hwt_addr);
++	mt76_test_status(a)->wcid = wcid;
++	mt76_test_status(b)->wcid = wcid;
++	mt76_rx(dev, MT_RXQ_MAIN, a);
++	mt76_rx(dev, MT_RXQ_MAIN, b);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(rxq), 1);
++	skb_queue_purge(rxq);
++	RCU_INIT_POINTER(dev->wcid[7], NULL);
++
++	/* held at teardown: freed */
++	atomic_set(&mt76_test_nfreed, 0);
++	mt76_rx(dev, MT_RXQ_MAIN, mt76_test_amsdu(test, 5, 7, true, false,
++						   mt76_hwt_addr));
++	KUNIT_ASSERT_NOT_NULL(test, phy->rx_amsdu[MT_RXQ_MAIN].head);
++	mt76_rx_amsdu_flush(dev, MT_RXQ_MAIN);
++	KUNIT_EXPECT_NULL(test, phy->rx_amsdu[MT_RXQ_MAIN].head);
++	KUNIT_EXPECT_NULL(test, phy->rx_amsdu[MT_RXQ_MAIN].tail);
++	KUNIT_EXPECT_EQ(test, atomic_read(&mt76_test_nfreed), 1);
++}
++
+ /* An A-MSDU ends early when a new one (new sequence number, or a new first
+  * subframe) or a plain frame arrives: what was collected goes first.
+  */
+@@ -2730,6 +2784,9 @@ static void mt76_test_rx_poll_complete(struct kunit *test)
+ 	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, wcid);
+ 	wcid->rx_check_pn = true;
++	/* published, as the stations drivers give the rx path are */
++	wcid->idx = 5;
++	rcu_assign_pointer(dev->wcid[5], wcid);
+ 
+ 	mt76_rx(dev, MT_RXQ_MAIN, mt76_test_rx_skb(test, MT76_TEST_QOS_DATA,
+ 						    mt76_hwt_addr, 1, 8));
+@@ -2785,6 +2842,7 @@ static void mt76_test_rx_poll_complete(struct kunit *test)
+ static struct kunit_case mt76_core_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_rx_needs_running_phy),
+ 	KUNIT_CASE(mt76_test_rx_amsdu_reassembly),
++	KUNIT_CASE(mt76_test_rx_amsdu_stale),
+ 	KUNIT_CASE(mt76_test_rx_amsdu_boundaries),
+ 	KUNIT_CASE(mt76_test_rx_amsdu_bad_first_subframe),
+ 	KUNIT_CASE(mt76_test_rx_rro_v3),

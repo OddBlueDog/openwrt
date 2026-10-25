@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: milkflint <milkflint@localhost>
+Date: Sun, 18 Oct 2026 20:07:09 +0100
+Subject: [PATCH] milkflint compat: pre-d49721c2 action frame layout for
+ OpenWrt 25.12 mac80211
+
+Upstream d49721c2 ("wifi: move action code from per-type frame structs")
+changed struct ieee80211_mgmt; Linux 6.18 headers (OpenWrt 25.12
+backports) still have u.action.u.addba_req.action_code. Keep upstream's
+full-length bounds check, expressed for the old layout. Not for upstream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 8481eac8..5fff968a 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -422,10 +422,10 @@ mt76_connac2_mac_write_txwi_80211(struct mt76_dev *dev, __le32 *txwi,
+ 	u32 val;
+ 
+ 	if (ieee80211_is_action(fc) &&
+-	    skb->len >= IEEE80211_MIN_ACTION_SIZE(addba_req.capab) &&
++	    skb->len >= offsetofend(struct ieee80211_mgmt, u.action.u.addba_req.capab) &&
+ 	    mgmt->u.action.category == WLAN_CATEGORY_BACK &&
+-	    mgmt->u.action.action_code == WLAN_ACTION_ADDBA_REQ) {
+-		u16 capab = le16_to_cpu(mgmt->u.action.addba_req.capab);
++	    mgmt->u.action.u.addba_req.action_code == WLAN_ACTION_ADDBA_REQ) {
++		u16 capab = le16_to_cpu(mgmt->u.action.u.addba_req.capab);
+ 
+ 		txwi[5] |= cpu_to_le32(MT_TXD5_ADD_BA);
+ 		tid = (capab >> 2) & IEEE80211_QOS_CTL_TID_MASK;

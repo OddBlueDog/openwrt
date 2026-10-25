@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 08:53:57 +0100
+Subject: [PATCH] wifi: mt76: park the tx worker while a station is removed
+
+mt76_txq_schedule_pending() takes a station off phy->tx_list and drops
+tx_lock, and mt76_txq_schedule_pending_wcid() drops the station's queue
+lock while it queues each frame. Station removal (mt76_wcid_cleanup())
+found the station already off the list in that window, took the frames
+left and returned, and mac80211 frees the station straight after the
+driver's NONE -> NOTEXIST, with no grace period. The worker then locked
+the station's tx_pending queue, bumped its non-AQL count and could link
+it back on tx_list, all in freed memory. The worker's rcu_read_lock()
+doesn't cover this: it reaches the station through the list, not RCU.
+
+A deauth followed at once by the station's removal (hostapd kicking a
+client) is the usual way in.
+
+Park the tx worker in mt76_sta_remove() around __mt76_sta_remove().
+Not in __mt76_sta_remove() itself: resets call it with the worker
+already parked, and unparking it there would restart it too early.
+dev->mutex orders this with the other places that park it.
+
+mt76_test_sta_remove_parks_worker checks that the worker can't run
+during the removal and runs again after it.
+
+Reported as a suggestion by another review; checked in the code.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c        | 10 +++++++++
+ tests/core-test.c | 52 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index e8ea18d7..1ffb7e59 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1678,7 +1678,17 @@ mt76_sta_remove(struct mt76_phy *phy, struct ieee80211_vif *vif,
+ 	struct mt76_dev *dev = phy->dev;
+ 
+ 	mutex_lock(&dev->mutex);
++	/*
++	 * The tx worker reaches a station through phy->tx_list, not RCU,
++	 * and drops the lists' locks while it queues each frame. Removal
++	 * finding the station already off the list doesn't mean the worker
++	 * is done with it, and mac80211 frees the station right after this
++	 * returns. Park the worker until the station is gone. (Not in
++	 * __mt76_sta_remove(): resets call it with the worker parked.)
++	 */
++	mt76_worker_disable(&dev->tx_worker);
+ 	__mt76_sta_remove(phy, vif, sta);
++	mt76_worker_enable(&dev->tx_worker);
+ 	mutex_unlock(&dev->mutex);
+ }
+ 
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 372c369e..00761ebc 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -36,6 +36,7 @@ static struct {
+ 	struct ieee80211_sta *sta_sta;
+ 	int n_sta_remove;
+ 	bool sta_remove_queued;	/* frames still queued or tx list at remove */
++	bool sta_remove_parked;	/* the tx worker didn't run during remove */
+ 	int n_sta_event;
+ 	enum mt76_sta_event sta_ev;
+ 	int sta_event_ret;
+@@ -99,6 +100,8 @@ static int mt76_test_drv_sta_add(struct mt76_dev *dev,
+ 	return 0;
+ }
+ 
++static atomic_t mt76_test_worker_runs;
++
+ static void mt76_test_drv_sta_remove(struct mt76_dev *dev,
+ 				     struct ieee80211_vif *vif,
+ 				     struct ieee80211_sta *sta)
+@@ -110,6 +113,15 @@ static void mt76_test_drv_sta_remove(struct mt76_dev *dev,
+ 	mt76_test_drv.sta_remove_queued = !skb_queue_empty(&wcid->tx_pending) ||
+ 					  !skb_queue_empty(&wcid->tx_offchannel) ||
+ 					  !list_empty(&wcid->tx_list);
++	if (dev->tx_worker.task) {
++		int runs = atomic_read(&mt76_test_worker_runs);
++
++		/* kicked now, it may only run once the removal is over */
++		mt76_worker_schedule(&dev->tx_worker);
++		msleep(50);
++		mt76_test_drv.sta_remove_parked =
++			atomic_read(&mt76_test_worker_runs) == runs;
++	}
+ }
+ 
+ static int mt76_test_sta_event(struct mt76_dev *dev, struct ieee80211_vif *vif,
+@@ -2947,6 +2959,45 @@ static void mt76_test_sta_remove(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->phy.num_sta, 0);
+ }
+ 
++static void mt76_test_idle_worker(struct mt76_worker *w)
++{
++	atomic_inc(&mt76_test_worker_runs);
++}
++
++/* Removing a station parks the tx worker around it, since the worker
++ * reaches stations through the tx list rather than RCU; it runs again
++ * afterwards.
++ */
++static void mt76_test_sta_remove_parks_worker(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct ieee80211_sta *sta = mt76_test_sta(test);
++	struct ieee80211_vif *vif = mt76_test_vif(test);
++	int runs, i;
++
++	KUNIT_ASSERT_EQ(test, mt76_worker_setup(dev->hw, &dev->tx_worker,
++						mt76_test_idle_worker,
++						"mt76-test-tx"), 0);
++	mt76_test_drv.sta_add_idx = 9;
++	KUNIT_ASSERT_EQ(test, mt76_sta_state(dev->hw, vif, sta,
++					     IEEE80211_STA_NOTEXIST,
++					     IEEE80211_STA_NONE), 0);
++	mt76_sta_pre_rcu_remove(dev->hw, vif, sta);
++	runs = atomic_read(&mt76_test_worker_runs);
++	KUNIT_EXPECT_EQ(test, mt76_sta_state(dev->hw, vif, sta,
++					     IEEE80211_STA_NONE,
++					     IEEE80211_STA_NOTEXIST), 0);
++
++	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_sta_remove, 1);
++	KUNIT_EXPECT_TRUE(test, mt76_test_drv.sta_remove_parked);
++
++	/* and it runs again afterwards */
++	for (i = 0; i < 100 && atomic_read(&mt76_test_worker_runs) == runs; i++)
++		msleep(10);
++	KUNIT_EXPECT_GT(test, atomic_read(&mt76_test_worker_runs), runs);
++	mt76_worker_teardown(&dev->tx_worker);
++}
++
+ /* The association steps reach the driver as events; other steps don't. */
+ static void mt76_test_sta_events(struct kunit *test)
+ {
+@@ -3248,6 +3299,7 @@ static struct kunit_case mt76_core_sta_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_sta_add_fails),
+ 	KUNIT_CASE(mt76_test_sta_add_published),
+ 	KUNIT_CASE(mt76_test_sta_remove),
++	KUNIT_CASE(mt76_test_sta_remove_parks_worker),
+ 	KUNIT_CASE(mt76_test_sta_events),
+ 	KUNIT_CASE(mt76_test_sta_state_no_phy),
+ 	KUNIT_CASE(mt76_test_wcid_cleanup),

@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:36:45 +0100
+Subject: [PATCH] wifi: mt76: mt7915: keep a single implicit BF row at 160 MHz
+
+For implicit beamforming of a VHT station at 160 MHz,
+mt7915_mcu_sta_bfer_vht() sets ibf_nrow to 1, but
+mt7915_mcu_sta_bfer_tlv() then overwrote it with the number of tx
+antennas, so the special case never reached the firmware.
+
+Set the default before the per-mode setup instead of after it. Only
+matters with implicit beamforming on (debugfs, off by default). Un-skip
+mt7915_test_bfer_vht_160_ibf.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c            | 3 ++-
+ mt7915/tests/mcu-test.c | 6 ++----
+ 2 files changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 3ac49e6a..eb3154c1 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -1310,6 +1310,8 @@ mt7915_mcu_sta_bfer_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_BF, sizeof(*bf));
+ 	bf = (struct sta_rec_bf *)tlv;
++	/* all tx antennas, unless the mode's setup below picks fewer */
++	bf->ibf_nrow = tx_ant;
+ 
+ 	if (sta->deflink.he_cap.has_he && ebf)
+ 		mt7915_mcu_sta_bfer_he(sta, vc, bf);
+@@ -1321,7 +1323,6 @@ mt7915_mcu_sta_bfer_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	bf->bf_cap = ebf ? ebf : dev->ibf << 1;
+ 	bf->bw = sta->deflink.bandwidth;
+ 	bf->ibf_dbw = sta->deflink.bandwidth;
+-	bf->ibf_nrow = tx_ant;
+ 
+ 	if (!ebf && sta->deflink.bandwidth <= IEEE80211_STA_RX_BW_40 && !bf->ncol)
+ 		bf->ibf_timeout = 0x48;
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 3ed4e431..fb44eb82 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -3436,16 +3436,14 @@ static void mt7915_test_bfer_vht(struct kunit *test)
+ 	KUNIT_EXPECT_NULL(test, mt7915_test_bf_tlv(test, &c));
+ }
+ 
+-/* Implicit 160 MHz VHT beamforming is meant to use a single implicit row
+- * (bfer_vht sets ibf_nrow = 1), but bfer_tlv overwrites it with tx_ant.
++/* Implicit 160 MHz VHT beamforming uses a single implicit row (bfer_vht
++ * sets ibf_nrow = 1), not one per tx antenna.
+  */
+ static void mt7915_test_bfer_vht_160_ibf(struct kunit *test)
+ {
+ 	struct mt7915_test_ctx c;
+ 	struct sta_rec_bf *bf;
+ 
+-	kunit_skip(test, "driver bug: 160 MHz iBF ibf_nrow = 1 is overwritten by tx_ant");
+-
+ 	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
+ 	mt7915_test_ht(c.sta);
+ 	mt7915_test_vht(c.sta);

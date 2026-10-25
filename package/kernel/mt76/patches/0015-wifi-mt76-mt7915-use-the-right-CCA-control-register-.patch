@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:16:34 +0100
+Subject: [PATCH] wifi: mt76: mt7915: use the right CCA control register on
+ mt7916/mt798x
+
+mt7915_mac_cca_stats_reset() always used the mt7915 address layout for
+MT_WF_PHY_RX_CTRL1, while mt7915_mac_enable_nf() already picks the
+mt7916 layout (band stride 1 << 20) for the same register on the other
+chips. On band 1 of mt7916/mt798x it therefore set bits in an unrelated
+register in band 0's PHY space on every channel change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 27d768a3..c3054e0c 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1096,7 +1096,9 @@ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ void mt7915_mac_cca_stats_reset(struct mt7915_phy *phy)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+-	u32 reg = MT_WF_PHY_RX_CTRL1(phy->mt76->band_idx);
++	u8 band = phy->mt76->band_idx;
++	u32 reg = is_mt7915(&dev->mt76) ? MT_WF_PHY_RX_CTRL1(band) :
++					  MT_WF_PHY_RX_CTRL1_MT7916(band);
+ 
+ 	mt76_clear(dev, reg, MT_WF_PHY_RX_CTRL1_STSCNT_EN);
+ 	mt76_set(dev, reg, BIT(11) | BIT(9));

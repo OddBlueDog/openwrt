@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:30:43 +0100
+Subject: [PATCH] wifi: mt76: initialise a station's wcid before publishing it
+
+mt76_sta_add() published the wcid in dev->wcid[] and only then ran
+mt76_wcid_init(), so a lookup of that index in between (a late tx
+status for the previous user of the index, or an rx frame) saw
+uninitialised lists, packet id allocator and phy_idx, and an rx frame
+that queued the station for polling had its poll_list entry reset
+afterwards. Initialise first; rcu_assign_pointer() orders the stores.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index 361604db..a202c02b 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1634,8 +1634,8 @@ mt76_sta_add(struct mt76_phy *phy, struct ieee80211_vif *vif,
+ 	if (published != wcid) {
+ 		WARN_ON_ONCE(published);
+ 		ewma_signal_init(&wcid->rssi);
+-		rcu_assign_pointer(dev->wcid[wcid->idx], wcid);
+ 		mt76_wcid_init(wcid, phy->band_idx);
++		rcu_assign_pointer(dev->wcid[wcid->idx], wcid);
+ 	} else {
+ 		wcid->phy_idx = phy->band_idx;
+ 	}

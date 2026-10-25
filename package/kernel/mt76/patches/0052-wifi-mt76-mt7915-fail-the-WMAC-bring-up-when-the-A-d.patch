@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:32:05 +0100
+Subject: [PATCH] wifi: mt76: mt7915: fail the WMAC bring-up when the A-die
+ can't be read
+
+mt798x_wmac_sku_setup() returned 0 even when reading an A-die's chip id
+over SPI failed, so mt7986_wmac_enable() went on configuring the A-dies
+and the SKU from its uninitialised adie_type.
+
+Return the error. Un-skip mt7915_soc_test_sku_setup_error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/soc.c            | 2 +-
+ mt7915/tests/soc-test.c | 2 --
+ 2 files changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/mt7915/soc.c b/mt7915/soc.c
+index da59412f..df89b61c 100644
+--- a/mt7915/soc.c
++++ b/mt7915/soc.c
+@@ -364,7 +364,7 @@ static int mt798x_wmac_sku_setup(struct mt7915_dev *dev, u32 *adie_type)
+ out:
+ 	mt76_wmac_spi_unlock(dev);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static inline u16 mt7986_adie_idx(u8 adie, u32 adie_type)
+diff --git a/mt7915/tests/soc-test.c b/mt7915/tests/soc-test.c
+index a0e7d81a..986b760d 100644
+--- a/mt7915/tests/soc-test.c
++++ b/mt7915/tests/soc-test.c
+@@ -905,8 +905,6 @@ static void mt7915_soc_test_sku_setup_error(struct kunit *test)
+ 	struct mt7915_soc_test *t;
+ 	u32 type = 0;
+ 
+-	kunit_skip(test, "driver bug: mt798x_wmac_sku_setup() returns 0 when an A-die chip id read fails, and mt7986_wmac_enable() goes on with its uninitialized adie_type");
+-
+ 	t = mt7915_soc_test_init(test, &dev);
+ 	t->spi_ok = 0;
+ 	KUNIT_EXPECT_EQ(test, mt798x_wmac_sku_setup(dev, &type), -ETIMEDOUT);

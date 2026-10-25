@@ -1,0 +1,368 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:49:15 +0100
+Subject: [PATCH] wifi: mt76: mt7915: record each station's dozes from the PS
+ sync events
+
+The 2026-05 firmware sends its PS sync event in a longer layout: 16-bit
+halves of the WTBL index and the power save flag at byte 6, where the
+old layout's flag byte is always 0. Every event read as "awake", so the
+driver never knew which stations doze.
+
+Read the flag by the event's length, drop events too short for either
+layout, and keep a record per station of what the firmware reports:
+dozing now and since when, how many dozes, the dozing time in all and
+the longest. debugfs "ps" in the station's directory shows it (the
+current doze counted in). The record is for monitoring only: tx still
+follows ps_sync (off by default) as before. It starts over when the
+station is added, also after a full reset, as the restarted firmware
+has every station awake.
+
+mt7915_mcu2_events_ps_sync_v2 and _ps_record check both; without the
+new layout both fail.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/debugfs.c         |  23 +++++++++
+ mt7915/main.c            |   9 ++++
+ mt7915/mcu.c             |  54 +++++++++++++++++++-
+ mt7915/mcu.h             |  13 +++++
+ mt7915/mt7915.h          |  23 +++++++++
+ mt7915/tests/mcu2-test.c | 108 +++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 228 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index b7fca26e..4592cf47 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1494,11 +1494,34 @@ mt7915_queues_show(struct seq_file *s, void *data)
+ 
+ DEFINE_SHOW_ATTRIBUTE(mt7915_queues);
+ 
++/* The station's power save as the firmware reports it (PS sync events),
++ * since it was added: dozing now and for how long, how often it dozed, its
++ * dozing time in all (the current doze included) and its longest doze.
++ */
++static int
++mt7915_sta_ps_show(struct seq_file *s, void *data)
++{
++	struct ieee80211_sta *sta = s->private;
++	struct mt7915_sta_ps_stats st;
++
++	mt7915_sta_ps_stats((struct mt7915_sta *)sta->drv_priv, &st);
++	seq_printf(s, "dozing %d\n", st.dozing);
++	seq_printf(s, "since_ms %u\n", st.since_ms);
++	seq_printf(s, "dozes %u\n", st.dozes);
++	seq_printf(s, "dozing_ms %llu\n", st.dozing_ms);
++	seq_printf(s, "longest_ms %u\n", st.longest_ms);
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(mt7915_sta_ps);
++
+ void mt7915_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta, struct dentry *dir)
+ {
+ 	debugfs_create_file("fixed_rate", 0600, dir, sta, &fops_fixed_rate);
+ 	debugfs_create_file("hw-queues", 0400, dir, sta, &mt7915_queues_fops);
++	debugfs_create_file("ps", 0400, dir, sta, &mt7915_sta_ps_fops);
+ }
+ 
+ #endif
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 67ec8ac0..99ede774 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -797,6 +797,15 @@ int mt7915_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 	msta->wcid.idx = idx;
+ 	msta->wcid.phy_idx = ext_phy;
+ 	msta->jiffies = jiffies;
++	/* a new station, or the same again after a full reset: the restarted
++	 * firmware starts with every station awake
++	 */
++	spin_lock_init(&msta->ps.lock);
++	msta->ps.since = jiffies;
++	msta->ps.dozing_ms = 0;
++	msta->ps.longest_ms = 0;
++	msta->ps.dozes = 0;
++	msta->ps.dozing = false;
+ 
+ 	if (sta->tdls)
+ 		set_bit(MT_WCID_FLAG_TDLS_PEER, &msta->wcid.flags);
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 93e4c4a7..a9da15a2 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -454,21 +454,71 @@ mt7915_mcu_rx_bcc_notify(struct mt7915_dev *dev, struct sk_buff *skb)
+ 			mt7915_mcu_cca_finish, mphy->hw);
+ }
+ 
++/* a station dozed or woke: what debugfs "ps" shows */
++static void
++mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
++{
++	unsigned long now = jiffies;
++
++	spin_lock(&msta->ps.lock);
++	if (dozing != msta->ps.dozing) {
++		u32 ms = jiffies_to_msecs(now - msta->ps.since);
++
++		if (msta->ps.dozing) {
++			msta->ps.dozing_ms += ms;
++			msta->ps.longest_ms = max(msta->ps.longest_ms, ms);
++		} else {
++			msta->ps.dozes++;
++		}
++		msta->ps.dozing = dozing;
++		msta->ps.since = now;
++	}
++	spin_unlock(&msta->ps.lock);
++}
++
++/* the record now, the current doze counted in */
++void mt7915_sta_ps_stats(struct mt7915_sta *msta,
++			 struct mt7915_sta_ps_stats *st)
++{
++	spin_lock_bh(&msta->ps.lock);
++	st->dozing = msta->ps.dozing;
++	st->since_ms = jiffies_to_msecs(jiffies - msta->ps.since);
++	st->dozes = msta->ps.dozes;
++	st->dozing_ms = msta->ps.dozing_ms + (st->dozing ? st->since_ms : 0);
++	st->longest_ms = max(msta->ps.longest_ms,
++			     st->dozing ? st->since_ms : 0);
++	spin_unlock_bh(&msta->ps.lock);
++}
++
+ static void
+ mt7915_mcu_rx_ps_sync(struct mt7915_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt7915_mcu_ps_notify *p = (void *)skb->data;
+ 	struct mt76_wcid *wcid;
+ 	u16 wcid_idx;
++	bool dozing;
++
++	if (skb->len < sizeof(*p))
++		return;
++
++	/* the 2026-05 firmware's longer layout has the flag at byte 6, where
++	 * byte 1 is always 0; the WTBL index bytes stay where they were
++	 */
++	if (skb->len >= sizeof(struct mt7915_mcu_ps_notify_v2))
++		dozing = ((struct mt7915_mcu_ps_notify_v2 *)p)->ps_bit;
++	else
++		dozing = p->ps_bit;
+ 
+ 	wcid_idx = p->wtbl_lower | (p->wtbl_higher << 8);
+ 	wcid = mt76_wcid_ptr(dev, wcid_idx);
+ 	if (!wcid || !wcid_to_sta(wcid))
+ 		return;
+ 
++	mt7915_mcu_sta_ps_record(container_of(wcid, struct mt7915_sta, wcid),
++				 dozing);
++
+ 	/* switched off, every event wakes the station: none stays held */
+-	mt76_sta_ps_transition(&dev->mt76, wcid,
+-			       READ_ONCE(ps_sync) && p->ps_bit);
++	mt76_sta_ps_transition(&dev->mt76, wcid, READ_ONCE(ps_sync) && dozing);
+ }
+ 
+ static void
+diff --git a/mt7915/mcu.h b/mt7915/mcu.h
+index cd2afd88..3fc4ac79 100644
+--- a/mt7915/mcu.h
++++ b/mt7915/mcu.h
+@@ -63,6 +63,19 @@ struct mt7915_mcu_ps_notify {
+ 	u8 rsv;
+ } __packed;
+ 
++/* the same event from the 2026-05 firmware: 16-bit fields, the flag later */
++struct mt7915_mcu_ps_notify_v2 {
++	struct mt76_connac2_mcu_rxd_hdr rxd;
++
++	u8 wtbl_lower;
++	u8 rsv0;
++	u8 wtbl_higher;
++	u8 rsv1;
++	__le16 rsv2;
++	u8 ps_bit;
++	u8 rsv3;
++} __packed;
++
+ struct mt7915_mcu_rdd_report {
+ 	struct mt76_connac2_mcu_rxd_hdr rxd;
+ 
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 45176156..ec02c3d5 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -165,6 +165,18 @@ struct mt7915_sta {
+ 		u8 flowid_mask;
+ 		struct mt7915_twt_flow flow[MT7915_MAX_STA_TWT_AGRT];
+ 	} twt;
++
++	/* power save as the firmware reports it, for debugfs (tx doesn't
++	 * look at it): set by the PS sync events, read by the "ps" file
++	 */
++	struct {
++		spinlock_t lock;
++		unsigned long since;	/* jiffies of the last change */
++		u64 dozing_ms;		/* dozing time up to @since */
++		u32 longest_ms;
++		u32 dozes;
++		bool dozing;
++	} ps;
+ };
+ 
+ struct mt7915_vif_cap {
+@@ -572,6 +584,17 @@ int mt7915_mcu_set_pulse_th(struct mt7915_dev *dev,
+ int mt7915_mcu_set_radar_th(struct mt7915_dev *dev, int index,
+ 			    const struct mt7915_dfs_pattern *pattern);
+ int mt7915_mcu_set_muru_ctrl(struct mt7915_dev *dev, u32 cmd, u32 val);
++
++struct mt7915_sta_ps_stats {
++	u64 dozing_ms;
++	u32 since_ms;
++	u32 longest_ms;
++	u32 dozes;
++	bool dozing;
++};
++
++void mt7915_sta_ps_stats(struct mt7915_sta *msta,
++			 struct mt7915_sta_ps_stats *st);
+ int mt7915_mcu_apply_group_cal(struct mt7915_dev *dev);
+ int mt7915_mcu_apply_tx_dpd(struct mt7915_phy *phy);
+ int mt7915_mcu_get_chan_mib_info(struct mt7915_phy *phy, bool chan_switch);
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index ff171389..839c5ed8 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -115,6 +115,9 @@ mt7915_mcu2_sta(struct kunit *test, struct ieee80211_vif *vif, u16 idx)
+ 	msta->wcid.idx = idx;
+ 	msta->wcid.sta = 1;
+ 	msta->vif = (struct mt7915_vif *)vif->drv_priv;
++	/* as mt7915_mac_sta_add() sets it up */
++	spin_lock_init(&msta->ps.lock);
++	msta->ps.since = jiffies;
+ 	return sta;
+ }
+ 
+@@ -1222,6 +1225,109 @@ static void mt7915_mcu2_events_ps_sync_off(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
+ }
+ 
++/* the 2026-05 firmware's layout: 16-bit index halves, the flag at byte 6 */
++static void mt7915_mcu2_ps_event_v2(struct kunit *test, struct mt7915_dev *dev,
++				    u16 wcid, bool ps)
++{
++	struct mt7915_mcu_ps_notify_v2 ev = {
++		.wtbl_lower = wcid & 0xff,
++		.wtbl_higher = wcid >> 8,
++		.rsv2 = cpu_to_le16(1),	/* a firmware value the driver ignores */
++		.ps_bit = ps,
++	};
++
++	mt7915_mcu2_rx_event(test, dev, mt7915_mcu2_event(test,
++			MCU_EVENT_EXT, MCU_EXT_EVENT_PS_SYNC, 0,
++			&ev, sizeof(ev)));
++}
++
++/* The 2026-05 firmware's longer event is read by its own layout, where the
++ * old one's flag byte is always 0; one too short for either is dropped.
++ */
++static void mt7915_mcu2_events_ps_sync_v2(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
++	struct mt7915_mcu_ps_notify short_ev = {
++		.wtbl_lower = 0x23,
++		.ps_bit = 1,
++	};
++	struct mt7915_sta *msta;
++
++	msta = (void *)mt7915_mcu2_sta(test, vif, 0x123)->drv_priv;
++	rcu_assign_pointer(dev->mt76.wcid[0x123], &msta->wcid);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_drop_wcids, dev), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_ps_sync_default, NULL), 0);
++	ps_sync = true;
++
++	mt7915_mcu2_ps_event_v2(test, dev, 0x123, true);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++	KUNIT_EXPECT_TRUE(test, msta->ps.dozing);
++	mt7915_mcu2_ps_event_v2(test, dev, 0x123, false);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++	KUNIT_EXPECT_FALSE(test, msta->ps.dozing);
++
++	/* the index only, no flag */
++	short_ev.wtbl_higher = 0x01;
++	mt7915_mcu2_rx_event(test, dev, mt7915_mcu2_event(test,
++			MCU_EVENT_EXT, MCU_EXT_EVENT_PS_SYNC, 0, &short_ev,
++			offsetof(struct mt7915_mcu_ps_notify, ps_bit)));
++	KUNIT_EXPECT_FALSE(test, msta->ps.dozing);
++	KUNIT_EXPECT_EQ(test, msta->ps.dozes, 1);
++}
++
++/* Each station's dozes as the firmware reports them, whatever ps_sync
++ * says (off here: tx goes on as before): how many, how long in all and
++ * the longest, the current one counted in. A repeated report changes
++ * nothing.
++ */
++static void mt7915_mcu2_events_ps_record(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
++	struct mt7915_sta_ps_stats st;
++	struct mt7915_sta *msta;
++
++	msta = (void *)mt7915_mcu2_sta(test, vif, 0x23)->drv_priv;
++	rcu_assign_pointer(dev->mt76.wcid[0x23], &msta->wcid);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_drop_wcids, dev), 0);
++
++	mt7915_sta_ps_stats(msta, &st);
++	KUNIT_EXPECT_FALSE(test, st.dozing);
++	KUNIT_EXPECT_EQ(test, st.dozes, 0);
++	KUNIT_EXPECT_EQ(test, st.dozing_ms, 0);
++
++	mt7915_mcu2_ps_event_v2(test, dev, 0x23, true);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++	/* 400 ms ago, then the same report again */
++	msta->ps.since -= msecs_to_jiffies(400);
++	mt7915_mcu2_ps_event_v2(test, dev, 0x23, true);
++	mt7915_sta_ps_stats(msta, &st);
++	KUNIT_EXPECT_TRUE(test, st.dozing);
++	KUNIT_EXPECT_EQ(test, st.dozes, 1);
++	KUNIT_EXPECT_GE(test, st.since_ms, 400);
++	KUNIT_EXPECT_GE(test, st.dozing_ms, 400);
++
++	mt7915_mcu2_ps_event_v2(test, dev, 0x23, false);
++	mt7915_sta_ps_stats(msta, &st);
++	KUNIT_EXPECT_FALSE(test, st.dozing);
++	KUNIT_EXPECT_GE(test, st.dozing_ms, 400);
++	KUNIT_EXPECT_LT(test, st.dozing_ms, 600);
++	KUNIT_EXPECT_EQ(test, st.longest_ms, st.dozing_ms);
++
++	/* a second, longer doze, still going */
++	mt7915_mcu2_ps_event_v2(test, dev, 0x23, true);
++	msta->ps.since -= msecs_to_jiffies(1000);
++	mt7915_sta_ps_stats(msta, &st);
++	KUNIT_EXPECT_EQ(test, st.dozes, 2);
++	KUNIT_EXPECT_GE(test, st.longest_ms, 1000);
++	KUNIT_EXPECT_GE(test, st.dozing_ms, 1400);
++	KUNIT_EXPECT_LT(test, st.dozing_ms, 1700);
++}
++
+ static void mt7915_mcu2_log_event(struct kunit *test, struct mt7915_dev *dev,
+ 				  u8 s2d, const void *data, int len)
+ {
+@@ -1285,6 +1391,8 @@ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_radar),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync_off),
++	KUNIT_CASE(mt7915_mcu2_events_ps_sync_v2),
++	KUNIT_CASE(mt7915_mcu2_events_ps_record),
+ 	KUNIT_CASE(mt7915_mcu2_events_log),
+ 	KUNIT_CASE(mt7915_mcu2_events_csa_bcc),
+ 	{}

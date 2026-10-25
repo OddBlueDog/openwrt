@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:16:34 +0100
+Subject: [PATCH] wifi: mt76: keep radar detection on the operating channel
+ after a sw scan
+
+mac80211 restores the operating channel (ieee80211_hw_conf_chan()) before
+it calls drv_sw_scan_complete(), so MT76_SCANNING is still set when the
+driver re-evaluates the DFS state for that channel change.
+mt76_phy_dfs_state() then returns MT_DFS_STATE_DISABLED, the radar
+detector is stopped, and nothing starts it again once the scan is over.
+
+In ETSI domains mac80211 allows scanning on an AP that sits on a DFS
+channel, which leaves it beaconing there without radar detection until
+the next channel change.
+
+Only treat the phy as scanning while it is actually on a scan channel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index 41d36360..361604db 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -2095,8 +2095,12 @@ enum mt76_dfs_state mt76_phy_dfs_state(struct mt76_phy *phy)
+ 	struct ieee80211_hw *hw = phy->hw;
+ 	struct mt76_dev *dev = phy->dev;
+ 
++	/* mac80211 restores the operating channel before it calls
++	 * sw_scan_complete, so only an off-channel scan step counts as
++	 * scanning here.
++	 */
+ 	if (dev->region == NL80211_DFS_UNSET ||
+-	    test_bit(MT76_SCANNING, &phy->state))
++	    (test_bit(MT76_SCANNING, &phy->state) && phy->offchannel))
+ 		return MT_DFS_STATE_DISABLED;
+ 
+ 	if (!phy->radar_enabled) {

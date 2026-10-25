@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:29:08 +0100
+Subject: [PATCH] wifi: mt76: defer the probe until the EEPROM NVMEM cell is
+ ready
+
+mt76_eeprom_init() turned every error from the device tree lookup into
+"no EEPROM in the device tree", including -EPROBE_DEFER from an
+"eeprom" NVMEM cell whose provider hasn't probed yet. The driver then
+went on with efuse or the default EEPROM file, i.e. without the board's
+calibration data, instead of trying again once the cell is there. The
+GL-MT6000 takes its EEPROM from such a cell, on an eMMC partition.
+
+Pass -EPROBE_DEFER on; all callers already return negative values, and
+mt7915 now cleans up after a failed init. Un-skip
+mt76_eeprom_test_init_nvmem_defer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ eeprom.c            | 9 ++++++++-
+ tests/eeprom-test.c | 2 --
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/eeprom.c b/eeprom.c
+index 913fccd0..6503cc24 100644
+--- a/eeprom.c
++++ b/eeprom.c
+@@ -549,12 +549,19 @@ EXPORT_SYMBOL_GPL(mt76_get_rate_power_limits);
+ int
+ mt76_eeprom_init(struct mt76_dev *dev, int len)
+ {
++	int ret;
++
+ 	dev->eeprom.size = len;
+ 	dev->eeprom.data = devm_kzalloc(dev->dev, len, GFP_KERNEL);
+ 	if (!dev->eeprom.data)
+ 		return -ENOMEM;
+ 
+-	return !mt76_get_of_eeprom(dev, dev->eeprom.data, len);
++	ret = mt76_get_of_eeprom(dev, dev->eeprom.data, len);
++	/* the EEPROM is there, its NVMEM provider just hasn't probed yet */
++	if (ret == -EPROBE_DEFER)
++		return ret;
++
++	return !ret;
+ }
+ EXPORT_SYMBOL_GPL(mt76_eeprom_init);
+ 
+diff --git a/tests/eeprom-test.c b/tests/eeprom-test.c
+index e3512290..1ae703f3 100644
+--- a/tests/eeprom-test.c
++++ b/tests/eeprom-test.c
+@@ -351,8 +351,6 @@ static void mt76_eeprom_test_init_nvmem_defer(struct kunit *test)
+ 	struct mt76_dev *dev;
+ 	struct device_node *np, *live;
+ 
+-	kunit_skip(test, "driver bug: mt76_eeprom_init() returns 0 (no EEPROM in DT, use efuse/default) when the eeprom NVMEM cell returns -EPROBE_DEFER");
+-
+ 	dev = mt76_eeprom_test_dev(test);
+ 	np = mt76_eeprom_test_of(test, dev);
+ 	live = mt76_eeprom_test_live(test);

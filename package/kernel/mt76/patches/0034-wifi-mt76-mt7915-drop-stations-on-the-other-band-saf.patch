@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:30:42 +0100
+Subject: [PATCH] wifi: mt76: mt7915: drop stations on the other band safely
+
+__mt7915_drop_sta() runs from ieee80211_iterate_active_interfaces() on
+both bands' hws when a station is authorized. It looked the station up
+with ieee80211_find_sta_by_ifaddr() outside an RCU read section, and on
+DBDC the station can belong to the other band's wiphy, whose lock isn't
+held, so it could be removed and freed while the firmware command for
+it was in flight.
+
+Look it up under RCU, then act only while its wcid is still published
+under dev->mt76.mutex, which removal needs to unpublish it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/main.c | 29 +++++++++++++++++++++++------
+ 1 file changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 43cdd3ad..23bc95de 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -816,21 +816,38 @@ static void
+ __mt7915_drop_sta(void *ptr, u8 *mac, struct ieee80211_vif *vif)
+ {
+ 	struct drop_sta_iter *data = ptr;
++	struct mt7915_dev *dev = data->dev;
+ 	struct ieee80211_sta *sta;
+ 	struct mt7915_sta *msta;
++	u16 idx;
+ 
+ 	if (vif == data->vif || vif->type != NL80211_IFTYPE_AP)
+ 		return;
+ 
++	rcu_read_lock();
+ 	sta = ieee80211_find_sta_by_ifaddr(data->hw, data->sta_addr, mac);
+-	if (!sta)
++	if (!sta) {
++		rcu_read_unlock();
+ 		return;
+-
++	}
+ 	msta = (struct mt7915_sta *)sta->drv_priv;
+-	mt7915_mcu_add_sta(data->dev, vif, sta, CONN_STATE_DISCONNECT, false);
+-	msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+-	msta->wcid.sta_disabled = 1;
+-	msta->wcid.sta = 0;
++	idx = msta->wcid.idx;
++	rcu_read_unlock();
++
++	/*
++	 * The station can belong to the other band's wiphy, whose lock is
++	 * not held here. mt76_sta_pre_rcu_remove() unpublishes the wcid under
++	 * dev->mt76.mutex, so a station whose wcid is still published cannot
++	 * be freed until the mutex is released.
++	 */
++	mutex_lock(&dev->mt76.mutex);
++	if (rcu_access_pointer(dev->mt76.wcid[idx]) == &msta->wcid) {
++		mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_DISCONNECT, false);
++		msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
++		msta->wcid.sta_disabled = 1;
++		msta->wcid.sta = 0;
++	}
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ static void

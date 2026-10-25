@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:30:43 +0100
+Subject: [PATCH] wifi: mt76: mt7915: skip unpublished stations in the station
+ poll
+
+mt7915_mac_sta_poll() takes a station off the poll list under
+sta_poll_lock and uses it after dropping the lock. Removal only unlinks
+it from that list, so if the station had already been unpublished, the
+RCU read section held by the poll doesn't keep it alive. Only process
+stations whose wcid is still published when they are taken off the
+list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index c5b37ee5..03041106 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -109,7 +109,7 @@ static void mt7915_mac_sta_poll(struct mt7915_dev *dev)
+ 	rcu_read_lock();
+ 
+ 	while (true) {
+-		bool clear = false;
++		bool clear = false, published;
+ 		u32 addr, val;
+ 		u16 idx;
+ 		s8 rssi[4];
+@@ -123,9 +123,19 @@ static void mt7915_mac_sta_poll(struct mt7915_dev *dev)
+ 		msta = list_first_entry(&sta_poll_list,
+ 					struct mt7915_sta, wcid.poll_list);
+ 		list_del_init(&msta->wcid.poll_list);
++		idx = msta->wcid.idx;
++		/*
++		 * Removal unlinks poll_list under this lock, so msta is alive
++		 * here. If its wcid is still published, the synchronize_net()
++		 * that precedes the free has to wait for our rcu_read_lock();
++		 * otherwise removal may complete while we use msta below.
++		 */
++		published = rcu_access_pointer(dev->mt76.wcid[idx]) ==
++			    &msta->wcid;
+ 		spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ 
+-		idx = msta->wcid.idx;
++		if (!published)
++			continue;
+ 
+ 		/* refresh peer's airtime reporting */
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 20);

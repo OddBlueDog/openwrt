@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:22:42 +0100
+Subject: [PATCH] wifi: mt76: mt7915: finish tx-free processing on a truncated
+ event
+
+When mt7915_mac_tx_free() ran past the end of the event it returned
+straight away. The tokens it had already released had their skbs queued
+on free_list, so they were never freed, and a pending tx wake-up was
+lost; if those were the last outstanding tokens, tx stayed blocked.
+The fixed header was also read without checking the event's length.
+
+Check the header length, make sure a whole entry fits before reading
+it, and stop the loop instead of returning so the completion runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index c3054e0c..8489f015 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -876,11 +876,15 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 	void *end = data + len;
+ 	bool v3, wake = false;
+ 	u16 total, count = 0;
+-	u32 txd = le32_to_cpu(free->txd);
+ 	__le32 *cur_info;
++	u32 txd;
++
++	if (WARN_ON_ONCE(len < sizeof(*free)))
++		return;
+ 
+ 	mt7915_mac_tx_free_prepare(dev);
+ 
++	txd = le32_to_cpu(free->txd);
+ 	total = le16_get_bits(free->ctrl, MT_TX_FREE_MSDU_CNT);
+ 	v3 = (FIELD_GET(MT_TX_FREE_VER, txd) == 0x4);
+ 
+@@ -888,8 +892,9 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 		u32 msdu, info;
+ 		u8 i;
+ 
+-		if (WARN_ON_ONCE((void *)cur_info >= end))
+-			return;
++		/* tokens released so far sit on free_list: always finish */
++		if (WARN_ON_ONCE((void *)(cur_info + 1) > end))
++			break;
+ 
+ 		/*
+ 		 * 1'b1: new wcid pair.

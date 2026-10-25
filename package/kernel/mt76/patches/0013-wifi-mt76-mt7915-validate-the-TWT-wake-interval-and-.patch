@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:16:34 +0100
+Subject: [PATCH] wifi: mt76: mt7915: validate the TWT wake interval and use
+ 64-bit math
+
+The wake interval requested by a station (mantissa << exponent) can be
+zero or well above 32 bits, but mt7915_mac_add_twt_setup() passes it to
+div_u64_rem(), whose divisor is a u32. A crafted request from any
+associating client can thus truncate the divisor, or make it zero, and
+the computed start time becomes garbage.
+
+Reject a zero interval and do the remainder in 64 bits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 73e7faac..27d768a3 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2289,7 +2289,7 @@ static int mt7915_mac_check_twt_req(struct ieee80211_twt_setup *twt)
+ 	duration = twt_agrt->min_twt_dur << 8;
+ 
+ 	interval = (u64)mantissa << exp;
+-	if (interval < duration)
++	if (!interval || interval < duration)
+ 		return -EOPNOTSUPP;
+ 
+ 	return 0;
+@@ -2382,13 +2382,12 @@ void mt7915_mac_add_twt_setup(struct ieee80211_hw *hw,
+ 	if (sta_setup_cmd == TWT_SETUP_CMD_REQUEST ||
+ 	    sta_setup_cmd == TWT_SETUP_CMD_SUGGEST) {
+ 		u64 interval = (u64)le16_to_cpu(twt_agrt->mantissa) << exp;
+-		u64 flow_tsf, curr_tsf;
+-		u32 rem;
++		u64 flow_tsf, curr_tsf, rem;
+ 
+ 		flow->sched = true;
+ 		flow->start_tsf = mt7915_mac_twt_sched_list_add(dev, flow);
+ 		curr_tsf = __mt7915_get_tsf(hw, msta->vif);
+-		div_u64_rem(curr_tsf - flow->start_tsf, interval, &rem);
++		div64_u64_rem(curr_tsf - flow->start_tsf, interval, &rem);
+ 		flow_tsf = curr_tsf + interval - rem;
+ 		twt_agrt->twt = cpu_to_le64(flow_tsf);
+ 	} else {

@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:24:22 +0100
+Subject: [PATCH] wifi: mt76: connac: take the HE MCS without the DCM bit from
+ tx status
+
+For HE rates, bits 4 and 5 of the tx rate index are DCM and the SU
+extended range tone, not part of the MCS. mt76_connac2_mac_fill_txs()
+read the MCS with MT_TX_RATE_IDX, so an HE frame sent with DCM read as
+MCS 16 and up: the status was dropped as an invalid HE MCS, it never
+updated the station's tx rate or the per-MCS counters, and rate.he_dcm
+could never be set. The rx path already masks the HE MCS to 4 bits.
+
+Mask it for HE modes too. Un-skip mt76_connac_test_txs_he_dcm.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c       | 6 +++++-
+ tests/connac-mac-test.c | 5 +----
+ 2 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 986e452e..93379112 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -663,11 +663,16 @@ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 	}
+ 
+ 	txrate = FIELD_GET(MT_TXS0_TX_RATE, txs);
++	mode = FIELD_GET(MT_TX_RATE_MODE, txrate);
+ 
+ 	rate.mcs = FIELD_GET(MT_TX_RATE_IDX, txrate);
+ 	rate.nss = FIELD_GET(MT_TX_RATE_NSS, txrate) + 1;
+ 	stbc = FIELD_GET(MT_TX_RATE_STBC, txrate);
+ 
++	/* for HE, bits 4 and 5 of the index are DCM and the SU ext tone */
++	if (mode >= MT_PHY_TYPE_HE_SU && mode <= MT_PHY_TYPE_HE_MU)
++		rate.mcs &= GENMASK(3, 0);
++
+ 	if (stbc && rate.nss > 1)
+ 		rate.nss >>= 1;
+ 
+@@ -676,7 +681,6 @@ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 	if (rate.mcs < ARRAY_SIZE(stats->tx_mcs))
+ 		stats->tx_mcs[rate.mcs]++;
+ 
+-	mode = FIELD_GET(MT_TX_RATE_MODE, txrate);
+ 	switch (mode) {
+ 	case MT_PHY_TYPE_CCK:
+ 		cck = true;
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 1b5500af..486bc2a7 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -1184,8 +1184,7 @@ static void mt76_connac_test_txs_modes(struct kunit *test)
+ }
+ 
+ /* An HE frame sent with DCM: MCS 3, DCM on. MT_TX_RATE_IDX includes the
+- * DCM bit (bit 4), so the MCS reads as 19, the status is rejected as an
+- * invalid HE MCS, and rate.he_dcm can never be set.
++ * DCM bit (bit 4); the MCS is the low 4 bits, and DCM is reported.
+  */
+ static void mt76_connac_test_txs_he_dcm(struct kunit *test)
+ {
+@@ -1193,8 +1192,6 @@ static void mt76_connac_test_txs_he_dcm(struct kunit *test)
+ 	struct mt76_wcid *wcid;
+ 	__le32 txs[8] = {};
+ 
+-	kunit_skip(test, "driver bug: HE txs with DCM rejected, MCS includes the DCM bit");
+-
+ 	dev = mt76_connac_test_dev(test);
+ 	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, wcid);

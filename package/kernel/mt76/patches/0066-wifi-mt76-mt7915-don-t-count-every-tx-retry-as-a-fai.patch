@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:50:31 +0100
+Subject: [PATCH] wifi: mt76: mt7915: don't count every tx retry as a failure
+
+The tx-free event's MPDU header words carry how many times a frame was
+sent and whether it was finally acked. mt7915_mac_tx_free() counted
+tx_failed as the retries plus the status bit, so a frame acked on its
+third try added 2 to tx_failed as well as to tx_retries. On the router
+`iw station dump` showed tx failed equal to tx retries for every client,
+which hides the frames that were actually lost.
+
+Count a failure only when the status says the frame wasn't acked, as
+mt7921 and mt7925 do. tx_retries is unchanged. Only without WED; with
+WED the PPDU tx status reports both counts.
+
+The three tx-free tests had pinned the old sum; they now expect only
+the dropped frame as failed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 7 +++----
+ mt7915/tests/mac-test.c | 6 +++---
+ 2 files changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 892d549f..8436dbf1 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -933,16 +933,15 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 		if (!mtk_wed_device_active(&mdev->mmio.wed) && wcid) {
+ 			u32 tx_retries = 0, tx_failed = 0, count;
+ 
++			/* count: transmissions; stat: non-zero if never acked */
+ 			if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3)) {
+ 				count = FIELD_GET(MT_TX_FREE_COUNT_V3, info);
+ 				tx_retries = count ? count - 1 : 0;
+-				tx_failed = tx_retries +
+-					!!FIELD_GET(MT_TX_FREE_STAT_V3, info);
++				tx_failed = !!FIELD_GET(MT_TX_FREE_STAT_V3, info);
+ 			} else if (!v3 && (info & MT_TX_FREE_MPDU_HEADER)) {
+ 				count = FIELD_GET(MT_TX_FREE_COUNT, info);
+ 				tx_retries = count ? count - 1 : 0;
+-				tx_failed = tx_retries +
+-					!!FIELD_GET(MT_TX_FREE_STAT, info);
++				tx_failed = !!FIELD_GET(MT_TX_FREE_STAT, info);
+ 			}
+ 			wcid->stats.tx_retries += tx_retries;
+ 			wcid->stats.tx_failed += tx_failed;
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 870ef3b7..bd065b90 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -2475,7 +2475,7 @@ static void mt7915_test_tx_free(struct kunit *test)
+ 	}
+ 	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, 0);
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_retries, 2);
+-	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 3);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 1);
+ 	KUNIT_EXPECT_FALSE(test, env->q.blocked);
+ 	/* band 0's PSD and BE rings were cleaned first */
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
+@@ -2521,7 +2521,7 @@ static void mt7915_test_tx_free_v3(struct kunit *test)
+ 	}
+ 	/* sent twice, then acked */
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_retries, 1);
+-	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 1);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 0);
+ 	/* both bands' rings */
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 4);
+ }
+@@ -2558,7 +2558,7 @@ static void mt7915_test_tx_free_unknown(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, 0);
+ 	/* the interface entry's frames are counted to it */
+ 	KUNIT_EXPECT_EQ(test, mvif->sta.wcid.stats.tx_retries, 3);
+-	KUNIT_EXPECT_EQ(test, mvif->sta.wcid.stats.tx_failed, 3);
++	KUNIT_EXPECT_EQ(test, mvif->sta.wcid.stats.tx_failed, 0);
+ 	kfree_skb(skb);
+ }
+ 

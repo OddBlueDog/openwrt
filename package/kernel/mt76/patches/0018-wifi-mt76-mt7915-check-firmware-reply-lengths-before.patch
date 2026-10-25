@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:22:42 +0100
+Subject: [PATCH] wifi: mt76: mt7915: check firmware reply lengths before
+ parsing
+
+The response parser and several callers read fixed offsets from MCU
+replies without checking their length: the sequence number, the
+THERMAL_CTRL result, the per-channel MIB counters used for survey and
+ACS, and the WA tx statistics. A short or mismatched reply then yields
+stale buffer contents as temperatures or channel-time counters.
+
+Treat a reply too short to hold a header as unmatched, and fail the
+others when the payload is shorter than what they read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 67f4e594..d8cdd414 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -175,6 +175,10 @@ mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+ 		return -ETIMEDOUT;
+ 	}
+ 
++	/* too short to carry a seq: not a response we can match */
++	if (skb->len < sizeof(*rxd))
++		return -EAGAIN;
++
+ 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
+ 	if (seq != rxd->seq &&
+ 	    !(rxd->eid == MCU_CMD_EXT_CID &&
+@@ -185,6 +189,8 @@ mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+ 		skb_pull(skb, sizeof(*rxd) - 4);
+ 		ret = *skb->data;
+ 	} else if (cmd == MCU_EXT_CMD(THERMAL_CTRL)) {
++		if (skb->len < sizeof(*rxd) + 8)
++			return -EINVAL;
+ 		skb_pull(skb, sizeof(*rxd) + 4);
+ 		ret = le32_to_cpu(*(__le32 *)skb->data);
+ 	} else {
+@@ -3238,6 +3244,11 @@ int mt7915_mcu_get_chan_mib_info(struct mt7915_phy *phy, bool chan_switch)
+ 	if (ret)
+ 		return ret;
+ 
++	if (skb->len < offs_cc + len * sizeof(*res)) {
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
++
+ 	res = (struct mt7915_mcu_mib *)(skb->data + offs_cc);
+ 
+ #define __res_u64(s) le64_to_cpu(res[s].data)
+@@ -4324,6 +4335,11 @@ int mt7915_mcu_wed_wa_tx_stats(struct mt7915_dev *dev, u16 wlan_idx)
+ 	if (ret)
+ 		return ret;
+ 
++	if (skb->len < (is_mt7915(&dev->mt76) ? 0 : 4) + sizeof(*res)) {
++		ret = -EINVAL;
++		goto out;
++	}
++
+ 	if (!is_mt7915(&dev->mt76))
+ 		skb_pull(skb, 4);
+ 

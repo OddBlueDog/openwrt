@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:18:07 +0100
+Subject: [PATCH] wifi: mt76: mt7915: program the VoW band of a new interface
+ on success
+
+Commit 6b7b98627bcc ("wifi: mt76: mt7915: HW ATF support for mt7986+")
+added the mt7915_mcu_set_vow_band() call at the single exit of
+mt7915_add_interface(). Commit c52a151151c1 ("wifi: mt76: mt7915: unwind
+state on add_interface failure") then gave the success path its own
+early return, so the group-to-band mapping is now only sent when adding
+the interface fails, and never for an interface that was actually added.
+
+Send it on the success path only.
+
+Fixes: c52a151151c1 ("wifi: mt76: mt7915: unwind state on add_interface failure")
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/main.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index d70a9c9e..8adbf480 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -279,6 +279,9 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
+ 
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
++	if (!is_mt7915(&dev->mt76))
++		mt7915_mcu_set_vow_band(dev, mvif);
++
+ 	return 0;
+ 
+ err:
+@@ -290,9 +293,6 @@ out:
+ 		phy->monitor_vif = NULL;
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+-	if (!is_mt7915(&dev->mt76))
+-		mt7915_mcu_set_vow_band(dev, mvif);
+-
+ 	return ret;
+ }
+ 

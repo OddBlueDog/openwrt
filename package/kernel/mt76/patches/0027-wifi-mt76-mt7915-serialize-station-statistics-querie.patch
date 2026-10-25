@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:27:47 +0100
+Subject: [PATCH] wifi: mt76: mt7915: serialize station statistics queries with
+ resets
+
+mt7915_sta_statistics() sends MCU queries that wait for a reply without
+holding dev->mt76.mutex. During a full reset the firmware is reloaded
+under that mutex after MT76_MCU_RESET has been cleared, so a station
+dump at that moment queues a query in the middle of the firmware
+download, times out, and makes the restart attempt fail and retry.
+
+Take the mutex around the queries.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/main.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 8adbf480..43cdd3ad 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1200,6 +1200,11 @@ static void mt7915_sta_statistics(struct ieee80211_hw *hw,
+ 	struct rate_info *txrate = &msta->wcid.rate;
+ 	struct rate_info rxrate = {};
+ 
++	/* serialize the MCU queries with mt7915_mac_full_reset(), which
++	 * reloads the firmware with this mutex held
++	 */
++	mutex_lock(&phy->dev->mt76.mutex);
++
+ 	if (!mt7915_mcu_get_rx_rate(phy, vif, sta, &rxrate)) {
+ 		sinfo->rxrate = rxrate;
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+@@ -1241,6 +1246,8 @@ static void mt7915_sta_statistics(struct ieee80211_hw *hw,
+ 		}
+ 	}
+ 
++	mutex_unlock(&phy->dev->mt76.mutex);
++
+ 	sinfo->tx_failed = msta->wcid.stats.tx_failed;
+ 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
+ 

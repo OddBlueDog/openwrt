@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:28:14 +0100
+Subject: [PATCH] wifi: mt76: mt7915: stop the hardware when init fails after
+ DMA setup
+
+When mt7915_init_hardware() failed after mt7915_dma_init(), for example
+because the firmware is missing or doesn't answer, or the EEPROM can't
+be loaded, mt7915_register_device() went straight to freeing band 1's
+phy. WFDMA stayed enabled with its rings, NAPI contexts and page pools
+allocated, the firmware wasn't given back and the MT798x WMAC stayed
+on, while the probe's caller went on to free the device. Only the error
+paths after mt7915_init_hardware() called mt7915_stop_hardware().
+
+Stop the hardware in mt7915_init_hardware() itself for everything that
+fails once DMA is up. Un-skip the test that checks it, and give the
+dead-firmware fixture the WMAC window the teardown now uses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c            | 51 +++++++++++++++++++++++-----------------
+ mt7915/tests/init-test.c | 34 ++++++++++-----------------
+ 2 files changed, 42 insertions(+), 43 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 94b58bbf..4e2db8e0 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -898,6 +898,23 @@ static bool mt7915_band_config(struct mt7915_dev *dev)
+ 	return ret;
+ }
+ 
++static void mt7915_stop_hardware(struct mt7915_dev *dev)
++{
++	int i;
++
++	mt76_for_each_q_rx(&dev->mt76, i) {
++		if (!mt76_queue_is_wed_rro(&dev->mt76.q_rx[i]))
++			napi_disable(&dev->mt76.napi[i]);
++	}
++	mt7915_mcu_exit(dev);
++	mt76_connac2_tx_token_put(&dev->mt76);
++	mt7915_dma_cleanup(dev);
++	tasklet_disable(&dev->mt76.irq_tasklet);
++
++	if (is_mt798x(&dev->mt76))
++		mt7986_wmac_disable(dev);
++}
++
+ static int
+ mt7915_init_hardware(struct mt7915_dev *dev, struct mt7915_phy *phy2)
+ {
+@@ -916,22 +933,24 @@ mt7915_init_hardware(struct mt7915_dev *dev, struct mt7915_phy *phy2)
+ 
+ 	ret = mt7915_mcu_init(dev);
+ 	if (ret)
+-		return ret;
++		goto stop_hw;
+ 
+ 	ret = mt7915_eeprom_init(dev);
+ 	if (ret < 0)
+-		return ret;
++		goto stop_hw;
+ 
+ 	if (dev->cal) {
+ 		ret = mt7915_mcu_apply_group_cal(dev);
+ 		if (ret)
+-			return ret;
++			goto stop_hw;
+ 	}
+ 
+ 	/* Beacon and mgmt frames should occupy wcid 0 */
+ 	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7915_WTBL_STA);
+-	if (idx)
+-		return -ENOSPC;
++	if (idx) {
++		ret = -ENOSPC;
++		goto stop_hw;
++	}
+ 
+ 	dev->mt76.global_wcid.idx = idx;
+ 	dev->mt76.global_wcid.hw_key_idx = -1;
+@@ -939,6 +958,11 @@ mt7915_init_hardware(struct mt7915_dev *dev, struct mt7915_phy *phy2)
+ 	rcu_assign_pointer(dev->mt76.wcid[idx], &dev->mt76.global_wcid);
+ 
+ 	return 0;
++
++stop_hw:
++	/* DMA is up: stop it and free the rings, as the later error paths do */
++	mt7915_stop_hardware(dev);
++	return ret;
+ }
+ 
+ void mt7915_set_stream_vht_txbf_caps(struct mt7915_phy *phy)
+@@ -1280,23 +1304,6 @@ static void mt7915_unregister_ext_phy(struct mt7915_dev *dev)
+ 	ieee80211_free_hw(mphy->hw);
+ }
+ 
+-static void mt7915_stop_hardware(struct mt7915_dev *dev)
+-{
+-	int i;
+-
+-	mt76_for_each_q_rx(&dev->mt76, i) {
+-		if (!mt76_queue_is_wed_rro(&dev->mt76.q_rx[i]))
+-			napi_disable(&dev->mt76.napi[i]);
+-	}
+-	mt7915_mcu_exit(dev);
+-	mt76_connac2_tx_token_put(&dev->mt76);
+-	mt7915_dma_cleanup(dev);
+-	tasklet_disable(&dev->mt76.irq_tasklet);
+-
+-	if (is_mt798x(&dev->mt76))
+-		mt7986_wmac_disable(dev);
+-}
+-
+ int mt7915_register_device(struct mt7915_dev *dev)
+ {
+ 	struct mt7915_phy *phy2;
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index fa0c44da..2f97d479 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -1796,13 +1796,15 @@ static void mt7915_init_test_unregister_device(struct kunit *test)
+ 
+ /* An MT7986 that can do DMA, about to go through mt7915_register_device()
+  * with firmware that doesn't answer: MT76_MCU_RESET is set, so each
+- * firmware command times out at once instead of after seconds.
++ * firmware command times out at once instead of after seconds. The WMAC
++ * window is there for the teardown to disable it again.
+  */
+ static struct mt7915_dev *mt7915_init_test_dead_fw(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev = mt7915_init_test_chip(test,
+ 						       MT7976_ONE_ADIE_DBDC);
+ 
++	mt7915_init_test_soc(test, dev);
+ 	KUNIT_ASSERT_EQ(test, dma_coerce_mask_and_coherent(dev->mt76.dma_dev,
+ 			DMA_BIT_MASK(32)), 0);
+ 	mt76_wr(dev, MT_TOP_MISC, FIELD_PREP(MT_TOP_MISC_FW_STATE,
+@@ -1816,17 +1818,6 @@ static struct mt7915_dev *mt7915_init_test_dead_fw(struct kunit *test)
+ 	return dev;
+ }
+ 
+-/* what mt7915_stop_hardware() would undo of the DMA init */
+-static void mt7915_init_test_dma_teardown(struct mt7915_dev *dev)
+-{
+-	int i;
+-
+-	mt76_for_each_q_rx(&dev->mt76, i)
+-		napi_disable(&dev->mt76.napi[i]);
+-	mt7915_dma_cleanup(dev);
+-	tasklet_kill(&dev->mt76.irq_tasklet);
+-}
+-
+ /* mt7915_register_device() with the firmware not answering (missing or
+  * hung): band config and DMA are set up, interrupts masked, the firmware
+  * download fails at the patch semaphore and the error comes back, without
+@@ -1855,28 +1846,29 @@ static void mt7915_init_test_register_no_firmware(struct kunit *test)
+ 	/* the driver's own firmware path took over from the fake */
+ 	KUNIT_EXPECT_PTR_NE(test, dev->mt76.mcu_ops, &mt7915_test_mcu_ops);
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
+-	/* rx DMA was set up */
++	/* rx DMA was set up (and torn down again, see the next test) */
+ 	KUNIT_EXPECT_NE(test, dev->mt76.q_rx[MT_RXQ_MAIN].ndesc, 0);
+-
+-	mt7915_init_test_dma_teardown(dev);
+ }
+ 
+-/* A failed mt7915_register_device() should leave the hardware as it found
+- * it: when mt7915_init_hardware() fails after the DMA init (no firmware),
+- * nothing stops the WFDMA engines or frees the rings, NAPI contexts and
+- * page pools (mt7915_stop_hardware() is only on the later error paths).
++/* A failed mt7915_register_device() leaves the hardware as it found it:
++ * when mt7915_init_hardware() fails after the DMA init (no firmware), it
++ * stops the WFDMA engines and frees the rings, NAPI contexts and page
++ * pools, as the later error paths do, and gives the firmware back.
+  */
+ static void mt7915_init_test_register_no_firmware_cleanup(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev;
+ 
+-	kunit_skip(test, "driver bug: mt7915_register_device() leaves DMA running and allocated when mt7915_init_hardware() fails");
+-
+ 	dev = mt7915_init_test_dead_fw(test);
+ 	KUNIT_EXPECT_LT(test, mt7915_register_device(dev), 0);
+ 	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
+ 			(MT_WFDMA0_GLO_CFG_TX_DMA_EN |
+ 			 MT_WFDMA0_GLO_CFG_RX_DMA_EN), 0);
++	KUNIT_EXPECT_NE(test, mt76_rr(dev, MT_TOP_LPCR_HOST_BAND(0)) &
++			MT_TOP_LPCR_HOST_FW_OWN, 0);
++	/* the WMAC is disabled again: bus sleep protection on */
++	KUNIT_EXPECT_NE(test, mt76_rr(dev, MT_CONN_INFRA_WF_SLP_PROT) &
++			MT_CONN_INFRA_WF_SLP_PROT_MASK, 0);
+ }
+ 
+ static struct kunit_case mt7915_init_test_cases[] = {

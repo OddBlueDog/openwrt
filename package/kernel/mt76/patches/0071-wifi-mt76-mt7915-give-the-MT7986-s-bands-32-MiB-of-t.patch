@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:54:13 +0100
+Subject: [PATCH] wifi: mt76: mt7915: give the MT7986's bands 32 MiB of tx
+ queues too
+
+mt7915_init_wiphy() raised mac80211's tx queue memory limit to 32 MiB
+only without DBDC. That rule is for the MT7915, whose two bands share
+one PCIe card. The MT7986 is always DBDC, so both its bands stayed on
+mac80211's default: 16 MiB on 5 GHz and 4 MiB on 2.4 GHz, where the
+band has no VHT. Once a band's fq memory is full, mac80211 drops from
+its longest flow, which can be a fast client's TCP flow.
+
+Keep 16 MiB for the MT7915 with DBDC and use 32 MiB everywhere else.
+fq_codel still bounds the queueing delay; this only raises the memory
+cap. On the router: "fq_memory_limit" in
+/sys/kernel/debug/ieee80211/phy*/aqm.
+
+The wiphy tests now expect 32 MiB on both MT7986 bands and 16 MiB on
+the MT7915 with DBDC.
+
+Ported from pesa1234/openwrt next-r4.12.0.rss.mtk,
+9001-wifi-mt76-mt7915-increase-txq-memory-limit (Chad Monroe).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c            |  8 +++++++-
+ mt7915/tests/init-test.c | 13 ++++++++-----
+ 2 files changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index cc3026a0..0ff15d27 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -456,7 +456,13 @@ mt7915_init_wiphy(struct mt7915_phy *phy)
+ 
+ 	hw->max_tx_fragments = 4;
+ 
+-	if (!phy->dev->dbdc_support)
++	/*
++	 * mac80211's default is 16 MiB, or 4 MiB without VHT (2.4 GHz).
++	 * Only the MT7915's DBDC, two bands on one PCIe card, keeps 16 MiB.
++	 */
++	if (dev->dbdc_support && is_mt7915(mdev))
++		wiphy->txq_memory_limit = 16 << 20; /* 16 MiB */
++	else
+ 		wiphy->txq_memory_limit = 32 << 20; /* 32 MiB */
+ 
+ 	if (phy->mt76->cap.has_2ghz) {
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index ae708b43..780f1b42 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -393,8 +393,9 @@ static void mt7915_init_test_wiphy(struct kunit *test)
+ 	KUNIT_EXPECT_NE(test, wiphy->flags & WIPHY_FLAG_HAS_CHANNEL_SWITCH, 0);
+ 	KUNIT_EXPECT_EQ(test, wiphy->mbssid_max_interfaces, 16);
+ 	KUNIT_EXPECT_EQ(test, hw->max_tx_fragments, 4);
+-	/* DBDC: the 32 MiB tx queue limit isn't raised */
+-	KUNIT_EXPECT_NE(test, wiphy->txq_memory_limit, 32 << 20);
++	/* DBDC on the MT7986: still 32 MiB of tx queues per band */
++	KUNIT_EXPECT_EQ(test, wiphy->txq_memory_limit, 32 << 20);
++	KUNIT_EXPECT_EQ(test, hw2->wiphy->txq_memory_limit, 32 << 20);
+ 	KUNIT_EXPECT_EQ(test, wiphy->available_antennas_tx, 0xf);
+ 	KUNIT_EXPECT_EQ(test, wiphy->available_antennas_rx, 0xf);
+ 	KUNIT_EXPECT_EQ(test, hw2->wiphy->available_antennas_tx, 0xf);
+@@ -1557,9 +1558,9 @@ static void mt7915_init_test_thermal_zone(struct kunit *test)
+ /* --- more capabilities, power and thermal corners ------------------------ */
+ 
+ /* The MT7915's wiphy (cheap: init_wiphy only checks the chip id): 4 us
+- * A-MPDU density, 7991 byte VHT MPDUs, and without DBDC 160 MHz short GI
+- * and extended NSS BW; a background radar chain but no per-station tx
+- * power.
++ * A-MPDU density, 7991 byte VHT MPDUs, and without DBDC 160 MHz short GI,
++ * extended NSS BW and 32 MiB tx queues; a background radar chain but no
++ * per-station tx power.
+  */
+ static void mt7915_init_test_wiphy_mt7915(struct kunit *test)
+ {
+@@ -1603,6 +1604,8 @@ static void mt7915_init_test_wiphy_mt7915(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, *vht & IEEE80211_VHT_CAP_SHORT_GI_160, 0);
+ 	KUNIT_EXPECT_FALSE(test, ieee80211_hw_check(hw,
+ 						   SUPPORTS_VHT_EXT_NSS_BW));
++	/* and two bands on one card share 16 MiB tx queues each */
++	KUNIT_EXPECT_EQ(test, hw->wiphy->txq_memory_limit, 16 << 20);
+ 	dev->mt76.rev = 0x79860000;
+ }
+ 

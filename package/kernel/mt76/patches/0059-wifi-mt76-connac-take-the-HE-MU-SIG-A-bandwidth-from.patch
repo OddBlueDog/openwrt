@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:41:16 +0100
+Subject: [PATCH] wifi: mt76: connac: take the HE-MU SIG-A bandwidth from the
+ frame
+
+mt76_connac2_mac_decode_he_mu_radiotap() ran after the RU decode had
+set status->bw to RATE_INFO_BW_HE_RU, and put status->bw, a rate_info_bw
+value, into radiotap's SIG-A bandwidth field, which counts 20, 40, 80
+and 160 MHz as 0-3. So every HE-MU frame was reported at 80 MHz, and
+its second content channel and second RU allocations were reported for
+20 and 40 MHz frames too. Only radiotap (monitor mode) is affected.
+
+Decode the HE-MU fields before the RU, and map the bandwidth. Un-skip
+mt76_connac_test_he_radiotap_mu_bw, and give the HE-MU test the 80 MHz
+frame its four RU allocations need.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c       | 21 +++++++++++++++++++--
+ tests/connac-mac-test.c | 30 ++++++++++++++++++++++++------
+ 2 files changed, 43 insertions(+), 8 deletions(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index c98bbbb9..1eda0c57 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -856,6 +856,7 @@ mt76_connac2_mac_decode_he_mu_radiotap(struct mt76_dev *dev, struct sk_buff *skb
+ 		.flags2 = HE_BITS(MU_FLAGS2_BW_FROM_SIG_A_BW_KNOWN),
+ 	};
+ 	struct ieee80211_radiotap_he_mu *he_mu;
++	u8 bw;
+ 
+ 	status->flag |= RX_FLAG_RADIOTAP_HE_MU;
+ 
+@@ -873,7 +874,23 @@ mt76_connac2_mac_decode_he_mu_radiotap(struct mt76_dev *dev, struct sk_buff *skb
+ 	if (status->he_dcm)
+ 		he_mu->flags1 |= MU_PREP(FLAGS1_SIG_B_DCM, status->he_dcm);
+ 
+-	he_mu->flags2 |= MU_PREP(FLAGS2_BW_FROM_SIG_A_BW, status->bw) |
++	/* the frame's bandwidth: called before the RU decode changes it */
++	switch (status->bw) {
++	case RATE_INFO_BW_160:
++		bw = IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW_160MHZ;
++		break;
++	case RATE_INFO_BW_80:
++		bw = IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW_80MHZ;
++		break;
++	case RATE_INFO_BW_40:
++		bw = IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW_40MHZ;
++		break;
++	default:
++		bw = IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW_20MHZ;
++		break;
++	}
++
++	he_mu->flags2 |= MU_PREP(FLAGS2_BW_FROM_SIG_A_BW, bw) |
+ 			 MU_PREP(FLAGS2_SIG_B_SYMS_USERS,
+ 				 le32_get_bits(rxv[2], MT_CRXV_HE_NUM_USER));
+ 
+@@ -955,8 +972,8 @@ void mt76_connac2_mac_decode_he_radiotap(struct mt76_dev *dev,
+ 		he->data3 |= HE_PREP(DATA3_UL_DL, UPLINK, rxv[2]);
+ 		he->data4 |= HE_PREP(DATA4_MU_STA_ID, MU_AID, rxv[7]);
+ 
+-		mt76_connac2_mac_decode_he_radiotap_ru(status, he, rxv);
+ 		mt76_connac2_mac_decode_he_mu_radiotap(dev, skb, rxv);
++		mt76_connac2_mac_decode_he_radiotap_ru(status, he, rxv);
+ 		break;
+ 	case MT_PHY_TYPE_HE_TB:
+ 		he->data1 |= HE_BITS(DATA1_FORMAT_TRIG) |
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 5b358db0..c0874c38 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -2139,7 +2139,8 @@ static void mt76_connac_test_he_radiotap_tb(struct kunit *test)
+ }
+ 
+ /* HE-MU: the station id and RU go in the HE header, the SIG-B fields in a
+- * second, HE-MU radiotap header in front of it.
++ * second, HE-MU radiotap header in front of it. At 80 MHz there are two
++ * RU allocations for each of the two content channels.
+  */
+ static void mt76_connac_test_he_radiotap_mu(struct kunit *test)
+ {
+@@ -2162,6 +2163,7 @@ static void mt76_connac_test_he_radiotap_mu(struct kunit *test)
+ 	rxv[7] = cpu_to_le32(FIELD_PREP(MT_CRXV_HE_MU_AID, 0x123));
+ 	status->rate_idx = 7;
+ 	status->he_dcm = 1;
++	status->bw = RATE_INFO_BW_80;
+ 
+ 	mt76_connac2_mac_decode_he_radiotap(dev, skb, rxv, MT_PHY_TYPE_HE_MU);
+ 
+@@ -2204,6 +2206,12 @@ static void mt76_connac_test_he_radiotap_mu(struct kunit *test)
+ 		le16_to_cpu(he_mu->flags2)), 5);
+ 	KUNIT_EXPECT_TRUE(test, le16_to_cpu(he_mu->flags2) &
+ 		IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW_KNOWN);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(
++		IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW,
++		le16_to_cpu(he_mu->flags2)),
++		IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW_80MHZ);
++	KUNIT_EXPECT_TRUE(test, flags1 &
++		IEEE80211_RADIOTAP_HE_MU_FLAGS1_CH2_RU_KNOWN);
+ 	KUNIT_EXPECT_EQ(test, he_mu->ru_ch1[0], 0x11);
+ 	KUNIT_EXPECT_EQ(test, he_mu->ru_ch2[0], 0x22);
+ 	KUNIT_EXPECT_EQ(test, he_mu->ru_ch1[1], 0x33);
+@@ -2218,9 +2226,10 @@ static void mt76_connac_test_he_radiotap_mu(struct kunit *test)
+ 			   IEEE80211_RADIOTAP_HE_MU_FLAGS1_SIG_B_DCM);
+ }
+ 
+-/* The SIG-A bandwidth in the HE-MU header should be the frame's (20, 40,
+- * 80 or 160 MHz, radiotap's 0-3); the driver encodes status->bw, which by
+- * then is RATE_INFO_BW_HE_RU (and in rate_info_bw units anyway).
++/* The SIG-A bandwidth in the HE-MU header is the frame's (20, 40, 80 or
++ * 160 MHz, radiotap's 0-3), not status->bw, which the RU decode turns into
++ * RATE_INFO_BW_HE_RU (and which is in rate_info_bw units anyway). A 40 MHz
++ * frame has one RU allocation per content channel.
+  */
+ static void mt76_connac_test_he_radiotap_mu_bw(struct kunit *test)
+ {
+@@ -2231,8 +2240,6 @@ static void mt76_connac_test_he_radiotap_mu_bw(struct kunit *test)
+ 	__le32 rxv[16] = {};
+ 	u8 mode;
+ 
+-	kunit_skip(test, "driver bug: HE-MU radiotap SIG-A BW is RATE_INFO_BW_HE_RU");
+-
+ 	dev = mt76_connac_test_dev(test);
+ 	skb = mt76_connac_test_rx_skb(test);
+ 	status = (struct mt76_rx_status *)skb->cb;
+@@ -2245,6 +2252,17 @@ static void mt76_connac_test_he_radiotap_mu_bw(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, FIELD_GET(
+ 		IEEE80211_RADIOTAP_HE_MU_FLAGS2_BW_FROM_SIG_A_BW,
+ 		le16_to_cpu(he_mu->flags2)), 1);
++	KUNIT_EXPECT_TRUE(test, le16_to_cpu(he_mu->flags1) &
++			  IEEE80211_RADIOTAP_HE_MU_FLAGS1_CH2_RU_KNOWN);
++
++	/* a second RU per channel only exists from 80 MHz up */
++	rxv[3] = cpu_to_le32(FIELD_PREP(MT_CRXV_HE_RU2, 0x33));
++	skb = mt76_connac_test_rx_skb(test);
++	status = (struct mt76_rx_status *)skb->cb;
++	status->bw = RATE_INFO_BW_40;
++	mt76_connac2_mac_decode_he_radiotap(dev, skb, rxv, mode);
++	he_mu = (struct ieee80211_radiotap_he_mu *)skb->data;
++	KUNIT_EXPECT_EQ(test, he_mu->ru_ch1[1], 0);
+ }
+ 
+ /* The connac2-only "known" bits go into the frame's own HE-MU header, not

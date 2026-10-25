@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:50:58 +0100
+Subject: [PATCH] wifi: mt76: skip a txq whose station is on the other hw
+
+mt76_txq_schedule_list() takes the phy for each txq from its wcid. A
+txq can outlive its station's wcid index on mac80211's active list: once
+the index is freed, a station on the other band of a DBDC chip can get
+it. The txq then came from band 0's hw while the phy was band 1's, and
+mt76_txq_send_burst() dequeued it with ieee80211_tx_dequeue() on band
+1's hw. mac80211's fq code then indexes one local's flows with the other
+local's, which can corrupt memory.
+
+Our earlier "schedule a station's txqs on the hw it belongs to" already
+keeps ieee80211_next_txq() on the hw the round started on; skip a txq
+whose wcid's phy is on another hw too. Multi-radio phys that share one
+hw are unaffected.
+
+Ported from pesa1234/openwrt next-r4.12.0.rss.mtk,
+9999-18-wifi-mt76-fix-kernel-panic-in-tx-scheduling-on-dual-band-Wi-Fi-6
+(Chen Minqiang). Not unit tested: this path needs mac80211's own txqs,
+which the KUnit fakes don't have.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tx.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/tx.c b/tx.c
+index 67be2aa7..6a3e82bb 100644
+--- a/tx.c
++++ b/tx.c
+@@ -611,7 +611,15 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
+ 		if (!wcid)
+ 			continue;
+ 
++		/*
++		 * A stale txq whose wcid index now belongs to a station on
++		 * another hw (the other band of a DBDC chip): dequeueing it
++		 * there would mix the two hws' mac80211 queues.
++		 */
+ 		phy = mt76_dev_phy(dev, wcid->phy_idx);
++		if (phy->hw != hw)
++			continue;
++
+ 		if (test_bit(MT76_RESET, &phy->state) || phy->offchannel)
+ 			continue;
+ 

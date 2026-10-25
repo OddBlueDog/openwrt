@@ -1,0 +1,4093 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 05:14:23 +0100
+Subject: [PATCH] milkflint tests: core DMA, tx path and MMIO
+
+83 KUnit tests in 5 suites. In-scope coverage:
+- dma.c: 0% -> 97.0%
+- tx.c: 4.1% -> 76.5%
+- mmio.c: 18.3% -> 100%
+
+- mt76-dma, mt76-dma-rx, mt76-dma-wed: real rings in coherent DMA memory,
+  with the queue registers in a buffer the test plays the hardware for.
+  - queue alloc and reset (EMI, and the dead-bus clamp);
+  - txwi/rxwi caches;
+  - tx_queue_skb: linear and fragmented frames, the 32-buffer limit, a
+    full queue, reset, prepare errors and the 4-byte pad;
+  - raw tx and tx cleanup;
+  - rx fill and process: budget, drop flags, fragments, oversized frames;
+  - WED rx tokens and the WED-RRO rings, including the fork's
+    repeat/old/unknown-token fixes;
+  - NAPI poll, init and cleanup.
+- mt76-tx: recording queue ops, with the tx worker parked.
+  - the pending and off-channel lists, and schedule_pending ordering and
+    hold-back, including the stranded-frames requeue fix;
+  - the tx worker across phys;
+  - non-AQL accounting on the primary link (the MLO fixes);
+  - tx-status pktids, including the stale-entry check;
+  - completion ordering and the timeout sweep;
+  - powersave transitions and the U-APSD EOSP;
+  - tokens and rx tokens.
+- mt76-mmio: the bus ops, copies with odd tails, register pairs and the
+  irq mask.
+
+Not covered: tx.c's mac80211 TXQ dequeue and scheduling loop. That needs
+mac80211 txqs, which only exist on interfaces created from userspace. The
+VM's hwsim self-test runs that path end to end.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dma.c             |    4 +
+ mmio.c            |    4 +
+ tests/dma-test.c  | 2234 +++++++++++++++++++++++++++++++++++++++++++++
+ tests/mmio-test.c |  221 +++++
+ tests/tx-test.c   | 1534 +++++++++++++++++++++++++++++++
+ tx.c              |    4 +
+ 6 files changed, 4001 insertions(+)
+ create mode 100644 tests/dma-test.c
+ create mode 100644 tests/mmio-test.c
+ create mode 100644 tests/tx-test.c
+
+diff --git a/dma.c b/dma.c
+index 3aef3583..d28fcaff 100644
+--- a/dma.c
++++ b/dma.c
+@@ -1237,3 +1237,7 @@ void mt76_dma_cleanup(struct mt76_dev *dev)
+ 	free_netdev(dev->tx_napi_dev);
+ }
+ EXPORT_SYMBOL_GPL(mt76_dma_cleanup);
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/dma-test.c"
++#endif
+diff --git a/mmio.c b/mmio.c
+index 73d47608..350cb42a 100644
+--- a/mmio.c
++++ b/mmio.c
+@@ -126,3 +126,7 @@ void mt76_mmio_init(struct mt76_dev *dev, void __iomem *regs)
+ 	spin_lock_init(&dev->mmio.irq_lock);
+ }
+ EXPORT_SYMBOL_GPL(mt76_mmio_init);
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/mmio-test.c"
++#endif
+diff --git a/tests/dma-test.c b/tests/dma-test.c
+new file mode 100644
+index 00000000..d2201d24
+--- /dev/null
++++ b/tests/dma-test.c
+@@ -0,0 +1,2234 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt76's DMA rings (dma.c). Included at the end of dma.c
++ * when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test build only).
++ *
++ * The rings are real: descriptors in coherent DMA memory of the KUnit
++ * device, rx buffers from real page pools, tx buffers DMA-mapped. Only the
++ * queue registers (q->regs) sit in a plain buffer standing in for the MMIO
++ * window, so a test plays the hardware by moving dma_idx, setting DMA_DONE
++ * on descriptors and writing frames into rx buffers.
++ */
++#include <kunit/test.h>
++#include <linux/dma-direct.h>
++#include "fake.h"
++
++#define MT76_DMA_TEST_TXWI_SIZE		32
++#define MT76_DMA_TEST_BUF_SIZE		2048
++#define MT76_DMA_TEST_REGS		0x400
++#define MT76_DMA_TEST_RX_RING		0x200
++#define MT76_DMA_TEST_MAX_TXQ		4
++
++struct mt76_dma_test {
++	struct kunit *test;
++	struct mt76_dev *dev;
++	u32 *regs;			/* the MMIO window */
++	struct net_device *napi_dev;	/* for the rx queues' NAPI */
++	unsigned long napi_added, napi_enabled;
++	struct mt76_queue *txq[MT76_DMA_TEST_MAX_TXQ];
++	int n_txq;
++	bool dma_cleaned;		/* mt76_dma_cleanup() did the teardown */
++
++	/* tx_prepare_skb */
++	int n_prepare;
++	int prepare_ret;
++	enum mt76_txq_id prepare_qid;
++	struct mt76_wcid *prepare_wcid;
++	struct ieee80211_sta *prepare_sta;
++	void *prepare_txwi;
++	int prepare_nbuf;
++	u32 tx_info;			/* what prepare puts in tx_info->info */
++
++	/* tx_complete_skb */
++	struct mt76_queue_entry done[8];
++	int n_done;
++	struct mt76_queue *bump_q;	/* the hardware finishes more frames */
++	u32 bump_dma_idx;		/* ...while the first one completes */
++
++	/* rx */
++	struct sk_buff_head rx;		/* frames passed to rx_skb */
++	enum mt76_rxq_id rx_qid;
++	u32 rx_info;
++	int n_rx_check;
++	bool rx_check_drop;
++	void *rx_check_data;
++	int rx_check_len;
++	int n_poll_complete;
++	enum mt76_rxq_id poll_qid;
++	int n_rro_ind;
++	void *rro_ind;
++	int n_msdu_page;
++	int msdu_page_ret;
++	dma_addr_t msdu_page_addr;
++
++	int n_freed;			/* test skbs freed */
++};
++
++static struct mt76_dma_test *mt76_dma_test_ctx;
++
++/* fake.h's mt76_test_hw_ops, plus the channel context ops mac80211 (6.9+)
++ * insists on: without them mt76_test_dev() can't allocate the hw.
++ */
++static const struct ieee80211_ops mt76_dma_test_hw_ops = {
++	.tx = mt76_test_tx,
++	.start = mt76_test_start,
++	.stop = mt76_test_stop,
++	.add_interface = mt76_test_add_interface,
++	.remove_interface = mt76_test_remove_interface,
++	.config = mt76_test_config,
++	.configure_filter = mt76_test_configure_filter,
++	.wake_tx_queue = mt76_test_wake_tx_queue,
++	.add_chanctx = ieee80211_emulate_add_chanctx,
++	.remove_chanctx = ieee80211_emulate_remove_chanctx,
++	.change_chanctx = ieee80211_emulate_change_chanctx,
++	.switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx,
++};
++
++/* --- the driver ------------------------------------------------------------ */
++
++static int mt76_dma_test_prepare(struct mt76_dev *dev, void *txwi_ptr,
++				 enum mt76_txq_id qid, struct mt76_wcid *wcid,
++				 struct ieee80211_sta *sta,
++				 struct mt76_tx_info *tx_info)
++{
++	struct mt76_dma_test *t = mt76_dma_test_ctx;
++
++	t->n_prepare++;
++	t->prepare_qid = qid;
++	t->prepare_wcid = wcid;
++	t->prepare_sta = sta;
++	t->prepare_txwi = txwi_ptr;
++	t->prepare_nbuf = tx_info->nbuf;
++	if (t->prepare_ret)
++		return t->prepare_ret;
++
++	memset(txwi_ptr, 0xa5, MT76_DMA_TEST_TXWI_SIZE);
++	tx_info->info = t->tx_info;
++	return 0;
++}
++
++static void mt76_dma_test_tx_complete(struct mt76_dev *dev,
++				      struct mt76_queue_entry *e)
++{
++	struct mt76_dma_test *t = mt76_dma_test_ctx;
++
++	if (t->n_done < ARRAY_SIZE(t->done))
++		t->done[t->n_done] = *e;
++	t->n_done++;
++	if (t->bump_q) {
++		struct mt76_queue_regs *regs = (void __force *)t->bump_q->regs;
++
++		WRITE_ONCE(regs->dma_idx, t->bump_dma_idx);
++		t->bump_q = NULL;
++	}
++	if (e->skb && e->skb != DMA_DUMMY_DATA)
++		dev_kfree_skb_any(e->skb);
++}
++
++static bool mt76_dma_test_rx_check(struct mt76_dev *dev, void *data, int len)
++{
++	struct mt76_dma_test *t = mt76_dma_test_ctx;
++
++	t->n_rx_check++;
++	t->rx_check_data = data;
++	t->rx_check_len = len;
++	return !t->rx_check_drop;
++}
++
++static void mt76_dma_test_rx_skb(struct mt76_dev *dev, enum mt76_rxq_id q,
++				 struct sk_buff *skb, u32 *info)
++{
++	struct mt76_dma_test *t = mt76_dma_test_ctx;
++
++	t->rx_qid = q;
++	t->rx_info = *info;
++	skb_queue_tail(&t->rx, skb);
++}
++
++static void mt76_dma_test_poll_complete(struct mt76_dev *dev,
++					enum mt76_rxq_id q)
++{
++	struct mt76_dma_test *t = mt76_dma_test_ctx;
++
++	t->n_poll_complete++;
++	t->poll_qid = q;
++}
++
++static void mt76_dma_test_rro_ind_cb(struct mt76_dev *dev, void *data)
++{
++	struct mt76_dma_test *t = mt76_dma_test_ctx;
++
++	t->n_rro_ind++;
++	t->rro_ind = data;
++}
++
++static int mt76_dma_test_msdu_page(struct mt76_dev *dev, struct mt76_queue *q,
++				   dma_addr_t p, void *data)
++{
++	struct mt76_dma_test *t = mt76_dma_test_ctx;
++
++	t->n_msdu_page++;
++	t->msdu_page_addr = p;
++	return t->msdu_page_ret;
++}
++
++#define MT76_DMA_TEST_DRV						\
++	.txwi_size = MT76_DMA_TEST_TXWI_SIZE,				\
++	.tx_prepare_skb = mt76_dma_test_prepare,			\
++	.tx_complete_skb = mt76_dma_test_tx_complete,			\
++	.rx_check = mt76_dma_test_rx_check,				\
++	.rx_skb = mt76_dma_test_rx_skb,					\
++	.rx_poll_complete = mt76_dma_test_poll_complete,		\
++	.rx_rro_ind_process = mt76_dma_test_rro_ind_cb
++
++static const struct mt76_driver_ops mt76_dma_test_drv = {
++	MT76_DMA_TEST_DRV,
++};
++
++/* like the mt7915: txwis belong to tx tokens, not to the ring */
++static const struct mt76_driver_ops mt76_dma_test_drv_no_free = {
++	MT76_DMA_TEST_DRV,
++	.drv_flags = MT_DRV_TXWI_NO_FREE,
++};
++
++static const struct mt76_driver_ops mt76_dma_test_drv_aligned = {
++	MT76_DMA_TEST_DRV,
++	.drv_flags = MT_DRV_TX_ALIGNED4_SKBS,
++};
++
++static const struct mt76_driver_ops mt76_dma_test_drv_msdu_page = {
++	MT76_DMA_TEST_DRV,
++	.rx_rro_add_msdu_page = mt76_dma_test_msdu_page,
++};
++
++/* --- the fixture ----------------------------------------------------------- */
++
++static void mt76_dma_test_teardown(void *data)
++{
++	struct mt76_dma_test *t = data;
++	struct mt76_dev *dev = t->dev;
++	struct mt76_txwi_cache *r;
++	int i, id;
++
++	skb_queue_purge(&t->rx);
++
++	if (!t->dma_cleaned) {
++		for (i = 0; i < t->n_txq; i++)
++			mt76_dma_tx_cleanup(dev, t->txq[i], true);
++
++		for_each_set_bit(i, &t->napi_enabled, __MT_RXQ_MAX)
++			napi_disable(&dev->napi[i]);
++
++		for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++) {
++			struct mt76_queue *q = &dev->q_rx[i];
++
++			/* RRO data buffers are owned by their rx tokens */
++			if (!q->ndesc || mt76_queue_is_wed_rro_data(q))
++				continue;
++			mt76_dma_rx_cleanup(dev, q);
++		}
++	}
++
++	/* buffers still held by rx tokens */
++	idr_for_each_entry(&dev->rx_token, r, id) {
++		if (r->ptr)
++			mt76_put_page_pool_buf(r->ptr, false);
++		kfree(r);
++	}
++	idr_destroy(&dev->rx_token);
++
++	if (!t->dma_cleaned) {
++		for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++) {
++			page_pool_destroy(dev->q_rx[i].page_pool);
++			dev->q_rx[i].page_pool = NULL;
++		}
++		for_each_set_bit(i, &t->napi_added, __MT_RXQ_MAX)
++			netif_napi_del(&dev->napi[i]);
++		mt76_free_pending_txwi(dev);
++		mt76_free_pending_rxwi(dev);
++	}
++	free_netdev(t->napi_dev);
++	mt76_dma_test_ctx = NULL;
++}
++
++/* An mt76 device with DMA queue ops and an MMIO window, on @drv (NULL: the
++ * plain test driver).
++ */
++static struct mt76_dma_test *
++mt76_dma_test_init(struct kunit *test, const struct mt76_driver_ops *drv)
++{
++	struct mt76_dma_test *t;
++	struct mt76_dev **priv;
++	struct mt76_dev *dev;
++
++	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, t);
++	t->test = test;
++	skb_queue_head_init(&t->rx);
++
++	dev = mt76_test_dev(test, sizeof(*dev), &mt76_dma_test_hw_ops,
++			    drv ?: &mt76_dma_test_drv);
++	t->dev = dev;
++	KUNIT_ASSERT_EQ(test, dma_coerce_mask_and_coherent(dev->dma_dev,
++			DMA_BIT_MASK(32)), 0);
++	t->regs = kunit_kzalloc(test, MT76_DMA_TEST_REGS, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, t->regs);
++	dev->mmio.regs = (void __iomem *)t->regs;
++	dev->rx_token_size = 64;
++	mt76_dma_attach(dev);
++
++	t->napi_dev = alloc_netdev_dummy(sizeof(struct mt76_dev *));
++	KUNIT_ASSERT_NOT_NULL(test, t->napi_dev);
++	priv = netdev_priv(t->napi_dev);
++	*priv = dev;
++
++	mt76_dma_test_ctx = t;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_dma_test_teardown, t), 0);
++	return t;
++}
++
++static struct mt76_queue_regs *mt76_dma_test_qregs(struct mt76_queue *q)
++{
++	return (struct mt76_queue_regs __force *)q->regs;
++}
++
++/* A tx queue of @ndesc descriptors on ring @idx, flushed at the end. */
++static struct mt76_queue *
++mt76_dma_test_tx_queue(struct mt76_dma_test *t, int idx, int ndesc)
++{
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	KUNIT_ASSERT_LT(t->test, t->n_txq, MT76_DMA_TEST_MAX_TXQ);
++	/* device-managed: the teardown still needs it */
++	q = devm_kzalloc(dev->dev, sizeof(*q), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(t->test, q);
++	KUNIT_ASSERT_EQ(t->test, dev->queue_ops->alloc(dev, q, idx, ndesc, 0,
++						       0), 0);
++	t->txq[t->n_txq++] = q;
++	return q;
++}
++
++/* rx queue @qid with @flags, its ring at MT76_DMA_TEST_RX_RING + qid. Its
++ * page pool links to the queue's NAPI context, which must look disabled
++ * when the pool goes (as netif_napi_add() leaves it): unless the test adds
++ * a real one, it is parked that way here. That saves an RCU grace period
++ * per queue in netif_napi_del().
++ */
++static struct mt76_queue *
++mt76_dma_test_rx_queue(struct mt76_dma_test *t, enum mt76_rxq_id qid,
++		       int ndesc, u16 flags)
++{
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q = &dev->q_rx[qid];
++	struct napi_struct *napi = &dev->napi[qid];
++
++	if (!test_bit(NAPI_STATE_LISTED, &napi->state)) {
++		set_bit(NAPI_STATE_SCHED, &napi->state);
++		WRITE_ONCE(napi->list_owner, -1);
++	}
++	q->flags = flags;
++	KUNIT_ASSERT_EQ(t->test, dev->queue_ops->alloc(dev, q, qid, ndesc,
++			MT76_DMA_TEST_BUF_SIZE, MT76_DMA_TEST_RX_RING), 0);
++	return q;
++}
++
++/* a real NAPI context for rx queue @qid, polling with mt76_dma_rx_poll() */
++static struct napi_struct *mt76_dma_test_napi(struct mt76_dma_test *t,
++					      enum mt76_rxq_id qid)
++{
++	struct napi_struct *napi = &t->dev->napi[qid];
++
++	netif_napi_add(t->napi_dev, napi, mt76_dma_rx_poll);
++	t->napi_added |= BIT(qid);
++	napi_enable(napi);
++	t->napi_enabled |= BIT(qid);
++
++	return napi;
++}
++
++static void mt76_dma_test_skb_destructor(struct sk_buff *skb)
++{
++	if (mt76_dma_test_ctx)
++		mt76_dma_test_ctx->n_freed++;
++}
++
++/* A frame of @len bytes of @fill, counted in t->n_freed when freed. */
++static struct sk_buff *mt76_dma_test_skb(struct mt76_dma_test *t, int len,
++					 u8 fill)
++{
++	struct sk_buff *skb;
++
++	skb = alloc_skb(len + 32, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(t->test, skb);
++	skb_reserve(skb, 32);
++	memset(skb_put(skb, len), fill, len);
++	skb->destructor = mt76_dma_test_skb_destructor;
++	return skb;
++}
++
++/* @skb with @n fragments of @len bytes on its frag_list */
++static void mt76_dma_test_add_frags(struct mt76_dma_test *t,
++				    struct sk_buff *skb, int n, int len)
++{
++	struct sk_buff **next = &skb_shinfo(skb)->frag_list;
++	int i;
++
++	for (i = 0; i < n; i++) {
++		struct sk_buff *frag = alloc_skb(len, GFP_KERNEL);
++
++		KUNIT_ASSERT_NOT_NULL(t->test, frag);
++		memset(skb_put(frag, len), 0x10 + i, len);
++		*next = frag;
++		next = &frag->next;
++		skb->len += len;
++		skb->data_len += len;
++	}
++}
++
++static bool mt76_dma_test_maps(struct mt76_dev *dev, dma_addr_t addr,
++			       const void *ptr)
++{
++	return dma_to_phys(dev->dma_dev, addr) == virt_to_phys(ptr);
++}
++
++/* Plays the hardware: puts @len bytes of @fill into the rx buffer of ring
++ * slot @idx and completes its descriptor, with @ctrl and @info.
++ */
++static void mt76_dma_test_rx_desc(struct mt76_dma_test *t,
++				  struct mt76_queue *q, int idx, int len,
++				  u8 fill, u32 ctrl, u32 info)
++{
++	struct mt76_queue_entry *e = &q->entry[idx];
++	struct mt76_desc *desc = &q->desc[idx];
++	int room = SKB_WITH_OVERHEAD(q->buf_size) - q->buf_offset;
++
++	if (e->buf) {
++		memset(e->buf + q->buf_offset, fill, min(len, room));
++		dma_sync_single_for_device(t->dev->dma_dev, e->dma_addr[0],
++					   min(len, room), DMA_FROM_DEVICE);
++	}
++	desc->info = cpu_to_le32(info);
++	dma_wmb();
++	desc->ctrl = cpu_to_le32(ctrl | MT_DMA_CTL_DMA_DONE |
++				 FIELD_PREP(MT_DMA_CTL_SD_LEN0, len));
++}
++
++/* a single-buffer frame */
++static void mt76_dma_test_rx_frame(struct mt76_dma_test *t,
++				   struct mt76_queue *q, int idx, int len,
++				   u8 fill)
++{
++	mt76_dma_test_rx_desc(t, q, idx, len, fill, MT_DMA_CTL_LAST_SEC0, 0);
++}
++
++/* rx processing as NAPI runs it: in softirq context */
++static int mt76_dma_test_poll(struct mt76_dma_test *t, struct mt76_queue *q,
++			      int budget)
++{
++	int done;
++
++	local_bh_disable();
++	done = mt76_dma_rx_process(t->dev, q, budget);
++	local_bh_enable();
++
++	return done;
++}
++
++static bool mt76_dma_test_skb_filled(struct sk_buff *skb, int off, int len,
++				     u8 fill)
++{
++	return !memchr_inv(skb->data + off, fill, len);
++}
++
++/* --- queue setup ---------------------------------------------------------- */
++
++/* A new tx ring is programmed into its own register block (ring_base plus
++ * 16 bytes per ring), starts empty at index 0 and has every descriptor
++ * marked done, i.e. owned by the host.
++ */
++static void mt76_dma_test_alloc_tx_queue(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	int i;
++
++	q = devm_kzalloc(dev->dev, sizeof(*q), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, q);
++	/* stale state from before a reset */
++	t->regs[(0x100 + 3 * MT_RING_SIZE) / 4 + 2] = 5;	/* cpu_idx */
++	t->regs[(0x100 + 3 * MT_RING_SIZE) / 4 + 3] = 6;	/* dma_idx */
++
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->alloc(dev, q, 3, 16, 0, 0x100),
++			0);
++	t->txq[t->n_txq++] = q;
++
++	KUNIT_EXPECT_PTR_EQ(test, (void *)q->regs,
++			    (void *)&t->regs[(0x100 + 3 * MT_RING_SIZE) / 4]);
++	regs = mt76_dma_test_qregs(q);
++	KUNIT_EXPECT_EQ(test, q->ndesc, 16);
++	KUNIT_EXPECT_EQ(test, q->hw_idx, 3);
++	KUNIT_EXPECT_PTR_EQ(test, q->dev, dev);
++	KUNIT_ASSERT_NOT_NULL(test, q->desc);
++	KUNIT_ASSERT_NOT_NULL(test, q->entry);
++	KUNIT_EXPECT_EQ(test, regs->desc_base, lower_32_bits(q->desc_dma));
++	KUNIT_EXPECT_EQ(test, regs->ring_size, 16);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 0);
++	KUNIT_EXPECT_EQ(test, regs->dma_idx, 0);
++	KUNIT_EXPECT_EQ(test, q->head, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 0);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	for (i = 0; i < q->ndesc; i++)
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[i].ctrl),
++				MT_DMA_CTL_DMA_DONE);
++	/* tx rings take no page pool */
++	KUNIT_EXPECT_NULL(test, q->page_pool);
++	/* the ring before it is untouched */
++	KUNIT_EXPECT_EQ(test, t->regs[(0x100 + 2 * MT_RING_SIZE) / 4 + 1], 0);
++}
++
++/* An rx ring gets a page pool for its buffers, but no buffers yet. */
++static void mt76_dma_test_alloc_rx_queue(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_BAND1, 8, 0);
++
++	KUNIT_EXPECT_NOT_NULL(test, q->page_pool);
++	KUNIT_EXPECT_EQ(test, q->buf_size, MT76_DMA_TEST_BUF_SIZE);
++	KUNIT_EXPECT_EQ(test, q->hw_idx, MT_RXQ_BAND1);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->ring_size, 8);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_NULL(test, q->entry[0].buf);
++}
++
++/* A queue reset hands every descriptor back to the host and restarts the
++ * ring at index 0, or, without resetting the indices, where the hardware
++ * stands.
++ */
++static void mt76_dma_test_queue_reset(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	regs = mt76_dma_test_qregs(q);
++
++	for (i = 0; i < q->ndesc; i++)
++		q->desc[i].ctrl = 0;
++	regs->cpu_idx = 4;
++	regs->dma_idx = 3;
++	regs->ring_size = 0;
++	regs->desc_base = 0;
++	q->head = 4;
++	q->tail = 3;
++
++	/* without resetting the indices: resync to the hardware's position */
++	dev->queue_ops->reset_q(dev, q, false);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 4);
++	KUNIT_EXPECT_EQ(test, regs->dma_idx, 3);
++	KUNIT_EXPECT_EQ(test, q->head, 3);
++	KUNIT_EXPECT_EQ(test, q->tail, 3);
++	KUNIT_EXPECT_EQ(test, regs->ring_size, 8);
++	KUNIT_EXPECT_EQ(test, regs->desc_base, lower_32_bits(q->desc_dma));
++	for (i = 0; i < q->ndesc; i++)
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[i].ctrl),
++				MT_DMA_CTL_DMA_DONE);
++
++	/* with: both indices back to 0 */
++	dev->queue_ops->reset_q(dev, q, true);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 0);
++	KUNIT_EXPECT_EQ(test, regs->dma_idx, 0);
++	KUNIT_EXPECT_EQ(test, q->head, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 0);
++
++	/* no queue, or a queue never allocated: nothing to do */
++	dev->queue_ops->reset_q(dev, NULL, true);
++	q->ndesc = 0;
++	regs->cpu_idx = 7;
++	dev->queue_ops->reset_q(dev, q, true);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 7);
++	q->ndesc = 8;
++	regs->cpu_idx = 0;
++}
++
++/* A dead bus reads 0xffffffff from every register: syncing to it must not
++ * put the ring indices out of range.
++ */
++static void mt76_dma_test_queue_reset_dead_bus(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	q->head = 5;
++	q->tail = 5;
++	mt76_dma_test_qregs(q)->dma_idx = 0xffffffff;
++
++	dev->queue_ops->reset_q(dev, q, false);
++
++	KUNIT_EXPECT_EQ(test, q->head, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 0);
++	mt76_dma_test_qregs(q)->dma_idx = 0;
++}
++
++/* EMI queues take their cpu index from host memory, not the register: a
++ * new one is left for the driver to reset; resets and kicks go to memory.
++ */
++static void mt76_dma_test_emi_queue(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	__le16 *emi;
++
++	emi = devm_kzalloc(dev->dev, sizeof(*emi), GFP_KERNEL);
++	q = devm_kzalloc(dev->dev, sizeof(*q), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, emi);
++	KUNIT_ASSERT_NOT_NULL(test, q);
++	t->regs[2] = 9;		/* ring 0's cpu_idx */
++	t->regs[3] = 2;		/* ring 0's dma_idx */
++	q->flags = MT_QFLAG_EMI_EN;
++
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->alloc(dev, q, 0, 8, 0, 0), 0);
++	t->txq[t->n_txq++] = q;
++	regs = mt76_dma_test_qregs(q);
++
++	/* not reset: the indices stay as they were */
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 9);
++	KUNIT_EXPECT_EQ(test, regs->dma_idx, 2);
++	KUNIT_EXPECT_EQ(test, q->head, 2);
++	KUNIT_EXPECT_EQ(test, regs->ring_size, 8);
++
++	q->emi_cpu_idx = emi;
++	*emi = cpu_to_le16(6);
++	dev->queue_ops->reset_q(dev, q, true);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(*emi), 0);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 9);
++	KUNIT_EXPECT_EQ(test, regs->dma_idx, 0);
++
++	q->head = 5;
++	dev->queue_ops->kick(dev, q);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(*emi), 5);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 9);
++	q->head = 0;
++}
++
++/* --- txwi and rxwi caches -------------------------------------------------- */
++
++/* A txwi comes from the cache when there is one; a new one is DMA-mapped,
++ * with its descriptor txwi_size bytes in front of the cache entry.
++ */
++static void mt76_dma_test_txwi_cache(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_txwi_cache *a, *b;
++
++	a = mt76_get_txwi(dev);
++	b = mt76_get_txwi(dev);
++	KUNIT_ASSERT_NOT_NULL(test, a);
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	KUNIT_EXPECT_PTR_NE(test, a, b);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, a->dma_addr,
++						   mt76_get_txwi_ptr(dev, a)));
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, b->dma_addr,
++						   mt76_get_txwi_ptr(dev, b)));
++
++	mt76_put_txwi(dev, a);
++	mt76_put_txwi(dev, b);
++	mt76_put_txwi(dev, NULL);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 2);
++
++	/* newest first, without a new allocation */
++	KUNIT_EXPECT_PTR_EQ(test, mt76_get_txwi(dev), b);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_get_txwi(dev), a);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
++
++	mt76_put_txwi(dev, a);
++	mt76_put_txwi(dev, b);
++	mt76_free_pending_txwi(dev);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
++}
++
++/* rxwis work the same way, start without a buffer, and freeing the cache
++ * gives back the buffers they still hold.
++ */
++static void mt76_dma_test_rxwi_cache(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_txwi_cache *a, *b;
++	struct mt76_queue *q;
++	u32 offset;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 4, 0);
++
++	a = mt76_get_rxwi(dev);
++	b = mt76_get_rxwi(dev);
++	KUNIT_ASSERT_NOT_NULL(test, a);
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	KUNIT_EXPECT_PTR_NE(test, a, b);
++	KUNIT_EXPECT_NULL(test, a->ptr);
++
++	mt76_put_rxwi(dev, a);
++	mt76_put_rxwi(dev, NULL);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->rxwi_cache), 1);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_get_rxwi(dev), a);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->rxwi_cache));
++
++	a->ptr = mt76_get_page_pool_buf(q, &offset, q->buf_size);
++	KUNIT_ASSERT_NOT_NULL(test, a->ptr);
++	mt76_put_rxwi(dev, a);
++	mt76_put_rxwi(dev, b);
++	mt76_free_pending_rxwi(dev);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->rxwi_cache));
++}
++
++/* --- tx -------------------------------------------------------------------------- */
++
++/* A linear frame takes one descriptor: the txwi in buf0, the frame in buf1.
++ * The driver gets the txwi to fill; the hardware is only told about the
++ * frame once the queue is kicked.
++ */
++static void mt76_dma_test_tx_queue_skb(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_entry *e;
++	struct mt76_txwi_cache *txwi;
++	struct ieee80211_sta *sta;
++	struct mt76_wcid *wcid;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++	struct mt76_desc *d;
++	u32 ctrl;
++	u8 *ptr;
++
++	q = mt76_dma_test_tx_queue(t, 1, 16);
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	sta = kunit_kzalloc(test, sizeof(*sta), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	KUNIT_ASSERT_NOT_NULL(test, sta);
++	skb = mt76_dma_test_skb(t, 100, 0x77);
++	dev->phy.band_idx = MT_BAND1;
++	t->tx_info = 0xc0000a50;
++
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_VI, skb, wcid, sta), 0);
++
++	KUNIT_EXPECT_EQ(test, t->n_prepare, 1);
++	KUNIT_EXPECT_EQ(test, t->prepare_qid, MT_TXQ_VI);
++	KUNIT_EXPECT_PTR_EQ(test, t->prepare_wcid, wcid);
++	KUNIT_EXPECT_PTR_EQ(test, t->prepare_sta, sta);
++	KUNIT_EXPECT_EQ(test, t->prepare_nbuf, 2);
++
++	e = &q->entry[0];
++	d = &q->desc[0];
++	txwi = e->txwi;
++	KUNIT_ASSERT_NOT_NULL(test, txwi);
++	ptr = mt76_get_txwi_ptr(dev, txwi);
++	KUNIT_EXPECT_PTR_EQ(test, t->prepare_txwi, (void *)ptr);
++	KUNIT_EXPECT_EQ(test, txwi->qid, MT_TXQ_VI);
++	KUNIT_EXPECT_EQ(test, txwi->phy_idx, MT_BAND1);
++	KUNIT_EXPECT_EQ(test, ptr[0], 0xa5);
++
++	ctrl = le32_to_cpu(d->ctrl);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(d->buf0),
++			lower_32_bits(txwi->dma_addr));
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(d->buf1),
++			lower_32_bits(e->dma_addr[1]));
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, e->dma_addr[1],
++						   skb->data));
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl),
++			MT76_DMA_TEST_TXWI_SIZE);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN1, ctrl), 100);
++	KUNIT_EXPECT_TRUE(test, ctrl & MT_DMA_CTL_LAST_SEC1);
++	KUNIT_EXPECT_FALSE(test, ctrl & MT_DMA_CTL_LAST_SEC0);
++	KUNIT_EXPECT_FALSE(test, ctrl & MT_DMA_CTL_DMA_DONE);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(d->info), 0xc0000a50);
++
++	KUNIT_EXPECT_PTR_EQ(test, e->skb, skb);
++	KUNIT_EXPECT_EQ(test, e->dma_len[0], MT76_DMA_TEST_TXWI_SIZE);
++	KUNIT_EXPECT_EQ(test, e->dma_len[1], 100);
++	/* the txwi stays mapped for reuse, the frame is unmapped when done */
++	KUNIT_EXPECT_TRUE(test, e->skip_buf0);
++	KUNIT_EXPECT_FALSE(test, e->skip_buf1);
++	KUNIT_EXPECT_EQ(test, e->wcid, 0xffff);
++	KUNIT_EXPECT_EQ(test, q->head, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 1);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 0);
++	dev->queue_ops->kick(dev, q);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 1);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 0);
++}
++
++/* Fragments fill the descriptors two at a time after the txwi and the
++ * head; the last buffer is marked in the last descriptor, and the frame's
++ * skb and txwi are kept on that one.
++ */
++static void mt76_dma_test_tx_queue_skb_frags(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff *skb, *frag;
++	struct mt76_queue *q;
++	u32 ctrl;
++
++	q = mt76_dma_test_tx_queue(t, 0, 16);
++
++	/* txwi + head + 2 fragments: two full descriptors */
++	skb = mt76_dma_test_skb(t, 60, 0x01);
++	mt76_dma_test_add_frags(t, skb, 2, 40);
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), 1);
++	KUNIT_EXPECT_EQ(test, t->prepare_nbuf, 4);
++	KUNIT_EXPECT_EQ(test, q->queued, 2);
++	KUNIT_EXPECT_EQ(test, q->head, 2);
++
++	ctrl = le32_to_cpu(q->desc[0].ctrl);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN1, ctrl), 60);
++	KUNIT_EXPECT_FALSE(test, ctrl & (MT_DMA_CTL_LAST_SEC0 |
++					 MT_DMA_CTL_LAST_SEC1));
++	frag = skb_shinfo(skb)->frag_list;
++	ctrl = le32_to_cpu(q->desc[1].ctrl);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl), 40);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN1, ctrl), 40);
++	KUNIT_EXPECT_TRUE(test, ctrl & MT_DMA_CTL_LAST_SEC1);
++	KUNIT_EXPECT_FALSE(test, ctrl & MT_DMA_CTL_LAST_SEC0);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, q->entry[1].dma_addr[0],
++						   frag->data));
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, q->entry[1].dma_addr[1],
++						   frag->next->data));
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[1].buf1),
++			lower_32_bits(q->entry[1].dma_addr[1]));
++
++	/* the first descriptor only marks the txwi as taken */
++	KUNIT_EXPECT_PTR_EQ(test, q->entry[0].txwi, DMA_DUMMY_DATA);
++	KUNIT_EXPECT_NULL(test, q->entry[0].skb);
++	KUNIT_EXPECT_TRUE(test, q->entry[0].skip_buf0);
++	KUNIT_EXPECT_FALSE(test, q->entry[0].skip_buf1);
++	KUNIT_EXPECT_PTR_EQ(test, q->entry[1].skb, skb);
++	KUNIT_EXPECT_NOT_NULL(test, q->entry[1].txwi);
++	KUNIT_EXPECT_PTR_NE(test, q->entry[1].txwi, DMA_DUMMY_DATA);
++	KUNIT_EXPECT_FALSE(test, q->entry[1].skip_buf0);
++	KUNIT_EXPECT_FALSE(test, q->entry[1].skip_buf1);
++
++	/* txwi + head + 1 fragment: the last descriptor is half used */
++	skb = mt76_dma_test_skb(t, 50, 0x02);
++	mt76_dma_test_add_frags(t, skb, 1, 30);
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), 3);
++	ctrl = le32_to_cpu(q->desc[3].ctrl);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl), 30);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN1, ctrl), 0);
++	KUNIT_EXPECT_TRUE(test, ctrl & MT_DMA_CTL_LAST_SEC0);
++	KUNIT_EXPECT_FALSE(test, ctrl & MT_DMA_CTL_LAST_SEC1);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[3].buf1), 0);
++	KUNIT_EXPECT_TRUE(test, q->entry[3].skip_buf1);
++	KUNIT_EXPECT_EQ(test, q->queued, 4);
++}
++
++/* A descriptor list holds 32 buffers: the txwi, the head and 30
++ * fragments fit, one more fragment is refused.
++ */
++static void mt76_dma_test_tx_queue_skb_max_frags(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++	u32 ctrl;
++
++	q = mt76_dma_test_tx_queue(t, 0, 32);
++
++	skb = mt76_dma_test_skb(t, 20, 0x01);
++	mt76_dma_test_add_frags(t, skb, 30, 8);
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), 15);
++	KUNIT_EXPECT_EQ(test, t->prepare_nbuf, 32);
++	KUNIT_EXPECT_EQ(test, q->queued, 16);
++	ctrl = le32_to_cpu(q->desc[15].ctrl);
++	KUNIT_EXPECT_TRUE(test, ctrl & MT_DMA_CTL_LAST_SEC1);
++
++	skb = mt76_dma_test_skb(t, 20, 0x02);
++	mt76_dma_test_add_frags(t, skb, 31, 8);
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), -ENOMEM);
++	KUNIT_EXPECT_EQ(test, t->n_prepare, 1);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 16);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 1);
++}
++
++/* A frame that doesn't fit is dropped (and reported) without touching the
++ * ring, and its txwi goes back to the cache.
++ */
++static void mt76_dma_test_tx_queue_skb_full(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	/* one descriptor left: that one is never used */
++	q->queued = 6;
++	skb = mt76_dma_test_skb(t, 100, 0x01);
++
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), -ENOMEM);
++	KUNIT_EXPECT_EQ(test, t->n_prepare, 0);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_EQ(test, q->head, 0);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[0].ctrl),
++			MT_DMA_CTL_DMA_DONE);
++	KUNIT_EXPECT_NULL(test, q->entry[0].skb);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 1);
++
++	/* two left: it fits */
++	q->queued = 5;
++	skb = mt76_dma_test_skb(t, 100, 0x02);
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), 0);
++	KUNIT_EXPECT_EQ(test, q->queued, 6);
++	/* the cached txwi was reused */
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
++	q->queued = 1;
++}
++
++/* During a reset, frames are dropped before anything is allocated. */
++static void mt76_dma_test_tx_queue_skb_reset(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	skb = mt76_dma_test_skb(t, 100, 0x01);
++	set_bit(MT76_RESET, &dev->phy.state);
++
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), -ENOMEM);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_EQ(test, t->n_prepare, 0);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
++	clear_bit(MT76_RESET, &dev->phy.state);
++}
++
++/* When the driver can't prepare the frame, its error is returned, the
++ * frame dropped and the txwi kept for the next one.
++ */
++static void mt76_dma_test_tx_queue_skb_prepare_error(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	skb = mt76_dma_test_skb(t, 100, 0x01);
++	mt76_dma_test_add_frags(t, skb, 1, 20);
++	t->prepare_ret = -EINVAL;
++
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), -EINVAL);
++	KUNIT_EXPECT_EQ(test, t->n_prepare, 1);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->head, 0);
++	KUNIT_EXPECT_NULL(test, q->entry[0].txwi);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 1);
++}
++
++/* Drivers that need 4-byte aligned payloads get a 2-byte pad after a
++ * 26-byte QoS header.
++ */
++static void mt76_dma_test_tx_queue_skb_pad(struct kunit *test)
++{
++	struct mt76_dma_test *t;
++	struct ieee80211_hdr *hdr;
++	struct mt76_queue *q;
++	struct mt76_dev *dev;
++	struct sk_buff *skb;
++
++	t = mt76_dma_test_init(test, &mt76_dma_test_drv_aligned);
++	dev = t->dev;
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	skb = mt76_dma_test_skb(t, 40, 0x66);
++	hdr = (struct ieee80211_hdr *)skb->data;
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 IEEE80211_STYPE_QOS_DATA);
++
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), 0);
++	KUNIT_EXPECT_EQ(test, skb->len, 42);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN1,
++					le32_to_cpu(q->desc[0].ctrl)), 42);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(((struct ieee80211_hdr *)
++					   skb->data)->frame_control),
++			IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA);
++	KUNIT_EXPECT_EQ(test, skb->data[25], 0x66);
++	KUNIT_EXPECT_EQ(test, skb->data[26], 0);
++	KUNIT_EXPECT_EQ(test, skb->data[27], 0);
++	KUNIT_EXPECT_EQ(test, skb->data[28], 0x66);
++}
++
++/* Raw frames (MCU messages) take one descriptor without a txwi and are
++ * kicked to the hardware at once.
++ */
++static void mt76_dma_test_tx_queue_raw(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_entry *e;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++	u32 ctrl;
++
++	q = mt76_dma_test_tx_queue(t, 2, 8);
++	skb = mt76_dma_test_skb(t, 64, 0x33);
++
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb_raw(dev, q, skb,
++			0x80000005), 0);
++
++	e = &q->entry[0];
++	ctrl = le32_to_cpu(q->desc[0].ctrl);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[0].buf0),
++			lower_32_bits(e->dma_addr[0]));
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, e->dma_addr[0],
++						   skb->data));
++	KUNIT_EXPECT_EQ(test, ctrl, FIELD_PREP(MT_DMA_CTL_SD_LEN0, 64) |
++				    MT_DMA_CTL_LAST_SEC0);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[0].buf1), 0);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[0].info), 0x80000005);
++	KUNIT_EXPECT_PTR_EQ(test, e->skb, skb);
++	KUNIT_EXPECT_NULL(test, e->txwi);
++	KUNIT_EXPECT_FALSE(test, e->skip_buf0);
++	KUNIT_EXPECT_TRUE(test, e->skip_buf1);
++	KUNIT_EXPECT_EQ(test, q->queued, 1);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 1);
++
++	/* completion hands the frame back to the driver */
++	mt76_dma_test_qregs(q)->dma_idx = 1;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_ASSERT_EQ(test, t->n_done, 1);
++	KUNIT_EXPECT_PTR_EQ(test, t->done[0].skb, skb);
++	KUNIT_EXPECT_NULL(test, t->done[0].txwi);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
++}
++
++/* Raw frames are dropped while the MCU is being reset or when the ring is
++ * full.
++ */
++static void mt76_dma_test_tx_queue_raw_errors(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++
++	q = mt76_dma_test_tx_queue(t, 2, 8);
++
++	set_bit(MT76_MCU_RESET, &dev->phy.state);
++	skb = mt76_dma_test_skb(t, 64, 0x33);
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb_raw(dev, q, skb, 0),
++			-ENOMEM);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 0);
++	clear_bit(MT76_MCU_RESET, &dev->phy.state);
++
++	q->queued = 6;
++	skb = mt76_dma_test_skb(t, 64, 0x33);
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb_raw(dev, q, skb, 0),
++			-ENOMEM);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 2);
++	KUNIT_EXPECT_EQ(test, q->head, 0);
++
++	q->queued = 5;
++	skb = mt76_dma_test_skb(t, 64, 0x33);
++	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb_raw(dev, q, skb, 0),
++			0);
++	KUNIT_EXPECT_EQ(test, q->queued, 6);
++	q->queued = 1;
++}
++
++/* Queue @n linear frames on @q, returning them in @skbs. */
++static void mt76_dma_test_queue_frames(struct mt76_dma_test *t,
++				       struct mt76_queue *q,
++				       struct sk_buff **skbs, int n)
++{
++	struct mt76_dev *dev = t->dev;
++	int i;
++
++	for (i = 0; i < n; i++) {
++		skbs[i] = mt76_dma_test_skb(t, 50 + i, i);
++		KUNIT_ASSERT_GE(t->test, dev->queue_ops->tx_queue_skb(&dev->phy,
++				q, MT_TXQ_BE, skbs[i], NULL, NULL), 0);
++	}
++	dev->queue_ops->kick(dev, q);
++}
++
++/* Cleanup completes the frames the hardware is done with (up to dma_idx),
++ * in ring order, and keeps the rest; the txwis are cached for reuse.
++ */
++static void mt76_dma_test_tx_cleanup(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_txwi_cache *txwi[3];
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff *skbs[3];
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	mt76_dma_test_queue_frames(t, q, skbs, 3);
++	for (i = 0; i < 3; i++)
++		txwi[i] = q->entry[i].txwi;
++
++	/* nothing done yet */
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, t->n_done, 0);
++	KUNIT_EXPECT_EQ(test, q->queued, 3);
++
++	mt76_dma_test_qregs(q)->dma_idx = 2;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_ASSERT_EQ(test, t->n_done, 2);
++	KUNIT_EXPECT_PTR_EQ(test, t->done[0].skb, skbs[0]);
++	KUNIT_EXPECT_PTR_EQ(test, t->done[0].txwi, txwi[0]);
++	KUNIT_EXPECT_PTR_EQ(test, t->done[1].skb, skbs[1]);
++	KUNIT_EXPECT_EQ(test, t->done[1].wcid, 0xffff);
++	KUNIT_EXPECT_EQ(test, q->tail, 2);
++	KUNIT_EXPECT_EQ(test, q->queued, 1);
++	/* completed entries are cleared, the pending one is kept */
++	KUNIT_EXPECT_NULL(test, q->entry[0].skb);
++	KUNIT_EXPECT_NULL(test, q->entry[1].txwi);
++	KUNIT_EXPECT_PTR_EQ(test, q->entry[2].skb, skbs[2]);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 2);
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&dev->txwi_cache,
++			struct mt76_txwi_cache, list), txwi[1]);
++
++	mt76_dma_test_qregs(q)->dma_idx = 3;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, t->n_done, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 3);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 3);
++
++	/* the next frame reuses the newest cached txwi */
++	mt76_dma_test_queue_frames(t, q, skbs, 1);
++	KUNIT_EXPECT_PTR_EQ(test, q->entry[3].txwi, txwi[2]);
++}
++
++/* dma_idx is read again when the cleanup reaches it, so frames finished
++ * meanwhile are reclaimed in the same pass.
++ */
++static void mt76_dma_test_tx_cleanup_reread(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff *skbs[4];
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	mt76_dma_test_queue_frames(t, q, skbs, 4);
++
++	mt76_dma_test_qregs(q)->dma_idx = 1;
++	t->bump_q = q;
++	t->bump_dma_idx = 3;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++
++	KUNIT_EXPECT_EQ(test, t->n_done, 3);
++	KUNIT_EXPECT_EQ(test, q->tail, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 1);
++}
++
++/* A frame spread over two descriptors completes once, with its txwi;
++ * the first descriptor's txwi placeholder isn't taken for a txwi.
++ */
++static void mt76_dma_test_tx_cleanup_multi_desc(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_txwi_cache *txwi;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	skb = mt76_dma_test_skb(t, 60, 0x01);
++	mt76_dma_test_add_frags(t, skb, 2, 40);
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++			MT_TXQ_BE, skb, NULL, NULL), 1);
++	txwi = q->entry[1].txwi;
++
++	mt76_dma_test_qregs(q)->dma_idx = 2;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++
++	KUNIT_ASSERT_EQ(test, t->n_done, 1);
++	KUNIT_EXPECT_PTR_EQ(test, t->done[0].skb, skb);
++	KUNIT_EXPECT_PTR_EQ(test, t->done[0].txwi, txwi);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 1);
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&dev->txwi_cache,
++			struct mt76_txwi_cache, list), txwi);
++	KUNIT_EXPECT_NULL(test, q->entry[0].txwi);
++}
++
++/* A flush completes everything regardless of the hardware, then resyncs
++ * the ring to where the hardware stands.
++ */
++static void mt76_dma_test_tx_cleanup_flush(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_regs *regs;
++	struct sk_buff *skbs[3];
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	regs = mt76_dma_test_qregs(q);
++	mt76_dma_test_queue_frames(t, q, skbs, 3);
++	regs->dma_idx = 1;
++	regs->ring_size = 0;
++
++	dev->queue_ops->tx_cleanup(dev, q, true);
++
++	KUNIT_EXPECT_EQ(test, t->n_done, 3);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->head, 1);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 1);
++	KUNIT_EXPECT_EQ(test, regs->ring_size, 8);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 3);
++}
++
++/* On a dead bus (dma_idx reads 0xffffffff) the cleanup can't tell how far
++ * the hardware got: it reclaims everything and keeps the ring indices in
++ * range.
++ */
++static void mt76_dma_test_tx_cleanup_dead_bus(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff *skbs[3];
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	mt76_dma_test_queue_frames(t, q, skbs, 3);
++	mt76_dma_test_qregs(q)->dma_idx = 0xffffffff;
++
++	dev->queue_ops->tx_cleanup(dev, q, false);
++
++	KUNIT_EXPECT_EQ(test, t->n_done, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 3);
++	KUNIT_EXPECT_LT(test, (int)q->tail, q->ndesc);
++	mt76_dma_test_qregs(q)->dma_idx = 3;
++}
++
++/* With MT_DRV_TXWI_NO_FREE (the mt7915) the txwi belongs to the driver's
++ * tx token: cleanup must not cache it.
++ */
++static void mt76_dma_test_tx_cleanup_no_free(struct kunit *test)
++{
++	struct mt76_dma_test *t;
++	struct sk_buff *skbs[2];
++	struct mt76_queue *q;
++	struct mt76_dev *dev;
++
++	t = mt76_dma_test_init(test, &mt76_dma_test_drv_no_free);
++	dev = t->dev;
++	q = mt76_dma_test_tx_queue(t, 0, 8);
++	mt76_dma_test_queue_frames(t, q, skbs, 2);
++	mt76_dma_test_qregs(q)->dma_idx = 2;
++
++	dev->queue_ops->tx_cleanup(dev, q, false);
++
++	KUNIT_ASSERT_EQ(test, t->n_done, 2);
++	KUNIT_EXPECT_NOT_NULL(test, t->done[0].txwi);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
++	/* the driver's job: give them back */
++	mt76_put_txwi(dev, t->done[0].txwi);
++	mt76_put_txwi(dev, t->done[1].txwi);
++}
++
++/* Cleaning up a missing or unallocated queue does nothing. */
++static void mt76_dma_test_tx_cleanup_no_queue(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	q = kunit_kzalloc(test, sizeof(*q), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, q);
++	q->queued = 1;
++
++	dev->queue_ops->tx_cleanup(dev, NULL, true);
++	dev->queue_ops->tx_cleanup(dev, q, true);
++
++	KUNIT_EXPECT_EQ(test, t->n_done, 0);
++	KUNIT_EXPECT_EQ(test, q->queued, 1);
++}
++
++/* --- rx -------------------------------------------------------------------------- */
++
++/* Filling an rx ring gives every slot but one a page pool buffer (the
++ * hardware would take a full ring for an empty one), each descriptor
++ * pointing past the buffer's headroom with the room left, owned by the
++ * hardware, and kicks the ring.
++ */
++static void mt76_dma_test_rx_fill(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	int i, len;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	q->buf_offset = 32;
++	len = SKB_WITH_OVERHEAD(MT76_DMA_TEST_BUF_SIZE) - 32;
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 7);
++	KUNIT_EXPECT_EQ(test, q->queued, 7);
++	KUNIT_EXPECT_EQ(test, q->head, 7);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 7);
++
++	for (i = 0; i < 7; i++) {
++		struct mt76_queue_entry *e = &q->entry[i];
++		struct mt76_desc *d = &q->desc[i];
++
++		KUNIT_ASSERT_NOT_NULL(test, e->buf);
++		KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, e->dma_addr[0],
++							   e->buf + 32));
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(d->buf0),
++				lower_32_bits(e->dma_addr[0]));
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(d->ctrl),
++				FIELD_PREP(MT_DMA_CTL_SD_LEN0, len));
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(d->buf1), 0);
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(d->info), 0);
++		KUNIT_EXPECT_EQ(test, e->dma_len[0], len);
++		KUNIT_EXPECT_EQ(test, e->wcid, 0xffff);
++		KUNIT_EXPECT_NULL(test, e->txwi);
++		if (i)
++			KUNIT_EXPECT_PTR_NE(test, e->buf, q->entry[i - 1].buf);
++	}
++	KUNIT_EXPECT_NULL(test, q->entry[7].buf);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[7].ctrl),
++			MT_DMA_CTL_DMA_DONE);
++
++	/* already full: nothing added, nothing kicked */
++	mt76_dma_test_qregs(q)->cpu_idx = 0x55;
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 0);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 0x55);
++	mt76_dma_test_qregs(q)->cpu_idx = 7;
++
++	/* a queue that was never allocated */
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill_buf(dev,
++					&dev->q_rx[MT_RXQ_BAND2], false), 0);
++}
++
++/* A completed single-buffer frame becomes an skb on the buffer itself
++ * (past the headroom), passed to the driver with its descriptor info;
++ * the slot is refilled and the ring kicked.
++ */
++static void mt76_dma_test_rx_process(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++	void *buf;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_BAND1, 8, 0);
++	q->buf_offset = 64;
++	KUNIT_ASSERT_EQ(test, mt76_dma_rx_fill(t->dev, q, false), 7);
++	buf = q->entry[0].buf;
++	mt76_dma_test_rx_desc(t, q, 0, 100, 0x3c, MT_DMA_CTL_LAST_SEC0,
++			      0xabcd0001);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
++
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 1);
++	skb = skb_peek(&t->rx);
++	KUNIT_EXPECT_EQ(test, t->rx_qid, MT_RXQ_BAND1);
++	KUNIT_EXPECT_EQ(test, t->rx_info, 0xabcd0001);
++	KUNIT_EXPECT_EQ(test, *(u32 *)skb->cb, 0xabcd0001);
++	KUNIT_EXPECT_EQ(test, skb->len, 100);
++	KUNIT_EXPECT_PTR_EQ(test, (void *)skb->head, buf);
++	KUNIT_EXPECT_PTR_EQ(test, (void *)skb->data, buf + 64);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb, 0, 100, 0x3c));
++	KUNIT_EXPECT_EQ(test, t->n_rx_check, 1);
++	KUNIT_EXPECT_PTR_EQ(test, t->rx_check_data, buf);
++	KUNIT_EXPECT_EQ(test, t->rx_check_len, 100);
++
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 7);
++	KUNIT_EXPECT_EQ(test, q->head, 0);
++	KUNIT_EXPECT_NULL(test, q->entry[0].buf);
++	KUNIT_EXPECT_NOT_NULL(test, q->entry[7].buf);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 0);
++
++	/* nothing more completed */
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 1);
++}
++
++/* Processing stops at the budget; the rest is left for the next poll. */
++static void mt76_dma_test_rx_process_budget(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	mt76_dma_rx_fill(t->dev, q, false);
++	for (i = 0; i < 3; i++)
++		mt76_dma_test_rx_frame(t, q, i, 60, i);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 2), 2);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 2);
++	KUNIT_EXPECT_EQ(test, q->tail, 2);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 2), 1);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 3);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb_peek_tail(&t->rx),
++							 0, 60, 2));
++}
++
++/* Frames the driver consumes in rx_check (tx-free events and the like) are
++ * recycled and don't count against the budget.
++ */
++static void mt76_dma_test_rx_process_rx_check(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_queue *q;
++	void *buf;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	mt76_dma_rx_fill(t->dev, q, false);
++	buf = q->entry[0].buf;
++	mt76_dma_test_rx_frame(t, q, 0, 24, 0x11);
++	t->rx_check_drop = true;
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++	KUNIT_EXPECT_EQ(test, t->n_rx_check, 1);
++	KUNIT_EXPECT_PTR_EQ(test, t->rx_check_data, buf);
++	KUNIT_EXPECT_EQ(test, t->rx_check_len, 24);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 7);
++}
++
++/* A frame over several buffers becomes one skb: the first buffer is its
++ * head, the others page fragments. Only complete frames reach the driver
++ * and rx_check, and they count once against the budget.
++ */
++static void mt76_dma_test_rx_process_frags(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct skb_shared_info *shinfo;
++	struct sk_buff *skb;
++	struct mt76_queue *q;
++	struct page *page;
++	void *buf1;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	mt76_dma_rx_fill(t->dev, q, false);
++	buf1 = q->entry[1].buf;
++	mt76_dma_test_rx_desc(t, q, 0, 1000, 0xaa, 0, 1);
++	mt76_dma_test_rx_desc(t, q, 1, 300, 0xbb, MT_DMA_CTL_LAST_SEC0, 2);
++
++	/* only the first half is there yet */
++	q->desc[1].ctrl &= ~cpu_to_le32(MT_DMA_CTL_DMA_DONE);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
++	KUNIT_EXPECT_NOT_NULL(test, q->rx_head);
++
++	q->desc[1].ctrl |= cpu_to_le32(MT_DMA_CTL_DMA_DONE);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 1);
++	KUNIT_EXPECT_NULL(test, q->rx_head);
++	skb = skb_peek(&t->rx);
++	shinfo = skb_shinfo(skb);
++	KUNIT_EXPECT_EQ(test, skb->len, 1300);
++	KUNIT_EXPECT_EQ(test, skb_headlen(skb), 1000);
++	KUNIT_ASSERT_EQ(test, shinfo->nr_frags, 1);
++	page = virt_to_head_page(buf1);
++	KUNIT_EXPECT_PTR_EQ(test, skb_frag_page(&shinfo->frags[0]), page);
++	KUNIT_EXPECT_EQ(test, skb_frag_off(&shinfo->frags[0]),
++			buf1 - page_address(page));
++	KUNIT_EXPECT_EQ(test, skb_frag_size(&shinfo->frags[0]), 300);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb, 0, 1000, 0xaa));
++	KUNIT_EXPECT_EQ(test, *(u8 *)skb_frag_address(&shinfo->frags[0]),
++			0xbb);
++	/* the info passed along is the last descriptor's */
++	KUNIT_EXPECT_EQ(test, t->rx_info, 2);
++	KUNIT_EXPECT_EQ(test, t->n_rx_check, 0);
++}
++
++/* Descriptors flagged for dropping (hardware drop, to-host-A, WED repeat,
++ * old non-fragment packets, PN check failures) are recycled without
++ * reaching the driver; the rest go through.
++ */
++static void mt76_dma_test_rx_process_drop(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	u32 last = MT_DMA_CTL_LAST_SEC0, ver = MT_DMA_CTL_VER_MASK;
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 16, 0);
++	mt76_dma_rx_fill(t->dev, q, false);
++
++	mt76_dma_test_rx_desc(t, q, 0, 40, 0, last | MT_DMA_CTL_DROP, 0);
++	mt76_dma_test_rx_desc(t, q, 1, 40, 1, last | MT_DMA_CTL_TO_HOST_A, 0);
++	q->desc[2].buf1 = cpu_to_le32(FIELD_PREP(MT_DMA_WED_IND_REASON,
++					MT_DMA_WED_IND_REASON_REPEAT));
++	mt76_dma_test_rx_desc(t, q, 2, 40, 2, last | ver, 0);
++	q->desc[3].buf1 = cpu_to_le32(FIELD_PREP(MT_DMA_WED_IND_REASON,
++					MT_DMA_WED_IND_REASON_OLDPKT));
++	mt76_dma_test_rx_desc(t, q, 3, 40, 3, last | ver, 0);
++	/* an old packet that is a fragment is kept */
++	q->desc[4].buf1 = q->desc[3].buf1;
++	mt76_dma_test_rx_desc(t, q, 4, 40, 4, last | ver,
++			      MT_DMA_INFO_DMA_FRAG);
++	mt76_dma_test_rx_desc(t, q, 5, 40, 5,
++			      last | ver | MT_DMA_CTL_PN_CHK_FAIL, 0);
++	mt76_dma_test_rx_desc(t, q, 6, 40, 6, last | ver, 0);
++	/* without the version bit, the PN check bit means nothing */
++	mt76_dma_test_rx_desc(t, q, 7, 40, 7, last | MT_DMA_CTL_PN_CHK_FAIL,
++			      0);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 3);
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 3);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb_peek(&t->rx),
++							 0, 40, 4));
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb_peek_tail(&t->rx),
++							 0, 40, 7));
++	KUNIT_EXPECT_EQ(test, q->tail, 8);
++	KUNIT_EXPECT_EQ(test, q->queued, 15);
++}
++
++/* A length the buffer can't hold is dropped; a fragment that long drops
++ * the frame it belongs to. The ring carries on with the next frame.
++ */
++static void mt76_dma_test_rx_process_too_long(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	int max = SKB_WITH_OVERHEAD(MT76_DMA_TEST_BUF_SIZE);
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	q->buf_offset = 16;
++	mt76_dma_rx_fill(t->dev, q, false);
++
++	mt76_dma_test_rx_frame(t, q, 0, max - 16 + 1, 0);
++	mt76_dma_test_rx_desc(t, q, 1, 100, 1, 0, 0);
++	mt76_dma_test_rx_frame(t, q, 2, MT76_DMA_TEST_BUF_SIZE - 16 + 1, 2);
++	mt76_dma_test_rx_frame(t, q, 3, max - 16, 3);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 2);
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 1);
++	KUNIT_EXPECT_EQ(test, skb_peek(&t->rx)->len, max - 16);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb_peek(&t->rx),
++							 0, max - 16, 3));
++	KUNIT_EXPECT_NULL(test, q->rx_head);
++	KUNIT_EXPECT_EQ(test, q->tail, 4);
++	KUNIT_EXPECT_EQ(test, t->n_rx_check, 1);
++}
++
++/* An skb holds MAX_SKB_FRAGS fragments: a frame of one buffer more is
++ * dropped as a whole.
++ */
++static void mt76_dma_test_rx_process_frag_overflow(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++	int i, n = MAX_SKB_FRAGS + 1;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 64, 0);
++	KUNIT_ASSERT_EQ(test, mt76_dma_rx_fill(t->dev, q, false), 63);
++	KUNIT_ASSERT_LE(test, 2 * n + 1, 63);
++
++	/* head + MAX_SKB_FRAGS fragments: delivered */
++	for (i = 0; i < n; i++)
++		mt76_dma_test_rx_desc(t, q, i, 64, i,
++				      i == n - 1 ? MT_DMA_CTL_LAST_SEC0 : 0, 0);
++	/* head + MAX_SKB_FRAGS + 1 fragments: dropped */
++	for (i = n; i < 2 * n + 1; i++)
++		mt76_dma_test_rx_desc(t, q, i, 64, i,
++				      i == 2 * n ? MT_DMA_CTL_LAST_SEC0 : 0, 0);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 64), 2);
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 1);
++	skb = skb_peek(&t->rx);
++	KUNIT_EXPECT_EQ(test, skb_shinfo(skb)->nr_frags, MAX_SKB_FRAGS);
++	KUNIT_EXPECT_EQ(test, skb->len, 64 * n);
++	KUNIT_EXPECT_NULL(test, q->rx_head);
++	KUNIT_EXPECT_EQ(test, q->tail, 2 * n + 1);
++}
++
++/* On a WED rx ring each buffer is registered as an rx token, which the
++ * descriptor carries for the hardware, with the buffer handed to the host.
++ */
++static void mt76_dma_test_rx_wed_fill(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, MT_WED_Q_RX(0));
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 7);
++
++	for (i = 0; i < 7; i++) {
++		struct mt76_queue_entry *e = &q->entry[i];
++		u32 buf1 = le32_to_cpu(q->desc[i].buf1);
++		struct mt76_txwi_cache *r;
++
++		KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_TOKEN, buf1), i);
++		KUNIT_EXPECT_TRUE(test, le32_to_cpu(q->desc[i].ctrl) &
++					MT_DMA_CTL_TO_HOST);
++		r = idr_find(&dev->rx_token, i);
++		KUNIT_ASSERT_NOT_NULL(test, r);
++		KUNIT_EXPECT_PTR_EQ(test, e->txwi, r);
++		KUNIT_EXPECT_PTR_EQ(test, r->ptr, e->buf);
++		KUNIT_EXPECT_EQ(test, r->dma_addr, e->dma_addr[0]);
++		KUNIT_EXPECT_EQ(test, r->qid, MT_RXQ_MAIN);
++	}
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 7);
++
++	/* a full WED ring is kicked even when nothing was added */
++	mt76_dma_test_qregs(q)->cpu_idx = 0x55;
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 0);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 7);
++}
++
++/* Out of rx tokens, the fill stops short and keeps the rxwi it couldn't
++ * register.
++ */
++static void mt76_dma_test_rx_wed_no_tokens(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	dev->rx_token_size = 3;
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, MT_WED_Q_RX(0));
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 3);
++	KUNIT_EXPECT_EQ(test, q->head, 3);
++	KUNIT_EXPECT_NULL(test, q->entry[3].buf);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 3);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->rxwi_cache), 1);
++}
++
++/* WED completes buffers by token, not by ring slot: the frame is the
++ * token's buffer, whose rxwi is then reused for the refill.
++ */
++static void mt76_dma_test_rx_wed_process(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_txwi_cache *r3;
++	struct mt76_queue *q;
++	struct sk_buff *skb;
++	void *buf3;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, MT_WED_Q_RX(0));
++	mt76_dma_rx_fill(dev, q, false);
++	buf3 = q->entry[3].buf;
++	r3 = idr_find(&dev->rx_token, 3);
++
++	memset(buf3, 0x5e, 80);
++	dma_sync_single_for_device(dev->dma_dev, q->entry[3].dma_addr[0], 80,
++				   DMA_FROM_DEVICE);
++	q->desc[0].buf1 = cpu_to_le32(FIELD_PREP(MT_DMA_CTL_TOKEN, 3));
++	mt76_dma_test_rx_desc(t, q, 0, 80, 0, MT_DMA_CTL_LAST_SEC0, 0);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
++
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 1);
++	skb = skb_peek(&t->rx);
++	KUNIT_EXPECT_PTR_EQ(test, (void *)skb->head, buf3);
++	KUNIT_EXPECT_EQ(test, skb->len, 80);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb, 0, 80, 0x5e));
++	/* token 3 was released and handed out again, with the same rxwi */
++	KUNIT_EXPECT_PTR_EQ(test, idr_find(&dev->rx_token, 3), r3);
++	KUNIT_EXPECT_PTR_EQ(test, r3->ptr, q->entry[7].buf);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_TOKEN,
++					le32_to_cpu(q->desc[7].buf1)), 3);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->rxwi_cache));
++	/* slot 0's own buffer is still out with its token */
++	KUNIT_EXPECT_NOT_NULL(test, idr_find(&dev->rx_token, 0));
++}
++
++/* A token the host doesn't know ends the poll there; nothing is passed
++ * up, and the next frame comes through on the next poll.
++ */
++static void mt76_dma_test_rx_wed_unknown_token(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, MT_WED_Q_RX(0));
++	mt76_dma_rx_fill(dev, q, false);
++	q->desc[0].buf1 = cpu_to_le32(FIELD_PREP(MT_DMA_CTL_TOKEN, 40));
++	mt76_dma_test_rx_frame(t, q, 0, 80, 0);
++	mt76_dma_test_rx_frame(t, q, 1, 90, 1);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_NOT_NULL(test, idr_find(&dev->rx_token, 0));
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 1);
++	KUNIT_EXPECT_EQ(test, skb_peek(&t->rx)->len, 90);
++}
++
++/* Cleanup takes every buffer back from the ring and drops a frame left
++ * half assembled.
++ */
++static void mt76_dma_test_rx_cleanup(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	mt76_dma_rx_fill(dev, q, false);
++	q->rx_head = mt76_dma_test_skb(t, 10, 0);
++
++	dev->queue_ops->rx_cleanup(dev, q);
++
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, q->head);
++	for (i = 0; i < q->ndesc; i++)
++		KUNIT_EXPECT_NULL(test, q->entry[i].buf);
++	KUNIT_EXPECT_NULL(test, q->rx_head);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
++
++	/* an unallocated queue */
++	dev->queue_ops->rx_cleanup(dev, &dev->q_rx[MT_RXQ_BAND2]);
++}
++
++/* On a WED ring, cleanup releases every buffer's token. */
++static void mt76_dma_test_rx_wed_cleanup(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, MT_WED_Q_RX(0));
++	mt76_dma_rx_fill(dev, q, false);
++
++	dev->queue_ops->rx_cleanup(dev, q);
++
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->rx_token));
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->rxwi_cache), 7);
++}
++
++/* An rx reset empties the ring, resyncs it to the hardware's position and
++ * refills it from there.
++ */
++static void mt76_dma_test_rx_reset(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	regs = mt76_dma_test_qregs(q);
++	mt76_dma_rx_fill(dev, q, false);
++	/* a half-received frame, a completed one, the hardware at slot 3 */
++	q->rx_head = mt76_dma_test_skb(t, 10, 0);
++	mt76_dma_test_rx_frame(t, q, 0, 60, 0);
++	regs->dma_idx = 3;
++	regs->ring_size = 0;
++
++	dev->queue_ops->rx_reset(dev, MT_RXQ_MAIN);
++
++	KUNIT_EXPECT_NULL(test, q->rx_head);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
++	KUNIT_EXPECT_EQ(test, regs->ring_size, 8);
++	KUNIT_EXPECT_EQ(test, q->tail, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 7);
++	KUNIT_EXPECT_EQ(test, q->head, 2);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 2);
++	KUNIT_EXPECT_NULL(test, q->entry[2].buf);
++	for (i = 3; i < 3 + 7; i++)
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[i % 8].ctrl),
++				FIELD_PREP(MT_DMA_CTL_SD_LEN0,
++				SKB_WITH_OVERHEAD(MT76_DMA_TEST_BUF_SIZE)));
++
++	/* a queue never allocated is left alone */
++	dev->queue_ops->rx_reset(dev, MT_RXQ_BAND2);
++	KUNIT_EXPECT_EQ(test, dev->q_rx[MT_RXQ_BAND2].queued, 0);
++}
++
++/* A WED tx-free ring is emptied by a reset but not refilled here: WED
++ * sets it up again itself.
++ */
++static void mt76_dma_test_rx_reset_wed_txfree(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN_WA, 8, MT_WED_Q_TXFREE);
++	mt76_dma_rx_fill(dev, q, false);
++	mt76_dma_test_qregs(q)->cpu_idx = 0x55;
++
++	dev->queue_ops->rx_reset(dev, MT_RXQ_MAIN_WA);
++
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 0x55);
++}
++
++/* The NAPI poll processes its own queue and, with budget to spare,
++ * completes NAPI and tells the driver to re-enable the interrupt.
++ */
++static void mt76_dma_test_rx_poll(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct napi_struct *napi;
++	struct mt76_queue *q;
++	int done;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_BAND1, 8, 0);
++	napi = mt76_dma_test_napi(t, MT_RXQ_BAND1);
++	mt76_dma_rx_fill(dev, q, false);
++	mt76_dma_test_rx_frame(t, q, 0, 60, 0);
++	mt76_dma_test_rx_frame(t, q, 1, 61, 1);
++
++	local_bh_disable();
++	KUNIT_ASSERT_TRUE(test, napi_schedule_prep(napi));
++	done = napi->poll(napi, 16);
++	local_bh_enable();
++
++	KUNIT_EXPECT_EQ(test, done, 2);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 2);
++	KUNIT_EXPECT_EQ(test, t->rx_qid, MT_RXQ_BAND1);
++	KUNIT_EXPECT_EQ(test, t->n_poll_complete, 1);
++	KUNIT_EXPECT_EQ(test, t->poll_qid, MT_RXQ_BAND1);
++	KUNIT_EXPECT_FALSE(test, test_bit(NAPI_STATE_SCHED, &napi->state));
++}
++
++/* With the budget used up, NAPI stays scheduled and the interrupt off. */
++static void mt76_dma_test_rx_poll_budget(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct napi_struct *napi;
++	struct mt76_queue *q;
++	int i, done;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	napi = mt76_dma_test_napi(t, MT_RXQ_MAIN);
++	mt76_dma_rx_fill(dev, q, false);
++	for (i = 0; i < 3; i++)
++		mt76_dma_test_rx_frame(t, q, i, 60, i);
++
++	local_bh_disable();
++	KUNIT_ASSERT_TRUE(test, napi_schedule_prep(napi));
++	done = mt76_dma_rx_poll(napi, 2);
++	KUNIT_EXPECT_EQ(test, done, 2);
++	KUNIT_EXPECT_EQ(test, t->n_poll_complete, 0);
++	KUNIT_EXPECT_TRUE(test, test_bit(NAPI_STATE_SCHED, &napi->state));
++	/* the next round finishes */
++	done = mt76_dma_rx_poll(napi, 2);
++	local_bh_enable();
++
++	KUNIT_EXPECT_EQ(test, done, 1);
++	KUNIT_EXPECT_EQ(test, t->n_poll_complete, 1);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 3);
++}
++
++static int mt76_dma_test_tx_poll(struct napi_struct *napi, int budget)
++{
++	return 0;
++}
++
++/* Queue init sets up the NAPI devices and a NAPI context for each rx
++ * queue in use (not for RRO queues, nor unused ones), and fills the rings;
++ * cleanup completes what is still queued, empties the rings and frees the
++ * caches.
++ */
++static void mt76_dma_test_init_cleanup(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	u16 rro = __MT_WED_RRO_Q(MT76_WED_RRO_Q_IND, 0);
++	struct mt76_queue *rxq, *rroq, *txq, *mcuq;
++	struct mt76_dev *dev = t->dev;
++	struct napi_struct *napi;
++	struct sk_buff *skb;
++
++	rxq = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 8, 0);
++	rroq = mt76_dma_test_rx_queue(t, MT_RXQ_RRO_IND, 4, rro);
++	txq = mt76_dma_test_tx_queue(t, 0, 8);
++	mcuq = mt76_dma_test_tx_queue(t, 1, 8);
++	dev->phy.q_tx[MT_TXQ_BE] = txq;
++	dev->q_mcu[MT_MCUQ_WM] = mcuq;
++	skb = mt76_dma_test_skb(t, 40, 0);
++	KUNIT_ASSERT_GE(test, dev->queue_ops->tx_queue_skb(&dev->phy, txq,
++			MT_TXQ_BE, skb, NULL, NULL), 0);
++	skb = mt76_dma_test_skb(t, 40, 0);
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb_raw(dev, mcuq, skb,
++			0), 0);
++	mt76_put_txwi(dev, mt76_get_txwi(dev));
++	mt76_put_rxwi(dev, mt76_get_rxwi(dev));
++
++	KUNIT_ASSERT_EQ(test, dev->queue_ops->init(dev, mt76_dma_rx_poll), 0);
++
++	KUNIT_ASSERT_NOT_NULL(test, dev->napi_dev);
++	KUNIT_ASSERT_NOT_NULL(test, dev->tx_napi_dev);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_priv(dev->napi_dev), dev);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_priv(dev->tx_napi_dev), dev);
++	KUNIT_EXPECT_STREQ(test, dev->napi_dev->name,
++			   wiphy_name(dev->hw->wiphy));
++	KUNIT_EXPECT_TRUE(test, dev->napi_dev->threaded);
++
++	napi = &dev->napi[MT_RXQ_MAIN];
++	KUNIT_EXPECT_PTR_EQ(test, (void *)napi->poll, (void *)mt76_dma_rx_poll);
++	KUNIT_EXPECT_PTR_EQ(test, napi->dev, dev->napi_dev);
++	KUNIT_EXPECT_FALSE(test, test_bit(NAPI_STATE_SCHED, &napi->state));
++	KUNIT_EXPECT_EQ(test, rxq->queued, 7);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(rxq)->cpu_idx, 7);
++	/* the RRO queue is left alone: not filled, NAPI not taken over */
++	napi = &dev->napi[MT_RXQ_RRO_IND];
++	KUNIT_EXPECT_NULL(test, (void *)napi->poll);
++	KUNIT_EXPECT_FALSE(test, test_bit(NAPI_STATE_LISTED, &napi->state));
++	KUNIT_EXPECT_EQ(test, rroq->queued, 0);
++	/* unused queues get none */
++	KUNIT_EXPECT_NULL(test, (void *)dev->napi[MT_RXQ_BAND1].poll);
++
++	/* what the driver does before the cleanup */
++	netif_napi_add_tx(dev->tx_napi_dev, &dev->tx_napi,
++			  mt76_dma_test_tx_poll);
++	napi_enable(&dev->tx_napi);
++	napi_disable(&dev->napi[MT_RXQ_MAIN]);
++
++	mt76_dma_cleanup(dev);
++	t->dma_cleaned = true;
++
++	KUNIT_EXPECT_EQ(test, t->n_done, 2);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 2);
++	KUNIT_EXPECT_EQ(test, txq->queued, 0);
++	KUNIT_EXPECT_EQ(test, mcuq->queued, 0);
++	KUNIT_EXPECT_EQ(test, rxq->queued, 0);
++	KUNIT_EXPECT_NULL(test, rxq->entry[0].buf);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->rxwi_cache));
++	rxq->page_pool = NULL;
++	rroq->page_pool = NULL;
++}
++
++/* --- WED RRO rings (MT7988/MT7992 WED v3, not the MT7986) ------------------ */
++
++/* RRO indication commands are the ring itself: a new ring has every
++ * command at the last magic count, a command is new only once it carries
++ * the ring's current count, and the count advances with each lap.
++ */
++static void mt76_dma_test_rro_ind(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	u16 flags = __MT_WED_RRO_Q(MT76_WED_RRO_Q_IND, 0);
++	struct mt76_wed_rro_desc *ring;
++	struct mt76_dev *dev = t->dev;
++	struct mt76_wed_rro_ind *cmd;
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_RRO_IND, 4, flags);
++	ring = (struct mt76_wed_rro_desc *)q->desc;
++	for (i = 0; i < 4; i++) {
++		cmd = (struct mt76_wed_rro_ind *)&ring[i];
++		KUNIT_EXPECT_EQ(test, FIELD_GET(RRO_IND_DATA1_MAGIC_CNT_MASK,
++						le32_to_cpu(cmd->data1)),
++				MT_DMA_WED_IND_CMD_CNT - 1);
++	}
++	KUNIT_EXPECT_EQ(test, q->magic_cnt, 0);
++
++	/* the "buffers" are the commands, no page is taken */
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 3);
++	KUNIT_EXPECT_PTR_EQ(test, q->entry[1].buf, (void *)&ring[1]);
++
++	/* nothing new yet */
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++
++	cmd = (struct mt76_wed_rro_ind *)&ring[0];
++	cmd->data1 = cpu_to_le32(FIELD_PREP(RRO_IND_DATA1_MAGIC_CNT_MASK, 0));
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
++	KUNIT_EXPECT_EQ(test, t->n_rro_ind, 1);
++	KUNIT_EXPECT_PTR_EQ(test, t->rro_ind, (void *)cmd);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 0);
++
++	/* to the end of the lap: the count moves on */
++	for (i = 1; i < 4; i++) {
++		cmd = (struct mt76_wed_rro_ind *)&ring[i];
++		cmd->data1 = cpu_to_le32(FIELD_PREP(RRO_IND_DATA1_MAGIC_CNT_MASK,
++						    0));
++	}
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 3);
++	KUNIT_EXPECT_EQ(test, q->magic_cnt, 1);
++	KUNIT_EXPECT_EQ(test, q->tail, 0);
++
++	/* slot 0 still has last lap's count: not new */
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++	cmd = (struct mt76_wed_rro_ind *)&ring[0];
++	cmd->data1 = cpu_to_le32(FIELD_PREP(RRO_IND_DATA1_MAGIC_CNT_MASK, 1));
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
++	KUNIT_EXPECT_EQ(test, t->n_rro_ind, 5);
++
++	/* a reset keeps the command layout and restarts the count */
++	dev->queue_ops->reset_q(dev, q, true);
++	KUNIT_EXPECT_EQ(test, q->magic_cnt, 0);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(RRO_IND_DATA1_MAGIC_CNT_MASK,
++					le32_to_cpu(cmd->data1)),
++			MT_DMA_WED_IND_CMD_CNT - 1);
++	q->queued = 0;
++}
++
++/* RXDMAD_C descriptors point at RRO data buffers by rx token: the frame is
++ * built from the token's buffer with the descriptor's length, repeated or
++ * old packets are dropped, and an unknown token is skipped.
++ */
++static void mt76_dma_test_rro_rxdmad_c(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_rro_rxdmad_c *dmad;
++	struct mt76_queue *data, *q;
++	struct sk_buff *skb;
++	void *buf2;
++	int i;
++
++	data = mt76_dma_test_rx_queue(t, MT_RXQ_RRO_BAND0, 8,
++			__MT_WED_RRO_Q(MT76_WED_RRO_Q_DATA, 0));
++	KUNIT_ASSERT_EQ(test, mt76_dma_rx_fill(dev, data, false), 7);
++	/* RRO data buffers get tokens too */
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_TOKEN,
++					le32_to_cpu(data->desc[2].buf1)), 2);
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_RRO_RXDMAD_C, 4,
++			__MT_WED_RRO_Q(MT76_WED_RRO_Q_RXDMAD_C, 0));
++	dmad = (struct mt76_rro_rxdmad_c *)q->desc;
++	for (i = 0; i < 4; i++)
++		KUNIT_EXPECT_EQ(test, FIELD_GET(RRO_RXDMAD_DATA3_MAGIC_CNT_MASK,
++						le32_to_cpu(dmad[i].data3)),
++				MT_DMA_MAGIC_CNT - 1);
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 3);
++	KUNIT_EXPECT_PTR_EQ(test, q->entry[0].buf, (void *)&dmad[0]);
++
++	buf2 = data->entry[2].buf;
++	memset(buf2, 0x2c, 120);
++	dma_sync_single_for_device(dev->dma_dev, data->entry[2].dma_addr[0],
++				   120, DMA_FROM_DEVICE);
++	dmad[0].data1 = cpu_to_le32(FIELD_PREP(RRO_RXDMAD_DATA1_SDL0_MASK,
++					       120) | RRO_RXDMAD_DATA1_LS_MASK);
++	dmad[0].data2 = cpu_to_le32(FIELD_PREP(RRO_RXDMAD_DATA2_RX_TOKEN_ID_MASK,
++					       2));
++	/* a repeated packet in token 4's buffer */
++	dmad[1].data1 = dmad[0].data1;
++	dmad[1].data2 = cpu_to_le32(FIELD_PREP(RRO_RXDMAD_DATA2_RX_TOKEN_ID_MASK,
++					       4) |
++				    FIELD_PREP(RRO_RXDMAD_DATA2_IND_REASON_MASK,
++					       MT_DMA_WED_IND_REASON_REPEAT));
++	/* a token nobody holds */
++	dmad[2].data1 = dmad[0].data1;
++	dmad[2].data2 = cpu_to_le32(FIELD_PREP(RRO_RXDMAD_DATA2_RX_TOKEN_ID_MASK,
++					       50));
++	for (i = 0; i < 3; i++)
++		dmad[i].data3 = cpu_to_le32(FIELD_PREP(RRO_RXDMAD_DATA3_MAGIC_CNT_MASK,
++						       0));
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 3);
++
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&t->rx), 1);
++	skb = skb_peek(&t->rx);
++	KUNIT_EXPECT_PTR_EQ(test, (void *)skb->head, buf2);
++	KUNIT_EXPECT_EQ(test, skb->len, 120);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_skb_filled(skb, 0, 120, 0x2c));
++	KUNIT_EXPECT_EQ(test, t->rx_qid, MT_RXQ_RRO_RXDMAD_C);
++	/* there is no descriptor info for these */
++	KUNIT_EXPECT_EQ(test, t->rx_info, 0);
++	/* both tokens were released, their rxwis cached */
++	KUNIT_EXPECT_NULL(test, idr_find(&dev->rx_token, 2));
++	KUNIT_EXPECT_NULL(test, idr_find(&dev->rx_token, 4));
++	KUNIT_EXPECT_NOT_NULL(test, idr_find(&dev->rx_token, 3));
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->rxwi_cache), 2);
++	/* their buffers left the data ring's token list */
++	data->entry[2].buf = NULL;
++	data->entry[4].buf = NULL;
++}
++
++/* With hardware RRO (WED_RRO_EN) the ring size register carries the RRO
++ * enable bit, each buffer is stamped with the lap's magic count, and rx
++ * only runs up to the hardware's dma_idx, which a dead bus can't move.
++ */
++static void mt76_dma_test_rro_en(struct kunit *test)
++{
++	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	int i;
++
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MAIN, 4, MT_QFLAG_WED_RRO_EN);
++	regs = mt76_dma_test_qregs(q);
++	KUNIT_EXPECT_EQ(test, regs->ring_size, MT_DMA_RRO_EN | 4);
++
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 3);
++	for (i = 0; i < 3; i++)
++		KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_MAGIC_MASK,
++					le32_to_cpu(q->desc[i].info)), 0);
++
++	for (i = 0; i < 3; i++)
++		mt76_dma_test_rx_frame(t, q, i, 50, i);
++	regs->dma_idx = 0xffffffff;
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 0);
++
++	regs->dma_idx = 1;
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 1);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	/* slot 3 closed the lap: slot 0 gets the next count */
++	KUNIT_EXPECT_EQ(test, q->magic_cnt, 1);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_MAGIC_MASK,
++					le32_to_cpu(q->desc[3].info)), 0);
++
++	regs->dma_idx = 3;
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_poll(t, q, 16), 2);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&t->rx), 3);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_MAGIC_MASK,
++					le32_to_cpu(q->desc[0].info)), 1);
++}
++
++/* MSDU page rings register each buffer with the driver; a buffer the
++ * driver can't take stops the fill.
++ */
++static void mt76_dma_test_rro_msdu_page(struct kunit *test)
++{
++	u16 flags = __MT_WED_RRO_Q(MT76_WED_RRO_Q_MSDU_PG, 0);
++	struct mt76_dma_test *t;
++	struct mt76_queue *q;
++	struct mt76_dev *dev;
++
++	t = mt76_dma_test_init(test, &mt76_dma_test_drv_msdu_page);
++	dev = t->dev;
++	q = mt76_dma_test_rx_queue(t, MT_RXQ_MSDU_PAGE_BAND0, 4, flags);
++
++	t->msdu_page_ret = -ENOMEM;
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 0);
++	KUNIT_EXPECT_EQ(test, t->n_msdu_page, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++
++	t->msdu_page_ret = 0;
++	KUNIT_EXPECT_EQ(test, mt76_dma_rx_fill(dev, q, false), 3);
++	KUNIT_EXPECT_EQ(test, t->n_msdu_page, 4);
++	KUNIT_EXPECT_EQ(test, t->msdu_page_addr, q->entry[2].dma_addr[0]);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[2].buf0),
++			lower_32_bits(q->entry[2].dma_addr[0]));
++}
++
++
++static struct kunit_case mt76_dma_test_cases[] = {
++	KUNIT_CASE(mt76_dma_test_alloc_tx_queue),
++	KUNIT_CASE(mt76_dma_test_alloc_rx_queue),
++	KUNIT_CASE(mt76_dma_test_queue_reset),
++	KUNIT_CASE(mt76_dma_test_queue_reset_dead_bus),
++	KUNIT_CASE(mt76_dma_test_emi_queue),
++	KUNIT_CASE(mt76_dma_test_txwi_cache),
++	KUNIT_CASE(mt76_dma_test_rxwi_cache),
++	KUNIT_CASE(mt76_dma_test_tx_queue_skb),
++	KUNIT_CASE(mt76_dma_test_tx_queue_skb_frags),
++	KUNIT_CASE(mt76_dma_test_tx_queue_skb_max_frags),
++	KUNIT_CASE(mt76_dma_test_tx_queue_skb_full),
++	KUNIT_CASE(mt76_dma_test_tx_queue_skb_reset),
++	KUNIT_CASE(mt76_dma_test_tx_queue_skb_prepare_error),
++	KUNIT_CASE(mt76_dma_test_tx_queue_skb_pad),
++	KUNIT_CASE(mt76_dma_test_tx_queue_raw),
++	KUNIT_CASE(mt76_dma_test_tx_queue_raw_errors),
++	KUNIT_CASE(mt76_dma_test_tx_cleanup),
++	KUNIT_CASE(mt76_dma_test_tx_cleanup_reread),
++	KUNIT_CASE(mt76_dma_test_tx_cleanup_multi_desc),
++	KUNIT_CASE(mt76_dma_test_tx_cleanup_flush),
++	KUNIT_CASE(mt76_dma_test_tx_cleanup_dead_bus),
++	KUNIT_CASE(mt76_dma_test_tx_cleanup_no_free),
++	KUNIT_CASE(mt76_dma_test_tx_cleanup_no_queue),
++	{}
++};
++
++static struct kunit_case mt76_dma_test_rx_cases[] = {
++	KUNIT_CASE(mt76_dma_test_rx_fill),
++	KUNIT_CASE(mt76_dma_test_rx_process),
++	KUNIT_CASE(mt76_dma_test_rx_process_budget),
++	KUNIT_CASE(mt76_dma_test_rx_process_rx_check),
++	KUNIT_CASE(mt76_dma_test_rx_process_frags),
++	KUNIT_CASE(mt76_dma_test_rx_process_drop),
++	KUNIT_CASE(mt76_dma_test_rx_process_too_long),
++	KUNIT_CASE(mt76_dma_test_rx_process_frag_overflow),
++	KUNIT_CASE(mt76_dma_test_rx_cleanup),
++	KUNIT_CASE(mt76_dma_test_rx_reset),
++	KUNIT_CASE(mt76_dma_test_rx_reset_wed_txfree),
++	KUNIT_CASE(mt76_dma_test_rx_poll),
++	KUNIT_CASE(mt76_dma_test_rx_poll_budget),
++	KUNIT_CASE(mt76_dma_test_init_cleanup),
++	{}
++};
++
++static struct kunit_case mt76_dma_test_wed_cases[] = {
++	KUNIT_CASE(mt76_dma_test_rx_wed_fill),
++	KUNIT_CASE(mt76_dma_test_rx_wed_no_tokens),
++	KUNIT_CASE(mt76_dma_test_rx_wed_process),
++	KUNIT_CASE(mt76_dma_test_rx_wed_unknown_token),
++	KUNIT_CASE(mt76_dma_test_rx_wed_cleanup),
++	KUNIT_CASE(mt76_dma_test_rro_ind),
++	KUNIT_CASE(mt76_dma_test_rro_rxdmad_c),
++	KUNIT_CASE(mt76_dma_test_rro_en),
++	KUNIT_CASE(mt76_dma_test_rro_msdu_page),
++	{}
++};
++
++static struct kunit_suite mt76_dma_test_suite = {
++	.name = "mt76-dma",
++	.test_cases = mt76_dma_test_cases,
++};
++
++static struct kunit_suite mt76_dma_test_rx_suite = {
++	.name = "mt76-dma-rx",
++	.test_cases = mt76_dma_test_rx_cases,
++};
++
++static struct kunit_suite mt76_dma_test_wed_suite = {
++	.name = "mt76-dma-wed",
++	.test_cases = mt76_dma_test_wed_cases,
++};
++
++kunit_test_suites(&mt76_dma_test_suite, &mt76_dma_test_rx_suite,
++		  &mt76_dma_test_wed_suite);
+diff --git a/tests/mmio-test.c b/tests/mmio-test.c
+new file mode 100644
+index 00000000..4a32ea26
+--- /dev/null
++++ b/tests/mmio-test.c
+@@ -0,0 +1,221 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt76's MMIO bus ops: mt76_mmio_init() and the register
++ * accessors it installs, run on a plain buffer standing in for the MMIO
++ * window. Included at the end of mmio.c when CONFIG_MT76_KUNIT_TEST is
++ * defined (milkflint's QEMU test build only).
++ */
++#include <kunit/test.h>
++#include "fake.h"
++
++#define MT76_MMIO_TEST_SIZE	0x100
++
++/* fake.h's mt76_test_hw_ops, plus the channel context ops mac80211 (6.9+)
++ * insists on: without them mt76_test_dev() can't allocate the hw.
++ */
++static const struct ieee80211_ops mt76_mmio_test_hw_ops = {
++	.tx = mt76_test_tx,
++	.start = mt76_test_start,
++	.stop = mt76_test_stop,
++	.add_interface = mt76_test_add_interface,
++	.remove_interface = mt76_test_remove_interface,
++	.config = mt76_test_config,
++	.configure_filter = mt76_test_configure_filter,
++	.wake_tx_queue = mt76_test_wake_tx_queue,
++	.add_chanctx = ieee80211_emulate_add_chanctx,
++	.remove_chanctx = ieee80211_emulate_remove_chanctx,
++	.change_chanctx = ieee80211_emulate_change_chanctx,
++	.switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx,
++};
++
++/* A device whose bus is MMIO on a zeroed buffer, returned in @regs. */
++static struct mt76_dev *mt76_mmio_test_dev(struct kunit *test, u32 **regs)
++{
++	struct mt76_dev *dev;
++
++	dev = mt76_test_dev(test, sizeof(*dev), &mt76_mmio_test_hw_ops, NULL);
++	*regs = kunit_kzalloc(test, MT76_MMIO_TEST_SIZE, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, *regs);
++	mt76_mmio_init(dev, (void __iomem *)*regs);
++
++	return dev;
++}
++
++/* Init installs the MMIO ops on the window it's given: plain register
++ * reads and writes hit the window at the register's offset.
++ */
++static void mt76_mmio_test_init_rr_wr(struct kunit *test)
++{
++	struct mt76_dev *dev;
++	u32 *regs;
++
++	dev = mt76_mmio_test_dev(test, &regs);
++
++	KUNIT_EXPECT_EQ(test, dev->bus->type, MT76_BUS_MMIO);
++	KUNIT_EXPECT_PTR_EQ(test, (void *)dev->mmio.regs, (void *)regs);
++	KUNIT_EXPECT_TRUE(test, mt76_is_mmio(dev));
++
++	__mt76_wr(dev, 0x10, 0xdeadbeef);
++	KUNIT_EXPECT_EQ(test, regs[0x10 / 4], 0xdeadbeef);
++	KUNIT_EXPECT_EQ(test, regs[0x0c / 4], 0);
++	KUNIT_EXPECT_EQ(test, regs[0x14 / 4], 0);
++
++	regs[0x24 / 4] = 0x01234567;
++	KUNIT_EXPECT_EQ(test, __mt76_rr(dev, 0x24), 0x01234567);
++	KUNIT_EXPECT_EQ(test, __mt76_rr(dev, 0x10), 0xdeadbeef);
++}
++
++/* Read-modify-write replaces only the masked bits and returns the value
++ * written.
++ */
++static void mt76_mmio_test_rmw(struct kunit *test)
++{
++	struct mt76_dev *dev;
++	u32 *regs;
++
++	dev = mt76_mmio_test_dev(test, &regs);
++	regs[0x40 / 4] = 0xaabbccdd;
++
++	KUNIT_EXPECT_EQ(test, __mt76_rmw(dev, 0x40, 0x0000ff00, 0x1200),
++			0xaabb12dd);
++	KUNIT_EXPECT_EQ(test, regs[0x40 / 4], 0xaabb12dd);
++
++	/* bits outside the mask in @val are still set (callers' contract) */
++	KUNIT_EXPECT_EQ(test, __mt76_rmw(dev, 0x40, 0xff000000, 0x5a000000),
++			0x5abb12dd);
++	KUNIT_EXPECT_EQ(test, regs[0x40 / 4], 0x5abb12dd);
++	KUNIT_EXPECT_EQ(test, regs[0x44 / 4], 0);
++}
++
++/* Copies to registers go in 32-bit little-endian words; a tail shorter
++ * than a word is zero-padded and the register after it is left alone.
++ */
++static void mt76_mmio_test_write_copy(struct kunit *test)
++{
++	static const u8 data[] = { 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
++	struct mt76_dev *dev;
++	u32 *regs;
++
++	dev = mt76_mmio_test_dev(test, &regs);
++	regs[0x84 / 4] = 0xffffffff;
++	regs[0x88 / 4] = 0xcafef00d;
++
++	__mt76_wr_copy(dev, 0x80, data, sizeof(data));
++
++	KUNIT_EXPECT_EQ(test, regs[0x80 / 4], 0x44332211);
++	KUNIT_EXPECT_EQ(test, regs[0x84 / 4], 0x00006655);
++	KUNIT_EXPECT_EQ(test, regs[0x88 / 4], 0xcafef00d);
++
++	/* whole words only: nothing past them */
++	__mt76_wr_copy(dev, 0x88, data, 4);
++	KUNIT_EXPECT_EQ(test, regs[0x88 / 4], 0x44332211);
++	KUNIT_EXPECT_EQ(test, regs[0x8c / 4], 0);
++}
++
++/* Copies from registers fill exactly @len bytes, the tail from the low
++ * bytes of the last register.
++ */
++static void mt76_mmio_test_read_copy(struct kunit *test)
++{
++	struct mt76_dev *dev;
++	u8 buf[8];
++	u32 *regs;
++
++	dev = mt76_mmio_test_dev(test, &regs);
++	regs[0x90 / 4] = 0x44332211;
++	regs[0x94 / 4] = 0x88776655;
++
++	memset(buf, 0xee, sizeof(buf));
++	__mt76_rr_copy(dev, 0x90, buf, 7);
++
++	KUNIT_EXPECT_EQ(test, buf[0], 0x11);
++	KUNIT_EXPECT_EQ(test, buf[3], 0x44);
++	KUNIT_EXPECT_EQ(test, buf[4], 0x55);
++	KUNIT_EXPECT_EQ(test, buf[6], 0x77);
++	/* nothing written past @len */
++	KUNIT_EXPECT_EQ(test, buf[7], 0xee);
++
++	memset(buf, 0xee, sizeof(buf));
++	__mt76_rr_copy(dev, 0x94, buf, 4);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(buf), 0x88776655);
++	KUNIT_EXPECT_EQ(test, buf[4], 0xee);
++}
++
++/* Register pair lists are written and read at the registers' own offsets:
++ * on MMIO the base (the MCU window on USB) plays no part.
++ */
++static void mt76_mmio_test_reg_pairs(struct kunit *test)
++{
++	struct mt76_reg_pair wr[] = {
++		{ .reg = 0x20, .value = 0x1111 },
++		{ .reg = 0x28, .value = 0x2222 },
++		{ .reg = 0x30, .value = 0x3333 },
++	};
++	struct mt76_reg_pair rd[] = {
++		{ .reg = 0x28 },
++		{ .reg = 0x20 },
++		{ .reg = 0x34 },
++	};
++	struct mt76_dev *dev;
++	u32 *regs;
++
++	dev = mt76_mmio_test_dev(test, &regs);
++	regs[0x34 / 4] = 0x4444;
++
++	/* only the first two pairs */
++	KUNIT_EXPECT_EQ(test, dev->bus->wr_rp(dev, 0x80, wr, 2), 0);
++	KUNIT_EXPECT_EQ(test, regs[0x20 / 4], 0x1111);
++	KUNIT_EXPECT_EQ(test, regs[0x28 / 4], 0x2222);
++	KUNIT_EXPECT_EQ(test, regs[0x30 / 4], 0);
++	KUNIT_EXPECT_EQ(test, regs[0xa0 / 4], 0);
++
++	KUNIT_EXPECT_EQ(test, dev->bus->rd_rp(dev, 0x80, rd, ARRAY_SIZE(rd)),
++			0);
++	KUNIT_EXPECT_EQ(test, rd[0].value, 0x2222);
++	KUNIT_EXPECT_EQ(test, rd[1].value, 0x1111);
++	KUNIT_EXPECT_EQ(test, rd[2].value, 0x4444);
++	KUNIT_EXPECT_EQ(test, rd[0].reg, 0x28);
++}
++
++/* The interrupt mask is kept in software and written to the mask
++ * register; without a register address only the cached copy changes.
++ */
++static void mt76_mmio_test_irq_mask(struct kunit *test)
++{
++	struct mt76_dev *dev;
++	u32 *regs;
++
++	dev = mt76_mmio_test_dev(test, &regs);
++
++	mt76_set_irq_mask(dev, 0x50, 0, BIT(0) | BIT(4) | BIT(9));
++	KUNIT_EXPECT_EQ(test, dev->mmio.irqmask, BIT(0) | BIT(4) | BIT(9));
++	KUNIT_EXPECT_EQ(test, regs[0x50 / 4], BIT(0) | BIT(4) | BIT(9));
++
++	/* clear and set in one call */
++	mt76_set_irq_mask(dev, 0x50, BIT(4), BIT(12));
++	KUNIT_EXPECT_EQ(test, dev->mmio.irqmask, BIT(0) | BIT(9) | BIT(12));
++	KUNIT_EXPECT_EQ(test, regs[0x50 / 4], BIT(0) | BIT(9) | BIT(12));
++
++	/* no register: the hardware isn't touched */
++	mt76_set_irq_mask(dev, 0, BIT(0), 0);
++	KUNIT_EXPECT_EQ(test, dev->mmio.irqmask, BIT(9) | BIT(12));
++	KUNIT_EXPECT_EQ(test, regs[0x50 / 4], BIT(0) | BIT(9) | BIT(12));
++	KUNIT_EXPECT_EQ(test, regs[0], 0);
++}
++
++static struct kunit_case mt76_mmio_test_cases[] = {
++	KUNIT_CASE(mt76_mmio_test_init_rr_wr),
++	KUNIT_CASE(mt76_mmio_test_rmw),
++	KUNIT_CASE(mt76_mmio_test_write_copy),
++	KUNIT_CASE(mt76_mmio_test_read_copy),
++	KUNIT_CASE(mt76_mmio_test_reg_pairs),
++	KUNIT_CASE(mt76_mmio_test_irq_mask),
++	{}
++};
++
++static struct kunit_suite mt76_mmio_test_suite = {
++	.name = "mt76-mmio",
++	.test_cases = mt76_mmio_test_cases,
++};
++
++kunit_test_suites(&mt76_mmio_test_suite);
+diff --git a/tests/tx-test.c b/tests/tx-test.c
+new file mode 100644
+index 00000000..06efa373
+--- /dev/null
++++ b/tests/tx-test.c
+@@ -0,0 +1,1534 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt76's tx path (tx.c): queueing and scheduling of
++ * pending frames, tx status tracking, non-AQL accounting, power save and
++ * tokens. Included at the end of tx.c when CONFIG_MT76_KUNIT_TEST is
++ * defined (milkflint's QEMU test build only).
++ *
++ * The hardware queues are a test queue_ops that records what it is given.
++ * mac80211 isn't registered, so there are no mac80211 stations or txqs:
++ * stations here are bare ieee80211_sta structs carrying the wcid in
++ * drv_priv, and nothing hands them to a mac80211 function that would look
++ * at its own part of the station (tx status reports go without one).
++ * The tx worker is parked, so scheduling it only sets its flag.
++ */
++#include <kunit/test.h>
++#include "fake.h"
++
++#define MT76_TX_TEST_NDESC	64
++#define MT76_TX_TEST_MAX_WCID	8
++
++struct mt76_tx_test_rec {
++	struct mt76_phy *phy;
++	struct mt76_queue *q;
++	enum mt76_txq_id qid;
++	struct sk_buff *skb;
++	struct mt76_wcid *wcid;
++	struct ieee80211_sta *sta;
++};
++
++struct mt76_tx_test {
++	struct kunit *test;
++	struct mt76_dev *dev;
++
++	struct mt76_tx_test_rec rec[16];	/* tx_queue_skb calls */
++	int n_queued;
++	struct sk_buff_head queued;
++	int queue_ret;
++	int n_kick;
++	struct mt76_queue *kick_q;
++	int n_cleanup;
++
++	int n_complete;
++	struct mt76_queue_entry complete;
++
++	struct mt76_wcid *wcids[MT76_TX_TEST_MAX_WCID];
++	int n_wcids;
++	int n_freed;
++};
++
++static struct mt76_tx_test *mt76_tx_test_ctx;
++
++/* fake.h's mt76_test_hw_ops, plus the channel context ops mac80211 (6.9+)
++ * insists on: without them mt76_test_dev() can't allocate the hw.
++ */
++static const struct ieee80211_ops mt76_tx_test_hw_ops = {
++	.tx = mt76_test_tx,
++	.start = mt76_test_start,
++	.stop = mt76_test_stop,
++	.add_interface = mt76_test_add_interface,
++	.remove_interface = mt76_test_remove_interface,
++	.config = mt76_test_config,
++	.configure_filter = mt76_test_configure_filter,
++	.wake_tx_queue = mt76_test_wake_tx_queue,
++	.add_chanctx = ieee80211_emulate_add_chanctx,
++	.remove_chanctx = ieee80211_emulate_remove_chanctx,
++	.change_chanctx = ieee80211_emulate_change_chanctx,
++	.switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx,
++};
++
++static int mt76_tx_test_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
++				  enum mt76_txq_id qid, struct sk_buff *skb,
++				  struct mt76_wcid *wcid,
++				  struct ieee80211_sta *sta)
++{
++	struct mt76_tx_test *t = mt76_tx_test_ctx;
++	int idx;
++
++	if (t->queue_ret) {
++		ieee80211_free_txskb(phy->hw, skb);
++		return t->queue_ret;
++	}
++
++	if (t->n_queued < ARRAY_SIZE(t->rec)) {
++		struct mt76_tx_test_rec *r = &t->rec[t->n_queued];
++
++		r->phy = phy;
++		r->q = q;
++		r->qid = qid;
++		r->skb = skb;
++		r->wcid = wcid;
++		r->sta = sta;
++	}
++	t->n_queued++;
++	skb_queue_tail(&t->queued, skb);
++
++	idx = q->head;
++	q->head = (q->head + 1) % q->ndesc;
++	q->queued++;
++	q->entry[idx].wcid = 0xffff;
++
++	return idx;
++}
++
++static void mt76_tx_test_kick(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	struct mt76_tx_test *t = mt76_tx_test_ctx;
++
++	t->n_kick++;
++	t->kick_q = q;
++}
++
++static void mt76_tx_test_cleanup(struct mt76_dev *dev, struct mt76_queue *q,
++				 bool flush)
++{
++	mt76_tx_test_ctx->n_cleanup++;
++}
++
++static const struct mt76_queue_ops mt76_tx_test_queue_ops = {
++	.tx_queue_skb = mt76_tx_test_queue_skb,
++	.tx_cleanup = mt76_tx_test_cleanup,
++	.kick = mt76_tx_test_kick,
++};
++
++static void mt76_tx_test_complete(struct mt76_dev *dev,
++				  struct mt76_queue_entry *e)
++{
++	struct mt76_tx_test *t = mt76_tx_test_ctx;
++
++	t->n_complete++;
++	t->complete = *e;
++}
++
++static const struct mt76_driver_ops mt76_tx_test_drv = {
++	.tx_complete_skb = mt76_tx_test_complete,
++};
++
++/* the mt7915's: management frames have a hardware queue */
++static const struct mt76_driver_ops mt76_tx_test_drv_mgmt_txq = {
++	.drv_flags = MT_DRV_HW_MGMT_TXQ,
++	.tx_complete_skb = mt76_tx_test_complete,
++};
++
++static const struct mt76_driver_ops mt76_tx_test_drv_hw_ps = {
++	.drv_flags = MT_DRV_HW_PS_BUFFERING,
++	.tx_complete_skb = mt76_tx_test_complete,
++};
++
++static const struct mt76_driver_ops mt76_tx_test_drv_ignore_txs = {
++	.drv_flags = MT_DRV_IGNORE_TXS_FAILED,
++	.tx_complete_skb = mt76_tx_test_complete,
++};
++
++static void mt76_tx_test_teardown(void *data)
++{
++	struct mt76_tx_test *t = data;
++	int i;
++
++	for (i = 0; i < t->n_wcids; i++) {
++		struct mt76_wcid *wcid = t->wcids[i];
++		struct sk_buff *skb;
++		int id;
++
++		/* as if their DMA completed, so the flush reports them */
++		idr_for_each_entry(&wcid->pktid, skb, id)
++			mt76_tx_skb_cb(skb)->flags |= MT_TX_CB_DMA_DONE;
++		/* report what's left without a station */
++		wcid->sta = 0;
++		wcid->def_wcid = NULL;
++		mt76_wcid_cleanup(t->dev, wcid);
++		if (rcu_access_pointer(t->dev->wcid[wcid->idx]) == wcid)
++			RCU_INIT_POINTER(t->dev->wcid[wcid->idx], NULL);
++	}
++	skb_queue_purge(&t->queued);
++	mt76_tx_test_ctx = NULL;
++}
++
++/* A hardware queue as the scheduler sees it. */
++static struct mt76_queue *mt76_tx_test_hwq(struct mt76_tx_test *t)
++{
++	struct mt76_dev *dev = t->dev;
++	struct mt76_queue *q;
++
++	/* device-managed: the teardown runs after kunit allocations go */
++	q = devm_kzalloc(dev->dev, sizeof(*q), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(t->test, q);
++	q->entry = devm_kcalloc(dev->dev, MT76_TX_TEST_NDESC,
++				sizeof(*q->entry), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(t->test, q->entry);
++	q->ndesc = MT76_TX_TEST_NDESC;
++	spin_lock_init(&q->lock);
++	spin_lock_init(&q->cleanup_lock);
++
++	return q;
++}
++
++static void mt76_tx_test_phy_init(struct mt76_tx_test *t,
++				  struct mt76_phy *phy)
++{
++	int i;
++
++	INIT_LIST_HEAD(&phy->tx_list);
++	spin_lock_init(&phy->tx_lock);
++	for (i = 0; i < __MT_TXQ_MAX; i++)
++		phy->q_tx[i] = mt76_tx_test_hwq(t);
++}
++
++static struct mt76_tx_test *
++mt76_tx_test_init(struct kunit *test, const struct mt76_driver_ops *drv)
++{
++	struct mt76_tx_test *t;
++	struct mt76_dev *dev;
++
++	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, t);
++	t->test = test;
++	skb_queue_head_init(&t->queued);
++
++	dev = mt76_test_dev(test, sizeof(*dev), &mt76_tx_test_hw_ops,
++			    drv ?: &mt76_tx_test_drv);
++	t->dev = dev;
++	dev->queue_ops = &mt76_tx_test_queue_ops;
++	mt76_tx_test_phy_init(t, &dev->phy);
++
++	/* a parked worker: mt76_worker_schedule() only sets its flag */
++	KUNIT_ASSERT_EQ(test, mt76_worker_setup(dev->hw, &dev->tx_worker,
++			NULL, "test"), 0);
++	mt76_worker_disable(&dev->tx_worker);
++
++	mt76_tx_test_ctx = t;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_tx_test_teardown, t), 0);
++	return t;
++}
++
++/* whether the tx worker was scheduled since the last call */
++static bool mt76_tx_test_worker_scheduled(struct mt76_dev *dev)
++{
++	return test_and_clear_bit(MT76_WORKER_SCHEDULED,
++				  &dev->tx_worker.state);
++}
++
++/* A wcid at index @idx on band @band, published in dev->wcid[] (if
++ * @publish), with a station around it (if @sta). Its rates are set, as
++ * mt76_tx() would otherwise ask mac80211's rate control for some.
++ */
++static struct mt76_wcid *
++mt76_tx_test_wcid(struct mt76_tx_test *t, u16 idx, u8 band, bool sta,
++		  bool publish)
++{
++	struct mt76_dev *dev = t->dev;
++	struct mt76_wcid *wcid;
++
++	KUNIT_ASSERT_LT(t->test, t->n_wcids, MT76_TX_TEST_MAX_WCID);
++	if (sta) {
++		struct ieee80211_sta *s;
++
++		s = devm_kzalloc(dev->dev, sizeof(*s) + sizeof(*wcid),
++				 GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(t->test, s);
++		wcid = (struct mt76_wcid *)s->drv_priv;
++	} else {
++		wcid = devm_kzalloc(dev->dev, sizeof(*wcid), GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(t->test, wcid);
++	}
++	mt76_wcid_init(wcid, band);
++	wcid->idx = idx;
++	wcid->sta = sta;
++	wcid->tx_info = MT_WCID_TX_INFO_SET;
++	if (publish)
++		rcu_assign_pointer(dev->wcid[idx], wcid);
++	t->wcids[t->n_wcids++] = wcid;
++
++	return wcid;
++}
++
++static void mt76_tx_test_skb_destructor(struct sk_buff *skb)
++{
++	if (mt76_tx_test_ctx)
++		mt76_tx_test_ctx->n_freed++;
++}
++
++/* An 802.11 frame of type @fc on access category @ac. */
++static struct sk_buff *mt76_tx_test_frame(struct mt76_tx_test *t, u16 fc,
++					  int ac)
++{
++	struct ieee80211_hdr *hdr;
++	struct sk_buff *skb;
++
++	skb = alloc_skb(128, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(t->test, skb);
++	skb_reserve(skb, 32);
++	hdr = skb_put_zero(skb, 64);
++	hdr->frame_control = cpu_to_le16(fc);
++	skb_set_queue_mapping(skb, ac);
++	skb->destructor = mt76_tx_test_skb_destructor;
++
++	return skb;
++}
++
++#define MT76_TX_TEST_DATA	(IEEE80211_FTYPE_DATA | IEEE80211_STYPE_DATA)
++#define MT76_TX_TEST_QOS	(IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA)
++#define MT76_TX_TEST_MGMT(s)	(IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_##s)
++
++static struct sk_buff *mt76_tx_test_data(struct mt76_tx_test *t, int ac)
++{
++	return mt76_tx_test_frame(t, MT76_TX_TEST_DATA, ac);
++}
++
++/* queue @skb on @wcid's @head the way mt76_tx() does */
++static void mt76_tx_test_pend(struct mt76_phy *phy, struct mt76_wcid *wcid,
++			      struct sk_buff *skb, struct sk_buff_head *head)
++{
++	__skb_queue_tail(head, skb);
++	if (list_empty(&wcid->tx_list))
++		list_add_tail(&wcid->tx_list, &phy->tx_list);
++}
++
++/* --- mt76_tx() and the pending lists -------------------------------------- */
++
++/* mt76_tx() queues a frame on its station's pending list, tagged with the
++ * phy's band, puts the station on the phy's tx list (once) and kicks the
++ * tx worker.
++ */
++static void mt76_tx_test_tx_pending(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_phy *phy = &dev->phy;
++	struct sk_buff *a, *b;
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 5, 0, false, true);
++	phy->band_idx = MT_BAND1;
++	a = mt76_tx_test_data(t, IEEE80211_AC_VI);
++	b = mt76_tx_test_data(t, IEEE80211_AC_BE);
++
++	mt76_tx(phy, NULL, wcid, a);
++
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&wcid->tx_pending), 1);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&wcid->tx_offchannel), 0);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&phy->tx_list), 1);
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&phy->tx_list,
++			struct mt76_wcid, tx_list), wcid);
++	KUNIT_EXPECT_EQ(test, IEEE80211_SKB_CB(a)->hw_queue &
++			      MT_TX_HW_QUEUE_PHY,
++			FIELD_PREP(MT_TX_HW_QUEUE_PHY, MT_BAND1));
++	KUNIT_EXPECT_TRUE(test, mt76_tx_test_worker_scheduled(dev));
++
++	mt76_tx(phy, NULL, wcid, b);
++
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&wcid->tx_pending), 2);
++	KUNIT_EXPECT_PTR_EQ(test, skb_peek(&wcid->tx_pending), a);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&phy->tx_list), 1);
++	KUNIT_EXPECT_TRUE(test, mt76_tx_test_worker_scheduled(dev));
++	/* nothing reaches the hardware before the worker runs */
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++	phy->band_idx = MT_BAND0;
++}
++
++/* Off-channel frames, and probe requests that ignore the rate mask (scan
++ * probes), go on the off-channel list, which can be sent while the phy is
++ * away from its operating channel.
++ */
++static void mt76_tx_test_tx_offchannel(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct sk_buff *off, *probe, *probe2, *data;
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	off = mt76_tx_test_data(t, IEEE80211_AC_BE);
++	IEEE80211_SKB_CB(off)->flags |= IEEE80211_TX_CTL_TX_OFFCHAN;
++	probe = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(PROBE_REQ),
++				   IEEE80211_AC_VO);
++	IEEE80211_SKB_CB(probe)->control.flags |=
++		IEEE80211_TX_CTRL_DONT_USE_RATE_MASK;
++	probe2 = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(PROBE_REQ),
++				    IEEE80211_AC_VO);
++	data = mt76_tx_test_data(t, IEEE80211_AC_BE);
++	IEEE80211_SKB_CB(data)->control.flags |=
++		IEEE80211_TX_CTRL_DONT_USE_RATE_MASK;
++
++	mt76_tx(phy, NULL, wcid, off);
++	mt76_tx(phy, NULL, wcid, probe);
++	mt76_tx(phy, NULL, wcid, probe2);
++	mt76_tx(phy, NULL, wcid, data);
++
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&wcid->tx_offchannel), 2);
++	KUNIT_EXPECT_PTR_EQ(test, skb_peek(&wcid->tx_offchannel), off);
++	KUNIT_EXPECT_PTR_EQ(test, skb_peek_tail(&wcid->tx_offchannel), probe);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&wcid->tx_pending), 2);
++	KUNIT_EXPECT_PTR_EQ(test, skb_peek(&wcid->tx_pending), probe2);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&phy->tx_list), 1);
++}
++
++/* Scheduling sends each station's pending frames in order to the hardware
++ * queue of their access category, kicking it, station by station; drained
++ * stations leave the tx list. Frames for a station are recorded on its
++ * ring entry and count as non-AQL until they complete.
++ */
++static void mt76_tx_test_schedule_pending(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct sk_buff *a1, *a2, *b1;
++	struct mt76_wcid *a, *b;
++	struct mt76_queue *q;
++
++	a = mt76_tx_test_wcid(t, 1, 0, true, true);
++	b = mt76_tx_test_wcid(t, 2, 0, false, true);
++	a1 = mt76_tx_test_data(t, IEEE80211_AC_VI);
++	a2 = mt76_tx_test_data(t, IEEE80211_AC_BE);
++	b1 = mt76_tx_test_data(t, IEEE80211_AC_VO);
++	mt76_tx(phy, wcid_to_sta(a), a, a1);
++	mt76_tx(phy, NULL, b, b1);
++	mt76_tx(phy, wcid_to_sta(a), a, a2);
++
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 3);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].skb, a1);
++	KUNIT_EXPECT_EQ(test, t->rec[0].qid, MT_TXQ_VI);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].q, phy->q_tx[MT_TXQ_VI]);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].wcid, a);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].sta, wcid_to_sta(a));
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].phy, phy);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[1].skb, a2);
++	KUNIT_EXPECT_EQ(test, t->rec[1].qid, MT_TXQ_BE);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[2].skb, b1);
++	KUNIT_EXPECT_EQ(test, t->rec[2].qid, MT_TXQ_VO);
++	KUNIT_EXPECT_NULL(test, t->rec[2].sta);
++	KUNIT_EXPECT_EQ(test, t->n_kick, 3);
++	KUNIT_EXPECT_PTR_EQ(test, t->kick_q, phy->q_tx[MT_TXQ_VO]);
++
++	KUNIT_EXPECT_TRUE(test, list_empty(&phy->tx_list));
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&a->tx_pending));
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&b->tx_pending));
++
++	q = phy->q_tx[MT_TXQ_VI];
++	KUNIT_EXPECT_EQ(test, q->entry[0].wcid, 1);
++	KUNIT_EXPECT_EQ(test, phy->q_tx[MT_TXQ_VO]->entry[0].wcid, 0xffff);
++	KUNIT_EXPECT_EQ(test, atomic_read(&a->non_aql_packets), 2);
++	KUNIT_EXPECT_EQ(test, atomic_read(&b->non_aql_packets), 0);
++
++	/* nothing left: nothing happens */
++	mt76_txq_schedule_pending(phy);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 3);
++}
++
++/* Off-channel frames go out first. While the phy is off its channel, only
++ * those are sent, and the station stays on the tx list for the others.
++ */
++static void mt76_tx_test_schedule_offchannel(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct sk_buff *data, *off;
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	data = mt76_tx_test_data(t, IEEE80211_AC_BE);
++	off = mt76_tx_test_data(t, IEEE80211_AC_BE);
++	IEEE80211_SKB_CB(off)->flags |= IEEE80211_TX_CTL_TX_OFFCHAN;
++	mt76_tx(phy, NULL, wcid, data);
++	mt76_tx(phy, NULL, wcid, off);
++	phy->offchannel = true;
++
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 1);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].skb, off);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&wcid->tx_pending), 1);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&phy->tx_list), 1);
++
++	phy->offchannel = false;
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 2);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[1].skb, data);
++	KUNIT_EXPECT_TRUE(test, list_empty(&phy->tx_list));
++}
++
++/* A stopped hardware queue ends the pass. The stations keep their frames
++ * and stay on the tx list, even with only pending (not off-channel) frames
++ * left, so they aren't stranded: the next pass sends them.
++ */
++static void mt76_tx_test_schedule_stopped(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct mt76_wcid *a, *b;
++
++	a = mt76_tx_test_wcid(t, 1, 0, false, true);
++	b = mt76_tx_test_wcid(t, 2, 0, false, true);
++	mt76_tx(phy, NULL, a, mt76_tx_test_data(t, IEEE80211_AC_BE));
++	mt76_tx(phy, NULL, a, mt76_tx_test_data(t, IEEE80211_AC_BE));
++	mt76_tx(phy, NULL, b, mt76_tx_test_data(t, IEEE80211_AC_VI));
++	phy->q_tx[MT_TXQ_BE]->stopped = true;
++
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&a->tx_pending), 2);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&b->tx_pending), 1);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&phy->tx_list), 2);
++
++	phy->q_tx[MT_TXQ_BE]->stopped = false;
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_EXPECT_EQ(test, t->n_queued, 3);
++	KUNIT_EXPECT_TRUE(test, list_empty(&phy->tx_list));
++}
++
++/* A blocked queue, a queue too full to take MT_TXQ_FREE_THR more frames
++ * and a phy in reset all hold the frames back too.
++ */
++static void mt76_tx_test_schedule_held(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct mt76_queue *q = phy->q_tx[MT_TXQ_BE];
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	mt76_tx(phy, NULL, wcid, mt76_tx_test_data(t, IEEE80211_AC_BE));
++
++	q->blocked = true;
++	mt76_txq_schedule_pending(phy);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++	q->blocked = false;
++
++	q->queued = q->ndesc - MT_TXQ_FREE_THR;
++	mt76_txq_schedule_pending(phy);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++	q->queued = q->ndesc - MT_TXQ_FREE_THR - 1;
++
++	set_bit(MT76_RESET, &phy->state);
++	mt76_txq_schedule_pending(phy);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&phy->tx_list), 1);
++	clear_bit(MT76_RESET, &phy->state);
++
++	mt76_txq_schedule_pending(phy);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 1);
++}
++
++/* With a hardware management queue (the mt7915), management frames go to
++ * the PSD queue unless they are bufferable ones for a station with its
++ * rates set, still on the normal pending list; deauths always do, data and
++ * 802.3-offloaded frames never.
++ */
++static void mt76_tx_test_schedule_mgmt_txq(struct kunit *test)
++{
++	struct mt76_tx_test *t;
++	struct sk_buff *data, *action, *deauth, *resp, *off, *encap, *norate;
++	struct mt76_wcid *wcid, *wcid2;
++	struct mt76_phy *phy;
++
++	t = mt76_tx_test_init(test, &mt76_tx_test_drv_mgmt_txq);
++	phy = &t->dev->phy;
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	wcid2 = mt76_tx_test_wcid(t, 2, 0, false, true);
++	wcid2->tx_info = 0;
++
++	data = mt76_tx_test_data(t, IEEE80211_AC_BE);
++	action = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(ACTION),
++				    IEEE80211_AC_VO);
++	deauth = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(DEAUTH),
++				    IEEE80211_AC_VO);
++	resp = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(PROBE_RESP),
++				  IEEE80211_AC_VO);
++	off = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(ACTION),
++				 IEEE80211_AC_VO);
++	encap = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(ACTION),
++				   IEEE80211_AC_VI);
++	IEEE80211_SKB_CB(encap)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
++	norate = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(ACTION),
++				    IEEE80211_AC_VO);
++
++	mt76_tx_test_pend(phy, wcid, data, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, action, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, deauth, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, resp, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, encap, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, off, &wcid->tx_offchannel);
++	mt76_tx_test_pend(phy, wcid2, norate, &wcid2->tx_pending);
++
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 7);
++	/* off-channel list first */
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].skb, off);
++	KUNIT_EXPECT_EQ(test, t->rec[0].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[1].skb, data);
++	KUNIT_EXPECT_EQ(test, t->rec[1].qid, MT_TXQ_BE);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[2].skb, action);
++	KUNIT_EXPECT_EQ(test, t->rec[2].qid, MT_TXQ_VO);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[3].skb, deauth);
++	KUNIT_EXPECT_EQ(test, t->rec[3].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[4].skb, resp);
++	KUNIT_EXPECT_EQ(test, t->rec[4].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[4].q, phy->q_tx[MT_TXQ_PSD]);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[5].skb, encap);
++	KUNIT_EXPECT_EQ(test, t->rec[5].qid, MT_TXQ_VI);
++	/* no rates yet: not a station to buffer for */
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[6].skb, norate);
++	KUNIT_EXPECT_EQ(test, t->rec[6].qid, MT_TXQ_PSD);
++}
++
++/* Without a hardware management queue, management frames stay on the
++ * queue of their access category.
++ */
++static void mt76_tx_test_schedule_no_mgmt_txq(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	mt76_tx(phy, NULL, wcid, mt76_tx_test_frame(t,
++			MT76_TX_TEST_MGMT(DEAUTH), IEEE80211_AC_VO));
++
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 1);
++	KUNIT_EXPECT_EQ(test, t->rec[0].qid, MT_TXQ_VO);
++}
++
++/* The tx worker sends the pending frames of the main phy and of the other
++ * phys (here a second radio on the same hw), each to its own queues.
++ */
++static void mt76_tx_test_worker(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_wcid *a, *b;
++	struct mt76_phy *phy2;
++	u32 hwq;
++
++	phy2 = devm_kzalloc(dev->dev, sizeof(*phy2), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, phy2);
++	phy2->dev = dev;
++	phy2->hw = dev->hw;
++	phy2->band_idx = MT_BAND1;
++	mt76_tx_test_phy_init(t, phy2);
++	dev->phys[MT_BAND1] = phy2;
++
++	a = mt76_tx_test_wcid(t, 1, MT_BAND0, false, true);
++	b = mt76_tx_test_wcid(t, 2, MT_BAND1, false, true);
++	mt76_tx(&dev->phy, NULL, a, mt76_tx_test_data(t, IEEE80211_AC_BE));
++	mt76_tx(phy2, NULL, b, mt76_tx_test_data(t, IEEE80211_AC_BE));
++
++	KUNIT_ASSERT_PTR_EQ(test, (void *)dev->tx_worker.fn,
++			    (void *)mt76_tx_worker);
++	dev->tx_worker.fn(&dev->tx_worker);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 2);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].phy, &dev->phy);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].q, dev->phy.q_tx[MT_TXQ_BE]);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[1].phy, phy2);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[1].q, phy2->q_tx[MT_TXQ_BE]);
++	hwq = IEEE80211_SKB_CB(t->rec[1].skb)->hw_queue;
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TX_HW_QUEUE_PHY, hwq), MT_BAND1);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->phy.tx_list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&phy2->tx_list));
++
++	/* the txq scheduler has nothing for mac80211-less phys */
++	mt76_txq_schedule_all(phy2);
++	mt76_txq_schedule(&dev->phy, MT_TXQ_PSD);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 2);
++}
++
++/* mac80211 waking a txq just kicks the tx worker. */
++static void mt76_tx_test_wake_tx_queue(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++
++	KUNIT_EXPECT_FALSE(test, mt76_tx_test_worker_scheduled(t->dev));
++	mt76_wake_tx_queue(t->dev->hw, NULL);
++	KUNIT_EXPECT_TRUE(test, mt76_tx_test_worker_scheduled(t->dev));
++}
++
++/* An ieee80211_txq whose driver area is an mt76_txq, for the band-0 BE AC.
++ * Enough for mt76_txq_send_burst()'s early-return branches, which read only
++ * txq->sta/ac and the wcid; it must not be driven into ieee80211_tx_dequeue(),
++ * which needs a txq backed by mac80211's internal fq state.
++ */
++static struct mt76_txq *mt76_tx_test_mtxq(struct mt76_tx_test *t)
++{
++	struct ieee80211_txq *txq;
++
++	txq = devm_kzalloc(t->dev->dev, sizeof(*txq) + sizeof(struct mt76_txq),
++			   GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(t->test, txq);
++	txq->ac = IEEE80211_AC_BE;
++
++	return (struct mt76_txq *)txq->drv_priv;
++}
++
++/* A burst isn't started for a station already at the non-AQL limit: the
++ * scheduler must leave it be rather than queue more.
++ */
++static void mt76_tx_test_send_burst_non_aql_limit(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct mt76_queue *q = phy->q_tx[MT_TXQ_BE];
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	atomic_set(&wcid->non_aql_packets, MT_MAX_NON_AQL_PKT);
++
++	KUNIT_EXPECT_EQ(test, mt76_txq_send_burst(phy, q, mt76_tx_test_mtxq(t),
++						  wcid), 0);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++	KUNIT_EXPECT_EQ(test, t->n_kick, 0);
++}
++
++/* A power-save station is not served at all unless the driver buffers for
++ * it in hardware.
++ */
++static void mt76_tx_test_send_burst_ps_no_buffering(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct mt76_queue *q = phy->q_tx[MT_TXQ_BE];
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	set_bit(MT_WCID_FLAG_PS, &wcid->flags);
++
++	/* the default test driver has no MT_DRV_HW_PS_BUFFERING */
++	KUNIT_EXPECT_EQ(test, mt76_txq_send_burst(phy, q, mt76_tx_test_mtxq(t),
++						  wcid), 0);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++}
++
++/* A hardware-buffering driver skips a power-save station while it still
++ * has AQL airtime pending (nothing queued is NULL here, so it isn't).
++ */
++static void mt76_tx_test_send_burst_ps_aql(struct kunit *test)
++{
++	struct mt76_tx_test *t;
++	struct mt76_phy *phy;
++	struct mt76_queue *q;
++	struct mt76_wcid *wcid;
++
++	t = mt76_tx_test_init(test, &mt76_tx_test_drv_hw_ps);
++	phy = &t->dev->phy;
++	q = phy->q_tx[MT_TXQ_BE];
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	set_bit(MT_WCID_FLAG_PS, &wcid->flags);
++	/* with no registered airtime, aql pending is 0, so it falls through
++	 * the PS gate to the non-AQL gate, which the limit then closes
++	 */
++	atomic_set(&wcid->non_aql_packets, MT_MAX_NON_AQL_PKT);
++
++	KUNIT_EXPECT_EQ(test, mt76_txq_send_burst(phy, q, mt76_tx_test_mtxq(t),
++						  wcid), 0);
++	KUNIT_EXPECT_EQ(test, t->n_queued, 0);
++}
++
++/* --- non-AQL accounting ------------------------------------------------------ */
++
++/* __mt76_tx_queue_skb() counts frames without an airtime estimate as
++ * non-AQL on the primary link's wcid and says to stop the burst at
++ * MT_MAX_NON_AQL_PKT; frames with an estimate, frames without a station
++ * and frames the queue refused don't count.
++ */
++static void mt76_tx_test_queue_skb_non_aql(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct mt76_wcid *wcid, *link, *nosta;
++	struct ieee80211_sta *sta;
++	struct sk_buff *skb;
++	bool stop = false;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	link = mt76_tx_test_wcid(t, 2, 0, true, true);
++	nosta = mt76_tx_test_wcid(t, 3, 0, false, true);
++	link->def_wcid = wcid;
++	sta = wcid_to_sta(wcid);
++	atomic_set(&wcid->non_aql_packets, MT_MAX_NON_AQL_PKT - 2);
++
++	KUNIT_EXPECT_EQ(test, __mt76_tx_queue_skb(phy, MT_TXQ_BE,
++			mt76_tx_test_data(t, 0), link, sta, &stop), 0);
++	KUNIT_EXPECT_FALSE(test, stop);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets),
++			MT_MAX_NON_AQL_PKT - 1);
++	KUNIT_EXPECT_EQ(test, atomic_read(&link->non_aql_packets), 0);
++	/* the entry records the link the frame went out on */
++	KUNIT_EXPECT_EQ(test, phy->q_tx[MT_TXQ_BE]->entry[0].wcid, 2);
++
++	skb = mt76_tx_test_data(t, 0);
++	ieee80211_info_set_tx_time_est(IEEE80211_SKB_CB(skb), 100);
++	KUNIT_EXPECT_EQ(test, __mt76_tx_queue_skb(phy, MT_TXQ_BE, skb, wcid,
++			sta, &stop), 1);
++	KUNIT_EXPECT_FALSE(test, stop);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets),
++			MT_MAX_NON_AQL_PKT - 1);
++
++	KUNIT_EXPECT_EQ(test, __mt76_tx_queue_skb(phy, MT_TXQ_BE,
++			mt76_tx_test_data(t, 0), nosta, NULL, &stop), 2);
++	KUNIT_EXPECT_FALSE(test, stop);
++	KUNIT_EXPECT_EQ(test, phy->q_tx[MT_TXQ_BE]->entry[2].wcid, 0xffff);
++
++	KUNIT_EXPECT_EQ(test, __mt76_tx_queue_skb(phy, MT_TXQ_BE,
++			mt76_tx_test_data(t, 0), wcid, sta, &stop), 3);
++	KUNIT_EXPECT_TRUE(test, stop);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets),
++			MT_MAX_NON_AQL_PKT);
++
++	/* refused by the queue */
++	t->queue_ret = -ENOMEM;
++	stop = false;
++	KUNIT_EXPECT_EQ(test, __mt76_tx_queue_skb(phy, MT_TXQ_BE,
++			mt76_tx_test_data(t, 0), wcid, sta, &stop), -ENOMEM);
++	KUNIT_EXPECT_FALSE(test, stop);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets),
++			MT_MAX_NON_AQL_PKT);
++	KUNIT_EXPECT_EQ(test, phy->q_tx[MT_TXQ_BE]->entry[4].wcid, 0);
++	t->queue_ret = 0;
++}
++
++/* Completion takes a non-AQL frame off the primary link's count, which
++ * never goes below zero; frames with an airtime estimate aren't counted.
++ */
++static void mt76_tx_test_check_non_aql(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_wcid *wcid, *link;
++	struct sk_buff *skb;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	link = mt76_tx_test_wcid(t, 2, 0, true, true);
++	link->def_wcid = wcid;
++	atomic_set(&wcid->non_aql_packets, 2);
++	skb = mt76_tx_test_data(t, 0);
++
++	mt76_tx_check_non_aql(t->dev, link, skb);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets), 1);
++	KUNIT_EXPECT_EQ(test, atomic_read(&link->non_aql_packets), 0);
++
++	/* back below the limit: the station's txqs (none here) get scheduled */
++	atomic_set(&wcid->non_aql_packets, MT_MAX_NON_AQL_PKT);
++	mt76_tx_check_non_aql(t->dev, wcid, skb);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets),
++			MT_MAX_NON_AQL_PKT - 1);
++
++	atomic_set(&wcid->non_aql_packets, 0);
++	mt76_tx_check_non_aql(t->dev, wcid, skb);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets), 0);
++
++	atomic_set(&wcid->non_aql_packets, 2);
++	ieee80211_info_set_tx_time_est(IEEE80211_SKB_CB(skb), 100);
++	mt76_tx_check_non_aql(t->dev, wcid, skb);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets), 2);
++	mt76_tx_check_non_aql(t->dev, NULL, skb);
++	kfree_skb(skb);
++}
++
++/* --- tx status ---------------------------------------------------------------- */
++
++/* Frames that want a tx status get a packet id (from 3) in their station's
++ * idr; the others a fixed id that tells the firmware there's nothing to
++ * report (no ack wanted, or no wcid) or no frame to look up.
++ */
++static void mt76_tx_test_status_skb_add(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff *plain, *noack, *req, *probe;
++	struct mt76_tx_cb *cb;
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 3, 0, false, true);
++	plain = mt76_tx_test_data(t, 0);
++	noack = mt76_tx_test_data(t, 0);
++	req = mt76_tx_test_data(t, 0);
++	probe = mt76_tx_test_data(t, 0);
++	IEEE80211_SKB_CB(noack)->flags = IEEE80211_TX_CTL_NO_ACK |
++					 IEEE80211_TX_CTL_REQ_TX_STATUS;
++	IEEE80211_SKB_CB(req)->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++	IEEE80211_SKB_CB(probe)->flags = IEEE80211_TX_CTL_RATE_CTRL_PROBE;
++
++	cb = mt76_tx_skb_cb(plain);
++	cb->pktid = 0x55;
++	cb->flags = MT_TX_CB_DMA_DONE;
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, wcid, plain),
++			MT_PACKET_ID_NO_SKB);
++	KUNIT_EXPECT_EQ(test, cb->pktid, 0);
++	KUNIT_EXPECT_EQ(test, cb->flags, 0);
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, wcid, noack),
++			MT_PACKET_ID_NO_ACK);
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, NULL, req),
++			MT_PACKET_ID_NO_ACK);
++	KUNIT_EXPECT_TRUE(test, list_empty(&wcid->list));
++
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, wcid, req),
++			MT_PACKET_ID_FIRST);
++	cb = mt76_tx_skb_cb(req);
++	KUNIT_EXPECT_EQ(test, cb->wcid, 3);
++	KUNIT_EXPECT_EQ(test, cb->pktid, MT_PACKET_ID_FIRST);
++	KUNIT_EXPECT_PTR_EQ(test, idr_find(&wcid->pktid, MT_PACKET_ID_FIRST),
++			    req);
++	/* the station is now polled for stale frames */
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&dev->wcid_list,
++			struct mt76_wcid, list), wcid);
++
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, wcid, probe),
++			MT_PACKET_ID_FIRST + 1);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->wcid_list), 1);
++
++	kfree_skb(plain);
++	kfree_skb(noack);
++}
++
++/* A wcid that isn't the one published at its index (removed, or the
++ * index reused by another station) gets no packet id, and isn't put back
++ * on the wcid list.
++ */
++static void mt76_tx_test_status_skb_add_stale(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_wcid *old, *new;
++	struct sk_buff *skb;
++
++	old = mt76_tx_test_wcid(t, 4, 0, false, false);
++	skb = mt76_tx_test_data(t, 0);
++	IEEE80211_SKB_CB(skb)->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, old, skb),
++			MT_PACKET_ID_NO_ACK);
++
++	new = mt76_tx_test_wcid(t, 4, 0, false, true);
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, old, skb),
++			MT_PACKET_ID_NO_ACK);
++	KUNIT_EXPECT_TRUE(test, list_empty(&old->list));
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&old->pktid));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->wcid_list));
++
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, new, skb),
++			MT_PACKET_ID_FIRST);
++}
++
++/* Packet ids run out at MT_PACKET_ID_MASK: the next frame still goes out,
++ * without a status to wait for.
++ */
++static void mt76_tx_test_status_skb_add_full(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++	int i;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	for (i = MT_PACKET_ID_FIRST; i < MT_PACKET_ID_MASK; i++) {
++		skb = mt76_tx_test_data(t, 0);
++		IEEE80211_SKB_CB(skb)->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++		KUNIT_ASSERT_EQ(test, mt76_tx_status_skb_add(dev, wcid, skb), i);
++		mt76_tx_skb_cb(skb)->flags |= MT_TX_CB_DMA_DONE;
++	}
++
++	skb = mt76_tx_test_data(t, 0);
++	IEEE80211_SKB_CB(skb)->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, wcid, skb),
++			MT_PACKET_ID_NO_SKB);
++	kfree_skb(skb);
++
++	/* a flush reports them all and forgets the station */
++	mt76_tx_status_check(dev, true);
++	KUNIT_EXPECT_EQ(test, t->n_freed, MT_PACKET_ID_MASK -
++					  MT_PACKET_ID_FIRST + 1);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&wcid->pktid));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->wcid_list));
++}
++
++/* A frame with a packet id is reported once both its DMA completion and
++ * its tx status are in, whichever comes first.
++ */
++static void mt76_tx_test_status_dma_then_txs(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff_head list;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++	int pid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	skb = mt76_tx_test_data(t, 0);
++	IEEE80211_SKB_CB(skb)->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++	pid = mt76_tx_status_skb_add(dev, wcid, skb);
++
++	/* DMA done: still waiting for the status */
++	mt76_tx_complete_skb(dev, wcid->idx, skb);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 0);
++	KUNIT_EXPECT_TRUE(test, mt76_tx_skb_cb(skb)->flags &
++				MT_TX_CB_DMA_DONE);
++	KUNIT_EXPECT_PTR_EQ(test, idr_find(&wcid->pktid, pid), skb);
++
++	/* the status: reported */
++	mt76_tx_status_lock(dev, &list);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_tx_status_skb_get(dev, wcid, pid,
++							 &list), skb);
++	mt76_tx_status_skb_done(dev, skb, &list);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&list), 1);
++	mt76_tx_status_unlock(dev, &list);
++
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&wcid->pktid));
++	KUNIT_EXPECT_TRUE(test, list_empty(&wcid->list));
++}
++
++static void mt76_tx_test_status_txs_then_dma(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff_head list;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++	int pid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	skb = mt76_tx_test_data(t, 0);
++	IEEE80211_SKB_CB(skb)->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++	pid = mt76_tx_status_skb_add(dev, wcid, skb);
++
++	mt76_tx_status_lock(dev, &list);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_tx_status_skb_get(dev, wcid, pid,
++							 &list), skb);
++	mt76_tx_status_skb_done(dev, skb, &list);
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&list), 0);
++	mt76_tx_status_unlock(dev, &list);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 0);
++
++	mt76_tx_complete_skb(dev, wcid->idx, skb);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++}
++
++/* Frames whose DMA completed over MT_TX_STATUS_SKB_TIMEOUT ago without a
++ * tx status are given up on and reported as failed; newer ones and ones
++ * still in DMA keep waiting, until a flush stops waiting for any status:
++ * the ones still in DMA are then reported when their DMA completes.
++ */
++static void mt76_tx_test_status_timeout(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff *skb[3], *s;
++	struct sk_buff_head list;
++	struct mt76_wcid *wcid;
++	int i;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	for (i = 0; i < 3; i++) {
++		skb[i] = mt76_tx_test_data(t, 0);
++		IEEE80211_SKB_CB(skb[i])->flags =
++			IEEE80211_TX_CTL_REQ_TX_STATUS;
++		mt76_tx_status_skb_add(dev, wcid, skb[i]);
++	}
++	mt76_tx_skb_cb(skb[0])->flags = MT_TX_CB_DMA_DONE;
++	mt76_tx_skb_cb(skb[0])->jiffies = jiffies - 2 * MT_TX_STATUS_SKB_TIMEOUT;
++	mt76_tx_skb_cb(skb[1])->flags = MT_TX_CB_DMA_DONE;
++	mt76_tx_skb_cb(skb[1])->jiffies = jiffies;
++
++	/* looking up an id that isn't there sweeps the stale ones */
++	mt76_tx_status_lock(dev, &list);
++	KUNIT_EXPECT_NULL(test, mt76_tx_status_skb_get(dev, wcid, 100, &list));
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&list), 1);
++	s = skb_peek(&list);
++	KUNIT_EXPECT_PTR_EQ(test, s, skb[0]);
++	KUNIT_EXPECT_TRUE(test, mt76_tx_skb_cb(s)->flags & MT_TX_CB_TXS_FAILED);
++	/* not acked: the status really is missing */
++	KUNIT_EXPECT_FALSE(test, IEEE80211_SKB_CB(s)->flags &
++				 IEEE80211_TX_STAT_ACK);
++	mt76_tx_status_unlock(dev, &list);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++	KUNIT_EXPECT_FALSE(test, list_empty(&wcid->list));
++
++	mt76_tx_status_check(dev, false);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++
++	mt76_tx_status_check(dev, true);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 2);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&wcid->pktid));
++	KUNIT_EXPECT_TRUE(test, list_empty(&wcid->list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->wcid_list));
++
++	mt76_tx_complete_skb(dev, wcid->idx, skb[2]);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 3);
++}
++
++/* Drivers whose tx status is unreliable report a timed-out frame as acked
++ * rather than lost, with no rate.
++ */
++static void mt76_tx_test_status_ignore_failed(struct kunit *test)
++{
++	struct mt76_tx_test *t;
++	struct ieee80211_tx_info *info;
++	struct sk_buff_head list;
++	struct mt76_wcid *wcid;
++	struct mt76_dev *dev;
++	struct sk_buff *skb;
++
++	t = mt76_tx_test_init(test, &mt76_tx_test_drv_ignore_txs);
++	dev = t->dev;
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	skb = mt76_tx_test_data(t, 0);
++	info = IEEE80211_SKB_CB(skb);
++	info->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++	mt76_tx_status_skb_add(dev, wcid, skb);
++	mt76_tx_skb_cb(skb)->flags = MT_TX_CB_DMA_DONE;
++	info->status.rates[0].idx = 3;
++	info->status.rates[0].count = 2;
++
++	mt76_tx_status_lock(dev, &list);
++	mt76_tx_status_skb_get(dev, wcid, -1, &list);
++	KUNIT_ASSERT_EQ(test, skb_queue_len(&list), 1);
++	KUNIT_EXPECT_TRUE(test, info->flags & IEEE80211_TX_STAT_ACK);
++	KUNIT_EXPECT_EQ(test, info->status.rates[0].idx, -1);
++	KUNIT_EXPECT_EQ(test, (int)info->status.rates[0].count, 0);
++	mt76_tx_status_unlock(dev, &list);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++}
++
++/* Frames without a packet id are reported when their DMA completes, onto
++ * the caller's free list if there is one, with or without a known wcid;
++ * the wcid's non-AQL count drops.
++ */
++static void mt76_tx_test_complete_no_pktid(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct sk_buff *skb, *tmp;
++	struct mt76_wcid *wcid;
++	LIST_HEAD(free_list);
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, false, true);
++	atomic_set(&wcid->non_aql_packets, 2);
++
++	skb = mt76_tx_test_data(t, 0);
++	KUNIT_ASSERT_EQ(test, mt76_tx_status_skb_add(dev, wcid, skb),
++			MT_PACKET_ID_NO_SKB);
++	__mt76_tx_complete_skb(dev, wcid->idx, skb, &free_list);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 0);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&free_list), 1);
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&free_list, struct sk_buff,
++						   list), skb);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets), 1);
++	list_for_each_entry_safe(skb, tmp, &free_list, list) {
++		skb_list_del_init(skb);
++		kfree_skb(skb);
++	}
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++
++	skb = mt76_tx_test_data(t, 0);
++	mt76_tx_complete_skb(dev, wcid->idx, skb);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 2);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets), 0);
++
++	skb = mt76_tx_test_data(t, 0);
++	mt76_tx_complete_skb(dev, 0xffff, skb);
++	KUNIT_EXPECT_EQ(test, t->n_freed, 3);
++}
++
++/* --- power save ------------------------------------------------------------------- */
++
++/* Going to sleep marks the station and kicks the worker; waking clears it
++ * and, for a station, schedules its txqs and the worker.
++ */
++static void mt76_tx_test_sta_ps_transition(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_wcid *wcid, *nosta;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	nosta = mt76_tx_test_wcid(t, 2, 0, false, true);
++
++	mt76_sta_ps_transition(dev, wcid, true);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, mt76_tx_test_worker_scheduled(dev));
++
++	mt76_sta_ps_transition(dev, wcid, false);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, mt76_tx_test_worker_scheduled(dev));
++
++	set_bit(MT_WCID_FLAG_PS, &nosta->flags);
++	mt76_sta_ps_transition(dev, nosta, false);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &nosta->flags));
++	KUNIT_EXPECT_FALSE(test, mt76_tx_test_worker_scheduled(dev));
++}
++
++/* After a frame of a sleeping station completes, drivers that buffer in
++ * hardware get its txqs re-armed and the worker kicked (or the wakeup is
++ * lost); other drivers, awake or station-less wcids don't.
++ */
++static void mt76_tx_test_ps_rearm(struct kunit *test)
++{
++	struct mt76_tx_test *t;
++	struct mt76_wcid *wcid, *nosta;
++	struct mt76_dev *dev;
++
++	t = mt76_tx_test_init(test, &mt76_tx_test_drv_hw_ps);
++	dev = t->dev;
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	nosta = mt76_tx_test_wcid(t, 2, 0, false, true);
++
++	mt76_tx_ps_rearm(dev, wcid);
++	KUNIT_EXPECT_FALSE(test, mt76_tx_test_worker_scheduled(dev));
++
++	set_bit(MT_WCID_FLAG_PS, &wcid->flags);
++	mt76_tx_ps_rearm(dev, wcid);
++	KUNIT_EXPECT_TRUE(test, mt76_tx_test_worker_scheduled(dev));
++
++	set_bit(MT_WCID_FLAG_PS, &nosta->flags);
++	mt76_tx_ps_rearm(dev, nosta);
++	mt76_tx_ps_rearm(dev, NULL);
++	KUNIT_EXPECT_FALSE(test, mt76_tx_test_worker_scheduled(dev));
++
++	/* the completion path re-arms too */
++	mt76_tx_complete_skb(dev, nosta->idx, mt76_tx_test_data(t, 0));
++	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
++}
++
++static void mt76_tx_test_ps_rearm_sw(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	set_bit(MT_WCID_FLAG_PS, &wcid->flags);
++	mt76_tx_ps_rearm(t->dev, wcid);
++	KUNIT_EXPECT_FALSE(test, mt76_tx_test_worker_scheduled(t->dev));
++}
++
++/* Frames released for a sleeping station go to the PSD queue as
++ * power-save responses. All but the last carry MOREDATA; the last ends the
++ * service period: EOSP and a tx status, and for U-APSD QoS data the EOSP
++ * bit in its QoS header.
++ */
++static void mt76_tx_test_queue_ps_skb(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_phy *phy = &t->dev->phy;
++	struct sk_buff *mid, *last, *pspoll, *plain;
++	struct ieee80211_tx_info *info;
++	struct ieee80211_hdr *hdr;
++	struct ieee80211_sta *sta;
++	struct mt76_wcid *wcid;
++
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	sta = wcid_to_sta(wcid);
++	mid = mt76_tx_test_frame(t, MT76_TX_TEST_QOS, 0);
++	last = mt76_tx_test_frame(t, MT76_TX_TEST_QOS |
++				     IEEE80211_FCTL_MOREDATA, 0);
++	pspoll = mt76_tx_test_frame(t, MT76_TX_TEST_QOS, 0);
++	plain = mt76_tx_test_data(t, 0);
++
++	mt76_queue_ps_skb(phy, sta, mid, false, IEEE80211_FRAME_RELEASE_UAPSD);
++	mt76_queue_ps_skb(phy, sta, last, true, IEEE80211_FRAME_RELEASE_UAPSD);
++	mt76_queue_ps_skb(phy, sta, pspoll, true,
++			  IEEE80211_FRAME_RELEASE_PSPOLL);
++	mt76_queue_ps_skb(phy, sta, plain, true,
++			  IEEE80211_FRAME_RELEASE_UAPSD);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 4);
++	KUNIT_EXPECT_EQ(test, t->rec[0].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].q, phy->q_tx[MT_TXQ_PSD]);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].wcid, wcid);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].sta, sta);
++
++	hdr = (struct ieee80211_hdr *)mid->data;
++	info = IEEE80211_SKB_CB(mid);
++	KUNIT_EXPECT_TRUE(test, info->control.flags &
++				IEEE80211_TX_CTRL_PS_RESPONSE);
++	KUNIT_EXPECT_TRUE(test, ieee80211_has_moredata(hdr->frame_control));
++	KUNIT_EXPECT_FALSE(test, info->flags & (IEEE80211_TX_STATUS_EOSP |
++						IEEE80211_TX_CTL_REQ_TX_STATUS));
++	KUNIT_EXPECT_FALSE(test, *ieee80211_get_qos_ctl(hdr) &
++				 IEEE80211_QOS_CTL_EOSP);
++
++	hdr = (struct ieee80211_hdr *)last->data;
++	info = IEEE80211_SKB_CB(last);
++	KUNIT_EXPECT_TRUE(test, info->control.flags &
++				IEEE80211_TX_CTRL_PS_RESPONSE);
++	KUNIT_EXPECT_FALSE(test, ieee80211_has_moredata(hdr->frame_control));
++	KUNIT_EXPECT_TRUE(test, info->flags & IEEE80211_TX_STATUS_EOSP);
++	KUNIT_EXPECT_TRUE(test, info->flags & IEEE80211_TX_CTL_REQ_TX_STATUS);
++	KUNIT_EXPECT_TRUE(test, *ieee80211_get_qos_ctl(hdr) &
++				IEEE80211_QOS_CTL_EOSP);
++
++	/* PS-Poll responses end with EOSP but leave the QoS header alone */
++	hdr = (struct ieee80211_hdr *)pspoll->data;
++	KUNIT_EXPECT_TRUE(test, IEEE80211_SKB_CB(pspoll)->flags &
++				IEEE80211_TX_STATUS_EOSP);
++	KUNIT_EXPECT_FALSE(test, *ieee80211_get_qos_ctl(hdr) &
++				 IEEE80211_QOS_CTL_EOSP);
++
++	/* no QoS header to mark in non-QoS data */
++	KUNIT_EXPECT_TRUE(test, IEEE80211_SKB_CB(plain)->flags &
++				IEEE80211_TX_STATUS_EOSP);
++	KUNIT_EXPECT_EQ(test, plain->data[24], 0);
++	KUNIT_EXPECT_EQ(test, plain->data[25], 0);
++}
++
++/* --- queues, blocking and tokens ------------------------------------------------- */
++
++/* Completing a ring entry hands its frame to the driver and moves the
++ * tail on, wrapping at the end of the ring.
++ */
++static void mt76_tx_test_queue_tx_complete(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_queue *q = t->dev->phy.q_tx[MT_TXQ_BE];
++	struct mt76_queue_entry e = {};
++	struct sk_buff *skb;
++
++	q->tail = q->ndesc - 1;
++	q->queued = 2;
++	skb = mt76_tx_test_data(t, 0);
++	e.skb = skb;
++	e.wcid = 7;
++
++	mt76_queue_tx_complete(t->dev, q, &e);
++	KUNIT_EXPECT_EQ(test, t->n_complete, 1);
++	KUNIT_EXPECT_PTR_EQ(test, t->complete.skb, skb);
++	KUNIT_EXPECT_EQ(test, t->complete.wcid, 7);
++	KUNIT_EXPECT_EQ(test, q->tail, 0);
++	KUNIT_EXPECT_EQ(test, q->queued, 1);
++
++	e.skb = NULL;
++	mt76_queue_tx_complete(t->dev, q, &e);
++	KUNIT_EXPECT_EQ(test, t->n_complete, 1);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	kfree_skb(skb);
++}
++
++/* Blocking tx marks the first queue of every band; unblocking clears them
++ * and restarts the tx worker. Setting the state it already has does
++ * nothing.
++ */
++static void mt76_tx_test_set_tx_blocked(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_phy *phy1, *phy2;
++
++	phy1 = devm_kzalloc(dev->dev, sizeof(*phy1), GFP_KERNEL);
++	phy2 = devm_kzalloc(dev->dev, sizeof(*phy2), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, phy1);
++	KUNIT_ASSERT_NOT_NULL(test, phy2);
++	phy1->q_tx[0] = mt76_tx_test_hwq(t);
++	phy2->q_tx[0] = mt76_tx_test_hwq(t);
++	dev->phys[MT_BAND1] = phy1;
++	dev->phys[MT_BAND2] = phy2;
++
++	mt76_set_tx_blocked(dev, true);
++	KUNIT_EXPECT_TRUE(test, dev->phy.q_tx[0]->blocked);
++	KUNIT_EXPECT_TRUE(test, phy1->q_tx[0]->blocked);
++	KUNIT_EXPECT_TRUE(test, phy2->q_tx[0]->blocked);
++	KUNIT_EXPECT_FALSE(test, dev->phy.q_tx[1]->blocked);
++	KUNIT_EXPECT_FALSE(test, mt76_tx_test_worker_scheduled(dev));
++
++	phy1->q_tx[0]->blocked = false;
++	mt76_set_tx_blocked(dev, true);
++	KUNIT_EXPECT_FALSE(test, phy1->q_tx[0]->blocked);
++	phy1->q_tx[0]->blocked = true;
++
++	mt76_set_tx_blocked(dev, false);
++	KUNIT_EXPECT_FALSE(test, dev->phy.q_tx[0]->blocked);
++	KUNIT_EXPECT_FALSE(test, phy1->q_tx[0]->blocked);
++	KUNIT_EXPECT_FALSE(test, phy2->q_tx[0]->blocked);
++	KUNIT_EXPECT_TRUE(test, mt76_tx_test_worker_scheduled(dev));
++
++	dev->phys[MT_BAND1] = NULL;
++	dev->phys[MT_BAND2] = NULL;
++}
++
++/* Tx tokens come from [token_start, token_start + token_size) and count
++ * against the device's in-flight limit: within MT76_TOKEN_FREE_THR of it
++ * tx is blocked, and releasing below it again asks for a wakeup.
++ * Management (PSD) frames are also counted per phy.
++ */
++static void mt76_tx_test_token(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_txwi_cache *txwi, *p, *mgmt;
++	struct mt76_dev *dev = t->dev;
++	struct mt76_phy *phy1;
++	bool wake = false;
++	int i, tok[4];
++
++	txwi = kunit_kcalloc(test, 4, sizeof(*txwi), GFP_KERNEL);
++	mgmt = kunit_kzalloc(test, sizeof(*mgmt), GFP_KERNEL);
++	phy1 = devm_kzalloc(dev->dev, sizeof(*phy1), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, txwi);
++	KUNIT_ASSERT_NOT_NULL(test, mgmt);
++	KUNIT_ASSERT_NOT_NULL(test, phy1);
++	phy1->q_tx[0] = mt76_tx_test_hwq(t);
++	dev->phys[MT_BAND1] = phy1;
++	dev->token_start = 100;
++	dev->token_size = MT76_TOKEN_FREE_THR + 5;
++
++	for (i = 0; i < 4; i++) {
++		p = &txwi[i];
++		p->qid = MT_TXQ_BE;
++		tok[i] = mt76_token_consume(dev, &p);
++		KUNIT_EXPECT_EQ(test, tok[i], 100 + i);
++		KUNIT_EXPECT_FALSE(test, dev->phy.q_tx[0]->blocked);
++	}
++	KUNIT_EXPECT_EQ(test, dev->token_count, 4);
++	KUNIT_EXPECT_EQ(test, atomic_read(&dev->phy.mgmt_tx_pending), 0);
++
++	/* the fifth reaches the threshold */
++	p = mgmt;
++	mgmt->qid = MT_TXQ_PSD;
++	mgmt->phy_idx = MT_BAND1;
++	KUNIT_EXPECT_EQ(test, mt76_token_consume(dev, &p), 104);
++	KUNIT_EXPECT_TRUE(test, dev->phy.q_tx[0]->blocked);
++	KUNIT_EXPECT_EQ(test, atomic_read(&phy1->mgmt_tx_pending), 1);
++	KUNIT_EXPECT_EQ(test, atomic_read(&dev->phy.mgmt_tx_pending), 0);
++
++	KUNIT_EXPECT_TRUE(test, phy1->q_tx[0]->blocked);
++
++	/* a used-up range */
++	dev->token_size = 5;
++	KUNIT_EXPECT_LT(test, mt76_token_consume(dev, &p), 0);
++	KUNIT_EXPECT_EQ(test, dev->token_count, 5);
++	KUNIT_EXPECT_EQ(test, atomic_read(&phy1->mgmt_tx_pending), 1);
++	dev->token_size = MT76_TOKEN_FREE_THR + 5;
++
++	KUNIT_EXPECT_PTR_EQ(test, mt76_token_release(dev, 104, &wake), mgmt);
++	KUNIT_EXPECT_EQ(test, atomic_read(&phy1->mgmt_tx_pending), 0);
++	KUNIT_EXPECT_TRUE(test, wake);
++	KUNIT_EXPECT_EQ(test, dev->token_count, 4);
++
++	/* unknown token: nothing changes */
++	KUNIT_EXPECT_NULL(test, mt76_token_release(dev, 104, NULL));
++	KUNIT_EXPECT_EQ(test, dev->token_count, 4);
++
++	/* no wakeup asked for while tx isn't blocked */
++	dev->phy.q_tx[0]->blocked = false;
++	wake = false;
++	KUNIT_EXPECT_PTR_EQ(test, mt76_token_release(dev, tok[2], &wake),
++			    &txwi[2]);
++	KUNIT_EXPECT_FALSE(test, wake);
++	KUNIT_EXPECT_EQ(test, dev->token_count, 3);
++
++	for (i = 0; i < 4; i++)
++		mt76_token_release(dev, tok[i], NULL);
++	KUNIT_EXPECT_EQ(test, dev->token_count, 0);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->token));
++	dev->phys[MT_BAND1] = NULL;
++}
++
++/* rx tokens map to an rxwi holding the buffer and its DMA address, below
++ * rx_token_size; releasing one hands the rxwi back once.
++ */
++static void mt76_tx_test_rx_token(struct kunit *test)
++{
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_txwi_cache *r;
++	int buf, tok;
++
++	r = kunit_kcalloc(test, 3, sizeof(*r), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, r);
++	dev->rx_token_size = 2;
++
++	tok = mt76_rx_token_consume(dev, &buf, &r[0], 0x1000);
++	KUNIT_EXPECT_EQ(test, tok, 0);
++	KUNIT_EXPECT_PTR_EQ(test, r[0].ptr, (void *)&buf);
++	KUNIT_EXPECT_EQ(test, r[0].dma_addr, 0x1000);
++	KUNIT_EXPECT_EQ(test, mt76_rx_token_consume(dev, &buf, &r[1], 0x2000),
++			1);
++	KUNIT_EXPECT_LT(test, mt76_rx_token_consume(dev, &buf, &r[2], 0x3000),
++			0);
++	KUNIT_EXPECT_NULL(test, r[2].ptr);
++	KUNIT_EXPECT_EQ(test, r[2].dma_addr, 0);
++
++	KUNIT_EXPECT_PTR_EQ(test, mt76_rx_token_release(dev, 1), &r[1]);
++	KUNIT_EXPECT_NULL(test, mt76_rx_token_release(dev, 1));
++	KUNIT_EXPECT_PTR_EQ(test, mt76_rx_token_release(dev, 0), &r[0]);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->rx_token));
++}
++
++static struct kunit_case mt76_tx_test_cases[] = {
++	KUNIT_CASE(mt76_tx_test_tx_pending),
++	KUNIT_CASE(mt76_tx_test_tx_offchannel),
++	KUNIT_CASE(mt76_tx_test_schedule_pending),
++	KUNIT_CASE(mt76_tx_test_schedule_offchannel),
++	KUNIT_CASE(mt76_tx_test_schedule_stopped),
++	KUNIT_CASE(mt76_tx_test_schedule_held),
++	KUNIT_CASE(mt76_tx_test_schedule_mgmt_txq),
++	KUNIT_CASE(mt76_tx_test_schedule_no_mgmt_txq),
++	KUNIT_CASE(mt76_tx_test_worker),
++	KUNIT_CASE(mt76_tx_test_wake_tx_queue),
++	KUNIT_CASE(mt76_tx_test_send_burst_non_aql_limit),
++	KUNIT_CASE(mt76_tx_test_send_burst_ps_no_buffering),
++	KUNIT_CASE(mt76_tx_test_send_burst_ps_aql),
++	KUNIT_CASE(mt76_tx_test_queue_skb_non_aql),
++	KUNIT_CASE(mt76_tx_test_check_non_aql),
++	KUNIT_CASE(mt76_tx_test_status_skb_add),
++	KUNIT_CASE(mt76_tx_test_status_skb_add_stale),
++	KUNIT_CASE(mt76_tx_test_status_skb_add_full),
++	KUNIT_CASE(mt76_tx_test_status_dma_then_txs),
++	KUNIT_CASE(mt76_tx_test_status_txs_then_dma),
++	KUNIT_CASE(mt76_tx_test_status_timeout),
++	KUNIT_CASE(mt76_tx_test_status_ignore_failed),
++	KUNIT_CASE(mt76_tx_test_complete_no_pktid),
++	KUNIT_CASE(mt76_tx_test_sta_ps_transition),
++	KUNIT_CASE(mt76_tx_test_ps_rearm),
++	KUNIT_CASE(mt76_tx_test_ps_rearm_sw),
++	KUNIT_CASE(mt76_tx_test_queue_ps_skb),
++	KUNIT_CASE(mt76_tx_test_queue_tx_complete),
++	KUNIT_CASE(mt76_tx_test_set_tx_blocked),
++	KUNIT_CASE(mt76_tx_test_token),
++	KUNIT_CASE(mt76_tx_test_rx_token),
++	{}
++};
++
++static struct kunit_suite mt76_tx_test_suite = {
++	.name = "mt76-tx",
++	.test_cases = mt76_tx_test_cases,
++};
++
++kunit_test_suites(&mt76_tx_test_suite);
+diff --git a/tx.c b/tx.c
+index f5e7c683..67be2aa7 100644
+--- a/tx.c
++++ b/tx.c
+@@ -1068,3 +1068,7 @@ mt76_rx_token_release(struct mt76_dev *dev, int token)
+ 	return t;
+ }
+ EXPORT_SYMBOL_GPL(mt76_rx_token_release);
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/tx-test.c"
++#endif

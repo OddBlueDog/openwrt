@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:27:47 +0100
+Subject: [PATCH] wifi: mt76: mt7915: republish the global wcid after a full
+ reset
+
+mt76_reset_device() clears dev->wcid[], and mt7915_mac_full_reset()
+only reallocated the global wcid's index without publishing it again,
+unlike probe. Status requests for frames sent through the global wcid
+were then reported as not acked and lookups for its index failed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index e7be7ccd..1c7a36df 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1516,6 +1516,8 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ 
+ 	i = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7915_WTBL_STA);
+ 	dev->mt76.global_wcid.idx = i;
++	/* mt76_reset_device() unpublished it */
++	rcu_assign_pointer(dev->mt76.wcid[i], &dev->mt76.global_wcid);
+ 	dev->recovery.hw_full_reset = false;
+ 
+ 	mutex_unlock(&dev->mt76.mutex);

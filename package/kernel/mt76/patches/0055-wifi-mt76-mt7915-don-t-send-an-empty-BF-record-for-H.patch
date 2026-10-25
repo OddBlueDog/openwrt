@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:36:12 +0100
+Subject: [PATCH] wifi: mt76: mt7915: don't send an empty BF record for HE-only
+ stations
+
+With implicit beamforming on (dev->ibf), mt7915_mcu_sta_bfer_tlv() added
+the STA_REC_BF TLV before finding out that an HE-only station (one
+without HT and VHT, as on 6 GHz) we can't beamform explicitly has no
+beamforming mode at all: HE is explicit only. It returned with the TLV
+still in the request, so the firmware got an all-zero BF record.
+
+Decide before adding the TLV. Un-skip mt7915_test_bfer_he_ibf.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c            | 16 +++++++++-------
+ mt7915/tests/mcu-test.c |  4 +---
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index e76d8b62..3ac49e6a 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -1294,27 +1294,29 @@ mt7915_mcu_sta_bfer_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	if (!ebf && !dev->ibf)
+ 		return;
+ 
++	/* he: eBF only, in accordance with spec
++	 * vht: support eBF and iBF
++	 * ht: iBF only, since mac80211 lacks of eBF support
++	 */
+ 	if (sta->deflink.he_cap.has_he && ebf) {
+ 		vc = mt76_connac_get_he_phy_cap(phy->mt76, vif);
+ 		if (!vc)
+ 			return;
++	} else if (!sta->deflink.vht_cap.vht_supported &&
++		   !sta->deflink.ht_cap.ht_supported) {
++		/* HE only: no iBF, so nothing to send */
++		return;
+ 	}
+ 
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_BF, sizeof(*bf));
+ 	bf = (struct sta_rec_bf *)tlv;
+ 
+-	/* he: eBF only, in accordance with spec
+-	 * vht: support eBF and iBF
+-	 * ht: iBF only, since mac80211 lacks of eBF support
+-	 */
+ 	if (sta->deflink.he_cap.has_he && ebf)
+ 		mt7915_mcu_sta_bfer_he(sta, vc, bf);
+ 	else if (sta->deflink.vht_cap.vht_supported)
+ 		mt7915_mcu_sta_bfer_vht(sta, phy, bf, ebf);
+-	else if (sta->deflink.ht_cap.ht_supported)
+-		mt7915_mcu_sta_bfer_ht(sta, phy, bf);
+ 	else
+-		return;
++		mt7915_mcu_sta_bfer_ht(sta, phy, bf);
+ 
+ 	bf->bf_cap = ebf ? ebf : dev->ibf << 1;
+ 	bf->bw = sta->deflink.bandwidth;
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index da845b58..3ed4e431 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -3535,14 +3535,12 @@ static void mt7915_test_bfer_ht(struct kunit *test)
+ }
+ 
+ /* An HE-only station that we can't explicitly beamform gets no BF record
+- * even with iBF on (HE is eBF only), yet bfer_tlv adds an empty one.
++ * even with iBF on (HE is eBF only), not an empty one.
+  */
+ static void mt7915_test_bfer_he_ibf(struct kunit *test)
+ {
+ 	struct mt7915_test_ctx c;
+ 
+-	kunit_skip(test, "driver bug: an all-zero STA_REC_BF goes out for HE-only stations with iBF on");
+-
+ 	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
+ 	mt7915_test_he(c.sta);
+ 	c.mvif->cap.he_su_ebfer = false;

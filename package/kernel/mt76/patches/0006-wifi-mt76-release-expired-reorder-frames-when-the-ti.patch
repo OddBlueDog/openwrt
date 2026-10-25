@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:18:08 +0100
+Subject: [PATCH] wifi: mt76: release expired reorder frames when the timeout
+ is reached
+
+The reorder work is queued mt76_aggr_tid_to_timeo() jiffies after the
+first frame is buffered behind a hole, but the expiry check only
+releases frames whose timeout has strictly passed. When the work runs on
+the expiry jiffy, which is the common case with a low HZ, nothing is
+released and the work is re-armed for another full timeout. A lost
+frame without a following BAR then stalls the TID for about twice the
+intended time (around 200 ms instead of 100 ms for best effort at
+HZ=100), which is close to the minimum TCP RTO.
+
+Treat the timeout as expired once it is reached.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agg-rx.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 3d34caf7..90c8a92c 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -76,7 +76,7 @@ mt76_rx_aggr_check_release(struct mt76_rx_tid *tid, struct sk_buff_head *frames)
+ 
+ 		nframes--;
+ 		status = (struct mt76_rx_status *)skb->cb;
+-		if (!time_after32(jiffies,
++		if (time_before32(jiffies,
+ 				  status->reorder_time +
+ 				  mt76_aggr_tid_to_timeo(tid->num)))
+ 			continue;

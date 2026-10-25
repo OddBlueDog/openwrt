@@ -1,0 +1,466 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 11:02:08 +0100
+Subject: [PATCH] milkflint tests: check what mutation testing showed unchecked
+
+Mutation testing put small bugs into the driver; each of these survived every
+test. Now they're caught:
+- mt7915 tx-free events: tx stays blocked while freeing leaves the token
+  pool at its threshold (both event formats).
+- mt7915 restart: the MT7986 has no second host interface, so its INT1
+  registers are left alone; the interrupt mask comes back.
+- mt7915 SER reset: the tx worker is running again and the tx NAPI was
+  kicked afterwards.
+- Firmware commands: eBF is off for a VHT station that isn't a beamformee;
+  the rate control TLV carries the station's bandwidth in phy.bw too; MCU
+  frames go out with no DMA descriptor info; tx power takes the best chain
+  even when it's the first; band 1 turns on its noise floor measurement
+  when it starts.
+- mt76 core: every tx queue counts as pending, not just BE; the driver's
+  set_channel runs under the device mutex; an asleep station repeating
+  its PM bit, or one without PS tracking, changes nothing; removing a
+  station ends the BA sessions of TID 0 and 15 too and leaves its queue
+  locks free; a 6 GHz band gets every OFDM rate; a message payload longer
+  than its length still gets the bus tailroom.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/mac-test.c  | 96 ++++++++++++++++++++++++++++++++++++++++
+ mt7915/tests/main-test.c |  7 ++-
+ mt7915/tests/mcu-test.c  |  8 ++++
+ mt7915/tests/mcu2-test.c | 14 ++++++
+ tests/core-test.c        | 56 +++++++++++++++++++++++
+ tests/mcu-test.c         | 16 ++++++-
+ 6 files changed, 195 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 87e4f1c1..870ef3b7 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -2601,6 +2601,65 @@ static void mt7915_test_tx_free_v0(struct kunit *test)
+ 	kfree_skb(skb[1]);
+ }
+ 
++/* Tx blocked because the token pool ran full stays blocked while freeing
++ * leaves it at the threshold or above, in either event format.
++ */
++static void mt7915_test_tx_free_still_full(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	int full = dev->mt76.token_size - MT76_TOKEN_FREE_THR;
++	struct sk_buff *skb;
++	u32 info[2];
++	__le32 *ev;
++	int id;
++
++	mt7915_test_sta(test, dev, 9, mvif);
++
++	/* the older format: one token freed, the pool still at the threshold */
++	id = mt7915_test_token(test, dev, 9, &skb);
++	dev->mt76.token_count += full;
++	env->q.blocked = true;
++	info[0] = id;
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY_V0, 1, 0, info, 1);
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 3 * 4));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb));
++	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, full);
++	KUNIT_EXPECT_TRUE(test, env->q.blocked);
++	kfree_skb(skb);
++
++	/* the current format: the same */
++	dev->mt76.token_count -= full;
++	id = mt7915_test_token(test, dev, 9, &skb);
++	dev->mt76.token_count += full;
++	info[0] = MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 9);
++	info[1] = FIELD_PREP(MT_TX_FREE_MSDU_ID, id);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 2, 0, info, 2);
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 4 * 4));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb));
++	KUNIT_EXPECT_TRUE(test, env->q.blocked);
++	kfree_skb(skb);
++
++	/* back at the threshold: still blocked; one below it: unblocked */
++	id = mt7915_test_token(test, dev, 9, &skb);
++	info[1] = FIELD_PREP(MT_TX_FREE_MSDU_ID, id);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 2, 0, info, 2);
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 4 * 4));
++	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, full);
++	KUNIT_EXPECT_TRUE(test, env->q.blocked);
++	kfree_skb(skb);
++	dev->mt76.token_count = full - 1;
++	id = mt7915_test_token(test, dev, 9, &skb);
++	kfree_skb(skb);
++	info[1] = FIELD_PREP(MT_TX_FREE_MSDU_ID, id);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 2, 0, info, 2);
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 4 * 4));
++	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, full - 1);
++	KUNIT_EXPECT_FALSE(test, env->q.blocked);
++	dev->mt76.token_count = 0;
++}
++
+ /* --- tx: tx status ------------------------------------------------------ */
+ 
+ static void mt7915_test_txs(u32 *txs, u16 wcid, u8 pid, u32 txs0)
+@@ -4111,12 +4170,28 @@ struct mt7915_test_napi {
+ 	struct mt7915_dev *dev;
+ };
+ 
++/* the NAPI contexts polled since the test's last mt7915_test_napi() */
++static struct napi_struct *mt7915_test_napi_log[8];
++static int mt7915_test_npolled;
++
+ static int mt7915_test_napi_poll(struct napi_struct *napi, int budget)
+ {
++	if (mt7915_test_npolled < ARRAY_SIZE(mt7915_test_napi_log))
++		mt7915_test_napi_log[mt7915_test_npolled++] = napi;
+ 	napi_complete(napi);
+ 	return 0;
+ }
+ 
++static bool mt7915_test_was_polled(struct napi_struct *napi)
++{
++	int i;
++
++	for (i = 0; i < mt7915_test_npolled; i++)
++		if (mt7915_test_napi_log[i] == napi)
++			return true;
++	return false;
++}
++
+ static void mt7915_test_napi_free(void *data)
+ {
+ 	struct mt7915_test_napi *n = data;
+@@ -4136,6 +4211,7 @@ static void mt7915_test_napi(struct kunit *test, struct mt7915_dev *dev)
+ 	n->dev = dev;
+ 	n->ndev = alloc_netdev_dummy(0);
+ 	KUNIT_ASSERT_NOT_NULL(test, n->ndev);
++	mt7915_test_npolled = 0;
+ 	rcu_expedite_gp();
+ 	netif_napi_add_tx(n->ndev, &dev->mt76.tx_napi, mt7915_test_napi_poll);
+ 	napi_enable(&dev->mt76.tx_napi);
+@@ -4415,12 +4491,21 @@ static void mt7915_test_mac_restart(struct kunit *test)
+ 	mt7915_test_token(test, dev, 0, &skb);
+ 	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+ 	set_bit(MT76_RESET, &phy1->mt76->state);
++	/* the MT7986 has no second host interface: its registers aren't ours */
++	mt76_wr(dev, MT_INT1_MASK_CSR, 0x5a5a);
++	mt76_wr(dev, MT_INT1_SOURCE_CSR, 0xa5a5);
++	mt76_wr(dev, MT_INT_MASK_CSR, 0);
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 	ret = mt7915_mac_restart(dev);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	KUNIT_EXPECT_LT(test, ret, 0);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_INT1_MASK_CSR), 0x5a5a);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_INT1_SOURCE_CSR), 0xa5a5);
++	/* interrupts back on */
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_INT_MASK_CSR),
++			dev->mt76.mmio.irqmask);
+ 	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb));
+ 	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, 0);
+ 	/* DMA re-enabled after the reset */
+@@ -4624,9 +4709,19 @@ static void mt7915_test_reset_work_ser(struct kunit *test)
+ 			      MT_MCU_CMD_RECOVERY_DONE |
+ 			      MT_MCU_CMD_NORMAL_STATE;
+ 	dev->mt76.mmio.irqmask = 0;
++	KUNIT_ASSERT_NOT_NULL(test, dev->mt76.tx_worker.task);
++	mt7915_test_npolled = 0;
+ 
+ 	mt7915_mac_reset_work(&dev->reset_work);
+ 
++	/* tx runs again: the tx worker is back, and the tx NAPI (which
++	 * reclaims what the hardware sent) was kicked
++	 */
++	KUNIT_EXPECT_NE(test, READ_ONCE(dev->mt76.tx_worker.task->__state),
++			TASK_PARKED);
++	KUNIT_EXPECT_TRUE(test, mt7915_test_was_polled(&dev->mt76.tx_napi));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_was_polled(
++			  &dev->mt76.napi[MT_RXQ_MAIN]));
+ 	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_MCU_INT_EVENT),
+ 			MT_MCU_INT_EVENT_RESET_DONE);
+ 	KUNIT_EXPECT_TRUE(test, mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
+@@ -4788,6 +4883,7 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_tx_free_v3),
+ 	KUNIT_CASE(mt7915_test_tx_free_unknown),
+ 	KUNIT_CASE(mt7915_test_tx_free_v0),
++	KUNIT_CASE(mt7915_test_tx_free_still_full),
+ 	KUNIT_CASE(mt7915_test_txs_rate),
+ 	KUNIT_CASE(mt7915_test_tx_status_lifecycle),
+ 	KUNIT_CASE(mt7915_test_rx_check_types),
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 3e668d65..ed8002fe 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -391,10 +391,15 @@ static void mt7915_main_test_start_stop_dbdc(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, mt7915_main_test_band_msgs(fake, mac, 0));
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 6);
+ 
+-	/* band 0 running: band 1 only touches band 1 */
++	/* band 0 running: band 1 only touches band 1, and measures its
++	 * noise floor
++	 */
+ 	KUNIT_ASSERT_EQ(test, mt7915_start(hw), 0);
+ 	mt7915_main_test_clear(fake);
++	mt76_wr(dev, MT_WF_PHY_RXTD12_MT7916(1), 0);
+ 	KUNIT_ASSERT_EQ(test, mt7915_start(hw2), 0);
++	KUNIT_EXPECT_NE(test, mt76_rr(dev, MT_WF_PHY_RXTD12_MT7916(1)) &
++			MT_WF_PHY_RXTD12_IRPI_SW_CLR, 0);
+ 	KUNIT_EXPECT_FALSE(test, mt7915_main_test_band_msgs(fake, pm, 0));
+ 	KUNIT_EXPECT_FALSE(test, mt7915_main_test_band_msgs(fake, mac, 0));
+ 	KUNIT_EXPECT_TRUE(test, mt7915_main_test_band_msgs(fake, mac, 1));
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index fb44eb82..8c7a5f30 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -3190,6 +3190,13 @@ static void mt7915_test_ebf_supported(struct kunit *test)
+ 	c.sta->deflink.vht_cap.cap |= IEEE80211_VHT_CAP_SU_BEAMFORMER_CAPABLE;
+ 	KUNIT_EXPECT_TRUE(test, mt7915_is_ebf_supported(c.phy, c.vif, c.sta,
+ 			  true));
++	/* ... but don't beamform a station that isn't a beamformee */
++	c.sta->deflink.vht_cap.cap &= ~IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE;
++	KUNIT_EXPECT_FALSE(test, mt7915_is_ebf_supported(c.phy, c.vif, c.sta,
++			   false));
++	KUNIT_EXPECT_TRUE(test, mt7915_is_ebf_supported(c.phy, c.vif, c.sta,
++			  true));
++	c.sta->deflink.vht_cap.cap |= IEEE80211_VHT_CAP_SU_BEAMFORMEE_CAPABLE;
+ 	c.mvif->cap.vht_su_ebfer = false;
+ 	c.mvif->cap.vht_su_ebfee = false;
+ 	KUNIT_EXPECT_FALSE(test, mt7915_is_ebf_supported(c.phy, c.vif, c.sta,
+@@ -3701,6 +3708,7 @@ static void mt7915_test_rate_ctrl_tlv_5g(struct kunit *test)
+ 			PHY_MODE_A | PHY_MODE_AN | PHY_MODE_AC);
+ 	KUNIT_EXPECT_EQ(test, ra->channel, 36);
+ 	KUNIT_EXPECT_EQ(test, ra->bw, IEEE80211_STA_RX_BW_80);
++	KUNIT_EXPECT_EQ(test, ra->phy.bw, IEEE80211_STA_RX_BW_80);
+ 	KUNIT_EXPECT_EQ(test, ra->rate_len, 4);
+ 	KUNIT_EXPECT_EQ(test, ra->supp_mode, MODE_OFDM | MODE_HT | MODE_VHT);
+ 	KUNIT_EXPECT_EQ(test, ra->supp_cck_rate, 0);
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index f2a5ebb7..436851d2 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -254,6 +254,7 @@ mt7915_mcu2_tune(struct kunit *test, struct mt7915_dev *dev, int freq,
+ struct mt7915_mcu2_frame {
+ 	struct list_head list;
+ 	struct mt76_queue *q;
++	u32 tx_info;			/* for the DMA descriptor */
+ 	int len;
+ 	u8 data[];			/* the TXD, then the payload */
+ };
+@@ -291,6 +292,7 @@ static int mt7915_mcu2_fw_queue(struct mt76_dev *mdev, struct mt76_queue *q,
+ 	frame = kunit_kmalloc(fw->test, sizeof(*frame) + skb->len, GFP_KERNEL);
+ 	if (frame) {
+ 		frame->q = q;
++		frame->tx_info = tx_info;
+ 		frame->len = skb->len;
+ 		memcpy(frame->data, skb->data, skb->len);
+ 		list_add_tail(&frame->list, &fw->frames);
+@@ -376,6 +378,8 @@ mt7915_mcu2_frame(struct kunit *test, struct mt7915_mcu2_fw *fw,
+ 	KUNIT_ASSERT_NOT_NULL(test, found);
+ 	KUNIT_ASSERT_EQ(test, found->len, (int)sizeof(*txd) + len);
+ 	KUNIT_EXPECT_PTR_EQ(test, found->q, &fw->q[qid]);
++	/* nothing for the descriptor's info word: the TXD says it all */
++	KUNIT_EXPECT_EQ(test, found->tx_info, 0);
+ 
+ 	txd = (struct mt76_connac2_mcu_txd *)found->data;
+ 	KUNIT_EXPECT_EQ(test, txd->cid, cid);
+@@ -581,6 +585,7 @@ mt7915_mcu2_last_frame(struct kunit *test, struct mt7915_mcu2_fw *fw,
+ 	KUNIT_ASSERT_FALSE(test, list_empty(&fw->frames));
+ 	frame = list_last_entry(&fw->frames, struct mt7915_mcu2_frame, list);
+ 	KUNIT_EXPECT_PTR_EQ(test, frame->q, &fw->q[qid]);
++	KUNIT_EXPECT_EQ(test, frame->tx_info, 0);
+ 	KUNIT_EXPECT_EQ(test, frame->len,
+ 			(int)sizeof(struct mt76_connac2_mcu_txd) + len);
+ 	return (struct mt76_connac2_mcu_txd *)frame->data;
+@@ -715,6 +720,7 @@ static void mt7915_mcu2_send_queues(struct kunit *test)
+ 					list);
+ 		KUNIT_EXPECT_PTR_EQ_MSG(test, frame->q, &fw->q[cases[i].qid],
+ 					"case %d", i);
++		KUNIT_EXPECT_EQ_MSG(test, frame->tx_info, 0, "case %d", i);
+ 	}
+ 	clear_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+ }
+@@ -2519,6 +2525,7 @@ static void mt7915_mcu2_power_setup(struct kunit *test,
+ static void mt7915_mcu2_txpower_sku_off(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev = mt7915_test_dev(test);
++	u8 *eep;
+ 
+ 	mt7915_mcu2_power_setup(test, dev, 10);
+ 	mt7915_mcu2_power_eeprom(test, dev, MT_EE_RATE_DELTA_EN |
+@@ -2529,6 +2536,13 @@ static void mt7915_mcu2_txpower_sku_off(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->mphy.txpower_cur, 36);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, 0);
+ 
++	/* the best chain can be the first one */
++	eep = dev->mt76.eeprom.data;
++	eep[MT_EE_TX0_POWER_2G_V2] = 40;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_set_txpower_sku(&dev->phy), 0);
++	KUNIT_EXPECT_EQ(test, dev->mphy.txpower_cur, 42);
++	eep[MT_EE_TX0_POWER_2G_V2] = 30;
++
+ 	mt7915_mcu2_power_eeprom(test, dev, MT_EE_RATE_DELTA_EN | 3);
+ 	KUNIT_EXPECT_EQ(test, mt7915_mcu_set_txpower_sku(&dev->phy), 0);
+ 	KUNIT_EXPECT_EQ(test, dev->mphy.txpower_cur, 31);
+diff --git a/tests/core-test.c b/tests/core-test.c
+index ccf55958..4344d823 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -19,6 +19,7 @@ static struct {
+ 	int n_set_channel;
+ 	int set_channel_ret;
+ 	bool set_in_reset;
++	bool set_locked;
+ 	struct cfg80211_chan_def set_chandef;
+ 	bool set_offchannel;
+ 	struct mt76_channel_state *set_state;
+@@ -61,6 +62,7 @@ static int mt76_test_set_channel(struct mt76_phy *phy)
+ {
+ 	mt76_test_drv.n_set_channel++;
+ 	mt76_test_drv.set_in_reset = test_bit(MT76_RESET, &phy->state);
++	mt76_test_drv.set_locked = mutex_is_locked(&phy->dev->mutex);
+ 	mt76_test_drv.set_chandef = phy->chandef;
+ 	mt76_test_drv.set_offchannel = phy->offchannel;
+ 	mt76_test_drv.set_state = phy->chan_state;
+@@ -1567,6 +1569,13 @@ static void mt76_test_register_ext_phy(struct kunit *test)
+ 	KUNIT_EXPECT_PTR_EQ(test, wiphy->bands[NL80211_BAND_6GHZ]->channels,
+ 			    phy->sband_6g.sband.channels);
+ 	KUNIT_EXPECT_PTR_EQ(test, dev->band_phys[NL80211_BAND_6GHZ], phy);
++	/* 5 and 6 GHz: every OFDM rate, no CCK */
++	KUNIT_EXPECT_EQ(test, wiphy->bands[NL80211_BAND_5GHZ]->n_bitrates,
++			ARRAY_SIZE(mt76_rates) - 4);
++	KUNIT_EXPECT_EQ(test, wiphy->bands[NL80211_BAND_6GHZ]->n_bitrates,
++			ARRAY_SIZE(mt76_rates) - 4);
++	KUNIT_EXPECT_PTR_EQ(test, wiphy->bands[NL80211_BAND_6GHZ]->bitrates,
++			    &mt76_rates[4]);
+ 	KUNIT_ASSERT_NOT_NULL(test, phy->chandef.chan);
+ 	KUNIT_EXPECT_EQ(test, phy->chandef.chan->center_freq, 5955);
+ 
+@@ -1725,6 +1734,9 @@ static void mt76_test_set_channel_switch(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_set_channel(phy, &ch6, false), 0);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_set_channel, 1);
+ 	KUNIT_EXPECT_TRUE(test, mt76_test_drv.set_in_reset);
++	/* the driver is called under the device mutex, released after */
++	KUNIT_EXPECT_TRUE(test, mt76_test_drv.set_locked);
++	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mutex));
+ 	KUNIT_EXPECT_PTR_EQ(test, mt76_test_drv.set_chandef.chan, &chans[5]);
+ 	KUNIT_EXPECT_FALSE(test, mt76_test_drv.set_offchannel);
+ 	KUNIT_EXPECT_PTR_EQ(test, mt76_test_drv.set_state, &states[5]);
+@@ -1804,6 +1816,7 @@ static void mt76_test_has_tx_pending(struct kunit *test)
+ 	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
+ 	struct mt76_phy *phy = &dev->phy;
+ 	struct mt76_queue q = {};
++	int i;
+ 
+ 	KUNIT_EXPECT_FALSE(test, mt76_has_tx_pending(phy));
+ 	phy->q_tx[MT_TXQ_BE] = &q;
+@@ -1813,7 +1826,17 @@ static void mt76_test_has_tx_pending(struct kunit *test)
+ 	q.queued = 0;
+ 	atomic_set(&phy->mgmt_tx_pending, 1);
+ 	KUNIT_EXPECT_TRUE(test, mt76_has_tx_pending(phy));
++	atomic_set(&phy->mgmt_tx_pending, 0);
+ 	phy->q_tx[MT_TXQ_BE] = NULL;
++
++	/* each queue counts, the first and the last too */
++	q.queued = 1;
++	for (i = 0; i < __MT_TXQ_MAX; i++) {
++		phy->q_tx[i] = &q;
++		KUNIT_EXPECT_TRUE_MSG(test, mt76_has_tx_pending(phy),
++				      "queue %d", i);
++		phy->q_tx[i] = NULL;
++	}
+ }
+ 
+ /* The survey lists every channel of every band in order, with the times
+@@ -2621,6 +2644,29 @@ static void mt76_test_check_sta_ps_unchanged(struct kunit *test)
+ 
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
+ 	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_sta_ps, 0);
++
++	/* a station asleep that says so again stays asleep */
++	set_bit(MT_WCID_FLAG_PS, &wcid->flags);
++	skb = mt76_test_rx_skb(test, IEEE80211_FTYPE_DATA |
++			       IEEE80211_STYPE_DATA | IEEE80211_FCTL_PM,
++			       mt76_hwt_addr, 1, 8);
++	mt76_test_status(skb)->wcid = wcid;
++	mt76_check_sta(dev, skb);
++	kfree_skb(skb);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_sta_ps, 0);
++	clear_bit(MT_WCID_FLAG_PS, &wcid->flags);
++
++	/* without power save tracking the power bit means nothing */
++	clear_bit(MT_WCID_FLAG_CHECK_PS, &wcid->flags);
++	skb = mt76_test_rx_skb(test, IEEE80211_FTYPE_DATA |
++			       IEEE80211_STYPE_DATA | IEEE80211_FCTL_PM,
++			       mt76_hwt_addr, 1, 8);
++	mt76_test_status(skb)->wcid = wcid;
++	mt76_check_sta(dev, skb);
++	kfree_skb(skb);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_sta_ps, 0);
+ }
+ 
+ /* A PS-Poll from a sender the hardware didn't match is looked up by its
+@@ -2851,6 +2897,10 @@ static void mt76_test_sta_remove(struct kunit *test)
+ 	mt76_wcid_mask_set(dev->wcid_mask, 9);
+ 	mutex_lock(&dev->mutex);
+ 	KUNIT_ASSERT_EQ(test, mt76_rx_aggr_start(dev, wcid, 2, 100, 8), 0);
++	/* the first and the last TID too */
++	KUNIT_ASSERT_EQ(test, mt76_rx_aggr_start(dev, wcid, 0, 100, 8), 0);
++	KUNIT_ASSERT_EQ(test, mt76_rx_aggr_start(dev, wcid,
++			ARRAY_SIZE(wcid->aggr) - 1, 100, 8), 0);
+ 	mutex_unlock(&dev->mutex);
+ 	skb_queue_tail(&wcid->tx_pending, mt76_test_skb(test, 32));
+ 
+@@ -2863,8 +2913,14 @@ static void mt76_test_sta_remove(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_sta_remove, 1);
+ 	KUNIT_EXPECT_PTR_EQ(test, mt76_test_drv.sta_sta, sta);
+ 	KUNIT_EXPECT_NULL(test, rcu_access_pointer(wcid->aggr[2]));
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(wcid->aggr[0]));
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(
++			  wcid->aggr[ARRAY_SIZE(wcid->aggr) - 1]));
+ 	KUNIT_EXPECT_EQ(test, atomic_read(&mt76_test_nfreed), 1);
+ 	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&wcid->tx_pending));
++	/* and its queues are left unlocked */
++	KUNIT_EXPECT_FALSE(test, spin_is_locked(&wcid->tx_pending.lock));
++	KUNIT_EXPECT_FALSE(test, spin_is_locked(&wcid->tx_offchannel.lock));
+ 	KUNIT_EXPECT_FALSE(test, dev->wcid_mask[0] & BIT(9));
+ 	KUNIT_EXPECT_EQ(test, dev->phy.num_sta, 0);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_sta_event, 0);
+diff --git a/tests/mcu-test.c b/tests/mcu-test.c
+index a367ef14..e0592ee0 100644
+--- a/tests/mcu-test.c
++++ b/tests/mcu-test.c
+@@ -203,7 +203,7 @@ static void mt76_mcu_test_msg_alloc(struct kunit *test)
+ 	static const u8 data[4] = { 1, 2, 3, 4 };
+ 	struct mt76_dev *dev = mt76_mcu_test_dev(test, &mt76_mcu_test_ops);
+ 	struct sk_buff *skb;
+-	u8 *tail;
++	u8 *tail, *big;
+ 	int i;
+ 
+ 	skb = __mt76_mcu_msg_alloc(dev, data, 32, sizeof(data), GFP_KERNEL);
+@@ -224,6 +224,20 @@ static void mt76_mcu_test_msg_alloc(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, skb->len, sizeof(data));
+ 	kfree_skb(skb);
+ 
++	/* ... and still gets the bus's tailroom after it (a payload far
++	 * larger than @len would overrun the buffer otherwise)
++	 */
++	big = kunit_kzalloc(test, 1024, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, big);
++	memset(big, 0x5a, 1024);
++	skb = __mt76_mcu_msg_alloc(dev, big, 1, 1024, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_EXPECT_EQ(test, skb->len, 1024);
++	KUNIT_EXPECT_MEMEQ(test, skb->data, big, 1024);
++	KUNIT_EXPECT_GE(test, skb_tailroom(skb), MT76_MCU_TEST_TAILROOM);
++	KUNIT_EXPECT_GE(test, skb_headroom(skb), MT76_MCU_TEST_HEADROOM);
++	kfree_skb(skb);
++
+ 	/* no payload: an empty message with room for @len */
+ 	skb = __mt76_mcu_msg_alloc(dev, NULL, 24, 24, GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, skb);

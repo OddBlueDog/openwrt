@@ -1,0 +1,2350 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:29:26 +0100
+Subject: [PATCH] milkflint tests: replay recordings as the hardware
+
+tests/replay.h plays a recording (record.h) back on top of fake.h:
+register reads by address (the n-th read gets the n-th recorded value),
+windows behind a selector register keyed by its value too (the remapped
+registers, the A-die's SPI data register), firmware commands with the
+recorded raw reply for the same command, an optional strict-order check,
+and a report of what the recording doesn't cover.
+
+The fakes now feed the recorder, so a run on them can be recorded and
+replayed. fake.h gets a write hook and a hook before each firmware reply;
+mt7915's fake device can take another name, for a second device in the
+same test.
+
+- mt76-record: the recorder's format, size bound, modes and firmware
+  download handling, and a fake run replayed to the same code: same
+  values, same replies, same recording.
+- mt7915-replay: a small firmware model on the fakes runs the firmware
+  boot, mt7915_init_hardware() (through the driver's own DMA firmware
+  path) and all of mt7915_register_device() with its init work and
+  teardown; a second device replays each recording and makes the same
+  accesses (1662 for registration). These were out of the tests' reach.
+  A capture from the router in the VM's
+  /lib/firmware/milkflint/mt7986-capture.rec is replayed through
+  registration too; without one that test is skipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c              |   1 +
+ mt7915/tests/fake.h        |  11 +-
+ mt7915/tests/replay-test.c | 748 ++++++++++++++++++++++++++++++++++++
+ record.c                   |   4 +
+ tests/fake.h               |  45 ++-
+ tests/record-test.c        | 764 +++++++++++++++++++++++++++++++++++++
+ tests/replay.h             | 618 ++++++++++++++++++++++++++++++
+ 7 files changed, 2182 insertions(+), 9 deletions(-)
+ create mode 100644 mt7915/tests/replay-test.c
+ create mode 100644 tests/record-test.c
+ create mode 100644 tests/replay.h
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 18e932f9..cc3026a0 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1403,4 +1403,5 @@ void mt7915_unregister_device(struct mt7915_dev *dev)
+ 
+ #if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
+ #include "tests/init-test.c"
++#include "tests/replay-test.c"
+ #endif
+diff --git a/mt7915/tests/fake.h b/mt7915/tests/fake.h
+index 65b76d05..a15002e7 100644
+--- a/mt7915/tests/fake.h
++++ b/mt7915/tests/fake.h
+@@ -40,7 +40,9 @@ static inline void mt7915_test_vfree(void *p)
+ #define mt7915_test_payload(msg, type) \
+ 	((msg) && (msg)->len >= sizeof(type) ? (type *)(msg)->data : NULL)
+ 
+-static inline struct mt7915_dev *mt7915_test_dev(struct kunit *test)
++/* @name: the KUnit device's, unique within the test */
++static inline struct mt7915_dev *__mt7915_test_dev(struct kunit *test,
++						   const char *name)
+ {
+ 	struct mt76_test_fake *fake;
+ 	struct mt76_bus_ops *bus;
+@@ -48,7 +50,7 @@ static inline struct mt7915_dev *mt7915_test_dev(struct kunit *test)
+ 	struct device *kdev;
+ 	void *mem;
+ 
+-	kdev = kunit_device_register(test, "mt7915e-test");
++	kdev = kunit_device_register(test, name);
+ 	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(kdev));
+ 	/* probing reads one register through MMIO before we can step in */
+ 	mem = vzalloc(SZ_8M);
+@@ -88,4 +90,9 @@ static inline struct mt7915_dev *mt7915_test_dev(struct kunit *test)
+ 	return dev;
+ }
+ 
++static inline struct mt7915_dev *mt7915_test_dev(struct kunit *test)
++{
++	return __mt7915_test_dev(test, "mt7915e-test");
++}
++
+ #endif
+diff --git a/mt7915/tests/replay-test.c b/mt7915/tests/replay-test.c
+new file mode 100644
+index 00000000..7eebf12c
+--- /dev/null
++++ b/mt7915/tests/replay-test.c
+@@ -0,0 +1,748 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests that replay a recording of an MT7986 (../../tests/replay.h)
++ * through what no fake could answer before: the firmware boot
++ * (mt7915_mcu_init_firmware()), mt7915_init_hardware() with DMA and the
++ * driver's own firmware path, and the whole of mt7915_register_device().
++ *
++ * Until there's a capture from the router, the recording is synthetic: the
++ * flow runs once on fake.h with a small model of the firmware answering
++ * (below) and the recorder attached, then a second device that has nothing
++ * but the recording replays it, and must make the same accesses, send the
++ * same commands and end up in the same state. A capture in the VM's
++ * /lib/firmware/milkflint/mt7986-capture.rec (see the README) is replayed
++ * through mt7915_register_device() by the last test, which is skipped
++ * without one.
++ *
++ * With the driver's own firmware path, commands go to the DMA rings: the
++ * device's queue ops are wrapped so that what's sent to the MCU queues
++ * goes to the fake instead, its command read back from the descriptor.
++ *
++ * Included at the end of mt7915/init.c, after tests/init-test.c, whose
++ * helpers it uses, when CONFIG_MT76_KUNIT_TEST is defined (milkflint's
++ * QEMU test build only).
++ */
++#include <linux/file.h>
++#include <linux/mount.h>
++#include <linux/namei.h>
++#include "../../tests/replay.h"
++
++#define MT7915_REPLAY_CAPTURE	"milkflint/mt7986-capture.rec"
++
++/* --- firmware files --------------------------------------------------------- */
++
++static void mt7915_replay_test_mkdir(struct kunit *test, const char *path)
++{
++	struct dentry *d;
++	struct path parent;
++	int ret;
++
++	d = kern_path_create(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
++	if (IS_ERR(d)) {
++		if (PTR_ERR(d) != -EEXIST)
++			kunit_skip(test, "can't create %s: %ld", path,
++				   PTR_ERR(d));
++		return;
++	}
++	ret = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), d,
++			0755);
++	done_path_create(&parent, d);
++	if (ret && ret != -EEXIST)
++		kunit_skip(test, "can't create %s: %d", path, ret);
++}
++
++/* /lib/firmware/@name, for request_firmware() (the VM's root file system
++ * is a throwaway copy)
++ */
++static void mt7915_replay_test_write(struct kunit *test, const char *name,
++				     const void *data, size_t len)
++{
++	char path[96];
++	struct file *f;
++	loff_t pos = 0;
++	ssize_t n;
++
++	snprintf(path, sizeof(path), "/lib/firmware/%s", name);
++	f = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++	if (IS_ERR(f))
++		kunit_skip(test, "can't create %s: %ld", path, PTR_ERR(f));
++	n = kernel_write(f, data, len, &pos);
++	filp_close(f, NULL);
++	/* until the deferred fput() runs, the file is still being written
++	 * and request_firmware() won't read it
++	 */
++	flush_delayed_fput();
++	if (n != len)
++		kunit_skip(test, "can't write %s: %zd", path, n);
++}
++
++#define MT7915_REPLAY_PATCH_DATA	0x100
++#define MT7915_REPLAY_PATCH_LEN		300
++#define MT7915_REPLAY_RAM_LEN		5000	/* two chunks */
++
++/* A ROM patch and WM/WA images the MT7986 loader takes: a section or
++ * region each, of made-up data.
++ */
++static void mt7915_replay_test_firmware(struct kunit *test)
++{
++	size_t plen = MT7915_REPLAY_PATCH_DATA + MT7915_REPLAY_PATCH_LEN;
++	size_t rlen = MT7915_REPLAY_RAM_LEN +
++		      sizeof(struct mt76_connac2_fw_region) +
++		      sizeof(struct mt76_connac2_fw_trailer);
++	struct mt76_connac2_fw_trailer *tr;
++	struct mt76_connac2_fw_region *reg;
++	struct mt76_connac2_patch_hdr *hdr;
++	struct mt76_connac2_patch_sec *sec;
++	u8 *patch, *ram;
++	int i;
++
++	mt7915_replay_test_mkdir(test, "/lib/firmware/mediatek");
++
++	patch = kunit_kzalloc(test, plen, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, patch);
++	for (i = MT7915_REPLAY_PATCH_DATA; i < plen; i++)
++		patch[i] = i * 3;
++	hdr = (struct mt76_connac2_patch_hdr *)patch;
++	memcpy(hdr->build_date, "20261019000000rf", 16);
++	hdr->hw_sw_ver = cpu_to_be32(0x8a108a10);
++	hdr->desc.n_region = cpu_to_be32(1);
++	sec = (struct mt76_connac2_patch_sec *)(hdr + 1);
++	sec->type = cpu_to_be32(PATCH_SEC_TYPE_INFO);
++	sec->offs = cpu_to_be32(MT7915_REPLAY_PATCH_DATA);
++	sec->info.addr = cpu_to_be32(0x200000);	/* MCU_PATCH_ADDRESS */
++	sec->info.len = cpu_to_be32(MT7915_REPLAY_PATCH_LEN);
++	mt7915_replay_test_write(test, MT7986_ROM_PATCH, patch, plen);
++
++	ram = kunit_kzalloc(test, rlen, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ram);
++	for (i = 0; i < MT7915_REPLAY_RAM_LEN; i++)
++		ram[i] = i * 5;
++	reg = (struct mt76_connac2_fw_region *)(ram + MT7915_REPLAY_RAM_LEN);
++	reg->addr = cpu_to_le32(0x900000);
++	reg->len = cpu_to_le32(MT7915_REPLAY_RAM_LEN);
++	tr = (struct mt76_connac2_fw_trailer *)(reg + 1);
++	tr->n_region = 1;
++	memcpy(tr->fw_ver, "rf-kunit-1", 10);
++	memcpy(tr->build_date, "20261019000000r", 15);
++	mt7915_replay_test_write(test, MT7986_FIRMWARE_WM, ram, rlen);
++	memcpy(tr->fw_ver, "rf-kunit-2", 10);
++	mt7915_replay_test_write(test, MT7986_FIRMWARE_WA, ram, rlen);
++}
++
++/* --- a model of the firmware, for making the recording ----------------------- */
++
++struct mt7915_replay_model {
++	u32 top_misc;		/* where MT_TOP_MISC is on the bus */
++	const u8 *eeprom;	/* what the efuse holds */
++	int starts;		/* FW_START_REQs seen */
++};
++
++static void mt7915_replay_test_fw_state(struct mt76_test_fake *fake,
++					u32 state)
++{
++	struct mt7915_replay_model *m = fake->priv;
++
++	mt76_test_set_reg(fake, m->top_misc,
++			  FIELD_PREP(MT_TOP_MISC_FW_STATE, state));
++}
++
++/* the firmware's state follows its restarts and starts: download mode
++ * after a restart, ready once WM and WA have both been started
++ */
++static int mt7915_replay_test_model_mcu(struct mt76_test_fake *fake,
++					const struct mt76_test_msg *msg)
++{
++	struct mt7915_replay_model *m = fake->priv;
++
++	if (msg->cmd == MCU_CMD(NIC_POWER_CTRL)) {
++		m->starts = 0;
++		mt7915_replay_test_fw_state(fake, FW_STATE_FW_DOWNLOAD);
++	} else if (msg->cmd == MCU_CMD(FW_START_REQ) && ++m->starts == 2) {
++		mt7915_replay_test_fw_state(fake, FW_STATE_RDY);
++	}
++	return 0;
++}
++
++static void mt7915_replay_test_model_reply(struct mt76_test_fake *fake,
++					   const struct mt76_test_msg *msg,
++					   struct sk_buff *reply)
++{
++	struct mt7915_replay_model *m = fake->priv;
++	struct mt7915_mcu_eeprom_info *info;
++	u32 addr;
++
++	if (msg->cmd == MCU_CMD(PATCH_SEM_CONTROL)) {
++		/* the status is the header's last word */
++		reply->data[sizeof(struct mt76_connac2_mcu_rxd) - 4] =
++			get_unaligned_le32(msg->data) == PATCH_SEM_GET ?
++			PATCH_NOT_DL_SEM_SUCCESS : PATCH_REL_SEM_SUCCESS;
++	} else if (msg->cmd == MCU_EXT_QUERY(EFUSE_FREE_BLOCK)) {
++		skb_put_u8(reply, 10);
++	} else if (msg->cmd == MCU_EXT_QUERY(EFUSE_ACCESS)) {
++		addr = get_unaligned_le32(msg->data);
++		info = skb_put_zero(reply, sizeof(*info));
++		info->addr = cpu_to_le32(addr);
++		info->valid = cpu_to_le32(1);
++		if (m->eeprom && addr + 16 <= MT7916_EEPROM_SIZE)
++			memcpy(info->data, m->eeprom + addr, 16);
++	}
++}
++
++/* --- the driver's firmware path, into the fake -------------------------------- */
++
++struct mt7915_replay_qops {
++	struct mt76_queue_ops ops;
++	const struct mt76_queue_ops *orig;
++};
++
++static struct mt7915_replay_qops mt7915_replay_qops;
++
++/* the command a connac2 descriptor says (mt76_connac2_mcu_fill_message()
++ * backwards)
++ */
++static int mt7915_replay_test_cmd(const struct mt76_connac2_mcu_txd *txd)
++{
++	int cmd = txd->cid;
++
++	if (txd->ext_cid)
++		cmd |= FIELD_PREP(__MCU_CMD_FIELD_EXT_ID, txd->ext_cid);
++	if (txd->set_query == MCU_Q_QUERY)
++		cmd |= __MCU_CMD_FIELD_QUERY;
++	if (!txd->ext_cid && txd->set_query != MCU_Q_NA)
++		cmd |= __MCU_CMD_FIELD_CE;
++	if (txd->s2d_index == MCU_S2D_H2C)
++		cmd |= __MCU_CMD_FIELD_WA;
++	return cmd;
++}
++
++static int mt7915_replay_test_tx_raw(struct mt76_dev *mdev,
++				     struct mt76_queue *q,
++				     struct sk_buff *skb, u32 tx_info)
++{
++	const struct mt76_connac2_mcu_txd *txd;
++	int cmd, seq;
++
++	if (q == mdev->q_mcu[MT_MCUQ_FWDL]) {
++		cmd = MCU_CMD(FW_SCATTER);
++	} else if (q == mdev->q_mcu[MT_MCUQ_WM] ||
++		   q == mdev->q_mcu[MT_MCUQ_WA]) {
++		txd = (const void *)skb->data;
++		cmd = mt7915_replay_test_cmd(txd);
++		/* the reply carries the descriptor's sequence number */
++		mt76_test_fake->seq = (txd->seq - 1) & 0xf;
++		skb_pull(skb, sizeof(*txd));
++	} else {
++		return mt7915_replay_qops.orig->tx_queue_skb_raw(mdev, q, skb,
++								 tx_info);
++	}
++
++	return mt76_test_mcu_send(mdev, skb, cmd, &seq);
++}
++
++/* once mt76_dma_attach() has set the device's queue ops: wrap them */
++static void mt7915_replay_test_wrap(struct mt76_dev *mdev)
++{
++	struct mt7915_replay_qops *w = &mt7915_replay_qops;
++
++	if (!mdev->queue_ops || mdev->queue_ops == &w->ops ||
++	    !mdev->queue_ops->tx_queue_skb_raw)
++		return;
++	w->orig = mdev->queue_ops;
++	w->ops = *mdev->queue_ops;
++	w->ops.tx_queue_skb_raw = mt7915_replay_test_tx_raw;
++	mdev->queue_ops = &w->ops;
++}
++
++/* every register access goes by here */
++static u32 mt7915_replay_test_rr_model(struct mt76_test_fake *fake, u32 addr,
++				       u32 val)
++{
++	mt7915_replay_test_wrap(fake->dev);
++	return val;
++}
++
++static u32 mt7915_replay_test_rr_replay(struct mt76_test_fake *fake,
++					u32 addr, u32 val)
++{
++	mt7915_replay_test_wrap(fake->dev);
++	return mt76_replay_rr(fake, addr, val);
++}
++
++/* --- devices ---------------------------------------------------------------- */
++
++static void mt7915_replay_test_tx_cleanup(struct mt76_dev *dev,
++					  struct mt76_queue *q, bool flush)
++{
++}
++
++/* without DMA: the firmware download still cleans up its queue */
++static const struct mt76_queue_ops mt7915_replay_test_no_dma = {
++	.tx_cleanup = mt7915_replay_test_tx_cleanup,
++};
++
++/* Enabling interrupts schedules the IRQ tasklet, which would then run
++ * whenever, against an interrupt source the fake says is all pending. The
++ * fake has no interrupts to give: replies go to the driver directly.
++ */
++static void mt7915_replay_test_irq_tasklet(struct tasklet_struct *t)
++{
++}
++
++static void mt7915_replay_test_setup(struct kunit *test,
++				     struct mt7915_dev *dev, bool dma)
++{
++	mt7915_init_test_soc(test, dev);
++	tasklet_setup(&dev->mt76.irq_tasklet, mt7915_replay_test_irq_tasklet);
++	if (dma)
++		KUNIT_ASSERT_EQ(test, dma_coerce_mask_and_coherent(
++				dev->mt76.dma_dev, DMA_BIT_MASK(32)), 0);
++	else
++		dev->mt76.queue_ops = &mt7915_replay_test_no_dma;
++	ieee80211_hw_set(dev->mt76.hw, NO_AUTO_VIF);
++}
++
++static void mt7915_replay_test_free(void *rec)
++{
++	mt76_record_free(rec);
++}
++
++static void mt7915_replay_test_kvfree(void *p)
++{
++	kvfree(p);
++}
++
++static struct mt76_record *mt7915_replay_test_record(struct kunit *test)
++{
++	struct mt76_record *rec = mt76_record_alloc(SZ_1M, 0);
++
++	KUNIT_ASSERT_NOT_NULL(test, rec);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_replay_test_free, rec), 0);
++	mt76_record_attach(rec);
++	return rec;
++}
++
++static void *mt7915_replay_test_take(struct kunit *test,
++				     struct mt76_record *rec, size_t *len)
++{
++	void *data;
++
++	mt76_record_detach(rec);
++	data = mt76_record_copy(rec, len);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_replay_test_kvfree, data), 0);
++	return data;
++}
++
++/* An MT7986 like the GL-MT6000's (one MT7976 doing both bands) to make the
++ * recording on, the firmware model answering. Its EEPROM image is the
++ * efuse's content.
++ */
++static struct mt7915_dev *mt7915_replay_test_model(struct kunit *test,
++						   bool dma)
++{
++	struct mt7915_dev *dev = mt7915_init_test_chip(test,
++						       MT7976_ONE_ADIE_DBDC);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_replay_model *m;
++
++	m = kunit_kzalloc(test, sizeof(*m), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, m);
++	m->eeprom = dev->mt76.eeprom.data;
++	m->top_misc = mt7915_init_test_addr(dev, MT_TOP_MISC);
++	mt7915_replay_test_setup(test, dev, dma);
++
++	fake->priv = m;
++	fake->mcu_hook = mt7915_replay_test_model_mcu;
++	fake->reply = mt7915_replay_test_model_reply;
++	fake->rr_hook = mt7915_replay_test_rr_model;
++	mt7915_replay_test_fw_state(fake, FW_STATE_FW_DOWNLOAD);
++
++	return dev;
++}
++
++/* The windows of the MT7986's register space that replays need keyed by
++ * a selector: the L2 remap (also the one probing uses before it knows the
++ * chip) and each A-die's SPI data register.
++ */
++static void mt7915_replay_test_windows(struct mt76_replay *r)
++{
++	mt76_replay_window(r, 0x400000 + MT_HIF_REMAP_L2_MT7916,
++			   0x400000 + MT_HIF_REMAP_BASE_L2_MT7916, SZ_64K);
++	mt76_replay_window(r, MT_HIF_REMAP_L2_MT7916,
++			   MT_HIF_REMAP_BASE_L2_MT7916, SZ_64K);
++	mt76_replay_window(r, MT_CONN_INFRA_OFFSET(MT_TOP_SPI_ADDR_CR(0)),
++			   MT_CONN_INFRA_OFFSET(MT_TOP_SPI_READ_DATA_CR(0)), 4);
++	mt76_replay_window(r, MT_CONN_INFRA_OFFSET(MT_TOP_SPI_ADDR_CR(1)),
++			   MT_CONN_INFRA_OFFSET(MT_TOP_SPI_READ_DATA_CR(1)), 4);
++}
++
++/* An MT7986 that knows nothing but @rec: the A-die SKU and everything
++ * else it reads come from there, as do the firmware's replies.
++ */
++static struct mt7915_dev *mt7915_replay_test_replayed(struct kunit *test,
++						      const void *rec,
++						      size_t len,
++						      struct mt76_replay **rp,
++						      bool dma)
++{
++	struct mt7915_dev *dev = __mt7915_test_dev(test, "mt7915e-replay");
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt76_replay *r;
++
++	mt7915_replay_test_setup(test, dev, dma);
++
++	r = mt76_replay_new(test, fake, rec, len);
++	mt7915_replay_test_windows(r);
++	r->strict = true;
++	mt76_replay_start(r, 0);
++	fake->rr_hook = mt7915_replay_test_rr_replay;
++	*rp = r;
++
++	return dev;
++}
++
++/* The two runs did the same: the same register accesses with the same
++ * values and the same commands with the same payloads, in the same order.
++ * (Replies can differ in number: the fake answers commands nobody waits
++ * for, the replay doesn't.)
++ */
++static bool mt7915_replay_test_io(const struct mt76_rec_hdr *h)
++{
++	return h->type != MT76_REC_DEV && h->type != MT76_REC_MARK &&
++	       h->type != MT76_REC_MCU_RESP && h->type != MT76_REC_MCU_RET;
++}
++
++/* records @from to @to of what mt7915_replay_test_same() compares */
++static void mt7915_replay_test_show(struct kunit *test, const char *what,
++				    const void *rec, int from, int to)
++{
++	const struct mt76_rec_hdr *h;
++	const void *body;
++	size_t off = 0;
++	int i = 0;
++	u32 blen;
++
++	while ((h = mt76_replay_next(rec, &off, &body, &blen)) && i <= to) {
++		if (!mt7915_replay_test_io(h))
++			continue;
++		if (i >= from)
++			kunit_info(test, "%s %d: type %u %*ph\n", what, i,
++				   h->type, min_t(u32, blen, 20), body);
++		i++;
++	}
++}
++
++static void mt7915_replay_test_same(struct kunit *test, const void *a,
++				    const void *b)
++{
++	const struct mt76_rec_hdr *x = NULL, *y = NULL;
++	const void *bx, *by;
++	size_t ox = 0, oy = 0;
++	u32 lx, ly;
++	int i = 0;
++
++	for (;;) {
++		do {
++			x = mt76_replay_next(a, &ox, &bx, &lx);
++		} while (x && !mt7915_replay_test_io(x));
++		do {
++			y = mt76_replay_next(b, &oy, &by, &ly);
++		} while (y && !mt7915_replay_test_io(y));
++		if (!x || !y)
++			break;
++		if (x->type != y->type || lx != ly || memcmp(bx, by, lx)) {
++			KUNIT_FAIL(test, "access %d differs", i);
++			mt7915_replay_test_show(test, "recorded", a, i - 6, i + 2);
++			mt7915_replay_test_show(test, "replayed", b, i - 6, i + 2);
++			return;
++		}
++		i++;
++	}
++	KUNIT_EXPECT_NULL(test, x);
++	KUNIT_EXPECT_NULL(test, y);
++	kunit_info(test, "the replay made the same %d accesses\n", i);
++}
++
++static void mt7915_replay_test_same_msgs(struct kunit *test,
++					 struct mt76_test_fake *a,
++					 struct mt76_test_fake *b)
++{
++	struct mt76_test_msg *x, *y;
++	int i;
++
++	KUNIT_EXPECT_EQ(test, a->n_msgs, b->n_msgs);
++	for (i = 0; i < min(a->n_msgs, b->n_msgs); i++) {
++		x = mt76_test_msg(a, i);
++		y = mt76_test_msg(b, i);
++		KUNIT_ASSERT_NOT_NULL(test, x);
++		KUNIT_ASSERT_NOT_NULL(test, y);
++		KUNIT_EXPECT_EQ_MSG(test, x->cmd, y->cmd, "message %d", i);
++		KUNIT_EXPECT_EQ_MSG(test, x->len, y->len, "message %d", i);
++		if (x->len == y->len)
++			KUNIT_EXPECT_MEMEQ_MSG(test, x->data, y->data, x->len,
++					       "message %d", i);
++	}
++}
++
++static void mt7915_replay_test_expect_clean(struct kunit *test,
++					    struct mt76_replay *r)
++{
++	mt76_replay_report(test, r);
++	KUNIT_EXPECT_TRUE(test, mt76_replay_covered(r));
++	KUNIT_EXPECT_FALSE(test, r->diverged);
++	KUNIT_EXPECT_EQ(test, r->beyond_mcu, 0);
++	KUNIT_EXPECT_EQ(test, r->pos, r->n_evs);
++}
++
++/* mt7915_unregister_device(), which frees the device: what would free it
++ * again goes, and what its fake still holds
++ */
++static void mt7915_replay_test_unregister(struct kunit *test,
++					  struct mt7915_dev *dev,
++					  struct mt76_test_fake *fake)
++{
++	kunit_remove_action(test, mt76_test_free_device, &dev->mt76);
++	kunit_remove_action(test, mt76_test_fake_free, fake);
++	mt7915_unregister_device(dev);
++	xa_destroy(&fake->regs);
++	if (mt76_test_fake == fake)
++		mt76_test_fake = NULL;
++}
++
++/* --- the tests ---------------------------------------------------------------- */
++
++/* The firmware boot (ROM patch, WM and WA download, firmware logging off,
++ * WTBL reset, MWDS, MU/RU platform type, rx airtime and RED), replayed:
++ * the device boots its firmware from the recording alone.
++ */
++static void mt7915_replay_test_init_firmware(struct kunit *test)
++{
++	struct mt76_test_fake *model_fake;
++	struct mt7915_dev *dev, *model;
++	struct mt76_record *rec;
++	struct mt76_replay *r;
++	void *data, *again;
++	size_t len, len2;
++
++	mt7915_replay_test_firmware(test);
++	model = mt7915_replay_test_model(test, false);
++	model_fake = mt76_test_fake;
++	rec = mt7915_replay_test_record(test);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_init_firmware(model), 0);
++	data = mt7915_replay_test_take(test, rec, &len);
++	KUNIT_ASSERT_TRUE(test, test_bit(MT76_STATE_MCU_RUNNING,
++					 &model->mphy.state));
++
++	dev = mt7915_replay_test_replayed(test, data, len, &r, false);
++	rec = mt7915_replay_test_record(test);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_init_firmware(dev), 0);
++	again = mt7915_replay_test_take(test, rec, &len2);
++
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_STATE_MCU_RUNNING,
++					 &dev->mphy.state));
++	KUNIT_EXPECT_STREQ(test, dev->mt76.hw->wiphy->fw_version,
++			   "rf-kunit-2-20261019000000r");
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(mt76_test_fake,
++						   MCU_CMD(FW_START_REQ)), 2);
++	mt7915_replay_test_expect_clean(test, r);
++	mt7915_replay_test_same_msgs(test, model_fake, mt76_test_fake);
++	mt7915_replay_test_same(test, data, again);
++}
++
++/* mt7915_init_hardware(): interrupts masked, DMA up, the firmware booted
++ * through the driver's own DMA path, the EEPROM read from efuse, wcid 0
++ * for the global wcid; then stopped again. Replayed, with the teardown.
++ */
++static void mt7915_replay_test_init_hardware(struct kunit *test)
++{
++	struct mt7915_phy *phy2, *phy2_model;
++	struct mt76_test_fake *model_fake;
++	struct mt7915_dev *dev, *model;
++	struct mt76_record *rec;
++	struct mt76_replay *r;
++	void *data, *again;
++	size_t len, len2;
++	u8 eeprom[16];
++
++	mt7915_replay_test_firmware(test);
++	rcu_expedite_gp();
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_init_test_unexpedite, NULL), 0);
++
++	model = mt7915_replay_test_model(test, true);
++	model_fake = mt76_test_fake;
++	memcpy(eeprom, model->mt76.eeprom.data, sizeof(eeprom));
++	rec = mt7915_replay_test_record(test);
++	model->dbdc_support = mt7915_band_config(model);
++	phy2_model = mt7915_alloc_ext_phy(model);
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(phy2_model));
++	KUNIT_ASSERT_EQ(test, mt7915_init_hardware(model, phy2_model), 0);
++	mt7915_stop_hardware(model);
++	data = mt7915_replay_test_take(test, rec, &len);
++	ieee80211_free_hw(phy2_model->mt76->hw);
++
++	dev = mt7915_replay_test_replayed(test, data, len, &r, true);
++	rec = mt7915_replay_test_record(test);
++	dev->dbdc_support = mt7915_band_config(dev);
++	KUNIT_EXPECT_TRUE(test, dev->dbdc_support);
++	phy2 = mt7915_alloc_ext_phy(dev);
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(phy2));
++	KUNIT_EXPECT_EQ(test, mt7915_init_hardware(dev, phy2), 0);
++
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_STATE_INITIALIZED,
++					 &dev->mphy.state));
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_STATE_MCU_RUNNING,
++					 &dev->mphy.state));
++	KUNIT_EXPECT_PTR_EQ(test, dev->mt76.queue_ops,
++			    &mt7915_replay_qops.ops);
++	/* the EEPROM came from "efuse": the model's image */
++	KUNIT_EXPECT_FALSE(test, dev->flash_mode);
++	KUNIT_EXPECT_MEMEQ(test, dev->mt76.eeprom.data, eeprom,
++			   sizeof(eeprom));
++	KUNIT_EXPECT_MEMEQ(test, dev->mphy.macaddr, mt7915_init_test_mac,
++			   ETH_ALEN);
++	KUNIT_EXPECT_EQ(test, dev->mphy.chainmask, 0xf);
++	KUNIT_EXPECT_TRUE(test, dev->mphy.cap.has_2ghz);
++	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(dev->mt76.wcid[0]),
++			    &dev->mt76.global_wcid);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(mt76_test_fake,
++				MCU_EXT_QUERY(EFUSE_ACCESS)),
++			MT7916_EEPROM_SIZE / MT7915_EEPROM_BLOCK_SIZE);
++
++	mt7915_stop_hardware(dev);
++	again = mt7915_replay_test_take(test, rec, &len2);
++	ieee80211_free_hw(phy2->mt76->hw);
++
++	mt7915_replay_test_expect_clean(test, r);
++	mt7915_replay_test_same_msgs(test, model_fake, mt76_test_fake);
++	mt7915_replay_test_same(test, data, again);
++}
++
++/* All of mt7915_register_device(), the init work it queues and
++ * mt7915_unregister_device(), replayed: both bands registered with
++ * mac80211, the init work's commands answered, the debugfs and coredump
++ * set up, then everything taken down again.
++ */
++static void mt7915_replay_test_register_device(struct kunit *test)
++{
++	struct mt76_test_fake *model_fake, *fake;
++	struct mt7915_dev *dev, *model;
++	struct mt76_record *rec;
++	struct mt76_replay *r;
++	void *data, *again;
++	size_t len, len2;
++	struct mt7915_phy *phy2;
++
++	mt7915_replay_test_firmware(test);
++	rcu_expedite_gp();
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_init_test_unexpedite, NULL), 0);
++
++	model = mt7915_replay_test_model(test, true);
++	model_fake = mt76_test_fake;
++	rec = mt7915_replay_test_record(test);
++	KUNIT_ASSERT_EQ(test, mt7915_register_device(model), 0);
++	flush_work(&model->init_work);
++	mt7915_replay_test_unregister(test, model, model_fake);
++	data = mt7915_replay_test_take(test, rec, &len);
++
++	dev = mt7915_replay_test_replayed(test, data, len, &r, true);
++	fake = mt76_test_fake;
++	rec = mt7915_replay_test_record(test);
++	KUNIT_ASSERT_EQ(test, mt7915_register_device(dev), 0);
++	flush_work(&dev->init_work);
++
++	phy2 = mt7915_ext_phy(dev);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_STATE_REGISTERED,
++					 &dev->mphy.state));
++	KUNIT_EXPECT_NOT_NULL(test, phy2);
++	if (phy2)
++		KUNIT_EXPECT_TRUE(test, test_bit(MT76_STATE_REGISTERED,
++						 &phy2->mt76->state));
++	KUNIT_EXPECT_TRUE(test, dev->recovery.hw_init_done);
++	KUNIT_EXPECT_TRUE(test, dev->dbdc_support);
++	KUNIT_EXPECT_STREQ(test, dev->mt76.hw->wiphy->fw_version,
++			   "rf-kunit-2-20261019000000r");
++	KUNIT_EXPECT_NOT_NULL(test, dev->debugfs_dir);
++	/* the init work's commands came last: the EEPROM mode first */
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++				MCU_EXT_CMD(EFUSE_BUFFER_MODE)), 1);
++
++	mt7915_replay_test_unregister(test, dev, fake);
++	again = mt7915_replay_test_take(test, rec, &len2);
++
++	mt7915_replay_test_expect_clean(test, r);
++	mt7915_replay_test_same_msgs(test, model_fake, fake);
++	mt7915_replay_test_same(test, data, again);
++}
++
++/* A capture from the router (wifi/capture.sh), if the VM has one, through
++ * mt7915_register_device(). The router reads its EEPROM from flash, which
++ * the VM hasn't got: the EEPROM recorded at registration stands in, as the
++ * default image the driver falls back to. What the capture doesn't cover
++ * (the VM's probe isn't the router's) is reported, not failed.
++ */
++static void mt7915_replay_test_capture(struct kunit *test)
++{
++	const struct mt76_rec_hdr *h;
++	struct mt7915_dev *dev;
++	struct mt76_replay *r;
++	const void *body;
++	size_t len, off = 0;
++	void *data;
++	u32 blen;
++	int ret;
++
++	dev = mt7915_init_test_chip(test, MT7976_ONE_ADIE_DBDC);
++	data = mt76_replay_request(test, dev->mt76.dev, MT7915_REPLAY_CAPTURE,
++				   &len);
++	if (!data)
++		kunit_skip(test, "no capture in /lib/firmware/%s",
++			   MT7915_REPLAY_CAPTURE);
++	KUNIT_ASSERT_NOT_NULL_MSG(test, mt76_replay_hdr(data, len),
++				  "%s isn't a recording",
++				  MT7915_REPLAY_CAPTURE);
++
++	mt7915_replay_test_firmware(test);
++	while ((h = mt76_replay_next(data, &off, &body, &blen)))
++		if (h->type == MT76_REC_BLOB && blen > 16 &&
++		    !strcmp(body, "eeprom"))
++			break;
++	if (h)
++		mt7915_replay_test_write(test,
++					 MT7986_EEPROM_MT7976_DEFAULT_DBDC,
++					 body + 16, blen - 16);
++
++	/* the first device was only for request_firmware() */
++	dev = mt7915_replay_test_replayed(test, data, len, &r, true);
++	r->strict = false;
++	rcu_expedite_gp();
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_init_test_unexpedite, NULL), 0);
++
++	ret = mt7915_register_device(dev);
++	mt76_replay_report(test, r);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	flush_work(&dev->init_work);
++	kunit_info(test, "capture: firmware %s, chainmask %#x, MAC %pM\n",
++		   dev->mt76.hw->wiphy->fw_version, dev->mt76.phy.chainmask,
++		   dev->mphy.macaddr);
++	mt7915_replay_test_unregister(test, dev, mt76_test_fake);
++}
++
++static struct kunit_case mt7915_replay_test_cases[] = {
++	KUNIT_CASE(mt7915_replay_test_init_firmware),
++	KUNIT_CASE(mt7915_replay_test_init_hardware),
++	KUNIT_CASE(mt7915_replay_test_register_device),
++	KUNIT_CASE(mt7915_replay_test_capture),
++	{}
++};
++
++static struct kunit_suite mt7915_replay_test_suite = {
++	.name = "mt7915-replay",
++	.test_cases = mt7915_replay_test_cases,
++};
++
++kunit_test_suites(&mt7915_replay_test_suite);
+diff --git a/record.c b/record.c
+index e733fcef..b14e48f0 100644
+--- a/record.c
++++ b/record.c
+@@ -711,4 +711,8 @@ static void __exit mt76_record_exit(void)
+ }
+ module_exit(mt76_record_exit);
+ 
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/record-test.c"
++#endif
++
+ #endif /* CONFIG_MT76_RECORD */
+diff --git a/tests/fake.h b/tests/fake.h
+index 149c1149..816bd9de 100644
+--- a/tests/fake.h
++++ b/tests/fake.h
+@@ -10,6 +10,8 @@
+  *   payload) and answered at once with a reply the driver's own parser
+  *   accepts: a zeroed header with the message's sequence number, plus the
+  *   payload the test's reply hook adds, if any.
++ * - Both go through the recorder (../record.h) like real MMIO does, so a
++ *   test can record what a fake said and replay it (replay.h).
+  * - A device to run them on: mt76_test_dev() allocates a real mt76_dev (and
+  *   its ieee80211_hw) on a KUnit device, wired to both fakes.
+  *
+@@ -38,6 +40,7 @@ struct mt76_test_fake {
+ 	unsigned int n_rr, n_wr;
+ 	u32 last_addr, last_val;	/* the last register written */
+ 	u32 (*rr_hook)(struct mt76_test_fake *fake, u32 addr, u32 val);
++	void (*wr_hook)(struct mt76_test_fake *fake, u32 addr, u32 val);
+ 
+ 	struct list_head msgs;		/* every message sent, oldest first */
+ 	unsigned int n_msgs;
+@@ -46,6 +49,11 @@ struct mt76_test_fake {
+ 	unsigned int reply_hdr;		/* reply header length */
+ 	unsigned int reply_seq_off;	/* where the sequence number goes */
+ 	u8 seq;
++	/* before answering @msg: <0 is what sending it returns, >0 means no
++	 * reply (the driver's wait times out), 0 answers it
++	 */
++	int (*mcu_hook)(struct mt76_test_fake *fake,
++			const struct mt76_test_msg *msg);
+ 	/* add a payload to @reply, the answer to @msg */
+ 	void (*reply)(struct mt76_test_fake *fake,
+ 		      const struct mt76_test_msg *msg, struct sk_buff *reply);
+@@ -70,31 +78,48 @@ static inline void mt76_test_set_reg(struct mt76_test_fake *fake, u32 addr,
+ 	xa_store(&fake->regs, addr, xa_mk_value(val), GFP_ATOMIC);
+ }
+ 
+-static inline u32 mt76_test_rr(struct mt76_dev *dev, u32 addr)
++static inline u32 __mt76_test_rr(struct mt76_test_fake *fake, u32 addr)
+ {
+-	struct mt76_test_fake *fake = mt76_test_fake;
+ 	u32 val = mt76_test_reg(fake, addr);
+ 
+ 	fake->n_rr++;
+ 	return fake->rr_hook ? fake->rr_hook(fake, addr, val) : val;
+ }
+ 
+-static inline void mt76_test_wr(struct mt76_dev *dev, u32 addr, u32 val)
++static inline void __mt76_test_wr(struct mt76_test_fake *fake, u32 addr,
++				  u32 val)
+ {
+-	struct mt76_test_fake *fake = mt76_test_fake;
+-
+ 	mt76_test_set_reg(fake, addr, val);
+ 	fake->n_wr++;
+ 	fake->last_addr = addr;
+ 	fake->last_val = val;
++	if (fake->wr_hook)
++		fake->wr_hook(fake, addr, val);
++}
++
++static inline u32 mt76_test_rr(struct mt76_dev *dev, u32 addr)
++{
++	u32 val = __mt76_test_rr(mt76_test_fake, addr);
++
++	mt76_record_rr(dev, addr, val);
++	return val;
++}
++
++static inline void mt76_test_wr(struct mt76_dev *dev, u32 addr, u32 val)
++{
++	__mt76_test_wr(mt76_test_fake, addr, val);
++	mt76_record_wr(dev, addr, val);
+ }
+ 
+ static inline u32 mt76_test_rmw(struct mt76_dev *dev, u32 addr, u32 mask,
+ 				u32 val)
+ {
+-	u32 cur = (mt76_test_rr(dev, addr) & ~mask) | val;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	u32 old = __mt76_test_rr(fake, addr);
++	u32 cur = (old & ~mask) | val;
+ 
+-	mt76_test_wr(dev, addr, cur);
++	__mt76_test_wr(fake, addr, cur);
++	mt76_record_rmw(dev, addr, mask, old, cur);
+ 	return cur;
+ }
+ 
+@@ -183,6 +208,12 @@ static inline int mt76_test_mcu_send(struct mt76_dev *dev, struct sk_buff *skb,
+ 		*seq = fake->seq;
+ 	if (fake->mcu_ret || fake->mcu_silent)
+ 		return fake->mcu_ret;
++	if (fake->mcu_hook) {
++		int ret = fake->mcu_hook(fake, msg);
++
++		if (ret)
++			return min(ret, 0);
++	}
+ 
+ 	reply = alloc_skb(fake->reply_hdr + 2048, GFP_KERNEL);
+ 	if (!reply)
+diff --git a/tests/record-test.c b/tests/record-test.c
+new file mode 100644
+index 00000000..719b6acc
+--- /dev/null
++++ b/tests/record-test.c
+@@ -0,0 +1,764 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for the recorder (record.c) and the replay fake built on its
++ * recordings (tests/replay.h): the format, the size bound and modes, and a
++ * recording of the fakes played back to the same driver code giving the
++ * same answers and the same recording. Included at the end of record.c
++ * when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test build only).
++ */
++#include <kunit/test.h>
++#include "replay.h"
++
++/* a "driver" and the "hardware" it talks to */
++#define REC_T_STATUS	0x100		/* bit 0 sets on the third read */
++#define REC_T_COUNTER	0x104		/* counts reads */
++#define REC_T_SEL	0x200		/* selects what the window shows */
++#define REC_T_WIN	0x1000		/* a window of 0x100 bytes */
++#define REC_T_CMD_A	0x5a11		/* answered with 4 bytes */
++#define REC_T_CMD_B	0x5a22		/* not waited for */
++
++struct mt76_record_test_hw {
++	u32 status_reads, counter;
++};
++
++struct mt76_record_test_out {
++	u32 polls, c1, c2, w1, w2, rmw, a;
++	int ret_a, ret_b;
++};
++
++static u32 mt76_record_test_rr(struct mt76_test_fake *fake, u32 addr,
++			       u32 val)
++{
++	struct mt76_record_test_hw *hw = fake->priv;
++
++	switch (addr) {
++	case REC_T_STATUS:
++		return ++hw->status_reads >= 3;
++	case REC_T_COUNTER:
++		return 0x1000 + hw->counter++;
++	case REC_T_WIN + 4:
++		return 0xa000 | mt76_test_reg(fake, REC_T_SEL);
++	}
++	return val;
++}
++
++static void mt76_record_test_reply(struct mt76_test_fake *fake,
++				   const struct mt76_test_msg *msg,
++				   struct sk_buff *reply)
++{
++	if (msg->cmd == REC_T_CMD_A)
++		put_unaligned_le32(0xc0de0000 | msg->data[0],
++				   skb_put(reply, 4));
++}
++
++static void mt76_record_test_driver(struct mt76_dev *dev,
++				    struct mt76_record_test_out *o,
++				    bool swap)
++{
++	u8 req[6] = { 0x42, 1, 2, 3, 4, 5 };
++	struct sk_buff *skb;
++
++	while (!(__mt76_rr(dev, REC_T_STATUS) & 1) && o->polls < 10)
++		o->polls++;
++	o->c1 = __mt76_rr(dev, REC_T_COUNTER);
++	o->c2 = __mt76_rr(dev, REC_T_COUNTER);
++	__mt76_wr(dev, REC_T_SEL, swap ? 2 : 1);
++	o->w1 = __mt76_rr(dev, REC_T_WIN + 4);
++	__mt76_wr(dev, REC_T_SEL, swap ? 1 : 2);
++	o->w2 = __mt76_rr(dev, REC_T_WIN + 4);
++	o->rmw = __mt76_rmw(dev, REC_T_COUNTER, 0xff, 0x5);
++
++	o->ret_a = mt76_mcu_send_and_get_msg(dev, REC_T_CMD_A, req,
++					     sizeof(req), true, &skb);
++	if (!o->ret_a) {
++		o->a = skb->len >= 4 ? get_unaligned_le32(skb->data) : 0;
++		dev_kfree_skb(skb);
++	}
++	o->ret_b = mt76_mcu_send_msg(dev, REC_T_CMD_B, req, 2, false);
++}
++
++static void mt76_record_test_free(void *rec)
++{
++	mt76_record_free(rec);
++}
++
++static struct mt76_record *mt76_record_test_start(struct kunit *test,
++						  size_t size, int mode)
++{
++	struct mt76_record *rec = mt76_record_alloc(size, mode);
++
++	KUNIT_ASSERT_NOT_NULL(test, rec);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_record_test_free, rec), 0);
++	mt76_record_attach(rec);
++	return rec;
++}
++
++static void mt76_record_test_kvfree(void *p)
++{
++	kvfree(p);
++}
++
++/* stop recording, and the recording so far */
++static void *mt76_record_test_take(struct kunit *test,
++				   struct mt76_record *rec, size_t *len)
++{
++	void *data;
++
++	mt76_record_detach(rec);
++	data = mt76_record_copy(rec, len);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_record_test_kvfree, data), 0);
++	KUNIT_ASSERT_NOT_NULL(test, mt76_replay_hdr(data, *len));
++	return data;
++}
++
++/* the @n-th record of @type (0: the first), its body and length */
++static const struct mt76_rec_hdr *
++mt76_record_test_find(const void *data, u8 type, int n, const void **body,
++		      u32 *blen)
++{
++	const struct mt76_rec_hdr *h;
++	size_t off = 0;
++
++	while ((h = mt76_replay_next(data, &off, body, blen)))
++		if (h->type == type && !n--)
++			return h;
++	return NULL;
++}
++
++static int mt76_record_test_count(const void *data, u8 type)
++{
++	const struct mt76_rec_hdr *h;
++	const void *body;
++	size_t off = 0;
++	u32 blen;
++	int n = 0;
++
++	while ((h = mt76_replay_next(data, &off, &body, &blen)))
++		n += h->type == type;
++	return n;
++}
++
++static struct mt76_dev *mt76_record_test_dev(struct kunit *test,
++					     struct mt76_record_test_hw *hw)
++{
++	struct mt76_dev *dev = mt76_test_dev(test, sizeof(*dev), NULL, NULL);
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	fake->priv = hw;
++	fake->rr_hook = mt76_record_test_rr;
++	fake->reply = mt76_record_test_reply;
++	return dev;
++}
++
++/* forget the run: registers, messages and replies, sequence numbers */
++static void mt76_record_test_reset(struct mt76_test_fake *fake)
++{
++	skb_queue_purge(&fake->dev->mcu.res_q);
++	xa_destroy(&fake->regs);
++	xa_init(&fake->regs);
++	INIT_LIST_HEAD(&fake->msgs);
++	fake->n_msgs = 0;
++	fake->seq = 0;
++	fake->rr_hook = NULL;
++	fake->reply = NULL;
++	fake->priv = NULL;
++}
++
++static struct mt76_replay *mt76_record_test_play(struct kunit *test,
++						 const void *data, size_t len)
++{
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt76_replay *r;
++
++	mt76_record_test_reset(fake);
++	r = mt76_replay_new(test, fake, data, len);
++	mt76_replay_window(r, REC_T_SEL, REC_T_WIN, 0x100);
++	r->strict = true;
++	mt76_replay_start(r, 0);
++	return r;
++}
++
++/* --- the recorder ------------------------------------------------------------- */
++
++/* Each kind of record, in order, with what it says: the device's name
++ * first, register accesses with address and value(s), a firmware command
++ * with its payload, its raw reply (header included) and the parser's
++ * result, rx events, notes and blobs.
++ */
++static void mt76_record_test_format(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	const struct mt76_rec_file_hdr *fh;
++	struct mt76_record_test_out o = {};
++	const struct mt76_rec_mcu *m;
++	const struct mt76_rec_hdr *h;
++	const struct mt76_rec_rx *rx;
++	static const u8 ev[] = { 1, 2, 3, 4, 5 };
++	struct mt76_record *rec;
++	struct mt76_dev *dev;
++	const __le32 *w;
++	const void *body;
++	void *data;
++	size_t len;
++	u32 blen;
++
++	dev = mt76_record_test_dev(test, &hw);
++	rec = mt76_record_test_start(test, SZ_64K, 0);
++	mt76_record_test_driver(dev, &o, false);
++	mt76_record_rx(dev, 3, ev, sizeof(ev));
++	__mt76_record_mark(dev, "hello %d", 7);
++	__mt76_record_blob(dev, "eeprom", ev, 3);
++	data = mt76_record_test_take(test, rec, &len);
++
++	fh = data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->hdr_len), sizeof(*fh));
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->data_len), len - sizeof(*fh));
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->flags), 0);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->dropped), 0);
++
++	/* the device first */
++	h = mt76_record_test_find(data, MT76_REC_DEV, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	KUNIT_EXPECT_PTR_EQ(test, (void *)h, data + sizeof(*fh));
++	KUNIT_EXPECT_EQ(test, h->dev, 0);
++	/* a KUnit device is called <test>.<name> */
++	KUNIT_ASSERT_EQ(test, blen, strlen(test->name) + strlen(".mt76-test"));
++	KUNIT_EXPECT_MEMEQ(test, body + blen - 10, ".mt76-test", 10);
++
++	/* the status was read three times: 0, 0, 1 */
++	KUNIT_EXPECT_EQ(test, o.polls, 2);
++	h = mt76_record_test_find(data, MT76_REC_RR, 2, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	w = body;
++	KUNIT_EXPECT_EQ(test, blen, 8);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[0]), REC_T_STATUS);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[1]), 1);
++
++	h = mt76_record_test_find(data, MT76_REC_WR, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	w = body;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[0]), REC_T_SEL);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[1]), 1);
++
++	/* read-modify-write: mask, the value read, the value written */
++	h = mt76_record_test_find(data, MT76_REC_RMW, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	w = body;
++	KUNIT_EXPECT_EQ(test, blen, 16);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[0]), REC_T_COUNTER);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[1]), 0xff);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[2]), 0x1002);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(w[3]), 0x1005);
++	KUNIT_EXPECT_EQ(test, o.rmw, 0x1005);
++
++	/* the command, waited for, with its payload */
++	h = mt76_record_test_find(data, MT76_REC_MCU_CMD, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	m = body;
++	KUNIT_EXPECT_EQ(test, blen, sizeof(*m) + 6);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(m->cmd), REC_T_CMD_A);
++	KUNIT_EXPECT_EQ(test, m->flags, MT76_REC_MCU_WAIT);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(m->len), 6);
++	KUNIT_EXPECT_EQ(test, ((u8 *)(m + 1))[0], 0x42);
++
++	/* its reply, raw: the fake's 4-byte header (seq first), then data */
++	h = mt76_record_test_find(data, MT76_REC_MCU_RESP, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	m = body;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(m->cmd), REC_T_CMD_A);
++	KUNIT_EXPECT_EQ(test, m->seq, 1);
++	KUNIT_EXPECT_EQ(test, m->flags, 0);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(m->len), 8);
++	KUNIT_EXPECT_EQ(test, ((u8 *)(m + 1))[0], 1);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)(m + 1) + 4),
++			0xc0de0042);
++	KUNIT_EXPECT_EQ(test, o.a, 0xc0de0042);
++
++	h = mt76_record_test_find(data, MT76_REC_MCU_RET, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	m = body;
++	KUNIT_EXPECT_EQ(test, m->seq, 1);
++	KUNIT_EXPECT_EQ(test, (int)le32_to_cpu(m->len), 0);
++
++	/* the second command isn't waited for: no reply, no result */
++	h = mt76_record_test_find(data, MT76_REC_MCU_CMD, 1, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	m = body;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(m->cmd), REC_T_CMD_B);
++	KUNIT_EXPECT_EQ(test, m->flags, 0);
++	KUNIT_EXPECT_EQ(test, mt76_record_test_count(data, MT76_REC_MCU_RESP),
++			1);
++
++	h = mt76_record_test_find(data, MT76_REC_RX, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	rx = body;
++	KUNIT_EXPECT_EQ(test, rx->q, 3);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(rx->len), sizeof(ev));
++	KUNIT_EXPECT_MEMEQ(test, rx + 1, ev, sizeof(ev));
++
++	h = mt76_record_test_find(data, MT76_REC_MARK, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	KUNIT_EXPECT_EQ(test, blen, 7);
++	KUNIT_EXPECT_MEMEQ(test, body, "hello 7", 7);
++
++	h = mt76_record_test_find(data, MT76_REC_BLOB, 0, &body, &blen);
++	KUNIT_ASSERT_NOT_NULL(test, h);
++	KUNIT_EXPECT_EQ(test, blen, 16 + 3);
++	KUNIT_EXPECT_STREQ(test, (char *)body, "eeprom");
++	KUNIT_EXPECT_MEMEQ(test, body + 16, ev, 3);
++
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->records),
++			mt76_record_test_count(data, MT76_REC_DEV) +
++			mt76_record_test_count(data, MT76_REC_RR) +
++			mt76_record_test_count(data, MT76_REC_WR) +
++			mt76_record_test_count(data, MT76_REC_RMW) +
++			mt76_record_test_count(data, MT76_REC_MCU_CMD) +
++			mt76_record_test_count(data, MT76_REC_MCU_RESP) +
++			mt76_record_test_count(data, MT76_REC_MCU_RET) +
++			mt76_record_test_count(data, MT76_REC_RX) +
++			mt76_record_test_count(data, MT76_REC_MARK) +
++			mt76_record_test_count(data, MT76_REC_BLOB));
++}
++
++/* Nothing is recorded with no recorder attached, or after detaching */
++static void mt76_record_test_detached(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	struct mt76_record_test_out o = {};
++	const struct mt76_rec_file_hdr *fh;
++	struct mt76_record *rec;
++	struct mt76_dev *dev;
++	void *data;
++	size_t len;
++
++	dev = mt76_record_test_dev(test, &hw);
++	rec = mt76_record_test_start(test, SZ_4K, 0);
++	mt76_record_detach(rec);
++	KUNIT_EXPECT_NULL(test, mt76_rec);
++	mt76_record_test_driver(dev, &o, false);
++	data = mt76_record_test_take(test, rec, &len);
++	fh = data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->data_len), 0);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->records), 0);
++}
++
++/* A full buffer stops the recording, with room kept to say so: the
++ * records that didn't fit are counted, nothing more is added.
++ */
++static void mt76_record_test_full(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	const struct mt76_rec_file_hdr *fh;
++	const struct mt76_rec_hdr *h, *last = NULL;
++	struct mt76_record *rec;
++	struct mt76_dev *dev;
++	const void *body;
++	u32 blen, records;
++	size_t off = 0, len;
++	void *data;
++	int i;
++
++	dev = mt76_record_test_dev(test, &hw);
++	rec = mt76_record_test_start(test, 512, 0);
++	for (i = 0; i < 100; i++)
++		__mt76_wr(dev, 0x10, i);
++	records = rec->records;
++	KUNIT_EXPECT_EQ(test, rec->state, MT76_REC_STOPPED);
++	KUNIT_EXPECT_LE(test, rec->len, 512);
++	__mt76_wr(dev, 0x10, 1000);
++	KUNIT_EXPECT_EQ(test, rec->records, records);
++
++	data = mt76_record_test_take(test, rec, &len);
++	fh = data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->flags),
++			MT76_REC_F_FULL | MT76_REC_F_STOPPED);
++	/* the device record, then 100 writes of 16 bytes didn't all fit */
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(fh->dropped),
++			101 - mt76_record_test_count(data, MT76_REC_WR));
++	KUNIT_EXPECT_GT(test, mt76_record_test_count(data, MT76_REC_WR), 20);
++
++	while ((h = mt76_replay_next(data, &off, &body, &blen)))
++		last = h;
++	KUNIT_ASSERT_NOT_NULL(test, last);
++	KUNIT_EXPECT_EQ(test, last->type, MT76_REC_MARK);
++	KUNIT_EXPECT_EQ(test, last->dev, MT76_REC_MAX_DEVS - 1);
++	body = last + 1;
++	KUNIT_EXPECT_MEMEQ(test, body, "stopped: buffer full",
++			   le16_to_cpu(last->len));
++}
++
++static const char *mt76_record_test_last_mark(struct kunit *test,
++					      const void *data, int back)
++{
++	int n = mt76_record_test_count(data, MT76_REC_MARK) - 1 - back;
++	const void *body;
++	u32 blen;
++	char *s;
++
++	KUNIT_ASSERT_GE(test, n, 0);
++	KUNIT_ASSERT_NOT_NULL(test, mt76_record_test_find(data, MT76_REC_MARK,
++							  n, &body, &blen));
++	s = kunit_kzalloc(test, blen + 1, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	memcpy(s, body, blen);
++	return s;
++}
++
++/* Mode 1 stops when bring-up is over, mode 2 records record_secs more;
++ * bring-up ends when user space says so or once the channels have settled
++ * (the settle work, after at least one channel change).
++ */
++static void mt76_record_test_modes(struct kunit *test)
++{
++	static struct ieee80211_channel chan = { .center_freq = 5180 };
++	struct mt76_record_test_hw hw = {};
++	struct mt76_record *rec;
++	struct mt76_dev *dev;
++	void *data;
++	size_t len;
++
++	dev = mt76_record_test_dev(test, &hw);
++
++	/* mode 1, user space: stops at once */
++	rec = mt76_record_test_start(test, SZ_4K, 1);
++	__mt76_wr(dev, 0x10, 1);
++	mt76_record_bringup_done(rec, false);
++	KUNIT_EXPECT_EQ(test, rec->state, MT76_REC_STOPPED);
++	KUNIT_EXPECT_EQ(test, rec->flags, MT76_REC_F_UP | MT76_REC_F_STOPPED);
++	__mt76_wr(dev, 0x10, 2);
++	data = mt76_record_test_take(test, rec, &len);
++	KUNIT_EXPECT_EQ(test, mt76_record_test_count(data, MT76_REC_WR), 1);
++	KUNIT_EXPECT_STREQ(test, mt76_record_test_last_mark(test, data, 1),
++			   "bring-up over: user space said so");
++	KUNIT_EXPECT_STREQ(test, mt76_record_test_last_mark(test, data, 0),
++			   "stopped: probe and bring-up only");
++
++	/* mode 2: the settle work ends bring-up after a channel change */
++	rec = mt76_record_test_start(test, SZ_4K, 2);
++	mt76_record_work(&rec->work.work);
++	KUNIT_EXPECT_EQ(test, rec->state, MT76_REC_RECORDING);
++	dev->phy.chandef.chan = &chan;
++	dev->phy.chandef.width = NL80211_CHAN_WIDTH_80;
++	mt76_record_channel(&dev->phy);
++	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&rec->work));
++	cancel_delayed_work_sync(&rec->work);
++	mt76_record_work(&rec->work.work);
++	KUNIT_EXPECT_EQ(test, rec->state, MT76_REC_TRAFFIC);
++	KUNIT_EXPECT_EQ(test, rec->flags, MT76_REC_F_UP | MT76_REC_F_UP_AUTO);
++	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&rec->work));
++	/* traffic is still recorded, until the time is up */
++	__mt76_wr(dev, 0x10, 3);
++	cancel_delayed_work_sync(&rec->work);
++	mt76_record_work(&rec->work.work);
++	KUNIT_EXPECT_EQ(test, rec->state, MT76_REC_STOPPED);
++	__mt76_wr(dev, 0x10, 4);
++	data = mt76_record_test_take(test, rec, &len);
++	KUNIT_EXPECT_EQ(test, mt76_record_test_count(data, MT76_REC_WR), 1);
++	KUNIT_EXPECT_STREQ(test, mt76_record_test_last_mark(test, data, 2),
++			   "channel: band 0, 5180 MHz, width 3");
++	KUNIT_EXPECT_STREQ(test, mt76_record_test_last_mark(test, data, 1),
++			   "bring-up over: channels settled");
++	KUNIT_EXPECT_STREQ(test, mt76_record_test_last_mark(test, data, 0),
++			   "stopped: traffic time is up");
++}
++
++static const struct mt76_queue_ops mt76_record_test_queue_ops = {};
++
++/* Firmware download chunks are recorded by their length only */
++static void mt76_record_test_fw_download(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	const struct mt76_rec_mcu *m;
++	struct mt76_record *rec;
++	struct mt76_dev *dev;
++	const void *body;
++	void *data, *fw;
++	size_t len;
++	u32 blen;
++
++	dev = mt76_record_test_dev(test, &hw);
++	dev->queue_ops = &mt76_record_test_queue_ops;
++	fw = kunit_kzalloc(test, 10000, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, fw);
++	rec = mt76_record_test_start(test, SZ_64K, 0);
++	KUNIT_EXPECT_EQ(test, __mt76_mcu_send_firmware(dev, 0x33, fw, 10000,
++						       4096), 0);
++	KUNIT_EXPECT_EQ(test, mt76_mcu_send_msg(dev, 0x34, fw, 100, false), 0);
++	data = mt76_record_test_take(test, rec, &len);
++
++	KUNIT_EXPECT_STREQ(test, mt76_record_test_last_mark(test, data, 0),
++			   "firmware download: 10000 bytes, cmd 00000033");
++	KUNIT_EXPECT_EQ(test, mt76_record_test_count(data, MT76_REC_MCU_CMD),
++			4);
++	KUNIT_ASSERT_NOT_NULL(test, mt76_record_test_find(data,
++				MT76_REC_MCU_CMD, 2, &body, &blen));
++	m = body;
++	KUNIT_EXPECT_EQ(test, blen, sizeof(*m));
++	KUNIT_EXPECT_EQ(test, m->flags, MT76_REC_MCU_CUT);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(m->len), 10000 - 2 * 4096);
++	/* and what comes after in full again */
++	KUNIT_ASSERT_NOT_NULL(test, mt76_record_test_find(data,
++				MT76_REC_MCU_CMD, 3, &body, &blen));
++	KUNIT_EXPECT_EQ(test, blen, sizeof(*m) + 100);
++}
++
++/* A reply that never came is recorded as a timeout */
++static void mt76_record_test_timeout(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	const struct mt76_rec_mcu *m;
++	struct mt76_record *rec;
++	struct mt76_dev *dev;
++	const void *body;
++	void *data;
++	size_t len;
++	u32 blen;
++
++	dev = mt76_record_test_dev(test, &hw);
++	mt76_test_fake->mcu_silent = true;
++	rec = mt76_record_test_start(test, SZ_4K, 0);
++	KUNIT_EXPECT_EQ(test, mt76_mcu_send_msg(dev, REC_T_CMD_A, NULL, 0,
++						true), -ETIMEDOUT);
++	data = mt76_record_test_take(test, rec, &len);
++
++	KUNIT_ASSERT_NOT_NULL(test, mt76_record_test_find(data,
++				MT76_REC_MCU_RESP, 0, &body, &blen));
++	m = body;
++	KUNIT_EXPECT_EQ(test, m->flags, MT76_REC_MCU_TIMEOUT);
++	KUNIT_EXPECT_EQ(test, blen, sizeof(*m));
++	KUNIT_ASSERT_NOT_NULL(test, mt76_record_test_find(data,
++				MT76_REC_MCU_RET, 0, &body, &blen));
++	m = body;
++	KUNIT_EXPECT_EQ(test, (int)le32_to_cpu(m->len), -ETIMEDOUT);
++}
++
++/* --- the replay ----------------------------------------------------------------- */
++
++/* every record but the timestamps */
++static void mt76_record_test_same(struct kunit *test, const void *a,
++				  const void *b)
++{
++	const struct mt76_rec_hdr *x, *y;
++	const void *bx, *by;
++	size_t ox = 0, oy = 0;
++	u32 lx, ly;
++	int i = 0;
++
++	for (;;) {
++		x = mt76_replay_next(a, &ox, &bx, &lx);
++		y = mt76_replay_next(b, &oy, &by, &ly);
++		if (!x || !y)
++			break;
++		KUNIT_EXPECT_EQ_MSG(test, x->type, y->type, "record %d", i);
++		KUNIT_EXPECT_EQ_MSG(test, x->dev, y->dev, "record %d", i);
++		KUNIT_ASSERT_EQ_MSG(test, lx, ly, "record %d", i);
++		KUNIT_EXPECT_MEMEQ_MSG(test, bx, by, lx, "record %d", i);
++		i++;
++	}
++	KUNIT_EXPECT_NULL(test, x);
++	KUNIT_EXPECT_NULL(test, y);
++}
++
++/* The recording of a run on the fakes, played back to the same code:
++ * the same values read and replies received, everything covered, in the
++ * same order, and recording the replay gives the same recording.
++ */
++static void mt76_record_test_replay(struct kunit *test)
++{
++	struct mt76_record_test_out o1 = {}, o2 = {};
++	struct mt76_record_test_hw hw = {};
++	struct mt76_record *rec;
++	struct mt76_replay *r;
++	struct mt76_dev *dev;
++	void *data, *again;
++	size_t len, len2;
++
++	dev = mt76_record_test_dev(test, &hw);
++	rec = mt76_record_test_start(test, SZ_64K, 0);
++	mt76_record_test_driver(dev, &o1, false);
++	data = mt76_record_test_take(test, rec, &len);
++
++	r = mt76_record_test_play(test, data, len);
++	rec = mt76_record_test_start(test, SZ_64K, 0);
++	mt76_record_test_driver(dev, &o2, false);
++	again = mt76_record_test_take(test, rec, &len2);
++
++	KUNIT_EXPECT_EQ(test, o2.polls, 2);
++	KUNIT_EXPECT_EQ(test, o2.c1, 0x1000);
++	KUNIT_EXPECT_EQ(test, o2.w1, 0xa001);
++	KUNIT_EXPECT_EQ(test, o2.w2, 0xa002);
++	KUNIT_EXPECT_EQ(test, o2.a, 0xc0de0042);
++	KUNIT_EXPECT_MEMEQ(test, &o2, &o1, sizeof(o1));
++	KUNIT_EXPECT_TRUE(test, mt76_replay_covered(r));
++	KUNIT_EXPECT_FALSE(test, r->diverged);
++	KUNIT_EXPECT_EQ(test, r->pos, r->n_evs);
++	KUNIT_EXPECT_EQ(test, r->beyond_rd, 0);
++	KUNIT_EXPECT_EQ(test, r->beyond_mcu, 0);
++	KUNIT_EXPECT_EQ(test, r->mcu, 2);
++	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, 2);
++	mt76_replay_report(test, r);
++	mt76_record_test_same(test, data, again);
++}
++
++/* A window is keyed by its selector: read the other way round, each read
++ * still gets what the selector picked, and strict order notices.
++ */
++static void mt76_record_test_replay_window(struct kunit *test)
++{
++	struct mt76_record_test_out o1 = {}, o2 = {};
++	struct mt76_record_test_hw hw = {};
++	struct mt76_record *rec;
++	struct mt76_replay *r;
++	struct mt76_dev *dev;
++	void *data;
++	size_t len;
++
++	dev = mt76_record_test_dev(test, &hw);
++	rec = mt76_record_test_start(test, SZ_64K, 0);
++	mt76_record_test_driver(dev, &o1, false);
++	data = mt76_record_test_take(test, rec, &len);
++
++	r = mt76_record_test_play(test, data, len);
++	mt76_record_test_driver(dev, &o2, true);
++	KUNIT_EXPECT_EQ(test, o2.w1, 0xa002);
++	KUNIT_EXPECT_EQ(test, o2.w2, 0xa001);
++	KUNIT_EXPECT_TRUE(test, mt76_replay_covered(r));
++	/* the first write to the selector is where they part */
++	KUNIT_EXPECT_TRUE(test, r->diverged);
++	KUNIT_EXPECT_EQ(test, r->div_got.type, MT76_REPLAY_EV_WR);
++	KUNIT_EXPECT_EQ(test, r->div_got.addr, REC_T_SEL);
++	KUNIT_EXPECT_EQ(test, r->div_got.val, 2);
++	KUNIT_EXPECT_EQ(test, r->div_want.val, 1);
++	KUNIT_EXPECT_EQ(test, r->div_pos, 5);
++}
++
++/* What the recording doesn't have is counted and listed: reads get the
++ * register file's value, commands the fake's empty reply; reads past the
++ * recorded ones get the last value again.
++ */
++static void mt76_record_test_replay_uncovered(struct kunit *test)
++{
++	struct mt76_record_test_out o = {};
++	struct mt76_record_test_hw hw = {};
++	struct mt76_record *rec;
++	struct mt76_replay *r;
++	struct mt76_dev *dev;
++	struct sk_buff *skb;
++	void *data;
++	size_t len;
++
++	dev = mt76_record_test_dev(test, &hw);
++	rec = mt76_record_test_start(test, SZ_64K, 0);
++	mt76_record_test_driver(dev, &o, false);
++	data = mt76_record_test_take(test, rec, &len);
++
++	r = mt76_record_test_play(test, data, len);
++	mt76_record_test_driver(dev, &o, false);
++	KUNIT_EXPECT_TRUE(test, mt76_replay_covered(r));
++
++	__mt76_wr(dev, 0x999, 7);
++	KUNIT_EXPECT_EQ(test, __mt76_rr(dev, 0x999), 7);
++	KUNIT_EXPECT_EQ(test, __mt76_rr(dev, 0x998), 0);
++	KUNIT_EXPECT_EQ(test, __mt76_rr(dev, 0x999), 7);
++	KUNIT_EXPECT_EQ(test, r->uncovered_rd, 3);
++	KUNIT_EXPECT_EQ(test, r->n_list_rd, 2);
++	KUNIT_EXPECT_EQ(test, r->list_rd[0], 0x999);
++	KUNIT_EXPECT_EQ(test, r->list_rd[1], 0x998);
++
++	/* the counter was read three times: its last value repeats */
++	KUNIT_EXPECT_EQ(test, __mt76_rr(dev, REC_T_COUNTER), 0x1002);
++	KUNIT_EXPECT_EQ(test, r->beyond_rd, 1);
++
++	KUNIT_EXPECT_EQ(test, mt76_mcu_send_and_get_msg(dev, 0x77, NULL, 0,
++							true, &skb), 0);
++	KUNIT_EXPECT_EQ(test, skb->len, 0);
++	dev_kfree_skb(skb);
++	KUNIT_EXPECT_EQ(test, r->uncovered_mcu, 1);
++	KUNIT_EXPECT_EQ(test, r->list_mcu[0], 0x77);
++	KUNIT_EXPECT_FALSE(test, mt76_replay_covered(r));
++	mt76_replay_report(test, r);
++}
++
++/* A command whose reply never came gets none in the replay either */
++static void mt76_record_test_replay_timeout(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	struct mt76_record *rec;
++	struct mt76_replay *r;
++	struct mt76_dev *dev;
++	void *data;
++	size_t len;
++
++	dev = mt76_record_test_dev(test, &hw);
++	mt76_test_fake->mcu_silent = true;
++	rec = mt76_record_test_start(test, SZ_4K, 0);
++	KUNIT_EXPECT_EQ(test, mt76_mcu_send_msg(dev, REC_T_CMD_A, NULL, 0,
++						true), -ETIMEDOUT);
++	data = mt76_record_test_take(test, rec, &len);
++
++	mt76_test_fake->mcu_silent = false;
++	r = mt76_record_test_play(test, data, len);
++	KUNIT_EXPECT_EQ(test, mt76_mcu_send_msg(dev, REC_T_CMD_A, NULL, 0,
++						true), -ETIMEDOUT);
++	KUNIT_EXPECT_TRUE(test, mt76_replay_covered(r));
++	KUNIT_EXPECT_FALSE(test, r->diverged);
++}
++
++/* Not a recording, or a cut one: refused, or read up to where it's whole */
++static void mt76_record_test_replay_bad(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	struct mt76_rec_file_hdr *fh;
++	const struct mt76_rec_hdr *h;
++	struct mt76_record *rec;
++	const void *body;
++	size_t len, off = 0;
++	void *data;
++	u32 blen;
++	int n = 0;
++
++	mt76_record_test_dev(test, &hw);
++	rec = mt76_record_test_start(test, SZ_4K, 0);
++	__mt76_wr(mt76_test_fake->dev, 1, 2);
++	__mt76_wr(mt76_test_fake->dev, 3, 4);
++	data = mt76_record_test_take(test, rec, &len);
++
++	KUNIT_EXPECT_NULL(test, mt76_replay_hdr(data, sizeof(*fh) - 1));
++	KUNIT_EXPECT_NULL(test, mt76_replay_hdr(data, len - 1));
++	fh = data;
++	fh->magic[0] = 'X';
++	KUNIT_EXPECT_NULL(test, mt76_replay_hdr(data, len));
++	fh->magic[0] = 'M';
++	KUNIT_EXPECT_NOT_NULL(test, mt76_replay_hdr(data, len));
++
++	/* the last write's record cut short */
++	fh->data_len = cpu_to_le32(le32_to_cpu(fh->data_len) - 4);
++	while ((h = mt76_replay_next(data, &off, &body, &blen)))
++		n++;
++	KUNIT_EXPECT_EQ(test, n, 2);
++}
++
++static struct kunit_case mt76_record_test_cases[] = {
++	KUNIT_CASE(mt76_record_test_format),
++	KUNIT_CASE(mt76_record_test_detached),
++	KUNIT_CASE(mt76_record_test_full),
++	KUNIT_CASE(mt76_record_test_modes),
++	KUNIT_CASE(mt76_record_test_fw_download),
++	KUNIT_CASE(mt76_record_test_timeout),
++	KUNIT_CASE(mt76_record_test_replay),
++	KUNIT_CASE(mt76_record_test_replay_window),
++	KUNIT_CASE(mt76_record_test_replay_uncovered),
++	KUNIT_CASE(mt76_record_test_replay_timeout),
++	KUNIT_CASE(mt76_record_test_replay_bad),
++	{}
++};
++
++static struct kunit_suite mt76_record_test_suite = {
++	.name = "mt76-record",
++	.test_cases = mt76_record_test_cases,
++};
++
++kunit_test_suites(&mt76_record_test_suite);
+diff --git a/tests/replay.h b/tests/replay.h
+new file mode 100644
+index 00000000..765dcfd8
+--- /dev/null
++++ b/tests/replay.h
+@@ -0,0 +1,618 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * A recording (../record.h) played back as the hardware, for mt76's KUnit
++ * tests (milkflint's QEMU test build only), on top of fake.h:
++ * - Register reads are answered from the recording, keyed by address: the
++ *   n-th read of an address gets the n-th value the recording read there
++ *   (a status polled until it changes replays the same way), and once those
++ *   run out, the last one again. Reads inside a window declared with
++ *   mt76_replay_window() are keyed by the value last written to the
++ *   window's selector register too, as remapped register windows and an
++ *   address/data register pair (the A-die's SPI) need. Writes go to
++ *   fake.h's register file, and reads the recording doesn't cover are
++ *   answered from there.
++ * - Firmware commands are answered with the raw reply the recording has
++ *   for the same command (the n-th time for the n-th), header included,
++ *   with the sequence number of the command now; with none where none
++ *   came. Commands it doesn't cover get fake.h's empty reply.
++ * - With strict order, every access is also checked against the order of
++ *   the recording, and the first place they part is kept. Recorded writes
++ *   may be missed out: some never reach the fake (mt76_set_irq_mask()
++ *   writes the interrupt mask straight to MMIO, which is recorded too).
++ * - What the recording didn't cover is counted and listed
++ *   (mt76_replay_report()).
++ *
++ * The recording is the test's: one made by running the fakes with the
++ * recorder attached, or a capture from the router (wifi/capture.sh) the
++ * test loads with mt76_replay_request().
++ */
++#ifndef __MT76_TEST_REPLAY_H
++#define __MT76_TEST_REPLAY_H
++
++#include <linux/bsearch.h>
++#include <linux/firmware.h>
++#include <linux/sort.h>
++#include "fake.h"
++
++#define MT76_REPLAY_MAX_WIN	8
++#define MT76_REPLAY_LIST	8	/* uncovered accesses listed */
++/* command id, extended id and the connac flags (query, uni, CE, WA) */
++#define MT76_REPLAY_CMD(cmd)	((u32)(cmd) & GENMASK(19, 0))
++
++enum {
++	MT76_REPLAY_EV_RD,
++	MT76_REPLAY_EV_WR,
++	MT76_REPLAY_EV_MCU,
++};
++
++struct mt76_replay_val {
++	u64 key;
++	u32 idx;		/* where in the recording */
++	u32 val;
++};
++
++/* the values (or replies) for one key: [first, first + n), next at pos */
++struct mt76_replay_key {
++	u64 key;
++	u32 first, n, pos;
++};
++
++struct mt76_replay_reply {
++	u32 cmd;
++	u32 idx;
++	const u8 *data;		/* the raw reply; NULL: none came */
++	u32 len;
++	bool wait;
++};
++
++struct mt76_replay_ev {
++	u8 type;		/* MT76_REPLAY_EV_* */
++	u32 addr;		/* or the command */
++	u32 val;
++};
++
++struct mt76_replay_win {
++	u32 sel, start, end;
++	u32 cur;		/* the selector's value, while parsing */
++};
++
++struct mt76_replay {
++	struct kunit *test;
++	struct mt76_test_fake *fake;
++	const u8 *rec;
++	size_t len;
++	int slot;		/* the recorded device replayed */
++
++	struct mt76_replay_win win[MT76_REPLAY_MAX_WIN];
++	int n_win;
++
++	struct mt76_replay_val *vals;	/* register reads, by key */
++	struct mt76_replay_key *keys;
++	u32 n_vals, n_keys;
++	struct mt76_replay_reply *replies;	/* commands, in order */
++	struct mt76_replay_val *by_cmd;	/* their indices, by command */
++	struct mt76_replay_key *cmds;
++	u32 n_replies, n_cmds;
++	struct mt76_replay_ev *evs;	/* every access, in order */
++	u32 n_evs, pos;
++
++	bool strict;
++	bool diverged;
++	u32 div_pos;
++	struct mt76_replay_ev div_want, div_got;
++
++	/* what the recording didn't cover */
++	u32 uncovered_rd, beyond_rd, uncovered_mcu, beyond_mcu;
++	u32 list_rd[MT76_REPLAY_LIST], list_mcu[MT76_REPLAY_LIST];
++	int n_list_rd, n_list_mcu;
++	u32 rd, mcu;			/* reads and commands answered */
++
++	const struct mt76_replay_reply *cur;	/* the reply being sent */
++	void *priv;			/* for the test's own hooks */
++};
++
++static inline void mt76_replay_kvfree(void *p)
++{
++	kvfree(p);
++}
++
++/* zeroed, freed when the test ends; captures can be tens of MiB */
++static inline void *mt76_replay_alloc(struct kunit *test, size_t n,
++				      size_t size)
++{
++	void *p = kvcalloc(n, size, GFP_KERNEL);
++
++	if (p && kunit_add_action_or_reset(test, mt76_replay_kvfree, p))
++		return NULL;
++	return p;
++}
++
++/* --- reading the recording ---------------------------------------------------- */
++
++static inline const struct mt76_rec_file_hdr *
++mt76_replay_hdr(const void *rec, size_t len)
++{
++	const struct mt76_rec_file_hdr *hdr = rec;
++
++	if (len < sizeof(*hdr) || memcmp(hdr->magic, MT76_REC_MAGIC, 8) ||
++	    le32_to_cpu(hdr->version) != MT76_REC_VERSION ||
++	    le32_to_cpu(hdr->hdr_len) < sizeof(*hdr) ||
++	    le32_to_cpu(hdr->hdr_len) > len ||
++	    le32_to_cpu(hdr->data_len) > len - le32_to_cpu(hdr->hdr_len))
++		return NULL;
++	return hdr;
++}
++
++/* the next record at *off (moved past it), or NULL at the end */
++static inline const struct mt76_rec_hdr *
++mt76_replay_next(const void *rec, size_t *off, const void **body, u32 *blen)
++{
++	const struct mt76_rec_file_hdr *fh = rec;
++	size_t end = le32_to_cpu(fh->hdr_len) + le32_to_cpu(fh->data_len);
++	const struct mt76_rec_hdr *h;
++	size_t next;
++
++	if (!*off)
++		*off = le32_to_cpu(fh->hdr_len);
++	if (*off + sizeof(*h) > end)
++		return NULL;
++
++	h = rec + *off;
++	*blen = le16_to_cpu(h->len);
++	next = *off + sizeof(*h) + ALIGN(*blen, 4);
++	if (next > end)
++		return NULL;
++
++	*body = h + 1;
++	*off = next;
++	return h;
++}
++
++static inline u64 mt76_replay_key_of(struct mt76_replay *r, u32 addr,
++				     bool parsing)
++{
++	int i;
++
++	for (i = 0; i < r->n_win; i++) {
++		struct mt76_replay_win *w = &r->win[i];
++		u32 sel;
++
++		if (addr < w->start || addr >= w->end)
++			continue;
++		sel = parsing ? w->cur : mt76_test_reg(r->fake, w->sel);
++		return (u64)sel << 32 | addr;
++	}
++	return addr;
++}
++
++static inline void mt76_replay_note_wr(struct mt76_replay *r, u32 addr,
++				       u32 val)
++{
++	int i;
++
++	for (i = 0; i < r->n_win; i++)
++		if (r->win[i].sel == addr)
++			r->win[i].cur = val;
++}
++
++static inline void mt76_replay_add_ev(struct mt76_replay *r, bool fill,
++				      u8 type, u32 addr, u32 val)
++{
++	if (fill)
++		r->evs[r->n_evs] = (struct mt76_replay_ev){
++			.type = type, .addr = addr, .val = val,
++		};
++	r->n_evs++;
++}
++
++static inline void mt76_replay_add_rd(struct mt76_replay *r, bool fill,
++				      u32 addr, u32 val)
++{
++	if (fill)
++		r->vals[r->n_vals] = (struct mt76_replay_val){
++			.key = mt76_replay_key_of(r, addr, true),
++			.idx = r->n_vals, .val = val,
++		};
++	r->n_vals++;
++	mt76_replay_add_ev(r, fill, MT76_REPLAY_EV_RD, addr, val);
++}
++
++static inline void mt76_replay_add_wr(struct mt76_replay *r, bool fill,
++				      u32 addr, u32 val)
++{
++	mt76_replay_note_wr(r, addr, val);
++	mt76_replay_add_ev(r, fill, MT76_REPLAY_EV_WR, addr, val);
++}
++
++/* one pass over the recording: counting (!fill) or filling the tables */
++static inline void mt76_replay_parse(struct mt76_replay *r, bool fill)
++{
++	struct mt76_replay_reply *pending = NULL;
++	const struct mt76_rec_hdr *h;
++	const void *body;
++	size_t off = 0;
++	u32 blen, i;
++	int j;
++
++	r->n_vals = r->n_evs = r->n_replies = 0;
++	for (j = 0; j < r->n_win; j++)
++		r->win[j].cur = 0;
++
++	while ((h = mt76_replay_next(r->rec, &off, &body, &blen))) {
++		const __le32 *w = body;
++		const struct mt76_rec_mcu *m = body;
++		u32 n;
++
++		if ((h->dev & 0xf) != r->slot ||
++		    (h->dev >> 4) != MT76_REC_SPACE_BUS)
++			continue;
++
++		switch (h->type) {
++		case MT76_REC_RR:
++			if (blen >= 8)
++				mt76_replay_add_rd(r, fill, le32_to_cpu(w[0]),
++						   le32_to_cpu(w[1]));
++			break;
++		case MT76_REC_WR:
++			if (blen >= 8)
++				mt76_replay_add_wr(r, fill, le32_to_cpu(w[0]),
++						   le32_to_cpu(w[1]));
++			break;
++		case MT76_REC_RMW:
++			if (blen < 16)
++				break;
++			mt76_replay_add_rd(r, fill, le32_to_cpu(w[0]),
++					   le32_to_cpu(w[2]));
++			mt76_replay_add_wr(r, fill, le32_to_cpu(w[0]),
++					   le32_to_cpu(w[3]));
++			break;
++		case MT76_REC_RD_COPY:
++		case MT76_REC_WR_COPY:
++			if (blen < 4)
++				break;
++			for (i = 0; 4 + i < blen; i += 4) {
++				u32 v = 0;
++
++				memcpy(&v, (const u8 *)body + 4 + i,
++				       min_t(u32, 4, blen - 4 - i));
++				v = le32_to_cpu((__force __le32)v);
++				if (h->type == MT76_REC_RD_COPY)
++					mt76_replay_add_rd(r, fill,
++						le32_to_cpu(w[0]) + i, v);
++				else
++					mt76_replay_add_wr(r, fill,
++						le32_to_cpu(w[0]) + i, v);
++			}
++			break;
++		case MT76_REC_MCU_CMD:
++			if (blen < sizeof(*m))
++				break;
++			n = MT76_REPLAY_CMD(le32_to_cpu(m->cmd));
++			pending = fill ? &r->replies[r->n_replies] : NULL;
++			if (pending)
++				*pending = (struct mt76_replay_reply){
++					.cmd = n, .idx = r->n_replies,
++					.wait = m->flags & MT76_REC_MCU_WAIT,
++				};
++			r->n_replies++;
++			mt76_replay_add_ev(r, fill, MT76_REPLAY_EV_MCU, n, 0);
++			break;
++		case MT76_REC_MCU_RESP:
++			/* the last one before the result is the one taken */
++			if (!pending || blen < sizeof(*m))
++				break;
++			if (m->flags & MT76_REC_MCU_TIMEOUT) {
++				pending->data = NULL;
++				pending->len = 0;
++			} else {
++				pending->data = (const u8 *)(m + 1);
++				pending->len = min_t(u32, le32_to_cpu(m->len),
++						     blen - sizeof(*m));
++			}
++			break;
++		case MT76_REC_MCU_RET:
++			pending = NULL;
++			break;
++		}
++	}
++}
++
++static inline int mt76_replay_cmp_val(const void *a, const void *b)
++{
++	const struct mt76_replay_val *x = a, *y = b;
++
++	if (x->key != y->key)
++		return x->key < y->key ? -1 : 1;
++	return x->idx < y->idx ? -1 : x->idx > y->idx;
++}
++
++static inline int mt76_replay_cmp_key(const void *key, const void *elt)
++{
++	const struct mt76_replay_key *k = elt;
++	u64 v = *(const u64 *)key;
++
++	return v < k->key ? -1 : v > k->key;
++}
++
++/* group sorted values into keys; returns how many */
++static inline u32 mt76_replay_group(struct mt76_replay_val *vals, u32 n,
++				    struct mt76_replay_key *keys)
++{
++	u32 i, nk = 0;
++
++	for (i = 0; i < n; i++) {
++		if (!i || vals[i].key != vals[i - 1].key)
++			keys[nk++] = (struct mt76_replay_key){
++				.key = vals[i].key, .first = i,
++			};
++		keys[nk - 1].n++;
++	}
++	return nk;
++}
++
++/* --- answering the driver -------------------------------------------------------- */
++
++static inline void mt76_replay_order(struct mt76_replay *r, u8 type,
++				     u32 addr, u32 val)
++{
++	struct mt76_replay_ev got = { .type = type, .addr = addr, .val = val };
++	const struct mt76_replay_ev *want;
++	u32 pos;
++
++	if (!r->strict || r->diverged)
++		return;
++
++	/* the next read or command, or a write before it */
++	for (pos = r->pos; pos < r->n_evs; pos++) {
++		want = &r->evs[pos];
++		if (want->type == type && want->addr == addr &&
++		    (type != MT76_REPLAY_EV_WR || want->val == val)) {
++			r->pos = pos + 1;
++			return;
++		}
++		if (want->type != MT76_REPLAY_EV_WR)
++			break;
++	}
++	want = r->pos < r->n_evs ? &r->evs[r->pos] : NULL;
++
++	r->diverged = true;
++	r->div_pos = r->pos;
++	r->div_got = got;
++	if (want)
++		r->div_want = *want;
++	else
++		r->div_want = (struct mt76_replay_ev){ .type = 0xff };
++}
++
++static inline void mt76_replay_list(u32 *list, int *n, u32 v)
++{
++	int i;
++
++	for (i = 0; i < *n; i++)
++		if (list[i] == v)
++			return;
++	if (*n < MT76_REPLAY_LIST)
++		list[(*n)++] = v;
++}
++
++static inline u32 mt76_replay_rr(struct mt76_test_fake *fake, u32 addr,
++				 u32 val)
++{
++	struct mt76_replay *r = fake->priv;
++	u64 key = mt76_replay_key_of(r, addr, false);
++	struct mt76_replay_key *k;
++
++	mt76_replay_order(r, MT76_REPLAY_EV_RD, addr, 0);
++	k = bsearch(&key, r->keys, r->n_keys, sizeof(*k),
++		    mt76_replay_cmp_key);
++	if (!k) {
++		r->uncovered_rd++;
++		mt76_replay_list(r->list_rd, &r->n_list_rd, addr);
++		return val;
++	}
++
++	r->rd++;
++	if (k->pos < k->n)
++		return r->vals[k->first + k->pos++].val;
++
++	r->beyond_rd++;
++	return r->vals[k->first + k->n - 1].val;
++}
++
++static inline void mt76_replay_wr(struct mt76_test_fake *fake, u32 addr,
++				  u32 val)
++{
++	mt76_replay_order(fake->priv, MT76_REPLAY_EV_WR, addr, val);
++}
++
++static inline int mt76_replay_mcu(struct mt76_test_fake *fake,
++				  const struct mt76_test_msg *msg)
++{
++	struct mt76_replay *r = fake->priv;
++	u64 cmd = MT76_REPLAY_CMD(msg->cmd);
++	const struct mt76_replay_reply *rep;
++	struct mt76_replay_key *k;
++
++	mt76_replay_order(r, MT76_REPLAY_EV_MCU, cmd, 0);
++	r->cur = NULL;
++	k = bsearch(&cmd, r->cmds, r->n_cmds, sizeof(*k),
++		    mt76_replay_cmp_key);
++	if (!k) {
++		r->uncovered_mcu++;
++		mt76_replay_list(r->list_mcu, &r->n_list_mcu, cmd);
++		return 0;
++	}
++
++	r->mcu++;
++	if (k->pos < k->n) {
++		rep = &r->replies[r->by_cmd[k->first + k->pos++].val];
++	} else {
++		r->beyond_mcu++;
++		rep = &r->replies[r->by_cmd[k->first + k->n - 1].val];
++	}
++	r->cur = rep;
++
++	/* none came (or none was waited for) */
++	return rep->data ? 0 : 1;
++}
++
++static inline void mt76_replay_reply(struct mt76_test_fake *fake,
++				     const struct mt76_test_msg *msg,
++				     struct sk_buff *reply)
++{
++	struct mt76_replay *r = fake->priv;
++	const struct mt76_replay_reply *rep = r->cur;
++
++	if (!rep || !rep->data)
++		return;
++
++	skb_trim(reply, 0);
++	if (rep->len > skb_tailroom(reply) &&
++	    pskb_expand_head(reply, 0, rep->len, GFP_KERNEL))
++		return;
++	skb_put_data(reply, rep->data, rep->len);
++	if (fake->reply_seq_off < rep->len)
++		reply->data[fake->reply_seq_off] = fake->seq;
++}
++
++/* --- setting it up ------------------------------------------------------------- */
++
++/* A replay of @rec (copied) for @fake; declare windows, then start it */
++static inline struct mt76_replay *
++mt76_replay_new(struct kunit *test, struct mt76_test_fake *fake,
++		const void *rec, size_t len)
++{
++	struct mt76_replay *r;
++
++	KUNIT_ASSERT_NOT_NULL_MSG(test, mt76_replay_hdr(rec, len),
++				  "not a recording");
++	r = kunit_kzalloc(test, sizeof(*r), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, r);
++	r->test = test;
++	r->fake = fake;
++	r->rec = mt76_replay_alloc(test, 1, len);
++	KUNIT_ASSERT_NOT_NULL(test, r->rec);
++	memcpy((void *)r->rec, rec, len);
++	r->len = len;
++
++	return r;
++}
++
++/* reads in [start, start + size) depend on the value written to @sel */
++static inline void mt76_replay_window(struct mt76_replay *r, u32 sel,
++				      u32 start, u32 size)
++{
++	KUNIT_ASSERT_LT(r->test, r->n_win, MT76_REPLAY_MAX_WIN);
++	r->win[r->n_win++] = (struct mt76_replay_win){
++		.sel = sel, .start = start, .end = start + size,
++	};
++}
++
++/* Build the tables for the recorded device in @slot (0: the first one the
++ * recording saw) and take over the fake's hooks.
++ */
++static inline void mt76_replay_start(struct mt76_replay *r, int slot)
++{
++	struct kunit *test = r->test;
++	u32 i;
++
++	r->slot = slot;
++	mt76_replay_parse(r, false);
++	r->vals = mt76_replay_alloc(test, r->n_vals + 1, sizeof(*r->vals));
++	r->keys = mt76_replay_alloc(test, r->n_vals + 1, sizeof(*r->keys));
++	r->evs = mt76_replay_alloc(test, r->n_evs + 1, sizeof(*r->evs));
++	r->replies = mt76_replay_alloc(test, r->n_replies + 1,
++				       sizeof(*r->replies));
++	r->by_cmd = mt76_replay_alloc(test, r->n_replies + 1,
++				      sizeof(*r->by_cmd));
++	r->cmds = mt76_replay_alloc(test, r->n_replies + 1, sizeof(*r->cmds));
++	KUNIT_ASSERT_TRUE(test, r->vals && r->keys && r->evs && r->replies &&
++				r->by_cmd && r->cmds);
++	mt76_replay_parse(r, true);
++
++	sort(r->vals, r->n_vals, sizeof(*r->vals), mt76_replay_cmp_val, NULL);
++	r->n_keys = mt76_replay_group(r->vals, r->n_vals, r->keys);
++
++	for (i = 0; i < r->n_replies; i++)
++		r->by_cmd[i] = (struct mt76_replay_val){
++			.key = r->replies[i].cmd, .idx = i, .val = i,
++		};
++	sort(r->by_cmd, r->n_replies, sizeof(*r->by_cmd),
++	     mt76_replay_cmp_val, NULL);
++	r->n_cmds = mt76_replay_group(r->by_cmd, r->n_replies, r->cmds);
++
++	r->fake->priv = r;
++	r->fake->rr_hook = mt76_replay_rr;
++	r->fake->wr_hook = mt76_replay_wr;
++	r->fake->mcu_hook = mt76_replay_mcu;
++	r->fake->reply = mt76_replay_reply;
++}
++
++/* everything the driver asked was in the recording */
++static inline bool mt76_replay_covered(const struct mt76_replay *r)
++{
++	return !r->uncovered_rd && !r->uncovered_mcu;
++}
++
++static inline void mt76_replay_report(struct kunit *test,
++				      const struct mt76_replay *r)
++{
++	static const char * const ev[] = { "read", "write", "command", "?" };
++	char buf[128];
++	int i, n;
++
++	kunit_info(test, "replay: %u reads (%u past the recording's), %u commands (%u past)\n",
++		   r->rd, r->beyond_rd, r->mcu, r->beyond_mcu);
++	if (r->uncovered_rd) {
++		for (i = n = 0; i < r->n_list_rd; i++)
++			n += scnprintf(buf + n, sizeof(buf) - n, " %#x",
++				       r->list_rd[i]);
++		kunit_info(test, "replay: %u reads not in the recording:%s%s\n",
++			   r->uncovered_rd, buf,
++			   r->n_list_rd == MT76_REPLAY_LIST ? " ..." : "");
++	}
++	if (r->uncovered_mcu) {
++		for (i = n = 0; i < r->n_list_mcu; i++)
++			n += scnprintf(buf + n, sizeof(buf) - n, " %#x",
++				       r->list_mcu[i]);
++		kunit_info(test, "replay: %u commands not in the recording:%s%s\n",
++			   r->uncovered_mcu, buf,
++			   r->n_list_mcu == MT76_REPLAY_LIST ? " ..." : "");
++	}
++	if (!r->diverged)
++		return;
++	kunit_info(test, "replay: access %u was %s %#x (%#x); the recording has:\n",
++		   r->div_pos, ev[min_t(u8, r->div_got.type, 3)],
++		   r->div_got.addr, r->div_got.val);
++	for (i = r->div_pos > 4 ? r->div_pos - 4 : 0;
++	     i < min(r->div_pos + 4, r->n_evs); i++)
++		kunit_info(test, "replay: %s %d: %s %#x (%#x)\n",
++			   i == r->div_pos ? "->" : "  ", i,
++			   ev[min_t(u8, r->evs[i].type, 3)], r->evs[i].addr,
++			   r->evs[i].val);
++}
++
++/* A capture from the router, from the VM's /lib/firmware (see the README's
++ * "Recording the real chip"), or NULL if there's none.
++ */
++static inline void *mt76_replay_request(struct kunit *test,
++					struct device *dev, const char *name,
++					size_t *len)
++{
++	const struct firmware *fw;
++	void *data;
++
++	if (request_firmware_direct(&fw, name, dev))
++		return NULL;
++
++	data = mt76_replay_alloc(test, 1, fw->size);
++	if (data) {
++		memcpy(data, fw->data, fw->size);
++		*len = fw->size;
++	}
++	release_firmware(fw);
++
++	return data;
++}
++
++#endif

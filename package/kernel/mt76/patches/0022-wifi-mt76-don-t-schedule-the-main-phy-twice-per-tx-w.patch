@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:25:54 +0100
+Subject: [PATCH] wifi: mt76: don't schedule the main phy twice per tx worker
+ run
+
+Since "add multi-radio support to tx scheduling", mt76_tx_worker_run()
+schedules dev->phy explicitly before walking dev->phys[]. On drivers
+without separate radio phys, dev->phys[MT_BAND0] is dev->phy itself, so
+band 0 got a second, mostly empty scheduling pass over all ACs on every
+run, and other bands waited behind it.
+
+Skip dev->phy in the loop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tx.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/tx.c b/tx.c
+index dc6a65d3..0060cfa8 100644
+--- a/tx.c
++++ b/tx.c
+@@ -785,7 +785,8 @@ void mt76_tx_worker_run(struct mt76_dev *dev)
+ 	mt76_txq_schedule_all(&dev->phy);
+ 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
+ 		phy = dev->phys[i];
+-		if (!phy)
++		/* unless replaced by a radio phy, phys[0] is dev->phy */
++		if (!phy || phy == &dev->phy)
+ 			continue;
+ 
+ 		mt76_txq_schedule_all(phy);

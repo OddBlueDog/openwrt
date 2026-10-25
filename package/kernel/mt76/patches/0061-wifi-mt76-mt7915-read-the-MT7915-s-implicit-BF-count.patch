@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:44:46 +0100
+Subject: [PATCH] wifi: mt76: mt7915: read the MT7915's implicit BF count from
+ SDR33
+
+Commit 15f9f88b ("mt76: mt7915: refine register definition") moved
+MT_MIB_SDR33 from 0x08c to 0x088, which on the MT7915 is MIB SDR32, the
+explicit beamforming count. Since then the MT7915's tx_pkt_ibf_cnt
+statistic just repeated tx_pkt_ebf_cnt. The MT7916 and MT798x take
+their implicit count from SDR32's upper half and don't use SDR33.
+
+Put SDR33 back at 0x08c. Un-skip mt7915_test_mib_ibf_mt7915.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/regs.h           | 2 +-
+ mt7915/tests/mac-test.c | 7 ++-----
+ 2 files changed, 3 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/regs.h b/mt7915/regs.h
+index dc7bb9a1..92c2e0d2 100644
+--- a/mt7915/regs.h
++++ b/mt7915/regs.h
+@@ -413,7 +413,7 @@ enum offs_rev {
+ #define MT_MIB_SDR32_TX_PKT_EBF_CNT	GENMASK(15, 0)
+ #define MT_MIB_SDR32_TX_PKT_IBF_CNT	GENMASK(31, 16)
+ 
+-#define MT_MIB_SDR33(_band)		MT_WF_MIB(_band, 0x088)
++#define MT_MIB_SDR33(_band)		MT_WF_MIB(_band, 0x08c)
+ #define MT_MIB_SDR33_TX_PKT_IBF_CNT	GENMASK(15, 0)
+ 
+ #define MT_MIB_SDRMUBF(_band)		MT_WF_MIB(_band, __OFFS(MIB_SDRMUBF))
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 4d8cdbb3..87e4f1c1 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -3889,17 +3889,14 @@ static void mt7915_test_mib_stats_mt7915(struct kunit *test)
+ }
+ 
+ /* MIB SDRn sits at 0x008 + 4 * n on the MT7915: SDR32 (explicit
+- * beamforming) at 0x088, SDR33 (implicit) at 0x08c. The implicit count
+- * must come from SDR33.
++ * beamforming) at 0x088, SDR33 (implicit) at 0x08c: the implicit count
++ * comes from SDR33.
+  */
+ static void mt7915_test_mib_ibf_mt7915(struct kunit *test)
+ {
+ 	struct mt7915_test_env *env;
+ 	struct mt7915_dev *dev;
+ 
+-	kunit_skip(test, "driver bug: MT7915 MT_MIB_SDR33 is 0x088 (SDR32), "
+-		   "should be 0x08c since 15f9f88b; IBF count reads EBF");
+-
+ 	env = mt7915_test_env_chip(test, 0x7915);
+ 	dev = env->dev;
+ 	mt76_wr(dev, MT_WF_MIB(0, 0x088), 5);

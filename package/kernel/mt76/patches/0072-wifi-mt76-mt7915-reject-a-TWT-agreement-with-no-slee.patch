@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 17:54:34 +0100
+Subject: [PATCH] wifi: mt76: mt7915: reject a TWT agreement with no sleep time
+
+mt7915_mac_check_twt_req() refused a wake interval shorter than the
+minimum wake duration, but accepted one exactly as long. The station
+is then awake for the whole interval and never sleeps, which gains
+nothing; such a schedule was reported to stall tx on the MT7915 family.
+
+Refuse an interval no longer than the wake duration.
+mt7915_test_twt_interval checks both sides of the boundary.
+
+Ported from pesa1234/openwrt next-r4.12.0.rss.mtk,
+6014-mt7915-reject-TWT-with-zero-sleep-duration (Erik Karlsson).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 3 ++-
+ mt7915/tests/mac-test.c | 7 ++++++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 8436dbf1..4b6bff33 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2374,8 +2374,9 @@ static int mt7915_mac_check_twt_req(struct ieee80211_twt_setup *twt)
+ 	mantissa = le16_to_cpu(twt_agrt->mantissa);
+ 	duration = twt_agrt->min_twt_dur << 8;
+ 
++	/* a station awake for its whole interval never sleeps */
+ 	interval = (u64)mantissa << exp;
+-	if (!interval || interval < duration)
++	if (!interval || interval <= duration)
+ 		return -EOPNOTSUPP;
+ 
+ 	return 0;
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index bd065b90..a6325325 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -36,7 +36,9 @@ static int mt7915_test_twt_check(u16 mantissa, u8 exp, u8 min_dur)
+ 	return mt7915_mac_check_twt_req(setup);
+ }
+ 
+-/* A station can't set up an agreement with a zero wake interval. */
++/* A station can't set up an agreement with a zero wake interval, or one
++ * it would spend awake.
++ */
+ static void mt7915_test_twt_interval(struct kunit *test)
+ {
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(0, 0, 0), -EOPNOTSUPP);
+@@ -44,6 +46,9 @@ static void mt7915_test_twt_interval(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(1024, 10, 4), 0);
+ 	/* interval shorter than the minimum wake duration */
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(1, 0, 4), -EOPNOTSUPP);
++	/* as long as it (4 * 256 us): no sleep; 1 us longer is fine */
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(1024, 0, 4), -EOPNOTSUPP);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(1025, 0, 4), 0);
+ 	/* intervals beyond 32 bits are valid requests */
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_twt_check(2, 31, 4), 0);
+ }

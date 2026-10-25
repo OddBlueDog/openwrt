@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:22:50 +0100
+Subject: [PATCH] wifi: mt76: put the band node in mt76_eeprom_override()
+
+for_each_child_of_node() holds a reference on the current child, which
+the loop body has to drop when it leaves the loop early. Both the
+-EPROBE_DEFER return and the break after finding the band kept it.
+Found by Coccinelle (for_each_child.cocci).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ eeprom.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/eeprom.c b/eeprom.c
+index 254d252b..374a7aaa 100644
+--- a/eeprom.c
++++ b/eeprom.c
+@@ -188,6 +188,7 @@ mt76_eeprom_override(struct mt76_phy *phy)
+ 			continue;
+ 
+ 		ret = of_get_mac_address(band_np, phy->macaddr);
++		of_node_put(band_np);
+ 		if (ret == -EPROBE_DEFER)
+ 			return ret;
+ 

@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:25:02 +0100
+Subject: [PATCH] wifi: mt76: mt7915: always drop TWT flow state on teardown
+
+mt7915_mac_twt_teardown_flow() returns before unlinking the flow when
+the MCU_TWT_AGRT_DELETE command fails, e.g. while the MCU is being
+reset. On station removal that leaves a flow embedded in the freed
+station on dev->twt_list, which the next TWT setup and the twt_stats
+debugfs file then walk.
+
+Release the local state regardless of the firmware result.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index b868cb26..a47ea09f 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2411,9 +2411,11 @@ void mt7915_mac_twt_teardown_flow(struct mt7915_dev *dev,
+ 		return;
+ 
+ 	flow = &msta->twt.flow[flowid];
+-	if (mt7915_mcu_twt_agrt_update(dev, msta->vif, flow,
+-				       MCU_TWT_AGRT_DELETE))
+-		return;
++	/* Drop the local state even if the firmware command fails: this is
++	 * also called on station removal and the flow must not stay on
++	 * twt_list after the station is freed.
++	 */
++	mt7915_mcu_twt_agrt_update(dev, msta->vif, flow, MCU_TWT_AGRT_DELETE);
+ 
+ 	list_del_init(&flow->list);
+ 	msta->twt.flowid_mask &= ~BIT(flowid);

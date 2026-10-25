@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 21:27:47 +0100
+Subject: [PATCH] wifi: mt76: mt7915: escalate an L1 SER that never reaches
+ RESET_DONE
+
+If the firmware never signals RESET_DONE, the L1 path skipped the DMA
+reset and token reclaim, waited another 30 s for NORMAL_STATE, then
+restarted DMA on top of rings that were never reset, with tokens
+possibly leaking until tx stayed blocked.
+
+Queue a full recovery instead of resuming.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 00abadfe..e7be7ccd 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1605,6 +1605,13 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 
+ 		mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+ 		mt7915_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
++	} else if (!mt7915_reset_aborted(dev)) {
++		/* No RESET_DONE: the rings were not reset and the tokens not
++		 * reclaimed, don't resume on top of them.
++		 */
++		dev->recovery.restart = true;
++		queue_work(dev->mt76.wq, &dev->reset_work);
++		goto out_aborted;
+ 	}
+ 
+ 	if (mt7915_reset_aborted(dev))

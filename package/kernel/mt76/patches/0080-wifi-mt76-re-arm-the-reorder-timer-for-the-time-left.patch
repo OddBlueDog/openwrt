@@ -1,0 +1,201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:36:58 +0100
+Subject: [PATCH] wifi: mt76: re-arm the reorder timer for the time left, not a
+ full timeout
+
+When the reorder work found frames that hadn't waited long enough, it
+queued itself again for a full timeout from now. But the work may have
+been queued for an earlier hole: queueing it for a new hole while it is
+pending doesn't move it. A hole that formed 60 ms after the work was
+queued for an earlier one (since filled) was looked at after 40 ms,
+then 100 ms later, so a best-effort frame behind it waited ~140 ms
+instead of 100, and up to twice the timeout in general (80 ms for
+voice and video).
+
+mt76_rx_aggr_check_release() now returns how long until the next
+buffered frame has waited long enough, and the work re-arms for that.
+
+mt76_test_reorder_next_check and mt76_test_aggr_work_rearms_remaining
+check it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agg-rx.c            | 39 +++++++++++++++++++++++---------
+ tests/agg-rx-test.c | 55 +++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 84 insertions(+), 10 deletions(-)
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 478ca4f7..456441aa 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -52,15 +52,20 @@ mt76_rx_aggr_release_head(struct mt76_rx_tid *tid, struct sk_buff_head *frames)
+ 	}
+ }
+ 
+-static void
++/*
++ * Release what waited long enough for a hole. Returns how long until the
++ * next buffered frame has waited long enough, or 0 if nothing is left.
++ */
++static unsigned long
+ mt76_rx_aggr_check_release(struct mt76_rx_tid *tid, struct sk_buff_head *frames)
+ {
++	unsigned long timeo = mt76_aggr_tid_to_timeo(tid->num), next = 0;
+ 	struct mt76_rx_status *status;
+ 	struct sk_buff *skb;
+ 	int start, idx, nframes;
+ 
+ 	if (!tid->nframes)
+-		return;
++		return 0;
+ 
+ 	mt76_rx_aggr_release_head(tid, frames);
+ 
+@@ -76,15 +81,24 @@ mt76_rx_aggr_check_release(struct mt76_rx_tid *tid, struct sk_buff_head *frames)
+ 
+ 		nframes--;
+ 		status = (struct mt76_rx_status *)skb->cb;
+-		if (time_before32(jiffies,
+-				  status->reorder_time +
+-				  mt76_aggr_tid_to_timeo(tid->num)))
++		if (time_before32(jiffies, status->reorder_time + timeo)) {
++			u32 left = status->reorder_time + timeo - (u32)jiffies;
++
++			/* a frame a later one releases may set it: just early */
++			if (!next || left < next)
++				next = left;
+ 			continue;
++		}
+ 
+ 		mt76_rx_aggr_release_frames(tid, frames, status->seqno);
+ 	}
+ 
+ 	mt76_rx_aggr_release_head(tid, frames);
++
++	if (!tid->nframes)
++		return 0;
++
++	return next ?: timeo;
+ }
+ 
+ static void
+@@ -94,21 +108,26 @@ mt76_rx_aggr_reorder_work(struct work_struct *work)
+ 					       reorder_work.work);
+ 	struct mt76_dev *dev = tid->dev;
+ 	struct sk_buff_head frames;
+-	int nframes;
++	unsigned long next;
+ 
+ 	__skb_queue_head_init(&frames);
+ 
+ 	local_bh_disable();
+ 	rcu_read_lock();
+ 
++	/*
++	 * Look again when the oldest frame left has waited long enough, not a
++	 * full timeout from now: the work may have been queued for an earlier
++	 * hole (queueing it again doesn't move it), so that frame has already
++	 * waited part of its time.
++	 */
+ 	spin_lock(&tid->lock);
+-	mt76_rx_aggr_check_release(tid, &frames);
+-	nframes = tid->nframes;
++	next = mt76_rx_aggr_check_release(tid, &frames);
+ 	spin_unlock(&tid->lock);
+ 
+-	if (nframes)
++	if (next)
+ 		ieee80211_queue_delayed_work(tid->dev->hw, &tid->reorder_work,
+-					     mt76_aggr_tid_to_timeo(tid->num));
++					     next);
+ 	mt76_rx_complete(dev, &frames, NULL);
+ 
+ 	rcu_read_unlock();
+diff --git a/tests/agg-rx-test.c b/tests/agg-rx-test.c
+index 510ff586..46c4b428 100644
+--- a/tests/agg-rx-test.c
++++ b/tests/agg-rx-test.c
+@@ -80,6 +80,34 @@ static void mt76_test_reorder_hold_before_timeout(struct kunit *test)
+ 	mt76_test_reorder_free(tid, &frames);
+ }
+ 
++/* A frame that has waited part of its timeout: the next look is due when
++ * the rest has passed, not a full timeout later.
++ */
++static void mt76_test_reorder_next_check(struct kunit *test)
++{
++	unsigned long timeo = mt76_aggr_tid_to_timeo(0), next;
++	struct sk_buff_head frames;
++	struct mt76_rx_tid *tid;
++
++	KUNIT_ASSERT_GT(test, timeo, 3);
++	tid = mt76_test_reorder_tid(test, timeo - 3);
++	__skb_queue_head_init(&frames);
++
++	next = mt76_rx_aggr_check_release(tid, &frames);
++	KUNIT_EXPECT_EQ(test, tid->nframes, 1);
++	/* 3 jiffies, less any that passed since */
++	KUNIT_EXPECT_GE(test, next, 1);
++	KUNIT_EXPECT_LE(test, next, 3);
++
++	/* released: nothing left to look at */
++	((struct mt76_rx_status *)
++	 tid->reorder_buf[101 % MT76_TEST_REORDER_SIZE]->cb)->reorder_time =
++		jiffies - timeo;
++	KUNIT_EXPECT_EQ(test, mt76_rx_aggr_check_release(tid, &frames), 0);
++	KUNIT_EXPECT_EQ(test, tid->nframes, 0);
++	mt76_test_reorder_free(tid, &frames);
++}
++
+ /* Nothing buffered: nothing to look at, nothing released. */
+ static void mt76_test_reorder_check_empty(struct kunit *test)
+ {
+@@ -580,6 +608,31 @@ static void mt76_test_aggr_work_holds(struct kunit *test)
+ 	cancel_delayed_work_sync(&tid->reorder_work);
+ }
+ 
++/* The timer was queued for an earlier hole and fires while a later frame
++ * has waited most of its timeout: it looks again when that frame's time
++ * is up, not a full timeout later (which was up to twice the timeout).
++ */
++static void mt76_test_aggr_work_rearms_remaining(struct kunit *test)
++{
++	struct mt76_test_aggr *a = mt76_test_aggr(test, true, 100, 8);
++	struct mt76_rx_tid *tid = mt76_test_aggr_tid(a, 0);
++	unsigned long timeo = mt76_aggr_tid_to_timeo(0);
++	struct sk_buff *skb;
++	long left;
++
++	skb = mt76_test_aggr_skb(test, a->wcid, 102);
++	mt76_test_aggr_rx(a, skb);
++	KUNIT_ASSERT_TRUE(test, cancel_delayed_work_sync(&tid->reorder_work));
++	mt76_test_aggr_status(skb)->reorder_time = jiffies - (timeo - 2);
++
++	mt76_rx_aggr_reorder_work(&tid->reorder_work.work);
++	KUNIT_EXPECT_EQ(test, tid->nframes, 1);
++	KUNIT_ASSERT_TRUE(test, delayed_work_pending(&tid->reorder_work));
++	left = (long)(tid->reorder_work.timer.expires - jiffies);
++	KUNIT_EXPECT_LE(test, left, 2);
++	cancel_delayed_work_sync(&tid->reorder_work);
++}
++
+ /* When the timer fires on a frame that waited long enough, the hole
+  * before it is given up on and the frame goes up to mac80211.
+  */
+@@ -645,6 +698,7 @@ static void mt76_test_aggr_timeout_by_tid(struct kunit *test)
+ static struct kunit_case mt76_agg_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_reorder_release_at_timeout),
+ 	KUNIT_CASE(mt76_test_reorder_hold_before_timeout),
++	KUNIT_CASE(mt76_test_reorder_next_check),
+ 	KUNIT_CASE(mt76_test_reorder_check_empty),
+ 	KUNIT_CASE(mt76_test_aggr_start_stop),
+ 	KUNIT_CASE(mt76_test_aggr_shutdown),
+@@ -657,6 +711,7 @@ static struct kunit_case mt76_agg_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_aggr_bar_release),
+ 	KUNIT_CASE(mt76_test_aggr_bar_ignored),
+ 	KUNIT_CASE(mt76_test_aggr_work_holds),
++	KUNIT_CASE(mt76_test_aggr_work_rearms_remaining),
+ 	KUNIT_CASE(mt76_test_aggr_work_releases),
+ 	KUNIT_CASE(mt76_test_aggr_timeout_by_tid),
+ 	{}

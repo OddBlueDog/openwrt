@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:25:02 +0100
+Subject: [PATCH] wifi: mt76: mt7915: restart radar detection after a full
+ reset
+
+mt7915_dfs_init_radar_detector() only talks to the firmware when the
+DFS state changes, and phy->dfs_state is only reset when the channel or
+width changes or the regulatory domain is updated. After a full chip
+reset the firmware is reloaded without a running radar detector, but
+mac80211 restores the same channel, so the state is unchanged and
+RDD_START/CAC_END are never sent again: radar detection stays off on
+the operating DFS channel until the channel changes.
+
+Reset the DFS state of both bands during the full reset, as the
+regulatory notifier already does, so the detector is set up again when
+the channel is restored.
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index ff69cf8e..dcd44c05 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1459,6 +1459,11 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ 	if (phy2)
+ 		phy2->omac_mask = 0;
+ 
++	/* the restarted firmware has no radar detector running */
++	dev->mphy.dfs_state = MT_DFS_STATE_UNKNOWN;
++	if (ext_phy)
++		ext_phy->dfs_state = MT_DFS_STATE_UNKNOWN;
++
+ 	mt76_reset_device(&dev->mt76);
+ 
+ 	INIT_LIST_HEAD(&dev->sta_rc_list);

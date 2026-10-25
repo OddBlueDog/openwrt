@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 22:49:18 +0100
+Subject: [PATCH] wifi: mt76: mt7915: no HE streams a station has turned off
+
+mt7915_mcu_set_sta_he_mcs() rewrote each width's HE MCS map only for the
+streams below the station's rx_nss (four at most) and left the higher
+ones as its capabilities said. When an HE station drops a stream with an
+Operating Mode Notification, mac80211 lowers rx_nss and the rate control
+work sends STA_REC_HE again, but its maps still offered both streams,
+and the firmware's rate control reads STA_REC_HE for HE stations (see
+mt7915_mcu_add_rate_ctrl()). Mark the streams from rx_nss up, and past
+the fourth, which we can't send anyway, not supported.
+
+Every width's map is cut at the same rx_nss. For a 160 MHz capable
+station mac80211 counts its HE streams as the lower of the 80 and
+160 MHz maps (ieee80211_sta_init_nss()), which could be fewer than it
+takes at 80 MHz. But rx_nss is the largest of that, the HT and the VHT
+counts, and HE on 2.4 and 5 GHz comes with HT (and on 5 GHz VHT)
+capabilities that no width cuts, so there rx_nss stays the station's
+80 MHz stream count until it says otherwise. Only an HE-only station on
+6 GHz (MT7916, not our MT7986) with fewer streams at 160 MHz gets its
+80 MHz map cut to that, which is how mac80211 already counts it.
+Cutting only the 160 and 80+80 maps would have left the 80 MHz one,
+the only one our HE80 router sends, as it was.
+
+mt7915_test_sta_he_mcs expected the old behaviour; the new
+mt7915_test_sta_he_mcs_nss checks STA_REC_HE of a station going to one
+stream and back, at 80 and 160 MHz. Both fail without the fix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c            |  3 ++
+ mt7915/tests/mcu-test.c | 63 +++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 60 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 68711660..45c54b94 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -106,6 +106,9 @@ mt7915_mcu_set_sta_he_mcs(struct ieee80211_sta *sta, __le16 *he_mcs,
+ 			break;
+ 	}
+ 
++	/* streams the station has turned off, or we can't send */
++	mcs_map |= GENMASK(15, 2 * max_nss);
++
+ 	*he_mcs = cpu_to_le16(mcs_map);
+ }
+ 
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index a6b644f2..a94bc296 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -672,22 +672,25 @@ static void mt7915_test_sta_he_mcs(struct kunit *test)
+ 	mt7915_mcu_set_sta_he_mcs(c.sta, &out, 0xffe4);
+ 	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xffe3);
+ 
+-	/* streams beyond rx_nss are left as they are */
++	/* streams beyond rx_nss are not supported */
+ 	c.sta->deflink.rx_nss = 1;
+ 	mt7915_mcu_set_sta_he_mcs(c.sta, &out, 0xffe4);
+-	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xffe7);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xffff);
++	mask[0] = 0xffff;
++	mt7915_mcu_set_sta_he_mcs(c.sta, &out, 0xffe4);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xfffc);
+ 
+-	/* and so is everything past the fourth stream */
++	/* and neither is anything past the fourth stream */
+ 	mask[0] = mask[1] = mask[2] = 0xffff;
+ 	mask[3] = GENMASK(7, 0);
+ 	mask[4] = 0;
+ 	c.sta->deflink.rx_nss = 8;
+ 	mt7915_mcu_set_sta_he_mcs(c.sta, &out, 0xfea4);
+-	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xfe24);
+-	/* three streams: the fourth one is not looked at */
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xff24);
++	/* three streams: the fourth one is not looked at, only dropped */
+ 	c.sta->deflink.rx_nss = 3;
+ 	mt7915_mcu_set_sta_he_mcs(c.sta, &out, 0xfea4);
+-	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xfea4);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(out), 0xffe4);
+ }
+ 
+ /* The VHT MCS bitmaps of a station: what its map supports, masked, per
+@@ -2757,6 +2760,53 @@ static void mt7915_test_sta_he_mcs_widths(struct kunit *test)
+ 			0);
+ }
+ 
++/* An HE station that drops to one stream (Operating Mode Notification, so
++ * a lower rx_nss) offers only that one in every width's map, not the two
++ * of its capabilities; back at two, both again.
++ */
++static void mt7915_test_sta_he_mcs_nss(struct kunit *test)
++{
++	struct ieee80211_sta_he_cap *cap;
++	struct mt7915_test_ctx c;
++	struct sta_rec_he *he;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_ht(c.sta);
++	mt7915_test_vht(c.sta);
++	mt7915_test_he(c.sta);
++	cap = &c.sta->deflink.he_cap;
++	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_80;
++
++	c.sta->deflink.rx_nss = 1;
++	he = mt7915_test_he_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, he);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(he->max_nss_mcs[CMD_HE_MCS_BW80]),
++			0xfffe);
++
++	c.sta->deflink.rx_nss = 2;
++	he = mt7915_test_he_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, he);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(he->max_nss_mcs[CMD_HE_MCS_BW80]),
++			0xfffa);
++
++	/* 160 MHz and 80+80 maps too */
++	cap->he_cap_elem.phy_cap_info[0] =
++		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G |
++		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G;
++	cap->he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(0xfffa);
++	cap->he_mcs_nss_supp.rx_mcs_80p80 = cpu_to_le16(0xfffa);
++	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_160;
++	c.sta->deflink.rx_nss = 1;
++	he = mt7915_test_he_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, he);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(he->max_nss_mcs[CMD_HE_MCS_BW80]),
++			0xfffe);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(he->max_nss_mcs[CMD_HE_MCS_BW160]),
++			0xfffe);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(he->max_nss_mcs[CMD_HE_MCS_BW8080]),
++			0xfffe);
++}
++
+ /* @c's station's STA_REC_MURU, built on its own */
+ static struct sta_rec_muru *mt7915_test_muru_tlv(struct kunit *test,
+ 						 struct mt7915_test_ctx *c)
+@@ -4279,6 +4329,7 @@ static struct kunit_case mt7915_mcu_sta_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_sta_he_caps),
+ 	KUNIT_CASE(mt7915_test_sta_he_fields),
+ 	KUNIT_CASE(mt7915_test_sta_he_mcs_widths),
++	KUNIT_CASE(mt7915_test_sta_he_mcs_nss),
+ 	KUNIT_CASE(mt7915_test_sta_muru),
+ 	KUNIT_CASE(mt7915_test_sta_ht_vht),
+ 	KUNIT_CASE(mt7915_test_sta_amsdu),

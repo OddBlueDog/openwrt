@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 11:16:42 +0100
+Subject: [PATCH] milkflint tests: park the tx worker before mt76-scan checks
+ the tx list
+
+mt76_scan_test_probe_requests checks that the probe requests leave the
+scan link's wcid on the phy's tx list. The tx worker, woken by
+mt76_tx(), can run on the VM's other CPU at the same time:
+mt76_txq_schedule_pending() takes each wcid off the list, drops the
+lock while it tries the (stopped) queues, and only then puts it back.
+A check in between sees an empty list ("Expected
+list_empty(&mv->wcid.tx_list) to be false, but is true", once in ~41
+boots).
+
+The test now parks the worker for the check. Parking waits for a run
+in progress to end, and a finished run always puts the wcid back while
+its frames can't go out, so what's checked is unchanged. Only around
+the check: the scan step's channel switch parks and unparks the worker
+itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/scan-test.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/tests/scan-test.c b/tests/scan-test.c
+index 2c5b819e..b2e593c9 100644
+--- a/tests/scan-test.c
++++ b/tests/scan-test.c
+@@ -397,7 +397,14 @@ static void mt76_scan_test_probe_requests(struct kunit *test)
+ 	MT76_SCAN_TEST_DELAY(test, delay, HZ / 16);
+ 	KUNIT_ASSERT_EQ(test, skb_queue_len(&mv->wcid.tx_offchannel), 2);
+ 	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&mv->wcid.tx_pending));
++	/* queued for the tx worker. A run of it (on the other CPU) takes the
++	 * wcid off the list while it tries the stopped queues, then puts it
++	 * back: park the worker, which waits for a run to finish. Not around
++	 * the step, whose channel switch parks and unparks it itself.
++	 */
++	mt76_worker_disable(&dev->tx_worker);
+ 	KUNIT_EXPECT_FALSE(test, list_empty(&mv->wcid.tx_list));
++	mt76_worker_enable(&dev->tx_worker);
+ 
+ 	skb = skb_peek(&mv->wcid.tx_offchannel);
+ 	hdr = (struct ieee80211_hdr *)skb->data;

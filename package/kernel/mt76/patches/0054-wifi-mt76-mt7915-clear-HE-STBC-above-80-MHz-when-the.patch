@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:34:39 +0100
+Subject: [PATCH] wifi: mt76: mt7915: clear HE STBC above 80 MHz when the
+ chains change
+
+mt7915_set_stream_he_txbf_caps() updates the HE caps in place each time
+the antennas change. It cleared the beamforming bits it may set, but not
+STBC tx/rx above 80 MHz, which an AP on 2 or more chains sets. So after
+set_antenna dropped to a single chain, the AP still advertised them,
+unlike a band that starts with one chain.
+
+Clear them with the other phy_cap_info[7] bits. Un-skip
+mt7915_init_test_he_caps_shrink.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c            | 5 ++++-
+ mt7915/tests/init-test.c | 7 ++-----
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 4e2db8e0..e38245a3 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1028,7 +1028,10 @@ mt7915_set_stream_he_txbf_caps(struct mt7915_phy *phy,
+ 	    IEEE80211_HE_PHY_CAP6_TRIG_MU_BEAMFORMING_PARTIAL_BW_FB;
+ 	elem->phy_cap_info[6] &= ~c;
+ 
+-	elem->phy_cap_info[7] &= ~IEEE80211_HE_PHY_CAP7_MAX_NC_MASK;
++	c = IEEE80211_HE_PHY_CAP7_MAX_NC_MASK |
++	    IEEE80211_HE_PHY_CAP7_STBC_TX_ABOVE_80MHZ |
++	    IEEE80211_HE_PHY_CAP7_STBC_RX_ABOVE_80MHZ;
++	elem->phy_cap_info[7] &= ~c;
+ 
+ 	c = IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US;
+ 	if (!is_mt7915(&dev->mt76))
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 2f97d479..4002fb14 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -682,17 +682,14 @@ static void mt7915_init_test_he_caps_chains(struct kunit *test)
+ }
+ 
+ /* set_antenna recomputes the HE caps in place: going from 4 chains to 1
+- * must give the same caps as a 1 chain band. The STBC beyond 80 MHz bits
+- * of an AP are only ever set, never cleared, so a single chain AP keeps
+- * claiming STBC tx/rx above 80 MHz.
++ * gives the same caps as a 1 chain band, without the STBC tx/rx above
++ * 80 MHz the 4 chains had.
+  */
+ static void mt7915_init_test_he_caps_shrink(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev;
+ 	const struct ieee80211_sta_he_cap *ap;
+ 
+-	kunit_skip(test, "driver bug: HE STBC >80 MHz bits stay set after the antennas drop to one chain");
+-
+ 	dev = mt7915_init_test_chip(test, MT7976_ONE_ADIE_DBDC);
+ 	dev->mphy.cap.has_2ghz = true;
+ 	dev->mphy.antenna_mask = 0xf;

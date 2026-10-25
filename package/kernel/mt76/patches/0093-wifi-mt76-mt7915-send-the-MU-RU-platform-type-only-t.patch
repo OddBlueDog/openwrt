@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 12:17:59 +0100
+Subject: [PATCH] wifi: mt76: mt7915: send the MU/RU platform type
+ only to the MT7915
+
+mt7915_mcu_init_firmware() sent MURU_SET_PLATFORM_TYPE (PERF_LEVEL_2) on
+every chip. Send it only on the MT7915 (2), not on the MT798x, where the
+firmware then keeps its boot value. In the one place the firmware reads
+it (setting up DL MU-MIMO users) only 1 takes a different branch, so the
+boot value and 2 should behave the same.
+
+muru_platform_type (default -1) picks: -1 by chip, 0 none, 1 or 2 that
+value.
+
+mt7915_mcu2_platform_type checks nothing is sent on the MT7986, 2 on the
+MT7915, and the forced values.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c             | 25 ++++++++++++++++++++--
+ mt7915/tests/mcu2-test.c | 46 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 19e370f8..f73a9ad0 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -58,6 +58,10 @@ static bool muru_ofdma_ul;
+ module_param(muru_ofdma_ul, bool, 0644);
+ MODULE_PARM_DESC(muru_ofdma_ul, "Let the firmware schedule UL OFDMA for HE stations (the firmware keeps the first station's setting per band, so set it before stations join)");
+ 
++static int muru_platform_type = -1;
++module_param(muru_platform_type, int, 0444);
++MODULE_PARM_DESC(muru_platform_type, "MU/RU platform type sent at boot: -1 by chip (2 on the MT7915, none on the MT798x), 0 none, 1 or 2 that value");
++
+ static u8
+ mt7915_mcu_get_sta_nss(u16 mcs_map)
+ {
+@@ -2394,6 +2398,24 @@ int mt7915_mcu_set_muru_ctrl(struct mt7915_dev *dev, u32 cmd, u32 val)
+ 				 sizeof(req), false);
+ }
+ 
++/*
++ * The MU/RU platform type goes to the MT7915 only (2); on
++ * the MT798x the firmware keeps its boot value, which reads like 2 in the
++ * one place that looks at it (1 takes another branch there).
++ */
++static int
++mt7915_mcu_set_platform_type(struct mt7915_dev *dev)
++{
++	int type = READ_ONCE(muru_platform_type);
++
++	if (type < 0)
++		type = is_mt7915(&dev->mt76) ? MURU_PLATFORM_TYPE_PERF_LEVEL_2 : 0;
++	if (!type)
++		return 0;
++
++	return mt7915_mcu_set_muru_ctrl(dev, MURU_SET_PLATFORM_TYPE, type);
++}
++
+ static int
+ mt7915_mcu_init_rx_airtime(struct mt7915_dev *dev)
+ {
+@@ -2535,8 +2557,7 @@ int mt7915_mcu_init_firmware(struct mt7915_dev *dev)
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = mt7915_mcu_set_muru_ctrl(dev, MURU_SET_PLATFORM_TYPE,
+-				       MURU_PLATFORM_TYPE_PERF_LEVEL_2);
++	ret = mt7915_mcu_set_platform_type(dev);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 7fa10bfc..ff171389 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -3453,6 +3453,51 @@ static void mt7915_mcu2_vow_stock(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, n);
+ }
+ 
++static void mt7915_mcu2_platform_type_reset(void *data)
++{
++	muru_platform_type = -1;
++}
++
++/* The MU/RU platform type at boot by default: nothing on
++ * the MT798x, 2 on the MT7915; the module parameter forces none or a value.
++ */
++static void mt7915_mcu2_platform_type(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	int cmd = MCU_EXT_CMD(MURU_CTRL);
++	struct {
++		__le32 cmd;
++		__le32 val;
++	} __packed *req;
++	unsigned int n;
++
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_platform_type_reset, NULL), 0);
++
++	n = mt76_test_fake->n_msgs;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_set_platform_type(dev), 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, n);
++
++	dev->mt76.rev = 0x79150000;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_set_platform_type(dev), 0);
++	req = (void *)mt7915_mcu2_msg(test, cmd, sizeof(*req))->data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->cmd), MURU_SET_PLATFORM_TYPE);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->val),
++			MURU_PLATFORM_TYPE_PERF_LEVEL_2);
++
++	muru_platform_type = 0;
++	n = mt76_test_fake->n_msgs;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_set_platform_type(dev), 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, n);
++	dev->mt76.rev = 0x79860000;
++
++	muru_platform_type = 1;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_set_platform_type(dev), 0);
++	req = (void *)mt7915_mcu2_msg(test, cmd, sizeof(*req))->data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->val),
++			MURU_PLATFORM_TYPE_PERF_LEVEL_1);
++}
++
+ /* An interface's BSS group on its band, for the airtime module: four per
+  * band for the hardware BSSIDs, extended BSSes after them.
+  */
+@@ -3796,6 +3841,7 @@ static struct kunit_case mt7915_mcu2_misc_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_vow_feature),
+ 	KUNIT_CASE(mt7915_mcu2_vow_fw_quanta),
+ 	KUNIT_CASE(mt7915_mcu2_vow_stock),
++	KUNIT_CASE(mt7915_mcu2_platform_type),
+ 	KUNIT_CASE(mt7915_mcu2_vow_band),
+ 	KUNIT_CASE(mt7915_mcu2_muru_stats),
+ 	KUNIT_CASE(mt7915_mcu2_muru_stats_short),

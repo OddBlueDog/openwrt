@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 11:23:31 +0100
+Subject: [PATCH] wifi: mt76: mt7915: no resets or dumps once the device is
+ being removed
+
+mt7915_unregister_device() cancels the dump and reset works first, then
+unregisters from mac80211, which removes the interfaces and stations
+with firmware commands. Two things queue the reset work again after the
+cancel:
+- the irq tasklet, on a firmware crash or SER event (mt7915_reset():
+  recovery.hw_init_done is never cleared);
+- any firmware command timing out (mt7915_mcu_parse_response()), which
+  is what a hung firmware does through the whole teardown.
+The work then runs next to mt7915_stop_hardware(), or when
+destroy_workqueue() drains it: on freed rings, or calling napi_disable()
+on NAPIs that stop_hardware already disabled, which never returns. So
+unloading the driver while its firmware hangs (switching drivers after
+a firmware fault) could hang rmmod or worse.
+
+Set MT76_REMOVED at the top of mt7915_unregister_device(), and don't
+queue resets or dumps once it's set; the works themselves return at
+once if queued just before. A timeout still sets MT76_MCU_RESET, so the
+teardown's later commands fail at once instead of each waiting out its
+timeout.
+
+mt7915_test_reset_removed checks neither the tasklet nor a timeout
+queues anything after removal starts, and the works do nothing. Without
+the fix its expectations fail, and the reset work it runs oopses the
+test VM in napi_disable().
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c           |  7 +++++++
+ mt7915/mac.c            |  9 ++++++++-
+ mt7915/mcu.c            |  4 +++-
+ mt7915/tests/mac-test.c | 43 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 0820e4dd..eda62119 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1396,6 +1396,13 @@ free_phy2:
+ 
+ void mt7915_unregister_device(struct mt7915_dev *dev)
+ {
++	/*
++	 * No more resets or dumps: the irq tasklet, and firmware commands
++	 * timing out (likely while a hung firmware is torn down), would
++	 * queue them again after the cancels below, to run on a stopped
++	 * device (napi_disable() twice never returns).
++	 */
++	set_bit(MT76_REMOVED, &dev->mphy.state);
+ 	cancel_work_sync(&dev->dump_work);
+ 	cancel_work_sync(&dev->reset_work);
+ 	cancel_work_sync(&dev->rc_work);
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index fe3f4f73..2fbe21c0 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1622,6 +1622,10 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 
++	/* queued just before the device went away (mt7915_unregister_device()) */
++	if (test_bit(MT76_REMOVED, &dev->mphy.state))
++		return;
++
+ 	/* chip full reset */
+ 	if (dev->recovery.restart) {
+ 		/* disable WA/WM WDT */
+@@ -1773,6 +1777,8 @@ void mt7915_mac_dump_work(struct work_struct *work)
+ 	u8 *buf;
+ 
+ 	dev = container_of(work, struct mt7915_dev, dump_work);
++	if (test_bit(MT76_REMOVED, &dev->mphy.state))
++		return;
+ 
+ 	mutex_lock(&dev->dump_mutex);
+ 
+@@ -1832,7 +1838,8 @@ skip_coredump:
+ 
+ void mt7915_reset(struct mt7915_dev *dev)
+ {
+-	if (!dev->recovery.hw_init_done)
++	if (!dev->recovery.hw_init_done ||
++	    test_bit(MT76_REMOVED, &dev->mphy.state))
+ 		return;
+ 
+ 	if (dev->recovery.hw_full_reset)
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index defec5de..27261502 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -165,10 +165,12 @@ mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+ 		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
+ 			cmd, seq);
+ 
++		/* also while the device goes away: later commands fail at once */
+ 		if (!test_and_set_bit(MT76_MCU_RESET, &dev->mphy.state)) {
+ 			dev->recovery.restart = true;
+ 			wake_up(&dev->mt76.mcu.wait);
+-			queue_work(dev->mt76.wq, &dev->reset_work);
++			if (!test_bit(MT76_REMOVED, &dev->mphy.state))
++				queue_work(dev->mt76.wq, &dev->reset_work);
+ 			wake_up(&dev->reset_wait);
+ 		}
+ 
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index b9394fca..fdf67310 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -4243,6 +4243,48 @@ static void mt7915_test_reset_events(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, work_pending(&dev->reset_work));
+ }
+ 
++/* While the device is being removed (mt7915_unregister_device() has
++ * cancelled the works), nothing queues a reset or a dump: not the irq
++ * tasklet, not a firmware command timing out (likely when a hung firmware
++ * is torn down), whose timeout still makes the commands after it fail at
++ * once. A work queued just before returns without touching the device.
++ */
++static void mt7915_test_reset_removed(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	int n_wr;
++
++	mt7915_test_block_wq(test, dev);
++	dev->recovery.hw_init_done = true;
++	set_bit(MT76_REMOVED, &dev->mphy.state);
++
++	dev->recovery.state = MT_MCU_CMD_WM_WDT;
++	mt7915_reset(dev);
++	dev->recovery.state = MT_MCU_CMD_STOP_DMA;
++	mt7915_reset(dev);
++	KUNIT_EXPECT_FALSE(test, work_pending(&dev->dump_work));
++	KUNIT_EXPECT_FALSE(test, work_pending(&dev->reset_work));
++	KUNIT_EXPECT_FALSE(test, dev->recovery.restart);
++
++	KUNIT_EXPECT_EQ(test, mt7915_test_parse_response(&dev->mt76,
++			MCU_EXT_CMD(GET_MIB_INFO), NULL, 1), -ETIMEDOUT);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_MCU_RESET, &dev->mphy.state));
++	KUNIT_EXPECT_FALSE(test, work_pending(&dev->reset_work));
++
++	n_wr = fake->n_wr;
++	mt7915_mac_reset_work(&dev->reset_work);
++	mt7915_mac_dump_work(&dev->dump_work);
++	KUNIT_EXPECT_EQ(test, fake->n_wr, n_wr);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_RESET, &dev->mphy.state));
++	KUNIT_EXPECT_FALSE(test, work_pending(&dev->reset_work));
++
++	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
++	clear_bit(MT76_REMOVED, &dev->mphy.state);
++	dev->recovery.restart = false;
++}
++
+ /* The dump work (no coredump support built in) goes on to the reset. */
+ static void mt7915_test_dump_work(struct kunit *test)
+ {
+@@ -5051,6 +5093,7 @@ static struct kunit_case mt7915_mac_reset_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_sta_rc_reset),
+ 	KUNIT_CASE(mt7915_test_update_vif_beacon),
+ 	KUNIT_CASE(mt7915_test_reset_events),
++	KUNIT_CASE(mt7915_test_reset_removed),
+ 	KUNIT_CASE(mt7915_test_dump_work),
+ 	KUNIT_CASE(mt7915_test_wait_reset_state),
+ 	KUNIT_CASE(mt7915_test_reset_work_idle),

@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:33:11 +0100
+Subject: [PATCH] wifi: mt76: mt7915: check the EEPROM and MU-RU reply lengths
+
+mt7915_mcu_get_eeprom(), mt7915_mcu_get_eeprom_free_block() and
+mt7915_mcu_muru_debug_get() read their fixed-size replies without
+checking the length, so a short or mismatched reply was read past its
+end: as EEPROM data copied into dev->mt76.eeprom.data, as the number of
+free efuse blocks, or as MU/RU counters added to the phy's statistics.
+The other readers got the same check in "check firmware reply lengths
+before parsing".
+
+Fail with -EINVAL when the reply is shorter than what is read. Un-skip
+mt7915_mcu2_get_eeprom_short and mt7915_mcu2_muru_stats_short.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c             | 15 +++++++++++++++
+ mt7915/tests/mcu2-test.c |  6 ++----
+ 2 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 926fafd8..e76d8b62 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -2270,6 +2270,11 @@ int mt7915_mcu_muru_debug_get(struct mt7915_phy *phy)
+ 	if (ret)
+ 		return ret;
+ 
++	if (skb->len < sizeof(*mu_stats)) {
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
++
+ 	mu_stats = (struct mt7915_mcu_muru_stats *)(skb->data);
+ 
+ 	/* accumulate stats, these are clear-on-read */
+@@ -2966,6 +2971,11 @@ int mt7915_mcu_get_eeprom(struct mt7915_dev *dev, u32 offset, u8 *read_buf)
+ 	if (ret)
+ 		return ret;
+ 
++	if (skb->len < sizeof(*res)) {
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
++
+ 	res = (struct mt7915_mcu_eeprom_info *)skb->data;
+ 	if (!buf) {
+ 		u32 addr = le32_to_cpu(res->addr);
+@@ -3002,6 +3012,11 @@ int mt7915_mcu_get_eeprom_free_block(struct mt7915_dev *dev, u8 *block_num)
+ 	if (ret)
+ 		return ret;
+ 
++	if (!skb->len) {
++		dev_kfree_skb(skb);
++		return -EINVAL;
++	}
++
+ 	*block_num = *(u8 *)skb->data;
+ 	dev_kfree_skb(skb);
+ 
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 771ea2a8..f2a5ebb7 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -2928,15 +2928,14 @@ static void mt7915_mcu2_get_eeprom_free_block(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, n, 0);
+ }
+ 
+-/* EEPROM replies are read without a length check: a short one (here just
+- * the header) must be refused rather than read past.
++/* A short EEPROM reply (here just the header) is refused rather than read
++ * past.
+  */
+ static void mt7915_mcu2_get_eeprom_short(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev;
+ 	u8 buf[16], n;
+ 
+-	kunit_skip(test, "driver bug: get_eeprom/get_eeprom_free_block read past a short reply");
+ 	dev = mt7915_test_dev(test);
+ 	mt7915_mcu2_eeprom(test, dev);
+ 	mt7915_mcu2_reply(test, NULL, 0);
+@@ -3406,7 +3405,6 @@ static void mt7915_mcu2_muru_stats_short(struct kunit *test)
+ {
+ 	struct mt7915_dev *dev;
+ 
+-	kunit_skip(test, "driver bug: muru_debug_get reads past a short reply");
+ 	dev = mt7915_test_dev(test);
+ 	mt7915_mcu2_reply(test, NULL, 0);
+ 	KUNIT_EXPECT_EQ(test, mt7915_mcu_muru_debug_get(&dev->phy), -EINVAL);

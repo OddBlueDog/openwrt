@@ -1,0 +1,654 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 00:58:17 +0100
+Subject: [PATCH] milkflint tests: fake hardware for the KUnit tests
+
+tests/fake.h: a sparse register file in place of MMIO, and a firmware
+stand-in that records every MCU message the driver sends and answers it
+with a reply the driver's parser accepts (optionally with a payload from
+the test), plus mt76_test_dev(), an mt76_dev with both on a KUnit device.
+
+mt7915/tests/fake.h: mt7915_test_dev(), an MT7986 probed the way its
+platform driver does (mt7915_mmio_probe(), chip 0x7986), with the register
+file under the driver's own address translation and replies going through
+mt7915_mcu_parse_response().
+
+First users: MAC_INIT_CTRL and its error path (mt7915-mcu), and the
+MT7986's register address translation (new suite mt7915-mmio).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mmio.c            |   4 +
+ mt7915/tests/fake.h      |  91 ++++++++++
+ mt7915/tests/mcu-test.c  |  52 +++++-
+ mt7915/tests/mmio-test.c |  62 +++++++
+ tests/fake.h             | 365 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 571 insertions(+), 3 deletions(-)
+ create mode 100644 mt7915/tests/fake.h
+ create mode 100644 mt7915/tests/mmio-test.c
+ create mode 100644 tests/fake.h
+
+diff --git a/mt7915/mmio.c b/mt7915/mmio.c
+index 8ef16ee0..b8a247a4 100644
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -1005,6 +1005,10 @@ static void __exit mt7915_exit(void)
+ 	pci_unregister_driver(&mt7915_hif_driver);
+ }
+ 
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/mmio-test.c"
++#endif
++
+ module_init(mt7915_init);
+ module_exit(mt7915_exit);
+ MODULE_DESCRIPTION("MediaTek MT7915E MMIO helpers");
+diff --git a/mt7915/tests/fake.h b/mt7915/tests/fake.h
+new file mode 100644
+index 00000000..65b76d05
+--- /dev/null
++++ b/mt7915/tests/fake.h
+@@ -0,0 +1,91 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * An MT7986 for the mt7915 KUnit tests (milkflint's QEMU test build only),
++ * on the fake hardware of ../../tests/fake.h.
++ *
++ * mt7915_test_dev() probes a real mt7915_dev the way the MT7986's platform
++ * driver does (mt7915_mmio_probe(), chip 0x7986), then:
++ * - the register file sits under the driver's own address translation
++ *   (dev->bus_ops), so fake->regs is keyed by the translated addresses
++ *   mt7915_rr()/mt7915_wr() produce, and every mt76_rr()/mt76_wr() in the
++ *   driver runs that translation;
++ * - firmware messages go to the fake and its replies through the driver's
++ *   real parser, mt7915_mcu_parse_response();
++ * - it does what mt7915_register_device() does before touching hardware:
++ *   links dev->phy, sets up the work items and lists.
++ * Band 1 (the MT7986's 5 GHz band) has no phy unless a test makes one.
++ */
++#ifndef __MT7915_TEST_FAKE_H
++#define __MT7915_TEST_FAKE_H
++
++#include <linux/vmalloc.h>
++#include "../../tests/fake.h"
++
++/* mt7915_mcu_parse_response() is static to mcu.c: tests/mcu-test.c exports it */
++int mt7915_test_parse_response(struct mt76_dev *mdev, int cmd,
++			       struct sk_buff *skb, int seq);
++
++static const struct mt76_mcu_ops mt7915_test_mcu_ops __maybe_unused = {
++	.headroom = sizeof(struct mt76_connac2_mcu_txd),
++	.mcu_skb_send_msg = mt76_test_mcu_send,
++	.mcu_parse_response = mt7915_test_parse_response,
++};
++
++static inline void mt7915_test_vfree(void *p)
++{
++	vfree(p);
++}
++
++/* the payload of a message, as @type (NULL if it's shorter than that) */
++#define mt7915_test_payload(msg, type) \
++	((msg) && (msg)->len >= sizeof(type) ? (type *)(msg)->data : NULL)
++
++static inline struct mt7915_dev *mt7915_test_dev(struct kunit *test)
++{
++	struct mt76_test_fake *fake;
++	struct mt76_bus_ops *bus;
++	struct mt7915_dev *dev;
++	struct device *kdev;
++	void *mem;
++
++	kdev = kunit_device_register(test, "mt7915e-test");
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(kdev));
++	/* probing reads one register through MMIO before we can step in */
++	mem = vzalloc(SZ_8M);
++	KUNIT_ASSERT_NOT_NULL(test, mem);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_test_vfree, mem), 0);
++
++	dev = mt7915_mmio_probe(kdev, mem, 0x7986);
++	KUNIT_ASSERT_FALSE(test, IS_ERR(dev));
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_test_free_device, &dev->mt76), 0);
++
++	fake = mt76_test_fake_attach(test, &dev->mt76);
++	fake->reply_hdr = sizeof(struct mt76_connac2_mcu_rxd);
++	fake->reply_seq_off = offsetof(struct mt76_connac2_mcu_rxd, seq);
++	dev->bus_ops = &mt76_test_bus_ops;
++	/* the rest of the bus copy probing made still points at MMIO */
++	bus = (struct mt76_bus_ops *)dev->mt76.bus;
++	bus->write_copy = mt76_test_write_copy;
++	bus->read_copy = mt76_test_read_copy;
++	bus->wr_rp = mt76_test_wr_rp;
++	bus->rd_rp = mt76_test_rd_rp;
++	dev->mt76.mcu_ops = &mt7915_test_mcu_ops;
++
++	dev->phy.dev = dev;
++	dev->phy.mt76 = &dev->mt76.phy;
++	dev->mt76.phy.priv = &dev->phy;
++	INIT_WORK(&dev->rc_work, mt7915_mac_sta_rc_work);
++	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt7915_mac_work);
++	INIT_LIST_HEAD(&dev->sta_rc_list);
++	INIT_LIST_HEAD(&dev->twt_list);
++	init_waitqueue_head(&dev->reset_wait);
++	INIT_WORK(&dev->reset_work, mt7915_mac_reset_work);
++	INIT_WORK(&dev->dump_work, mt7915_mac_dump_work);
++	mutex_init(&dev->dump_mutex);
++
++	return dev;
++}
++
++#endif
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index c671a23b..c62d33bb 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -1,10 +1,19 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ /*
+- * KUnit tests for mt7915 firmware reply parsing. Included at the end of
+- * mt7915/mcu.c when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test
+- * build only).
++ * KUnit tests for mt7915 firmware messages: reply parsing, and the commands
++ * the driver sends, checked against the fake firmware of fake.h. Included at
++ * the end of mt7915/mcu.c when CONFIG_MT76_KUNIT_TEST is defined
++ * (milkflint's QEMU test build only).
+  */
+ #include <kunit/test.h>
++#include "fake.h"
++
++/* for fake.h's mt7915_test_dev(), in the other files' tests too */
++int mt7915_test_parse_response(struct mt76_dev *mdev, int cmd,
++			       struct sk_buff *skb, int seq)
++{
++	return mt7915_mcu_parse_response(mdev, cmd, skb, seq);
++}
+ 
+ /* A reply of @len bytes with sequence number @seq. The tailroom is zeroed,
+  * so reading past the reply is deterministic.
+@@ -62,8 +71,45 @@ static void mt7915_test_reply_lengths(struct kunit *test)
+ 	kfree_skb(skb);
+ }
+ 
++/* Turning a band's MAC on: header translation off, then MAC_INIT_CTRL with
++ * the band, the only one of the two the driver waits for.
++ */
++static void mt7915_test_set_mac(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt76_test_msg *msg;
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_set_mac(dev, 1, true, false), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 2);
++
++	msg = mt76_test_msg(fake, 0);
++	KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(RX_HDR_TRANS));
++	KUNIT_EXPECT_EQ(test, msg->len, 8);
++	KUNIT_EXPECT_EQ(test, msg->data[1], 0);		/* enable */
++
++	msg = mt76_test_msg(fake, 1);
++	KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(MAC_INIT_CTRL));
++	KUNIT_EXPECT_EQ(test, msg->len, 4);
++	KUNIT_EXPECT_EQ(test, msg->data[0], 1);		/* enable */
++	KUNIT_EXPECT_EQ(test, msg->data[1], 1);		/* band */
++}
++
++/* A firmware error comes back to the caller, and nothing after it is sent. */
++static void mt7915_test_set_mac_error(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	fake->mcu_ret = -EIO;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_set_mac(dev, 0, true, false), -EIO);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 1);
++}
++
+ static struct kunit_case mt7915_mcu_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_reply_lengths),
++	KUNIT_CASE(mt7915_test_set_mac),
++	KUNIT_CASE(mt7915_test_set_mac_error),
+ 	{}
+ };
+ 
+diff --git a/mt7915/tests/mmio-test.c b/mt7915/tests/mmio-test.c
+new file mode 100644
+index 00000000..ff7d7c3b
+--- /dev/null
++++ b/mt7915/tests/mmio-test.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for the MT7986's register access: how mt7915_rr()/mt7915_wr()
++ * translate the driver's addresses into its MMIO window. Included at the end
++ * of mt7915/mmio.c when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU
++ * test build only).
++ */
++#include <kunit/test.h>
++#include "fake.h"
++
++/* Addresses below 1 MiB are offsets into the window already. */
++static void mt7915_test_reg_direct(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	mt76_wr(dev, 0x24200, 0x1234);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, 0x24200), 0x1234);
++	mt76_test_set_reg(fake, 0x24204, 0xabcd);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, 0x24204), 0xabcd);
++}
++
++/* Bus addresses in the fixed map land at its offsets: WF_LMAC_TOP band 0
++ * (WF_CFG) at 0x820e0000 is window offset 0x420000.
++ */
++static void mt7915_test_reg_fixed_map(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	mt76_wr(dev, 0x820e0010, 0x55);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, 0x420010), 0x55);
++	mt76_rmw(dev, 0x820e0010, 0xf0, 0x30);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, 0x420010), 0x35);
++}
++
++/* CONN_INFRA addresses on the MT798x are window offsets from 0x18000000,
++ * without the PCIe chips' layer 1 remap register.
++ */
++static void mt7915_test_reg_conn_infra(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	mt76_wr(dev, MT_INFRA_BASE + 0x1000, 7);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, 0x1000), 7);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, MT_HIF_REMAP_L1), 0);
++}
++
++static struct kunit_case mt7915_mmio_test_cases[] = {
++	KUNIT_CASE(mt7915_test_reg_direct),
++	KUNIT_CASE(mt7915_test_reg_fixed_map),
++	KUNIT_CASE(mt7915_test_reg_conn_infra),
++	{}
++};
++
++static struct kunit_suite mt7915_mmio_test_suite = {
++	.name = "mt7915-mmio",
++	.test_cases = mt7915_mmio_test_cases,
++};
++
++kunit_test_suites(&mt7915_mmio_test_suite);
+diff --git a/tests/fake.h b/tests/fake.h
+new file mode 100644
+index 00000000..38ae4975
+--- /dev/null
++++ b/tests/fake.h
+@@ -0,0 +1,365 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Fake hardware for mt76's KUnit tests (milkflint's QEMU test build only;
++ * included by the tests' *-test.c files, never by the driver itself).
++ *
++ * - Registers: a sparse register file instead of MMIO. A read returns what
++ *   was last written there (0 if nothing was), unless the test's rr_hook
++ *   says otherwise (a status bit that sets itself, a counter...).
++ * - Firmware (MCU): every message the driver sends is recorded (command and
++ *   payload) and answered at once with a reply the driver's own parser
++ *   accepts: a zeroed header with the message's sequence number, plus the
++ *   payload the test's reply hook adds, if any.
++ * - A device to run them on: mt76_test_dev() allocates a real mt76_dev (and
++ *   its ieee80211_hw) on a KUnit device, wired to both fakes.
++ *
++ * KUnit runs one test at a time, so the fake in use is one global per file.
++ * Everything is freed when the test ends.
++ */
++#ifndef __MT76_TEST_FAKE_H
++#define __MT76_TEST_FAKE_H
++
++#include <kunit/test.h>
++#include <kunit/device.h>
++#include <linux/xarray.h>
++
++struct mt76_test_msg {
++	struct list_head list;
++	int cmd;
++	int len;
++	u8 data[];			/* the payload the driver built */
++};
++
++struct mt76_test_fake {
++	struct kunit *test;
++	struct mt76_dev *dev;
++
++	struct xarray regs;		/* address -> value */
++	unsigned int n_rr, n_wr;
++	u32 last_addr, last_val;	/* the last register written */
++	u32 (*rr_hook)(struct mt76_test_fake *fake, u32 addr, u32 val);
++
++	struct list_head msgs;		/* every message sent, oldest first */
++	unsigned int n_msgs;
++	int mcu_ret;			/* what sending a message returns */
++	bool mcu_silent;		/* no reply: the driver's wait times out */
++	unsigned int reply_hdr;		/* reply header length */
++	unsigned int reply_seq_off;	/* where the sequence number goes */
++	u8 seq;
++	/* add a payload to @reply, the answer to @msg */
++	void (*reply)(struct mt76_test_fake *fake,
++		      const struct mt76_test_msg *msg, struct sk_buff *reply);
++
++	void *priv;			/* for the test's hooks */
++};
++
++static struct mt76_test_fake *mt76_test_fake __maybe_unused;
++
++/* --- registers ------------------------------------------------------------- */
++
++static inline u32 mt76_test_reg(struct mt76_test_fake *fake, u32 addr)
++{
++	void *v = xa_load(&fake->regs, addr);
++
++	return v ? xa_to_value(v) : 0;
++}
++
++static inline void mt76_test_set_reg(struct mt76_test_fake *fake, u32 addr,
++				     u32 val)
++{
++	xa_store(&fake->regs, addr, xa_mk_value(val), GFP_ATOMIC);
++}
++
++static inline u32 mt76_test_rr(struct mt76_dev *dev, u32 addr)
++{
++	struct mt76_test_fake *fake = mt76_test_fake;
++	u32 val = mt76_test_reg(fake, addr);
++
++	fake->n_rr++;
++	return fake->rr_hook ? fake->rr_hook(fake, addr, val) : val;
++}
++
++static inline void mt76_test_wr(struct mt76_dev *dev, u32 addr, u32 val)
++{
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	mt76_test_set_reg(fake, addr, val);
++	fake->n_wr++;
++	fake->last_addr = addr;
++	fake->last_val = val;
++}
++
++static inline u32 mt76_test_rmw(struct mt76_dev *dev, u32 addr, u32 mask,
++				u32 val)
++{
++	u32 cur = (mt76_test_rr(dev, addr) & ~mask) | val;
++
++	mt76_test_wr(dev, addr, cur);
++	return cur;
++}
++
++static inline void mt76_test_write_copy(struct mt76_dev *dev, u32 addr,
++					const void *data, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i += 4) {
++		u32 v = 0;
++
++		memcpy(&v, data + i, min(4, len - i));
++		mt76_test_wr(dev, addr + i, v);
++	}
++}
++
++static inline void mt76_test_read_copy(struct mt76_dev *dev, u32 addr,
++				       void *data, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i += 4) {
++		u32 v = mt76_test_rr(dev, addr + i);
++
++		memcpy(data + i, &v, min(4, len - i));
++	}
++}
++
++static inline int mt76_test_wr_rp(struct mt76_dev *dev, u32 base,
++				  const struct mt76_reg_pair *rp, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++)
++		mt76_test_wr(dev, base + rp[i].reg, rp[i].value);
++	return 0;
++}
++
++static inline int mt76_test_rd_rp(struct mt76_dev *dev, u32 base,
++				  struct mt76_reg_pair *rp, int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++)
++		rp[i].value = mt76_test_rr(dev, base + rp[i].reg);
++	return 0;
++}
++
++static const struct mt76_bus_ops mt76_test_bus_ops __maybe_unused = {
++	.rr = mt76_test_rr,
++	.wr = mt76_test_wr,
++	.rmw = mt76_test_rmw,
++	.write_copy = mt76_test_write_copy,
++	.read_copy = mt76_test_read_copy,
++	.wr_rp = mt76_test_wr_rp,
++	.rd_rp = mt76_test_rd_rp,
++	.type = MT76_BUS_MMIO,
++};
++
++/* --- firmware ---------------------------------------------------------------- */
++
++/* mcu_skb_send_msg: record the message, queue the reply */
++static inline int mt76_test_mcu_send(struct mt76_dev *dev, struct sk_buff *skb,
++				     int cmd, int *seq)
++{
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt76_test_msg *msg;
++	struct sk_buff *reply;
++
++	msg = kunit_kmalloc(fake->test, sizeof(*msg) + skb->len, GFP_KERNEL);
++	if (!msg) {
++		dev_kfree_skb(skb);
++		return -ENOMEM;
++	}
++	msg->cmd = cmd;
++	msg->len = skb->len;
++	memcpy(msg->data, skb->data, skb->len);
++	list_add_tail(&msg->list, &fake->msgs);
++	fake->n_msgs++;
++	dev_kfree_skb(skb);
++
++	fake->seq = (fake->seq + 1) & 0xf;
++	if (!fake->seq)
++		fake->seq = 1;
++	if (seq)
++		*seq = fake->seq;
++	if (fake->mcu_ret || fake->mcu_silent)
++		return fake->mcu_ret;
++
++	reply = alloc_skb(fake->reply_hdr + 2048, GFP_KERNEL);
++	if (!reply)
++		return -ENOMEM;
++	skb_put_zero(reply, fake->reply_hdr);
++	if (fake->reply_seq_off < fake->reply_hdr)
++		reply->data[fake->reply_seq_off] = fake->seq;
++	if (fake->reply)
++		fake->reply(fake, msg, reply);
++	skb_queue_tail(&dev->mcu.res_q, reply);
++	wake_up(&dev->mcu.wait);
++
++	return 0;
++}
++
++/* for drivers without a parser of their own: check the seq, drop the header */
++static inline int mt76_test_mcu_parse(struct mt76_dev *dev, int cmd,
++				      struct sk_buff *skb, int seq)
++{
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	if (!skb)
++		return -ETIMEDOUT;
++	if (skb->len < fake->reply_hdr ||
++	    skb->data[fake->reply_seq_off] != seq)
++		return -EAGAIN;
++	skb_pull(skb, fake->reply_hdr);
++	return 0;
++}
++
++/* the @i-th message sent (0: the first), or NULL */
++static inline struct mt76_test_msg *mt76_test_msg(struct mt76_test_fake *fake,
++						  unsigned int i)
++{
++	struct mt76_test_msg *msg;
++
++	list_for_each_entry(msg, &fake->msgs, list)
++		if (!i--)
++			return msg;
++	return NULL;
++}
++
++/* the last message sent with command @cmd, or NULL */
++static inline struct mt76_test_msg *
++mt76_test_find_msg(struct mt76_test_fake *fake, int cmd)
++{
++	struct mt76_test_msg *msg, *found = NULL;
++
++	list_for_each_entry(msg, &fake->msgs, list)
++		if (msg->cmd == cmd)
++			found = msg;
++	return found;
++}
++
++/* how many messages with command @cmd were sent */
++static inline int mt76_test_count_msgs(struct mt76_test_fake *fake, int cmd)
++{
++	struct mt76_test_msg *msg;
++	int n = 0;
++
++	list_for_each_entry(msg, &fake->msgs, list)
++		n += msg->cmd == cmd;
++	return n;
++}
++
++static inline void mt76_test_fake_free(void *data)
++{
++	struct mt76_test_fake *fake = data;
++
++	skb_queue_purge(&fake->dev->mcu.res_q);
++	xa_destroy(&fake->regs);
++	if (mt76_test_fake == fake)
++		mt76_test_fake = NULL;
++}
++
++/* a fresh fake for @dev; @dev's bus and firmware are the caller's to point
++ * at it (mt76_test_dev() does)
++ */
++static inline struct mt76_test_fake *
++mt76_test_fake_attach(struct kunit *test, struct mt76_dev *dev)
++{
++	struct mt76_test_fake *fake;
++
++	fake = kunit_kzalloc(test, sizeof(*fake), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, fake);
++	fake->test = test;
++	fake->dev = dev;
++	xa_init(&fake->regs);
++	INIT_LIST_HEAD(&fake->msgs);
++	mt76_test_fake = fake;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_test_fake_free, fake), 0);
++	dev->mcu.timeout = HZ / 20;
++	return fake;
++}
++
++/* --- a device -------------------------------------------------------------------- */
++
++static inline int mt76_test_start(struct ieee80211_hw *hw) { return 0; }
++static inline void mt76_test_stop(struct ieee80211_hw *hw, bool suspend) {}
++static inline void mt76_test_tx(struct ieee80211_hw *hw,
++				struct ieee80211_tx_control *control,
++				struct sk_buff *skb)
++{
++	ieee80211_free_txskb(hw, skb);
++}
++static inline int mt76_test_add_interface(struct ieee80211_hw *hw,
++					  struct ieee80211_vif *vif)
++{
++	return 0;
++}
++static inline void mt76_test_remove_interface(struct ieee80211_hw *hw,
++					      struct ieee80211_vif *vif) {}
++static inline int mt76_test_config(struct ieee80211_hw *hw, int radio_idx,
++				   u32 changed)
++{
++	return 0;
++}
++static inline void mt76_test_configure_filter(struct ieee80211_hw *hw,
++					      unsigned int changed_flags,
++					      unsigned int *total_flags,
++					      u64 multicast)
++{
++	*total_flags = 0;
++}
++static inline void mt76_test_wake_tx_queue(struct ieee80211_hw *hw,
++					   struct ieee80211_txq *txq) {}
++
++/* the minimum mac80211 insists on */
++static const struct ieee80211_ops mt76_test_hw_ops __maybe_unused = {
++	.tx = mt76_test_tx,
++	.start = mt76_test_start,
++	.stop = mt76_test_stop,
++	.add_interface = mt76_test_add_interface,
++	.remove_interface = mt76_test_remove_interface,
++	.config = mt76_test_config,
++	.configure_filter = mt76_test_configure_filter,
++	.wake_tx_queue = mt76_test_wake_tx_queue,
++};
++
++static inline void mt76_test_free_device(void *data)
++{
++	mt76_free_device(data);
++}
++
++static const struct mt76_mcu_ops mt76_test_mcu_ops __maybe_unused = {
++	.mcu_skb_send_msg = mt76_test_mcu_send,
++	.mcu_parse_response = mt76_test_mcu_parse,
++};
++
++/* An mt76_dev of @size bytes (the driver's struct, mt76_dev first) on a
++ * KUnit device, with the fake bus and firmware. @ops and @drv_ops may be
++ * NULL for mt76_test_hw_ops and empty driver ops.
++ */
++static inline struct mt76_dev *
++mt76_test_dev(struct kunit *test, unsigned int size,
++	      const struct ieee80211_ops *ops,
++	      const struct mt76_driver_ops *drv_ops)
++{
++	static const struct mt76_driver_ops no_drv_ops = {};
++	struct mt76_test_fake *fake;
++	struct mt76_dev *dev;
++	struct device *kdev;
++
++	kdev = kunit_device_register(test, "mt76-test");
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(kdev));
++	dev = mt76_alloc_device(kdev, size, ops ?: &mt76_test_hw_ops,
++				drv_ops ?: &no_drv_ops);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_test_free_device, dev), 0);
++	fake = mt76_test_fake_attach(test, dev);
++	fake->reply_hdr = 4;
++	fake->reply_seq_off = 0;
++	dev->bus = &mt76_test_bus_ops;
++	dev->mcu_ops = &mt76_test_mcu_ops;
++	return dev;
++}
++
++#endif
