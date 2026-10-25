@@ -1,0 +1,22 @@
+#!/bin/sh
+# MediaTek's hardware airtime fairness (the firmware's VoW ATF), from
+# milkflint.wifi.hw_atf: 1 on, anything else (or unset) off. Stock OpenWrt's
+# mt76 has no hardware ATF; our fork, on newer upstream mt76, turns it on
+# for the MT7986 by default. MilkFlint keeps it off, as stock (with Wi-Fi
+# 6's OFDMA it may cost more than it gives). mac80211's software airtime
+# fairness stays on, as in stock. Writes the radios named, or every radio
+# that has the switch (the stock driver has none): it's one switch per chip,
+# taken at once, without restarting Wi-Fi. The ieee80211 hotplug
+# (31-milkflint-hw-atf) runs this for each radio as it appears, and
+# milkflint-tuning when the setting changes.
+#
+#   wifi-hw-atf [phy...]
+
+[ "$(uci -q get milkflint.wifi.hw_atf)" = 1 ] && v=1 || v=0
+
+[ $# -gt 0 ] || set -- $(ls /sys/kernel/debug/ieee80211 2> /dev/null)
+for phy; do
+	f=/sys/kernel/debug/ieee80211/$phy/mt76/vow_atf
+	[ -w "$f" ] && [ "$(cat "$f")" != $v ] && echo $v > "$f"
+done
+exit 0

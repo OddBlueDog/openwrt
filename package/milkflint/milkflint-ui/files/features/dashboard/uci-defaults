@@ -1,0 +1,4 @@
+#!/bin/sh
+# The dashboard's temperature graphs: keep recording the last hour.
+/etc/init.d/milkflint-dashboard enable
+exit 0

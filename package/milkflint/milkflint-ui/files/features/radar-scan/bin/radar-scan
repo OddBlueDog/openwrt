@@ -1,0 +1,222 @@
+#!/usr/bin/ucode
+// DFS radar scan (ui feature "radar-scan"): listens for radar on the 5 GHz
+// radio's radar channels, block by block, for as long as asked, and writes
+// what it heard to /tmp/milkflint/radar-scan.json for the feature's rpcd
+// plugin, which starts this in the background with the request in
+// /tmp/milkflint/radar-scan-request.json.
+//
+// It only listens. The radio's network goes down for the scan (wifi down)
+// and a monitor interface, which transmits nothing, is tuned to each block
+// in turn: mt76 arms the chip's radar detector in monitor mode on radar
+// channels (mt76_phy_dfs_state), so radar there is handled as in normal
+// use. The kernel puts the block's channels off limits for 30 minutes (DFS
+// state unavailable), which this watches for, and with the MilkFlint driver
+// the chip's reports (debugfs rdd_reports) say which radar pattern matched
+// and give its pulses: width, power, interval. Each block is listened to
+// for the whole time, keeping every report in it. (A radar check, the
+// kernel's CAC, would do for 60 s but won't run again on channels that
+// passed one, so it can't give a longer or a repeated scan.)
+//
+// Its events go to the system log as radar-scan lines in hostapd's DFS
+// format, so radar-log keeps them with the rest. radar-scan-watchdog
+// brings the network back if this dies or overruns; a stop request
+// (/tmp/milkflint/radar-scan.stop) ends it within a second.
+'use strict';
+
+import * as nl from 'nl80211';
+import { mkdir, popen, readfile, readlink, rename, stat, unlink, writefile } from 'fs';
+
+const DIR = '/tmp/milkflint';
+const STATE = DIR + '/radar-scan.json';
+const REQUEST = DIR + '/radar-scan-request.json';
+const STOP = DIR + '/radar-scan.stop';
+const IFNAME = 'radarscan0';
+const c = nl.const;
+// nl80211_chan_width by MHz (20 with HT)
+const NL_WIDTH = { '20': 1, '40': 2, '80': 3, '160': 5 };
+
+let state;
+
+function save() {
+	writefile(STATE + '.tmp', sprintf('%J', state));
+	rename(STATE + '.tmp', STATE);
+}
+
+function log(msg) {
+	system([ 'logger', '-t', 'radar-scan', msg ]);
+}
+
+// the radar channels' DFS state by channel (usable, available, unavailable)
+// and when it began (the kernel says for how many seconds it's been so)
+function dfs_states(phy) {
+	const out = {};
+	let ch = null;
+	const p = popen(`iw phy ${phy} channels`);
+	for (let line = p.read('line'); length(line); line = p.read('line')) {
+		let m = match(line, /\* [0-9]+ MHz \[([0-9]+)\]/);
+		if (m) {
+			ch = +m[1];
+			continue;
+		}
+		m = match(line, /DFS state: ([a-z]+)( \(for ([0-9]+) sec\))?/);
+		if (m && ch != null)
+			out[ch] = { state: m[1], since: time() - +(m[3] ?? 0) };
+	}
+	p.close();
+	return out;
+}
+
+// radar put this channel off limits since `before`: it became unavailable,
+// or (heard again) its 30 minutes started over
+function newly_off(now, before, ch) {
+	return now[ch]?.state == 'unavailable' &&
+		(before[ch]?.state != 'unavailable' || now[ch].since > before[ch].since + 1);
+}
+
+// the chip's radar reports (MilkFlint's mt7915 driver), oldest first; null
+// when the driver doesn't keep them
+function reports(phy) {
+	const text = readfile(`/sys/kernel/debug/ieee80211/${phy}/mt76/rdd_reports`);
+	if (text == null)
+		return null;
+	const out = [];
+	for (let line in split(text, '\n')) {
+		const w = split(trim(line), ' ');
+		if (w[0] == 'report') {
+			const r = { seq: +w[1], pulses: [] };
+			for (let i = 2; i + 1 < length(w); i += 2)
+				r[w[i]] = (w[i] == 'pri_stg') ? map(split(w[i + 1], ','), (x) => +x) : +w[i + 1];
+			push(out, r);
+		}
+		else if (w[0] == 'pulse' && length(out))
+			push(out[length(out) - 1].pulses, { kind: w[1], start: +w[3], width: +w[5], power: +w[7] });
+	}
+	return out;
+}
+
+function ap_up(wiphy) {
+	for (let i in nl.request(c.NL80211_CMD_GET_INTERFACE, c.NLM_F_DUMP) ?? [])
+		if (i.wiphy == wiphy && i.iftype == c.NL80211_IFTYPE_AP)
+			return true;
+	return false;
+}
+
+function stop_asked() {
+	return stat(STOP) != null;
+}
+
+function fields(b) {
+	return `freq=${b.freq} chan_width=${NL_WIDTH[b.width]} cf1=${b.center}`;
+}
+
+// listen on block b for req.seconds (or until stopped); null, or why the
+// scan can't go on
+function listen(phy, b, seconds) {
+	nl.error();
+	nl.request(c.NL80211_CMD_SET_WIPHY, 0, { dev: IFNAME, wiphy_freq: b.freq, channel_width: NL_WIDTH[b.width], center_freq1: b.center });
+	const err = nl.error();
+	if (err) {
+		b.status = 'failed';
+		b.error = `${err}`;
+		save();
+		return null;
+	}
+	const known = reports(phy) ?? [];
+	const seq0 = length(known) ? known[length(known) - 1].seq : 0;
+	const before = dfs_states(phy);
+	b.status = 'listening';
+	b.started = time();
+	b.elapsed = 0;
+	b.reports = [];
+	b.off_limits = [];
+	save();
+	log(`${IFNAME}: DFS-SCAN-START ${fields(b)} seconds=${seconds}`);
+	let lost = null;
+	while (time() < b.started + seconds) {
+		sleep(1000);
+		if (stop_asked())
+			break;
+		// still listening there: anything starting the network again moves the radio
+		const i = nl.request(c.NL80211_CMD_GET_INTERFACE, 0, { dev: IFNAME });
+		if (i?.wiphy_freq != b.freq) {
+			lost = readfile(`/sys/class/ieee80211/${phy}/index`) == null
+				? 'the Wi-Fi driver was reloaded during the scan'
+				: 'the 5 GHz network was started again during the scan';
+			break;
+		}
+		const now = dfs_states(phy);
+		const off = filter(b.channels, (ch) => newly_off(now, before, ch));
+		const fresh = filter(reports(phy) ?? [], (r) => r.seq > seq0);
+		if ((length(off) || length(fresh)) && b.heard_after == null) {
+			b.heard_after = time() - b.started;
+			const r = fresh[0];
+			log(`${IFNAME}: DFS-RADAR-DETECTED ${fields(b)} scan=1 after=${b.heard_after}` +
+				(r ? ` type=${r.type} pulses=${r.periodic_pulses + r.long_pulses}` : ''));
+		}
+		b.off_limits = uniq([ ...b.off_limits, ...off ]);
+		b.reports = fresh;
+		b.elapsed = time() - b.started;
+		save();
+	}
+	b.ended = time();
+	b.elapsed = b.ended - b.started;
+	b.status = b.heard_after != null ? 'radar' : (b.elapsed < seconds ? 'stopped' : 'clear');
+	log(`${IFNAME}: DFS-SCAN-END ${fields(b)} result=${b.status} listened=${b.elapsed}`);
+	save();
+	return lost;
+}
+
+mkdir(DIR);
+unlink(STOP);
+const req = json(readfile(REQUEST) ?? 'null');
+const pid = +readlink('/proc/self');
+const total = length(req.blocks) * req.seconds;
+state = {
+	state: 'starting', pid, radio: req.radio, phy: req.phy, seconds: req.seconds,
+	started: time(), deadline: time() + total + 120,
+	blocks: map(req.blocks, (b) => ({ ...b, status: 'waiting' }))
+};
+save();
+system([ 'start-stop-daemon', '-S', '-b', '-x', '/usr/libexec/milkflint/radar-scan-watchdog', '--', `${pid}`, `${state.deadline}`, req.radio ]);
+log(`radar scan of ${length(req.blocks)} block(s), ${req.seconds} s each: ${req.radio} off until it ends`);
+
+let error = null, lost = null;
+const wiphy = +trim(readfile(`/sys/class/ieee80211/${req.phy}/index`) ?? '-1');
+try {
+	system([ 'wifi', 'down', req.radio ]);
+	for (let i = 0; i < 40 && ap_up(wiphy); i++)
+		sleep(500);
+	nl.error();
+	nl.request(c.NL80211_CMD_NEW_INTERFACE, 0, { wiphy, ifname: IFNAME, iftype: c.NL80211_IFTYPE_MONITOR });
+	const err = nl.error();
+	if (err)
+		die(`can't add the listening interface: ${err}`);
+	system([ 'ip', 'link', 'set', IFNAME, 'up' ]);
+	state.state = 'running';
+	save();
+	for (let b in state.blocks) {
+		if (stop_asked() || lost) {
+			b.status = 'skipped';
+			continue;
+		}
+		lost = listen(req.phy, b, req.seconds);
+	}
+}
+catch (e) {
+	error = `${e}`;
+}
+
+system([ 'ip', 'link', 'set', IFNAME, 'down' ]);
+nl.request(c.NL80211_CMD_DEL_INTERFACE, 0, { dev: IFNAME });
+// unless something already started the network again, or the radio went
+// with a driver reload (whoever reloaded it brings Wi-Fi back; a second
+// `wifi up` meanwhile can leave the other band down)
+if (!ap_up(wiphy) && readfile(`/sys/class/ieee80211/${req.phy}/index`) != null)
+	system([ 'wifi', 'up', req.radio ]);
+state.state = 'done';
+state.ended = time();
+state.stopped = stop_asked();
+state.error = error ?? lost;
+save();
+unlink(STOP);
+log(`radar scan ended${state.error ? ` (${state.error})` : ''}: ${req.radio} back on`);

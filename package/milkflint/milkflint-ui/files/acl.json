@@ -1,0 +1,27 @@
+{
+	"milkflint-ui": {
+		"description": "MilkFlint web interface: status, and the settings its pages change",
+		"read": {
+			"ubus": {
+				"milkflint": [ "stats", "sqm_status", "neighbors", "pipeline" ],
+				"system": [ "board", "info" ],
+				"iwinfo": [ "devices", "info", "assoclist", "freqlist", "txpowerlist", "countrylist", "survey" ],
+				"network.interface": [ "dump" ],
+				"network.device": [ "status" ],
+				"luci-rpc": [ "getDHCPLeases", "getHostHints", "getWirelessDevices" ],
+				"uci": [ "get", "changes" ],
+				"luci": [ "getTimezones", "getUnixtime" ]
+			},
+			"uci": [ "network", "wireless", "dhcp", "firewall", "system", "sqm", "milkflint", "dnsproxy", "upnpd", "nlbwmon" ],
+			"cgi-io": [ "backup" ]
+		},
+		"write": {
+			"ubus": {
+				"uci": [ "set", "add", "delete", "rename", "order", "revert", "apply", "confirm", "rollback" ],
+				"system": [ "reboot" ],
+				"luci": [ "setPassword", "setLocaltime" ]
+			},
+			"uci": [ "network", "wireless", "dhcp", "firewall", "system", "sqm", "milkflint", "dnsproxy", "upnpd", "nlbwmon" ]
+		}
+	}
+}

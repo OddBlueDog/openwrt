@@ -1,0 +1,12 @@
+{
+	"milkflint-network-quality": {
+		"description": "MilkFlint web interface: Network Quality",
+		"read": {
+			"ubus": { "milkflint.netquality": [ "status", "history" ] },
+			"uci": [ "milkflint" ]
+		},
+		"write": {
+			"uci": [ "milkflint" ]
+		}
+	}
+}

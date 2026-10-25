@@ -1,0 +1,6 @@
+{
+	"milkflint-logs": {
+		"description": "MilkFlint web interface: Logs",
+		"read": { "ubus": { "milkflint.logs": [ "read", "status" ] } }
+	}
+}

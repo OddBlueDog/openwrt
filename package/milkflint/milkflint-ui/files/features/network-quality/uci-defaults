@@ -1,0 +1,21 @@
+#!/bin/sh
+# Network Quality defaults: on, a round every 5 s, pinging 1.1.1.1 and
+# resolving openwrt.org through the upstream resolver, and once a minute a
+# server each in the UK, Europe and the US (route_uk/eu/us override them;
+# the probe has the same defaults, so older configs get them too), with
+# 7 days of minute summaries kept in /root/milkflint-netquality.
+[ -f /etc/config/milkflint ] || touch /etc/config/milkflint
+if ! uci -q get milkflint.netquality > /dev/null; then
+	uci -q batch <<-UCI
+		set milkflint.netquality=netquality
+		set milkflint.netquality.enabled='1'
+		set milkflint.netquality.interval='5'
+		set milkflint.netquality.ping_target='1.1.1.1'
+		set milkflint.netquality.dns_domain='openwrt.org'
+		set milkflint.netquality.routes='1'
+		set milkflint.netquality.history_days='7'
+		commit milkflint
+	UCI
+fi
+/etc/init.d/milkflint-network-quality enable
+exit 0

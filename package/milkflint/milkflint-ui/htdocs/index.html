@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="/milkflint/favicon.svg" type="image/svg+xml" />
+    <title>Router</title>
+    <script>
+      // Apply the saved light/dark choice before first paint (no flash).
+      (function () {
+        var pref = null;
+        try { pref = localStorage.getItem('milkflint.theme'); } catch (e) {}
+        var dark = pref === 'dark' || (pref !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.setAttribute('data-darkmode', dark ? 'true' : 'false');
+      })();
+    </script>
+    
+    <link rel="modulepreload" crossorigin href="/milkflint/assets/ubus-DbpmpHUz.js">
+    <link rel="modulepreload" crossorigin href="/milkflint/assets/dist-rxOv_Zfr.js">
+    <link rel="modulepreload" crossorigin href="/milkflint/assets/dist-YfqymyuE.js">
+    <link rel="modulepreload" crossorigin href="/milkflint/assets/dist-B1owWylu.js">
+    
+  <script>
+      fetch('/milkflint/manifest.json', { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (m) {
+          m.css.forEach(function (href) {
+            var l = document.createElement('link');
+            l.rel = 'stylesheet';
+            l.href = href;
+            document.head.appendChild(l);
+          });
+          var s = document.createElement('script');
+          s.type = 'module';
+          s.src = m.js;
+          document.head.appendChild(s);
+        });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

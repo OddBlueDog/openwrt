@@ -1,0 +1,63 @@
+#!/usr/bin/ucode
+// MilkFlint radar log (procd service milkflint-wifi, ui feature "wifi").
+// Keeps hostapd's radar events for the Radios & SSIDs page, on the router's
+// storage so a reboot doesn't lose them: radar checks started and finished
+// (DFS-CAC-*), radar heard (DFS-RADAR-DETECTED), the moves to another
+// channel after it (DFS-NEW-CHANNEL), channels usable again 30 minutes on
+// (DFS-NOP-FINISHED), and a radar check that ended without a result (hostapd
+// leaving its DFS state for DISABLED, as when the settings are reloaded
+// during it); also the DFS radar scan's events (radar-scan, in the same
+// format: DFS-SCAN-START/END, DFS-RADAR-DETECTED with scan=1). One line
+// each, "<ctime> [<epoch>.<ms>] <interface>: <event>",
+// in /root/milkflint-wifi/radar.log, up to 64 KB: then the file becomes
+// radar.log.old, replacing the older one. It only reads the system log.
+'use strict';
+
+import { open, stat, rename, mkdir, readfile, popen } from 'fs';
+
+const DIR = '/root/milkflint-wifi';
+const LOG = DIR + '/radar.log';
+const MAX = 65536;
+
+// the time of a file's last line, so a restart doesn't write the lines of
+// this boot still in logread's buffer again
+function last_ms(path) {
+	const lines = split(trim(readfile(path) ?? ''), '\n');
+	const m = match(lines[length(lines) - 1], /\[([0-9]+)\.([0-9]+)\]/);
+	return m ? int(m[1]) * 1000 + int(m[2]) : 0;
+}
+
+mkdir(DIR);
+const since = max(last_ms(LOG), last_ms(LOG + '.old'));
+
+let out = open(LOG, 'a');
+// As logs-keeper reads it: -l (more lines than logd holds) prints the RAM
+// buffer first, which -f alone doesn't, then it follows. SIGPIPE may be
+// ignored here, so a logread nobody reads would run on: the shell says
+// "TICK" every 30 s, and once that fails (this stopped) it ends logread;
+// "EOF" once logread has stopped (logd restarted), and procd starts this again.
+const p = popen(`logread -f -t -l 1000000 & LR=$!
+trap 'kill $LR 2> /dev/null; exit' PIPE TERM INT HUP
+while sleep 30; do
+	kill -0 $LR 2> /dev/null || { echo EOF; break; }
+	echo TICK 2> /dev/null || break
+done
+kill $LR 2> /dev/null`);
+for (let line = p.read('line'); length(line); line = p.read('line')) {
+	line = rtrim(line, '\n');
+	if (line == 'EOF')
+		break;
+	// "<ctime> [<epoch>.<ms>] daemon.notice hostapd: phy1-ap0: DFS-CAC-START freq=5220 ..."
+	const m = match(line, /^(.{24}) \[([0-9]+)\.([0-9]+)\] [a-z]+\.[a-z]+ (hostapd|radar-scan): ([A-Za-z0-9_.-]+): (DFS-[A-Z-]+.*|interface state DFS->.*)$/);
+	if (!m || int(m[2]) * 1000 + int(m[3]) <= since)
+		continue;
+	out.write(`${m[1]} [${m[2]}.${m[3]}] ${m[5]}: ${m[6]}\n`);
+	out.flush();
+	if ((stat(LOG)?.size ?? 0) >= MAX) {
+		out.close();
+		rename(LOG, LOG + '.old');
+		out = open(LOG, 'a');
+	}
+}
+p.close();
+out.close();

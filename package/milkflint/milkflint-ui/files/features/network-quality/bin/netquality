@@ -1,0 +1,336 @@
+#!/usr/bin/ucode
+// MilkFlint network quality probe (procd service milkflint-network-quality, ui
+// feature "network-quality"). Every `interval` seconds it times a ping to
+// the WAN gateway, a ping to an internet target and a DNS lookup through the
+// upstream resolver, and keeps the last hour of samples in RAM for the
+// milkflint.netquality rpcd object, with whether the gateway has ever
+// answered (many providers' gateways never answer pings: the page and the
+// log keeper leave those out rather than call them lost). Once a minute it
+// also pings one server each in the UK, Europe and the US (`routes`), to
+// tell a slower route abroad from a slower line: big DNS services answer
+// from the nearest city, so these are servers made for latency tests, each
+// in one place, pinged once each, their addresses looked up once an hour.
+// Each minute's rounds are summed up in one line of a day file under
+// /root (`history_days`, 7 by default), for the page's 24 h and 7 d views,
+// and each quarter hour's in a -15m file beside it: appended, never
+// rewritten, whole days deleted when they're too old.
+// It only reads and measures.
+'use strict';
+
+import { cursor } from 'uci';
+import { readfile, writefile, rename, mkdir, popen, open, lsdir, unlink } from 'fs';
+
+let resolv = null;
+try {
+	resolv = require('resolv');
+}
+catch (e) {
+	// falls back to timing nslookup
+}
+
+const DIR = '/tmp/milkflint';
+const STATE = DIR + '/netquality.json';
+const HISTORY = '/root/milkflint-netquality';	// <YYYY-MM-DD>.jsonl, UTC days
+const ROUTE_EVERY = 60;		// s between route pings
+const RESOLVE_EVERY = 3600;	// s before a route's address is looked up again
+// Vultr's hosts for latency tests (https://www.vultr.com/resources/faq/#downloadspeedtests)
+const ROUTES = [
+	{ key: 'uk', label: 'UK', host: 'lon-gb-ping.vultr.com' },
+	{ key: 'eu', label: 'Europe', host: 'fra-de-ping.vultr.com' },
+	{ key: 'us', label: 'US', host: 'nj-us-ping.vultr.com' }
+];
+
+function settings() {
+	const s = cursor().get_all('milkflint', 'netquality') ?? {};
+	const interval = int(s.interval ?? 5);
+	const days = int(s.history_days ?? 7);
+	return {
+		interval: (interval >= 2 && interval <= 300) ? interval : 5,
+		history_days: (days >= 0 && days <= 31) ? days : 7,
+		ping_target: s.ping_target ?? '1.1.1.1',
+		dns_domain: s.dns_domain ?? 'openwrt.org',
+		routes: (s.routes ?? '1') == '1'
+			? map(ROUTES, (r) => ({ ...r, host: s[`route_${r.key}`] ?? r.host }))
+			: []
+	};
+}
+
+function now_ms() {
+	const t = clock(true);
+	return t[0] * 1000 + t[1] / 1000000.0;
+}
+
+function shellquote(s) {
+	return "'" + replace(s, "'", "'\\''") + "'";
+}
+
+// a running `ping -c 1` (read it with ping_result), or null
+function ping_start(host, timeout) {
+	if (!host || !match(host, /^[A-Za-z0-9.:-]+$/))
+		return null;
+	return popen(`ping -c 1 -W ${timeout} ${shellquote(host)} 2>/dev/null`, 'r');
+}
+
+// its round-trip time in ms, or null when there's no answer
+function ping_result(fd) {
+	if (!fd)
+		return null;
+	const out = fd.read('all');
+	fd.close();
+	const m = match(out, /time=([0-9.]+) ?ms/);
+	return m ? +m[1] : null;
+}
+
+function ping(host, timeout) {
+	return ping_result(ping_start(host, timeout));
+}
+
+// a host name's IPv4 address through the router's own resolver, or null
+function resolve(host) {
+	if (match(host, /^[0-9.]+$/))
+		return host;
+	if (!match(host, /^[A-Za-z0-9.-]+$/))
+		return null;
+	if (resolv) {
+		const r = resolv.query([ host ], { type: [ 'A' ], timeout: 2000 });
+		return r?.[host]?.A?.[0] ?? null;
+	}
+	const fd = popen(`nslookup ${shellquote(host)} 2>/dev/null`, 'r');
+	const out = fd ? fd.read('all') : '';
+	if (fd)
+		fd.close();
+	const m = match(out, /\nAddress( 1)?: ([0-9.]+)\n/);
+	return m ? m[2] : null;
+}
+
+// host: { addr, next }: looked up again after an hour, or a minute after a
+// failed lookup; an address that stops resolving is kept, so a DNS fault
+// shows in the DNS probe, not as routes lost
+let addrs = {};
+function route_addr(host) {
+	const c = addrs[host];
+	if (c == null || time() >= c.next) {
+		const a = resolve(host);
+		addrs[host] = { addr: a ?? c?.addr, next: time() + (a != null ? RESOLVE_EVERY : 60) };
+	}
+	return addrs[host].addr;
+}
+
+// one ping to each route's server, all at once: { uk: ms|null, ... }
+function route_round(routes) {
+	const fds = map(routes, (r) => ping_start(route_addr(r.host), 2));
+	const got = {};
+	for (let i, r in routes)
+		got[r.key] = ping_result(fds[i]);
+	return got;
+}
+
+// IPv4 default gateway, from the kernel's routing table
+function gateway() {
+	for (let line in split(readfile('/proc/net/route') ?? '', '\n')) {
+		const f = split(line, '\t');
+		if (length(f) > 7 && f[1] == '00000000' && f[7] == '00000000' && f[2] != '00000000') {
+			const h = f[2];
+			return sprintf('%d.%d.%d.%d', hex(substr(h, 6, 2)), hex(substr(h, 4, 2)), hex(substr(h, 2, 2)), hex(substr(h, 0, 2)));
+		}
+	}
+	return null;
+}
+
+// the first upstream resolver the WAN connection gave us (else dnsmasq)
+function dns_server() {
+	for (let line in split(readfile('/tmp/resolv.conf.d/resolv.conf.auto') ?? '', '\n')) {
+		const m = match(line, /^nameserver ([0-9.]+)/);
+		if (m)
+			return m[1];
+	}
+	return '127.0.0.1';
+}
+
+// time to resolve `domain` at `server`, in ms, or null on failure
+function dns_lookup(domain, server) {
+	if (!match(domain, /^[A-Za-z0-9.-]+$/))
+		return null;
+	const t0 = now_ms();
+	let ok = false;
+	if (resolv) {
+		const r = resolv.query([ domain ], { type: [ 'A' ], nameserver: [ server ], timeout: 2000 });
+		ok = length(r?.[domain]?.A ?? []) > 0;
+	}
+	else {
+		const fd = popen(`nslookup ${shellquote(domain)} ${shellquote(server)} 2>/dev/null`, 'r');
+		const out = fd ? fd.read('all') : '';
+		if (fd)
+			fd.close();
+		ok = match(out, /Name:/) != null;
+	}
+	return ok ? now_ms() - t0 : null;
+}
+
+// a probe's values over a minute: [typical (median), worst, lost, rounds],
+// times to 0.1 ms; null when it wasn't measured
+function minute_stat(values) {
+	if (!length(values))
+		return null;
+	const got = sort(filter(values, (v) => v != null), (a, b) => a - b);
+	const r1 = (v) => int(v * 10 + 0.5) / 10.0;
+	return length(got)
+		? [ r1(got[int((length(got) - 1) / 2)]), r1(got[-1]), length(values) - length(got), length(values) ]
+		: [ null, null, length(values), length(values) ];
+}
+
+function day_name(t) {
+	const d = gmtime(t);
+	return sprintf('%04d-%02d-%02d', d.year, d.mon, d.mday);
+}
+
+// minute stats merged (as rpcd.uc's merge(): keep the two alike): the
+// median of the typicals, the worst worst, losses and rounds added up
+function merge(stats) {
+	stats = filter(stats, (x) => x != null);
+	if (!length(stats))
+		return null;
+	const typ = sort(filter(map(stats, (x) => x[0]), (v) => v != null), (a, b) => a - b);
+	const worst = filter(map(stats, (x) => x[1]), (v) => v != null);
+	let lost = 0, rounds = 0;
+	for (let x in stats) {
+		lost += x[2];
+		rounds += x[3];
+	}
+	return [ length(typ) ? typ[int((length(typ) - 1) / 2)] : null, length(worst) ? max(...worst) : null, lost, rounds ];
+}
+
+function append(path, line) {
+	const fd = open(path, 'a');
+	if (fd) {
+		// numbers and fixed keys only, so without %J's spaces (~140 B a line)
+		fd.write(replace(sprintf('%J', line), / /g, '') + '\n');
+		fd.close();
+	}
+}
+
+// the minutes of the quarter hour so far, summed up in <day>-15m.jsonl
+// when it ends: the 7-day view reads ~700 of those, not ~10,000 minutes,
+// which would take seconds on the router
+let quarter = null, quarter_minutes = [];
+function record_quarter(line) {
+	const q = line.t - line.t % 900;
+	if (quarter != null && q != quarter && length(quarter_minutes)) {
+		const ql = { t: quarter, internet: merge(map(quarter_minutes, (m) => m.internet)), dns: merge(map(quarter_minutes, (m) => m.dns)) };
+		const gw = merge(map(quarter_minutes, (m) => m.gateway));
+		if (gw != null)
+			ql.gateway = gw;
+		const routes = {};
+		for (let m in quarter_minutes)
+			for (let k, v in m.routes ?? {})
+				push(routes[k] ??= [], v);
+		if (length(routes)) {
+			ql.routes = {};
+			for (let k, v in routes)
+				ql.routes[k] = merge(v);
+		}
+		append(`${HISTORY}/${day_name(quarter)}-15m.jsonl`, ql);
+	}
+	if (q != quarter)
+		quarter_minutes = [];
+	quarter = q;
+	push(quarter_minutes, line);
+}
+
+// one line for the minute starting at `t`, then the day files older than
+// `days` deleted
+function record_minute(t, rounds, s, with_gateway) {
+	const line = {
+		t,
+		internet: minute_stat(map(rounds, (r) => r.internet)),
+		dns: minute_stat(map(rounds, (r) => r.dns))
+	};
+	if (with_gateway)
+		line.gateway = minute_stat(map(rounds, (r) => r.gateway));
+	const routed = filter(rounds, (r) => r.routes != null);
+	if (length(routed)) {
+		line.routes = {};
+		for (let rt in s.routes)
+			line.routes[rt.key] = minute_stat(map(routed, (r) => r.routes[rt.key]));
+	}
+	mkdir(HISTORY);
+	append(`${HISTORY}/${day_name(t)}.jsonl`, line);
+	record_quarter(line);
+	// the day `days` ago stays too, so a full `days` × 24 h are always there
+	const oldest = day_name(t - s.history_days * 86400);
+	for (let f in lsdir(HISTORY) ?? [])
+		if (match(f, /^[0-9-]{10}(-15m)?\.jsonl$/) && substr(f, 0, 10) < oldest)
+			unlink(`${HISTORY}/${f}`);
+}
+
+mkdir(DIR);
+let samples = [];
+let minute = null, minute_rounds = [];	// the rounds of the minute so far
+// the gateway we ping, and whether it has answered since this started (or
+// since the gateway changed; kept when this starts again)
+let gw_addr = null, gw_answers = false;
+let route_at = 0;	// when the routes were last pinged
+try {
+	const prev = json(readfile(STATE) ?? 'null');
+	if (type(prev?.samples) == 'array')
+		samples = prev.samples;
+	if (prev?.targets?.gateway != null && prev?.gateway_answers == true) {
+		gw_addr = prev.targets.gateway;
+		gw_answers = true;
+	}
+}
+catch (e) {
+	// start fresh
+}
+
+while (true) {
+	const s = settings();
+	const keep = int(3600 / s.interval);
+	const started = now_ms();
+	const gw = gateway();
+	const ns = dns_server();
+	if (gw != null && gw != gw_addr) {
+		gw_addr = gw;
+		gw_answers = false;
+	}
+
+	const gw_ms = ping(gw, 1);
+	if (gw_ms != null)
+		gw_answers = true;
+	const sample = {
+		t: time(),
+		gateway: gw_ms,
+		internet: ping(s.ping_target, 2),
+		dns: dns_lookup(s.dns_domain, ns)
+	};
+	if (length(s.routes) && sample.t - route_at >= ROUTE_EVERY) {
+		route_at = sample.t;
+		sample.routes = route_round(s.routes);
+	}
+	push(samples, sample);
+	const m = sample.t - sample.t % 60;
+	if (minute != null && m != minute && s.history_days > 0)
+		record_minute(minute, minute_rounds, s, gw_answers);
+	if (m != minute)
+		minute_rounds = [];
+	minute = m;
+	push(minute_rounds, sample);
+	if (length(samples) > keep)
+		samples = slice(samples, length(samples) - keep);
+
+	writefile(STATE + '.tmp', sprintf('%J', {
+		interval: s.interval,
+		targets: {
+			gateway: gw, internet: s.ping_target, dns_server: ns, dns_domain: s.dns_domain,
+			routes: map(s.routes, (r) => ({ key: r.key, label: r.label, host: r.host, addr: addrs[r.host]?.addr }))
+		},
+		resolver: resolv ? 'resolv' : 'nslookup',
+		gateway_answers: (gw != null) ? gw_answers : null,
+		samples
+	}));
+	rename(STATE + '.tmp', STATE);
+
+	const wait = s.interval * 1000 - (now_ms() - started);
+	if (wait > 0)
+		sleep(int(wait));
+}

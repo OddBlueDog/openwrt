@@ -1,0 +1,58 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] select_cake: use_mq_egress for the interface itself
+
+use_mq picks cake_mq for both directions. Some drivers send everything on
+one queue of several (mtk_eth: one per MAC), so egress cake_mq runs one
+busy sub-cake beside idle ones that cost memory (~1 MiB each) and a resync
+for nothing. use_mq_egress (default: use_mq) chooses for the interface's
+own qdisc; the ingress ifb still follows use_mq.
+
+diff --git a/src/defaults.sh b/src/defaults.sh
+index eb7cb07..aff6fb7 100644
+--- a/src/defaults.sh
++++ b/src/defaults.sh
+@@ -20,6 +20,8 @@
+ [ -z "$IECN" ] && IECN="ECN"
+ [ -z "$EECN" ] && EECN="ECN"
+ [ -z "$USE_MQ" ] && USE_MQ=0
++# egress only: some drivers send everything on one queue (MilkFlint)
++[ -z "$USE_MQ_EGRESS" ] && USE_MQ_EGRESS=$USE_MQ
+ # These two used to be called something else; preserve backwards compatibility
+ [ -z "$ZERO_DSCP_INGRESS" ] && ZERO_DSCP_INGRESS="${ZERO_DSCP:-${SQUASH_DSCP:-1}}"
+ [ -z "$IGNORE_DSCP_INGRESS" ] && IGNORE_DSCP_INGRESS="${IGNORE_DSCP:-${SQUASH_INGRESS:-1}}"
+diff --git a/src/functions.sh b/src/functions.sh
+index 43d5d5c..201ecfb 100644
+--- a/src/functions.sh
++++ b/src/functions.sh
+@@ -885,12 +885,18 @@ select_cake() {
+     local interface
+     local num_queues
+     local qdisc
++    local use_mq
+     interface=$1
+     num_queues=$(ls -d /sys/class/net/$interface/queues/tx-* | wc -l)
+     qdisc=cake
+ 
++    # use_mq_egress: the interface's own (egress) qdisc, when its driver
++    # sends on fewer queues than it has; ingress (the ifb) follows use_mq
++    use_mq=$USE_MQ
++    [ "$interface" = "$IFACE" ] && use_mq=$USE_MQ_EGRESS
++
+     # cake_mq only works on multiqueue devices
+-    if [ "$USE_MQ" -eq "1" ] && [ "$num_queues" -gt "1" ] && verify_qdisc cake_mq; then
++    if [ "$use_mq" -eq "1" ] && [ "$num_queues" -gt "1" ] && verify_qdisc cake_mq; then
+         qdisc=cake_mq
+     fi
+ 
+diff --git a/src/run-openwrt.sh b/src/run-openwrt.sh
+index d735a2f..50f14a5 100644
+--- a/src/run-openwrt.sh
++++ b/src/run-openwrt.sh
+@@ -67,6 +67,7 @@ start_sqm_section() {
+     export QDISC=$(config_get "$section" qdisc)
+     export SCRIPT=$(config_get "$section" script)
+     export USE_MQ=$(config_get "$section" use_mq)
++    export USE_MQ_EGRESS=$(config_get "$section" use_mq_egress)
+ 
+     # The UCI names for these two variables are confusing and should have been
+     # changed ages ago. For now, keep the bad UCI names but use meaningful

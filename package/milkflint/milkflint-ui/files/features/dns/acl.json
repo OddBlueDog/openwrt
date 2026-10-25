@@ -1,0 +1,12 @@
+{
+	"milkflint-dns": {
+		"description": "MilkFlint web interface: DNS",
+		"read": {
+			"ubus": { "milkflint.dns": [ "status" ] },
+			"uci": [ "dhcp", "dnsproxy", "firewall", "milkflint" ]
+		},
+		"write": {
+			"uci": [ "dhcp", "dnsproxy", "firewall", "milkflint" ]
+		}
+	}
+}

@@ -1,0 +1,12 @@
+{
+	"milkflint-data-statistics": {
+		"description": "MilkFlint web interface: Data Statistics",
+		"read": {
+			"ubus": { "milkflint.traffic": [ "periods", "usage" ] },
+			"uci": [ "nlbwmon", "milkflint" ]
+		},
+		"write": {
+			"uci": [ "nlbwmon", "milkflint" ]
+		}
+	}
+}

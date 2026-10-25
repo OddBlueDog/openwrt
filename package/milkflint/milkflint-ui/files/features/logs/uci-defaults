@@ -1,0 +1,27 @@
+#!/bin/sh
+# Logs defaults: the Wi-Fi log on, in RAM, sampling every 10 s, with
+# everything it adds to the devices' lines (channel use, MU/OFDMA, 802.11k,
+# Network Quality; an older config without these options has them on too);
+# the radar log on; the logs kept across reboots only once that's turned
+# on; 3 MB per log. The debug log's counters and snapshots are off: they're
+# for chasing a dropout.
+[ -f /etc/config/milkflint ] || touch /etc/config/milkflint
+if ! uci -q get milkflint.logs > /dev/null; then
+	uci -q batch <<-UCI
+		set milkflint.logs=logs
+		set milkflint.logs.persist='0'
+		set milkflint.logs.size='3'
+		set milkflint.logs.wifi='1'
+		set milkflint.logs.wifi_interval='10'
+		set milkflint.logs.wifi_channel='1'
+		set milkflint.logs.wifi_mu='1'
+		set milkflint.logs.wifi_rrm='1'
+		set milkflint.logs.wifi_net='1'
+		set milkflint.logs.radar='1'
+		set milkflint.logs.debug_counters='0'
+		set milkflint.logs.debug_snapshot='0'
+		commit milkflint
+	UCI
+fi
+/etc/init.d/milkflint-logs enable
+exit 0

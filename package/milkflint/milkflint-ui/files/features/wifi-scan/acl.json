@@ -1,0 +1,11 @@
+{
+	"milkflint-wifi-scan": {
+		"description": "MilkFlint web interface: nearby Wi-Fi networks",
+		"read": {
+			"ubus": { "milkflint.wifiscan": [ "results" ] }
+		},
+		"write": {
+			"ubus": { "milkflint.wifiscan": [ "start" ] }
+		}
+	}
+}

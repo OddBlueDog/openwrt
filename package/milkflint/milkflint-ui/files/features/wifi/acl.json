@@ -1,0 +1,8 @@
+{
+	"milkflint-wifi": {
+		"description": "MilkFlint web interface: Wi-Fi",
+		"read": {
+			"ubus": { "milkflint.wifi": [ "dfs", "radar", "regulatory", "countries", "beamforming" ] }
+		}
+	}
+}

@@ -1,0 +1,143 @@
+#!/bin/sh
+# How the internet port groups what it receives (GRO), from the Performance
+# Tuning page's settings, all optional (unset: automatic):
+#
+#   milkflint.gro.mode      fraglist | plain | off
+#   milkflint.gro.udp_fwd   1 | 0     UDP GRO forwarding (rx-udp-gro-forwarding)
+#   milkflint.gro.max_size  bytes     the largest plain GRO packet (gro_max_size)
+#
+# Automatic is OpenWrt's fraglist GRO, except when the download CAKE takes
+# GRO packets whole (no-split-gso in sqm's iqdisc_opts) and software flow
+# offloading is off: then plain GRO with UDP GRO forwarding. With offloading
+# on, plain GRO saves nothing on TCP and costs more on UDP, since the Wi-Fi
+# port copies and checksums plain GRO packets apart where it only unchains
+# fraglist ones; with offloading off, plain GRO takes less CPU on TCP.
+# UDP GRO forwarding is on with plain GRO unless set:
+# fraglist GRO groups forwarded UDP (QUIC) anyway, plain GRO only with it.
+# max_size only applies to plain GRO: fraglist GRO always groups up to 64 KB.
+#
+# The port is the one Smart Queue shapes for the internet (not a guest
+# network's), or the wan interface's device without Smart Queue, followed
+# down to its hardware port (eth1 under a VLAN). A port that stops being it
+# gets OpenWrt's defaults back. Everything is ethtool -K and ip link set:
+# nothing goes down. milkflint-tuning runs this when the settings, sqm or
+# the firewall change.
+#
+#   gro          put the settings into effect
+#   gro show     print what they resolve to, one line per port:
+#                dev=eth1 mode=fraglist auto=fraglist udp=0 max=65536 whole=1 offload=1
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+STATE=/var/run/milkflint-tuning/gro.ports
+MAX=65536
+
+# <dev>: the device under it with hardware (a VLAN's port), or itself; a
+# device over several (a bridge) stays itself
+lowest() {
+	local dev=$1 lower i=0
+	while [ $i -lt 4 ]; do
+		lower=$(ls -d /sys/class/net/$dev/lower_* 2> /dev/null)
+		[ -n "$lower" ] && [ "$(echo "$lower" | wc -l)" -eq 1 ] || break
+		dev=${lower##*/lower_}
+		i=$((i + 1))
+	done
+	echo "$dev"
+}
+
+# <dev>: it, or what's under it, has hardware (not pppoe-wan, not a tunnel)
+has_hw() {
+	[ -e "/sys/class/net/$1/device" ] || [ -n "$(ls -d /sys/class/net/$1/lower_* 2> /dev/null)" ]
+}
+
+is_guest() {
+	case "$1" in br-guest* | ifb4br-guest*) return 0 ;; esac
+	return 1
+}
+
+# sqm queue sections: the internet one that's on sets $queue_dev and $whole
+find_queue() {
+	local iface enabled opts
+	config_get iface "$1" interface
+	config_get enabled "$1" enabled 0
+	config_get opts "$1" iqdisc_opts
+	[ -n "$iface" ] && [ "$enabled" = 1 ] && ! is_guest "$iface" && [ -z "$queue_dev" ] || return 0
+	queue_dev=$iface
+	case " $opts " in *" no-split-gso "*) whole=1 ;; esac
+}
+
+offload_on() {
+	local sw hw
+	sw=$(uci -q get firewall.@defaults[0].flow_offloading)
+	hw=$(uci -q get firewall.@defaults[0].flow_offloading_hw)
+	[ "$sw" = 1 ] || [ "$hw" = 1 ]
+}
+
+# prints "dev mode auto udp max whole offload" for the internet port
+resolve() {
+	local queue_dev= whole=0 offload=0 dev mode auto udp max
+	config_load sqm
+	config_foreach find_queue queue
+	dev=$queue_dev
+	if [ -z "$dev" ] || ! has_hw "$dev"; then
+		# no Smart Queue, or it shapes a device without hardware (pppoe-wan)
+		network_get_physdev dev wan 2> /dev/null || dev=
+		[ -n "$dev" ] || dev=$queue_dev
+	fi
+	[ -n "$dev" ] || return 0
+	dev=$(lowest "$dev")
+	[ -d "/sys/class/net/$dev" ] || return 0
+	offload_on && offload=1
+	if [ "$whole" = 1 ] && [ "$offload" = 0 ]; then auto=plain; else auto=fraglist; fi
+	mode=$(uci -q get milkflint.gro.mode)
+	case "$mode" in fraglist | plain | off) ;; *) mode=$auto ;; esac
+	udp=$(uci -q get milkflint.gro.udp_fwd)
+	case "$udp" in 0 | 1) ;; *) [ "$mode" = plain ] && udp=1 || udp=0 ;; esac
+	max=$(uci -q get milkflint.gro.max_size)
+	case "$max" in
+	'' | *[!0-9]*) max=$MAX ;;
+	*) { [ "$max" -ge 4096 ] && [ "$max" -le $MAX ]; } || max=$MAX ;;
+	esac
+	echo "$dev $mode $auto $udp $max $whole $offload"
+}
+
+onoff() { [ "$1" = 1 ] && echo on || echo off; }
+
+# <dev> <mode> <udp> <max>
+set_port() {
+	local dev=$1 mode=$2 udp=$3 max=$4 list=on gro=on
+	case "$mode" in
+	plain) list=off ;;
+	off) gro=off ;;
+	esac
+	# one feature per call: a driver refusing one mustn't stop the others
+	if command -v ethtool > /dev/null; then
+		ethtool -K "$dev" gro "$gro" 2> /dev/null
+		ethtool -K "$dev" rx-gro-list "$list" 2> /dev/null
+		ethtool -K "$dev" rx-udp-gro-forwarding "$(onoff "$udp")" 2> /dev/null
+	fi
+	ip link set dev "$dev" gro_max_size "$max" gro_ipv4_max_size "$max" 2> /dev/null
+	return 0
+}
+
+if [ "$1" = show ]; then
+	set -- $(resolve)
+	[ $# -eq 7 ] && echo "dev=$1 mode=$2 auto=$3 udp=$4 max=$5 whole=$6 offload=$7"
+	exit 0
+fi
+
+set -- $(resolve)
+# a port that's no longer the internet's gets OpenWrt's defaults back
+for old in $(cat "$STATE" 2> /dev/null); do
+	[ "$old" = "$1" ] || [ ! -d "/sys/class/net/$old" ] || set_port "$old" fraglist 0 $MAX
+done
+mkdir -p "${STATE%/*}"
+if [ $# -eq 7 ]; then
+	set_port "$1" "$2" "$4" "$5"
+	echo "$1" > "$STATE"
+	logger -t milkflint-tuning "GRO on $1: $2 (automatic: $3), UDP GRO forwarding $(onoff "$4"), up to $5 bytes"
+else
+	: > "$STATE"
+fi
+exit 0

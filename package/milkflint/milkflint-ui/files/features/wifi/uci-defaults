@@ -1,0 +1,16 @@
+#!/bin/sh
+# Wi-Fi country GB on a fresh install (or a factory reset): without one,
+# OpenWrt uses the world rules and 5 GHz may refuse to start. Only on
+# radios with no country (or "00", the world rules), so a country chosen
+# on the Wi-Fi page stays. Wi-Fi itself stays off until it's set up.
+# `wifi config` first: it writes the radios' config if it isn't there yet
+# (it only adds radios that are missing).
+wifi config > /dev/null 2>&1
+for radio in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+	country=$(uci -q get "wireless.$radio.country")
+	if [ -z "$country" ] || [ "$country" = 00 ]; then
+		uci set "wireless.$radio.country=GB"
+	fi
+done
+uci commit wireless
+exit 0

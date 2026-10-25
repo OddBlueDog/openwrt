@@ -1,0 +1,38 @@
+#!/bin/sh
+# Watchdog for radar-scan (ui feature "radar-scan"), which takes the 5 GHz
+# network down while it listens for radar. If the scan's process dies, or
+# is still running once DEADLINE (unix time) has passed, this ends it,
+# removes its listening interface and brings the radio's network back.
+# radar-scan starts it, detached, before it touches anything.
+#   radar-scan-watchdog PID DEADLINE RADIO
+PID=$1
+DEADLINE=$2
+RADIO=$3
+STATE=/tmp/milkflint/radar-scan.json
+
+finished() {
+	[ "$(jsonfilter -i "$STATE" -e @.state 2> /dev/null)" = done ]
+}
+
+while sleep 5; do
+	finished && exit 0
+	kill -0 "$PID" 2> /dev/null && [ "$(date +%s)" -lt "$DEADLINE" ] && continue
+	kill "$PID" 2> /dev/null
+	sleep 2
+	finished && exit 0
+	ip link set radarscan0 down 2> /dev/null
+	iw dev radarscan0 del 2> /dev/null
+	wifi up "$RADIO"
+	logger -t radar-scan "radarscan0: DFS-SCAN-END result=stopped reason=watchdog"
+	logger -t radar-scan "radar scan ended by its watchdog: $RADIO back on"
+	ucode -e "
+		import { readfile, writefile } from 'fs';
+		let s = json(readfile('$STATE') ?? '{}') ?? {};
+		s.state = 'done'; s.ended = time(); s.error = 'the scan stopped unexpectedly, and its watchdog brought 5 GHz back';
+		for (let b in s.blocks ?? [])
+			if (b.status == 'listening' || b.status == 'waiting')
+				b.status = 'stopped';
+		writefile('$STATE', sprintf('%J', s));
+	"
+	exit 0
+done

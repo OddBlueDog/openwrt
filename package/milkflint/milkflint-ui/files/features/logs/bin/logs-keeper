@@ -1,0 +1,1601 @@
+#!/usr/bin/ucode
+// MilkFlint log keeper (procd service milkflint-logs, ui feature "logs").
+// Follows the system log and keeps up to three logs, as milkflint.logs says
+// (the init script passes the settings as arguments, e.g. persist=1 wifi=1
+// channel=1 mu=1 rrm=1 net=1 counters=0 snapshot=0 size=3 interval=10):
+// - persist=1: the whole system log, the kernel's lines included, in
+//   /root/milkflint-logs/system.log, so a reboot or a crash doesn't lose it
+//   (logd only keeps a small buffer in RAM);
+// - wifi=1: the Wi-Fi log, wifi.log: the system log's Wi-Fi lines (hostapd,
+//   the driver and mac80211, kernel warnings, MilkFlint's Wi-Fi
+//   services), and every `interval` seconds a line per device that sent or
+//   received anything (every device once a minute): signal, packets,
+//   retries, failures, rates, the airtime queued for it and the airtime it
+//   used, and with the MilkFlint driver how much of the time it slept (the
+//   firmware's power save reports). For each radio with such a device, how
+//   busy the channel was and with what. Also the Network Quality probe's
+//   rounds since the last line, each radio once a minute (with its TWT
+//   agreements, and its MU/OFDMA and beamforming counters over the minute),
+//   and the firmware's error counters when they change. A device that has a
+//   hard time (no tx, failures, retries, a legacy rate) is asked how it
+//   hears us, at most once a minute (every 10 minutes when it's fine): an
+//   802.11k link measurement, or a beacon report from its scan table,
+//   whichever it supports; its answer is a line of its own. Four of these
+//   can be left out (each on unless its argument is 0): channel= how busy
+//   the channel was (a firmware query per radio each sample), mu= the
+//   MU/OFDMA and beamforming counters, rrm= the 802.11k requests, net= the
+//   Network Quality rounds;
+// - counters=1, snapshot=1 (debug_counters, debug_snapshot: off unless a
+//   dropout is being chased): the debug log, debug.log. counters=1 adds
+//   every `interval` seconds the load and the packets at each hop (CPU and
+//   softirqs per core, the network threads, interrupts, CAKE on eth1 and
+//   ifb4eth1, eth1's BQL, packets per interface), and once a minute the
+//   ceilings (conntrack, memory), eth1's link, the WAN and restarts of
+//   netifd, hostapd, dnsmasq and dnsproxy. snapshot=1 records everything at
+//   once, at most once a minute, when a Network Quality round loses the
+//   internet or DNS or a device gets NO TX.
+// The logs are on the router's storage with persist=1, else in RAM
+// (/tmp/milkflint-logs). Each log keeps up to `size` MB: at half that the
+// file becomes <file>.old, replacing the older half. It only reads, apart
+// from those measurement requests (one small frame each, which hostapd
+// sends): nothing here changes Wi-Fi or the network.
+'use strict';
+
+import { open, stat, rename, mkdir, readfile, writefile, popen, glob, unlink } from 'fs';
+import { connect } from 'ubus';
+
+const DISK = '/root/milkflint-logs';
+const RAM = '/tmp/milkflint-logs';
+const STATE = RAM + '/keeper.json';
+const DEBUGFS = '/sys/kernel/debug/ieee80211';
+const NETQUALITY = '/tmp/milkflint/netquality.json';
+
+const args = {};
+for (let a in ARGV) {
+	const m = match(a, /^([a-z]+)=(.*)$/);
+	if (m)
+		args[m[1]] = m[2];
+}
+
+function setting(name, fallback, lo, hi) {
+	const v = int(args[name] ?? fallback);
+	return (v >= lo && v <= hi) ? v : fallback;
+}
+
+const PERSIST = args.persist == '1';
+const WIFI = args.wifi == '1';
+const CHANNEL = WIFI && args.channel != '0';
+const MU = WIFI && args.mu != '0';
+const RRM = WIFI && args.rrm != '0';
+const NET = WIFI && args.net != '0';
+const COUNTERS = args.counters == '1';
+const SNAPSHOT = args.snapshot == '1';
+const SAMPLING = WIFI || COUNTERS || SNAPSHOT;
+const HALF = setting('size', 3, 1, 100) * 1024 * 1024 / 2;
+const INTERVAL = setting('interval', 10, 2, 300);
+const DIR = PERSIST ? DISK : RAM;
+const START_MS = time() * 1000;
+
+// ---- the log files -------------------------------------------------------
+
+// Appends lines, moving the file to <path>.old once it reaches HALF bytes.
+function logfile(path) {
+	let fd = null, size = 0;
+	return {
+		write: function(line) {
+			if (fd == null) {
+				fd = open(path, 'a');
+				if (fd == null)
+					return;
+				size = stat(path)?.size ?? 0;
+			}
+			if (size > 0 && size + length(line) + 1 > HALF) {
+				fd.close();
+				rename(path, path + '.old');
+				fd = open(path, 'a');
+				size = 0;
+				if (fd == null)
+					return;
+			}
+			fd.write(line + '\n');
+			fd.flush();
+			size += length(line) + 1;
+		}
+	};
+}
+
+// by localtime()'s wday % 7: ucode counts Monday 1 to Sunday 7
+const DAYS = [ 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat' ];
+const MONTHS = [ 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec' ];
+
+// the time as logread writes it (ctime), so both kinds of line read alike
+function stamp() {
+	const t = localtime();
+	return sprintf('%s %s %2d %02d:%02d:%02d %d', DAYS[t.wday % 7], MONTHS[t.mon - 1], t.mday, t.hour, t.min, t.sec, t.year);
+}
+
+// "1h 05m", "3m 20s"
+function span(s) {
+	return (s >= 3600) ? sprintf('%dh %02dm', s / 3600, (s % 3600) / 60) : sprintf('%dm %02ds', s / 60, s % 60);
+}
+
+function uptime() {
+	return span(int(split(readfile('/proc/uptime') ?? '0', ' ')[0]));
+}
+
+mkdir(RAM);
+if (PERSIST)
+	mkdir(DISK);
+
+// What each file already has from this boot (/tmp goes with a reboot), by
+// path: the time of its last line from logread, so a restart (or switching
+// persist off and on again) doesn't write the RAM buffer into it again.
+let state = {};
+try {
+	state = json(readfile(STATE) ?? '{}') ?? {};
+}
+catch (e) {
+	state = {};
+}
+
+function target(path) {
+	const fresh = (type(state[path]) != 'int');
+	if (fresh)
+		state[path] = 0;
+	return { path, file: logfile(path), since: state[path], fresh };
+}
+
+function save_state() {
+	writefile(STATE + '.tmp', sprintf('%J', state));
+	rename(STATE + '.tmp', STATE);
+}
+
+const system_log = PERSIST ? target(DISK + '/system.log') : null;
+const wifi_log = WIFI ? target(DIR + '/wifi.log') : null;
+const debug_log = (COUNTERS || SNAPSHOT) ? target(DIR + '/debug.log') : null;
+save_state();
+
+if (system_log?.fresh)
+	system_log.file.write(`${stamp()} user.notice milkflint-logs: ---- recording started, router up ${uptime()}; the lines of this boot still in RAM follow ----`);
+if (wifi_log) {
+	const off = filter([ CHANNEL ? null : 'channel use', MU ? null : 'MU/OFDMA', RRM ? null : '802.11k', NET ? null : 'Network Quality' ], (x) => x != null);
+	wifi_log.file.write(`${stamp()} user.notice milkflint-logs: ---- recording ${wifi_log.fresh ? 'started' : 'again'}, router up ${uptime()}: Wi-Fi events, and devices every ${INTERVAL} s` +
+		(length(off) ? ` (without ${join(', ', off)})` : '') + ' ----');
+}
+if (debug_log)
+	debug_log.file.write(`${stamp()} user.notice milkflint-logs: ---- recording ${debug_log.fresh ? 'started' : 'again'}, router up ${uptime()}: ` +
+		join(', and ', filter([ COUNTERS ? `counters every ${INTERVAL} s` : null, SNAPSHOT ? 'a snapshot when the internet, DNS or a device stops' : null ], (x) => x != null)) + ' ----');
+
+// ---- which system log lines are Wi-Fi lines ------------------------------
+
+const WIFI_KERNEL = /mt79|mt76|ieee80211|cfg80211|mac80211|phy[0-9]|wlan|-ap[0-9]|hostapd|wifi/i;
+let trace = 0;	// lines left of a kernel warning's dump
+// hostapd's beacon report lines since the last sample, for rrm_replies()
+let beacon_lines = [];
+
+// `rest`: a logread line after its time, "kern.warn kernel: [ 12.3] mt7915e ..."
+function is_wifi(rest) {
+	const m = match(rest, /^[a-z0-9]+\.[a-z]+ ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
+	if (!m)
+		return false;
+	const tag = m[1], msg = m[3];
+	if (tag == 'kernel') {
+		// a warning's whole dump, whatever its subsystem: the stack says whose
+		if (match(msg, /cut here|WARNING:|BUG:|Oops|Unable to handle/)) {
+			trace = 80;
+			return true;
+		}
+		if (trace > 0) {
+			trace = match(msg, /end trace/) ? 0 : trace - 1;
+			return true;
+		}
+		return match(msg, WIFI_KERNEL) != null;
+	}
+	// what our link measurement requests make hostapd say: the replies go
+	// to its ubus subscribers (rrm_events() below), not its own request
+	if (tag == 'hostapd' && match(msg, /^Unexpected Link measurement report/))
+		return false;
+	if (match(tag, /^(hostapd|wpa_supplicant|milkflint-wifi|milkflint-tuning)/))
+		return true;
+	if (tag == 'netifd')
+		return match(msg, /radio[0-9]|[Ww]ireless|phy[0-9]|-ap[0-9]/) != null;
+	return false;
+}
+
+// System log lines the debug counters copy, highlighted: services starting
+// again, the WAN going down or up, eth1's link.
+function notable(rest) {
+	const m = match(rest, /^[a-z0-9]+\.[a-z]+ ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
+	if (!m)
+		return false;
+	const tag = m[1], msg = m[3];
+	if (tag == 'procd')
+		return match(msg, /crash loop|Instance (network|wpad|hostapd|dnsmasq|dnsproxy)/) != null;
+	if (tag == 'netifd')
+		return match(msg, /Interface 'wan6?' /) != null;
+	if (tag == 'kernel')
+		return match(msg, /eth1: Link is/) != null;
+	if (tag == 'dnsmasq')
+		return match(msg, /^started, version/) != null;
+	if (tag == 'dnsproxy')
+		return match(msg, /dnsproxy starting/) != null;
+	if (tag == 'hostapd')
+		return match(msg, /AP-DISABLED|AP-ENABLED/) != null;
+	return false;
+}
+
+// one line from `logread -f -t`: "<ctime> [<epoch>.<ms>] <facility.level> <tag>: <message>"
+function on_log_line(line) {
+	const m = match(line, /^(.{24}) \[([0-9]+)\.([0-9]+)\] (.*)$/);
+	if (!m) {
+		system_log?.file.write(line);
+		return;
+	}
+	const ms = int(m[2]) * 1000 + int(m[3]);
+	const text = m[1] + ' ' + m[4];
+	let wrote = false;
+	if (system_log && ms > system_log.since) {
+		system_log.file.write(text);
+		state[system_log.path] = ms;
+		wrote = true;
+	}
+	if (wifi_log && is_wifi(m[4]) && ms > wifi_log.since) {
+		wifi_log.file.write(text);
+		state[wifi_log.path] = ms;
+		wrote = true;
+		if (RRM && index(m[4], 'BEACON-RESP-RX ') >= 0)
+			push(beacon_lines, m[4]);
+	}
+	// only what happens from now on: the RAM buffer's lines are the past
+	if (COUNTERS && ms > START_MS && notable(m[4]))
+		debug_log.file.write(`${m[1]} daemon.warn counters: SYSLOG ${m[4]}`);
+	if (wrote)
+		save_state();
+}
+
+// ---- small helpers ---------------------------------------------------------
+
+function kb(bytes) {
+	if (bytes >= 1048576)
+		return sprintf('%.1f MB', bytes / 1048576.0);
+	if (bytes >= 1024)
+		return sprintf('%d KB', bytes / 1024);
+	return sprintf('%d B', bytes);
+}
+
+function ms_of_us(us) {
+	return (us >= 1000) ? sprintf('%.1f ms', us / 1000.0) : sprintf('%d us', us);
+}
+
+// a rate: "0.2", "830", "12.4k"
+function num(n) {
+	if (n >= 10000)
+		return sprintf('%.1fk', n / 1000.0);
+	return (n > 0 && n < 9.95) ? sprintf('%.1f', n) : sprintf('%.0f', n);
+}
+
+// bits per second: "640 kbit/s", "92.4 Mbit/s"
+function bits(bps) {
+	return (bps >= 1000000) ? sprintf('%.1f Mbit/s', bps / 1000000.0) : sprintf('%.0f kbit/s', bps / 1000.0);
+}
+
+function now_s() {
+	const c = clock(true);
+	return c[0] + c[1] / 1000000000.0;
+}
+
+function lines_of(path) {
+	return split(trim(readfile(path) ?? ''), '\n');
+}
+
+function wifi_line(level, text) {
+	wifi_log?.file.write(`${stamp()} daemon.${level} wifi-stats: ${text}`);
+}
+
+function debug_line(level, tag, text) {
+	debug_log.file.write(`${stamp()} daemon.${level} ${tag}: ${text}`);
+}
+
+// ---- the Wi-Fi samples ---------------------------------------------------
+
+// the airtime mac80211 has queued for a device, in us (AQL: "Q depth: VO:
+// 0 us VI: 0 us BE: 1200 us BK: 0 us"), or null without AQL
+function queued(phy, dev, mac) {
+	const m = match(readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/aql`) ?? '', /Q depth:([^\n]*)/);
+	if (!m)
+		return null;
+	let us = 0;
+	for (let n in match(m[1], /([0-9]+) us/g))
+		us += int(n[1]);
+	return us;
+}
+
+// all of a radio's ("total  1200 us")
+function phy_queued(phy) {
+	const m = match(readfile(`${DEBUGFS}/${phy}/aql_pending`) ?? '', /total +([0-9]+) us/);
+	return m ? int(m[1]) : null;
+}
+
+// A device's power save as the MilkFlint driver records it from the
+// firmware's reports (debugfs "ps": dozing, since_ms, dozes, dozing_ms,
+// longest_ms), or null with another driver.
+function sleep_of(phy, dev, mac) {
+	const s = readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/ps`);
+	if (!s)
+		return null;
+	const r = {};
+	for (let m in match(s, /([a-z_]+) ([0-9]+)/g))
+		r[m[1]] = int(m[2]);
+	return (r.dozing_ms != null) ? r : null;
+}
+
+// the airtime a device has used, in us (mac80211's "RX: n us", "TX: n us")
+function airtime_of(phy, dev, mac) {
+	const s = readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/airtime`) ?? '';
+	const rx = match(s, /RX: ([0-9]+) us/), tx = match(s, /TX: ([0-9]+) us/);
+	return (rx && tx) ? { rx: int(rx[1]), tx: int(tx[1]) } : null;
+}
+
+
+// the firmware's error counters, from the driver (the same for both bands)
+function firmware() {
+	const f = glob(`${DEBUGFS}/phy*/mt76/sys_recovery`)?.[0];
+	const s = f ? readfile(f) : null;
+	if (!s)
+		return null;
+	const parts = [];
+	for (let m in match(s, /(SER_[A-Z0-9_]+) *= *(0x[0-9a-f]+)/g))
+		if (hex(m[2]) != 0)
+			push(parts, `${m[1]} ${m[2]}`);
+	const r = match(s, /SYS_RESET_COUNT: WM ([0-9]+), WA ([0-9]+)/);
+	if (r)
+		push(parts, `resets WM ${r[1]} WA ${r[2]}`);
+	return join(', ', parts);
+}
+
+// device names from the DHCP leases
+let names = {};
+function read_names() {
+	names = {};
+	for (let line in split(readfile('/tmp/dhcp.leases') ?? '', '\n')) {
+		const f = split(line, ' ');
+		if (length(f) >= 4)
+			names[lc(f[1])] = (f[3] != '*') ? f[3] : f[2];
+	}
+}
+
+// The Network Quality probe's rounds since the last sample: a `net:` line
+// in the Wi-Fi log, and in the debug log with the counters. Returns that
+// line when it's trouble: the internet or DNS lost, or a gateway that
+// answers pings stopped. Many providers' gateways never answer pings: one
+// that hasn't since the probe started (or this keeper, with an older probe)
+// is said once, then left out.
+let net_seen = time();
+let gw_answered = false;	// a round since this started had a gateway reply
+let gw_quiet = null;		// the gateway we said doesn't answer pings
+function net_rounds() {
+	let nq = null;
+	try {
+		nq = json(readfile(NETQUALITY) ?? 'null');
+	}
+	catch (e) {
+		return null;
+	}
+	const rounds = filter(nq?.samples ?? [], (s) => s.t > net_seen);
+	if (!length(rounds))
+		return null;
+	net_seen = rounds[-1].t;
+	for (let r in rounds)
+		if (r.gateway != null)
+			gw_answered = true;
+	const gw = nq.targets?.gateway;
+	const answers = (type(nq.gateway_answers) == 'bool') ? nq.gateway_answers : gw_answered;
+	const quiet = (gw != null && !answers);
+	if (quiet && gw_quiet != gw) {
+		const note = `net: gateway ${gw}: no ping reply (many providers' gateways never answer), so it's left out of these lines`;
+		if (NET)
+			wifi_line('info', note);
+		if (COUNTERS)
+			debug_line('info', 'counters', note);
+	}
+	gw_quiet = quiet ? gw : null;
+
+	const parts = [];
+	let lost = false;
+	for (let k in [ 'gateway', 'internet', 'dns' ]) {
+		if (k == 'gateway' && quiet)
+			continue;
+		const got = filter(map(rounds, (s) => s[k]), (v) => v != null);
+		if (length(got) < length(rounds)) {
+			push(parts, `${k} lost ${length(rounds) - length(got)}/${length(rounds)}`);
+			lost = true;
+		}
+		else
+			push(parts, sprintf('%s %.1f ms', k, max(...got)));
+	}
+	// the UK/Europe/US servers, pinged once a minute: how far the slowness
+	// reaches, so not trouble by themselves
+	const routes = filter(rounds, (s) => type(s.routes) == 'object');
+	if (length(routes)) {
+		for (let r in nq.targets?.routes ?? []) {
+			const got = filter(map(routes, (s) => s.routes[r.key]), (v) => v != null);
+			push(parts, length(got) ? sprintf('%s %.1f ms', r.key, max(...got)) : `${r.key} no answer`);
+		}
+	}
+	const text = `net: ${join(', ', parts)}${length(rounds) > 1 ? ` (worst of ${length(rounds)} rounds)` : ''}`;
+	if (NET)
+		wifi_line(lost ? 'warn' : 'info', text);
+	if (COUNTERS)
+		debug_line(lost ? 'warn' : 'info', 'counters', text);
+	return lost ? text : null;
+}
+
+// a device's line: { level, text }; `d` the counters' change since the
+// last sample (null for a new device)
+function station_text(st) {
+	const s = st.s, d = st.d;
+	const name = names[st.mac] ? ` ${names[st.mac]}` : '';
+	let text = `${st.dev} ${st.mac}${name}: ${s.signal} dBm`;
+	let level = 'info';
+	if (d != null) {
+		text += `, tx ${d.txp} pkts ${kb(d.txb)} (${d.retries} retries, ${d.failed} fail), rx ${d.rxp} pkts ${kb(d.rxb)}`;
+		// it's talking to us, yet nothing reaches it
+		if (d.rxp >= 5 && d.txp == 0) {
+			text += ', NO TX';
+			level = 'warn';
+		}
+		if (d.failed >= 5 && d.failed * 20 >= d.txp)
+			level = 'warn';
+	}
+	text += sprintf(', idle %d ms, %d/%d Mbit/s', s.inactive ?? 0, (s.tx?.rate ?? 0) / 1000, (s.rx?.rate ?? 0) / 1000);
+	const q = queued(st.phy, st.dev, st.mac);
+	if (q != null)
+		text += `, queued ${ms_of_us(q)}`;
+	// the share of the window: its airtime, and how much of it it slept
+	if (d?.secs > 0 && d.air_tx != null) {
+		const tx = d.air_tx / 10000.0 / d.secs, rx = d.air_rx / 10000.0 / d.secs;
+		if (tx >= 0.5 || rx >= 0.5)
+			text += sprintf(', airtime %.0f%% tx %.0f%% rx', tx, rx);
+	}
+	if (d?.secs > 0 && d.asleep_ms != null && (d.asleep_ms > 0 || d.dozes > 0))
+		text += sprintf(', asleep %.0f%% (%d doze%s)', min(100, d.asleep_ms / 10.0 / d.secs), d.dozes, d.dozes == 1 ? '' : 's');
+	if (st.sleep?.dozing && st.sleep.since_ms >= 1000)
+		text += sprintf(', dozing for %.1f s', st.sleep.since_ms / 1000.0);
+	const ps = int(trim(readfile(`${DEBUGFS}/${st.phy}/netdev:${st.dev}/stations/${st.mac}/num_ps_buf_frames`) ?? ''));
+	if (ps > 0)
+		text += `, ${ps} frames held (asleep)`;
+	if (st.fresh)
+		text += ', first sample';
+	return { level, text };
+}
+
+let prev = {};		// "<dev> <mac>": the counters at the last sample
+let stations = [];	// the last sample's devices, for a snapshot
+let fw_prev = null;
+// the last sample's radios ({ dev, phy, bssid, active: a device line was
+// written }), for radio_lines(), and its devices with traffic ({ dev, mac,
+// bssid, why: set when it had a hard time }), for the 802.11k requests
+let radios = [];
+let to_ask = [];
+let signals = {};	// mac: the signal we heard from it at the last sample
+let homes = {};		// mac: the interface it was on at the last sample
+
+// why a device's window looks like trouble, or null
+function trouble_of(d, s) {
+	if (d == null)
+		return null;
+	if (d.rxp >= 5 && d.txp == 0)
+		return 'no tx';
+	if (d.failed >= 5)
+		return `${d.failed} failed`;
+	if (d.txp >= 5 && d.retries >= d.txp)
+		return 'more retries than packets';
+	if (d.txp >= 20 && (s.tx?.rate ?? 0) > 0 && s.tx.rate <= 54000)
+		return `tx rate ${s.tx.rate / 1000} Mbit/s`;
+	return null;
+}
+
+// Each radio's devices: their lines in the Wi-Fi log (with wifi=1), and
+// the devices that got NO TX.
+function sample(conn, minute) {
+	const seen = {}, notx = [];
+	const t = now_s();
+	stations = [];
+	radios = [];
+	to_ask = [];
+	for (let dev in conn.call('iwinfo', 'devices', {})?.devices ?? []) {
+		const info = conn.call('iwinfo', 'info', { device: dev });
+		if (info?.mode != 'Master')
+			continue;
+		const phy = info.phy;
+		const radio = { dev, phy, bssid: lc(info.bssid ?? ''), active: false };
+		push(radios, radio);
+		const list = conn.call('iwinfo', 'assoclist', { device: dev })?.results ?? [];
+		if (minute && wifi_log) {
+			const f = info.frequency ?? 0;
+			const band = (f > 5925) ? '6 GHz' : (f > 4900) ? '5 GHz' : '2.4 GHz';
+			const q = phy_queued(phy);
+			wifi_line('info', sprintf('%s: %s ch %s, %d device%s%s%s', dev, band, info.channel ?? '?', length(list),
+				length(list) == 1 ? '' : 's', info.noise ? `, noise ${info.noise} dBm` : '',
+				q != null ? `, queued ${ms_of_us(q)}` : ''));
+		}
+		for (let s in list) {
+			const mac = lc(s.mac);
+			const key = dev + ' ' + mac;
+			const sl = sleep_of(phy, dev, mac), air = airtime_of(phy, dev, mac);
+			signals[mac] = s.signal;
+			homes[mac] = dev;
+			const cur = {
+				txp: s.tx?.packets ?? 0, txb: s.tx?.bytes ?? 0, retries: s.tx?.retries ?? 0, failed: s.tx?.failed ?? 0,
+				rxp: s.rx?.packets ?? 0, rxb: s.rx?.bytes ?? 0, t,
+				dozing_ms: sl?.dozing_ms, dozes: sl?.dozes, air_tx: air?.tx, air_rx: air?.rx
+			};
+			seen[key] = cur;
+			const p = prev[key];
+			// new, or connected again (the counters started over): no deltas yet
+			const fresh = !p || cur.txp < p.txp || cur.rxp < p.rxp;
+			const d = fresh ? null : {
+				txp: cur.txp - p.txp, txb: cur.txb - p.txb, retries: cur.retries - p.retries,
+				failed: cur.failed - p.failed, rxp: cur.rxp - p.rxp, rxb: cur.rxb - p.rxb, secs: t - p.t
+			};
+			// the sleep and airtime counters, where they didn't start over
+			if (d != null && cur.dozing_ms != null && p.dozing_ms != null && cur.dozing_ms >= p.dozing_ms) {
+				d.asleep_ms = cur.dozing_ms - p.dozing_ms;
+				d.dozes = cur.dozes - p.dozes;
+			}
+			if (d != null && cur.air_tx != null && p.air_tx != null && cur.air_tx >= p.air_tx) {
+				d.air_tx = cur.air_tx - p.air_tx;
+				d.air_rx = cur.air_rx - p.air_rx;
+			}
+			const st = { phy, dev, mac, s, d, fresh, sleep: sl };
+			push(stations, st);
+			if (d != null && d.rxp >= 5 && d.txp == 0)
+				push(notx, `${dev} ${mac}${names[mac] ? ' ' + names[mac] : ''}`);
+			const why = trouble_of(d, s);
+			if (why || (d != null && (d.txp > 0 || d.rxp > 0)))
+				push(to_ask, { dev, mac, bssid: radio.bssid, why });
+			if (!wifi_log || (!minute && (d == null || (d.txp == 0 && d.rxp == 0 && d.failed == 0))))
+				continue;
+			const line = station_text(st);
+			wifi_line(line.level, line.text);
+			radio.active = true;
+		}
+	}
+	prev = seen;
+	return notx;
+}
+
+// ---- debug counters ------------------------------------------------------
+
+// Runs `cmd` in the background and waits up to `ms` for its output. For
+// tc and ethtool, which need the kernel's network lock (rtnl): if that is
+// stuck they block, and the keeper, and the system log it keeps, mustn't
+// block with them. A run that hasn't finished stops new ones until it
+// does. Returns the output, or null (`job.stuck` says since when).
+const JOB = RAM + '/debug-job.out';
+const job = { pid: null, stuck: 0 };
+function bounded(cmd, ms) {
+	if (job.pid != null) {
+		if (stat(`/proc/${job.pid}`) != null)
+			return null;
+		job.pid = null;
+	}
+	unlink(JOB);
+	const fd = popen(`{ { ${cmd}; } > ${JOB}.tmp 2> /dev/null; mv ${JOB}.tmp ${JOB}; } > /dev/null 2>&1 & echo $!`, 'r');
+	if (!fd)
+		return null;
+	const pid = trim(fd.read('all'));
+	fd.close();
+	for (let waited = 0; waited <= ms; waited += 10) {
+		const out = readfile(JOB);
+		if (out != null) {
+			if (job.stuck) {
+				if (debug_log)
+					debug_line('warn', 'counters', `RTNL tc and ethtool answer again, after ${span(time() - job.stuck)}`);
+				job.stuck = 0;
+			}
+			return out;
+		}
+		sleep(10);
+	}
+	job.pid = pid;
+	if (!job.stuck) {
+		job.stuck = time();
+		// the Wi-Fi log's MU line uses this too, with or without a debug log
+		if (debug_log)
+			debug_line('warn', 'counters', sprintf("RTNL tc and ethtool haven't answered within %d s: the kernel's network lock may be stuck (no CAKE numbers until they do)", ms / 1000));
+	}
+	return null;
+}
+
+// a bounded job's output: "@ <name>" lines start each command's part
+function sections(text) {
+	const out = {};
+	for (let part in split('\n' + (text ?? ''), '\n@ ')) {
+		const i = index(part, '\n');
+		if (i > 0)
+			out[substr(part, 0, i)] = substr(part, i + 1);
+	}
+	return out;
+}
+
+const TC = "echo '@ eth1'; tc -s -j qdisc show dev eth1; echo; echo '@ ifb4eth1'; tc -s -j qdisc show dev ifb4eth1";
+
+// per CPU, from /proc/stat: jiffies in all, idle (with iowait), irq, softirq
+function cpu_times() {
+	const out = {};
+	for (let l in lines_of('/proc/stat')) {
+		const m = match(l, /^cpu([0-9]+) +(.*)$/);
+		if (!m)
+			continue;
+		const f = map(split(m[2], ' '), (x) => int(x));
+		let all = 0;
+		for (let i = 0; i < 8 && i < length(f); i++)
+			all += f[i];
+		out[m[1]] = { all, idle: f[3] + f[4], irq: f[5], si: f[6] };
+	}
+	return out;
+}
+
+// "cpu0 12% si 5%, cpu1 30% si 21%, ...": busy (all but idle), and the
+// softirq and irq shares when there are any
+function cpu_text(a, b) {
+	const parts = [];
+	for (let c in sort(keys(b), (x, y) => int(x) - int(y))) {
+		const p = a[c], q = b[c];
+		const all = p ? q.all - p.all : 0;
+		if (all <= 0)
+			continue;
+		let t = sprintf('cpu%s %.0f%%', c, 100.0 * (all - (q.idle - p.idle)) / all);
+		const si = 100.0 * (q.si - p.si) / all, irq = 100.0 * (q.irq - p.irq) / all;
+		if (si >= 0.5)
+			t += sprintf(' si %.0f%%', si);
+		if (irq >= 0.5)
+			t += sprintf(' irq %.0f%%', irq);
+		push(parts, t);
+	}
+	return join(', ', parts);
+}
+
+// per CPU: packets the backlog processed, dropped (backlog full), squeezed
+// (out of budget or time) and waiting now, from /proc/net/softnet_stat
+function softnet() {
+	const out = [];
+	for (let l in lines_of('/proc/net/softnet_stat')) {
+		const f = split(l, ' ');
+		if (length(f) >= 3)
+			push(out, { cpu: (length(f) > 12) ? hex(f[12]) : length(out), done: hex(f[0]), dropped: hex(f[1]), squeezed: hex(f[2]), backlog: (length(f) > 11) ? hex(f[11]) : 0 });
+	}
+	return out;
+}
+
+// only what went up: "cpu1 squeezed +3"
+function softnet_text(a, b) {
+	const parts = [];
+	for (let i = 0; i < length(b); i++) {
+		const p = a[i], q = b[i];
+		if (!p || p.cpu != q.cpu)
+			continue;
+		for (let k in [ 'dropped', 'squeezed' ])
+			if (q[k] > p[k])
+				push(parts, `cpu${q.cpu} ${k} +${q[k] - p[k]}`);
+	}
+	return join(', ', parts);
+}
+
+// the threads that move packets: ksoftirqd, the NAPI threads, mt76's tx
+// worker (their pids change when the driver loads again)
+const NET_THREAD = /^(ksoftirqd\/|napi\/|mt76-)/;
+let net_threads = [];
+function find_net_threads() {
+	net_threads = [];
+	for (let d in glob('/proc/[0-9]*') ?? [])
+		if (match(trim(readfile(d + '/comm') ?? ''), NET_THREAD))
+			push(net_threads, substr(d, 6));
+}
+
+// CPU time so far of each of `pids`, in ticks (1/100 s), with its name
+function proc_times(pids) {
+	const out = {};
+	for (let pid in pids) {
+		const m = match(trim(readfile(`/proc/${pid}/stat`) ?? ''), /^[0-9]+ \((.*)\) (.*)$/);
+		if (!m)
+			continue;
+		const f = split(m[2], ' ');
+		out[pid] = { name: m[1], t: int(f[11]) + int(f[12]) };
+	}
+	return out;
+}
+
+// the busiest of them between two reads: "mt76-tx phy6 13%, napi/phy6-28 9%"
+function busiest(a, b, secs, top) {
+	const list = [];
+	for (let pid, q in b) {
+		const p = a[pid];
+		if (!p || p.name != q.name)
+			continue;
+		const pct = (q.t - p.t) / secs;	// ticks are 1/100 s
+		if (pct >= 1)
+			push(list, [ q.name, pct ]);
+	}
+	sort(list, (x, y) => (y[1] > x[1]) ? 1 : (y[1] < x[1]) ? -1 : 0);
+	return join(', ', map(slice(list, 0, top), (x) => sprintf('%s %.0f%%', x[0], x[1])));
+}
+
+// interrupts so far of the Ethernet and Wi-Fi lines of /proc/interrupts,
+// by number: { "120": { name: "ethernet", n: 931327 } }
+function irq_counts() {
+	const out = {};
+	let cpus = 0;
+	for (let l in lines_of('/proc/interrupts')) {
+		if (!cpus) {
+			cpus = length(match(l, /CPU[0-9]+/g) ?? []);
+			continue;
+		}
+		if (!match(l, /ethernet|mt7915e/))
+			continue;
+		const f = split(trim(l), / +/);
+		let n = 0;
+		for (let i = 1; i <= cpus && i < length(f); i++)
+			n += int(f[i]);
+		out[rtrim(f[0], ':')] = { name: replace(f[-1], /^[0-9a-f]+\./, ''), n };
+	}
+	return out;
+}
+
+// "ethernet 93 203, mt7915e 191" per second
+function irq_text(a, b, secs) {
+	const by = {}, order = [];
+	for (let k in sort(keys(b), (x, y) => int(x) - int(y))) {
+		if (!a[k])
+			continue;
+		if (!by[b[k].name]) {
+			by[b[k].name] = [];
+			push(order, b[k].name);
+		}
+		push(by[b[k].name], num((b[k].n - a[k].n) / secs));
+	}
+	return join(', ', map(order, (name) => `${name} ${join(' ', by[name])}`));
+}
+
+// packets, errors and drops of each hop, from /proc/net/dev
+const HOPS = /^(eth1|ifb4eth1|br-lan|phy[0-9]+-ap[0-9]+)$/;
+function if_counts() {
+	const out = {};
+	for (let l in lines_of('/proc/net/dev')) {
+		const m = match(l, /^ *([^ :]+): *(.*)$/);
+		if (!m || !match(m[1], HOPS))
+			continue;
+		const f = map(split(m[2], / +/), (x) => int(x));
+		out[m[1]] = { rx: f[1], rx_err: f[2], rx_drop: f[3], tx: f[9], tx_err: f[10], tx_drop: f[11] };
+	}
+	return out;
+}
+
+// the hops in the order a download takes them
+function hop_rank(name) {
+	return (name == 'eth1') ? 0 : (name == 'ifb4eth1') ? 1 : (name == 'br-lan') ? 2 : 3;
+}
+
+// "eth1 rx 1234 tx 567, ..., phy7-ap0 rx 480 tx 1150 (tx drop +3)" per
+// second; a radio's interface only when it moved
+function if_text(a, b, secs) {
+	const parts = [];
+	const order = sort(keys(b), (x, y) => (hop_rank(x) != hop_rank(y)) ? hop_rank(x) - hop_rank(y) : (x < y) ? -1 : (x > y) ? 1 : 0);
+	for (let name in order) {
+		const q = b[name], p = a[name];
+		if (!p)
+			continue;
+		const rx = q.rx - p.rx, tx = q.tx - p.tx;
+		if (rx == 0 && tx == 0 && hop_rank(name) == 3)
+			continue;
+		let t = `${name} rx ${num(rx / secs)} tx ${num(tx / secs)}`;
+		const bad = [];
+		for (let k in [ 'rx_err', 'rx_drop', 'tx_err', 'tx_drop' ])
+			if (q[k] > p[k])
+				push(bad, `${replace(k, '_', ' ')} +${q[k] - p[k]}`);
+		if (length(bad))
+			t += ` (${join(', ', bad)})`;
+		push(parts, t);
+	}
+	return join(', ', parts);
+}
+
+// eth1's transmit queues, numbered
+let eth_queues = null;
+function eth1_queues() {
+	if (eth_queues == null)
+		eth_queues = sort(glob('/sys/class/net/eth1/queues/tx-*') ?? [], (x, y) => int(substr(x, index(x, 'tx-') + 3)) - int(substr(y, index(y, 'tx-') + 3)));
+	return eth_queues;
+}
+
+// the bytes the driver has taken and not yet sent, per queue (BQL):
+// "tx-1 1514 of 24438 B", only queues with some; a queue stuck with bytes
+// in flight while nothing goes out is a stalled transmitter
+function bql_text() {
+	const parts = [];
+	for (let q in eth1_queues()) {
+		const n = int(trim(readfile(q + '/byte_queue_limits/inflight') ?? '0'));
+		if (n > 0)
+			push(parts, sprintf('%s %d of %s B', substr(q, index(q, 'tx-')), n, trim(readfile(q + '/byte_queue_limits/limit') ?? '?')));
+	}
+	return join(', ', parts);
+}
+
+// the netdev watchdog's timeouts on eth1 (the driver reset a stuck queue)
+function tx_timeouts() {
+	let n = 0;
+	for (let q in eth1_queues())
+		n += int(trim(readfile(q + '/tx_timeout') ?? '0'));
+	return n;
+}
+
+// CAKE on eth1 (upload) and ifb4eth1 (download), from `tc -s -j`: each
+// CAKE qdisc by "<dev> <parent>", and what each device's root is
+function cake_now(sec) {
+	const out = { q: {}, root: {} };
+	for (let dev in [ 'eth1', 'ifb4eth1' ]) {
+		let list = null;
+		try {
+			list = json(trim(sec[dev] ?? '') || '[]');
+		}
+		catch (e) {
+			list = null;
+		}
+		for (let q in (type(list) == 'array') ? list : []) {
+			if (q.root)
+				out.root[dev] = `${q.kind} ${q.handle}`;
+			if (q.kind != 'cake')
+				continue;
+			let av = 0, pk = 0, marks = 0;
+			for (let t in q.tins ?? []) {
+				av = max(av, t.avg_delay_us ?? 0);
+				pk = max(pk, t.peak_delay_us ?? 0);
+				marks += t.ecn_mark ?? 0;
+			}
+			out.q[`${dev} ${q.root ? q.handle : q.parent}`] = {
+				bytes: q.bytes ?? 0, pkts: q.packets ?? 0, drops: q.drops ?? 0, backlog: q.backlog ?? 0, qlen: q.qlen ?? 0,
+				mem: q.memory_used ?? 0, limit: q.memory_limit ?? 0, av, pk, marks
+			};
+		}
+	}
+	return out;
+}
+
+// the CAKE qdiscs that moved: rate, drops, backlog, memory (the peak since
+// it was set up) and delays (CAKE's averages, per tin, the worst tin)
+function cake_text(a, b, secs) {
+	const parts = [];
+	let idle = 0;
+	for (let k in sort(keys(b.q))) {
+		const q = b.q[k], p = a?.q[k];
+		if (p && q.bytes == p.bytes && q.drops == p.drops && q.backlog == 0) {
+			idle++;
+			continue;
+		}
+		if (!p && q.bytes == 0)
+			continue;
+		let t = k;
+		if (p)
+			t += sprintf(' %s %s pkt/s, drops +%d', bits((q.bytes - p.bytes) * 8 / secs), num((q.pkts - p.pkts) / secs), q.drops - p.drops);
+		else
+			t += ' (first sample)';
+		if (p && q.marks > p.marks)
+			t += sprintf(', marks +%d', q.marks - p.marks);
+		t += `, backlog ${kb(q.backlog)} ${q.qlen}p, mem ${kb(q.mem)} of ${kb(q.limit)}, delay av ${ms_of_us(q.av)} pk ${ms_of_us(q.pk)}`;
+		push(parts, t);
+	}
+	if (!length(parts))
+		return length(keys(b.q)) ? 'idle' : 'no CAKE on eth1 or ifb4eth1';
+	return join('; ', parts);
+}
+
+function resources() {
+	const parts = [];
+	const ct = trim(readfile('/proc/sys/net/netfilter/nf_conntrack_count') ?? '');
+	const ct_max = trim(readfile('/proc/sys/net/netfilter/nf_conntrack_max') ?? '');
+	let level = 'info';
+	if (ct != '') {
+		push(parts, `conntrack ${ct} of ${ct_max}`);
+		if (int(ct) * 10 >= int(ct_max) * 9)
+			level = 'warn';
+	}
+	const mem = {};
+	for (let m in match(readfile('/proc/meminfo') ?? '', /(MemAvailable|Slab|VmallocUsed): +([0-9]+) kB/g))
+		mem[m[1]] = int(m[2]) * 1024;
+	for (let k in [ 'MemAvailable', 'Slab', 'VmallocUsed' ])
+		if (mem[k] != null)
+			push(parts, `${k} ${kb(mem[k])}`);
+	if (mem.MemAvailable != null && mem.MemAvailable < 64 * 1048576)
+		level = 'warn';
+	return { level, text: join(', ', parts) };
+}
+
+// wan and wan6: up, and for how long; what `before` said when netifd
+// doesn't answer
+function wan_status(conn, before) {
+	const out = {};
+	for (let w in [ 'wan', 'wan6' ]) {
+		const s = conn?.call(`network.interface.${w}`, 'status', {});
+		if (s)
+			out[w] = { up: s.up == true, uptime: s.uptime ?? 0 };
+		else if (before?.[w])
+			out[w] = before[w];
+	}
+	return out;
+}
+
+function wan_text(wan) {
+	return join(', ', map(keys(wan), (w) => wan[w].up ? `${w} up ${span(wan[w].uptime)}` : `${w} down`));
+}
+
+// procd's instances of the services a dropout could come from, by
+// "<service>/<instance>": their pid, or 0 while not running; what `before`
+// said for a service when procd doesn't answer
+const SERVICES = [ 'network', 'wpad', 'dnsmasq', 'dnsproxy' ];
+function service_pids(conn, before) {
+	const out = {};
+	for (let name in SERVICES) {
+		const s = conn?.call('service', 'list', { name });
+		if (s == null) {
+			for (let k, pid in before ?? {})
+				if (index(k, name + '/') == 0)
+					out[k] = pid;
+			continue;
+		}
+		for (let inst, i in s[name]?.instances ?? {})
+			out[`${name}/${inst}`] = i.running ? i.pid : 0;
+	}
+	return out;
+}
+
+// "netifd", "hostapd", "dnsmasq/cfg01411c"
+function service_label(k) {
+	const i = index(k, '/'), name = substr(k, 0, i), inst = substr(k, i + 1);
+	if (name == 'network')
+		return 'netifd';
+	if (name == 'wpad')
+		return inst;
+	return (inst == 'instance1' || inst == name) ? name : k;
+}
+
+// "1000Mb/s Full" from `ethtool eth1`
+function link_speed(text) {
+	const s = match(text ?? '', /Speed: ([^\n]*)/), d = match(text ?? '', /Duplex: ([^\n]*)/);
+	return s ? (s[1] + (d ? ' ' + d[1] : '')) : null;
+}
+
+let cnt = null;		// the counters at the last tick
+let cake_prev = null;	// CAKE's at the last tick that had them
+let slow = null;	// once a minute: eth1's link, the WAN, the services
+
+function counters(conn, minute) {
+	if (minute)
+		find_net_threads();
+	const now = { t: now_s(), cpu: cpu_times(), irq: irq_counts(), thr: proc_times(net_threads), sn: softnet(), ifs: if_counts() };
+	const out = bounded(TC + (minute ? "; echo; echo '@ link'; ethtool eth1" : ''), 2000);
+	const sec = (out != null) ? sections(out) : null;
+	const cake = (sec != null) ? cake_now(sec) : null;
+	const p = cnt;
+	cnt = now;
+
+	if (p != null) {
+		const secs = now.t - p.t;
+		let text = `cpu: ${cpu_text(p.cpu, now.cpu)}`;
+		const irq = irq_text(p.irq, now.irq, secs);
+		if (irq != '')
+			text += `; irq/s ${irq}`;
+		const thr = busiest(p.thr, now.thr, secs, 8);
+		text += `; threads ${thr != '' ? thr : 'all under 1%'}`;
+		const sn = softnet_text(p.sn, now.sn);
+		debug_line(match(sn, /dropped/) ? 'warn' : 'info', 'counters', text + (sn != '' ? `; softnet ${sn}` : ''));
+		if (cake != null) {
+			const bql = bql_text();
+			debug_line('info', 'counters', `cake: ${cake_text(cake_prev, cake, now.t - (cake_prev?.t ?? now.t) || secs)}${bql != '' ? `; bql eth1 ${bql}` : ''}`);
+		}
+		debug_line('info', 'counters', `pkt/s: ${if_text(p.ifs, now.ifs, secs)}`);
+	}
+	if (cake != null) {
+		for (let dev in [ 'eth1', 'ifb4eth1' ])
+			if (cake_prev != null && cake_prev.root[dev] != cake.root[dev])
+				debug_line('warn', 'counters', `QDISC ${dev}: ${cake_prev.root[dev] ?? 'none'} -> ${cake.root[dev] ?? 'none'} (SQM set it up again: its counters start over)`);
+		cake.t = now.t;
+		cake_prev = cake;
+	}
+	if (!minute)
+		return;
+
+	// once a minute: the ceilings, eth1's link, the WAN, the services
+	const cur = {
+		carrier: int(trim(readfile('/sys/class/net/eth1/carrier_changes') ?? '0')),
+		timeouts: tx_timeouts(),
+		speed: (sec != null) ? link_speed(sec.link) : slow?.speed,
+		wan: wan_status(conn, slow?.wan),
+		svc: service_pids(conn, slow?.svc)
+	};
+	const res = resources();
+	debug_line(res.level, 'counters', `res: ${res.text}; eth1 ${cur.speed ?? '?'}, carrier changes ${cur.carrier}, tx timeouts ${cur.timeouts}; ${wan_text(cur.wan)}`);
+	if (slow == null) {
+		debug_line('info', 'counters', `services: ${join(', ', map(sort(keys(cur.svc)), (k) => `${service_label(k)} ${cur.svc[k] ? 'pid ' + cur.svc[k] : 'not running'}`))}`);
+		slow = cur;
+		return;
+	}
+	if (cur.carrier != slow.carrier)
+		debug_line('warn', 'counters', `LINK eth1 carrier changes ${slow.carrier} -> ${cur.carrier} (the WAN cable's link went down and up)`);
+	if (cur.speed != null && slow.speed != null && cur.speed != slow.speed)
+		debug_line('warn', 'counters', `LINK eth1 ${slow.speed} -> ${cur.speed}`);
+	if (cur.timeouts > slow.timeouts)
+		debug_line('warn', 'counters', `TX TIMEOUT eth1 +${cur.timeouts - slow.timeouts} (the kernel found a transmit queue stuck and reset it)`);
+	for (let w, s in cur.wan) {
+		const was = slow.wan[w];
+		if (!was)
+			continue;
+		if (was.up && !s.up)
+			debug_line('warn', 'counters', `WAN ${w} down (was up ${span(was.uptime)})`);
+		else if (!was.up && s.up)
+			debug_line('warn', 'counters', `WAN ${w} up`);
+		else if (s.up && s.uptime < was.uptime)
+			debug_line('warn', 'counters', `WAN ${w} connected again, up ${span(s.uptime)} (was up ${span(was.uptime)})`);
+	}
+	for (let k, pid in cur.svc) {
+		const was = slow.svc[k];
+		if (was == null)
+			debug_line('warn', 'counters', `RESTART ${service_label(k)}: started, pid ${pid}`);
+		else if (was && !pid)
+			debug_line('warn', 'counters', `STOPPED ${service_label(k)} (was pid ${was})`);
+		else if (pid && pid != was)
+			debug_line('warn', 'counters', was ? `RESTART ${service_label(k)}: pid ${was} -> ${pid}` : `RESTART ${service_label(k)}: running again, pid ${pid}`);
+	}
+	for (let k, was in slow.svc)
+		if (cur.svc[k] == null)
+			debug_line('warn', 'counters', `STOPPED ${service_label(k)}: gone (was pid ${was})`);
+	slow = cur;
+}
+
+// ---- the snapshot ----------------------------------------------------------
+
+// /proc/softirqs: { NET_RX: [ per CPU ] }
+function softirqs() {
+	const out = {};
+	for (let l in lines_of('/proc/softirqs')) {
+		const m = match(l, /^ *([A-Z_]+): +(.*)$/);
+		if (m)
+			out[m[1]] = map(split(trim(m[2]), / +/), (x) => int(x));
+	}
+	return out;
+}
+
+// "NET_RX 12 340 402 300, ..." per CPU per second, the kinds that ran
+function softirq_text(a, b, secs) {
+	const parts = [];
+	for (let k, v in b) {
+		const p = a[k];
+		if (!p)
+			continue;
+		const d = [];
+		let any = false;
+		for (let i = 0; i < length(v); i++) {
+			push(d, num((v[i] - (p[i] ?? v[i])) / secs));
+			if (v[i] != p[i])
+				any = true;
+		}
+		if (any)
+			push(parts, `${k} ${join(' ', d)}`);
+	}
+	return join(', ', parts);
+}
+
+// the default route's gateway, and whether it answers ARP (/proc/net/arp:
+// flags 0x2 is a complete entry)
+function gateway_text() {
+	let gw = null;
+	for (let line in lines_of('/proc/net/route')) {
+		const f = split(line, '\t');
+		if (length(f) > 7 && f[1] == '00000000' && f[7] == '00000000' && f[2] != '00000000') {
+			const h = f[2];
+			gw = sprintf('%d.%d.%d.%d', hex(substr(h, 6, 2)), hex(substr(h, 4, 2)), hex(substr(h, 2, 2)), hex(substr(h, 0, 2)));
+			break;
+		}
+	}
+	if (gw == null)
+		return 'no default route';
+	for (let line in lines_of('/proc/net/arp')) {
+		const f = split(line, / +/);
+		if (f[0] == gw)
+			return `gateway ${gw} via ${f[5]}, ARP ${(hex(f[2]) & 2) ? 'complete ' + f[3] : 'incomplete (no answer)'}`;
+	}
+	return `gateway ${gw}, not in the ARP table`;
+}
+
+// Writes the state of every hop at once into the debug log: at most once a
+// minute. Takes about a second (it measures the load over one).
+let last_snapshot = 0;
+function snapshot(conn, reason) {
+	if (time() - last_snapshot < 60)
+		return;
+	last_snapshot = time();
+	const when = stamp();
+	const line = (level, text) => debug_log.file.write(`${when} daemon.${level} snapshot: ${text}`);
+	line('warn', `---- ${reason} ----`);
+	wifi_line('info', 'a snapshot is in the debug log');
+
+	// the load over the next second: every process, so a runaway one shows
+	const pids = map(glob('/proc/[0-9]*') ?? [], (d) => substr(d, 6));
+	const a = { t: now_s(), cpu: cpu_times(), si: softirqs(), thr: proc_times(pids), sn: softnet(), ifs: if_counts() };
+	sleep(1000);
+	const b = { t: now_s(), cpu: cpu_times(), si: softirqs(), thr: proc_times(pids), sn: softnet(), ifs: if_counts() };
+	const secs = b.t - a.t;
+	line('info', `cpu (1 s): ${cpu_text(a.cpu, b.cpu)}`);
+	line('info', `softirqs/s per cpu: ${softirq_text(a.si, b.si, secs)}`);
+	const top = busiest(a.thr, b.thr, secs, 12);
+	line('info', `busiest (1 s): ${top != '' ? top : 'nothing over 1%'}`);
+	line('info', 'softnet (since boot): ' + join(', ', map(b.sn, (s) => sprintf('cpu%d %s/s, dropped %d, squeezed %d, backlog %d',
+		s.cpu, num((s.done - (a.sn[s.cpu]?.done ?? s.done)) / secs), s.dropped, s.squeezed, s.backlog))));
+	line('info', `pkt/s (1 s): ${if_text(a.ifs, b.ifs, secs)}`);
+
+	// the queues
+	const out = bounded(TC + "; echo; echo '@ ethtool'; ethtool -S eth1", 3000);
+	if (out == null)
+		line('warn', "tc and ethtool didn't answer: the kernel's network lock (rtnl) may be stuck");
+	else {
+		const sec = sections(out);
+		for (let dev in [ 'eth1', 'ifb4eth1' ]) {
+			let list = null;
+			try {
+				list = json(trim(sec[dev] ?? '') || '[]');
+			}
+			catch (e) {
+				list = null;
+			}
+			let idle = 0;
+			for (let q in (type(list) == 'array') ? list : []) {
+				if (!q.root && q.kind == 'cake' && !q.packets && !q.backlog) {
+					idle++;
+					continue;
+				}
+				let t = sprintf('tc %s %s %s %s, sent %s %d pkts, dropped %d, overlimits %d, requeues %d, backlog %s %dp',
+					dev, q.kind, q.handle, q.parent ? 'parent ' + q.parent : 'root', kb(q.bytes ?? 0), q.packets ?? 0,
+					q.drops ?? 0, q.overlimits ?? 0, q.requeues ?? 0, kb(q.backlog ?? 0), q.qlen ?? 0);
+				if (q.memory_used != null)
+					t += `, memory ${kb(q.memory_used)} of ${kb(q.memory_limit ?? 0)}`;
+				if (q.capacity_estimate)
+					t += `, capacity ${bits(q.capacity_estimate * 8)}`;
+				for (let i = 0; i < length(q.tins ?? []); i++) {
+					const n = q.tins[i];
+					t += sprintf('; tin %d: delay pk %s av %s sp %s, drops %d, marks %d, flows sparse %d bulk %d unresponsive %d',
+						i, ms_of_us(n.peak_delay_us ?? 0), ms_of_us(n.avg_delay_us ?? 0), ms_of_us(n.base_delay_us ?? 0),
+						n.drops ?? 0, n.ecn_mark ?? 0, n.sparse_flows ?? 0, n.bulk_flows ?? 0, n.unresponsive_flows ?? 0);
+				}
+				line('info', t);
+			}
+			if (idle)
+				line('info', `tc ${dev}: ${idle} more CAKE queues, empty`);
+		}
+		const nz = [];
+		for (let m in match(sec.ethtool ?? '', /([A-Za-z0-9_]+): ([0-9]+)/g))
+			if (m[2] != '0')
+				push(nz, `${m[1]} ${m[2]}`);
+		line('info', `ethtool -S eth1: ${length(nz) ? join(', ', nz) : 'all 0'}`);
+	}
+	const bql = bql_text();
+	line('info', `bql eth1: ${bql != '' ? bql : 'nothing in flight'}; tx timeouts ${tx_timeouts()}`);
+
+	// Wi-Fi: the driver's queues (these files only read memory and
+	// registers: no firmware commands, which would hang with the firmware)
+	for (let dir in glob(`${DEBUGFS}/phy*`) ?? []) {
+		const phy = substr(dir, length(DEBUGFS) + 1);
+		const xq = readfile(dir + '/mt76/xmit-queues');
+		if (xq) {
+			const parts = [];
+			for (let m in match(xq, /([A-Z]+) *\| *([0-9]+) *\| *([0-9]+) *\| *([0-9]+)/g))
+				push(parts, `${m[1]} ${m[2]} (${m[3]}/${m[4]})`);
+			line('info', `${phy} xmit-queues, queued (head/tail): ${join(', ', parts)}`);
+		}
+		const hq = readfile(dir + '/mt76/hw-queues');
+		if (hq)
+			line('info', `${phy} hw-queues: ${join(' | ', filter(map(split(hq, '\n'), (l) => trim(l)), (l) => l != ''))}`);
+		const aql = readfile(dir + '/aql_pending');
+		if (aql) {
+			const parts = [];
+			for (let m in match(aql, /\n([A-Z\/]+) +([0-9]+) us/g))
+				push(parts, `${m[1]} ${m[2]}`);
+			line('info', `${phy} aql_pending (us): ${join(', ', parts)}`);
+		}
+	}
+	const fw = firmware();
+	if (fw != null)
+		line('info', `firmware errors: ${fw == '' ? 'none' : fw}`);
+	if (!length(stations))
+		line('info', 'devices: none');
+	for (let st in stations) {
+		const s = station_text(st);
+		line(s.level, `device ${s.text}`);
+	}
+
+	// the way out
+	const res = resources();
+	line(res.level, `res: ${res.text}`);
+	line('info', `wan: ${wan_text(wan_status(conn))}; ${gateway_text()}`);
+	const fd = popen('dmesg | tail -n 20', 'r');
+	if (fd) {
+		for (let l in split(trim(fd.read('all') ?? ''), '\n'))
+			if (l != '')
+				line('info', `dmesg: ${l}`);
+		fd.close();
+	}
+	line('info', '---- end of snapshot ----');
+}
+
+// ---- radios, and 802.11k ---------------------------------------------------
+
+// The channel's time counters of a radio's interface (iw's survey of the
+// channel in use, in ms), or null. A survey asks the firmware for its
+// counters: with a firmware that stopped answering it waits for that.
+function survey(dev) {
+	const fd = popen(`iw dev ${dev} survey dump 2> /dev/null`, 'r');
+	if (!fd)
+		return null;
+	const out = fd.read('all') ?? '';
+	fd.close();
+	for (let block in split(out, 'Survey data from')) {
+		if (index(block, '[in use]') < 0)
+			continue;
+		const get = (what) => {
+			const m = match(block, regexp(what + ':\\s+([0-9]+) ms'));
+			return m ? int(m[1]) : null;
+		};
+		return {
+			active: get('channel active time'), busy: get('channel busy time'),
+			rx: get('channel receive time'), bss_rx: get('channel BSS receive time'),
+			tx: get('channel transmit time')
+		};
+	}
+	return null;
+}
+
+// "channel busy 38%: we sent 25%, heard our devices 5%, other networks 6%,
+// other energy 2%": between two surveys; other energy is busy time with
+// nothing sent or received (interference, or frames too weak to decode)
+function channel_text(a, b) {
+	if (!a || !b || a.active == null || b.active == null)
+		return null;
+	const act = b.active - a.active;
+	if (act <= 0)
+		return null;
+	const pct = (x) => sprintf('%.0f%%', max(0, x) * 100.0 / act);
+	const busy = b.busy - a.busy, tx = b.tx - a.tx, rx = b.rx - a.rx;
+	let t = sprintf('channel busy %s in %.0f s: we sent %s', pct(busy), act / 1000.0, pct(tx));
+	if (a.bss_rx != null && b.bss_rx != null) {
+		const ours = b.bss_rx - a.bss_rx;
+		t += `, heard our devices ${pct(ours)}, other networks ${pct(rx - ours)}`;
+	}
+	else
+		t += `, heard ${pct(rx)}`;
+	return t + `, other energy ${pct(busy - rx - tx)}`;
+}
+
+// a radio's TWT agreements (the driver's twt_stats table, a row each)
+function twt_count(phy) {
+	let n = 0;
+	for (let l in lines_of(`${DEBUGFS}/${phy}/mt76/twt_stats`))
+		if (match(l, /^ *[0-9]+ *\|/))
+			n++;
+	return n;
+}
+
+// The MU/OFDMA and beamforming counters of a radio (its AP interface's
+// ethtool stats, which only read the driver's copy: no firmware command).
+// The DL/UL ones count while the driver's muru_debug is on (the image's
+// hotplug turns it on). ethtool needs rtnl, hence bounded().
+function mu_counters(dev) {
+	const out = bounded(`ethtool -S ${dev}`, 3000);
+	if (out == null)
+		return null;
+	const c = {};
+	for (let m in match(out, /([a-z0-9_]+): ([0-9]+)/g))
+		c[m[1]] = int(m[2]);
+	return length(c) ? c : null;
+}
+
+function mu_text(a, b) {
+	if (!a || !b)
+		return null;
+	const d = (k) => max(0, (b[k] ?? 0) - (a[k] ?? 0));
+	const sum = (ks) => {
+		let n = 0;
+		for (let k in ks)
+			n += d(k);
+		return n;
+	};
+	const dl_ofdma = sum([ 'dl_he_2ru_cnt', 'dl_he_3ru_cnt', 'dl_he_4ru_cnt', 'dl_he_5to8ru_cnt',
+		'dl_he_9to16ru_cnt', 'dl_he_gtr16ru_cnt' ]);
+	const dl_mimo = sum([ 'dl_vht_2mu_cnt', 'dl_vht_3mu_cnt', 'dl_vht_4mu_cnt', 'dl_he_2mu_cnt',
+		'dl_he_3mu_cnt', 'dl_he_4mu_cnt' ]);
+	const ul_ofdma = sum([ 'ul_hetrig_su_cnt', 'ul_hetrig_2ru_cnt', 'ul_hetrig_3ru_cnt', 'ul_hetrig_4ru_cnt',
+		'ul_hetrig_5to8ru_cnt', 'ul_hetrig_9to16ru_cnt', 'ul_hetrig_gtr16ru_cnt' ]);
+	const ul_mimo = sum([ 'ul_hetrig_2mu_cnt', 'ul_hetrig_3mu_cnt', 'ul_hetrig_4mu_cnt' ]);
+	const mu = d('tx_mu_mpdu'), mu_ok = d('tx_mu_successful_mpdu');
+	const att = d('tx_mpdu_attempts'), ok = d('tx_mpdu_success');
+	const ebf = d('tx_pkt_ebf_cnt'), fb = d('tx_beamformer_rx_feedback_all');
+	if (!dl_ofdma && !dl_mimo && !ul_ofdma && !ul_mimo && !mu && !ebf && !fb)
+		return null;
+	let t = sprintf('DL OFDMA %d PPDUs, DL MU-MIMO %d, UL OFDMA %d (triggered), UL MU-MIMO %d', dl_ofdma, dl_mimo, ul_ofdma, ul_mimo);
+	if (mu)
+		t += sprintf('; MU MPDUs %d, %.0f%% acked', mu, mu_ok * 100.0 / mu);
+	if (att)
+		t += sprintf('; all MPDUs %.0f%% acked', ok * 100.0 / att);
+	return t + sprintf('; beamformed %d PPDUs, %d feedback reports', ebf, fb);
+}
+
+// ---- 802.11k: how a device hears us -----------------------------------------
+
+// A link measurement: the device measures our request frame and says at
+// what power (RCPI) and signal to noise (RSNI) it heard it. Its replies
+// only go to hostapd's ubus subscribers: a `ubus subscribe` runs in the
+// background for the radios' hostapd objects (again whenever they change,
+// as a driver reload renames them), its replies appended to RRM_EVENTS.
+// Without link measurement, a beacon report from the device's scan table
+// (no scan of its own), which hostapd also logs (BEACON-RESP-RX).
+const RRM_EVENTS = RAM + '/rrm-events';
+const RRM_PID = RAM + '/rrm-subscribe.pid';
+const RRM_STRUGGLING = 60, RRM_BASELINE = 600;	// s between requests to a device
+const RRM_RESUBSCRIBE = 300;	// s: hostapd may have re-registered its objects
+// offset: how far RRM_EVENTS has been read; an earlier run logged the rest
+const rrm = { pid: null, objs: null, since: 0, offset: stat(RRM_EVENTS)?.size ?? 0, caps: {}, asked: {} };
+
+// the subscriber's two processes: ubus, and the awk that filters for it
+function rrm_stop() {
+	for (let pid in split(trim(readfile(RRM_PID) ?? ''), ' '))
+		if (match(pid, /^[0-9]+$/) && stat(`/proc/${pid}`) != null)
+			system(`kill ${pid} 2> /dev/null`);
+	rrm.pid = null;
+	unlink(RRM_PID);
+}
+
+// keeps the subscriber on the radios' interfaces (`devs`): started again
+// when they change, and every few minutes, since a Wi-Fi reload registers
+// hostapd's objects again under the same names
+function rrm_subscribe(devs) {
+	const objs = join(' ', map(sort(devs), (d) => 'hostapd.' + d));
+	if (rrm.pid != null && objs == rrm.objs && stat(`/proc/${rrm.pid}`) != null &&
+	    time() - rrm.since < RRM_RESUBSCRIBE)
+		return;
+	rrm_stop();
+	rrm.objs = objs;
+	rrm.since = time();
+	if (objs == '')
+		return;
+	// both pids into RRM_PID: ubus's, then awk's
+	const fd = popen(`( ubus subscribe ${objs} 2> /dev/null & echo $! > ${RRM_PID}; wait ) | ` +
+		`awk '/link-measurement-report/ { print; fflush() }' >> ${RRM_EVENTS} 2> /dev/null & echo $!`, 'r');
+	if (!fd)
+		return;
+	rrm.pid = trim(fd.read('all') ?? '');
+	fd.close();
+	// the subshell writes ubus's pid as it starts
+	for (let i = 0; i < 20 && !match(readfile(RRM_PID) ?? '', /[0-9]/); i++)
+		sleep(10);
+	writefile(RRM_PID, trim(readfile(RRM_PID) ?? '') + ' ' + rrm.pid);
+}
+
+// a device's RM Enabled Capabilities (byte 0: bit 0 link measurement, bit 6
+// beacon table), from hostapd, refreshed once a minute
+function rrm_caps(conn, dev) {
+	const caps = {};
+	const clients = conn.call(`hostapd.${dev}`, 'get_clients', {})?.clients ?? {};
+	for (let mac, c in clients)
+		caps[lc(mac)] = c.rrm?.[0] ?? 0;
+	rrm.caps[dev] = caps;
+}
+
+// asks the device, if it can answer and wasn't asked lately; `why` is set
+// when it's having a hard time (then it may be asked once a minute)
+function rrm_ask(conn, dev, mac, bssid, why) {
+	const caps = rrm.caps[dev]?.[mac] ?? 0;
+	const last = rrm.asked[mac];
+	if (!(caps & 0x41) || (last && time() - last.t < (why ? RRM_STRUGGLING : RRM_BASELINE)))
+		return;
+	if (caps & 1)
+		conn.call(`hostapd.${dev}`, 'link_measurement_req', { addr: mac });
+	else
+		conn.call(`hostapd.${dev}`, 'rrm_beacon_req', {
+			addr: mac, mode: 2, op_class: 0, channel: 255, duration: 0, bssid: bssid ?? 'ff:ff:ff:ff:ff:ff'
+		});
+	rrm.asked[mac] = { t: time(), dev, why };
+	if (why)
+		wifi_line('info', `${dev} ${mac}${names[mac] ? ' ' + names[mac] : ''}: asked how it hears us (${why})`);
+}
+
+// 802.11's RCPI in dBm and RSNI in dB, or null where not measured
+function rcpi_dbm(v) {
+	return (v != null && v <= 220) ? v / 2.0 - 110 : null;
+}
+
+function rsni_db(v) {
+	return (v != null && v < 255) ? v / 2.0 - 10 : null;
+}
+
+function heard_text(rcpi, rsni) {
+	const p = rcpi_dbm(rcpi), n = rsni_db(rsni);
+	return (p != null ? sprintf('%.1f dBm', p) : 'an unmeasured level') + (n != null ? sprintf(', SNR %.1f dB', n) : '');
+}
+
+// A link measurement's RCPI. Apple's devices put their RSSI there as a
+// signed byte (200 for -56 dBm) instead of 802.11's RCPI, and leave RSNI
+// at 0: of the two readings, the one nearer what we hear from the device
+// is taken (a link is near enough symmetric, give or take our higher
+// power), and then RSNI 0 means not measured.
+function lm_text(mac, rcpi, rsni) {
+	const std = rcpi_dbm(rcpi), ours = signals[mac];
+	const signed = (rcpi != null && rcpi >= 128 && rcpi < 255) ? rcpi - 256 : null;
+	const off = (a) => (a > ours) ? a - ours : ours - a;
+	if (signed != null && ours != null && (std == null || off(signed) < off(std)))
+		return sprintf('%d dBm (sent as an RSSI)', signed) + ((rsni && rsni < 255) ? sprintf(', SNR %.1f dB', rsni_db(rsni)) : '');
+	return heard_text(rcpi, rsni);
+}
+
+// The answers since the last sample: link measurements from the
+// subscriber's file, beacon reports from hostapd's log lines.
+function rrm_replies() {
+	const st = stat(RRM_EVENTS);
+	if (st && st.size < rrm.offset)
+		rrm.offset = 0;
+	if (st && st.size > rrm.offset) {
+		const fd = open(RRM_EVENTS, 'r');
+		if (fd) {
+			fd.seek(rrm.offset);
+			const text = fd.read('all') ?? '';
+			fd.close();
+			rrm.offset += length(text);
+			for (let l in split(text, '\n')) {
+				let ev = null;
+				try {
+					ev = json(l)?.['link-measurement-report'];
+				}
+				catch (e) {
+					continue;
+				}
+				const mac = lc(ev?.address ?? '');
+				if (mac == '')
+					continue;
+				const dev = rrm.asked[mac]?.dev ?? homes[mac] ?? '?';
+				wifi_line('info', `${dev} ${mac}${names[mac] ? ' ' + names[mac] : ''}: says it hears us at ${lm_text(mac, ev.rcpi, ev.rsni)} (link measurement)`);
+			}
+		}
+		// the file only grows: start it over once read past 256 KB
+		if (rrm.offset > 262144) {
+			writefile(RRM_EVENTS, '');
+			rrm.offset = 0;
+		}
+	}
+	for (let l in beacon_lines) {
+		// "hostapd: <dev>: BEACON-RESP-RX <mac> <token> <mode> <report hex>": a
+		// Beacon report (op class, channel, start time 8, duration 2, frame
+		// info, RCPI, RSNI, BSSID 6, ...); a non-zero mode is a refusal
+		const m = match(l, /hostapd: ([^:]+): BEACON-RESP-RX ([0-9a-f:]{17}) [0-9]+ ([0-9a-f]{2}) ?([0-9a-f]*)/);
+		if (!m)
+			continue;
+		const who = `${m[1]} ${m[2]}${names[m[2]] ? ' ' + names[m[2]] : ''}`;
+		const b = [];
+		for (let i = 0; i + 1 < length(m[4]); i += 2)
+			push(b, hex(substr(m[4], i, 2)));
+		if (hex(m[3]) != 0 || length(b) < 21) {
+			wifi_line('info', `${who}: wouldn't give a beacon report (mode ${m[3]})`);
+			continue;
+		}
+		const bssid = join(':', map(slice(b, 15, 21), (x) => sprintf('%02x', x)));
+		wifi_line('info', `${who}: its scan table has ${bssid} on ch ${b[1]} at ${heard_text(b[13], b[14])} (beacon report)`);
+	}
+	beacon_lines = [];
+}
+
+// Per radio, after its devices: how busy the channel was (every sample in
+// which a device line was written, and once a minute; with channel=1), and
+// once a minute its TWT agreements and its MU/OFDMA counters over the
+// minute (with mu=1).
+let chan_prev = {}, mu_prev = {};
+function radio_lines(minute) {
+	for (let r in radios) {
+		if (CHANNEL) {
+			const sv = survey(r.dev);
+			const ct = channel_text(chan_prev[r.dev], sv);
+			if (sv)
+				chan_prev[r.dev] = sv;
+			if (ct && (r.active || minute))
+				wifi_line('info', `${r.dev}: ${ct}`);
+		}
+		if (!minute)
+			continue;
+		const twt = twt_count(r.phy);
+		if (twt)
+			wifi_line('info', `${r.dev}: ${twt} TWT agreement${twt == 1 ? '' : 's'} (devices that sleep on a schedule)`);
+		if (!MU)
+			continue;
+		const mu = mu_counters(r.dev);
+		const mt = mu_text(mu_prev[r.dev], mu);
+		if (mu)
+			mu_prev[r.dev] = mu;
+		if (mt)
+			wifi_line('info', `${r.dev} in the last minute: ${mt}`);
+	}
+}
+
+// ---- every interval --------------------------------------------------------
+
+let ticks = 0;
+function tick() {
+	const minute = (ticks % max(1, int(60 / INTERVAL))) == 0;
+	ticks++;
+	if (minute && (WIFI || SNAPSHOT))
+		read_names();
+	const trouble = [];
+	const net = net_rounds();
+	if (net != null)
+		push(trouble, net);
+
+	if (WIFI) {
+		const fw = firmware();
+		if (fw != null && fw != fw_prev) {
+			wifi_line(fw_prev == null ? 'info' : 'warn', `firmware errors: ${fw == '' ? 'none' : fw}`);
+			fw_prev = fw;
+		}
+	}
+
+	// 5 s at most per call: a stuck daemon mustn't hold up the system log
+	const conn = connect(null, 5);
+	if (conn && (WIFI || SNAPSHOT)) {
+		const notx = sample(conn, minute);
+		if (length(notx))
+			push(trouble, `NO TX: ${join(', ', notx)}`);
+	}
+	if (conn && WIFI)
+		radio_lines(minute);
+	if (conn && RRM) {
+		rrm_subscribe(map(radios, (r) => r.dev));
+		rrm_replies();
+		if (minute)
+			for (let r in radios)
+				rrm_caps(conn, r.dev);
+		for (let a in to_ask)
+			rrm_ask(conn, a.dev, a.mac, a.bssid, a.why);
+	}
+	if (COUNTERS)
+		counters(conn, minute);
+	if (SNAPSHOT && length(trouble))
+		snapshot(conn, join('; ', trouble));
+	if (conn)
+		conn.disconnect();
+}
+
+// ---- main ----------------------------------------------------------------
+
+// logread -t adds each line's time in ms, for the restart check above; -l
+// (more lines than logd holds) prints the RAM buffer first, which -f alone
+// doesn't, then it follows. The loop says "TICK" every INTERVAL seconds,
+// and "EOF" once logread has stopped (logd restarted): procd starts this
+// again. procd only stops this process, so once nobody reads the pipe the
+// loop ends and takes logread with it (SIGPIPE may be ignored here: the
+// failed echo ends it then).
+rrm_stop();
+const src = popen(`logread -f -t -l 1000000 & LR=$!
+trap 'kill $LR 2> /dev/null; exit' PIPE TERM INT HUP
+while sleep ${SAMPLING ? INTERVAL : 30}; do
+	kill -0 $LR 2> /dev/null || { echo EOF; break; }
+	echo TICK 2> /dev/null || break
+done
+kill $LR 2> /dev/null`, 'r');
+if (!src)
+	exit(1);
+
+for (let line = src.read('line'); line != null && line != ''; line = src.read('line')) {
+	line = rtrim(line, '\n');
+	if (line == 'TICK') {
+		if (SAMPLING)
+			tick();
+	}
+	else if (line == 'EOF')
+		break;
+	else
+		on_log_line(line);
+}
+exit(1);

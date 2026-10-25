@@ -1,0 +1,8 @@
+{
+	"milkflint-tuning": {
+		"description": "MilkFlint web interface: Performance Tuning",
+		"read": {
+			"ubus": { "milkflint.tuning": [ "status" ] }
+		}
+	}
+}

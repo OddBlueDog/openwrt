@@ -1,0 +1,26 @@
+# MilkFlint: the driver's MU/RU statistics on (muru_debug), on every radio
+# as it appears: at boot, or when the driver loads again, so the
+# Wi-Fi log's once-a-minute MU/OFDMA line has its DL/UL counters (ethtool's
+# dl_*/ul_* stay 0 without it). It costs one firmware query per band every
+# half second, so only while that line is recorded: the Logs page's Wi-Fi
+# log and its MU/OFDMA counters (milkflint.logs.wifi, wifi_mu; on unless
+# 0). The logs service sets the radios already there when they change.
+# Installed as /etc/hotplug.d/ieee80211/32-milkflint-muru; hotplug-call
+# sources it, so it returns rather than exits. The stock driver has the
+# same file; with no mt76 debugfs there's nothing to do.
+
+[ "$ACTION" = add ] || return 0
+[ "$(uci -q get milkflint.logs.wifi)" = 0 ] && return 0
+[ "$(uci -q get milkflint.logs.wifi_mu)" = 0 ] && return 0
+
+(
+	phy=${DEVICENAME:-${DEVPATH##*/}}
+	f=/sys/kernel/debug/ieee80211/$phy/mt76/muru_debug
+	# the driver adds its debugfs files after the radio is registered
+	i=0
+	while [ ! -w "$f" ] && [ $i -lt 20 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	[ -w "$f" ] && echo 1 > "$f"
+) > /dev/null 2>&1 &

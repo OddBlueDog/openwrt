@@ -1,0 +1,13 @@
+{
+	"milkflint-firewall": {
+		"description": "MilkFlint web interface: Firewall (read-only: the running ruleset's counters, as LuCI's status page reads them, and fw4's check of the config)",
+		"read": {
+			"ubus": { "file": [ "exec" ] },
+			"file": {
+				"/usr/sbin/nft --terse --json list ruleset": [ "exec" ],
+				"/sbin/fw4 check": [ "exec" ]
+			},
+			"uci": [ "firewall" ]
+		}
+	}
+}

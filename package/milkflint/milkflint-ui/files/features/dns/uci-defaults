@@ -1,0 +1,10 @@
+#!/bin/sh
+# DNS comes from the internet provider until it's changed on the DNS page.
+[ -f /etc/config/milkflint ] || touch /etc/config/milkflint
+uci -q get milkflint.dns > /dev/null || uci -q set milkflint.dns=dns
+[ -n "$(uci -q get milkflint.dns.mode)" ] || uci -q set milkflint.dns.mode='auto'
+# before 0.4 the DNS page used https-dns-proxy, with a plain on/off
+uci -q delete milkflint.dns.encrypted
+uci -q commit milkflint
+/etc/init.d/milkflint-dns enable
+exit 0
