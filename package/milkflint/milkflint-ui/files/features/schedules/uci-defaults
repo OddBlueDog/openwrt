@@ -1,0 +1,4 @@
+#!/bin/sh
+[ -f /etc/config/milkflint ] || touch /etc/config/milkflint
+/etc/init.d/milkflint-schedules enable
+exit 0

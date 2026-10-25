@@ -1,0 +1,13 @@
+{
+	"milkflint-upgrade": {
+		"description": "MilkFlint web interface: firmware upgrade",
+		"read": {
+			"ubus": { "milkflint.upgrade": [ "check" ], "system": [ "validate_firmware_image" ] }
+		},
+		"write": {
+			"cgi-io": [ "upload" ],
+			"file": { "/tmp/firmware.bin": [ "write" ] },
+			"ubus": { "milkflint.upgrade": [ "start", "discard" ] }
+		}
+	}
+}

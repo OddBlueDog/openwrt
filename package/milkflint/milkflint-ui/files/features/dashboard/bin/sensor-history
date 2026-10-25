@@ -1,0 +1,65 @@
+#!/usr/bin/ucode
+// MilkFlint sensor history (procd service milkflint-dashboard, ui feature
+// "dashboard"). Every INTERVAL seconds it reads the router's temperatures,
+// through the milkflint ubus object so they're named as the dashboard names
+// them, and keeps the last hour in RAM for the milkflint.sensors rpcd
+// object. It only reads.
+'use strict';
+
+import { readfile, writefile, rename, mkdir, popen } from 'fs';
+
+const DIR = '/tmp/milkflint';
+const STATE = DIR + '/sensors.json';
+const INTERVAL = 10;
+const KEEP = 3600 / INTERVAL;
+
+function now_ms() {
+	const t = clock(true);
+	return t[0] * 1000 + t[1] / 1000000.0;
+}
+
+// { name: °C to 0.1 }
+function temperatures() {
+	const p = popen('ubus call milkflint stats 2>/dev/null', 'r');
+	if (!p)
+		return {};
+	let stats = null;
+	try {
+		stats = json(p.read('all'));
+	}
+	catch (e) {
+		stats = null;
+	}
+	p.close();
+	const out = {};
+	for (let t in stats?.temperatures ?? [])
+		out[t.name] = int(t.celsius * 10 + 0.5) / 10.0;
+	return out;
+}
+
+mkdir(DIR);
+
+// carry on from the last run (a restart of the service, not of the router)
+let samples = [];
+try {
+	const prev = json(readfile(STATE) ?? 'null');
+	if (type(prev?.samples) == 'array')
+		samples = prev.samples;
+}
+catch (e) {
+	// start fresh
+}
+
+while (true) {
+	const started = now_ms();
+	push(samples, { t: time(), c: temperatures() });
+	if (length(samples) > KEEP)
+		samples = slice(samples, length(samples) - KEEP);
+
+	writefile(STATE + '.tmp', sprintf('%J', { interval: INTERVAL, samples }));
+	rename(STATE + '.tmp', STATE);
+
+	const wait = INTERVAL * 1000 - (now_ms() - started);
+	if (wait > 0)
+		sleep(int(wait));
+}

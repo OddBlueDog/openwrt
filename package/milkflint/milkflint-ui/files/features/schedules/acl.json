@@ -1,0 +1,7 @@
+{
+	"milkflint-schedules": {
+		"description": "MilkFlint web interface: Scheduled Tasks",
+		"read": { "uci": [ "milkflint" ] },
+		"write": { "uci": [ "milkflint" ] }
+	}
+}

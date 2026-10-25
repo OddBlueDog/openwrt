@@ -1,0 +1,10 @@
+#!/bin/sh
+# Runs one scheduled task; called from the crontab block that
+# /etc/init.d/milkflint-schedules writes.
+logger -t milkflint-schedules "running scheduled task: $1"
+case "$1" in
+	reboot) reboot ;;
+	wifi_off) wifi down ;;
+	wifi_on) wifi up ;;
+	*) exit 1 ;;
+esac

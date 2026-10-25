@@ -1,0 +1,30 @@
+# MilkFlint: a shorter Wi-Fi hardware queue for best-effort traffic, on every
+# radio as it appears (at boot, or when the driver loads again).
+# Installed as /etc/hotplug.d/ieee80211/30-milkflint-aql; hotplug-call
+# sources it, so it returns rather than exits.
+#
+# mac80211's AQL lets each station queue 5 ms of airtime in the driver, and
+# 12 ms while the radio's total is under 24 ms: with one busy client it's
+# always 12. Whenever the client's link is slower than the download (Smart
+# Queue's shaper), that queue fills, and every packet to the client, a
+# speed test's latency probes too, waits behind it. Lower limits (2500/5000)
+# keep that wait shorter. What doesn't fit stays in mac80211's own queues,
+# where fq_codel sends sparse flows first.
+#
+# milkflint.wifi.aql_be (the Performance Tuning page): "<low> <high>" in us,
+# or "off" for mac80211's 5000 12000. /usr/libexec/milkflint/wifi-aql
+# writes it; milkflint-tuning runs that too when the setting changes.
+
+[ "$ACTION" = add ] || return 0
+
+(
+	phy=${DEVICENAME:-${DEVPATH##*/}}
+	f=/sys/kernel/debug/ieee80211/$phy/aql_txq_limit
+	# mac80211 adds its debugfs files after the radio is registered
+	i=0
+	while [ ! -w "$f" ] && [ $i -lt 20 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	/usr/libexec/milkflint/wifi-aql "$phy"
+) > /dev/null 2>&1 &

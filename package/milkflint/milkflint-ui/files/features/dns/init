@@ -1,0 +1,37 @@
+#!/bin/sh /etc/rc.common
+# MilkFlint encrypted DNS (ui feature "dns"): AdGuard's dnsproxy runs when
+# the DNS page turns it on (dnsproxy.global.enabled, written with the rest
+# of its settings), and is stopped and disabled otherwise. dnsproxy has no
+# reload trigger of its own, so this restarts it when its settings change.
+
+START=94
+USE_PROCD=1
+
+proxy_wanted() {
+	[ "$(uci -q get dnsproxy.global.enabled)" = "1" ]
+}
+
+start_service() {
+	[ -x /etc/init.d/dnsproxy ] || return 0
+	if proxy_wanted; then
+		/etc/init.d/dnsproxy enabled || /etc/init.d/dnsproxy enable
+		/etc/init.d/dnsproxy running || /etc/init.d/dnsproxy start
+	elif /etc/init.d/dnsproxy enabled || /etc/init.d/dnsproxy running; then
+		/etc/init.d/dnsproxy stop
+		/etc/init.d/dnsproxy disable
+	fi
+}
+
+reload_service() {
+	[ -x /etc/init.d/dnsproxy ] || return 0
+	if proxy_wanted; then
+		/etc/init.d/dnsproxy enable
+		/etc/init.d/dnsproxy restart
+	else
+		start_service
+	fi
+}
+
+service_triggers() {
+	procd_add_reload_trigger "dnsproxy"
+}

@@ -1,0 +1,24 @@
+#!/bin/sh /etc/rc.common
+# MilkFlint data statistics (ui feature "data-statistics"): nlbwmon counts
+# each device's traffic while the Data Statistics page has it on
+# (milkflint.datastats.enabled, on unless '0'), and is stopped and disabled
+# otherwise. Stopping it writes its database, so the counts so far are kept
+# for when it's turned back on.
+
+START=95
+USE_PROCD=1
+
+start_service() {
+	[ -x /etc/init.d/nlbwmon ] || return 0
+	if [ "$(uci -q get milkflint.datastats.enabled)" != "0" ]; then
+		/etc/init.d/nlbwmon enabled || /etc/init.d/nlbwmon enable
+		/etc/init.d/nlbwmon running || /etc/init.d/nlbwmon start
+	elif /etc/init.d/nlbwmon enabled || /etc/init.d/nlbwmon running; then
+		/etc/init.d/nlbwmon stop
+		/etc/init.d/nlbwmon disable
+	fi
+}
+
+service_triggers() {
+	procd_add_reload_trigger "milkflint"
+}

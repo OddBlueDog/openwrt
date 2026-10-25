@@ -1,0 +1,387 @@
+#!/usr/bin/ucode
+// Nearby Wi-Fi networks, for the "wifi-scan" feature: scans the given radios
+// (phys) from their running access points, all at once, and writes what
+// they heard to /tmp/milkflint/wifi-scan.json for the feature's rpcd plugin,
+// which starts it in the background (a scan takes seconds; rpcd answers
+// one call at a time).
+//
+//   wifi-scan phy0 phy1
+//
+// A radio scans by leaving its channel for each of the others in turn
+// (mac80211's software scan, as LuCI's Scan button does through iwinfo):
+// its devices hear nothing from it until it's back, a second or a few.
+// NL80211_SCAN_FLAG_AP lets an access point that's beaconing scan, and
+// FLUSH empties the radio's cache first, so only networks heard now are
+// listed. Information elements are parsed as IEEE 802.11-2020 9.4.2 lays
+// them out.
+'use strict';
+
+import * as nl from 'nl80211';
+import { mkdir, readfile, rename, writefile } from 'fs';
+
+const OUT = '/tmp/milkflint/wifi-scan.json';
+const SCAN_FLAG_FLUSH = 1 << 1;
+const SCAN_FLAG_AP = 1 << 2;
+const TIMEOUT_MS = 30000;
+const c = nl.const;
+
+// nl80211_chan_width -> MHz (80+80 counted as 160)
+const CHAN_WIDTH = { '0': 20, '1': 20, '2': 40, '3': 80, '4': 160, '5': 160, '13': 320 };
+
+const CIPHERS = { '1': 'wep40', '2': 'tkip', '4': 'ccmp', '5': 'wep104', '8': 'gcmp', '9': 'gcmp256', '10': 'ccmp256' };
+const AKMS = {
+	'1': 'eap', '2': 'psk', '3': 'ft-eap', '4': 'ft-psk', '5': 'eap-sha256', '6': 'psk-sha256',
+	'8': 'sae', '9': 'ft-sae', '11': 'eap-suite-b', '12': 'eap-suite-b-192', '18': 'owe',
+	'24': 'sae-ext', '25': 'ft-sae-ext'
+};
+// WPA (version 1) uses Microsoft's OUI and its own numbers
+const WPA_CIPHERS = { '2': 'tkip', '4': 'ccmp' };
+const WPA_AKMS = { '1': 'eap', '2': 'psk' };
+const OUI_IEEE = '\x00\x0f\xac';
+const OUI_MS = '\x00\x50\xf2';
+// WPS attributes worth showing: what the network's own device says it is
+const WPS_ATTRS = { '4113': 'name', '4129': 'manufacturer', '4131': 'model', '4132': 'model_number' };
+
+function u8(s, o) { return ord(s, o) ?? 0; }
+function u16le(s, o) { return u8(s, o) | (u8(s, o + 1) << 8); }
+function u16be(s, o) { return (u8(s, o) << 8) | u8(s, o + 1); }
+
+function now_ms() {
+	const t = clock(true);
+	return t[0] * 1000 + t[1] / 1000000;
+}
+
+function band_of(mhz) {
+	if (mhz >= 2400 && mhz < 2500) return '2g';
+	if (mhz >= 5925 && mhz <= 7125) return '6g';
+	if (mhz >= 4900 && mhz < 5925) return '5g';
+	return null;
+}
+
+function channel_of(mhz) {
+	if (mhz == 2484) return 14;
+	if (mhz < 2500) return (mhz - 2407) / 5;
+	if (mhz == 5935) return 2;
+	if (mhz > 5950) return (mhz - 5950) / 5;
+	return (mhz - 5000) / 5;
+}
+
+function mhz_of(band, ch) {
+	if (band == '2g') return ch == 14 ? 2484 : 2407 + 5 * ch;
+	if (band == '6g') return ch == 2 ? 5935 : 5950 + 5 * ch;
+	return 5000 + 5 * ch;
+}
+
+// s as valid UTF-8: control characters left out, broken sequences as U+FFFD
+// (an SSID is any 32 bytes, and the JSON has to parse)
+function text(s) {
+	let out = '';
+	const n = length(s ?? '');
+	for (let i = 0; i < n; ) {
+		const b = ord(s, i);
+		const len = b < 0x80 ? 1 : (b & 0xe0) == 0xc0 ? 2 : (b & 0xf0) == 0xe0 ? 3 : (b & 0xf8) == 0xf0 ? 4 : 0;
+		let ok = len > 0 && i + len <= n && (len != 2 || b >= 0xc2);
+		for (let k = 1; ok && k < len; k++)
+			ok = (ord(s, i + k) & 0xc0) == 0x80;
+		if (!ok) {
+			out += '\ufffd';
+			i++;
+			continue;
+		}
+		if (len > 1 || (b >= 0x20 && b != 0x7f))
+			out += substr(s, i, len);
+		i += len;
+	}
+	return out;
+}
+
+// a suite list (count, then 4-byte OUI + type) from offset o
+function suites(data, o, oui, names) {
+	const n = u16le(data, o), list = [];
+	for (let i = 0; i < n; i++) {
+		const p = o + 2 + i * 4;
+		if (p + 4 > length(data))
+			break;
+		const name = substr(data, p, 3) == oui ? names[`${u8(data, p + 3)}`] : null;
+		if (name && index(list, name) < 0)
+			push(list, name);
+	}
+	return { list, next: o + 2 + n * 4 };
+}
+
+function parse_ies(list) {
+	const ie = {};
+	for (let e in list ?? []) {
+		const d = e.data ?? '';
+		switch (e.type) {
+		case 0:
+			ie.ssid = d;
+			break;
+		case 7:
+			if (match(substr(d, 0, 2), /^[A-Z]{2}$/))
+				ie.country = substr(d, 0, 2);
+			break;
+		case 11:
+			if (length(d) >= 3)
+				ie.load = { stations: u16le(d, 0), utilization: u8(d, 2) / 255 };
+			break;
+		case 45:
+			ie.ht_cap = true;
+			break;
+		case 48: {
+			// version, group cipher, pairwise ciphers, AKMs, capabilities
+			const pw = suites(d, 6, OUI_IEEE, CIPHERS);
+			const akm = suites(d, pw.next, OUI_IEEE, AKMS);
+			const caps = akm.next + 2 <= length(d) ? u16le(d, akm.next) : 0;
+			ie.rsn = { ciphers: pw.list, akm: akm.list, mfp: caps & 0x40 ? 'required' : caps & 0x80 ? 'capable' : null };
+			break;
+		}
+		case 61:
+			if (length(d) >= 2)
+				ie.ht = { secondary: u8(d, 1) & 3, any_width: (u8(d, 1) & 4) != 0 };
+			break;
+		case 191:
+			ie.vht_cap = true;
+			break;
+		case 192:
+			if (length(d) >= 3)
+				ie.vht = { width: u8(d, 0), seg0: u8(d, 1), seg1: u8(d, 2) };
+			break;
+		case 221: {
+			const oui = substr(d, 0, 3), kind = u8(d, 3);
+			if (oui == OUI_MS && kind == 1) {
+				// after OUI and type: version, group cipher, pairwise ciphers, AKMs
+				const pw = suites(d, 10, OUI_MS, WPA_CIPHERS);
+				ie.wpa = { ciphers: pw.list, akm: suites(d, pw.next, OUI_MS, WPA_AKMS).list };
+			}
+			else if (oui == OUI_MS && kind == 4) {
+				const wps = {};
+				for (let p = 4; p + 4 <= length(d); ) {
+					const t = u16be(d, p), l = u16be(d, p + 2);
+					const name = WPS_ATTRS[`${t}`];
+					const v = name ? trim(text(substr(d, p + 4, l))) : '';
+					if (v != '')
+						wps[name] = v;
+					p += 4 + l;
+				}
+				if (length(keys(wps)))
+					ie.wps = wps;
+			}
+			break;
+		}
+		case 255: {
+			// an extension: its own id first
+			const ext = u8(d, 0);
+			if (ext == 35)
+				ie.he_cap = true;
+			else if (ext == 108)
+				ie.eht_cap = true;
+			else if (ext == 36 && length(d) >= 7) {
+				// HE Operation: 3 bytes of parameters, BSS colour, basic HE-MCS, then
+				// what the parameters say is there
+				const params = u8(d, 1) | (u8(d, 2) << 8) | (u8(d, 3) << 16);
+				let o = 7;
+				if (params & (1 << 14)) {
+					ie.he_vht = { width: u8(d, o), seg0: u8(d, o + 1), seg1: u8(d, o + 2) };
+					o += 3;
+				}
+				if (params & (1 << 15))
+					o += 1;
+				if ((params & (1 << 17)) && o + 4 <= length(d))
+					ie.he6 = { width: u8(d, o + 1) & 3, ccfs0: u8(d, o + 2), ccfs1: u8(d, o + 3) };
+			}
+			else if (ext == 106 && length(d) >= 6) {
+				// EHT Operation: parameters, basic EHT-MCS (4), then the channel if present
+				if ((u8(d, 1) & 1) && length(d) >= 9)
+					ie.eht = { width: u8(d, 6) & 7, ccfs0: u8(d, 7), ccfs1: u8(d, 8) };
+			}
+			break;
+		}
+		}
+	}
+	return ie;
+}
+
+function distance(a, b) {
+	return a > b ? a - b : b - a;
+}
+
+// The whole channel: its width and centre (MHz), from the operation elements.
+function span(mhz, band, ie) {
+	let width = 20, center = mhz;
+	if (ie.ht?.any_width && (ie.ht.secondary == 1 || ie.ht.secondary == 3)) {
+		width = 40;
+		center = mhz + (ie.ht.secondary == 1 ? 10 : -10);
+	}
+	const vht = ie.vht ?? ie.he_vht;
+	if (band == '5g' && vht?.width >= 1 && vht.seg0) {
+		if (vht.width == 1 && !vht.seg1) {
+			width = 80;
+			center = mhz_of(band, vht.seg0);
+		}
+		else if (vht.width == 1 && distance(vht.seg1, vht.seg0) == 8) {
+			width = 160;
+			center = mhz_of(band, vht.seg1);
+		}
+		else if (vht.width == 2) {
+			width = 160;
+			center = mhz_of(band, vht.seg0);
+		}
+		else {
+			// 80+80: the part with the primary channel
+			width = 80;
+			center = mhz_of(band, vht.seg0);
+		}
+	}
+	if (band == '6g' && ie.he6) {
+		width = [ 20, 40, 80, 160 ][ie.he6.width];
+		const seg = width == 160 && ie.he6.ccfs1 && distance(ie.he6.ccfs1, ie.he6.ccfs0) == 8 ? ie.he6.ccfs1 : ie.he6.ccfs0;
+		center = mhz_of(band, seg);
+	}
+	const eht = ie.eht ? [ 20, 40, 80, 160, 320 ][ie.eht.width] : null;
+	if (eht && eht > width) {
+		width = eht;
+		center = mhz_of(band, eht >= 160 ? ie.eht.ccfs1 : ie.eht.ccfs0);
+	}
+	// an element that doesn't fit the primary channel: trust only the primary
+	if (distance(center, mhz) > width / 2)
+		return { width: 20, center: mhz };
+	return { width, center };
+}
+
+function standard(band, ie) {
+	if (ie.eht_cap) return 'be';
+	if (ie.he_cap) return 'ax';
+	// on 2.4 GHz a VHT element is a vendor extension, not Wi-Fi 5
+	if (band != '2g' && ie.vht_cap) return 'ac';
+	if (ie.ht_cap) return 'n';
+	return 'legacy';
+}
+
+function network(bss, phy) {
+	const ie = parse_ies(bss.information_elements ?? bss.beacon_ies);
+	const band = band_of(bss.frequency);
+	if (!band)
+		return null;
+	let hidden = ie.ssid == null || length(ie.ssid) == 0;
+	if (!hidden) {
+		hidden = true;
+		for (let i = 0; i < length(ie.ssid); i++)
+			if (ord(ie.ssid, i) != 0)
+				hidden = false;
+	}
+	const s = span(bss.frequency, band, ie);
+	return {
+		bssid: lc(bss.bssid),
+		ssid: hidden ? null : text(ie.ssid),
+		mhz: bss.frequency,
+		band,
+		channel: channel_of(bss.frequency),
+		width: s.width,
+		center: s.center,
+		signal: bss.signal_mbm != null ? bss.signal_mbm / 100 : null,
+		seen_ms: bss.seen_ms_ago,
+		beacon_interval: bss.beacon_interval,
+		standard: standard(band, ie),
+		security: {
+			// the capability field's Privacy bit, with no WPA or RSN: WEP
+			privacy: ((bss.capability ?? 0) & 0x10) != 0,
+			wpa: ie.wpa,
+			rsn: ie.rsn
+		},
+		stations: ie.load?.stations,
+		utilization: ie.load?.utilization,
+		country: ie.country,
+		wps: ie.wps,
+		radio: phy
+	};
+}
+
+function write(state) {
+	mkdir('/tmp/milkflint');
+	writefile(`${OUT}.tmp`, sprintf('%J', state));
+	rename(`${OUT}.tmp`, OUT);
+}
+
+const started = time();
+const start_ms = now_ms();
+const ifaces = nl.request(c.NL80211_CMD_GET_INTERFACE, c.NLM_F_DUMP) ?? [];
+// this router's own access points, on any radio: not neighbours
+const own = map(filter(ifaces, (i) => i.iftype == c.NL80211_IFTYPE_AP), (i) => lc(i.mac));
+
+const radios = [];
+for (let phy in ARGV) {
+	const wiphy = +trim(readfile(`/sys/class/ieee80211/${phy}/index`) ?? '-1');
+	const ap = filter(ifaces, (i) => i.wiphy == wiphy && i.iftype == c.NL80211_IFTYPE_AP && i.wiphy_freq)[0];
+	push(radios, {
+		phy,
+		wiphy,
+		ifname: ap?.ifname,
+		band: ap ? band_of(ap.wiphy_freq) : null,
+		mhz: ap?.wiphy_freq,
+		width: ap ? CHAN_WIDTH[`${ap.channel_width}`] : null,
+		center: ap?.center_freq1,
+		error: ap ? null : 'no access point running'
+	});
+}
+
+// listen before triggering: a scan can end before the first wait would start listening
+nl.waitfor([ c.NL80211_CMD_NEW_SCAN_RESULTS ], 1);
+
+const pending = {};
+for (let r in radios) {
+	if (r.error)
+		continue;
+	const req = { dev: r.ifname, scan_flags: SCAN_FLAG_AP | SCAN_FLAG_FLUSH, scan_ssids: [ '' ] };
+	// nl.error() hands back the last error and clears it
+	nl.error();
+	nl.request(c.NL80211_CMD_TRIGGER_SCAN, 0, req);
+	let err = nl.error();
+	if (err) {
+		// busy: another scan (hostapd's own, or LuCI's) is finishing
+		sleep(1000);
+		nl.request(c.NL80211_CMD_TRIGGER_SCAN, 0, req);
+		err = nl.error();
+	}
+	if (err)
+		r.error = err;
+	else
+		pending[`${r.wiphy}`] = r;
+}
+
+while (length(keys(pending))) {
+	const left = start_ms + TIMEOUT_MS - now_ms();
+	if (left <= 0)
+		break;
+	const ev = nl.waitfor([ c.NL80211_CMD_NEW_SCAN_RESULTS, c.NL80211_CMD_SCAN_ABORTED ], int(left));
+	if (!ev)
+		break;
+	const r = pending[`${ev.msg?.wiphy}`];
+	if (!r)
+		continue;
+	if (ev.cmd == c.NL80211_CMD_SCAN_ABORTED)
+		r.error = 'scan aborted';
+	r.duration_ms = int(now_ms() - start_ms);
+	delete pending[`${r.wiphy}`];
+}
+for (let k in keys(pending))
+	pending[k].error = 'no answer in time';
+
+// a network heard by more than one radio (a radio that does several bands): its strongest
+const found = {};
+for (let r in radios) {
+	if (!r.ifname || r.error == 'scan aborted')
+		continue;
+	for (let b in nl.request(c.NL80211_CMD_GET_SCAN, c.NLM_F_DUMP, { dev: r.ifname }) ?? []) {
+		const n = b.bss ? network(b.bss, r.phy) : null;
+		if (!n || index(own, n.bssid) >= 0)
+			continue;
+		const seen = found[n.bssid];
+		if (!seen || (n.signal ?? -200) > (seen.signal ?? -200))
+			found[n.bssid] = n;
+	}
+}
+
+for (let r in radios)
+	delete r.wiphy;
+write({ state: 'done', started, finished: time(), radios, networks: values(found) });

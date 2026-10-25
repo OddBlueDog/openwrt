@@ -1,0 +1,6 @@
+{
+	"milkflint-admin-password": {
+		"description": "MilkFlint web interface: Admin Password",
+		"read": { "ubus": { "milkflint.adminpassword": [ "status" ] } }
+	}
+}

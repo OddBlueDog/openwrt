@@ -1,0 +1,13 @@
+{
+	"milkflint-upnp": {
+		"description": "MilkFlint web interface: UPnP",
+		"read": {
+			"ubus": { "milkflint.upnp": [ "mappings" ] },
+			"uci": [ "upnpd" ]
+		},
+		"write": {
+			"ubus": { "milkflint.upnp": [ "clear" ] },
+			"uci": [ "upnpd" ]
+		}
+	}
+}

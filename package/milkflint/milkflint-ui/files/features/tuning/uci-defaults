@@ -1,0 +1,12 @@
+#!/bin/sh
+# Older versions of the Performance Tuning page had milkflint.sqm.gro and
+# .udp_gro_fwd, read by a milkflint-sqm service that's gone. Its GRO settings
+# are milkflint.gro.* now (/usr/libexec/milkflint/gro), so drop the old
+# ones, and their section if that leaves it empty.
+[ -f /etc/config/milkflint ] || touch /etc/config/milkflint
+uci -q delete milkflint.sqm.gro
+uci -q delete milkflint.sqm.udp_gro_fwd
+[ -n "$(uci -q show milkflint.sqm | grep -v '^milkflint\.sqm=')" ] || uci -q delete milkflint.sqm
+uci -q commit milkflint
+/etc/init.d/milkflint-tuning enable
+exit 0

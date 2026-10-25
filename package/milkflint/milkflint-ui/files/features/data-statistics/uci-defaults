@@ -1,0 +1,29 @@
+#!/bin/sh
+# Data Statistics is on until it's turned off on its page.
+[ -f /etc/config/milkflint ] || touch /etc/config/milkflint
+if ! uci -q get milkflint.datastats > /dev/null; then
+	uci -q batch <<-UCI
+		set milkflint.datastats=datastats
+		set milkflint.datastats.enabled='1'
+		commit milkflint
+	UCI
+fi
+/etc/init.d/milkflint-data-statistics enable
+
+# nlbwmon's defaults, changed only while they're still the defaults:
+# - it counts every private range as local, so behind another router (a
+#   private WAN address) the router's own traffic shows up as a device:
+#   count the LAN only;
+# - it keeps its database in RAM, so every restart loses the month so far:
+#   keep it in flash (eMMC on the GL-MT6000; written daily and at shutdown).
+s='nlbwmon.@nlbwmon[0]'
+uci -q get "$s" > /dev/null || exit 0
+if [ "$(uci -q get "$s.local_network")" = "192.168.0.0/16 172.16.0.0/12 10.0.0.0/8 lan" ]; then
+	uci delete "$s.local_network"
+	uci add_list "$s.local_network=lan"
+fi
+if [ "$(uci -q get "$s.database_directory")" = "/var/lib/nlbwmon" ]; then
+	uci set "$s.database_directory=/etc/nlbwmon"
+fi
+uci commit nlbwmon
+exit 0

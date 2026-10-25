@@ -1,0 +1,78 @@
+#!/bin/sh /etc/rc.common
+# MilkFlint logs (ui feature "logs"): /usr/libexec/milkflint/logs-keeper
+# keeps the system log on the router's storage (milkflint.logs.persist),
+# writes the Wi-Fi log (milkflint.logs.wifi, with what it adds to the
+# devices' lines: wifi_channel, wifi_mu, wifi_rrm, wifi_net; on by default)
+# and, for chasing a dropout, the debug log (milkflint.logs.debug_counters,
+# debug_snapshot; off by default), each up to milkflint.logs.size MB. The
+# settings are its arguments, so procd restarts it when they change and
+# leaves it alone when another page saves (it doesn't compare the
+# environment).
+
+# right after logd (log: 12), so a boot's first run still finds the boot's
+# kernel lines in its buffer, and before the Wi-Fi driver loads (19)
+START=13
+USE_PROCD=1
+
+# <option> <default> <min> <max>: a whole number in range, else the default
+number() {
+	local v
+	v=$(uci -q get milkflint.logs.$1)
+	case "$v" in
+	'' | *[!0-9]*) v=$2 ;;
+	esac
+	[ "$v" -ge "$3" ] && [ "$v" -le "$4" ] || v=$2
+	echo "$v"
+}
+
+# <option>: 1 unless it's 0
+on() {
+	[ "$(uci -q get milkflint.logs.$1)" = "0" ] && echo 0 || echo 1
+}
+
+# The driver's MU/RU statistics (muru_debug: a firmware query per band every
+# half second) are only for the Wi-Fi log's MU/OFDMA line: on while that's
+# recorded. At boot there are no radios yet; the ieee80211 hotplug
+# (32-milkflint-muru) sets each one as it appears. Only a change is written.
+muru() {
+	local f
+	for f in /sys/kernel/debug/ieee80211/*/mt76/muru_debug; do
+		[ -w "$f" ] && [ "$(cat "$f" 2> /dev/null)" != "$1" ] && echo "$1" > "$f"
+	done 2> /dev/null
+	return 0
+}
+
+start_service() {
+	local persist=0 wifi counters=0 snapshot=0
+	[ "$(uci -q get milkflint.logs.persist)" = "1" ] && persist=1
+	wifi=$(on wifi)
+	[ "$(uci -q get milkflint.logs.debug_counters)" = "1" ] && counters=1
+	[ "$(uci -q get milkflint.logs.debug_snapshot)" = "1" ] && snapshot=1
+	if [ $wifi = 1 ]; then
+		muru "$(on wifi_mu)"
+	else
+		muru 0
+	fi
+	[ $persist = 1 ] || [ $wifi = 1 ] || [ $counters = 1 ] || [ $snapshot = 1 ] || return 0
+	procd_open_instance
+	procd_set_param command /usr/bin/ucode /usr/libexec/milkflint/logs-keeper \
+		persist=$persist wifi=$wifi channel="$(on wifi_channel)" mu="$(on wifi_mu)" \
+		rrm="$(on wifi_rrm)" net="$(on wifi_net)" counters=$counters snapshot=$snapshot \
+		size="$(number size 3 1 100)" interval="$(number wifi_interval 10 2 300)"
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+# the keeper's ubus subscriber for 802.11k replies outlives it (a new run
+# stops the last one's): stop it with the service
+stop_service() {
+	local pids
+	pids=$(cat /tmp/milkflint-logs/rrm-subscribe.pid 2> /dev/null)
+	[ -n "$pids" ] && kill $pids 2> /dev/null
+	rm -f /tmp/milkflint-logs/rrm-subscribe.pid
+}
+
+service_triggers() {
+	procd_add_reload_trigger "milkflint"
+}

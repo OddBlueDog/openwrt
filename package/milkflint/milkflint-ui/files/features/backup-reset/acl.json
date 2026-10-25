@@ -1,0 +1,9 @@
+{
+	"milkflint-backup-reset": {
+		"description": "MilkFlint web interface: Backup & Reset",
+		"read": { "cgi-io": [ "backup" ] },
+		"write": {
+			"ubus": { "milkflint.maintenance": [ "factory_reset" ], "system": [ "reboot" ] }
+		}
+	}
+}

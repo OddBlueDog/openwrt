@@ -1,0 +1,11 @@
+{
+	"milkflint-radar-scan": {
+		"description": "MilkFlint web interface: DFS radar scan",
+		"read": {
+			"ubus": { "milkflint.radarscan": [ "status", "reports" ] }
+		},
+		"write": {
+			"ubus": { "milkflint.radarscan": [ "start", "stop" ] }
+		}
+	}
+}
