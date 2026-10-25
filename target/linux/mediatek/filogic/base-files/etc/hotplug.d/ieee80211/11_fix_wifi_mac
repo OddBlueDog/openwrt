@@ -4,6 +4,18 @@ PHYNBR=${DEVPATH##*/phy}
 
 [ -n $PHYNBR ] || exit 0
 
+# This phy among its device's phys, in order (0 for the first). Unlike
+# PHYNBR it stays the same when the driver is loaded again (phy2, phy3...).
+phy_dev_index() {
+	local p n=0
+
+	for p in /sys${DEVPATH%/*}/phy*; do
+		[ -e "$p" ] || continue
+		[ "${p##*/phy}" -lt "$PHYNBR" ] && n=$((n + 1))
+	done
+	echo "$n"
+}
+
 . /lib/functions.sh
 . /lib/functions/system.sh
 
@@ -126,8 +138,9 @@ case "$board" in
 	glinet,gl-x3000|\
 	glinet,gl-xe3000)
 		addr=$(mmc_get_mac_binary factory 0x04)
-		[ "$PHYNBR" = "0" ] && echo "$addr" > /sys${DEVPATH}/macaddress
-		[ "$PHYNBR" = "1" ] && macaddr_add $addr 1 > /sys${DEVPATH}/macaddress
+		band=$(phy_dev_index)
+		[ "$band" = "0" ] && echo "$addr" > /sys${DEVPATH}/macaddress
+		[ "$band" = "1" ] && macaddr_add $addr 1 > /sys${DEVPATH}/macaddress
 		;;
 	globitel,bt-r320)
 		addr=$(mmc_get_mac_binary factory 0x4)
