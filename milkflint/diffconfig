@@ -5,14 +5,14 @@ CONFIG_TARGET_mediatek_filogic=y
 CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-mt6000=y
 
 # The firmware is MilkFlint, with its own version number on top of the
-# OpenWrt release ("MilkFlint 0.1a (OpenWrt 25.12.6)" in the banner and
+# OpenWrt release ("MilkFlint 0.11a (OpenWrt 25.12.6)" in the banner and
 # os-release). Images are named
 # milkflint-<version>-<revision>-mediatek-filogic-glinet_gl-mt6000-*.bin.
 # Packages still come from OpenWrt's repository for that release.
 CONFIG_IMAGEOPT=y
 CONFIG_VERSIONOPT=y
 CONFIG_VERSION_DIST="MilkFlint"
-CONFIG_VERSION_NUMBER="0.1a"
+CONFIG_VERSION_NUMBER="0.11a"
 CONFIG_VERSION_CODE_FILENAMES=y
 CONFIG_VERSION_MANUFACTURER="MilkFlint"
 CONFIG_VERSION_MANUFACTURER_URL="https://github.com/OddBlueDog/openwrt"

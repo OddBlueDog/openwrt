@@ -48,8 +48,10 @@ country.
 ## This branch
 
 `milkflint-25.12` is the OpenWrt release `v25.12.6` with MilkFlint's
-changes as commits on top, so `git log v25.12.6..` lists all of them. A new
-OpenWrt release is picked up by rebasing them onto its tag.
+changes as commits on top, so `git log v25.12.6..` lists all of them. Each
+update is a new commit, OpenWrt's 25.12 point releases are merged in, and
+each MilkFlint release is a tag on the branch (`milkflint-0.11a`), with its
+images on the Releases page.
 
 | Where | What |
 |---|---|
