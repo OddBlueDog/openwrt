@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="MilkFlint">
+  <title>MilkFlint</title>
+  <style>
+    .stone { fill: #2e333b; stroke: #2e333b; }
+    @media (prefers-color-scheme: dark) { .stone { fill: #4b525d; stroke: #4b525d; } }
+  </style>
+  <defs>
+    <clipPath id="milkflint-stone">
+      <path d="M39.1 6.6 51.9 17.4Q55 20 55.5 24L57.5 40Q58 44 55.2 46.8L44.8 57.2Q42 60 38 60H23Q19 60 16.5 56.9L8.5 47.1Q6 44 6.8 40.1L10.2 22.9Q11 19 14.4 16.9L32.6 6.1Q36 4 39.1 6.6Z"/>
+    </clipPath>
+  </defs>
+  <!-- a flint, chipped to a point, half full of milk -->
+  <path class="stone" d="M39.1 6.6 51.9 17.4Q55 20 55.5 24L57.5 40Q58 44 55.2 46.8L44.8 57.2Q42 60 38 60H23Q19 60 16.5 56.9L8.5 47.1Q6 44 6.8 40.1L10.2 22.9Q11 19 14.4 16.9L32.6 6.1Q36 4 39.1 6.6Z" stroke-width="3.2" stroke-linejoin="round"/>
+  <path d="M0 37C11 30.5 21 30.5 32 35.5S52 41 64 34V64H0Z" fill="#fbf7ee" clip-path="url(#milkflint-stone)"/>
+</svg>

@@ -1,0 +1,75 @@
+/*
+ * MilkFlint's palette, shared with the project website (site/src/styles.css):
+ * warm paper and ink, one rust accent. Dark mode is data-darkmode="true" on
+ * <html>, the same switch LuCI's themes use.
+ */
+:root {
+  --background: #f5f4ef;
+  --foreground: #1c1b18;
+  --card: #fbfaf6;
+  --card-foreground: #1c1b18;
+  --popover: #fbfaf6;
+  --popover-foreground: #1c1b18;
+  --muted: #ebe9e1;
+  --muted-foreground: #5c5a52;
+  --secondary: #ebe9e1;
+  --secondary-foreground: #1c1b18;
+  --accent: #e6e3d9;
+  --accent-foreground: #1c1b18;
+  --primary: #b5410f;
+  --primary-foreground: #fffaf5;
+  --destructive: #a32a1c;
+  --destructive-foreground: #fffaf5;
+  --success: #2f7a3f;
+  --success-foreground: #f6fbf6;
+  --warning: #9a6a00;
+  --warning-foreground: #fffaf0;
+  --info: #2c5f8a;
+  --border: #d9d6cc;
+  --rule: #c9c5b8;
+  --input: #d9d6cc;
+  --ring: #b5410f;
+  --sidebar: #efede6;
+  --chart-1: #b5410f;
+  --chart-2: #2c5f8a;
+  --chart-3: #2f7a3f;
+  --chart-4: #9a6a00;
+  --radius: 0.5rem;
+  --font-sans: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+  color-scheme: light;
+}
+
+:root[data-darkmode='true'] {
+  --background: #141412;
+  --foreground: #e8e6df;
+  --card: #1a1a17;
+  --card-foreground: #e8e6df;
+  --popover: #1f1e1b;
+  --popover-foreground: #e8e6df;
+  --muted: #22211e;
+  --muted-foreground: #a19e94;
+  --secondary: #22211e;
+  --secondary-foreground: #e8e6df;
+  --accent: #2a2925;
+  --accent-foreground: #e8e6df;
+  --primary: #f08a5d;
+  --primary-foreground: #1a0d06;
+  --destructive: #f07a6a;
+  --destructive-foreground: #1a0806;
+  --success: #6cc483;
+  --success-foreground: #07140a;
+  --warning: #e0b04a;
+  --warning-foreground: #1a1204;
+  --info: #7fb3e0;
+  --border: #34322d;
+  --rule: #45423b;
+  --input: #3a3832;
+  --ring: #f08a5d;
+  --sidebar: #171715;
+  --chart-1: #f08a5d;
+  --chart-2: #7fb3e0;
+  --chart-3: #6cc483;
+  --chart-4: #e0b04a;
+  color-scheme: dark;
+}

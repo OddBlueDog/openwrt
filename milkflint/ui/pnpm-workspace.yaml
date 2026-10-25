@@ -1,0 +1,41 @@
+# pnpm settings for ui/ (the LuCI theme and the dashboard). Same supply-chain
+# rules as site/; each setting is explained in site/README.md,
+# "Supply-chain security".
+
+registry: https://registry.npmjs.org/
+
+# Only install versions published at least 7 days (10080 minutes) ago, and fail
+# instead of falling back to a younger version or an undated package.
+minimumReleaseAge: 10080
+minimumReleaseAgeStrict: true
+minimumReleaseAgeIgnoreMissingTime: false
+
+# Fail if a package's trust evidence (trusted publisher / provenance) is weaker
+# than for an earlier release of the same package.
+trustPolicy: no-downgrade
+
+# Transitive dependencies may only come from the registry (no git/tarball URLs).
+blockExoticSubdeps: true
+
+# Dependency install scripts never run unless listed here as `true`. A package
+# with an unreviewed build script fails the install (strictDepBuilds).
+strictDepBuilds: true
+dangerouslyAllowAllBuilds: false
+allowBuilds: {}
+
+# Refuse dependencies whose `engines` don't match this Node, and fail on
+# unmet peer dependencies.
+engineStrict: true
+strictPeerDependencies: true
+
+# The one peer exception: eslint-plugin-jsx-a11y 6.10.2 (its latest release)
+# declares eslint up to ^9, but ESLint 9 is end-of-life. The plugin uses none
+# of the APIs ESLint 10 removed. Scoped to that exact plugin version, so an
+# update has to be looked at again.
+peerDependencyRules:
+  allowedVersions:
+    eslint-plugin-jsx-a11y@6.10.2>eslint: '10'
+
+# `pnpm add` writes exact versions.
+saveExact: true
+savePrefix: ''
