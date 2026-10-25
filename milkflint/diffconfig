@@ -1,0 +1,45 @@
+# MilkFlint's build configuration for the GL.iNet GL-MT6000 (Flint 2):
+#   cp milkflint/diffconfig .config && make defconfig
+CONFIG_TARGET_mediatek=y
+CONFIG_TARGET_mediatek_filogic=y
+CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-mt6000=y
+
+# The firmware is MilkFlint, with its own version number on top of the
+# OpenWrt release ("MilkFlint 0.1a (OpenWrt 25.12.6)" in the banner and
+# os-release). Images are named
+# milkflint-<version>-<revision>-mediatek-filogic-glinet_gl-mt6000-*.bin.
+# Packages still come from OpenWrt's repository for that release.
+CONFIG_IMAGEOPT=y
+CONFIG_VERSIONOPT=y
+CONFIG_VERSION_DIST="MilkFlint"
+CONFIG_VERSION_NUMBER="0.1a"
+CONFIG_VERSION_CODE_FILENAMES=y
+CONFIG_VERSION_MANUFACTURER="MilkFlint"
+CONFIG_VERSION_MANUFACTURER_URL="https://github.com/OddBlueDog/openwrt"
+CONFIG_VERSION_HOME_URL="https://github.com/OddBlueDog/openwrt"
+CONFIG_VERSION_BUG_URL="https://github.com/OddBlueDog/openwrt/issues"
+CONFIG_VERSION_SUPPORT_URL="https://github.com/OddBlueDog/openwrt/issues"
+CONFIG_VERSION_FIRMWARE_URL="https://github.com/OddBlueDog/openwrt/releases"
+CONFIG_KERNEL_BUILD_USER="builder"
+CONFIG_KERNEL_BUILD_DOMAIN="milkflint"
+
+CONFIG_PACKAGE_luci=y
+
+# MilkFlint's web interface at the router's address; LuCI stays under
+# "Advanced". Smart Queue needs SQM with CAKE.
+CONFIG_PACKAGE_milkflint-ui=y
+CONFIG_PACKAGE_sqm-scripts=y
+CONFIG_PACKAGE_luci-app-sqm=y
+# Pages that need extra packages: DNS (encrypted DNS through AdGuard's
+# dnsproxy), UPnP, Data Statistics
+CONFIG_PACKAGE_dnsproxy=y
+CONFIG_PACKAGE_miniupnpd-nftables=y
+CONFIG_PACKAGE_nlbwmon=y
+# The VPN pages (Remote access, VPN client)
+CONFIG_PACKAGE_kmod-wireguard=y
+CONFIG_PACKAGE_wireguard-tools=y
+CONFIG_PACKAGE_luci-proto-wireguard=y
+
+# On an arm64 build host, OpenWrt's Go (for dnsproxy) can't build its own
+# bootstrap: point it at the host's Go instead, e.g.
+# CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT="/usr/lib/go"
