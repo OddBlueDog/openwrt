@@ -1,3 +1,98 @@
+<img src="milkflint/logo.svg" width="96" alt="MilkFlint logo: a flint rock, half full of milk">
+
+# MilkFlint: OpenWrt for the GL.iNet Flint 2 (GL-MT6000)
+
+MilkFlint is OpenWrt with a few changes for the Flint 2. It aims for:
+
+- **Stable 5 GHz Wi-Fi**: a fork of the open-source mt76 driver with fixes
+  for the MT7986's Wi-Fi (resets, power save, block-ack sessions, radar
+  detection, firmware replies and more), plus a few mac80211 and hostapd
+  fixes.
+- **RSS**: received Ethernet traffic spread over the MT7986's receive
+  rings, each with its own interrupt and CPU core, instead of all on one.
+- **cake_mq**: multi-queue CAKE for Smart Queue (SQM), sharing the line's
+  rate between the queues by demand, with less CPU per packet, and working
+  with flow offloading.
+
+It also has its own web interface for the everyday settings, served at the
+router's address; LuCI stays installed under "Advanced".
+
+MilkFlint is experimental (an alpha). Images are on the
+[Releases](https://github.com/OddBlueDog/openwrt/releases) page.
+
+## Installing
+
+> **Don't keep settings.** Untick "Keep settings" when you flash MilkFlint,
+> whether the router runs GL.iNet's firmware, OpenWrt or an earlier
+> MilkFlint (from a shell: `sysupgrade -n`). Settings from another firmware
+> or an earlier alpha may not match this one; start clean and set the
+> router up again. Back up first if you want your old settings for
+> reference.
+
+Flash only `milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin`. Never
+the factory, preloader or bl31-uboot images: they can brick the router or
+replace its bootloader, and with it the U-Boot recovery page.
+
+- **From GL.iNet's firmware:** at <http://192.168.8.1>, System → Upgrade →
+  Local Upgrade, upload the image, untick "Keep Settings".
+- **From OpenWrt:** LuCI's System → Backup / Flash Firmware → Flash image,
+  untick "Keep settings".
+- **If it won't boot:** U-Boot recovery, on
+  [OpenWrt's GL-MT6000 page](https://openwrt.org/toh/gl.inet/gl-mt6000).
+
+Then plug a cable into a LAN port and open <http://192.168.1.1>. There's no
+password yet: sign in with it empty and set one under System → Admin
+Password. Wi-Fi is off until you set it up on the Wi-Fi page, with your
+country.
+
+## This branch
+
+`milkflint-25.12` is the OpenWrt release `v25.12.6` with MilkFlint's
+changes as commits on top, so `git log v25.12.6..` lists all of them. A new
+OpenWrt release is picked up by rebasing them onto its tag.
+
+| Where | What |
+|---|---|
+| `target/linux/`, `package/kernel/mac80211/`, `package/network/services/hostapd/`, `package/base-files/` | Kernel, Ethernet, mac80211 and hostapd patches, and MilkFlint's name and version |
+| `package/kernel/mt76/patches/` | The mt76 driver fork, on upstream mt76 of the date in its Makefile |
+| `package/milkflint/milkflint-ui/` | The web interface package (`htdocs/` is the built interface) |
+| `package/milkflint/` | Newer versions of dnsproxy, miniupnpd, nlbwmon and sqm-scripts; they replace the feeds' copies |
+| `milkflint/ui/` | The web interface's source (React, TypeScript) |
+| `milkflint/diffconfig` | The build configuration |
+
+## Building
+
+On a Linux build host set up for OpenWrt (see below):
+
+```bash
+./scripts/feeds update -a
+./scripts/feeds install -a
+cp milkflint/diffconfig .config
+make defconfig
+make download
+make -j$(nproc)
+```
+
+`feeds install` says it isn't overriding the core packages in
+`package/milkflint/`: that's how they replace the feeds' copies. The images
+are in `bin/targets/mediatek/filogic/`; flash the
+`milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin` one (see Installing).
+
+To build the web interface after changing it (Node.js 24 and pnpm):
+
+```bash
+cd milkflint/ui
+pnpm install --frozen-lockfile
+pnpm package
+```
+
+`pnpm package` checks it (TypeScript, ESLint), builds it and copies it into
+`package/milkflint/milkflint-ui/htdocs/`.
+
+---
+
+*The rest of this README is OpenWrt's.*
+
 ![OpenWrt logo](include/logo.png)
 
 OpenWrt Project is a Linux operating system targeting embedded devices. Instead
