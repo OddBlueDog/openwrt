@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="/milkflint/favicon.svg" type="image/svg+xml" />
+    <title>Router</title>
+    <script>
+      // Apply the saved light/dark choice before first paint (no flash).
+      (function () {
+        var pref = null;
+        try { pref = localStorage.getItem('milkflint.theme'); } catch (e) {}
+        var dark = pref === 'dark' || (pref !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.setAttribute('data-darkmode', dark ? 'true' : 'false');
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
