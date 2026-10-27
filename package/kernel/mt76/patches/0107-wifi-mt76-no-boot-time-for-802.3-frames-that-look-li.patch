@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:27:22 +0000
+Subject: [PATCH] wifi: mt76: no boot time for 802.3 frames that look like
+ beacons
+
+mt76_rx_convert() gives beacons and probe responses the boot time they
+came at (status->boottime_ns), testing the frame control at the start of
+the frame. An 802.3 frame (RX_FLAG_8023, every data frame with rx decap
+offload) starts with its DA instead: one to a MAC whose first byte is
+0x80-0x83 reads as a beacon, 0x50-0x53 as a probe response, and gets a
+clock read and a boot time nothing uses.
+
+Test the frame control only for 802.11 frames.
+
+mt76_test_rx_convert_8023.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c        |  6 ++++--
+ tests/core-test.c | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 38 insertions(+), 2 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index 9b712e98..7cdee77f 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1355,8 +1355,10 @@ mt76_rx_convert(struct mt76_dev *dev, struct sk_buff *skb,
+ 	if (status->signal <= -128)
+ 		status->flag |= RX_FLAG_NO_SIGNAL_VAL;
+ 
+-	if (ieee80211_is_beacon(hdr->frame_control) ||
+-	    ieee80211_is_probe_resp(hdr->frame_control))
++	/* an 802.3 frame has no frame control: that's its DA */
++	if (!(status->flag & RX_FLAG_8023) &&
++	    (ieee80211_is_beacon(hdr->frame_control) ||
++	     ieee80211_is_probe_resp(hdr->frame_control)))
+ 		status->boottime_ns = ktime_get_boottime_ns();
+ 
+ 	BUILD_BUG_ON(sizeof(mstat) > sizeof(skb->cb));
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 4c7686c5..60e24a78 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -2354,6 +2354,39 @@ static void mt76_test_rx_convert(struct kunit *test)
+ 	dev->phys[MT_BAND1] = NULL;
+ }
+ 
++/* An 802.3 frame's first bytes are its DA, not a frame control: one to a
++ * MAC starting 0x80 (a beacon's frame control) or 0x50 (a probe
++ * response's) gets no boot time.
++ */
++static void mt76_test_rx_convert_8023(struct kunit *test)
++{
++	static const u8 first[] = { 0x80, 0x83, 0x50, 0x53 };
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct ieee80211_sta *rsta;
++	struct ieee80211_hw *hw;
++	struct sk_buff *skb;
++	struct ethhdr *eth;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(first); i++) {
++		skb = alloc_skb(32 + ETH_HLEN + 64, GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(test, skb);
++		skb_reserve(skb, 32);
++		eth = skb_put_zero(skb, ETH_HLEN);
++		eth->h_dest[0] = first[i];
++		eth->h_proto = htons(ETH_P_IP);
++		skb_put_zero(skb, 64);
++		memset(skb->cb, 0, sizeof(skb->cb));
++		mt76_test_status(skb)->flag = RX_FLAG_8023;
++
++		mt76_rx_convert(dev, skb, &hw, &rsta);
++		KUNIT_EXPECT_TRUE(test,
++				  IEEE80211_SKB_RXCB(skb)->flag & RX_FLAG_8023);
++		KUNIT_EXPECT_EQ(test, IEEE80211_SKB_RXCB(skb)->boottime_ns, 0);
++		kfree_skb(skb);
++	}
++}
++
+ static void mt76_test_set_pn(u8 *pn, u64 val)
+ {
+ 	int i;
+@@ -2855,6 +2888,7 @@ static struct kunit_case mt76_core_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_rx_amsdu_bad_first_subframe),
+ 	KUNIT_CASE(mt76_test_rx_rro_v3),
+ 	KUNIT_CASE(mt76_test_rx_convert),
++	KUNIT_CASE(mt76_test_rx_convert_8023),
+ 	KUNIT_CASE(mt76_test_ccmp_pn_advances),
+ 	KUNIT_CASE(mt76_test_ccmp_pn_replay),
+ 	KUNIT_CASE(mt76_test_ccmp_pn_skipped),

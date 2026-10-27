@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:04:26 +0000
+Subject: [PATCH] wifi: mt76: mt7915: select the WTBL group once per station
+ poll
+
+mt7915_mac_sta_poll() reads three parts of a station's WTBL entry: its
+airtime counters (dw 20-27), the GI bits (dw 7) and the ack signal
+(dw 30). Each went through mt7915_mac_wtbl_lmac_addr(), which writes the
+group register (MT_WTBLON_TOP_WDUCR), with the same group each time. The
+poll runs after every tx-free event for each station on the poll list,
+so two of every three of those writes were for nothing.
+
+Select the group once, for the airtime counters, and address the other
+two words directly: nothing in between selects another group
+(mt7915_mac_wtbl_update() has its own register). The group register's
+other users still write it without a lock, as before; that only matters
+with stations in different groups (wcid 128 and up), and the selection
+now covers all of a station's reads rather than each one.
+
+mt7915_test_sta_poll_group_once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 11 ++++++-----
+ mt7915/tests/mac-test.c | 42 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 5 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 63f3363a..3961514f 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -137,7 +137,10 @@ static void mt7915_mac_sta_poll(struct mt7915_dev *dev)
+ 		if (!published)
+ 			continue;
+ 
+-		/* refresh peer's airtime reporting */
++		/* refresh peer's airtime reporting. This selects the WTBL
++		 * group of the station's entry, which the GI and ack signal
++		 * reads below use too: nothing in between selects another.
++		 */
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 20);
+ 
+ 		for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+@@ -194,8 +197,7 @@ static void mt7915_mac_sta_poll(struct mt7915_dev *dev)
+ 		 * from per-sta counters directly.
+ 		 */
+ 		rate = &msta->wcid.rate;
+-		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 7);
+-		val = mt76_rr(dev, addr);
++		val = mt76_rr(dev, MT_WTBL_LMAC_OFFS(idx, 7));
+ 
+ 		switch (rate->bw) {
+ 		case RATE_INFO_BW_160:
+@@ -225,8 +227,7 @@ static void mt7915_mac_sta_poll(struct mt7915_dev *dev)
+ 		}
+ 
+ 		/* get signal strength of resp frames (CTS/BA/ACK) */
+-		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 30);
+-		val = mt76_rr(dev, addr);
++		val = mt76_rr(dev, MT_WTBL_LMAC_OFFS(idx, 30));
+ 
+ 		rssi[0] = to_rssi(GENMASK(7, 0), val);
+ 		rssi[1] = to_rssi(GENMASK(15, 8), val);
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 356e932d..d8d5e606 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -3129,6 +3129,47 @@ static void mt7915_test_sta_poll_no_sta(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, msta->ack_signal, 0);
+ }
+ 
++/* fake->priv: the group register's address, then the writes to it seen */
++static void mt7915_test_count_wducr(struct mt76_test_fake *fake, u32 addr,
++				    u32 val)
++{
++	u32 *wducr = fake->priv;
++
++	if (addr == wducr[0])
++		wducr[1]++;
++}
++
++/* A poll selects the station's WTBL group once, for the airtime, GI and
++ * ack signal reads alike.
++ */
++static void mt7915_test_sta_poll_group_once(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *msta = mt7915_test_sta(test, dev, 130, mvif);
++	u32 *wducr;
++
++	wducr = kunit_kzalloc(test, 2 * sizeof(*wducr), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wducr);
++	mt76_wr(dev, MT_WTBLON_TOP_WDUCR, 0);
++	wducr[0] = fake->last_addr;
++	fake->priv = wducr;
++	fake->wr_hook = mt7915_test_count_wducr;
++
++	msta->wcid.rate.flags = RATE_INFO_FLAGS_HE_MCS;
++	msta->wcid.rate.bw = RATE_INFO_BW_80;
++	dev->mphy.antenna_mask = 0x3;
++	mt76_wr(dev, mt7915_test_wtbl(130, 7), 2 << 28);
++	mt76_wr(dev, mt7915_test_wtbl(130, 30), 0x00005860);
++	mt7915_test_poll(dev, msta);
++	KUNIT_EXPECT_EQ(test, wducr[1], 1);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_WTBLON_TOP_WDUCR), 1);
++	KUNIT_EXPECT_EQ(test, msta->wcid.rate.he_gi, 2);
++	KUNIT_EXPECT_EQ(test, msta->ack_signal, -61);
++}
++
+ /* --- TWT agreements ----------------------------------------------------- */
+ 
+ /* the firmware's TWT_AGRT_UPDATE request */
+@@ -5199,6 +5240,7 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_sta_poll_ack_signal),
+ 	KUNIT_CASE(mt7915_test_sta_poll_airtime),
+ 	KUNIT_CASE(mt7915_test_sta_poll_no_sta),
++	KUNIT_CASE(mt7915_test_sta_poll_group_once),
+ 	{}
+ };
+ 

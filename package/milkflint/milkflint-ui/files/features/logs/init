@@ -31,7 +31,7 @@ on() {
 }
 
 # The driver's MU/RU statistics (muru_debug: a firmware query per band every
-# half second) are only for the Wi-Fi log's MU/OFDMA line: on while that's
+# ten seconds) are only for the Wi-Fi log's MU/OFDMA line: on while that's
 # recorded. At boot there are no radios yet; the ieee80211 hotplug
 # (32-milkflint-muru) sets each one as it appears. Only a change is written.
 muru() {

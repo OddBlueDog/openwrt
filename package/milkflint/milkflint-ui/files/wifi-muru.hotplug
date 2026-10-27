@@ -2,7 +2,7 @@
 # as it appears: at boot, or when the driver loads again, so the
 # Wi-Fi log's once-a-minute MU/OFDMA line has its DL/UL counters (ethtool's
 # dl_*/ul_* stay 0 without it). It costs one firmware query per band every
-# half second, so only while that line is recorded: the Logs page's Wi-Fi
+# ten seconds, so only while that line is recorded: the Logs page's Wi-Fi
 # log and its MU/OFDMA counters (milkflint.logs.wifi, wifi_mu; on unless
 # 0). The logs service sets the radios already there when they change.
 # Installed as /etc/hotplug.d/ieee80211/32-milkflint-muru; hotplug-call

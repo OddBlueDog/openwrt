@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:03:36 +0000
+Subject: [PATCH] wifi: mt76: connac: don't take the station TX rate from a
+ frame that wasn't acked
+
+mt76_connac2_mac_fill_txs() sets wcid->rate from every rate-controlled
+tx status. mt76 hands that rate to mac80211 with each completed frame,
+and mac80211's AQL estimates each frame's airtime from it. The status of
+a frame that wasn't acked (no ack, no answer to its RTS, or its time in
+the queue ran out) carries the last rate of its retry chain, often the
+lowest, not the one rate control picked. After one, AQL budgets every
+frame of the station at that rate until the next sampled status a
+quarter of a second later: a few frames per AC in flight, and small
+aggregates. The station's tx bitrate shows that rate too, and keeps it
+while the station is idle.
+
+Take the rate only from acked statuses, as already only from those that
+aren't fixed-rate. A failed one is still counted in the rate, width and
+mode statistics. A module parameter, failed_txs_rate (mt76-connac-lib,
+0644, off), puts the stock behaviour back for comparisons.
+
+mt76_test_txs_failed_keeps_rate; mt76_connac_test_add_txs_skb_noack now
+expects the rate left as it was.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76_connac_mac.c       | 11 +++++--
+ tests/connac-mac-test.c | 69 ++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 77 insertions(+), 3 deletions(-)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 95e13a68..264d9e40 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -627,6 +627,10 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac2_mac_write_txwi);
+ 
++static bool failed_txs_rate;
++module_param(failed_txs_rate, bool, 0644);
++MODULE_PARM_DESC(failed_txs_rate, "Take the station's tx rate from the status of a frame that wasn't acked too, as stock OpenWrt's mt76 does");
++
+ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 			       __le32 *txs_data)
+ {
+@@ -754,9 +758,12 @@ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 	/* Management, multicast and min-rate frames go out at a fixed
+ 	 * rate that doesn't reflect rate control, so don't let their
+ 	 * status overwrite the rate used for reporting and airtime
+-	 * estimation.
++	 * estimation. Nor a frame that wasn't acked: its status has the
++	 * last rate of its retry chain, often the lowest, and AQL would
++	 * budget every frame at that rate until the next sampled status.
+ 	 */
+-	if (!(txs & MT_TXS0_FIXED_RATE))
++	if (!(txs & MT_TXS0_FIXED_RATE) &&
++	    (!(txs & MT_TXS0_ACK_ERROR_MASK) || READ_ONCE(failed_txs_rate)))
+ 		wcid->rate = rate;
+ 
+ 	return true;
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 0b9da9ec..f22476f8 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -56,6 +56,70 @@ static void mt76_test_txs_fixed_rate_keeps_rate(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_mcs[9], 1);
+ }
+ 
++static void mt76_test_restore_failed_txs_rate(void *old)
++{
++	WRITE_ONCE(failed_txs_rate, (bool)(uintptr_t)old);
++}
++
++/* A frame that wasn't acked (no ack, RTS unanswered, or its time in the
++ * queue ran out) is counted but doesn't replace the rate: its status has
++ * the bottom of the retry chain. failed_txs_rate puts the stock behaviour
++ * back.
++ */
++static void mt76_test_txs_failed_keeps_rate(struct kunit *test)
++{
++	static const u32 fail[] = {
++		MT_TXS0_ACK_TIMEOUT, MT_TXS0_RTS_TIMEOUT, MT_TXS0_QUEUE_TIMEOUT
++	};
++	struct mt76_wcid *wcid;
++	struct mt76_dev *dev;
++	__le32 txs[8] = {};
++	int i;
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_test_restore_failed_txs_rate,
++			(void *)(uintptr_t)READ_ONCE(failed_txs_rate)), 0);
++	WRITE_ONCE(failed_txs_rate, false);
++
++	/* acked: HE MCS 11, 2 streams, 160 MHz */
++	txs[0] = mt76_test_txs0(false, 11, 2, IEEE80211_STA_RX_BW_160);
++	KUNIT_ASSERT_TRUE(test, mt76_connac2_mac_fill_txs(dev, wcid, txs));
++	KUNIT_EXPECT_EQ(test, wcid->rate.mcs, 11);
++
++	/* not acked, sent last at MCS 0, 1 stream, 20 MHz */
++	for (i = 0; i < ARRAY_SIZE(fail); i++) {
++		txs[0] = mt76_test_txs0(false, 0, 1, IEEE80211_STA_RX_BW_20) |
++			 cpu_to_le32(fail[i]);
++		KUNIT_ASSERT_TRUE(test,
++				  mt76_connac2_mac_fill_txs(dev, wcid, txs));
++		KUNIT_EXPECT_EQ(test, wcid->rate.mcs, 11);
++		KUNIT_EXPECT_EQ(test, wcid->rate.nss, 2);
++		KUNIT_EXPECT_EQ(test, wcid->rate.bw, RATE_INFO_BW_160);
++	}
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_mcs[0], ARRAY_SIZE(fail));
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_mcs[11], 1);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bw[0], ARRAY_SIZE(fail));
++
++	/* a lower rate that was acked is taken */
++	txs[0] = mt76_test_txs0(false, 7, 2, IEEE80211_STA_RX_BW_80);
++	KUNIT_ASSERT_TRUE(test, mt76_connac2_mac_fill_txs(dev, wcid, txs));
++	KUNIT_EXPECT_EQ(test, wcid->rate.mcs, 7);
++	KUNIT_EXPECT_EQ(test, wcid->rate.bw, RATE_INFO_BW_80);
++
++	/* stock: the failed frame's rate is taken */
++	WRITE_ONCE(failed_txs_rate, true);
++	txs[0] = mt76_test_txs0(false, 0, 1, IEEE80211_STA_RX_BW_20) |
++		 cpu_to_le32(MT_TXS0_ACK_TIMEOUT);
++	KUNIT_ASSERT_TRUE(test, mt76_connac2_mac_fill_txs(dev, wcid, txs));
++	KUNIT_EXPECT_EQ(test, wcid->rate.mcs, 0);
++	KUNIT_EXPECT_EQ(test, wcid->rate.nss, 1);
++	KUNIT_EXPECT_EQ(test, wcid->rate.bw, RATE_INFO_BW_20);
++}
++
+ /* Putting all tokens back leaves no WED tokens accounted either. */
+ static void mt76_test_token_put_clears_wed_count(struct kunit *test)
+ {
+@@ -1351,7 +1415,9 @@ static void mt76_connac_test_add_txs_skb_noack(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, refcount_read(&skb->users), 1);
+ 	KUNIT_EXPECT_FALSE(test, info->flags & IEEE80211_TX_STAT_ACK);
+ 	KUNIT_EXPECT_EQ(test, info->status.ampdu_ack_len, 0);
+-	KUNIT_EXPECT_EQ(test, wcid->rate.legacy, 60);
++	/* counted, but not taken as the station's rate */
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_mode[MT_PHY_TYPE_OFDM], 1);
++	KUNIT_EXPECT_EQ(test, wcid->rate.legacy, 0);
+ }
+ 
+ /* --- tx completion and cleanup -------------------------------------------- */
+@@ -2590,6 +2656,7 @@ static void mt76_connac_test_frag0_invalid(struct kunit *test)
+ 
+ static struct kunit_case mt76_connac_mac_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_txs_fixed_rate_keeps_rate),
++	KUNIT_CASE(mt76_test_txs_failed_keeps_rate),
+ 	KUNIT_CASE(mt76_test_token_put_clears_wed_count),
+ 	KUNIT_CASE(mt76_connac_test_ppe_thresh),
+ 	KUNIT_CASE(mt76_connac_test_tx_rate_val),

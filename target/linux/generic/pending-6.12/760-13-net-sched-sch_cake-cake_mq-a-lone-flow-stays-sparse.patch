@@ -1,0 +1,154 @@
+From: MilkFlint <milkflint@localhost>
+Date: Tue, 27 Oct 2026 22:00:00 +0000
+Subject: [PATCH] net/sched: sch_cake: cake_mq: a lone flow stays sparse on
+ its sub-cake
+
+cake_dequeue() returns as soon as the qdisc holds no packets, without
+looking at the flows, and a flow already in a rotation gets no new
+quantum with its next packet. In one CAKE with other traffic queued, a
+sparse flow between its packets is found empty by the next dequeue and
+leaves; it comes back as a new flow, with a fresh quantum, with its next
+packet. A cake_mq sub-cake carrying only that flow drains after each of
+its packets, so the flow is never found empty: it spends its quantum
+packet by packet, and when it runs out it has a packet queued, turns
+bulk and moves to the bulk rotation, where it stays as long as it keeps
+sending more often than cake_mq_drained() retires an idle rotation.
+
+A steady sparse stream (a game, a call, a ping) alone on its sub-cake so
+counts as a bulk flow of its host in the shared host table: that host's
+real downloads on the other sub-cakes get half the quantum and half the
+bulk weight there, and against another host's download it gets a third
+of the rate instead of the half one CAKE gives it.
+
+When a cake_mq sub-cake drains, let its new flows go as the next dequeue
+would find them (cake_flow_emptied(): out of the flowchain, or with the
+decaying flows while their AQM state isn't at rest). Its bulk rotation
+is kept as before, between bursts, until the sub-cake is idle.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2551,6 +2551,12 @@
+  * sub-cake is idle and might not dequeue again for a long time: it retires
+  * its rotation then (the watchdog wakes it), so its flows leave the host
+  * loads the busy sub-cakes share out by.
++ *
++ * The new flows go at once, as the next dequeue would find each of them
++ * in one CAKE with other traffic queued: a sparse flow alone on its
++ * sub-cake, which drains after each of its packets, would otherwise never
++ * be found empty, spend its quantum and turn bulk, counted against its
++ * host in the busy sub-cakes for as long as it keeps sending.
+  */
+ static void cake_mq_drained(struct cake_sched_data *q, ktime_t now)
+ {
+@@ -2558,8 +2564,16 @@
+ 	bool bulk = false;
+ 	u16 tin;
+ 
+-	for (tin = 0; tin < q->tin_cnt; tin++)
+-		bulk |= !list_empty(&q->tins[tin].old_flows);
++	for (tin = 0; tin < q->tin_cnt; tin++) {
++		struct cake_tin_data *b = &q->tins[tin];
++
++		while (!list_empty(&b->new_flows))
++			cake_flow_emptied(q, b, list_first_entry(&b->new_flows,
++								 struct cake_flow,
++								 flowchain),
++					  now);
++		bulk |= !list_empty(&b->old_flows);
++	}
+ 	if (!bulk)
+ 		return;
+ 	if (ktime_to_ns(now) < idle_at) {
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1366,6 +1366,81 @@
+ 	for (i = 0; i < 2 * CAKE_QUEUES; i++)
+ 		KUNIT_ASSERT_EQ(test, atomic_read(&mq->cfg->mq_hosts[i]), 0);
+ 	KUNIT_EXPECT_FALSE(test, hrtimer_is_queued(&q->watchdog.timer));
++}
++
++/* A packet from LAN host @host, port @sport, into tin @b as a new flow,
++ * already dequeued: in the sparse rotation, empty, its quantum less @len
++ */
++static struct cake_flow *cake_test_sparse_flow(struct kunit *test,
++					       struct cake_tin_data *b, int mode,
++					       u8 host, u16 sport, int len)
++{
++	struct sk_buff *skb = cake_test_skb(test, false, IPPROTO_UDP, host, sport, 0);
++	struct cake_flow *flow = &b->flows[cake_hash(b, skb, mode, 0, 0)];
++
++	list_add_tail(&flow->flowchain, &b->new_flows);
++	flow->set = CAKE_SET_SPARSE;
++	b->sparse_flow_count++;
++	flow->deficit = 1514 - len;
++	return flow;
++}
++
++/* A sub-cake out of packets lets its new flows go, as the next dequeue
++ * would in one CAKE with other traffic queued: a sparse flow alone on its
++ * sub-cake comes back fresh with its next packet instead of spending its
++ * quantum into the bulk rotation, where its host would count one more
++ * bulk flow in every sub-cake. One whose AQM isn't at rest yet waits with
++ * the decaying flows. The bulk rotation is kept, as between bursts.
++ */
++static void cake_test_mq_drained_sparse(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_mq_q(mq, 1);
++	/* the real clock: the watchdog is a real timer, cancelled before it fires */
++	u64 now = ktime_get_ns() + NSEC_PER_SEC;
++	struct cake_flow *bulk, *sparse, *active;
++	struct cake_tin_data *b;
++	int i;
++
++	mq->cfg->flow_mode = CAKE_FLOW_DUAL_SRC;
++	mq->cfg->mq_hosts = cake_test_alloc(test, 2 * CAKE_MAX_TINS * CAKE_QUEUES *
++						  sizeof(atomic_t));
++	q->tins = cake_test_alloc(test, CAKE_MAX_TINS * sizeof(*q->tins));
++	q->tin_cnt = 1;
++	b = &q->tins[0];
++	INIT_LIST_HEAD(&b->new_flows);
++	INIT_LIST_HEAD(&b->old_flows);
++	INIT_LIST_HEAD(&b->decaying_flows);
++	cake_mq_set_host_tables(q, mq->cfg->mq_hosts);
++	qdisc_watchdog_init(&q->watchdog, mq->sch[1]);
++
++	bulk = cake_test_bulk_flow(test, b, CAKE_FLOW_DUAL_SRC, 5, 40000);
++	sparse = cake_test_sparse_flow(test, b, CAKE_FLOW_DUAL_SRC, 5, 41000, 100);
++	active = cake_test_sparse_flow(test, b, CAKE_FLOW_DUAL_SRC, 6, 41000, 100);
++	active->cvars.count = 1;
++	active->cvars.drop_next = ns_to_ktime(now + NSEC_PER_SEC);
++
++	q->last_active = now;
++	cake_mq_drained(q, now);
++	KUNIT_EXPECT_TRUE(test, list_empty(&b->new_flows));
++	KUNIT_EXPECT_EQ(test, sparse->set, CAKE_SET_NONE);
++	KUNIT_EXPECT_TRUE(test, list_empty(&sparse->flowchain));
++	KUNIT_EXPECT_EQ(test, active->set, CAKE_SET_DECAYING);
++	KUNIT_EXPECT_EQ(test, b->sparse_flow_count, 0);
++	KUNIT_EXPECT_EQ(test, b->decaying_flow_count, 1);
++	/* the bulk flow stays, and its host counts it alone */
++	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 1);
++	KUNIT_EXPECT_EQ(test, cake_host_load(b, bulk, CAKE_FLOW_DUAL_SRC), 1);
++	KUNIT_EXPECT_TRUE(test, hrtimer_is_queued(&q->watchdog.timer));
++	qdisc_watchdog_cancel(&q->watchdog);
++
++	/* nothing new: nothing changes */
++	cake_mq_drained(q, now);
++	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 1);
++	KUNIT_EXPECT_EQ(test, b->decaying_flow_count, 1);
++	qdisc_watchdog_cancel(&q->watchdog);
++	for (i = 0; i < CAKE_QUEUES; i++)
++		KUNIT_ASSERT_LE(test, atomic_read(&mq->cfg->mq_hosts[i]), 1);
+ }
+ 
+ /* Any mix of flows going bulk and empty in four sub-cakes, hosts spread
+@@ -1669,6 +1744,7 @@
+ 	KUNIT_CASE(cake_test_mq_host_retag),
+ 	KUNIT_CASE(cake_test_mq_retire_on_idle),
+ 	KUNIT_CASE(cake_test_mq_drained),
++	KUNIT_CASE(cake_test_mq_drained_sparse),
+ 	KUNIT_CASE(cake_test_mq_host_table_matches),
+ 	{}
+ };

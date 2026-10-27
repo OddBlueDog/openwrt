@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:04:40 +0000
+Subject: [PATCH] wifi: mt76: mt7915: space out mac_work's firmware queries
+
+mt7915_mac_work() runs every 100 ms per band with the device mutex held.
+Each run asked the firmware for the channel's airtime counters
+(GET_MIB_INFO), and every fifth run, with muru_debug on, for the MU/RU
+statistics (MURU_CTRL). Each query is a firmware round trip under the
+mutex, which station changes, keys and station dumps wait for.
+
+The airtime counters are cumulative 64-bit times: asking every 500 ms,
+with the MIB counters, loses nothing, and a survey dump still asks when
+it's read. The MU statistics are counts the driver adds up; ethtool
+reads them, and debugfs's muru_stats asks again when it's read: every
+10 s is enough. The noise floor came with the airtime counters, but it's
+a register read averaged over 16 samples, so the runs in between now
+sample it on its own: it keeps its 100 ms pace and its time constant.
+
+With muru_debug on, from 12 firmware queries a second per band to about 2.
+
+mt7915_test_mac_work, for the new cadence and the noise floor sampled on
+every run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 31 +++++++++++++++++++------
+ mt7915/mt7915.h         |  1 +
+ mt7915/tests/mac-test.c | 50 ++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 67 insertions(+), 15 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 3961514f..fa982201 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1277,14 +1277,11 @@ mt7915_phy_get_nf(struct mt7915_phy *phy, int idx)
+ 	return sum / n;
+ }
+ 
+-void mt7915_update_channel(struct mt76_phy *mphy)
++static void mt7915_update_noise(struct mt7915_phy *phy)
+ {
+-	struct mt7915_phy *phy = mphy->priv;
+-	struct mt76_channel_state *state = mphy->chan_state;
++	struct mt76_channel_state *state = phy->mt76->chan_state;
+ 	int nf;
+ 
+-	mt7915_mcu_get_chan_mib_info(phy, false);
+-
+ 	nf = mt7915_phy_get_nf(phy, phy->mt76->band_idx);
+ 	if (!phy->noise)
+ 		phy->noise = nf << 4;
+@@ -1294,6 +1291,14 @@ void mt7915_update_channel(struct mt76_phy *mphy)
+ 	state->noise = -(phy->noise >> 4);
+ }
+ 
++void mt7915_update_channel(struct mt76_phy *mphy)
++{
++	struct mt7915_phy *phy = mphy->priv;
++
++	mt7915_mcu_get_chan_mib_info(phy, false);
++	mt7915_update_noise(phy);
++}
++
+ /* The firmware crashed (or a full reset was forced) while a SER handshake
+  * was in progress: mt7915_reset() has queued dump_work, which queues the
+  * full reset.
+@@ -2194,15 +2199,27 @@ void mt7915_mac_work(struct work_struct *work)
+ 
+ 	mutex_lock(&mphy->dev->mutex);
+ 
+-	mt76_update_survey(mphy);
++	/*
++	 * Each firmware query holds the mutex for a round trip, so they're
++	 * spaced out: the channel's airtime every 500 ms (its counters are
++	 * cumulative, and a survey dump asks again), the MU statistics
++	 * every 10 s (counts added up here, read by ethtool and once a
++	 * minute by the Wi-Fi log; debugfs asks again). The noise floor is
++	 * a register read averaged over 16 samples, so it keeps its pace.
++	 */
+ 	if (++mphy->mac_work_count == 5) {
+ 		mphy->mac_work_count = 0;
+ 
++		mt76_update_survey(mphy);
+ 		mt7915_mac_update_stats(phy);
+ 		mt7915_mac_severe_check(phy);
+ 
+-		if (phy->dev->muru_debug)
++		if (phy->dev->muru_debug && ++phy->muru_work_count >= 20) {
++			phy->muru_work_count = 0;
+ 			mt7915_mcu_muru_debug_get(phy);
++		}
++	} else {
++		mt7915_update_noise(phy);
+ 	}
+ 
+ 	mutex_unlock(&mphy->dev->mutex);
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index a0f4ebf8..f67ee46e 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -250,6 +250,7 @@ struct mt7915_phy {
+ 
+ 	struct mt76_mib_stats mib;
+ 	struct mt76_channel_state state_ts;
++	u8 muru_work_count;	/* mac_work's MIB rounds since the MU stats */
+ 
+ 	bool sku_limit_en:1;
+ 	bool sku_path_en:1;
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index d8d5e606..9c6c30ad 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -4928,46 +4928,80 @@ static void mt7915_test_muru_reply(struct mt76_test_fake *fake,
+ 		mt7915_test_mib_reply(fake, msg, reply);
+ }
+ 
+-/* The watchdog work, every 100 ms: channel survey each time; every 5th time
+- * the MIB counters, the rx-stuck checks and (when enabled) the MU stats.
+- * It always re-arms itself.
++/* The watchdog work, every 100 ms: the noise floor each time; every 5th
++ * time the channel survey, the MIB counters and the rx-stuck checks; every
++ * 100th (when enabled) the MU stats. It always re-arms itself.
+  */
+ static void mt7915_test_mac_work(struct kunit *test)
+ {
+ 	struct mt7915_test_env *env = mt7915_test_hw_env(test);
+ 	struct mt7915_dev *dev = env->dev;
+ 	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_test_irpi *irpi;
+ 	int i;
+ 
++	irpi = kunit_kzalloc(test, sizeof(*irpi), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, irpi);
+ 	cancel_delayed_work_sync(&dev->mphy.mac_work);
+ 	fake->reply = mt7915_test_muru_reply;
++	fake->priv = irpi;
++	fake->rr_hook = mt7915_test_irpi_hook;
++	dev->mphy.chainmask = 0x1;
+ 	mt76_wr(dev, MT_MIB_SDR3(0), 0x00070000);
+ 	mt76_wr(dev, MT_TRB_RXPSR0(0), 0x5);
+ 	dev->phy.omac_mask = BIT(0);
+ 	dev->muru_debug = true;
+ 
++	/* noise at -86 dBm, then -60 dBm: averaged in on each run */
++	irpi->count[0][2] = 10;
+ 	for (i = 1; i <= 4; i++) {
+ 		mt7915_mac_work(&dev->mphy.mac_work.work);
+ 		KUNIT_EXPECT_EQ(test, dev->mphy.mac_work_count, i);
++		/* re-armed */
++		KUNIT_EXPECT_TRUE(test,
++				  delayed_work_pending(&dev->mphy.mac_work));
++		cancel_delayed_work_sync(&dev->mphy.mac_work);
++		if (i == 1) {
++			KUNIT_EXPECT_EQ(test, dev->phy.noise, 86 << 4);
++			irpi->count[0][2] = 0;
++			irpi->count[0][8] = 5;
++		} else if (i == 2) {
++			KUNIT_EXPECT_EQ(test, dev->phy.noise,
++					(86 << 4) + 60 - 86);
++		}
+ 	}
+ 	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
+-			MCU_EXT_CMD(GET_MIB_INFO)), 4);
++			MCU_EXT_CMD(GET_MIB_INFO)), 0);
+ 	KUNIT_EXPECT_EQ(test, dev->phy.mib.fcs_err_cnt, 0);
+ 	KUNIT_EXPECT_EQ(test, dev->phy.trb_ts, 0);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
+ 			MCU_EXT_CMD(MURU_CTRL)), 0);
+-	/* re-armed */
+-	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dev->mphy.mac_work));
+ 
+ 	mt7915_mac_work(&dev->mphy.mac_work.work);
+ 	KUNIT_EXPECT_EQ(test, dev->mphy.mac_work_count, 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(GET_MIB_INFO)), 1);
++	KUNIT_EXPECT_EQ(test, env->chan_state.cc_busy, 1000);
+ 	KUNIT_EXPECT_EQ(test, dev->phy.mib.fcs_err_cnt, 7);
+ 	KUNIT_EXPECT_EQ(test, dev->phy.trb_ts, 0x5);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
+-			MCU_EXT_CMD(MURU_CTRL)), 1);
+-	KUNIT_EXPECT_EQ(test, env->chan_state.cc_busy, 1000);
++			MCU_EXT_CMD(MURU_CTRL)), 0);
+ 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dev->mphy.mac_work));
+ 	cancel_delayed_work_sync(&dev->mphy.mac_work);
++
++	/* ten seconds in: 20 surveys, the first MU stats */
++	for (i = 6; i <= 100; i++) {
++		mt7915_mac_work(&dev->mphy.mac_work.work);
++		cancel_delayed_work_sync(&dev->mphy.mac_work);
++		if (i == 99)
++			KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++					MCU_EXT_CMD(MURU_CTRL)), 0);
++	}
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(GET_MIB_INFO)), 20);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(MURU_CTRL)), 1);
++	KUNIT_EXPECT_EQ(test, dev->phy.muru_work_count, 0);
+ }
+ 
+ /* A complete SER (L1) recovery: DMA stopped and reset, tokens reclaimed,
