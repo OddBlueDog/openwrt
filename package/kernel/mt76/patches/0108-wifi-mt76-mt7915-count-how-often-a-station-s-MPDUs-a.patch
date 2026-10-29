@@ -1,0 +1,275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:09:11 +0000
+Subject: [PATCH] wifi: mt76: mt7915: count how often a station's MPDUs are
+ sent; a data retry limit
+
+A data frame gets 15 transmissions before the hardware gives up on it
+(REM_TX_COUNT 15, no lifetime). When another network takes most of the
+air, a frame can use most of them, and the station's later frames wait
+behind it.
+
+To see whether that is what happens, the tx-free events' transmission
+count of each MPDU header goes into a per-station histogram (1, 2, 3-4,
+5-8, 9+ transmissions), shown with the never-acked count in the
+station's debugfs file tx_attempts. Its count variable is now zeroed for
+the words that aren't MPDU headers.
+
+data_tx_count (module parameter, 1-31) sets the transmissions for data
+frames on the AC queues; management frames, beacons and the PS queue's
+frames keep 15. The default, 15, is stock.
+
+mt7915_test_tx_free_attempts, the buckets in mt7915_test_tx_free and
+mt7915_test_tx_free_v3, and mt76_connac_test_txwi_data_tx_count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt76.h                  |  1 +
+ mt76_connac_mac.c       | 15 ++++++++++++++-
+ mt7915/debugfs.c        | 23 +++++++++++++++++++++++
+ mt7915/mac.c            |  4 +++-
+ mt7915/tests/mac-test.c | 37 +++++++++++++++++++++++++++++++++++++
+ tests/connac-mac-test.c | 36 ++++++++++++++++++++++++++++++++++++
+ 6 files changed, 114 insertions(+), 2 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index e898feb6..e1c0d70e 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -363,6 +363,7 @@ struct mt76_sta_stats {
+ 	u32 tx_packets;		/* unit: MSDU */
+ 	u32 tx_retries;
+ 	u32 tx_failed;
++	u32 tx_attempts[5];	/* MPDUs sent 1, 2, 3-4, 5-8, 9+ times */
+ 	/* WED RX */
+ 	u64 rx_bytes;
+ 	u32 rx_packets;
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index 264d9e40..ef71b95f 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -501,6 +501,15 @@ mt76_connac2_mac_write_txwi_80211(struct mt76_dev *dev, __le32 *txwi,
+ 	}
+ }
+ 
++/* How many times the hardware sends a data frame before it gives up on it.
++ * With the air busy, a frame can take most of its 15 tries, holding up the
++ * station's later frames; fewer tries give up sooner and leave the loss to
++ * TCP. Management frames, beacons and frames to the PS queue keep 15.
++ */
++static unsigned int data_tx_count = 15;
++module_param(data_tx_count, uint, 0644);
++MODULE_PARM_DESC(data_tx_count, "Times a data frame is sent before the hardware gives up on it (1-31, 15 as stock)");
++
+ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
+ 				 struct sk_buff *skb, struct mt76_wcid *wcid,
+ 				 struct ieee80211_key_conf *key, int pid,
+@@ -518,6 +527,7 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
+ 	bool inband_disc = !!(changed & (BSS_CHANGED_UNSOL_BCAST_PROBE_RESP |
+ 					 BSS_CHANGED_FILS_DISCOVERY));
+ 	bool amsdu_en = wcid->amsdu;
++	u32 tx_count = 15;
+ 
+ 	if (vif) {
+ 		struct mt76_vif_link *mvif = (struct mt76_vif_link *)vif->drv_priv;
+@@ -543,6 +553,9 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
+ 		p_fmt = mt76_is_mmio(dev) ? MT_TX_TYPE_CT : MT_TX_TYPE_SF;
+ 		q_idx = wmm_idx * MT76_CONNAC_MAX_WMM_SETS +
+ 			mt76_connac_lmac_mapping(skb_get_queue_mapping(skb));
++		if (is_8023 ||
++		    ieee80211_is_data(((struct ieee80211_hdr *)skb->data)->frame_control))
++			tx_count = clamp_val(READ_ONCE(data_tx_count), 1, 31);
+ 
+ 		/* mt7915 WA only counts WED path */
+ 		if (is_mt7915(dev) && mtk_wed_device_active(&dev->mmio.wed))
+@@ -565,7 +578,7 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
+ 	txwi[1] = cpu_to_le32(val);
+ 	txwi[2] = 0;
+ 
+-	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, 15);
++	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, tx_count);
+ 	if (!is_connac2(dev))
+ 		val |= MT_TXD3_SW_POWER_MGMT;
+ 	if (key)
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index f3ca6843..cc83634c 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1583,12 +1583,35 @@ mt7915_sta_ps_show(struct seq_file *s, void *data)
+ 
+ DEFINE_SHOW_ATTRIBUTE(mt7915_sta_ps);
+ 
++/* How many times the station's MPDUs were sent before they were acked or
++ * given up on (tx-free events): long retry chains are what delays a
++ * station's frames when the air is busy. "failed": never acked.
++ */
++static int
++mt7915_sta_tx_attempts_show(struct seq_file *s, void *data)
++{
++	struct ieee80211_sta *sta = s->private;
++	struct mt76_sta_stats *st = &((struct mt7915_sta *)sta->drv_priv)->wcid.stats;
++	static const char * const name[] = { "1", "2", "3-4", "5-8", "9+" };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(st->tx_attempts); i++)
++		seq_printf(s, "%s %u\n", name[i], READ_ONCE(st->tx_attempts[i]));
++	seq_printf(s, "failed %u\n", READ_ONCE(st->tx_failed));
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(mt7915_sta_tx_attempts);
++
+ void mt7915_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta, struct dentry *dir)
+ {
+ 	debugfs_create_file("fixed_rate", 0600, dir, sta, &fops_fixed_rate);
+ 	debugfs_create_file("hw-queues", 0400, dir, sta, &mt7915_queues_fops);
+ 	debugfs_create_file("ps", 0400, dir, sta, &mt7915_sta_ps_fops);
++	debugfs_create_file("tx_attempts", 0400, dir, sta,
++			    &mt7915_sta_tx_attempts_fops);
+ }
+ 
+ #endif
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index fa982201..151e8a69 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -942,7 +942,7 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 		}
+ 
+ 		if (!mtk_wed_device_active(&mdev->mmio.wed) && wcid) {
+-			u32 tx_retries = 0, tx_failed = 0, count;
++			u32 tx_retries = 0, tx_failed = 0, count = 0;
+ 
+ 			/* count: transmissions; stat: non-zero if never acked */
+ 			if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3)) {
+@@ -956,6 +956,8 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 			}
+ 			wcid->stats.tx_retries += tx_retries;
+ 			wcid->stats.tx_failed += tx_failed;
++			if (count)
++				wcid->stats.tx_attempts[min_t(u32, fls(count - 1), 4)]++;
+ 		}
+ 
+ 		if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3))
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 9c6c30ad..15ab5c12 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -2543,6 +2543,12 @@ static void mt7915_test_tx_free(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, 0);
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_retries, 2);
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 1);
++	/* counted as sent 3-4 times */
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_attempts[2], 1);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_attempts[0] +
++			      msta->wcid.stats.tx_attempts[1] +
++			      msta->wcid.stats.tx_attempts[3] +
++			      msta->wcid.stats.tx_attempts[4], 0);
+ 	KUNIT_EXPECT_FALSE(test, env->q.blocked);
+ 	/* band 0's PSD and BE rings were cleaned first */
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
+@@ -2638,10 +2644,40 @@ static void mt7915_test_tx_free_v3(struct kunit *test)
+ 	/* sent twice, then acked */
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_retries, 1);
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 0);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_attempts[1], 1);
+ 	/* both bands' rings */
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 4);
+ }
+ 
++/* Each MPDU header's transmission count lands in its bucket: 1, 2, 3-4,
++ * 5-8 and 9+ (v3 events carry up to 15).
++ */
++static void mt7915_test_tx_free_attempts(struct kunit *test)
++{
++	static const u8 count[] = { 1, 2, 3, 4, 5, 8, 9, 15 };
++	static const u32 want[5] = { 1, 1, 2, 2, 2 };
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *msta = mt7915_test_sta(test, dev, 9, mvif);
++	u32 info[1 + ARRAY_SIZE(count)];
++	__le32 *ev;
++	int i;
++
++	mt7915_test_band1(test, env);
++	info[0] = MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 9);
++	for (i = 0; i < ARRAY_SIZE(count); i++)
++		info[1 + i] = MT_TX_FREE_MPDU_HEADER_V3 |
++			      FIELD_PREP(MT_TX_FREE_COUNT_V3, count[i]);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, ARRAY_SIZE(info) - 1,
++			       FIELD_PREP(MT_TX_FREE_VER, 4), info, ARRAY_SIZE(info));
++
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, (2 + ARRAY_SIZE(info)) * 4));
++	for (i = 0; i < 5; i++)
++		KUNIT_EXPECT_EQ_MSG(test, msta->wcid.stats.tx_attempts[i], want[i],
++				    "bucket %d", i);
++}
++
+ /* Words before any wcid pair, for an entry that's no station, or for
+  * unknown tokens are skipped; the rest of the event is still handled.
+  */
+@@ -5263,6 +5299,7 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_tx_free),
+ 	KUNIT_CASE(mt7915_test_tx_free_frags),
+ 	KUNIT_CASE(mt7915_test_tx_free_v3),
++	KUNIT_CASE(mt7915_test_tx_free_attempts),
+ 	KUNIT_CASE(mt7915_test_tx_free_unknown),
+ 	KUNIT_CASE(mt7915_test_tx_free_v0),
+ 	KUNIT_CASE(mt7915_test_tx_free_still_full),
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index f22476f8..428d1ce1 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -571,6 +571,41 @@ static void mt76_connac_test_txwi_data(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_connac_test_dw(txwi, 8), 0xffffffff);
+ }
+ 
++/* data_tx_count sets how often a data frame is sent (clamped to 1-31);
++ * frames for the PS queue keep 15.
++ */
++static void mt76_connac_test_txwi_data_tx_count(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_connac_test_dev(test);
++	struct ieee80211_sta *sta = mt76_connac_test_sta(test, 9);
++	struct mt76_wcid *wcid = mt76_connac_test_wcid(sta);
++	unsigned int old = READ_ONCE(data_tx_count);
++	static const struct { unsigned int set, want; } c[] = {
++		{ 15, 15 }, { 7, 7 }, { 1, 1 }, { 0, 1 }, { 31, 31 }, { 40, 31 },
++	};
++	struct sk_buff *skb;
++	__le32 txwi[16];
++	int i;
++
++	skb = mt76_connac_test_frame(test, MT76_CONNAC_TEST_QOS_DATA,
++				     mt76_connac_test_peer, 60);
++	skb_set_queue_mapping(skb, IEEE80211_AC_BE);
++	for (i = 0; i < ARRAY_SIZE(c); i++) {
++		WRITE_ONCE(data_tx_count, c[i].set);
++		mt76_connac2_mac_write_txwi(dev, txwi, skb, wcid, NULL, 7,
++					    MT_TXQ_BE, 0);
++		KUNIT_EXPECT_EQ_MSG(test, FIELD_GET(MT_TXD3_REM_TX_COUNT,
++						    mt76_connac_test_dw(txwi, 3)),
++				    c[i].want, "data_tx_count %u", c[i].set);
++	}
++	/* the PS queue's frames keep the stock count */
++	WRITE_ONCE(data_tx_count, 7);
++	mt76_connac2_mac_write_txwi(dev, txwi, skb, wcid, NULL, 7, MT_TXQ_PSD, 0);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TXD3_REM_TX_COUNT,
++					mt76_connac_test_dw(txwi, 3)), 15);
++	WRITE_ONCE(data_tx_count, old);
++}
++
+ /* A frame whose tx status we want: reported to the host, never in an
+  * A-MSDU; no-ack and power management queue variants.
+  */
+@@ -2663,6 +2698,7 @@ static struct kunit_case mt76_connac_mac_test_cases[] = {
+ 	KUNIT_CASE(mt76_connac_test_tx_rate_val_beacon),
+ 	KUNIT_CASE(mt76_connac_test_txwi_data),
+ 	KUNIT_CASE(mt76_connac_test_txwi_status),
++	KUNIT_CASE(mt76_connac_test_txwi_data_tx_count),
+ 	KUNIT_CASE(mt76_connac_test_txwi_mgmt),
+ 	KUNIT_CASE(mt76_connac_test_txwi_band1),
+ 	KUNIT_CASE(mt76_connac_test_txwi_beacon),

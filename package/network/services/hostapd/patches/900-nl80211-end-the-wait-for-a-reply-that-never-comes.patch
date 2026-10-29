@@ -1,0 +1,85 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 10:00:00 +0000
+Subject: [PATCH] nl80211: end the wait for a reply that never comes
+
+send_and_recv_glb() reads replies while err.err is positive. The kernel
+queues its answer while it handles the request, but drops it when the
+receive queue of the socket is full at that moment (the next read then
+fails with ENOBUFS). The loop then waits for a reply that never comes.
+On a socket that an eloop handler also reads, such as the nl_connect
+socket of a BSS, which gets the EAPOL frames of its stations and sends
+SET_BEACON, the socket is non-blocking: nl_recvmsgs() returns 0 when
+there is nothing to read, and the loop spins at full CPU instead.
+Either way the event loop stops, and with it every station, control and
+ubus interface, until hostapd is restarted.
+
+Wait for each part of the reply with poll(), and end the request with
+-ETIMEDOUT after 5 seconds without one. The kernel has handled the
+request by the time it was sent, and each part of a dump follows the
+read before it, so a reply that is seconds late was lost.
+
+Signed-off-by: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+---
+ src/drivers/driver_nl80211.c | 34 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 2c7a2d8..4da8f8f 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -14,6 +14,7 @@
+ #include <sys/types.h>
+ #include <sys/utsname.h>
+ #include <fcntl.h>
++#include <poll.h>
+ #include <net/if.h>
+ #include <netlink/genl/genl.h>
+ #include <netlink/genl/ctrl.h>
+@@ -519,6 +520,9 @@ out:
+ }
+ 
+ 
++/* the longest wait for the next message of a reply after the request went out */
++#define NL80211_REPLY_TIMEOUT_MS 5000
++
+ int send_and_recv_glb(struct nl80211_global *global,
+ 		      struct wpa_driver_nl80211_data *drv, /* may be NULL */
+ 		      struct nl_sock *nl_handle, struct nl_msg *msg,
+@@ -596,8 +600,36 @@ int send_and_recv_glb(struct nl80211_global *global,
+ 			  valid_handler, valid_data);
+ 
+ 	while (err.err > 0) {
+-		int res = nl_recvmsgs(nl_handle, cb);
++		struct pollfd pfd = {
++			.fd = nl_socket_get_fd(nl_handle),
++			.events = POLLIN,
++		};
++		int res;
++
++		/*
++		 * The kernel queues the reply while it handles the request, so
++		 * it is there unless the receive queue was full and the reply
++		 * was dropped (ENOBUFS). Don't wait for ever then, and don't
++		 * spin on a non-blocking socket (one that an eloop handler
++		 * reads, which also gets events and EAPOL frames), where
++		 * nl_recvmsgs() returns 0 when there is nothing to read.
++		 */
++		res = poll(&pfd, 1, NL80211_REPLY_TIMEOUT_MS);
++		if (res < 0 && errno == EINTR)
++			continue;
++		if (res <= 0) {
++			wpa_printf(MSG_ERROR,
++				   "nl80211: no reply to command %u in %d ms%s%s",
++				   ((struct genlmsghdr *)
++				    nlmsg_data(nlmsg_hdr(msg)))->cmd,
++				   NL80211_REPLY_TIMEOUT_MS,
++				   res < 0 ? ": " : "",
++				   res < 0 ? strerror(errno) : "");
++			err.err = res < 0 ? -errno : -ETIMEDOUT;
++			break;
++		}
+ 
++		res = nl_recvmsgs(nl_handle, cb);
+ 		if (res == -NLE_DUMP_INTR) {
+ 			/* Most likely one of the nl80211 dump routines hit a
+ 			 * case where internal results changed while the dump

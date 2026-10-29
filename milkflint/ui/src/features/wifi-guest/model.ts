@@ -8,6 +8,7 @@
 import { ipToInt } from '@/lib/api/network';
 import { bool, type Change, list, type Section, str } from '@/lib/api/uci';
 import { addIntercept, interceptSection } from '../dns/intercept';
+import { keyError } from '../wifi/security';
 import { defaultGuestLabel, type GuestId, guestBridge } from './guest';
 
 /** Where a new guest network's addresses start. */
@@ -238,7 +239,8 @@ export function speedOk(v: string): boolean {
 function credsErrors(c: Creds, at: string, e: Errors): void {
   const bytes = new TextEncoder().encode(c.ssid).length;
   if (bytes < 1 || bytes > 32) e[`${at}-ssid`] = 'Use 1 to 32 characters.';
-  if (c.encryption !== 'none' && !((c.key.length >= 8 && c.key.length <= 63) || /^[0-9a-fA-F]{64}$/.test(c.key))) e[`${at}-key`] = 'Use 8 to 63 characters.';
+  const keyBad = keyError(c.encryption, c.key);
+  if (keyBad !== undefined) e[`${at}-key`] = keyBad;
 }
 
 /**

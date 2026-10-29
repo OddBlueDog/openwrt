@@ -8,5 +8,5 @@
     "moduleResolution": "NodeNext",
     "types": ["node"]
   },
-  "include": ["vite.config.ts", "scripts"]
+  "include": ["vite.config.ts", "scripts", "tests"]
 }

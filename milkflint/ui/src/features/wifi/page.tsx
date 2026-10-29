@@ -23,7 +23,7 @@ import { blockOf, describeBlock } from './channels';
 import { CountryField } from './country';
 import { WifiLive } from './live';
 import { RadarCard } from './radar';
-import { securityOptions } from './security';
+import { keyError, securityOptions } from './security';
 import {
   type Country,
   type Frequency,
@@ -406,10 +406,8 @@ function validate(f: RadioForm): Partial<Record<'ssid' | 'key', string>> {
   const errors: Partial<Record<'ssid' | 'key', string>> = {};
   const bytes = new TextEncoder().encode(f.ssid).length;
   if (f.iface !== undefined && (bytes < 1 || bytes > 32)) errors.ssid = 'Use 1 to 32 characters.';
-  if (f.iface !== undefined && f.encryption !== 'none') {
-    const ok = (f.key.length >= 8 && f.key.length <= 63) || /^[0-9a-fA-F]{64}$/.test(f.key);
-    if (!ok) errors.key = 'Use 8 to 63 characters.';
-  }
+  const keyBad = f.iface === undefined ? undefined : keyError(f.encryption, f.key);
+  if (keyBad !== undefined) errors.key = keyBad;
   return errors;
 }
 

@@ -12,7 +12,7 @@ define Package/milkflint-ui
   CATEGORY:=LuCI
   TITLE:=MilkFlint web interface (dashboard and main settings)
   DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +rpcd-mod-iwinfo +uhttpd +uhttpd-mod-ubus \
-	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-resolv +ethtool
+	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-resolv +ethtool +milkflint-rtprio
   PKGARCH:=all
 endef
 
@@ -36,11 +36,11 @@ endef
 define Package/milkflint-ui/install
 	$(INSTALL_DIR) $(1)/www/milkflint $(1)/usr/share/rpcd/acl.d $(1)/usr/share/rpcd/ucode \
 		$(1)/etc/uci-defaults $(1)/etc/init.d $(1)/usr/libexec/milkflint $(1)/usr/libexec/platform \
-		$(1)/etc/hotplug.d/ieee80211 $(1)/lib/preinit
+		$(1)/etc/hotplug.d/ieee80211 $(1)/lib/preinit $(1)/etc/sysctl.d
 	$(CP) ./htdocs/* $(1)/www/milkflint/
 	$(INSTALL_BIN) ./files/packet-steering.sh $(1)/usr/libexec/platform/packet-steering.sh
+	$(INSTALL_CONF) ./files/flowtable.sysctl $(1)/etc/sysctl.d/20-milkflint-flowtable.conf
 	$(INSTALL_DATA) ./files/wifi-aql.hotplug $(1)/etc/hotplug.d/ieee80211/30-milkflint-aql
-	$(INSTALL_DATA) ./files/wifi-hw-atf.hotplug $(1)/etc/hotplug.d/ieee80211/31-milkflint-hw-atf
 	$(INSTALL_DATA) ./files/wifi-muru.hotplug $(1)/etc/hotplug.d/ieee80211/32-milkflint-muru
 	$(INSTALL_DATA) ./files/milkflint.html $(1)/www/milkflint.html
 	$(INSTALL_DATA) ./files/acl.json $(1)/usr/share/rpcd/acl.d/milkflint-ui.json

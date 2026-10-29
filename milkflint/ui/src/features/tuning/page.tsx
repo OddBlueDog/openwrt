@@ -43,7 +43,8 @@ import { type GroPort, getTuningStatus, type TuningStatus } from './api';
 //   writes sqm's iqdisc_opts to match, as the Smart Queue page does.
 //   The GRO card only shows while the firewall's flow offloading is off, or
 //   once a GRO setting isn't automatic: with offloading on (MilkFlint's
-//   default), OpenWrt's fraglist GRO is the cheapest, and automatic keeps it.
+//   default), automatic is plain GRO up to 16 KB when the download CAKE takes
+//   GRO packets whole (fraglist GRO otherwise), which leaves nothing to pick.
 // Unset everywhere is what the image does: Restore defaults unsets them.
 // Moving to or from RSS can also switch Smart Queue's multi-queue CAKE
 // (sqm's use_mq), which only spreads over CPUs when RSS does.

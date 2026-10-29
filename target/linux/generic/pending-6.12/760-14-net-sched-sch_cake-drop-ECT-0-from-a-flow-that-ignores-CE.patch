@@ -1,0 +1,423 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 29 Oct 2026 19:00:00 +0000
+Subject: [PATCH] net/sched: sch_cake: drop ECT(0) from a flow that ignores CE marks
+
+COBALT marks ECN-capable packets instead of dropping them. Some senders
+(BBR-like ones) answer the marks with CWR yet keep their rate: their
+queue then sits far above target while the flow's COBALT count climbs
+into the thousands, where the same flows without ECN are dropped and
+slow down.
+
+Once a flow's count has reached ecn_fail_count (module parameter,
+default 256, 0: always mark as upstream) and its packets have stayed
+over twice the target for COBALT_ECN_STRIKES (8) signals in a row, its
+ECT(0) packets are dropped instead of marked, from the drop rate a count
+of ecn_fail_count gives, until its count decays to 0 and it is marked
+again. Flows that answer the marks never get that far. ECT(1) (L4S) is
+never dropped this way, nor is a GSO batch of more than
+COBALT_ECN_MAX_SEGS (4) packets (it is marked).
+
+KUnit: the switch and the restarted rate (IPv4 and IPv6), ECT(1) always
+marked, a queue near the target and broken strikes never switch,
+not-ECT unchanged, the parameter off, GSO batches, back to marking once
+the count decays.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -105,6 +105,8 @@
+  * @p_drop:		BLUE drop probability (0.32 fxp)
+  * @dropping:		set if in dropping state
+  * @ecn_marked:		set if marked
++ * @ecn_strikes:	signals in a row that found the flow's marks ignored
++ * @ecn_ignored:	set when the flow's ECT(0) packets are dropped, not marked
+  */
+ struct cobalt_vars {
+ 	u32	count;
+@@ -114,6 +116,8 @@
+ 	u32     p_drop;
+ 	bool	dropping;
+ 	bool    ecn_marked;
++	u8	ecn_strikes;
++	bool	ecn_ignored;
+ };
+ 
+ enum {
+@@ -465,6 +469,60 @@
+ 	memset(vars, 0, sizeof(*vars));
+ }
+ 
++/* COBALT marks ECN-capable packets instead of dropping them. Some senders
++ * (BBR-like ones) answer the marks with CWR yet keep their rate, and their
++ * queue then sits far above target while the flow's count climbs into the
++ * thousands; dropped instead, they slow down. A flow whose packets are
++ * ECT(0), whose count has reached ecn_fail_count and that is still over
++ * twice the target at COBALT_ECN_STRIKES signals in a row, has its ECT(0)
++ * packets dropped from then on, from the drop rate a count of
++ * ecn_fail_count gives, until its count decays to 0 and it is marked again.
++ * Responsive flows, ECN or not, stay far below such a count. ECT(1) (L4S)
++ * is never dropped this way, nor is a GSO batch of more than
++ * COBALT_ECN_MAX_SEGS packets (it is marked). 0: always mark, as upstream.
++ */
++static unsigned int ecn_fail_count __read_mostly = 256;
++module_param(ecn_fail_count, uint, 0644);
++MODULE_PARM_DESC(ecn_fail_count, "COBALT count at which a flow that ignores ECN marks is dropped instead (0: always mark)");
++
++#define COBALT_ECN_STRIKES	8
++#define COBALT_ECN_MAX_SEGS	4
++
++static u8 cobalt_ecn(struct sk_buff *skb)
++{
++	switch (skb_protocol(skb, true)) {
++	case cpu_to_be16(ETH_P_IP):
++		if (skb_network_header(skb) + sizeof(struct iphdr) <= skb_tail_pointer(skb))
++			return ipv4_get_dsfield(ip_hdr(skb)) & INET_ECN_MASK;
++		break;
++	case cpu_to_be16(ETH_P_IPV6):
++		if (skb_network_header(skb) + sizeof(struct ipv6hdr) <= skb_tail_pointer(skb))
++			return ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK;
++		break;
++	}
++	return INET_ECN_NOT_ECT;
++}
++
++/* count and its 1/sqrt, set outright rather than stepped to */
++static void cobalt_set_count(struct cobalt_vars *vars, u32 count)
++{
++	vars->count = count;
++	if (count < REC_INV_SQRT_CACHE) {
++		vars->rec_inv_sqrt = inv_sqrt_cache[count];
++		return;
++	}
++	vars->rec_inv_sqrt = div64_u64(1ULL << 32, int_sqrt(count) + 1);
++	cobalt_newton_step(vars);
++	cobalt_newton_step(vars);
++}
++
++/* the flow is marked again once its count has decayed to 0 */
++static void cobalt_ecn_reset(struct cobalt_vars *vars)
++{
++	vars->ecn_strikes = 0;
++	vars->ecn_ignored = false;
++}
++
+ /* CoDel control_law is t + interval/sqrt(count)
+  * We maintain in rec_inv_sqrt the reciprocal value of sqrt(count) to avoid
+  * both sqrt() and divide operation.
+@@ -528,6 +586,8 @@
+ 						 p->interval,
+ 						 vars->rec_inv_sqrt);
+ 	}
++	if (!vars->count)
++		cobalt_ecn_reset(vars);
+ 
+ 	return down;
+ }
+@@ -583,9 +643,30 @@
+ 	}
+ 
+ 	if (next_due && vars->dropping) {
+-		/* Use ECN mark if possible, otherwise drop */
+-		drop = !(vars->ecn_marked = INET_ECN_set_ce(skb));
++		u32 fail = READ_ONCE(ecn_fail_count);
++		u8 ecn = fail ? cobalt_ecn(skb) : INET_ECN_NOT_ECT;
+ 
++		if (ecn == INET_ECN_ECT_0 && !vars->ecn_ignored) {
++			if (vars->count >= fail && sojourn > 2 * p->target) {
++				if (++vars->ecn_strikes >= COBALT_ECN_STRIKES) {
++					vars->ecn_ignored = true;
++					cobalt_set_count(vars, fail);
++				}
++			} else {
++				vars->ecn_strikes = 0;
++			}
++		}
++
++		if (vars->ecn_ignored && ecn == INET_ECN_ECT_0 &&
++		    skb_shinfo(skb)->gso_segs <= COBALT_ECN_MAX_SEGS) {
++			/* the flow ignores marks: drop, as without ECN */
++			vars->ecn_marked = false;
++			drop = true;
++		} else {
++			/* Use ECN mark if possible, otherwise drop */
++			drop = !(vars->ecn_marked = INET_ECN_set_ce(skb));
++		}
++
+ 		vars->count++;
+ 		if (!vars->count)
+ 			vars->count--;
+@@ -604,6 +685,8 @@
+ 			schedule = ktime_sub(now, vars->drop_next);
+ 			next_due = vars->count && ktime_to_ns(schedule) >= 0;
+ 		}
++		if (!vars->count)
++			cobalt_ecn_reset(vars);
+ 	}
+ 
+ 	/* Simple BLUE implementation.  Lack of ECN is deliberate. */
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+-/* KUnit tests for sch_cake's flow hashing, DRR quanta, and cake_mq's count
+- * of active sub-cakes, share of the rate and host loads. Built into
++/* KUnit tests for sch_cake's flow hashing, DRR quanta, COBALT's drops for
++ * flows that ignore ECN marks, and cake_mq's count of active sub-cakes,
++ * share of the rate and host loads. Built into
+  * sch_cake.ko (#included at the end of sch_cake.c) when
+  * CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs when it loads.
+  */
+@@ -1692,6 +1693,237 @@
+ 
+ static unsigned int cake_test_slack;
+ 
++/* COBALT's signals for one flow, each when it comes due: the flow's
++ * packets wait @sojourn and carry the ECN codepoint @ecn.
++ */
++struct cake_test_ecn {
++	struct cobalt_vars v;
++	struct cobalt_params p;
++	ktime_t now;
++	u32 marks, drops;
++};
++
++static void cake_test_ecn_init(struct cake_test_ecn *e)
++{
++	memset(e, 0, sizeof(*e));
++	e->p.target = 2500 * NSEC_PER_USEC;	/* rtt 50ms */
++	e->p.interval = 50 * NSEC_PER_MSEC;
++	e->p.mtu_time = 12 * NSEC_PER_USEC;	/* 1514 bytes at ~1 Gbit/s */
++	e->now = CAKE_TEST_NOW;
++}
++
++static void cake_test_ecn_set(struct sk_buff *skb, u8 ecn)
++{
++	if (skb->protocol == htons(ETH_P_IPV6))
++		ipv6_change_dsfield(ipv6_hdr(skb), (u8)~INET_ECN_MASK, ecn);
++	else
++		ipv4_change_dsfield(ip_hdr(skb), (u8)~INET_ECN_MASK, ecn);
++}
++
++/* @n signals; returns how many were drops */
++static u32 cake_test_ecn_run(struct cake_test_ecn *e, struct sk_buff *skb,
++			     u8 ecn, u64 sojourn, u32 n)
++{
++	u32 drops = 0, signals = 0, calls = 0;
++
++	while (signals < n && calls++ < 4 * n + 4) {
++		bool drop;
++
++		cake_test_ecn_set(skb, ecn);
++		/* the next signal is due at drop_next; the first sets it */
++		e->now = e->v.count ? max(ktime_add_ns(e->now, 1), e->v.drop_next) :
++				      ktime_add_ns(e->now, NSEC_PER_MSEC);
++		cobalt_set_enqueue_time(skb, ktime_sub_ns(e->now, sojourn));
++		drop = cobalt_should_drop(&e->v, &e->p, e->now, skb, 1);
++		if (drop || e->v.ecn_marked)
++			signals++;
++		drops += drop;
++		e->drops += drop;
++		e->marks += e->v.ecn_marked;
++	}
++	return drops;
++}
++
++/* An ECT(0) flow far over target (20 ms) is marked, not dropped, until its
++ * count reaches ecn_fail_count and it has stayed over twice the target for
++ * COBALT_ECN_STRIKES more signals; from then on its packets are dropped,
++ * from the drop rate a count of ecn_fail_count gives (1/sqrt exact).
++ */
++static void cake_test_ecn_ignored_switches(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++	u32 fail = READ_ONCE(ecn_fail_count), drops, want;
++
++	KUNIT_ASSERT_GE(test, fail, REC_INV_SQRT_CACHE);
++	cake_test_ecn_init(&e);
++	drops = cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC,
++				  fail + COBALT_ECN_STRIKES - 2);
++	KUNIT_EXPECT_EQ(test, drops, 0);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++	KUNIT_EXPECT_EQ(test, e.marks, fail + COBALT_ECN_STRIKES - 2);
++
++	drops = cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 1);
++	KUNIT_EXPECT_EQ(test, drops, 1);
++	KUNIT_EXPECT_TRUE(test, e.v.ecn_ignored);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_marked);
++	/* restarted at ecn_fail_count, plus this signal */
++	KUNIT_EXPECT_EQ(test, e.v.count, fail + 1);
++	/* 2^32 / sqrt(count), within 0.1% */
++	want = int_sqrt64(div64_u64(U64_MAX, fail + 1));
++	KUNIT_EXPECT_LE(test, abs((s64)e.v.rec_inv_sqrt - (s64)want), (s64)(want >> 10));
++
++	/* and stays dropped */
++	drops = cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 100);
++	KUNIT_EXPECT_EQ(test, drops, 100);
++	/* the packet left as it came: ECT(0), not CE */
++	KUNIT_EXPECT_EQ(test, ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK, INET_ECN_ECT_0);
++}
++
++/* The same over IPv4 */
++static void cake_test_ecn_ignored_ipv4(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, false, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++	u32 fail = READ_ONCE(ecn_fail_count);
++
++	ip_send_check(ip_hdr(skb));
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC,
++						fail + COBALT_ECN_STRIKES - 2), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 50), 50);
++	KUNIT_EXPECT_TRUE(test, e.v.ecn_ignored);
++	KUNIT_EXPECT_EQ(test, ip_fast_csum((u8 *)ip_hdr(skb), ip_hdr(skb)->ihl), 0);
++}
++
++/* ECT(1) (L4S) is always marked, however long the flow ignores it */
++static void cake_test_ecn_l4s_marked(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 20 * NSEC_PER_MSEC,
++						4 * READ_ONCE(ecn_fail_count)), 0);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++	KUNIT_EXPECT_EQ(test, e.marks, 4 * READ_ONCE(ecn_fail_count));
++}
++
++/* A flow whose queue stays within twice the target is marked whatever its
++ * count: CoDel-like flows that answer the marks never get that far.
++ */
++static void cake_test_ecn_near_target_marked(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 4 * NSEC_PER_MSEC,
++						4 * READ_ONCE(ecn_fail_count)), 0);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++}
++
++/* One signal under twice the target starts the strikes over */
++static void cake_test_ecn_strikes_reset(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++	u32 fail = READ_ONCE(ecn_fail_count), i;
++
++	cake_test_ecn_init(&e);
++	/* counts 1 to fail - 1: no strikes yet */
++	cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, fail - 1);
++	for (i = 0; i < 20; i++) {
++		/* COBALT_ECN_STRIKES - 1 strikes, then one under */
++		KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC,
++							COBALT_ECN_STRIKES - 1), 0);
++		KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 4 * NSEC_PER_MSEC, 1), 0);
++	}
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++}
++
++/* Not-ECT packets are dropped on every signal, as ever, and don't switch
++ * the flow
++ */
++static void cake_test_ecn_not_ect_dropped(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_NOT_ECT, 20 * NSEC_PER_MSEC,
++						2 * READ_ONCE(ecn_fail_count)),
++			2 * READ_ONCE(ecn_fail_count));
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++	KUNIT_EXPECT_EQ(test, e.marks, 0);
++}
++
++/* ecn_fail_count 0 marks ECT(0) whatever the count, as upstream */
++static void cake_test_ecn_off(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	u32 fail = READ_ONCE(ecn_fail_count);
++	struct cake_test_ecn e;
++
++	WRITE_ONCE(ecn_fail_count, 0);
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC,
++						4 * fail), 0);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++	/* and turning it off stops the drops of a switched flow at once */
++	WRITE_ONCE(ecn_fail_count, fail);
++	cake_test_ecn_init(&e);
++	cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, fail + COBALT_ECN_STRIKES);
++	KUNIT_ASSERT_TRUE(test, e.v.ecn_ignored);
++	WRITE_ONCE(ecn_fail_count, 0);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 20), 0);
++	WRITE_ONCE(ecn_fail_count, fail);
++}
++
++/* A GSO batch of more than COBALT_ECN_MAX_SEGS packets is marked, not
++ * dropped whole, even in a flow that ignores marks
++ */
++static void cake_test_ecn_gso_marked(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++	u32 fail = READ_ONCE(ecn_fail_count);
++
++	cake_test_ecn_init(&e);
++	cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, fail + COBALT_ECN_STRIKES);
++	KUNIT_ASSERT_TRUE(test, e.v.ecn_ignored);
++	skb_shinfo(skb)->gso_segs = COBALT_ECN_MAX_SEGS + 1;
++	e.marks = 0;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 10), 0);
++	KUNIT_EXPECT_EQ(test, e.marks, 10);
++	skb_shinfo(skb)->gso_segs = COBALT_ECN_MAX_SEGS;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 10), 10);
++	skb_shinfo(skb)->gso_segs = 0;
++}
++
++/* Once its queue is gone and its count has decayed to 0, a switched flow
++ * is marked again
++ */
++static void cake_test_ecn_decays_back(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_test_ecn e;
++	u32 fail = READ_ONCE(ecn_fail_count), i;
++
++	cake_test_ecn_init(&e);
++	cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, fail + COBALT_ECN_STRIKES);
++	KUNIT_ASSERT_TRUE(test, e.v.ecn_ignored);
++	for (i = 0; i < 100000 && e.v.count; i++) {
++		e.now = max(ktime_add_ns(e.now, 1), e.v.drop_next);
++		cobalt_queue_empty(&e.v, &e.p, e.now);
++	}
++	KUNIT_EXPECT_EQ(test, e.v.count, 0);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++	KUNIT_EXPECT_EQ(test, e.v.ecn_strikes, 0);
++	e.drops = 0;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 50), 0);
++}
++
+ static int cake_test_init(struct kunit *test)
+ {
+ 	int i;
+@@ -1724,6 +1956,15 @@
+ #endif
+ 	KUNIT_CASE(cake_test_wake_slack),
+ 	KUNIT_CASE(cake_test_wake_slack_batches),
++	KUNIT_CASE(cake_test_ecn_ignored_switches),
++	KUNIT_CASE(cake_test_ecn_ignored_ipv4),
++	KUNIT_CASE(cake_test_ecn_l4s_marked),
++	KUNIT_CASE(cake_test_ecn_near_target_marked),
++	KUNIT_CASE(cake_test_ecn_strikes_reset),
++	KUNIT_CASE(cake_test_ecn_not_ect_dropped),
++	KUNIT_CASE(cake_test_ecn_off),
++	KUNIT_CASE(cake_test_ecn_gso_marked),
++	KUNIT_CASE(cake_test_ecn_decays_back),
+ 	KUNIT_CASE(cake_test_mq_marks_its_queue),
+ 	KUNIT_CASE(cake_test_mq_count_back_from_idle),
+ 	KUNIT_CASE(cake_test_mq_count_real_queues),

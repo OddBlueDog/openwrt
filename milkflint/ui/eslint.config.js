@@ -49,14 +49,24 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
-  // Node code: the Vite config and the packaging scripts.
+  // Node code: the Vite config, the packaging scripts and the tests.
   {
-    files: ['vite.config.ts', 'scripts/**/*.ts'],
+    files: ['vite.config.ts', 'scripts/**/*.ts', 'tests/**/*.ts'],
     languageOptions: {
       globals: globals.node,
     },
     rules: {
       'no-console': 'off',
+    },
+  },
+  // node:test runs every test() it's given: their promises are its to await.
+  {
+    files: ['tests/**/*.ts'],
+    rules: {
+      '@typescript-eslint/no-floating-promises': [
+        'error',
+        { allowForKnownSafeCalls: [{ from: 'package', name: 'test', package: 'node:test' }] },
+      ],
     },
   },
   // This config file itself is plain JavaScript outside the TypeScript projects.

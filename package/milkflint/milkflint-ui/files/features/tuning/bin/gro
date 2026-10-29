@@ -6,14 +6,17 @@
 #   milkflint.gro.udp_fwd   1 | 0     UDP GRO forwarding (rx-udp-gro-forwarding)
 #   milkflint.gro.max_size  bytes     the largest plain GRO packet (gro_max_size)
 #
-# Automatic is OpenWrt's fraglist GRO, except when the download CAKE takes
-# GRO packets whole (no-split-gso in sqm's iqdisc_opts) and software flow
-# offloading is off: then plain GRO with UDP GRO forwarding. With offloading
-# on, plain GRO saves nothing on TCP and costs more on UDP, since the Wi-Fi
-# port copies and checksums plain GRO packets apart where it only unchains
-# fraglist ones; with offloading off, plain GRO takes less CPU on TCP.
-# UDP GRO forwarding is on with plain GRO unless set:
-# fraglist GRO groups forwarded UDP (QUIC) anyway, plain GRO only with it.
+# Automatic is plain GRO when the download CAKE takes GRO packets whole
+# (no-split-gso in sqm's iqdisc_opts), up to 16 KB a packet, and OpenWrt's
+# fraglist GRO otherwise. CAKE holds a whole GRO packet against its shaper
+# and marks or drops it as one: with plain GRO a mark reaches every packet
+# of it (fraglist GRO's members keep their own headers), and smaller GRO
+# packets hold up whatever waits behind them for less time. Packets wait
+# less under load that way, on the Wi-Fi too, for about the same CPU.
+# UDP GRO forwarding is on with plain GRO only while software flow
+# offloading is off, unless set: with offloading on, the Wi-Fi port copies
+# and checksums plain UDP GRO packets apart where it only unchains fraglist
+# ones. Fraglist GRO groups forwarded UDP (QUIC) anyway.
 # max_size only applies to plain GRO: fraglist GRO always groups up to 64 KB.
 #
 # The port is the one Smart Queue shapes for the internet (not a guest
@@ -32,6 +35,8 @@
 
 STATE=/var/run/milkflint-tuning/gro.ports
 MAX=65536
+# automatic plain GRO's largest packet, for a CAKE that takes them whole
+AUTO_MAX=16384
 
 # <dev>: the device under it with hardware (a VLAN's port), or itself; a
 # device over several (a bridge) stays itself
@@ -76,7 +81,7 @@ offload_on() {
 
 # prints "dev mode auto udp max whole offload" for the internet port
 resolve() {
-	local queue_dev= whole=0 offload=0 dev mode auto udp max
+	local queue_dev= whole=0 offload=0 dev mode auto udp max dflt
 	config_load sqm
 	config_foreach find_queue queue
 	dev=$queue_dev
@@ -89,15 +94,16 @@ resolve() {
 	dev=$(lowest "$dev")
 	[ -d "/sys/class/net/$dev" ] || return 0
 	offload_on && offload=1
-	if [ "$whole" = 1 ] && [ "$offload" = 0 ]; then auto=plain; else auto=fraglist; fi
+	if [ "$whole" = 1 ]; then auto=plain; else auto=fraglist; fi
 	mode=$(uci -q get milkflint.gro.mode)
 	case "$mode" in fraglist | plain | off) ;; *) mode=$auto ;; esac
 	udp=$(uci -q get milkflint.gro.udp_fwd)
-	case "$udp" in 0 | 1) ;; *) [ "$mode" = plain ] && udp=1 || udp=0 ;; esac
+	case "$udp" in 0 | 1) ;; *) [ "$mode" = plain ] && [ "$offload" = 0 ] && udp=1 || udp=0 ;; esac
 	max=$(uci -q get milkflint.gro.max_size)
+	[ "$mode" = plain ] && [ "$whole" = 1 ] && dflt=$AUTO_MAX || dflt=$MAX
 	case "$max" in
-	'' | *[!0-9]*) max=$MAX ;;
-	*) { [ "$max" -ge 4096 ] && [ "$max" -le $MAX ]; } || max=$MAX ;;
+	'' | *[!0-9]*) max=$dflt ;;
+	*) { [ "$max" -ge 4096 ] && [ "$max" -le $MAX ]; } || max=$dflt ;;
 	esac
 	echo "$dev $mode $auto $udp $max $whole $offload"
 }

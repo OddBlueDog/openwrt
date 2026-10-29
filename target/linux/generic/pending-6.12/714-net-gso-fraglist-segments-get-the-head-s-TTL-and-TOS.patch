@@ -1,0 +1,169 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 29 Oct 2026 19:00:00 +0000
+Subject: [PATCH] net: gso: fraglist segments get the head's TTL and TOS
+
+A fraglist GSO batch's members keep the network headers they arrived
+with: skb_segment_list() copies only the MAC header, and the
+segment_list_csum() helpers bring only the addresses and ports over from
+the head (for NAT). GRO only joined packets whose TTL (hop limit) and
+TOS (traffic class) were the same, so any difference is what forwarding
+did to the head since: a TTL lowered by the router or the flowtable, a
+DSCP wash or an ECN CE mark from a qdisc. The members went out without
+them, unlike segments of a plain GSO packet, which all get the head's
+header.
+
+Copy the head's TTL and TOS (IPv4, with the header checksum) and its
+first word and hop limit (IPv6: version, traffic class, flow label) to
+each member as TCP and UDP fraglist batches are split, and don't take
+the shortcut for an unchanged 4-tuple when they differ.
+
+Tested by ifb's KUnit cases (previous patch).
+
+---
+--- a/include/net/gso.h
++++ b/include/net/gso.h
+@@ -4,6 +4,9 @@
+ #define _NET_GSO_H
+ 
+ #include <linux/skbuff.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <net/checksum.h>
+ 
+ /* Keeps track of mac header offset relative to skb->head.
+  * It is useful for TSO of Tunneling protocol. e.g. GRE.
+@@ -104,6 +107,48 @@
+ 	skb->mac_header = mac_offset;
+ 	skb->network_header = skb->mac_header + mac_len;
+ 	skb->mac_len = mac_len;
++}
++
++/* A fraglist GSO batch's members keep the network headers they arrived
++ * with, and GRO only joined packets whose TTL (hop limit) and TOS (traffic
++ * class) were the same. What forwarding changed on the head since (the TTL
++ * a router lowers, a DSCP wash, an ECN CE mark) goes to each member as the
++ * batch is split, as segmentation from the head's header gives plain GSO.
++ */
++static inline bool gso_list_iph_differs(const struct iphdr *iph,
++					const struct iphdr *iph2)
++{
++	return iph->ttl != iph2->ttl || iph->tos != iph2->tos;
++}
++
++static inline void gso_list_copy_iph(struct iphdr *iph2,
++				     const struct iphdr *iph)
++{
++	/* version, ihl and tos; then ttl and protocol */
++	if (iph2->tos != iph->tos) {
++		csum_replace2(&iph2->check, *(__be16 *)iph2, *(const __be16 *)iph);
++		*(__be16 *)iph2 = *(const __be16 *)iph;
++	}
++	if (iph2->ttl != iph->ttl) {
++		csum_replace2(&iph2->check, *(__be16 *)&iph2->ttl,
++			      *(const __be16 *)&iph->ttl);
++		*(__be16 *)&iph2->ttl = *(const __be16 *)&iph->ttl;
++	}
++}
++
++static inline bool gso_list_ipv6h_differs(const struct ipv6hdr *iph,
++					  const struct ipv6hdr *iph2)
++{
++	return iph->hop_limit != iph2->hop_limit ||
++	       *(const __be32 *)iph != *(const __be32 *)iph2;
++}
++
++static inline void gso_list_copy_ipv6h(struct ipv6hdr *iph2,
++				       const struct ipv6hdr *iph)
++{
++	/* version, traffic class and flow label */
++	*(__be32 *)iph2 = *(const __be32 *)iph;
++	iph2->hop_limit = iph->hop_limit;
+ }
+ 
+ #endif /* _NET_GSO_H */
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -67,7 +67,8 @@
+ 	iph2 = ip_hdr(seg->next);
+ 
+ 	if (!(*(const u32 *)&th->source ^ *(const u32 *)&th2->source) &&
+-	    iph->daddr == iph2->daddr && iph->saddr == iph2->saddr)
++	    iph->daddr == iph2->daddr && iph->saddr == iph2->saddr &&
++	    !gso_list_iph_differs(iph, iph2))
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+@@ -80,6 +81,7 @@
+ 		__tcpv4_gso_segment_csum(seg,
+ 					 &iph2->daddr, iph->daddr,
+ 					 &th2->dest, th->dest);
++		gso_list_copy_iph(iph2, iph);
+ 	}
+ 
+ 	return segs;
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -231,7 +231,8 @@
+ 	if ((udp_hdr(seg)->dest == udp_hdr(seg->next)->dest) &&
+ 	    (udp_hdr(seg)->source == udp_hdr(seg->next)->source) &&
+ 	    (ip_hdr(seg)->daddr == ip_hdr(seg->next)->daddr) &&
+-	    (ip_hdr(seg)->saddr == ip_hdr(seg->next)->saddr))
++	    (ip_hdr(seg)->saddr == ip_hdr(seg->next)->saddr) &&
++	    !gso_list_iph_differs(ip_hdr(seg), ip_hdr(seg->next)))
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+@@ -244,6 +245,7 @@
+ 		__udpv4_gso_segment_csum(seg,
+ 					 &iph2->daddr, &iph->daddr,
+ 					 &uh2->dest, &uh->dest);
++		gso_list_copy_iph(iph2, iph);
+ 	}
+ 
+ 	return segs;
+@@ -289,7 +291,8 @@
+ 
+ 	if (!(*(const u32 *)&uh->source ^ *(const u32 *)&uh2->source) &&
+ 	    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
+-	    ipv6_addr_equal(&iph->daddr, &iph2->daddr))
++	    ipv6_addr_equal(&iph->daddr, &iph2->daddr) &&
++	    !gso_list_ipv6h_differs(iph, iph2))
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+@@ -300,6 +303,7 @@
+ 					 &uh2->source, uh->source);
+ 		__udpv6_gso_segment_csum(seg, &iph2->daddr, &iph->daddr,
+ 					 &uh2->dest, uh->dest);
++		gso_list_copy_ipv6h(iph2, iph);
+ 	}
+ 
+ 	return segs;
+--- a/net/ipv6/tcpv6_offload.c
++++ b/net/ipv6/tcpv6_offload.c
+@@ -12,6 +12,7 @@
+ #include <net/protocol.h>
+ #include <net/tcp.h>
+ #include <net/ip6_checksum.h>
++#include <net/gso.h>
+ #include "ip6_offload.h"
+ 
+ static void tcp6_check_fraglist_gro(struct list_head *head, struct sk_buff *skb,
+@@ -142,7 +143,8 @@
+ 
+ 	if (!(*(const u32 *)&th->source ^ *(const u32 *)&th2->source) &&
+ 	    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
+-	    ipv6_addr_equal(&iph->daddr, &iph2->daddr))
++	    ipv6_addr_equal(&iph->daddr, &iph2->daddr) &&
++	    !gso_list_ipv6h_differs(iph, iph2))
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+@@ -153,6 +155,7 @@
+ 					 &th2->source, th->source);
+ 		__tcpv6_gso_segment_csum(seg, &iph2->daddr, &iph->daddr,
+ 					 &th2->dest, th->dest);
++		gso_list_copy_ipv6h(iph2, iph);
+ 	}
+ 
+ 	return segs;

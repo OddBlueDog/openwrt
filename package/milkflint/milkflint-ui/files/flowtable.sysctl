@@ -1,0 +1,6 @@
+# Software flow offloading: keep an idle offloaded UDP flow 180 s, as
+# conntrack keeps a replied one without offloading. With the kernel's 30 s,
+# a flow offloaded before its first reply stays unreplied (replies on the
+# fast path don't mark it) and its NAT mapping goes 60 s after its last
+# packet, under RFC 4787's two minutes: quiet calls, games and VPNs lose it.
+net.netfilter.nf_flowtable_udp_timeout = 180

@@ -23,6 +23,11 @@
 # Multi-queue) ring N also feeds sub-queue N. Ring 0 gets no flows: CPU0
 # keeps the TX NAPI and its interrupts, which with ring 0 too would leave it
 # nearly full. Rate and latency as with RPS, with less CPU in all.
+# With RSS the Wi-Fi threads may run on any CPU, CPU0 included, and the
+# rings' NAPI threads run SCHED_FIFO, as mt76-tx does: a ring's thread that
+# wakes runs at once instead of waiting behind a Wi-Fi thread on its CPU,
+# and the Wi-Fi threads move to whichever CPU is free. Both cut the time
+# packets wait for a CPU under load.
 # milkflint.steering.rss=0 keeps every flow on ring 0 with the RPS layout
 # above. Without the rings (an older image), that layout is all there is.
 #
@@ -50,6 +55,21 @@ eth_napi_pids() {
 	done | sort -n | awk '{ print $2 }'
 }
 
+# the NAPI threads of rings 1-3, the ones the RSS table uses, at SCHED_FIFO
+# $1 (1-99), or back to SCHED_OTHER with "other". TX's and ring 0's stay
+# SCHED_OTHER.
+RTPRIO=/usr/libexec/milkflint/rtprio
+ring_policy() {
+	[ -x $RTPRIO ] || return 0
+	for pid in $(eth_napi_pids | tail -n +3); do
+		if [ "$1" = other ]; then
+			$RTPRIO "$pid" other > /dev/null
+		else
+			$RTPRIO "$pid" fifo "$1" > /dev/null
+		fi
+	done
+}
+
 has_rss() {
 	command -v ethtool > /dev/null &&
 		ethtool -x $RSS_DEV 2> /dev/null | grep -q 'with 4 RX ring' &&
@@ -68,6 +88,7 @@ rss_off() {
 
 if [ "$(uci -q get milkflint.steering.layout)" = openwrt ] && [ -x /usr/libexec/network/packet-steering.uc ]; then
 	rss_off
+	ring_policy other
 	flows=$(uci -q get "network.@globals[0].steering_flows")
 	[ "${flows:-0}" -gt 0 ] 2> /dev/null && exec /usr/libexec/network/packet-steering.uc -l "$flows" "$1"
 	exec /usr/libexec/network/packet-steering.uc "$1"
@@ -89,8 +110,10 @@ if [ -z "$off" ] && [ "$(uci -q get milkflint.steering.rss)" != 0 ] && has_rss &
 		taskset -p "$m" "$pid" > /dev/null
 		n=$((n + 1))
 	done
+	ring_policy 1
 else
 	rss_off
+	ring_policy other
 fi
 
 all=$(printf %x $(((1 << $(grep -c ^processor /proc/cpuinfo)) - 1)))
@@ -98,7 +121,7 @@ all=$(printf %x $(((1 << $(grep -c ^processor /proc/cpuinfo)) - 1)))
 for p in /proc/[0-9]*; do
 	case "$(cat "$p/comm" 2> /dev/null)" in
 	napi/mtk_eth-*) [ -n "$rss" ] && continue; m=$NAPI_CPUS ;;
-	napi/phy*|mt76-tx*) m=$WORK_CPUS ;;
+	napi/phy*|mt76-tx*) [ -n "$rss" ] && m=$all || m=$WORK_CPUS ;;
 	*) continue ;;
 	esac
 	[ -n "$off" ] && m=$all

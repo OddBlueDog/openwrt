@@ -364,8 +364,15 @@ uc_hostapd_bss_delete(uc_vm_t *vm, size_t nargs)
 	hostapd_drv_set_first_bss(iface->bss[0]);
 	hapd->interface_added = 1;
 
+	/* deauthenticate the stations while the BSS still runs, as
+	 * __uc_hostapd_bss_stop() does: after stop_ap the broadcast
+	 * Deauthentication frame isn't sent */
+	hostapd_bss_deinit_no_free(hapd);
 	hostapd_drv_stop_ap(hapd);
 	hostapd_bss_deinit(hapd);
+	/* deinit skips these for a bss that never started; both are idempotent */
+	hostapd_ucode_free_bss(hapd);
+	hostapd_ubus_free_bss(hapd);
 	hostapd_remove_iface_bss_conf(iface->conf, hapd->conf);
 	hostapd_config_free_bss(hapd->conf);
 #ifdef CONFIG_IEEE80211BE
@@ -414,7 +421,7 @@ uc_hostapd_iface_add_bss(uc_vm_t *vm, size_t nargs)
 {
 	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
 	struct hostapd_bss_config *bss;
-	struct hostapd_config *conf;
+	struct hostapd_config *conf = NULL;
 	struct hostapd_data *hapd;
 	uc_value_t *file = uc_fn_arg(0);
 	uc_value_t *index = uc_fn_arg(1);
@@ -502,7 +509,9 @@ uc_hostapd_iface_set_bss_order(uc_vm_t *vm, size_t nargs)
 		struct hostapd_data *bss;
 
 		bss = ucv_resource_data(ucv_array_get(bss_list, i), "hostapd.bss");
-		if (bss->iface != iface)
+		/* a handle of a BSS whose data hostapd freed, e.g. at its own
+		 * interface restart after radar, has no data any more */
+		if (!bss || bss->iface != iface)
 			goto free;
 
 		for (size_t k = 0; k < i; k++)
@@ -731,10 +740,22 @@ uc_hostapd_iface_switch_channel(uc_vm_t *vm, size_t nargs)
 	intval = ucv_int64_get(ucv_object_get(info, "oper_chwidth", NULL));
 	if (errno)
 		intval = hostapd_get_oper_chwidth(conf);
-	if (intval)
-		csa.freq_params.bandwidth = 40 << intval;
-	else
+	switch (intval) {
+	case CONF_OPER_CHWIDTH_80MHZ:
+	case CONF_OPER_CHWIDTH_80P80MHZ:
+		/* 80+80 uses an 80 MHz primary segment plus center_freq2 */
+		csa.freq_params.bandwidth = 80;
+		break;
+	case CONF_OPER_CHWIDTH_160MHZ:
+		csa.freq_params.bandwidth = 160;
+		break;
+	case CONF_OPER_CHWIDTH_320MHZ:
+		csa.freq_params.bandwidth = 320;
+		break;
+	default:
 		csa.freq_params.bandwidth = csa.freq_params.sec_channel_offset ? 40 : 20;
+		break;
+	}
 
 	if ((intval = ucv_int64_get(ucv_object_get(info, "frequency", NULL))) && !errno)
 		csa.freq_params.freq = intval;
@@ -743,10 +764,43 @@ uc_hostapd_iface_switch_channel(uc_vm_t *vm, size_t nargs)
 	if ((intval = ucv_int64_get(ucv_object_get(info, "center_freq2", NULL))) && !errno)
 		csa.freq_params.center_freq2 = intval;
 
-	for (i = 0; i < iface->num_bss; i++)
+	/* mac80211 completes the switch only if every BSS of the radio
+	 * takes part */
+	for (i = 0; i < iface->num_bss && !ret; i++)
 		ret = hostapd_switch_channel(iface->bss[i], &csa);
 
 	return ucv_boolean_new(!ret);
+}
+
+static uc_value_t *
+uc_hostapd_iface_csa_in_progress(uc_vm_t *vm, size_t nargs)
+{
+	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
+
+	if (!iface)
+		return NULL;
+
+	return ucv_boolean_new(hostapd_csa_in_progress(iface));
+}
+
+/* The channel the interface runs, which a channel switch hostapd made by
+ * itself (a radar) moves away from the one its configuration names. */
+static uc_value_t *
+uc_hostapd_iface_freq_running(uc_vm_t *vm, size_t nargs)
+{
+	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
+	uc_value_t *ret;
+
+	if (!iface || !iface->freq)
+		return NULL;
+
+	ret = ucv_object_new(vm);
+	ucv_object_add(ret, "frequency", ucv_int64_new(iface->freq));
+	ucv_object_add(ret, "sec_channel", ucv_int64_new(iface->conf->secondary_channel));
+	ucv_object_add(ret, "center_seg0_idx",
+		       ucv_int64_new(hostapd_get_oper_centr_freq_seg0_idx(iface->conf)));
+
+	return ret;
 }
 
 static uc_value_t *
@@ -832,13 +886,15 @@ int hostapd_ucode_sta_auth(struct hostapd_data *hapd, struct sta_info *sta)
 			size_t str_len;
 
 			cur_psk = ucv_array_get(cur, i);
+			if (ucv_type(cur_psk) != UC_STRING)
+				continue;
 			str = ucv_string_get(cur_psk);
 			str_len = strlen(str);
-			if (!str || str_len < 8 || str_len > 64)
+			if (str_len < 8 || str_len > 64)
 				continue;
 
 			p = os_zalloc(sizeof(*p));
-			if (len == 64) {
+			if (str_len == 64) {
 				if (hexstr2bin(str, p->psk, PMK_LEN) < 0) {
 					free(p);
 					continue;
@@ -967,6 +1023,8 @@ int hostapd_ucode_init(struct hapd_interfaces *ifaces)
 		{ "stop", uc_hostapd_iface_stop },
 		{ "start", uc_hostapd_iface_start },
 		{ "switch_channel", uc_hostapd_iface_switch_channel },
+		{ "csa_in_progress", uc_hostapd_iface_csa_in_progress },
+		{ "freq_running", uc_hostapd_iface_freq_running },
 	};
 	uc_value_t *data, *proto;
 
@@ -1011,6 +1069,15 @@ void hostapd_ucode_bss_cb(struct hostapd_data *hapd, const char *type)
 {
 	uc_value_t *val;
 
+	/*
+	 * hostapd sets a BSS up again by itself when it restarts an interface
+	 * (DFS fallback, a failed channel switch, the NOP wait). Its old
+	 * handles lost their data in hostapd_ucode_free_bss(), so refresh
+	 * hostapd.bss, or hostapd.uc's next reload passes them back.
+	 */
+	if (!strcmp(type, "bss_add"))
+		hostapd_ucode_update_interfaces();
+
 	if (wpa_ucode_call_prepare(type))
 		return;
 
@@ -1034,9 +1101,10 @@ void hostapd_ucode_free_bss(struct hostapd_data *hapd)
 	if (wpa_ucode_call_prepare("bss_remove"))
 		return;
 
+	uc_value_push(ucv_string_new(hapd->iface->phy));
 	uc_value_push(ucv_string_new(hapd->conf->iface));
 	uc_value_push(ucv_get(val));
-	ucv_put(wpa_ucode_call(2));
+	ucv_put(wpa_ucode_call(3));
 
 	ucv_put(val);
 }

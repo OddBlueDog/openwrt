@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 19:45:00 +0000
+Subject: [PATCH] net: ethernet: mtk_eth_soc: cap the RX interrupt delay
+
+Adaptive RX moderation (net_dim, START_FROM_EQE) picks interrupt
+delays of up to 256 us (260 in the hardware's 20 us steps), and one
+setting serves every RX ring: on a busy ring each packet can wait that
+long before its NAPI runs.
+
+rx_dim_max_us (module parameter, default 40, 0: as net_dim picks) caps
+it. A busy ring then interrupts more often and its packets wait less,
+for a little more CPU.
+
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -4311,16 +4311,30 @@
+ 	return ret;
+ }
+ 
++/* The longest an RX interrupt is held back for more packets, in us, whatever
++ * adaptive moderation picks. Its profiles go up to 256 us (260 in the
++ * hardware's 20 us steps), and on a busy ring every packet can wait that
++ * long before its NAPI runs; one setting serves all the rings. Capped at
++ * 40 us, a busy ring interrupts more often and packets wait less, for
++ * a little more CPU. 0: the moderation's own choice, as upstream.
++ */
++static unsigned int rx_dim_max_us = 40;
++module_param(rx_dim_max_us, uint, 0644);
++MODULE_PARM_DESC(rx_dim_max_us, "The longest an RX interrupt is held back for more packets, in us (0: as adaptive moderation picks)");
++
+ static void mtk_dim_rx(struct work_struct *work)
+ {
+ 	struct dim *dim = container_of(work, struct dim, work);
+ 	struct mtk_eth *eth = container_of(dim, struct mtk_eth, rx_dim);
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
++	unsigned int cap = READ_ONCE(rx_dim_max_us);
+ 	struct dim_cq_moder cur_profile;
+ 	u32 val, cur;
+ 
+ 	cur_profile = net_dim_get_rx_moderation(eth->rx_dim.mode,
+ 						dim->profile_ix);
++	if (cap && cur_profile.usec > cap)
++		cur_profile.usec = cap;
+ 	spin_lock_bh(&eth->dim_lock);
+ 
+ 	val = MTK_PDMA_DELAY_RX_EN;

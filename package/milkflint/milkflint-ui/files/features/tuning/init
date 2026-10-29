@@ -5,9 +5,6 @@
 # - milkflint.wifi.aql_be: the Wi-Fi driver queue's best-effort limits,
 #   which /usr/libexec/milkflint/wifi-aql writes to every radio (the
 #   ieee80211 hotplug does the same for each radio as it appears);
-# - milkflint.wifi.hw_atf: MediaTek's hardware airtime fairness, off unless
-#   1 (/usr/libexec/milkflint/wifi-hw-atf; the ieee80211 hotplug again for
-#   each radio as it appears);
 # - milkflint.steering.layout: MilkFlint's or OpenWrt's packet steering
 #   (/usr/libexec/platform/packet-steering.sh), and milkflint.steering.rss:
 #   0 spreads with RPS instead of the Ethernet's RSS rings. Whether steering
@@ -44,7 +41,6 @@ reload_if_enabled() {
 apply() {
 	mkdir -p "$RUN"
 	put aql "$(uci -q get milkflint.wifi.aql_be)" /usr/libexec/milkflint/wifi-aql
-	put hw_atf "$(uci -q get milkflint.wifi.hw_atf)" /usr/libexec/milkflint/wifi-hw-atf
 	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss)" reload_if_enabled packet_steering
 	# what the GRO settings resolve to: sqm and firewall changes count too
 	put gro "$(/usr/libexec/milkflint/gro show)" /usr/libexec/milkflint/gro

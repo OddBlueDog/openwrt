@@ -1,0 +1,228 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 29 Oct 2026 19:00:00 +0000
+Subject: [PATCH] net: ifb: pass fraglist GRO batches whole
+
+ifb offers plain GSO (NETIF_F_GSO_SOFTWARE) but not NETIF_F_GSO_FRAGLIST,
+so validate_xmit_skb() splits every fraglist GRO batch (rx-gro-list) into
+its packets as it leaves ifb's qdisc. Everything ifb hands back (its
+netfilter ingress hook and the flowtable, forwarding, the bridge) then
+runs once per packet, where a plain GRO batch passes ifb whole and takes
+one pass. With Smart Queue's download CAKE on ifb (no-split-gso) a
+batch is a few packets.
+
+Offer NETIF_F_GSO_FRAGLIST too: a fraglist batch is split where its way
+out needs it, as a plain one is. The forwarding the batch's head gets
+then has to reach its members when it is split: the next patch.
+
+KUnit (ifb_test.c): ifb's features take fraglist batches; a forwarded
+IPv4 and IPv6 batch, split, gives every packet the head's TTL (hop
+limit) and TOS (traffic class) and a good IPv4 header checksum.
+
+---
+--- a/drivers/net/ifb.c
++++ b/drivers/net/ifb.c
+@@ -310,8 +310,15 @@
+ 	.get_ethtool_stats	= ifb_get_ethtool_stats,
+ };
+ 
++/* NETIF_F_GSO_FRAGLIST: a fraglist GRO batch (rx-gro-list) passes whole,
++ * as a plain GRO batch does, rather than being split into its packets on
++ * the way out of ifb's qdisc. What ifb hands back (to the flowtable,
++ * forwarding and the bridge) then takes one pass per batch, and the
++ * batch is split where its way out needs it.
++ */
+ #define IFB_FEATURES (NETIF_F_HW_CSUM | NETIF_F_SG  | NETIF_F_FRAGLIST	| \
+-		      NETIF_F_GSO_SOFTWARE | NETIF_F_GSO_ENCAP_ALL	| \
++		      NETIF_F_GSO_SOFTWARE | NETIF_F_GSO_FRAGLIST	| \
++		      NETIF_F_GSO_ENCAP_ALL				| \
+ 		      NETIF_F_HIGHDMA | NETIF_F_HW_VLAN_CTAG_TX		| \
+ 		      NETIF_F_HW_VLAN_STAG_TX)
+ 
+--- a/drivers/net/ifb_test.c
++++ b/drivers/net/ifb_test.c
+@@ -1,10 +1,16 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ /* KUnit tests for the netfilter ingress hook ifb runs on what it hands back
+- * to the receive path. Built into ifb.ko (#included at the end of ifb.c)
++ * to the receive path, and for the fraglist GRO batches it passes whole. Built into ifb.ko (#included at the end of ifb.c)
+  * when CONFIG_IFB_KUNIT_TEST is set; the suite runs when it loads.
+  */
+ #include <kunit/test.h>
+ #include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/tcp.h>
++#include <net/dsfield.h>
++#include <net/gso.h>
++#include <net/inet_ecn.h>
++#include <net/ip.h>
+ 
+ /* the tests' packets; anything else on lo is left alone */
+ #define IFB_TEST_MARK	0x1fb0cafe
+@@ -146,11 +152,167 @@
+ 	KUNIT_EXPECT_EQ(test, h->seen, 1);
+ }
+ 
++/* ifb takes a fraglist GRO batch whole, as it takes a plain GRO one */
++static void ifb_test_fraglist_features(struct kunit *test)
++{
++	struct net_device *dev;
++
++	dev = alloc_netdev(0, "ifbtest%d", NET_NAME_UNKNOWN, ifb_setup);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_EXPECT_TRUE(test, dev->features & NETIF_F_GSO_FRAGLIST);
++	KUNIT_EXPECT_TRUE(test, dev->hw_features & NETIF_F_GSO_FRAGLIST);
++	KUNIT_EXPECT_TRUE(test, net_gso_ok(dev->features,
++					   SKB_GSO_TCPV6 | SKB_GSO_FRAGLIST));
++	KUNIT_EXPECT_TRUE(test, net_gso_ok(dev->features,
++					   SKB_GSO_TCPV4 | SKB_GSO_FRAGLIST));
++	KUNIT_EXPECT_TRUE(test, net_gso_ok(dev->features,
++					   SKB_GSO_UDP_L4 | SKB_GSO_FRAGLIST));
++	/* and without the flag, a fraglist batch is split */
++	KUNIT_EXPECT_FALSE(test, net_gso_ok(dev->features & ~NETIF_F_GSO_FRAGLIST,
++					    SKB_GSO_TCPV6 | SKB_GSO_FRAGLIST));
++	free_netdev(dev);
++}
++
++#define IFB_TEST_MSS	100
++
++/* One TCP packet of a flow, IPv4 or IPv6, from its network header (the
++ * MAC header is there too, empty), as GRO had it: data at the payload
++ * for a batch member (@pulled), at the network header for the head.
++ */
++static struct sk_buff *ifb_test_tcp(struct kunit *test, bool v6, u32 seq,
++				    bool pulled)
++{
++	int nh = v6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
++	struct sk_buff *skb = alloc_skb(256, GFP_KERNEL);
++	struct tcphdr *th;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	skb_reserve(skb, 64);
++	skb_reset_mac_header(skb);
++	skb_reset_network_header(skb);
++	if (v6) {
++		struct ipv6hdr *ip6 = skb_put_zero(skb, nh);
++
++		ip6->version = 6;
++		ip6->nexthdr = IPPROTO_TCP;
++		ip6->hop_limit = 64;
++		ip6->payload_len = htons(sizeof(*th) + IFB_TEST_MSS);
++		ip6->saddr.s6_addr32[0] = htonl(0x20010db8);
++		ip6->saddr.s6_addr[15] = 1;
++		ip6->daddr.s6_addr32[0] = htonl(0x20010db8);
++		ip6->daddr.s6_addr[15] = 2;
++		ipv6_change_dsfield(ip6, 0, INET_ECN_ECT_0);
++		skb->protocol = htons(ETH_P_IPV6);
++	} else {
++		struct iphdr *iph = skb_put_zero(skb, nh);
++
++		iph->version = 4;
++		iph->ihl = 5;
++		iph->ttl = 64;
++		iph->tos = INET_ECN_ECT_0;
++		iph->protocol = IPPROTO_TCP;
++		iph->tot_len = htons(nh + sizeof(*th) + IFB_TEST_MSS);
++		iph->saddr = htonl(0xc0000201);
++		iph->daddr = htonl(0xc0a80102);
++		ip_send_check(iph);
++		skb->protocol = htons(ETH_P_IP);
++	}
++	skb_set_transport_header(skb, nh);
++	th = skb_put_zero(skb, sizeof(*th));
++	th->source = htons(443);
++	th->dest = htons(40000);
++	th->seq = htonl(seq);
++	th->doff = sizeof(*th) / 4;
++	th->ack = 1;
++	memset(skb_put(skb, IFB_TEST_MSS), 0x5a, IFB_TEST_MSS);
++	if (pulled)
++		skb_pull(skb, nh + sizeof(*th));
++	return skb;
++}
++
++/* A fraglist GRO batch of @n packets */
++static struct sk_buff *ifb_test_batch(struct kunit *test, bool v6, int n)
++{
++	struct sk_buff *head = ifb_test_tcp(test, v6, 1000, false), **tail;
++	int i;
++
++	tail = &skb_shinfo(head)->frag_list;
++	for (i = 1; i < n; i++) {
++		struct sk_buff *m = ifb_test_tcp(test, v6, 1000 + i * IFB_TEST_MSS, true);
++
++		*tail = m;
++		tail = &m->next;
++		head->len += m->len;
++		head->data_len += m->len;
++		head->truesize += m->truesize;
++	}
++	skb_shinfo(head)->gso_size = IFB_TEST_MSS;
++	skb_shinfo(head)->gso_segs = n;
++	skb_shinfo(head)->gso_type = SKB_GSO_FRAGLIST |
++				     (v6 ? SKB_GSO_TCPV6 : SKB_GSO_TCPV4);
++	head->ip_summed = CHECKSUM_UNNECESSARY;
++	return head;
++}
++
++/* Forwarded whole (ifb hands it on as one skb), the batch's head gets a
++ * lower TTL (hop limit) and, from the qdisc, a CE mark; split where it
++ * leaves, every packet of it carries both, with a good IPv4 checksum.
++ */
++static void ifb_test_fraglist_split(struct kunit *test, bool v6)
++{
++	struct sk_buff *skb = ifb_test_batch(test, v6, 3), *segs, *seg, *next;
++	int n = 0;
++
++	if (v6) {
++		ipv6_hdr(skb)->hop_limit--;
++		ipv6_change_dsfield(ipv6_hdr(skb), INET_ECN_MASK, INET_ECN_CE);
++	} else {
++		ip_decrease_ttl(ip_hdr(skb));
++		ipv4_change_dsfield(ip_hdr(skb), INET_ECN_MASK, INET_ECN_CE);
++	}
++
++	/* as validate_xmit_skb() does: the batch's own skb comes back as the
++	 * first segment with a reference of its own, and the caller drops the
++	 * one it held
++	 */
++	segs = skb_gso_segment(skb, 0);
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(segs));
++	consume_skb(skb);
++	skb_list_walk_safe(segs, seg, next) {
++		n++;
++		if (v6) {
++			KUNIT_EXPECT_EQ(test, ipv6_hdr(seg)->hop_limit, 63);
++			KUNIT_EXPECT_EQ(test, ipv6_get_dsfield(ipv6_hdr(seg)) & INET_ECN_MASK,
++					INET_ECN_CE);
++		} else {
++			KUNIT_EXPECT_EQ(test, ip_hdr(seg)->ttl, 63);
++			KUNIT_EXPECT_EQ(test, ip_hdr(seg)->tos & INET_ECN_MASK, INET_ECN_CE);
++			KUNIT_EXPECT_EQ(test, ip_fast_csum(ip_hdr(seg), ip_hdr(seg)->ihl), 0);
++		}
++		KUNIT_EXPECT_EQ(test, ntohl(tcp_hdr(seg)->seq), 1000 + (n - 1) * IFB_TEST_MSS);
++	}
++	KUNIT_EXPECT_EQ(test, n, 3);
++	kfree_skb_list(segs);
++}
++
++static void ifb_test_fraglist_split_v4(struct kunit *test)
++{
++	ifb_test_fraglist_split(test, false);
++}
++
++static void ifb_test_fraglist_split_v6(struct kunit *test)
++{
++	ifb_test_fraglist_split(test, true);
++}
++
+ static struct kunit_case ifb_test_cases[] = {
+ 	KUNIT_CASE(ifb_test_no_hook),
+ 	KUNIT_CASE(ifb_test_accept),
+ 	KUNIT_CASE(ifb_test_stolen),
+ 	KUNIT_CASE(ifb_test_drop),
++	KUNIT_CASE(ifb_test_fraglist_features),
++	KUNIT_CASE(ifb_test_fraglist_split_v4),
++	KUNIT_CASE(ifb_test_fraglist_split_v6),
+ 	{}
+ };
+ 
