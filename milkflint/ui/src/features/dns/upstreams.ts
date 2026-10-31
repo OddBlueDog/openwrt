@@ -5,7 +5,7 @@
 // cache) keep old answers.
 // No imports from the app, so the tests (ui/tests) load it as it is.
 
-import { type Block, blockLabels, type DnsServer, type Proto, protoOf, type ProviderId, providers, urlFor } from './providers.ts';
+import { type Block, blockLabels, type DnsServer, type Proto, protoLabels, protoOf, type ProviderId, providers, urlFor } from './providers.ts';
 
 /** A provider's server (by name), or a custom address. */
 export interface ServerPick {
@@ -175,6 +175,21 @@ export function describe(mode: 'auto' | 'static' | 'encrypted', main: ServerPick
   return pair === 'parallel'
     ? `Each lookup goes ${how} to ${a} and ${b} at once; the first answer is used.`
     : `Lookups go ${how} to ${a}, and to ${b} only when ${a} ${mode === 'encrypted' ? 'fails or is slow' : 'doesn’t answer'}.`;
+}
+
+/**
+ * When the second server can't use the chosen encryption type: which server
+ * falls back to DNS over HTTPS ("Google doesn't offer DNS over QUIC, so it
+ * uses DNS over HTTPS"). Undefined when it can, or when either is custom (a
+ * custom address says its own type, and the type is then the custom main
+ * server's).
+ */
+export function protoNote(main: ServerPick, backup: ServerPick | undefined, proto: Proto): string | undefined {
+  if (backup === undefined || main.provider === 'custom' || backup.provider === 'custom') return undefined;
+  const server = serverOf(backup);
+  if (server === undefined || urlFor(server, proto) !== undefined) return undefined;
+  const name = (p: Proto): string => protoLabels[p].replace(/ \(.*\)$/, '');
+  return `${shortName(backup)} doesn’t offer ${name(proto)}, so it uses ${name('doh')}.`;
 }
 
 /** A server's description and whether it checks DNSSEC, for its field's hint. */

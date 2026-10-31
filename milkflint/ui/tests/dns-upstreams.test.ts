@@ -12,6 +12,7 @@ import {
   keepHoursOf,
   matchingServer,
   plainServers,
+  protoNote,
   proxyServers,
   type ServerPick,
   serverHint,
@@ -148,4 +149,14 @@ test('short names, and the page’s sentence for each setup', () => {
   assert.equal(describe('encrypted', cloudflare, google, 'parallel'), 'Each lookup goes encrypted to Cloudflare and Google at once; the first answer is used.');
   assert.equal(describe('encrypted', cloudflare, google, 'fallback'), 'Lookups go encrypted to Cloudflare, and to Google only when Cloudflare fails or is slow.');
   assert.equal(describe('static', cloudflare, google, 'fallback'), 'Lookups go unencrypted to Cloudflare, and to Google only when Cloudflare doesn’t answer.');
+});
+
+test('the encryption note names a second server that falls back to DNS over HTTPS, only then', () => {
+  const adguard = pick('adguard', 'Default');
+  const google = pick('google', 'Default');
+  assert.equal(protoNote(adguard, google, 'doq'), 'Google doesn’t offer DNS over QUIC, so it uses DNS over HTTPS.');
+  assert.equal(protoNote(adguard, pick('controld', 'Malware'), 'doq'), undefined);
+  assert.equal(protoNote(cloudflare, google, 'dot'), undefined);
+  assert.equal(protoNote(adguard, undefined, 'doq'), undefined);
+  assert.equal(protoNote(adguard, pick('custom', '', 'tls://dns.example'), 'doq'), undefined);
 });

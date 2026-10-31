@@ -4,7 +4,10 @@ import type { ComponentProps, ReactElement } from 'react';
 import { cn } from '@/lib/utils';
 
 export const Select = SelectPrimitive.Root;
-export const SelectValue = SelectPrimitive.Value;
+/** The chosen item's text, marked for SelectTrigger's styles (Radix's Value ignores className). */
+export function SelectValue(props: ComponentProps<typeof SelectPrimitive.Value>): ReactElement {
+  return <SelectPrimitive.Value data-slot="select-value" {...props} />;
+}
 export const SelectGroup = SelectPrimitive.Group;
 
 export function SelectTrigger({
@@ -16,9 +19,10 @@ export function SelectTrigger({
     <SelectPrimitive.Trigger
       data-slot="select-trigger"
       className={cn(
-        'flex h-9 w-full items-center justify-between gap-2 rounded-md border border-input bg-card px-3 py-2 text-sm whitespace-nowrap shadow-xs transition-[color,box-shadow] outline-none data-[placeholder]:text-muted-foreground',
+        'flex h-9 w-full min-w-0 items-center justify-between gap-2 rounded-md border border-input bg-card px-3 py-2 text-sm whitespace-nowrap shadow-xs transition-[color,box-shadow] outline-none data-[placeholder]:text-muted-foreground',
         'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50 aria-invalid:border-destructive',
-        '*:data-[slot=select-value]:line-clamp-1 *:data-[slot=select-value]:flex *:data-[slot=select-value]:items-center *:data-[slot=select-value]:gap-2 [&_svg]:pointer-events-none [&_svg]:shrink-0',
+        // a long value ends in … rather than widening the trigger (open the list for all of it)
+        '*:data-[slot=select-value]:block *:data-[slot=select-value]:min-w-0 *:data-[slot=select-value]:truncate [&_svg]:pointer-events-none [&_svg]:shrink-0',
         className,
       )}
       {...props}

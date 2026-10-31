@@ -49,6 +49,7 @@ import {
   matchingServer,
   type Pair,
   plainServers,
+  protoNote,
   type ProxyServers,
   proxyServers,
   type ServerPick,
@@ -590,6 +591,8 @@ export function DnsPage(): ReactElement {
             // the router doesn't check DNSSEC itself: say when a chosen server doesn't either
             const dnssec = chosen ? dnssecWarning(main) : undefined;
             const backupDnssec = chosen && backup !== undefined ? backupDnssecWarning(backup, use) : undefined;
+            // the second server can't use the chosen encryption type: it falls back to DNS over HTTPS
+            const protoFallback = form.mode === 'encrypted' ? protoNote(main, backup, form.proto) : undefined;
             const sends = form.mode === 'static' ? planned.dnsmasq : [...(planned.proxy?.upstream ?? []), ...(planned.proxy?.fallback ?? [])];
             const ids = Object.keys(providers) as ProviderId[];
             const [mainTitle, backupTitle] = slotTitles[form.pair];
@@ -685,11 +688,11 @@ export function DnsPage(): ReactElement {
                           <Field
                             id="dns-proto"
                             label="Encryption"
-                            className="sm:grid-cols-[minmax(10rem,14rem)_1fr] pb-0"
+                            className="pb-0"
                             hint={
                               backup === undefined
                                 ? 'All three keep lookups private; DNS over HTTPS is the hardest for a network to block.'
-                                : 'For both servers: DNS over HTTPS for one whose provider doesn’t offer this type.'
+                                : 'Used for both servers.'
                             }
                           >
                             <Select
@@ -709,6 +712,7 @@ export function DnsPage(): ReactElement {
                                 ))}
                               </SelectContent>
                             </Select>
+                            {protoFallback !== undefined && <p className="text-xs text-muted-foreground">{protoFallback}</p>}
                           </Field>
                         )}
                         {filter !== undefined && <WarningBox title="They don’t filter the same">{filter}</WarningBox>}

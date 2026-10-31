@@ -5,7 +5,6 @@ import { type ReactElement, type ReactNode, useRef, useState } from 'react';
 import { Sparkline } from '@/components/charts/sparkline';
 import { QrCode } from '@/components/qr-code';
 import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { useLoad } from '@/hooks/use-load';
@@ -255,18 +254,19 @@ function BandCard({ b }: { b: Band }): ReactElement {
             </p>
           </div>
           {online && b.ssid !== undefined && b.section !== undefined && (
-            <Button
-              variant="ghost"
-              size="icon"
-              className="-my-1 shrink-0"
+            // a tile like the band's icon on the left, labelled, so it reads as a button
+            <button
+              type="button"
+              className="flex shrink-0 cursor-pointer flex-col items-center justify-center gap-1 rounded-lg border bg-card px-2.5 py-1.5 text-muted-foreground shadow-xs transition-colors outline-none hover:border-primary/40 hover:bg-primary/10 hover:text-primary focus-visible:ring-[3px] focus-visible:ring-ring/40"
               aria-label={`Show a QR code to join ${b.ssid}`}
               title="Join with a camera"
               onClick={() => {
                 setQr(true);
               }}
             >
-              <QrCodeIcon />
-            </Button>
+              <QrCodeIcon className="size-4" />
+              <span className="text-[10px] leading-none font-semibold tracking-wide">QR</span>
+            </button>
           )}
         </div>
         {online && b.ssid !== undefined && b.section !== undefined && (
