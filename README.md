@@ -52,8 +52,11 @@ country.
 
 Built from the same tree, not tested on the hardware here: reports welcome.
 Install OpenWrt on it first, following
-[OpenWrt's EX5601-T0 page](https://openwrt.org/toh/zyxel/ex5601-t0), and
-make sure you can recover it from there (serial console, recovery image)
+[OpenWrt's device page](https://openwrt.org/toh/zyxel/t-56#installation)
+(filed under the T-56, an ISP's EX5601-T1: the same router without the
+SFP+ port) and the
+[EX5601-T0 forum thread](https://forum.openwrt.org/t/adding-openwrt-support-for-zyxel-ex5601-t0/155914),
+and make sure you can recover it from there (serial console, recovery image)
 before you flash anything else. Then flash the MilkFlint image for the
 flash layout it has, which `cat /tmp/sysinfo/board_name` tells:
 
