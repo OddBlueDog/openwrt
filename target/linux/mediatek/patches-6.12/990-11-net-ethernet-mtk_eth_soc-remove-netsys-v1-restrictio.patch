@@ -25,11 +25,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  drivers/net/ethernet/mediatek/mtk_eth_soc.c | 5 ++---
  1 file changed, 2 insertions(+), 3 deletions(-)
 
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index 6060cfe..560b056 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -1992,7 +1992,7 @@ static bool mtk_skb_has_small_frag(struct sk_buff *skb)
+@@ -1992,7 +1992,7 @@ static bool mtk_skb_has_small_frag(struc
  static bool mtk_skb_valid_gso(struct mtk_eth *eth, struct sk_buff *skb,
  			      unsigned int header_len)
  {
@@ -38,7 +36,7 @@ index 6060cfe..560b056 100644
  		return false;
  
  	if (!(skb_shinfo(skb)->gso_type & SKB_GSO_FRAGLIST))
-@@ -2074,8 +2074,7 @@ static netdev_tx_t mtk_start_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -2074,8 +2074,7 @@ static netdev_tx_t mtk_start_xmit(struct
  
  send:
  	skb_list_walk_safe(skb, skb, next) {

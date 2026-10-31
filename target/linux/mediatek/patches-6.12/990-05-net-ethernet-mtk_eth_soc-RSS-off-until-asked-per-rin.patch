@@ -25,8 +25,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  drivers/net/ethernet/mediatek/mtk_eth_soc.h |  7 ++
  2 files changed, 69 insertions(+), 28 deletions(-)
 
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index d9e6abb..dac0f95 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 @@ -2600,11 +2600,24 @@ rx_done:
@@ -59,7 +57,7 @@ index d9e6abb..dac0f95 100644
  
  	if (xdp_flush)
  		xdp_do_flush();
-@@ -2812,7 +2825,8 @@ static int mtk_napi_rx(struct napi_struct *napi, int budget)
+@@ -2812,7 +2825,8 @@ static int mtk_napi_rx(struct napi_struc
  	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
  	int rx_done_total = 0;
  
@@ -69,7 +67,7 @@ index d9e6abb..dac0f95 100644
  
  	do {
  		int rx_done;
-@@ -3442,23 +3456,12 @@ static int mtk_rss_init(struct mtk_eth *eth)
+@@ -3442,23 +3456,12 @@ static int mtk_rss_init(struct mtk_eth *
  {
  	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
  	struct mtk_rss_params *rss_params = &eth->rss_params;
@@ -93,7 +91,7 @@ index d9e6abb..dac0f95 100644
  	if (RX_DESC_OFS(eth, 1) == sizeof(struct mtk_rx_dma)) {
  		/* Set RSS rings to PSE modes */
  		for (i = 1; i <= MTK_HW_LRO_RING_NUM; i++) {
-@@ -3782,7 +3785,7 @@ static irqreturn_t mtk_handle_irq_rx(int irq, void *priv)
+@@ -3782,7 +3785,7 @@ static irqreturn_t mtk_handle_irq_rx(int
  	struct mtk_eth *eth = rx_napi->eth;
  	struct mtk_rx_ring *ring = rx_napi->rx_ring;
  
@@ -129,7 +127,7 @@ index d9e6abb..dac0f95 100644
  	if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS)) {
  		for (i = 1; i < MTK_RX_RSS_NUM; i++) {
  			rx_napi = &eth->rx_napi[MTK_RSS_RING(i)];
-@@ -5211,6 +5228,10 @@ static int mtk_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
+@@ -5211,6 +5228,10 @@ static int mtk_get_rxnfc(struct net_devi
  	int ret = -EOPNOTSUPP;
  
  	switch (cmd->cmd) {
@@ -140,7 +138,7 @@ index d9e6abb..dac0f95 100644
  	case ETHTOOL_GRXCLSRLCNT:
  		if (dev->hw_features & NETIF_F_LRO) {
  			struct mtk_mac *mac = netdev_priv(dev);
-@@ -5379,6 +5400,7 @@ static int mtk_set_rxfh(struct net_device *dev,
+@@ -5379,6 +5400,7 @@ static int mtk_set_rxfh(struct net_devic
  	struct mtk_eth *eth = mac->hw;
  	struct mtk_rss_params *rss_params = &eth->rss_params;
  	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
@@ -148,7 +146,7 @@ index d9e6abb..dac0f95 100644
  	int i;
  
  	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS) || !eth->soc->rss_num) {
-@@ -5392,6 +5414,22 @@ static int mtk_set_rxfh(struct net_device *dev,
+@@ -5392,6 +5414,22 @@ static int mtk_set_rxfh(struct net_devic
  		return -EOPNOTSUPP;
  	}
  
@@ -171,7 +169,7 @@ index d9e6abb..dac0f95 100644
  	if (rxfh->key) {
  		memcpy(rss_params->hash_key, rxfh->key,
  		       sizeof(rss_params->hash_key));
-@@ -5401,19 +5439,15 @@ static int mtk_set_rxfh(struct net_device *dev,
+@@ -5401,19 +5439,15 @@ static int mtk_set_rxfh(struct net_devic
  	}
  
  	if (rxfh->indir) {
@@ -194,7 +192,7 @@ index d9e6abb..dac0f95 100644
  	return 0;
  }
  
-@@ -5447,7 +5481,6 @@ static const struct ethtool_ops mtk_ethtool_ops = {
+@@ -5447,7 +5481,6 @@ static const struct ethtool_ops mtk_etht
  	.get_ethtool_stats	= mtk_get_ethtool_stats,
  	.get_pauseparam		= mtk_get_pauseparam,
  	.set_pauseparam		= mtk_set_pauseparam,
@@ -202,7 +200,7 @@ index d9e6abb..dac0f95 100644
  	.get_rxnfc		= mtk_get_rxnfc,
  	.set_rxnfc		= mtk_set_rxnfc,
  	.get_rxfh_key_size	= mtk_get_rxfh_key_size,
-@@ -5841,6 +5874,7 @@ static int mtk_probe(struct platform_device *pdev)
+@@ -5841,6 +5874,7 @@ static int mtk_probe(struct platform_dev
  	spin_lock_init(&eth->tx_irq_lock);
  	spin_lock_init(&eth->rx_irq_lock);
  	spin_lock_init(&eth->dim_lock);
@@ -210,7 +208,7 @@ index d9e6abb..dac0f95 100644
  
  	eth->rx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
  	INIT_WORK(&eth->rx_dim.work, mtk_dim_rx);
-@@ -6346,7 +6380,7 @@ static const struct mtk_soc_data mt7986_data = {
+@@ -6355,7 +6389,7 @@ static const struct mtk_soc_data mt7986_
  		DESC_SIZE(struct mtk_tx_dma_v2),
  		.dma_max_len = MTK_TX_DMA_BUF_LEN_V2,
  		.dma_len_offset = 8,
@@ -219,7 +217,7 @@ index d9e6abb..dac0f95 100644
  		.fq_dma_size = MTK_DMA_SIZE(2K),
  	},
  	.rx = {
-@@ -6384,7 +6418,7 @@ static const struct mtk_soc_data mt7987_data = {
+@@ -6393,7 +6427,7 @@ static const struct mtk_soc_data mt7987_
  		.dma_l4_valid = RX_DMA_L4_VALID_V2,
  		.dma_max_len = MTK_TX_DMA_BUF_LEN_V2,
  		.dma_len_offset = 8,
@@ -228,8 +226,6 @@ index d9e6abb..dac0f95 100644
  	},
  };
  
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.h b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
-index a567327..462e540 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 @@ -1060,6 +1060,12 @@ struct mtk_napi {

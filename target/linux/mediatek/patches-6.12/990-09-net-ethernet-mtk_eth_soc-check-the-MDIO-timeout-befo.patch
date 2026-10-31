@@ -23,11 +23,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  drivers/net/ethernet/mediatek/mtk_eth_soc.c | 8 +++++++-
  1 file changed, 7 insertions(+), 1 deletion(-)
 
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index 2d179f7..3ec4cd5 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -350,9 +350,15 @@ static int mtk_mdio_busy_wait(struct mtk_eth *eth)
+@@ -350,9 +350,15 @@ static int mtk_mdio_busy_wait(struct mtk
  	unsigned long t_start = jiffies;
  
  	while (1) {

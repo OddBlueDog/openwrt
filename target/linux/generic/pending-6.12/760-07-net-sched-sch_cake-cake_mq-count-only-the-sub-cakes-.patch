@@ -40,8 +40,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  net/sched/sch_cake_test.c | 214 +++++++++++++++++++++++++++++++++++++-
  2 files changed, 271 insertions(+), 23 deletions(-)
 
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index 0af18cd..c9eb71a 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
 @@ -203,6 +203,8 @@ struct cake_sched_config {
@@ -106,7 +104,7 @@ index 0af18cd..c9eb71a 100644
  static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
  			struct sk_buff **to_free)
  {
-@@ -1851,6 +1899,9 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+@@ -1851,6 +1899,9 @@ static s32 cake_enqueue(struct sk_buff *
  			b->time_next_packet = now;
  
  		if (!sch->q.qlen) {
@@ -116,7 +114,7 @@ index 0af18cd..c9eb71a 100644
  			if (ktime_before(q->time_next_packet, now)) {
  				q->failsafe_next_packet = now;
  				q->time_next_packet = now;
-@@ -2085,27 +2136,8 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+@@ -2085,27 +2136,8 @@ static struct sk_buff *cake_dequeue(stru
  
  	if (q->config->is_shared && q->rate_ns &&
  	    now - q->last_checked_active >= q->config->sync_time) {
@@ -156,7 +154,7 @@ index 0af18cd..c9eb71a 100644
  }
  
  static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
-@@ -3342,6 +3377,11 @@ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+@@ -3342,6 +3377,11 @@ static int cake_mq_init(struct Qdisc *sc
  			return ret;
  	}
  
@@ -168,8 +166,6 @@ index 0af18cd..c9eb71a 100644
  	ret = mq_init_common(sch, opt, extack, &cake_qdisc_ops);
  	if (ret)
  		return ret;
-diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
-index 7b7f71d..8dd767d 100644
 --- a/net/sched/sch_cake_test.c
 +++ b/net/sched/sch_cake_test.c
 @@ -1,10 +1,13 @@
@@ -189,7 +185,7 @@ index 7b7f71d..8dd767d 100644
  #include <net/net_namespace.h>
  
  static void cake_test_kvfree(void *p)
-@@ -337,6 +340,207 @@ static void cake_test_bulk_quantum(struct kunit *test)
+@@ -337,6 +340,207 @@ static void cake_test_bulk_quantum(struc
  	KUNIT_EXPECT_LE(test, v, ((24414 * quantum_div[12]) >> 16) + 1);
  }
  
@@ -397,7 +393,7 @@ index 7b7f71d..8dd767d 100644
  static int cake_test_init(struct kunit *test)
  {
  	int i;
-@@ -355,6 +559,10 @@ static struct kunit_case cake_test_cases[] = {
+@@ -355,6 +559,10 @@ static struct kunit_case cake_test_cases
  	KUNIT_CASE(cake_test_quantum_one_flow_exact),
  	KUNIT_CASE(cake_test_quantum_shared),
  	KUNIT_CASE(cake_test_bulk_quantum),

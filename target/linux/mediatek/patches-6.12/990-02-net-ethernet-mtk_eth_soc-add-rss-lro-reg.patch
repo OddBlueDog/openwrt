@@ -8,11 +8,9 @@ Subject: [PATCH 2/5] net: ethernet: mtk_eth_soc: add rss lro reg
  drivers/net/ethernet/mediatek/mtk_eth_soc.h | 31 +++++++++++++++------
  2 files changed, 45 insertions(+), 9 deletions(-)
 
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index f11bb53..1a7d64a 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -60,13 +60,18 @@ static const struct mtk_reg_map mtk_reg_map = {
+@@ -60,13 +60,18 @@ static const struct mtk_reg_map mtk_reg_
  		.rx_ptr		= 0x0900,
  		.rx_cnt_cfg	= 0x0904,
  		.pcrx_ptr	= 0x0908,
@@ -31,7 +29,7 @@ index f11bb53..1a7d64a 100644
  	},
  	.qdma = {
  		.qtx_cfg	= 0x1800,
-@@ -124,6 +129,7 @@ static const struct mtk_reg_map mt7986_reg_map = {
+@@ -124,6 +129,7 @@ static const struct mtk_reg_map mt7986_r
  	.tx_irq_mask		= 0x461c,
  	.tx_irq_status		= 0x4618,
  	.pdma = {
@@ -39,7 +37,7 @@ index f11bb53..1a7d64a 100644
  		.rx_ptr		= 0x4100,
  		.rx_cnt_cfg	= 0x4104,
  		.pcrx_ptr	= 0x4108,
-@@ -134,6 +140,12 @@ static const struct mtk_reg_map mt7986_reg_map = {
+@@ -134,6 +140,12 @@ static const struct mtk_reg_map mt7986_r
  		.irq_mask	= 0x4228,
  		.adma_rx_dbg0	= 0x4238,
  		.int_grp	= 0x4250,
@@ -52,7 +50,7 @@ index f11bb53..1a7d64a 100644
  	},
  	.qdma = {
  		.qtx_cfg	= 0x4400,
-@@ -182,10 +194,21 @@ static const struct mtk_reg_map mt7988_reg_map = {
+@@ -182,10 +194,21 @@ static const struct mtk_reg_map mt7988_r
  		.glo_cfg	= 0x6a04,
  		.rst_idx	= 0x6a08,
  		.delay_irq	= 0x6a0c,
@@ -74,8 +72,6 @@ index f11bb53..1a7d64a 100644
  	},
  	.qdma = {
  		.qtx_cfg	= 0x4400,
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.h b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
-index 15b5dd6..92cdc97 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
 @@ -1216,16 +1216,29 @@ struct mtk_reg_map {

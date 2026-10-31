@@ -18,8 +18,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  net/sched/sch_cake.c | 15 ++++++++++++---
  1 file changed, 12 insertions(+), 3 deletions(-)
 
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index 73fc285..5ee4558 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
 @@ -264,6 +264,7 @@ struct cake_sched_data {
@@ -30,7 +28,7 @@ index 73fc285..5ee4558 100644
  	u32		active_queues;
  };
  
-@@ -2054,7 +2055,7 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+@@ -2054,7 +2055,7 @@ static struct sk_buff *cake_dequeue(stru
  		u32 num_active_qs = 1;
  		unsigned int ntx;
  
@@ -39,7 +37,7 @@ index 73fc285..5ee4558 100644
  			other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
  			other_priv = qdisc_priv(other_sch);
  
-@@ -2071,7 +2072,13 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+@@ -2071,7 +2072,13 @@ static struct sk_buff *cake_dequeue(stru
  		if (num_active_qs > 1)
  			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
  
@@ -64,7 +62,7 @@ index 73fc285..5ee4558 100644
  
  	/* collect delay stats */
  	delay = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
-@@ -2647,6 +2655,7 @@ static void cake_reconfigure(struct Qdisc *sch)
+@@ -2647,6 +2655,7 @@ static void cake_reconfigure(struct Qdis
  	struct cake_sched_config *q = qd->config;
  
  	cake_configure_rates(sch, qd->config->rate_bps, false);

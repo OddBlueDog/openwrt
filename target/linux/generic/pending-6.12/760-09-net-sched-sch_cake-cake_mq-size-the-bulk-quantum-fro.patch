@@ -24,8 +24,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  net/sched/sch_cake_test.c | 45 +++++++++++++++++++++++++++++++++
  2 files changed, 83 insertions(+), 14 deletions(-)
 
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index f0afea0..d497066 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
 @@ -163,6 +163,8 @@ struct cake_tin_data {
@@ -37,7 +35,7 @@ index f0afea0..d497066 100644
  
  	struct cobalt_params cparams;
  	u32	drop_overlimit;
-@@ -842,25 +844,14 @@ static u16 cake_get_flow_quantum(struct cake_tin_data *q,
+@@ -842,25 +844,14 @@ static u16 cake_get_flow_quantum(struct
  	return cake_host_share(q, flow, flow_mode, q->flow_quantum);
  }
  
@@ -66,7 +64,7 @@ index f0afea0..d497066 100644
  }
  
  /* cake_mq: what a flow in the bulk rotation adds to its sub-cake's bid for
-@@ -3093,6 +3084,36 @@ static int cake_config_diffserv3(struct Qdisc *sch, u64 rate, u32 mtu)
+@@ -3093,6 +3084,36 @@ static int cake_config_diffserv3(struct
  	return 0;
  }
  
@@ -103,7 +101,7 @@ index f0afea0..d497066 100644
  static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
  {
  	u32 mtu = likely(rate_adjust) ? 0 : psched_mtu(qdisc_dev(sch));
-@@ -3123,6 +3144,9 @@ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+@@ -3123,6 +3144,9 @@ static void cake_configure_rates(struct
  		break;
  	}
  
@@ -113,11 +111,9 @@ index f0afea0..d497066 100644
  	if (!rate_adjust) {
  		for (c = qd->tin_cnt; c < CAKE_MAX_TINS; c++) {
  			cake_clear_tin(sch, c);
-diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
-index 9ce4537..fcfaa88 100644
 --- a/net/sched/sch_cake_test.c
 +++ b/net/sched/sch_cake_test.c
-@@ -316,8 +316,10 @@ static u16 cake_test_bulk(struct kunit *test, u64 rate_bps, u16 flags, u16 n)
+@@ -316,8 +316,10 @@ static u16 cake_test_bulk(struct kunit *
  	qd->config = cfg;
  	cfg->flow_mode = CAKE_FLOW_TRIPLE;
  	cfg->rate_flags = flags;
@@ -128,7 +124,7 @@ index 9ce4537..fcfaa88 100644
  	return cake_get_bulk_quantum(qd, b, flow);
  }
  
-@@ -340,6 +342,48 @@ static void cake_test_bulk_quantum(struct kunit *test)
+@@ -340,6 +342,48 @@ static void cake_test_bulk_quantum(struc
  	KUNIT_EXPECT_LE(test, v, ((24414 * quantum_div[12]) >> 16) + 1);
  }
  
@@ -177,7 +173,7 @@ index 9ce4537..fcfaa88 100644
  /* cake_mq on a device with 16 tx queues, not registered. Each queue's
   * sub-cake is a Qdisc with only what the count reads: its queue length and
   * when it last sent a packet.
-@@ -1370,6 +1414,7 @@ static struct kunit_case cake_test_cases[] = {
+@@ -1370,6 +1414,7 @@ static struct kunit_case cake_test_cases
  	KUNIT_CASE(cake_test_quantum_one_flow_exact),
  	KUNIT_CASE(cake_test_quantum_shared),
  	KUNIT_CASE(cake_test_bulk_quantum),

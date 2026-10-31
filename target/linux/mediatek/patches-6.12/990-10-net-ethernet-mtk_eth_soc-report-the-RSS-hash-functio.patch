@@ -16,11 +16,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  drivers/net/ethernet/mediatek/mtk_eth_soc.c | 3 +--
  1 file changed, 1 insertion(+), 2 deletions(-)
 
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index 3ec4cd5..6060cfe 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -5424,8 +5424,7 @@ static int mtk_get_rxfh(struct net_device *dev, struct ethtool_rxfh_param *rxfh)
+@@ -5424,8 +5424,7 @@ static int mtk_get_rxfh(struct net_devic
  	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_RSS) || !eth->soc->rss_num)
  		return -EOPNOTSUPP;
  

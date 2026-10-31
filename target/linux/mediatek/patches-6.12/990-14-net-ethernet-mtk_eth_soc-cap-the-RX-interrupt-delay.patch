@@ -15,7 +15,7 @@ for a little more CPU.
 ---
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -4311,16 +4311,30 @@
+@@ -4311,16 +4311,30 @@ err_disable_clks:
  	return ret;
  }
  

@@ -14,11 +14,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  net/sched/sch_cake.c | 6 ++++++
  1 file changed, 6 insertions(+)
 
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index 5ee4558..25c70e5 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
-@@ -691,6 +691,12 @@ static u16 cake_get_flow_quantum(struct cake_tin_data *q,
+@@ -691,6 +691,12 @@ static u16 cake_get_flow_quantum(struct
  		host_load = max(host_load,
  				q->hosts[flow->dsthost].dsthost_bulk_flow_count);
  

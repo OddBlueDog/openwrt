@@ -21,11 +21,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  net/sched/sch_cake_test.c | 6 ++++++
  2 files changed, 12 insertions(+)
 
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index d497066..ab4da23 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
-@@ -953,6 +953,12 @@ static u32 cake_hash(struct cake_tin_data *q, const struct sk_buff *skb,
+@@ -953,6 +953,12 @@ static u32 cake_hash(struct cake_tin_dat
  	if ((!hash_flows || (use_skbhash && !nat_enabled)) && !hosts_now)
  		goto skip_hash;
  
@@ -38,11 +36,9 @@ index d497066..ab4da23 100644
  	skb_flow_dissect_flow_keys(skb, &keys,
  				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
  
-diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
-index fcfaa88..36809ec 100644
 --- a/net/sched/sch_cake_test.c
 +++ b/net/sched/sch_cake_test.c
-@@ -170,6 +170,12 @@ static void cake_test_check_flow(struct kunit *test, struct cake_tin_data *q,
+@@ -170,6 +170,12 @@ static void cake_test_check_flow(struct
  static const int cake_test_modes[] = {
  	CAKE_FLOW_SRC_IP, CAKE_FLOW_DST_IP, CAKE_FLOW_HOSTS, CAKE_FLOW_FLOWS,
  	CAKE_FLOW_DUAL_SRC, CAKE_FLOW_DUAL_DST, CAKE_FLOW_TRIPLE,

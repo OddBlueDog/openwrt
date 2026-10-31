@@ -23,7 +23,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
 ---
 --- a/drivers/net/Kconfig
 +++ b/drivers/net/Kconfig
-@@ -161,6 +161,15 @@
+@@ -161,6 +161,15 @@ config IFB
  	  'ifb1' etc.
  	  Look at the iproute2 documentation directory for usage etc
  
@@ -41,7 +41,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  config MACVLAN
 --- a/drivers/net/ifb.c
 +++ b/drivers/net/ifb.c
-@@ -86,6 +86,27 @@
+@@ -86,6 +86,27 @@ static void ifb_update_q_stats(struct if
  	u64_stats_update_end(&stats->sync);
  }
  
@@ -69,7 +69,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  static void ifb_ri_tasklet(struct tasklet_struct *t)
  {
  	struct ifb_q_private *txp = from_tasklet(txp, t, ifb_tasklet);
-@@ -128,6 +149,8 @@
+@@ -128,6 +149,8 @@ static void ifb_ri_tasklet(struct taskle
  			dev_queue_xmit(skb);
  		} else {
  			skb_pull_rcsum(skb, skb->mac_len);
@@ -78,7 +78,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  			netif_receive_skb(skb);
  		}
  	}
-@@ -456,3 +479,7 @@
+@@ -456,3 +479,7 @@ MODULE_LICENSE("GPL");
  MODULE_DESCRIPTION("Intermediate Functional Block (ifb) netdevice driver for sharing of resources and ingress packet queuing");
  MODULE_AUTHOR("Jamal Hadi Salim");
  MODULE_ALIAS_RTNL_LINK("ifb");

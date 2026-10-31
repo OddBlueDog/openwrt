@@ -28,7 +28,7 @@ is kept as before, between bursts, until the sub-cake is idle.
 ---
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
-@@ -2551,6 +2551,12 @@
+@@ -2551,6 +2551,12 @@ static void cake_mq_retire_tin(struct ca
   * sub-cake is idle and might not dequeue again for a long time: it retires
   * its rotation then (the watchdog wakes it), so its flows leave the host
   * loads the busy sub-cakes share out by.
@@ -41,7 +41,7 @@ is kept as before, between bursts, until the sub-cake is idle.
   */
  static void cake_mq_drained(struct cake_sched_data *q, ktime_t now)
  {
-@@ -2558,8 +2564,16 @@
+@@ -2558,8 +2564,16 @@ static void cake_mq_drained(struct cake_
  	bool bulk = false;
  	u16 tin;
  
@@ -62,12 +62,10 @@ is kept as before, between bursts, until the sub-cake is idle.
  	if (ktime_to_ns(now) < idle_at) {
 --- a/net/sched/sch_cake_test.c
 +++ b/net/sched/sch_cake_test.c
-@@ -1366,6 +1366,81 @@
- 	for (i = 0; i < 2 * CAKE_QUEUES; i++)
- 		KUNIT_ASSERT_EQ(test, atomic_read(&mq->cfg->mq_hosts[i]), 0);
+@@ -1368,6 +1368,81 @@ static void cake_test_mq_drained(struct
  	KUNIT_EXPECT_FALSE(test, hrtimer_is_queued(&q->watchdog.timer));
-+}
-+
+ }
+ 
 +/* A packet from LAN host @host, port @sport, into tin @b as a new flow,
 + * already dequeued: in the sparse rotation, empty, its quantum less @len
 + */
@@ -141,10 +139,12 @@ is kept as before, between bursts, until the sub-cake is idle.
 +	qdisc_watchdog_cancel(&q->watchdog);
 +	for (i = 0; i < CAKE_QUEUES; i++)
 +		KUNIT_ASSERT_LE(test, atomic_read(&mq->cfg->mq_hosts[i]), 1);
- }
- 
++}
++
  /* Any mix of flows going bulk and empty in four sub-cakes, hosts spread
-@@ -1669,6 +1744,7 @@
+  * over them: the table always holds what they count, and each tin's
+  * weight is its flows'
+@@ -1669,6 +1744,7 @@ static struct kunit_case cake_test_cases
  	KUNIT_CASE(cake_test_mq_host_retag),
  	KUNIT_CASE(cake_test_mq_retire_on_idle),
  	KUNIT_CASE(cake_test_mq_drained),

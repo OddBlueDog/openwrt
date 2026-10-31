@@ -24,8 +24,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 381 insertions(+)
  create mode 100644 net/sched/sch_cake_test.c
 
-diff --git a/net/sched/Kconfig b/net/sched/Kconfig
-index 8180d0c..4f0b7f5 100644
 --- a/net/sched/Kconfig
 +++ b/net/sched/Kconfig
 @@ -296,6 +296,16 @@ config NET_SCH_CAKE
@@ -45,8 +43,6 @@ index 8180d0c..4f0b7f5 100644
  config NET_SCH_FQ
  	tristate "Fair Queue"
  	help
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index ac896fd..0af18cd 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
 @@ -3452,3 +3452,7 @@ MODULE_AUTHOR("Jonathan Morton");
@@ -57,9 +53,6 @@ index ac896fd..0af18cd 100644
 +#if IS_ENABLED(CONFIG_NET_SCH_CAKE_KUNIT_TEST)
 +#include "sch_cake_test.c"
 +#endif
-diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
-new file mode 100644
-index 0000000..7b7f71d
 --- /dev/null
 +++ b/net/sched/sch_cake_test.c
 @@ -0,0 +1,367 @@

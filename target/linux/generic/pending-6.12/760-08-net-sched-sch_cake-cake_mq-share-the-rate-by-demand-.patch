@@ -96,8 +96,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  net/sched/sch_cake_test.c | 910 ++++++++++++++++++++++++++++++++++++--
  2 files changed, 1415 insertions(+), 118 deletions(-)
 
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index c9eb71a..f0afea0 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
 @@ -135,6 +135,7 @@ struct cake_flow {
@@ -326,7 +324,7 @@ index c9eb71a..f0afea0 100644
  
  	/* quantum_div[1] stands for 65536, which doesn't fit in a u16: a host
  	 * with one bulk flow gives it the whole quantum, no dither needed.
-@@ -738,6 +863,21 @@ static u16 cake_get_bulk_quantum(struct cake_sched_data *qd,
+@@ -738,6 +863,21 @@ static u16 cake_get_bulk_quantum(struct
  	return cake_host_share(b, flow, qd->config->flow_mode, quantum);
  }
  
@@ -382,7 +380,7 @@ index c9eb71a..f0afea0 100644
  			q->hosts[outer_hash + k].dsthost_tag = dsthost_hash;
  found_dst:
  			dsthost_idx = outer_hash + k;
-@@ -1626,6 +1779,10 @@ static int cake_advance_shaper(struct cake_sched_data *q,
+@@ -1626,6 +1779,10 @@ static int cake_advance_shaper(struct ca
  			q->failsafe_next_packet = \
  				ktime_add_ns(q->failsafe_next_packet,
  					     failsafe_dur);
@@ -393,7 +391,7 @@ index c9eb71a..f0afea0 100644
  	}
  	return len;
  }
-@@ -1841,19 +1998,147 @@ static void cake_mq_mark_used(struct Qdisc *sch, struct cake_sched_data *q)
+@@ -1841,19 +1998,147 @@ static void cake_mq_mark_used(struct Qdi
  		set_bit(ntx, used);
  }
  
@@ -544,7 +542,7 @@ index c9eb71a..f0afea0 100644
  		other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
  		other_priv = qdisc_priv(other_sch);
  
-@@ -1863,10 +2148,63 @@ static u32 cake_mq_active_queues(struct Qdisc *sch, struct cake_sched_data *q)
+@@ -1863,10 +2148,63 @@ static u32 cake_mq_active_queues(struct
  		other_qlen = READ_ONCE(other_sch->q.qlen);
  		other_last_active = READ_ONCE(other_priv->last_active);
  
@@ -611,7 +609,7 @@ index c9eb71a..f0afea0 100644
  }
  
  static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
-@@ -2122,6 +2460,99 @@ static void cake_clear_tin(struct Qdisc *sch, u16 tin)
+@@ -2122,6 +2460,99 @@ static void cake_clear_tin(struct Qdisc
  			kfree_skb(skb);
  }
  
@@ -711,13 +709,15 @@ index c9eb71a..f0afea0 100644
  static struct sk_buff *cake_dequeue(struct Qdisc *sch)
  {
  	struct cake_sched_data *q = qdisc_priv(sch);
-@@ -2136,26 +2567,35 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+@@ -2136,26 +2567,35 @@ static struct sk_buff *cake_dequeue(stru
  
  	if (q->config->is_shared && q->rate_ns &&
  	    now - q->last_checked_active >= q->config->sync_time) {
 -		u32 num_active_qs = cake_mq_active_queues(sch, q);
 -		u64 new_rate = q->config->rate_bps;
--
++		struct cake_mq_peers peers;
++		u64 new_rate;
+ 
 -		if (num_active_qs > 1)
 -			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
 -
@@ -725,9 +725,6 @@ index c9eb71a..f0afea0 100644
 -		 * tin's rate (a division and a shift loop per tin) when it does.
 -		 */
 -		if (new_rate != q->synced_rate) {
-+		struct cake_mq_peers peers;
-+		u64 new_rate;
-+
 +		cake_mq_publish(q, now);
 +		cake_mq_read_peers(sch, q, now, &peers);
 +		new_rate = cake_mq_share(q->config->rate_bps, q->mq_weight,
@@ -846,7 +843,7 @@ index c9eb71a..f0afea0 100644
  	} else if (!sch->q.qlen) {
  		int i;
  
-@@ -2402,8 +2814,11 @@ static void cake_reset(struct Qdisc *sch)
+@@ -2402,8 +2814,11 @@ static void cake_reset(struct Qdisc *sch
  	if (!q->tins)
  		return;
  
@@ -859,7 +856,7 @@ index c9eb71a..f0afea0 100644
  }
  
  static const struct nla_policy cake_policy[TCA_CAKE_MAX + 1] = {
-@@ -2711,6 +3126,8 @@ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+@@ -2711,6 +3126,8 @@ static void cake_configure_rates(struct
  	if (!rate_adjust) {
  		for (c = qd->tin_cnt; c < CAKE_MAX_TINS; c++) {
  			cake_clear_tin(sch, c);
@@ -868,7 +865,7 @@ index c9eb71a..f0afea0 100644
  			qd->tins[c].cparams.mtu_time = qd->tins[ft].cparams.mtu_time;
  		}
  	}
-@@ -2995,11 +3412,23 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+@@ -2995,11 +3412,23 @@ static int cake_init(struct Qdisc *sch,
  	return 0;
  }
  
@@ -941,7 +938,7 @@ index c9eb71a..f0afea0 100644
  }
  
  static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
-@@ -3381,6 +3846,10 @@ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+@@ -3381,6 +3846,10 @@ static int cake_mq_init(struct Qdisc *sc
  	priv->cake_config.used_qs = bitmap_zalloc(dev->num_tx_queues, GFP_KERNEL);
  	if (!priv->cake_config.used_qs)
  		return -ENOMEM;
@@ -952,8 +949,6 @@ index c9eb71a..f0afea0 100644
  
  	ret = mq_init_common(sch, opt, extack, &cake_qdisc_ops);
  	if (ret)
-diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
-index 8dd767d..9ce4537 100644
 --- a/net/sched/sch_cake_test.c
 +++ b/net/sched/sch_cake_test.c
 @@ -1,8 +1,8 @@
@@ -969,7 +964,7 @@ index 8dd767d..9ce4537 100644
   */
  #include <kunit/test.h>
  #include <linux/etherdevice.h>
-@@ -400,27 +400,38 @@ static void cake_test_mq_enqueue(struct cake_test_mq *mq, int i)
+@@ -400,27 +400,38 @@ static void cake_test_mq_enqueue(struct
  	mq->sch[i]->q.qlen++;
  }
  
@@ -1018,7 +1013,7 @@ index 8dd767d..9ce4537 100644
  	return n;
  }
  
-@@ -445,36 +456,44 @@ static void cake_test_mq_marks_its_queue(struct kunit *test)
+@@ -445,36 +456,44 @@ static void cake_test_mq_marks_its_queue
  static void cake_test_mq_count_back_from_idle(struct kunit *test)
  {
  	struct cake_test_mq *mq = cake_test_mq_alloc(test);
@@ -1078,7 +1073,7 @@ index 8dd767d..9ce4537 100644
  }
  
  /* Only the real tx queues count, as the device changes how many it has */
-@@ -486,14 +505,14 @@ static void cake_test_mq_count_real_queues(struct kunit *test)
+@@ -486,14 +505,14 @@ static void cake_test_mq_count_real_queu
  	for (i = 10; i < CAKE_TEST_TXQS; i++)
  		cake_test_mq_enqueue(mq, i);
  
@@ -1097,7 +1092,7 @@ index 8dd767d..9ce4537 100644
  }
  
  /* Any mix of never used, idle, queued and just-sent sub-cakes, and of real
-@@ -508,7 +527,7 @@ static void cake_test_mq_count_matches_all(struct kunit *test)
+@@ -508,7 +527,7 @@ static void cake_test_mq_count_matches_a
  	prandom_seed_state(&rnd, 760);
  	for (round = 0; round < 2000; round++) {
  		int self = prandom_u32_state(&rnd) % CAKE_TEST_TXQS;
@@ -1106,7 +1101,7 @@ index 8dd767d..9ce4537 100644
  
  		bitmap_zero(mq->cfg->used_qs, CAKE_TEST_TXQS);
  		mq->dev->real_num_tx_queues = 1 + prandom_u32_state(&rnd) % CAKE_TEST_TXQS;
-@@ -517,28 +536,820 @@ static void cake_test_mq_count_matches_all(struct kunit *test)
+@@ -517,28 +536,820 @@ static void cake_test_mq_count_matches_a
  
  			mq->sch[i]->q.qlen = 0;
  			q->last_active = 0;
@@ -1129,14 +1124,14 @@ index 8dd767d..9ce4537 100644
  				break;
 -			case 3:	/* sent since @self last counted */
 +			case 3:	/* sent within CAKE_MQ_TAU */
++				cake_test_mq_enqueue(mq, i);
++				mq->sch[i]->q.qlen = 0;
++				q->last_active = now - prandom_u32_state(&rnd) % CAKE_MQ_TAU;
++				break;
++			case 4:	/* sent, stamped on another CPU after @now */
  				cake_test_mq_enqueue(mq, i);
  				mq->sch[i]->q.qlen = 0;
 -				q->last_active = since + 1 + prandom_u32_state(&rnd) % 1000;
-+				q->last_active = now - prandom_u32_state(&rnd) % CAKE_MQ_TAU;
- 				break;
-+			case 4:	/* sent, stamped on another CPU after @now */
-+				cake_test_mq_enqueue(mq, i);
-+				mq->sch[i]->q.qlen = 0;
 +				q->last_active = now + 1 + prandom_u32_state(&rnd) % 1000;
 +				break;
 +			}
@@ -1194,7 +1189,7 @@ index 8dd767d..9ce4537 100644
 +					continue;
 +				p.bids += cases[c][j];
 +				p.sat_bids += cases[c][j];
- 			}
++			}
 +			share = cake_mq_share(CAKE_TEST_RATE, cases[c][i], 0, &p);
 +			want = div64_u64(CAKE_TEST_RATE * cases[c][i], total);
 +			KUNIT_EXPECT_LE(test, share, want);
@@ -1481,10 +1476,12 @@ index 8dd767d..9ce4537 100644
 +				fixed[i] = true;
 +				left -= demand[i];
 +				again = true;
-+				break;
-+			}
-+		}
-+	}
+ 				break;
+ 			}
+ 		}
+-		KUNIT_ASSERT_EQ(test, cake_test_mq_count(mq, self),
+-				cake_test_mq_count_all(mq, self));
+ 	}
 +	for (i = 0; i < n; i++)
 +		if (!demand[i])
 +			want[i] = 0;
@@ -1919,12 +1916,10 @@ index 8dd767d..9ce4537 100644
 +		} else {
 +			flow = list_first_entry(&b->old_flows, struct cake_flow, flowchain);
 +			cake_flow_emptied(h->q[s], b, flow, 0);
- 		}
--		KUNIT_ASSERT_EQ(test, cake_test_mq_count(mq, self),
--				cake_test_mq_count_all(mq, self));
++		}
 +		if (round % 100 == 0)
 +			cake_test_hosts_check(test, h);
- 	}
++	}
 +	cake_test_hosts_check(test, h);
 +	for (round = 0; round < 4; round++)
 +		cake_mq_retire_tin(h->q[round], &h->q[round]->tins[0], 0);
@@ -1934,7 +1929,7 @@ index 8dd767d..9ce4537 100644
  }
  
  static int cake_test_init(struct kunit *test)
-@@ -563,6 +1374,23 @@ static struct kunit_case cake_test_cases[] = {
+@@ -563,6 +1374,23 @@ static struct kunit_case cake_test_cases
  	KUNIT_CASE(cake_test_mq_count_back_from_idle),
  	KUNIT_CASE(cake_test_mq_count_real_queues),
  	KUNIT_CASE(cake_test_mq_count_matches_all),

@@ -123,7 +123,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  struct flow_offload {
 --- a/net/bridge/br_fdb.c
 +++ b/net/bridge/br_fdb.c
-@@ -273,6 +273,7 @@ struct net_bridge_fdb_entry *br_fdb_find_rcu(struct net_bridge *br,
+@@ -273,6 +273,7 @@ struct net_bridge_fdb_entry *br_fdb_find
  {
  	return fdb_find_rcu(&br->fdb_hash_tbl, addr, vid);
  }
@@ -162,7 +162,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  	tristate
 --- a/net/bridge/netfilter/Makefile
 +++ b/net/bridge/netfilter/Makefile
-@@ -9,6 +9,9 @@ obj-$(CONFIG_NFT_BRIDGE_REJECT)  += nft_reject_bridge.o
+@@ -9,6 +9,9 @@ obj-$(CONFIG_NFT_BRIDGE_REJECT)  += nft_
  # connection tracking
  obj-$(CONFIG_NF_CONNTRACK_BRIDGE) += nf_conntrack_bridge.o
  
@@ -2081,7 +2081,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
 +kunit_test_suite(nf_flow_bridge_test_suite);
 --- a/net/netfilter/nft_flow_offload.c
 +++ b/net/netfilter/nft_flow_offload.c
-@@ -328,6 +328,9 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+@@ -329,6 +329,9 @@ static void nft_flow_offload_eval(const
  
  	switch (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum) {
  	case IPPROTO_TCP:
@@ -2091,7 +2091,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
  					  sizeof(_tcph), &_tcph);
  		if (unlikely(!tcph || tcph->fin || tcph->rst ||
-@@ -360,18 +363,28 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+@@ -361,18 +364,28 @@ static void nft_flow_offload_eval(const
  	if (!nf_ct_is_confirmed(ct))
  		goto out;
  
@@ -2105,12 +2105,6 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  	dir = CTINFO2DIR(ctinfo);
 -	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
 -		goto err_flow_route;
--
--	flow = flow_offload_alloc(ct);
--	if (!flow)
--		goto err_flow_alloc;
--
--	flow_offload_route_init(flow, &route);
 +	if (flowtable->type->flow_alloc) {
 +		/* the bridge's: the ports and addresses of this packet */
 +		flow = flowtable->type->flow_alloc(ct, pkt, dir);
@@ -2123,13 +2117,18 @@ Signed-off-by: MilkFlint <milkflint@localhost>
 +		flow = flow_offload_alloc(ct);
 +		if (!flow)
 +			goto err_flow_alloc;
-+
+ 
+-	flow = flow_offload_alloc(ct);
+-	if (!flow)
+-		goto err_flow_alloc;
+-
+-	flow_offload_route_init(flow, &route);
 +		flow_offload_route_init(flow, &route);
 +	}
  	if (tcph)
  		flow_offload_ct_tcp(ct);
  
-@@ -398,9 +411,11 @@ static int nft_flow_offload_validate(const struct nft_ctx *ctx,
+@@ -399,9 +412,11 @@ static int nft_flow_offload_validate(con
  {
  	unsigned int hook_mask = (1 << NF_INET_FORWARD);
  

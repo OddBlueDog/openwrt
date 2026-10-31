@@ -24,11 +24,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  net/sched/sch_cake.c | 41 ++++++++++++++++++++++++++++++++++-------
  1 file changed, 34 insertions(+), 7 deletions(-)
 
-diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
-index 25c70e5..44b1386 100644
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
-@@ -677,9 +677,9 @@ static void cake_inc_dsthost_bulk_flow_count(struct cake_tin_data *q,
+@@ -677,9 +677,9 @@ static void cake_inc_dsthost_bulk_flow_c
  		q->hosts[flow->dsthost].dsthost_bulk_flow_count++;
  }
  
@@ -41,7 +39,7 @@ index 25c70e5..44b1386 100644
  {
  	u16 host_load = 1;
  
-@@ -695,13 +695,40 @@ static u16 cake_get_flow_quantum(struct cake_tin_data *q,
+@@ -695,13 +695,40 @@ static u16 cake_get_flow_quantum(struct
  	 * with one bulk flow gives it the whole quantum, no dither needed.
  	 */
  	if (host_load == 1)

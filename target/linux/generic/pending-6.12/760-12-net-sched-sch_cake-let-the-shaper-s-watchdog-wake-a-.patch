@@ -34,12 +34,10 @@ Signed-off-by: MilkFlint <milkflint@localhost>
 ---
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
-@@ -2202,6 +2202,26 @@
- 	if (!q->config->is_shared)
- 		return next;
+@@ -2204,6 +2204,26 @@ static u64 cake_mq_wake_by(struct cake_s
  	return min_t(u64, next, ktime_to_ns(now) + CAKE_MQ_TAU);
-+}
-+
+ }
+ 
 +/* How late the shaper's watchdog may wake, in microseconds (hrtimer slack).
 + * A shaper held back for each packet in turn takes a timer interrupt and a
 + * qdisc run per packet: cake_mq's sub-cakes, each at a share of the rate,
@@ -58,10 +56,12 @@ Signed-off-by: MilkFlint <milkflint@localhost>
 +{
 +	qdisc_watchdog_schedule_range_ns(&q->watchdog, expires,
 +					 (u64)READ_ONCE(wake_slack_us) * NSEC_PER_USEC);
- }
- 
++}
++
  static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
-@@ -2247,7 +2267,7 @@
+ 			struct sk_buff **to_free)
+ {
+@@ -2247,7 +2267,7 @@ static s32 cake_enqueue(struct sk_buff *
  					    ktime_to_ns(
  						   q->failsafe_next_packet));
  				sch->qstats.overlimits++;
@@ -70,7 +70,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  			}
  		}
  	}
-@@ -2603,7 +2623,7 @@
+@@ -2603,7 +2623,7 @@ begin:
  		sch->qstats.overlimits++;
  		if (q->config->is_shared)
  			q->mq_held_at = ktime_to_ns(now);
@@ -79,7 +79,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  		return NULL;
  	}
  
-@@ -2780,7 +2800,7 @@
+@@ -2780,7 +2800,7 @@ retry:
  
  		if (q->config->is_shared)
  			q->mq_held_at = ktime_to_ns(now);
@@ -90,11 +90,10 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  
 --- a/net/sched/sch_cake_test.c
 +++ b/net/sched/sch_cake_test.c
-@@ -1505,11 +1505,125 @@
- 	}
+@@ -1506,10 +1506,124 @@ static void cake_test_nat_conntrack(stru
  }
  #endif
-+
+ 
 +/* The watchdog wakes no earlier than the shaper's next packet and at most
 + * the slack after it: an hrtimer set for that range
 + */
@@ -161,7 +160,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
 +		while (sent < n && !(ktime_after(q->time_next_packet, now) &&
 +				     ktime_after(q->failsafe_next_packet, now))) {
 +			s64 ahead = ktime_to_ns(q->time_next_packet) - ktime_to_ns(now);
- 
++
 +			r.early = max(r.early, ahead);
 +			r.late = max(r.late, -ahead);
 +			cake_advance_shaper(q, b, skb, now, false);
@@ -216,7 +215,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  	/* as cake_init() fills it in, for a module with no qdisc yet */
  	quantum_div[0] = ~0;
  	for (i = 1; i <= CAKE_QUEUES; i++)
-@@ -1517,6 +1631,11 @@
+@@ -1517,6 +1631,11 @@ static int cake_test_init(struct kunit *
  	return 0;
  }
  
@@ -228,7 +227,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  static struct kunit_case cake_test_cases[] = {
  	KUNIT_CASE(cake_test_hash_matches_eager),
  	KUNIT_CASE(cake_test_hash_reallocates_idle_flow),
-@@ -1528,6 +1647,8 @@
+@@ -1528,6 +1647,8 @@ static struct kunit_case cake_test_cases
  #if IS_ENABLED(CONFIG_NF_CONNTRACK)
  	KUNIT_CASE(cake_test_nat_conntrack),
  #endif
@@ -237,7 +236,7 @@ Signed-off-by: MilkFlint <milkflint@localhost>
  	KUNIT_CASE(cake_test_mq_marks_its_queue),
  	KUNIT_CASE(cake_test_mq_count_back_from_idle),
  	KUNIT_CASE(cake_test_mq_count_real_queues),
-@@ -1555,6 +1676,7 @@
+@@ -1555,6 +1676,7 @@ static struct kunit_case cake_test_cases
  static struct kunit_suite cake_test_suite = {
  	.name = "sch_cake",
  	.init = cake_test_init,

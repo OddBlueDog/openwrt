@@ -21,7 +21,7 @@ limit) and TOS (traffic class) and a good IPv4 header checksum.
 ---
 --- a/drivers/net/ifb.c
 +++ b/drivers/net/ifb.c
-@@ -310,8 +310,15 @@
+@@ -310,8 +310,15 @@ static const struct ethtool_ops ifb_etht
  	.get_ethtool_stats	= ifb_get_ethtool_stats,
  };
  
@@ -58,7 +58,7 @@ limit) and TOS (traffic class) and a good IPv4 header checksum.
  
  /* the tests' packets; anything else on lo is left alone */
  #define IFB_TEST_MARK	0x1fb0cafe
-@@ -146,11 +152,167 @@
+@@ -146,11 +152,167 @@ static void ifb_test_drop(struct kunit *
  	KUNIT_EXPECT_EQ(test, h->seen, 1);
  }
  

@@ -32,12 +32,10 @@ Tested by ifb's KUnit cases (previous patch).
  
  /* Keeps track of mac header offset relative to skb->head.
   * It is useful for TSO of Tunneling protocol. e.g. GRE.
-@@ -104,6 +107,48 @@
- 	skb->mac_header = mac_offset;
- 	skb->network_header = skb->mac_header + mac_len;
+@@ -106,4 +109,46 @@ static inline void skb_gso_error_unwind(
  	skb->mac_len = mac_len;
-+}
-+
+ }
+ 
 +/* A fraglist GSO batch's members keep the network headers they arrived
 + * with, and GRO only joined packets whose TTL (hop limit) and TOS (traffic
 + * class) were the same. What forwarding changed on the head since (the TTL
@@ -78,12 +76,12 @@ Tested by ifb's KUnit cases (previous patch).
 +	/* version, traffic class and flow label */
 +	*(__be32 *)iph2 = *(const __be32 *)iph;
 +	iph2->hop_limit = iph->hop_limit;
- }
- 
++}
++
  #endif /* _NET_GSO_H */
 --- a/net/ipv4/tcp_offload.c
 +++ b/net/ipv4/tcp_offload.c
-@@ -67,7 +67,8 @@
+@@ -67,7 +67,8 @@ static struct sk_buff *__tcpv4_gso_segme
  	iph2 = ip_hdr(seg->next);
  
  	if (!(*(const u32 *)&th->source ^ *(const u32 *)&th2->source) &&
@@ -93,7 +91,7 @@ Tested by ifb's KUnit cases (previous patch).
  		return segs;
  
  	while ((seg = seg->next)) {
-@@ -80,6 +81,7 @@
+@@ -80,6 +81,7 @@ static struct sk_buff *__tcpv4_gso_segme
  		__tcpv4_gso_segment_csum(seg,
  					 &iph2->daddr, iph->daddr,
  					 &th2->dest, th->dest);
@@ -103,7 +101,7 @@ Tested by ifb's KUnit cases (previous patch).
  	return segs;
 --- a/net/ipv4/udp_offload.c
 +++ b/net/ipv4/udp_offload.c
-@@ -231,7 +231,8 @@
+@@ -231,7 +231,8 @@ static struct sk_buff *__udpv4_gso_segme
  	if ((udp_hdr(seg)->dest == udp_hdr(seg->next)->dest) &&
  	    (udp_hdr(seg)->source == udp_hdr(seg->next)->source) &&
  	    (ip_hdr(seg)->daddr == ip_hdr(seg->next)->daddr) &&
@@ -113,7 +111,7 @@ Tested by ifb's KUnit cases (previous patch).
  		return segs;
  
  	while ((seg = seg->next)) {
-@@ -244,6 +245,7 @@
+@@ -244,6 +245,7 @@ static struct sk_buff *__udpv4_gso_segme
  		__udpv4_gso_segment_csum(seg,
  					 &iph2->daddr, &iph->daddr,
  					 &uh2->dest, &uh->dest);
@@ -121,7 +119,7 @@ Tested by ifb's KUnit cases (previous patch).
  	}
  
  	return segs;
-@@ -289,7 +291,8 @@
+@@ -289,7 +291,8 @@ static struct sk_buff *__udpv6_gso_segme
  
  	if (!(*(const u32 *)&uh->source ^ *(const u32 *)&uh2->source) &&
  	    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
@@ -131,7 +129,7 @@ Tested by ifb's KUnit cases (previous patch).
  		return segs;
  
  	while ((seg = seg->next)) {
-@@ -300,6 +303,7 @@
+@@ -300,6 +303,7 @@ static struct sk_buff *__udpv6_gso_segme
  					 &uh2->source, uh->source);
  		__udpv6_gso_segment_csum(seg, &iph2->daddr, &iph->daddr,
  					 &uh2->dest, uh->dest);
@@ -149,7 +147,7 @@ Tested by ifb's KUnit cases (previous patch).
  #include "ip6_offload.h"
  
  static void tcp6_check_fraglist_gro(struct list_head *head, struct sk_buff *skb,
-@@ -142,7 +143,8 @@
+@@ -142,7 +143,8 @@ static struct sk_buff *__tcpv6_gso_segme
  
  	if (!(*(const u32 *)&th->source ^ *(const u32 *)&th2->source) &&
  	    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
@@ -159,7 +157,7 @@ Tested by ifb's KUnit cases (previous patch).
  		return segs;
  
  	while ((seg = seg->next)) {
-@@ -153,6 +155,7 @@
+@@ -153,6 +155,7 @@ static struct sk_buff *__tcpv6_gso_segme
  					 &th2->source, th->source);
  		__tcpv6_gso_segment_csum(seg, &iph2->daddr, &iph->daddr,
  					 &th2->dest, th->dest);

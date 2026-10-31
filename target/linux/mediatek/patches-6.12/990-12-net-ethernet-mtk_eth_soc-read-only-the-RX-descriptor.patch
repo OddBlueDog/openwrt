@@ -37,11 +37,9 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  drivers/net/ethernet/mediatek/mtk_eth_soc.c | 31 ++++++++++++++++-----
  1 file changed, 24 insertions(+), 7 deletions(-)
 
-diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-index 560b056..f3f82aa 100644
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
-@@ -1358,20 +1358,37 @@ static inline int mtk_max_buf_size(int frag_size)
+@@ -1358,20 +1358,37 @@ static inline int mtk_max_buf_size(int f
  	return buf_size;
  }
  
@@ -85,7 +83,7 @@ index 560b056..f3f82aa 100644
  	}
  
  	return true;
-@@ -2441,7 +2458,7 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
+@@ -2441,7 +2458,7 @@ static int mtk_poll_rx(struct napi_struc
  		rxd = ring->dma + RX_DESC_OFS(eth, idx);
  		data = ring->data[idx];
  

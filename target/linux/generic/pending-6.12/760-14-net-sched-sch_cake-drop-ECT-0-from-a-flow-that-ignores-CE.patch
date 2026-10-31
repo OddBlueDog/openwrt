@@ -25,7 +25,7 @@ the count decays.
 ---
 --- a/net/sched/sch_cake.c
 +++ b/net/sched/sch_cake.c
-@@ -105,6 +105,8 @@
+@@ -105,6 +105,8 @@ struct cobalt_params {
   * @p_drop:		BLUE drop probability (0.32 fxp)
   * @dropping:		set if in dropping state
   * @ecn_marked:		set if marked
@@ -34,7 +34,7 @@ the count decays.
   */
  struct cobalt_vars {
  	u32	count;
-@@ -114,6 +116,8 @@
+@@ -114,6 +116,8 @@ struct cobalt_vars {
  	u32     p_drop;
  	bool	dropping;
  	bool    ecn_marked;
@@ -43,7 +43,7 @@ the count decays.
  };
  
  enum {
-@@ -465,6 +469,60 @@
+@@ -465,6 +469,60 @@ static void cobalt_vars_init(struct coba
  	memset(vars, 0, sizeof(*vars));
  }
  
@@ -104,7 +104,7 @@ the count decays.
  /* CoDel control_law is t + interval/sqrt(count)
   * We maintain in rec_inv_sqrt the reciprocal value of sqrt(count) to avoid
   * both sqrt() and divide operation.
-@@ -528,6 +586,8 @@
+@@ -528,6 +586,8 @@ static bool cobalt_queue_empty(struct co
  						 p->interval,
  						 vars->rec_inv_sqrt);
  	}
@@ -113,7 +113,7 @@ the count decays.
  
  	return down;
  }
-@@ -583,9 +643,30 @@
+@@ -583,8 +643,29 @@ static bool cobalt_should_drop(struct co
  	}
  
  	if (next_due && vars->dropping) {
@@ -121,7 +121,7 @@ the count decays.
 -		drop = !(vars->ecn_marked = INET_ECN_set_ce(skb));
 +		u32 fail = READ_ONCE(ecn_fail_count);
 +		u8 ecn = fail ? cobalt_ecn(skb) : INET_ECN_NOT_ECT;
- 
++
 +		if (ecn == INET_ECN_ECT_0 && !vars->ecn_ignored) {
 +			if (vars->count >= fail && sojourn > 2 * p->target) {
 +				if (++vars->ecn_strikes >= COBALT_ECN_STRIKES) {
@@ -142,11 +142,10 @@ the count decays.
 +			/* Use ECN mark if possible, otherwise drop */
 +			drop = !(vars->ecn_marked = INET_ECN_set_ce(skb));
 +		}
-+
+ 
  		vars->count++;
  		if (!vars->count)
- 			vars->count--;
-@@ -604,6 +685,8 @@
+@@ -604,6 +685,8 @@ static bool cobalt_should_drop(struct co
  			schedule = ktime_sub(now, vars->drop_next);
  			next_due = vars->count && ktime_to_ns(schedule) >= 0;
  		}
@@ -167,7 +166,7 @@ the count decays.
   * sch_cake.ko (#included at the end of sch_cake.c) when
   * CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs when it loads.
   */
-@@ -1692,6 +1693,237 @@
+@@ -1692,6 +1693,237 @@ static void cake_test_wake_slack_batches
  
  static unsigned int cake_test_slack;
  
@@ -405,7 +404,7 @@ the count decays.
  static int cake_test_init(struct kunit *test)
  {
  	int i;
-@@ -1724,6 +1956,15 @@
+@@ -1724,6 +1956,15 @@ static struct kunit_case cake_test_cases
  #endif
  	KUNIT_CASE(cake_test_wake_slack),
  	KUNIT_CASE(cake_test_wake_slack_batches),
