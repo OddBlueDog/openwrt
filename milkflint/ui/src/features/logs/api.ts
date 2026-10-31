@@ -2,11 +2,11 @@ import { z } from 'zod';
 import { call } from '@/lib/ubus';
 import { bool, type Change, getConfig, str } from '@/lib/api/uci';
 
-export type LogKind = 'system' | 'kernel' | 'wifi' | 'radar' | 'debug' | 'crash';
+export type LogKind = 'system' | 'kernel' | 'wifi' | 'radar' | 'debug' | 'dns' | 'crash';
 
 /**
  * The last `lines` lines of the system log, the kernel log, the Wi-Fi log,
- * the radar log, the debug log or the kernel's crash reports. With the logs
+ * the radar log, the debug log, the DNS log or the kernel's crash reports. With the logs
  * kept across reboots, the system and kernel logs come from the router's
  * saved copy, which goes back past the last restart.
  */
@@ -27,6 +27,8 @@ const statusSchema = z.object({
   /** the debug log's counters and snapshots (absent from older routers) */
   counters: z.boolean().optional(),
   snapshot: z.boolean().optional(),
+  /** the DNS log (absent from older routers) */
+  dns: z.boolean().optional(),
   /** the log keeper is running */
   recording: z.boolean(),
   /** where the logs are written */
@@ -36,6 +38,7 @@ const statusSchema = z.object({
   wifi_bytes: z.number().nullable(),
   radar_bytes: z.number().nullish(),
   debug_bytes: z.number().nullish(),
+  dns_bytes: z.number().nullish(),
   /** the kernel's crash reports kept since the last restart (pstore) */
   crash_reports: z.number().optional(),
 });
@@ -67,10 +70,15 @@ export interface LogSettings {
   counters: boolean;
   /** debug log: everything at once when the internet or a device stops (debug_snapshot) */
   snapshot: boolean;
+  /** the DNS log: slow and unanswered lookups, a summary every minute (dns) */
+  dns: boolean;
+  /** dnsmasq's section, whose logqueries goes with `dns`; not edited */
+  dnsmasq: string | undefined;
 }
 
 export async function getLogSettings(): Promise<LogSettings> {
-  const s = (await getConfig('milkflint')).find((x) => x['.name'] === 'logs');
+  const [milkflint, dhcp] = await Promise.all([getConfig('milkflint'), getConfig('dhcp')]);
+  const s = milkflint.find((x) => x['.name'] === 'logs');
   return {
     persist: bool(s, 'persist', false),
     size: str(s, 'size') ?? '3',
@@ -83,10 +91,21 @@ export async function getLogSettings(): Promise<LogSettings> {
     radar: bool(s, 'radar', true),
     counters: bool(s, 'debug_counters', false),
     snapshot: bool(s, 'debug_snapshot', false),
+    dns: bool(s, 'dns', false),
+    dnsmasq: dhcp.find((x) => x['.type'] === 'dnsmasq')?.['.name'],
   };
 }
 
-export function logSettingsChanges(f: LogSettings): Change[] {
+/** The settings as uci changes; dnsmasq's logqueries only when the DNS log is turned on or off (it restarts dnsmasq). */
+export function logSettingsChanges(f: LogSettings, before: LogSettings): Change[] {
+  const dnsmasq: Change[] =
+    f.dns === before.dns || f.dnsmasq === undefined
+      ? []
+      : [
+          f.dns
+            ? { op: 'set', config: 'dhcp', section: f.dnsmasq, values: { logqueries: '1' } }
+            : { op: 'unset', config: 'dhcp', section: f.dnsmasq, options: ['logqueries'] },
+        ];
   return [
     {
       op: 'set',
@@ -104,7 +123,9 @@ export function logSettingsChanges(f: LogSettings): Change[] {
         radar: f.radar ? '1' : '0',
         debug_counters: f.counters ? '1' : '0',
         debug_snapshot: f.snapshot ? '1' : '0',
+        dns: f.dns ? '1' : '0',
       },
     },
+    ...dnsmasq,
   ];
 }

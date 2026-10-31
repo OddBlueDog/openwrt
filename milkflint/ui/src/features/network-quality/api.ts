@@ -7,7 +7,10 @@ const sampleSchema = z.object({
   /** Round-trip / lookup times in ms; null when there was no answer. */
   gateway: z.number().nullable(),
   internet: z.number().nullable(),
+  /** The main DNS server's time (the first of dns_servers). */
   dns: z.number().nullable(),
+  /** Each DNS server's time by its key (host name or address); absent from older probes. */
+  dns_servers: z.record(z.string(), z.number().nullable()).optional(),
   /** Every 30 s: ms to each route's server by key (uk, eu, us), null when lost. */
   routes: z.record(z.string(), z.number().nullable()).optional(),
 });
@@ -22,6 +25,15 @@ const routeSchema = z.object({
 });
 export type Route = z.output<typeof routeSchema>;
 
+const dnsTargetSchema = z.object({
+  /** The samples' and history's key: the server's host name (encrypted DNS) or address. */
+  key: z.string(),
+  host: z.string(),
+  /** The address asked; null until the host name has resolved. */
+  addr: z.string().nullish(),
+});
+export type DnsTarget = z.output<typeof dnsTargetSchema>;
+
 const statusSchema = z.object({
   enabled: z.boolean(),
   now: z.number(),
@@ -32,6 +44,8 @@ const statusSchema = z.object({
       internet: z.string(),
       dns_server: z.string(),
       dns_domain: z.string(),
+      /** Every DNS server asked, the main one first; absent from older probes. */
+      dns_servers: z.array(dnsTargetSchema).optional(),
       /** Servers in the UK, Europe and the US; absent from older routers. */
       routes: z.array(routeSchema).optional(),
     })
@@ -57,6 +71,7 @@ const bucketSchema = z.object({
   dns: statSchema,
   gateway: statSchema.optional(),
   routes: z.record(z.string(), statSchema).optional(),
+  dns_servers: z.record(z.string(), statSchema).optional(),
 });
 export type Bucket = z.output<typeof bucketSchema>;
 

@@ -6,6 +6,7 @@ import {
   SatelliteDishIcon,
   ScrollTextIcon,
   SearchIcon,
+  ServerOffIcon,
   SettingsIcon,
   ShieldCheckIcon,
   WifiOffIcon,
@@ -36,6 +37,7 @@ const kinds: { id: LogKind; label: string; title: string }[] = [
   { id: 'wifi', label: 'Wi-Fi', title: 'Wi-Fi log' },
   { id: 'radar', label: 'Radar', title: 'Radar log' },
   { id: 'debug', label: 'Debug', title: 'Debug log' },
+  { id: 'dns', label: 'DNS', title: 'DNS log' },
   { id: 'crash', label: 'Crashes', title: 'Crash reports' },
 ];
 
@@ -45,6 +47,7 @@ const placeholders: Record<LogKind, string> = {
   wifi: 'Filter, e.g. a device name or NO TX',
   radar: 'Filter, e.g. RADAR-DETECTED or CAC',
   debug: 'Filter, e.g. snapshot, cake or RESTART',
+  dns: 'Filter, e.g. slow, a device or a site',
   crash: 'Filter, e.g. Oops, panic or mt7915',
 };
 
@@ -63,13 +66,21 @@ function source(kind: LogKind, status: LogStatus | undefined): string {
   if (status === undefined) return '';
   if (kind === 'wifi' && !status.wifi) return 'off';
   if (kind === 'debug' && !debugOn(status)) return 'off';
+  if (kind === 'dns' && status.dns !== true) return 'off';
   if (kind === 'radar') {
     if (status.radar === false) return 'off';
     const bytes = status.radar_bytes ?? null;
     return `kept across restarts${bytes === null ? '' : `, ${formatBytes(bytes)} saved`}`;
   }
   if (kind === 'crash') return 'kept until the router loses power';
-  const bytes = kind === 'wifi' ? status.wifi_bytes : kind === 'debug' ? (status.debug_bytes ?? null) : status.system_bytes;
+  const bytes =
+    kind === 'wifi'
+      ? status.wifi_bytes
+      : kind === 'debug'
+        ? (status.debug_bytes ?? null)
+        : kind === 'dns'
+          ? (status.dns_bytes ?? null)
+          : status.system_bytes;
   if (status.persist) return `kept across restarts${bytes === null ? '' : `, ${formatBytes(bytes)} saved`}`;
   return 'since the last restart';
 }
@@ -109,7 +120,7 @@ export function LogsPage(): ReactElement {
 
   return (
     <>
-      <PageHeader title="Logs" description="The system, kernel, Wi-Fi, radar and debug logs, and the kernel's crash reports, newest at the bottom." />
+      <PageHeader title="Logs" description="The system, kernel, Wi-Fi, radar, debug and DNS logs, and the kernel's crash reports, newest at the bottom." />
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_26rem]">
         <Card>
           <CardHeading
@@ -118,7 +129,7 @@ export function LogsPage(): ReactElement {
             description={data === undefined ? 'Loading…' : `${String(shown.length)} of ${String(data.length)} lines${where === '' ? '' : `, ${where}`}`}
           />
           <CardContent className="flex flex-col gap-3">
-            <div role="radiogroup" aria-label="Log" className="grid grid-cols-3 self-start rounded-md border bg-muted/50 p-0.5 text-xs sm:flex">
+            <div role="radiogroup" aria-label="Log" className="grid grid-cols-4 self-start rounded-md border bg-muted/50 p-0.5 text-xs sm:flex">
               {kinds.map((k) => (
                 <button
                   key={k.id}
@@ -166,6 +177,15 @@ export function LogsPage(): ReactElement {
                 <AlertTitle>The debug log is off</AlertTitle>
                 <AlertDescription>
                   Turn on the debug counters or the snapshot in the settings below while chasing a dropout. Older lines from when it was on are still shown.
+                </AlertDescription>
+              </Alert>
+            )}
+            {kind === 'dns' && status !== undefined && status.dns !== true && (
+              <Alert variant="info">
+                <ServerOffIcon />
+                <AlertTitle>The DNS log is off</AlertTitle>
+                <AlertDescription>
+                  Turn it on in the settings below while chasing slow pages or apps. Older lines from when it was on are still shown.
                 </AlertDescription>
               </Alert>
             )}
@@ -322,7 +342,7 @@ function SettingsCard({ onApplied }: { onApplied: () => void }): ReactElement | 
             className={side}
             id="logs-persist"
             label="Keep after a restart"
-            hint="Saves the system log, the kernel's lines included, the Wi-Fi log and the debug log on the router's storage (/root/milkflint-logs). Otherwise they're only in memory, and a restart or crash clears them."
+            hint="Saves the system log, the kernel's lines included, the Wi-Fi, debug and DNS logs on the router's storage (/root/milkflint-logs). Otherwise they're only in memory, and a restart or crash clears them."
           >
             <Switch
               id="logs-persist"
@@ -454,6 +474,21 @@ function SettingsCard({ onApplied }: { onApplied: () => void }): ReactElement | 
               }}
             />
           </Field>
+          <Field
+            className={side}
+            id="logs-dns"
+            label="DNS log"
+            hint="For chasing slow pages or apps: each lookup that takes over 500 ms, fails or gets no answer, with the site and the device, a summary every minute, and the DNS services' errors. To time them, the router notes every lookup in memory for a moment and keeps only the slow ones. Turning it on or off restarts the DNS service: a second without lookups."
+          >
+            <Switch
+              id="logs-dns"
+              className="mt-2 xl:mt-0"
+              checked={form.dns}
+              onCheckedChange={(v) => {
+                set('dns', v);
+              }}
+            />
+          </Field>
         </CardContent>
       </Card>
       <SaveBar
@@ -461,7 +496,7 @@ function SettingsCard({ onApplied }: { onApplied: () => void }): ReactElement | 
         busy={state.phase === 'applying'}
         invalid={false}
         onSave={() => {
-          void apply(logSettingsChanges(form));
+          if (data !== undefined) void apply(logSettingsChanges(form, data));
         }}
         onRevert={() => {
           setEdit(undefined);

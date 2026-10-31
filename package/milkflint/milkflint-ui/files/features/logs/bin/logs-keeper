@@ -34,6 +34,16 @@
 //   netifd, hostapd, dnsmasq and dnsproxy. snapshot=1 records everything at
 //   once, at most once a minute, when a Network Quality round loses the
 //   internet or DNS or a device gets NO TX.
+// - dns=1 (off unless turned on): the DNS log, dns.log. dnsmasq then logs
+//   every lookup (the Logs page turns its log-queries=extra on with this),
+//   and logd's millisecond times say how long each took, from the device's
+//   question to dnsmasq's answer: lookups over 500 ms, failed ones (dnsmasq
+//   couldn't reach its servers, or they failed) and ones never answered get
+//   a line each (the name, the device, the time), and every
+//   minute a summary (how many, how many the router answered itself, the
+//   typical and slowest time of the rest). Also the DNS services' errors
+//   (dnsproxy's upstream timeouts), warnings and restarts. The lookups'
+//   own lines stay out of system.log.
 // The logs are on the router's storage with persist=1, else in RAM
 // (/tmp/milkflint-logs). Each log keeps up to `size` MB: at half that the
 // file becomes <file>.old, replacing the older half. It only reads, apart
@@ -70,7 +80,8 @@ const RRM = WIFI && args.rrm != '0';
 const NET = WIFI && args.net != '0';
 const COUNTERS = args.counters == '1';
 const SNAPSHOT = args.snapshot == '1';
-const SAMPLING = WIFI || COUNTERS || SNAPSHOT;
+const DNS = args.dns == '1';
+const SAMPLING = WIFI || COUNTERS || SNAPSHOT || DNS;
 const HALF = setting('size', 3, 1, 100) * 1024 * 1024 / 2;
 const INTERVAL = setting('interval', 10, 2, 300);
 const DIR = PERSIST ? DISK : RAM;
@@ -153,6 +164,7 @@ function save_state() {
 const system_log = PERSIST ? target(DISK + '/system.log') : null;
 const wifi_log = WIFI ? target(DIR + '/wifi.log') : null;
 const debug_log = (COUNTERS || SNAPSHOT) ? target(DIR + '/debug.log') : null;
+const dns_log = DNS ? target(DIR + '/dns.log') : null;
 save_state();
 
 if (system_log?.fresh)
@@ -165,6 +177,9 @@ if (wifi_log) {
 if (debug_log)
 	debug_log.file.write(`${stamp()} user.notice milkflint-logs: ---- recording ${debug_log.fresh ? 'started' : 'again'}, router up ${uptime()}: ` +
 		join(', and ', filter([ COUNTERS ? `counters every ${INTERVAL} s` : null, SNAPSHOT ? 'a snapshot when the internet, DNS or a device stops' : null ], (x) => x != null)) + ' ----');
+if (dns_log)
+	dns_log.file.write(`${stamp()} user.notice milkflint-logs: ---- recording ${dns_log.fresh ? 'started' : 'again'}, router up ${uptime()}: ` +
+		'lookups over 500 ms, failed or not answered, a summary every minute, and the DNS services\' errors and restarts ----');
 
 // ---- which system log lines are Wi-Fi lines ------------------------------
 
@@ -224,6 +239,164 @@ function notable(rest) {
 	return false;
 }
 
+// ---- the DNS log -----------------------------------------------------------
+
+const DNS_SLOW_MS = 500;
+// devices ask again after a second or two and give up within about ten
+const DNS_LOST_MS = 10000;
+
+let dns_pending = {};	// lookup number: { ms, name, type, client }
+let dns_answered = {};	// "<client> <name> <type>": when it was last answered
+let dns_hosts = {};	// address: the device's name, from the DHCP leases
+let dns_counts = null;	// since the last summary
+let dns_since = 0;
+
+function dns_reset() {
+	dns_counts = { asked: 0, local: 0, times: [], slow: 0, failed: 0, lost: 0 };
+	dns_since = time();
+}
+
+function dns_line(level, text) {
+	dns_log.file.write(`${stamp()} daemon.${level} dns: ${text}`);
+}
+
+function read_hosts() {
+	dns_hosts = {};
+	for (let line in split(readfile('/tmp/dhcp.leases') ?? '', '\n')) {
+		const f = split(line, ' ');
+		if (length(f) >= 4 && f[3] != '*')
+			dns_hosts[f[2]] = f[3];
+	}
+}
+
+function dns_who(ip) {
+	if (ip == '127.0.0.1' || ip == '::1')
+		return 'the router';
+	return dns_hosts[ip] ? `${dns_hosts[ip]} ${ip}` : ip;
+}
+
+// "230 ms", "3.21 s"
+function dns_took(ms) {
+	return (ms >= 1000) ? sprintf('%.2f s', ms / 1000.0) : sprintf('%d ms', ms);
+}
+
+// dnsmasq's log-queries=extra lines, "<n> <client>/<port> <what> <name>
+// [is|to|from <more>]", where <n> numbers one lookup's lines: query[A],
+// forwarded, then the answer: reply (from upstream) or cached, config, a
+// hosts file, DHCP (the router's own). A CNAME chain answers in several
+// lines; the first is when. Times the lookup when `live` (not the RAM
+// buffer's past), and returns whether the line was one of these.
+function dns_lookup(ms, msg, live) {
+	// (POSIX regular expressions: no (?:...) groups)
+	const m = match(msg, /^([0-9]+) ([^ \/]+)\/[0-9]+ ([^ ]+) ([^ ]+)( (is|to|from) (.*))?$/);
+	if (!m)
+		return false;
+	if (!live)
+		return true;
+	const id = m[1], what = m[3];
+	const q = match(what, /^query\[([A-Za-z0-9]+)\]$/);
+	if (q) {
+		dns_counts.asked++;
+		dns_pending[id] = { ms, name: m[4], type: q[1], client: m[2] };
+		return true;
+	}
+	const p = dns_pending[id];
+	if (p == null || m[6] != 'is')
+		return true;
+	delete dns_pending[id];
+	dns_answered[`${p.client} ${p.name} ${p.type}`] = ms;
+	// the device asking the same again gets a new number: the wait is from
+	// its first ask
+	let first = p.ms, times = 1;
+	for (let other in keys(dns_pending)) {
+		const o = dns_pending[other];
+		if (o.client == p.client && o.name == p.name && o.type == p.type) {
+			first = min(first, o.ms);
+			times++;
+			delete dns_pending[other];
+		}
+	}
+	const took = ms - first;
+	const asked = (times > 1) ? ` (asked ${times} times)` : '';
+	// dnsmasq couldn't ask its servers ("config error is REFUSED (EDE:
+	// network error)"), or they failed
+	if (match(m[7], /^(REFUSED|SERVFAIL)/)) {
+		dns_counts.failed++;
+		dns_line('warn', `failed: ${p.name} (${p.type}) for ${dns_who(p.client)} after ${dns_took(took)}${asked}: ${m[7]}`);
+		return true;
+	}
+	if (what != 'reply') {
+		dns_counts.local++;
+		return true;
+	}
+	push(dns_counts.times, took);
+	if (took > DNS_SLOW_MS) {
+		dns_counts.slow++;
+		dns_line('warn', `slow: ${p.name} (${p.type}) for ${dns_who(p.client)}: ${dns_took(took)}${asked}, answer ${m[7]}`);
+	}
+	return true;
+}
+
+// The DNS services' own lines the DNS log copies: dnsproxy's errors and
+// warnings (an upstream timing out) and starts, dnsmasq's warnings and
+// restarts, procd restarting either.
+function dns_service(level, tag, msg) {
+	if (tag == 'dnsproxy')
+		return match(msg, / (ERROR|WARN) |starting dns proxy server/) != null;
+	if (tag == 'dnsmasq')
+		return level == 'warn' || level == 'err' || match(msg, /^(started, version|exiting on receipt)/) != null;
+	if (tag == 'procd')
+		return match(msg, /(Instance|crash loop).*(dnsmasq|dnsproxy)/) != null;
+	return false;
+}
+
+// Each sample: the questions given up on, and once a minute the summary.
+function dns_tick() {
+	const now = time() * 1000;
+	// a device asking again gets a new number: one line for them all
+	const lost = {};
+	for (let id in keys(dns_pending)) {
+		const p = dns_pending[id];
+		if (now - p.ms < DNS_LOST_MS)
+			continue;
+		delete dns_pending[id];
+		const key = `${p.client} ${p.name} ${p.type}`;
+		// answered under another of its numbers
+		if ((dns_answered[key] ?? 0) >= p.ms)
+			continue;
+		if (lost[key])
+			lost[key].times++;
+		else
+			lost[key] = { ...p, times: 1 };
+	}
+	for (let key, p in lost) {
+		dns_counts.lost++;
+		dns_line('warn', `not answered within ${DNS_LOST_MS / 1000} s: ${p.name} (${p.type}) for ${dns_who(p.client)}` +
+			(p.times > 1 ? ` (asked ${p.times} times)` : ''));
+	}
+	const secs = time() - dns_since;
+	if (secs < 60)
+		return;
+	for (let k in keys(dns_answered))
+		if (now - dns_answered[k] > 60000)
+			delete dns_answered[k];
+	const d = dns_counts;
+	if (d.asked > 0) {
+		const t = sort(d.times, (a, b) => a - b);
+		const n = length(t);
+		dns_line((d.slow || d.failed || d.lost) ? 'warn' : 'info', `${d.asked} lookups in ${secs} s: ${d.local} answered by the router` +
+			(n ? `, ${n} from the internet (typically ${dns_took(t[int(n / 2)])}, slowest ${dns_took(t[n - 1])})` : '') +
+			(d.slow ? `, ${d.slow} slow` : '') + (d.failed ? `, ${d.failed} failed` : '') + (d.lost ? `, ${d.lost} not answered` : ''));
+	}
+	dns_reset();
+	read_hosts();
+}
+
+if (DNS) {
+	dns_reset();
+	read_hosts();
+}
+
 // one line from `logread -f -t`: "<ctime> [<epoch>.<ms>] <facility.level> <tag>: <message>"
 function on_log_line(line) {
 	const m = match(line, /^(.{24}) \[([0-9]+)\.([0-9]+)\] (.*)$/);
@@ -234,7 +407,20 @@ function on_log_line(line) {
 	const ms = int(m[2]) * 1000 + int(m[3]);
 	const text = m[1] + ' ' + m[4];
 	let wrote = false;
-	if (system_log && ms > system_log.since) {
+	// the DNS log: lookups are timed and kept out of system.log, the DNS
+	// services' lines copied
+	let lookup = false;
+	if (DNS) {
+		const t = match(m[4], /^[a-z0-9]+\.([a-z]+) ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
+		if (t && t[2] == 'dnsmasq')
+			lookup = dns_lookup(ms, t[4], ms > START_MS);
+		if (t && !lookup && ms > dns_log.since && dns_service(t[1], t[2], t[4])) {
+			dns_log.file.write(text);
+			state[dns_log.path] = ms;
+			wrote = true;
+		}
+	}
+	if (system_log && !lookup && ms > system_log.since) {
 		system_log.file.write(text);
 		state[system_log.path] = ms;
 		wrote = true;
@@ -1526,6 +1712,8 @@ let ticks = 0;
 function tick() {
 	const minute = (ticks % max(1, int(60 / INTERVAL))) == 0;
 	ticks++;
+	if (DNS)
+		dns_tick();
 	if (minute && (WIFI || SNAPSHOT))
 		read_names();
 	const trouble = [];

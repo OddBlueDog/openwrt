@@ -81,7 +81,7 @@ return {
 		},
 		// the minute history of the last `span` seconds (up to 8 days) in
 		// `step`-second buckets (at least 60): { now, start, step, days,
-		// buckets: [{ i, internet, dns, gateway?, routes? }] }, bucket i
+		// buckets: [{ i, internet, dns, gateway?, routes?, dns_servers? }] }, bucket i
 		// covering start + i * step. Steps of whole quarter hours read the
 		// probe's -15m files (7 days of minutes would take seconds).
 		history: {
@@ -115,14 +115,16 @@ return {
 					const gw = merge(map(ms, (m) => m.gateway));
 					if (gw != null)
 						b.gateway = gw;
-					const routes = {};
-					for (let m in ms)
-						for (let k, v in m.routes ?? {})
-							push(routes[k] ??= [], v);
-					if (length(routes)) {
-						b.routes = {};
-						for (let k, v in routes)
-							b.routes[k] = merge(v);
+					for (let field in [ 'routes', 'dns_servers' ]) {
+						const by = {};
+						for (let m in ms)
+							for (let k, v in m[field] ?? {})
+								push(by[k] ??= [], v);
+						if (length(by)) {
+							b[field] = {};
+							for (let k, v in by)
+								b[field][k] = merge(v);
+						}
 					}
 					push(buckets, b);
 				}

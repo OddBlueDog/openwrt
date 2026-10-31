@@ -1,0 +1,22 @@
+#!/bin/sh
+# Whether Smart Queue (CAKE) drops the ECN-capable packets of a download that
+# keeps ignoring its ECN marks, as it drops a download without ECN, from
+# milkflint.cake.ecn_drop: "0" always marks, as upstream CAKE; unset drops.
+# Some servers answer the marks and keep their speed, and their queue stays
+# long; dropped, they slow down, at a little speed to them. L4S traffic is
+# always marked. sch_cake (its ecn_fail_count, sch_cake 760-14) takes it at
+# once. milkflint-tuning runs this at boot and when the setting changes;
+# sch_cake keeps it while it stays loaded.
+#
+#   cake-ecn
+
+P=/sys/module/sch_cake/parameters/ecn_fail_count
+
+# sch_cake not loaded yet (Smart Queue off), or without the parameter
+[ -w "$P" ] || exit 0
+if [ "$(uci -q get milkflint.cake.ecn_drop)" = 0 ]; then
+	echo 0 > "$P"
+else
+	echo 256 > "$P"
+fi
+exit 0

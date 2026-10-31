@@ -1,6 +1,10 @@
 // Public DNS providers, as the stock firmware offers them: each with a few
 // servers (filtering levels), their plain addresses for static DNS, and
 // their encrypted addresses (DNS over HTTPS, TLS and, for some, QUIC).
+// Each server says what it blocks and whether it checks DNSSEC: whether it
+// refuses a domain whose DNSSEC signature is broken (dnssec-failed.org,
+// sigfail.verteiltesysteme.net) instead of answering it.
+// No imports from the app, so the tests (ui/tests) load it as it is.
 
 export type Proto = 'doh' | 'dot' | 'doq';
 
@@ -10,9 +14,24 @@ export const protoLabels: Record<Proto, string> = {
   doq: 'DNS over QUIC (DoQ)',
 };
 
+/** What a server filters out (phishing counts as malware, trackers as ads). */
+export type Block = 'malware' | 'adult' | 'ads' | 'social' | 'proxies';
+
+/** For a list in a sentence ("blocks malware, ads and adult content"), so none has an "and" of its own. */
+export const blockLabels: Record<Block, string> = {
+  malware: 'malware',
+  adult: 'adult content',
+  ads: 'ads',
+  social: 'social networks',
+  proxies: 'proxies',
+};
+
 export interface DnsServer {
   name: string;
   description: string;
+  blocks: readonly Block[];
+  /** it checks DNSSEC signatures (the router doesn't: dnsmasq is built without) */
+  dnssec: boolean;
   doh: string;
   dot: string;
   doq?: string;
@@ -34,6 +53,8 @@ export const providers = {
       {
         name: 'Standard',
         description: 'Nothing filtered. Fast and privacy-focused.',
+        blocks: [],
+        dnssec: true,
         doh: 'https://cloudflare-dns.com/dns-query',
         dot: 'tls://one.one.one.one',
         v4: ['1.1.1.1', '1.0.0.1'],
@@ -42,6 +63,8 @@ export const providers = {
       {
         name: 'Security',
         description: 'Blocks known malware and phishing sites.',
+        blocks: ['malware'],
+        dnssec: true,
         doh: 'https://security.cloudflare-dns.com/dns-query',
         dot: 'tls://security.cloudflare-dns.com',
         v4: ['1.1.1.2', '1.0.0.2'],
@@ -50,6 +73,8 @@ export const providers = {
       {
         name: 'Family',
         description: 'Security, and blocks adult content too.',
+        blocks: ['malware', 'adult'],
+        dnssec: true,
         doh: 'https://family.cloudflare-dns.com/dns-query',
         dot: 'tls://family.cloudflare-dns.com',
         v4: ['1.1.1.3', '1.0.0.3'],
@@ -64,6 +89,8 @@ export const providers = {
       {
         name: 'Default',
         description: 'Nothing filtered.',
+        blocks: [],
+        dnssec: true,
         doh: 'https://dns.google/dns-query',
         dot: 'tls://dns.google',
         v4: ['8.8.8.8', '8.8.4.4'],
@@ -77,7 +104,9 @@ export const providers = {
     servers: [
       {
         name: 'Recommended',
-        description: 'Blocks malware, validates DNSSEC.',
+        description: 'Blocks malware.',
+        blocks: ['malware'],
+        dnssec: true,
         doh: 'https://dns.quad9.net/dns-query',
         dot: 'tls://dns.quad9.net',
         v4: ['9.9.9.9', '149.112.112.112'],
@@ -86,6 +115,8 @@ export const providers = {
       {
         name: 'Secured with ECS',
         description: 'As Recommended, and passes part of your address on so CDNs pick nearby servers.',
+        blocks: ['malware'],
+        dnssec: true,
         doh: 'https://dns11.quad9.net/dns-query',
         dot: 'tls://dns11.quad9.net',
         v4: ['9.9.9.11', '149.112.112.11'],
@@ -93,7 +124,9 @@ export const providers = {
       },
       {
         name: 'Unsecured',
-        description: 'No malware blocking, no DNSSEC validation.',
+        description: 'No malware blocking.',
+        blocks: [],
+        dnssec: true,
         doh: 'https://dns10.quad9.net/dns-query',
         dot: 'tls://dns10.quad9.net',
         v4: ['9.9.9.10', '149.112.112.10'],
@@ -108,6 +141,8 @@ export const providers = {
       {
         name: 'Default',
         description: 'Blocks ads and trackers.',
+        blocks: ['ads'],
+        dnssec: true,
         doh: 'https://dns.adguard-dns.com/dns-query',
         dot: 'tls://dns.adguard-dns.com',
         doq: 'quic://dns.adguard-dns.com',
@@ -117,6 +152,8 @@ export const providers = {
       {
         name: 'Unfiltered',
         description: 'Nothing blocked.',
+        blocks: [],
+        dnssec: true,
         doh: 'https://unfiltered.adguard-dns.com/dns-query',
         dot: 'tls://unfiltered.adguard-dns.com',
         doq: 'quic://unfiltered.adguard-dns.com',
@@ -126,6 +163,8 @@ export const providers = {
       {
         name: 'Family',
         description: 'Blocks ads, trackers and adult content; Safe Search where possible.',
+        blocks: ['ads', 'adult'],
+        dnssec: true,
         doh: 'https://family.adguard-dns.com/dns-query',
         dot: 'tls://family.adguard-dns.com',
         doq: 'quic://family.adguard-dns.com',
@@ -141,6 +180,8 @@ export const providers = {
       {
         name: 'Standard',
         description: 'Nothing filtered.',
+        blocks: [],
+        dnssec: true,
         doh: 'https://dns.opendns.com/dns-query',
         dot: 'tls://dns.opendns.com',
         v4: ['208.67.222.222', '208.67.220.220'],
@@ -149,6 +190,8 @@ export const providers = {
       {
         name: 'FamilyShield',
         description: 'Blocks adult content, proxies and phishing sites.',
+        blocks: ['malware', 'adult', 'proxies'],
+        dnssec: true,
         doh: 'https://familyshield.opendns.com/dns-query',
         dot: 'tls://familyshield.opendns.com',
         v4: ['208.67.222.123', '208.67.220.123'],
@@ -163,6 +206,8 @@ export const providers = {
       {
         name: 'Security Filter',
         description: 'Blocks phishing, spam and malware domains.',
+        blocks: ['malware'],
+        dnssec: false,
         doh: 'https://doh.cleanbrowsing.org/doh/security-filter/',
         dot: 'tls://security-filter-dns.cleanbrowsing.org',
         v4: ['185.228.168.9', '185.228.169.9'],
@@ -171,6 +216,8 @@ export const providers = {
       {
         name: 'Adult Filter',
         description: 'Blocks adult sites; Google and Bing in Safe Mode.',
+        blocks: ['malware', 'adult'],
+        dnssec: false,
         doh: 'https://doh.cleanbrowsing.org/doh/adult-filter/',
         dot: 'tls://adult-filter-dns.cleanbrowsing.org',
         v4: ['185.228.168.10', '185.228.169.11'],
@@ -179,6 +226,8 @@ export const providers = {
       {
         name: 'Family Filter',
         description: 'Adult Filter, and blocks proxies, VPNs and mixed-content sites.',
+        blocks: ['malware', 'adult', 'proxies'],
+        dnssec: false,
         doh: 'https://doh.cleanbrowsing.org/doh/family-filter/',
         dot: 'tls://family-filter-dns.cleanbrowsing.org',
         v4: ['185.228.168.168', '185.228.169.168'],
@@ -193,6 +242,8 @@ export const providers = {
       {
         name: 'Unfiltered',
         description: 'Nothing blocked.',
+        blocks: [],
+        dnssec: true,
         doh: 'https://freedns.controld.com/p0',
         dot: 'tls://p0.freedns.controld.com',
         doq: 'quic://p0.freedns.controld.com',
@@ -202,6 +253,8 @@ export const providers = {
       {
         name: 'Malware',
         description: 'Blocks malware.',
+        blocks: ['malware'],
+        dnssec: true,
         doh: 'https://freedns.controld.com/p1',
         dot: 'tls://p1.freedns.controld.com',
         doq: 'quic://p1.freedns.controld.com',
@@ -211,6 +264,8 @@ export const providers = {
       {
         name: 'Malware + Ads',
         description: 'Blocks malware, ads and tracking.',
+        blocks: ['malware', 'ads'],
+        dnssec: true,
         doh: 'https://freedns.controld.com/p2',
         dot: 'tls://p2.freedns.controld.com',
         doq: 'quic://p2.freedns.controld.com',
@@ -220,6 +275,8 @@ export const providers = {
       {
         name: 'Malware + Ads + Social',
         description: 'Blocks malware, ads, tracking and social networks.',
+        blocks: ['malware', 'ads', 'social'],
+        dnssec: true,
         doh: 'https://freedns.controld.com/p3',
         dot: 'tls://p3.freedns.controld.com',
         doq: 'quic://p3.freedns.controld.com',
@@ -229,6 +286,8 @@ export const providers = {
       {
         name: 'Family',
         description: 'Blocks malware, ads, tracking and adult content.',
+        blocks: ['malware', 'ads', 'adult'],
+        dnssec: true,
         doh: 'https://freedns.controld.com/family',
         dot: 'tls://family.freedns.controld.com',
         doq: 'quic://family.freedns.controld.com',

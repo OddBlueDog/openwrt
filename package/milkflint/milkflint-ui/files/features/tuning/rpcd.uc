@@ -1,7 +1,8 @@
 // rpcd plugin for the "tuning" feature: what the Performance Tuning page's
 // settings are doing right now. Each radio's best-effort AQL limits
-// (mac80211's debugfs), where packet steering put the network work, and how
-// the internet port groups what it receives (GRO). Read-only: the settings
+// (mac80211's debugfs), where packet steering put the network work, how
+// the internet port groups what it receives (GRO), and the drivers' latency
+// settings (their module parameters). Read-only: the settings
 // are uci (milkflint, network.globals, sqm), and
 // /etc/init.d/milkflint-tuning puts them into effect.
 'use strict';
@@ -106,8 +107,17 @@ function wired(dev) {
 // threads and the Wi-Fi driver's threads may use, and the CPUs what the
 // wired ports receive is spread over (RPS; empty: none, it stays where it
 // arrives).
+// a thread's scheduling policy: field 41 of /proc/<pid>/stat, after the
+// command name, which may hold spaces (0 normal, 1 FIFO, 2 round-robin)
+function policy(pid) {
+	const stat = readfile(`/proc/${pid}/stat`) ?? '';
+	const fields = split(substr(stat, rindex(stat, ')') + 2), ' ');
+	return +(fields[38] ?? 0);
+}
+
 function steering() {
 	const ethernet = [], wifi = [], rps = [];
+	let realtime = false;
 	for (let pid in lsdir('/proc') ?? []) {
 		if (!match(pid, /^[0-9]+$/))
 			continue;
@@ -117,6 +127,8 @@ function steering() {
 			continue;
 		const m = match(readfile(`/proc/${pid}/status`) ?? '', /Cpus_allowed_list:[ \t]*([0-9,-]+)/);
 		add_all(of_wifi ? wifi : ethernet, cpu_list(m?.[1]));
+		if (!of_wifi && policy(pid) > 0)
+			realtime = true;
 	}
 	for (let dev in lsdir('/sys/class/net') ?? [])
 		if (wired(dev))
@@ -127,7 +139,7 @@ function steering() {
 	for (let line in split(readfile('/proc/stat') ?? '', '\n'))
 		if (match(line, /^cpu[0-9]+ /))
 			cpus++;
-	return { cpus, ethernet: sort(ethernet), wifi: sort(wifi), rps: sort(rps) };
+	return { cpus, ethernet: sort(ethernet), wifi: sort(wifi), rps: sort(rps), realtime };
 }
 
 // The kernel's tick rate (HZ), from /proc/timer_list: jiffies start at
@@ -153,6 +165,27 @@ function tick_rate() {
 	return null;
 }
 
+// a module parameter's number; null where the image doesn't have it (or
+// sch_cake isn't loaded)
+function param(path) {
+	const v = trim(readfile(path) ?? '');
+	return match(v, /^[0-9]+$/) ? +v : null;
+}
+
+// the drivers' latency settings as they are now: the Ethernet's longest RX
+// interrupt delay (µs, 0: no limit), sch_cake's count at which an ECN
+// download that ignores its marks is dropped (0: never; null with sch_cake
+// not loaded, or without the parameter: cake_loaded tells which), and the
+// Wi-Fi driver's sends of a data frame
+function knobs() {
+	return {
+		rx_delay: param('/sys/module/mtk_eth/parameters/rx_dim_max_us'),
+		cake_ecn: param('/sys/module/sch_cake/parameters/ecn_fail_count'),
+		cake_loaded: access('/sys/module/sch_cake') == true,
+		wifi_retries: param('/sys/module/mt76_connac_lib/parameters/data_tx_count'),
+	};
+}
+
 function kernel() {
 	return {
 		hz: tick_rate(),
@@ -166,7 +199,7 @@ return {
 	'milkflint.tuning': {
 		status: {
 			call: function() {
-				return { radios: radios(), steering: steering(), gro: gro(), kernel: kernel() };
+				return { radios: radios(), steering: steering(), gro: gro(), kernel: kernel(), knobs: knobs() };
 			}
 		}
 	}

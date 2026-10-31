@@ -27,7 +27,10 @@
 # rings' NAPI threads run SCHED_FIFO, as mt76-tx does: a ring's thread that
 # wakes runs at once instead of waiting behind a Wi-Fi thread on its CPU,
 # and the Wi-Fi threads move to whichever CPU is free. Both cut the time
-# packets wait for a CPU under load.
+# packets wait for a CPU under load, for a little more CPU.
+# milkflint.steering.wifi_all=0 keeps the Wi-Fi threads on CPUs 1-3, and
+# milkflint.steering.rings_rt=0 the rings' threads at normal priority (the
+# Performance Tuning page's switches).
 # milkflint.steering.rss=0 keeps every flow on ring 0 with the RPS layout
 # above. Without the rings (an older image), that layout is all there is.
 #
@@ -110,18 +113,21 @@ if [ -z "$off" ] && [ "$(uci -q get milkflint.steering.rss)" != 0 ] && has_rss &
 		taskset -p "$m" "$pid" > /dev/null
 		n=$((n + 1))
 	done
-	ring_policy 1
+	[ "$(uci -q get milkflint.steering.rings_rt)" = 0 ] && ring_policy other || ring_policy 1
 else
 	rss_off
 	ring_policy other
 fi
 
 all=$(printf %x $(((1 << $(grep -c ^processor /proc/cpuinfo)) - 1)))
+# the Wi-Fi threads: every CPU with RSS, unless asked to keep to CPUs 1-3
+wifi=$WORK_CPUS
+[ -n "$rss" ] && [ "$(uci -q get milkflint.steering.wifi_all)" != 0 ] && wifi=$all
 
 for p in /proc/[0-9]*; do
 	case "$(cat "$p/comm" 2> /dev/null)" in
 	napi/mtk_eth-*) [ -n "$rss" ] && continue; m=$NAPI_CPUS ;;
-	napi/phy*|mt76-tx*) [ -n "$rss" ] && m=$all || m=$WORK_CPUS ;;
+	napi/phy*|mt76-tx*) m=$wifi ;;
 	*) continue ;;
 	esac
 	[ -n "$off" ] && m=$all

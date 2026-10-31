@@ -10,6 +10,17 @@
 #   0 spreads with RPS instead of the Ethernet's RSS rings. Whether steering
 #   is on at all is network.globals.packet_steering, whose changes reload
 #   packet_steering by themselves;
+#   milkflint.steering.wifi_all "0" keeps the Wi-Fi driver's threads on the
+#   RSS rings' CPUs, and milkflint.steering.rings_rt "0" runs the rings'
+#   receive threads at normal priority (packet-steering.sh too);
+# - milkflint.steering.rx_delay: the longest the Ethernet's receive
+#   interrupt waits, in µs (/usr/libexec/milkflint/rx-delay);
+# - milkflint.cake.ecn_drop "0": Smart Queue always marks ECN downloads, even
+#   ones that ignore the marks (/usr/libexec/milkflint/cake-ecn; the iface
+#   hotplug 12-milkflint-cake-ecn runs it after sqm too);
+# - milkflint.wifi.retries: how often the Wi-Fi driver sends a data frame
+#   before it gives up (/usr/libexec/milkflint/wifi-retries; the ieee80211
+#   hotplug runs it for each radio too);
 # - milkflint.gro.*: how the internet port groups what it receives
 #   (/usr/libexec/milkflint/gro). Its automatic choice follows Smart Queue's
 #   download options and the firewall's flow offloading, so this also
@@ -41,7 +52,10 @@ reload_if_enabled() {
 apply() {
 	mkdir -p "$RUN"
 	put aql "$(uci -q get milkflint.wifi.aql_be)" /usr/libexec/milkflint/wifi-aql
-	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss)" reload_if_enabled packet_steering
+	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss) $(uci -q get milkflint.steering.wifi_all) $(uci -q get milkflint.steering.rings_rt)" reload_if_enabled packet_steering
+	put rx_delay "$(uci -q get milkflint.steering.rx_delay)" /usr/libexec/milkflint/rx-delay
+	put cake_ecn "$(uci -q get milkflint.cake.ecn_drop)" /usr/libexec/milkflint/cake-ecn
+	put retries "$(uci -q get milkflint.wifi.retries)" /usr/libexec/milkflint/wifi-retries
 	# what the GRO settings resolve to: sqm and firewall changes count too
 	put gro "$(/usr/libexec/milkflint/gro show)" /usr/libexec/milkflint/gro
 }

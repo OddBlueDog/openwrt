@@ -1,0 +1,28 @@
+#!/bin/sh
+# How many times the Wi-Fi driver sends a data frame before it gives up on
+# it, from milkflint.wifi.retries: 1 to 31, unset for the stock 15. Fewer:
+# when the air is busy, a station's later frames wait less behind one that
+# keeps failing, and TCP resends what was given up. The driver (the mt76
+# fork's data_tx_count) takes it for the next frames. The ieee80211 hotplug
+# (30-milkflint-aql) runs this as a radio appears, milkflint-tuning when the
+# setting changes.
+#
+#   wifi-retries
+
+DEFAULT=15
+P=/sys/module/mt76_connac_lib/parameters/data_tx_count
+
+[ -w "$P" ] || exit 0
+n=$(uci -q get milkflint.wifi.retries)
+case "$n" in
+'') n=$DEFAULT ;;
+*[!0-9]*)
+	logger -t milkflint-tuning "milkflint.wifi.retries isn't 1 to 31: using $DEFAULT"
+	n=$DEFAULT
+	;;
+esac
+# as a plain number: the kernel would read 080 as octal
+n=$(expr "$n" + 0)
+{ [ "$n" -ge 1 ] && [ "$n" -le 31 ]; } || n=$DEFAULT
+echo "$n" > "$P"
+exit 0

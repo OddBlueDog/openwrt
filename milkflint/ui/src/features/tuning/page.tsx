@@ -1,4 +1,4 @@
-import { ActivityIcon, CpuIcon, LayersIcon, RotateCcwIcon, TimerIcon, WifiIcon } from 'lucide-react';
+import { ActivityIcon, CpuIcon, EthernetPortIcon, GaugeIcon, LayersIcon, RotateCcwIcon, TimerIcon, WifiIcon } from 'lucide-react';
 import { type ReactElement, useCallback, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading, InfoRow } from '@/components/card-heading';
@@ -27,6 +27,18 @@ import { GSO, takesWhole, type Whole, wholeSetting, wholeValue, withOpts, words 
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
 import { type GroPort, getTuningStatus, type TuningStatus } from './api';
+import {
+  ecnNow,
+  type Knobs,
+  knobDefaults,
+  knobOptions,
+  knobSectionsChanged,
+  readKnobs,
+  retriesLabel,
+  retryChoices,
+  rxDelayChoices,
+  rxDelayLabel,
+} from './knobs';
 
 // The settings (router side: features/tuning/init puts them into effect):
 // - milkflint.wifi.aql_be: the Wi-Fi queue's best-effort limits, "<low>
@@ -41,10 +53,10 @@ import { type GroPort, getTuningStatus, type TuningStatus } from './api';
 // - milkflint.gro.whole ("1", "0"): whether Smart Queue's download CAKE takes
 //   GRO packets whole; unset goes with the speed (../sqm/gso.ts). The page
 //   writes sqm's iqdisc_opts to match, as the Smart Queue page does.
-//   The GRO card only shows while the firewall's flow offloading is off, or
-//   once a GRO setting isn't automatic: with offloading on (MilkFlint's
-//   default), automatic is plain GRO up to 16 KB when the download CAKE takes
-//   GRO packets whole (fraglist GRO otherwise), which leaves nothing to pick.
+//   Automatic is plain GRO up to 16 KB when the download CAKE takes GRO
+//   packets whole, fraglist GRO otherwise;
+// - the latency settings in ./knobs.ts: milkflint.steering.wifi_all,
+//   .rings_rt and .rx_delay, milkflint.cake.ecn_drop, milkflint.wifi.retries.
 // Unset everywhere is what the image does: Restore defaults unsets them.
 // Moving to or from RSS can also switch Smart Queue's multi-queue CAKE
 // (sqm's use_mq), which only spreads over CPUs when RSS does.
@@ -54,7 +66,7 @@ type Steering = 'rss' | 'rps' | 'openwrt' | 'off';
 type Gro = 'auto' | 'fraglist' | 'plain' | 'off';
 type UdpFwd = 'auto' | 'on' | 'off';
 
-interface TuningForm {
+interface TuningForm extends Knobs {
   aql: Aql;
   /** the custom AQL limits, µs */
   aqlLow: string;
@@ -82,6 +94,7 @@ interface TuningData {
 }
 
 const defaults: TuningForm = {
+  ...knobDefaults,
   aql: 'default',
   aqlLow: '2500',
   aqlHigh: '5000',
@@ -99,8 +112,8 @@ const groLabels: Record<Gro, string> = {
   plain: 'Plain GRO',
   off: 'Off',
 };
-// the largest plain GRO packet: the kernel's 64 KB and three smaller ones
-const groSizes = ['', '32768', '16384', '8192'];
+// the largest plain GRO packet: automatic, the kernel's 64 KB and three smaller ones
+const groSizes = ['', '65536', '32768', '16384', '8192'];
 
 function sizeLabel(bytes: string | number): string {
   const n = Number(bytes === '' ? 65536 : bytes);
@@ -163,6 +176,7 @@ async function loadTuning(): Promise<TuningData> {
       udpFwd: udpFwd === '1' ? 'on' : udpFwd === '0' ? 'off' : 'auto',
       groMax: /^\d{4,5}$/.test(groMax) ? groMax : '',
       whole: wholeSetting(str(gro, 'whole')),
+      ...readKnobs((name, option) => str(section(name), option)),
     },
     milkflint,
     globals: globals?.['.name'],
@@ -215,6 +229,11 @@ function meaning(f: TuningForm, data: TuningData | undefined): string {
     f.udpFwd,
     f.groMax,
     f.whole,
+    f.wifiAll,
+    f.ringsRt,
+    f.rxDelay,
+    f.ecnDrop,
+    f.retries,
   ]);
 }
 
@@ -265,16 +284,24 @@ function sectionChanges(config: string, sections: Section[], name: string, optio
 function toChanges(f: TuningForm, data: TuningData): Change[] {
   const was = data.form;
   const changes: Change[] = [];
-  if (aqlValue(f) !== aqlValue(was)) {
-    changes.push(...sectionChanges('milkflint', data.milkflint, 'wifi', { aql_be: aqlValue(f) }));
+  const knobs = knobOptions(f);
+  const knobsChanged = knobSectionsChanged(f, was);
+  if (aqlValue(f) !== aqlValue(was) || knobsChanged.has('wifi')) {
+    changes.push(...sectionChanges('milkflint', data.milkflint, 'wifi', { aql_be: aqlValue(f), ...knobs.wifi }));
   }
-  if (f.steering !== was.steering) {
+  if (f.steering !== was.steering || knobsChanged.has('steering')) {
     changes.push(
       ...sectionChanges('milkflint', data.milkflint, 'steering', {
         layout: f.steering === 'openwrt' ? 'openwrt' : undefined,
         rss: f.steering === 'rps' ? '0' : undefined,
+        ...knobs.steering,
       }),
     );
+  }
+  if (knobsChanged.has('cake')) {
+    changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', knobs.cake));
+  }
+  if (f.steering !== was.steering) {
     // on or off is OpenWrt's own option: "0" is off, unset (its default) on
     if (f.steering === 'off') {
       changes.push(
@@ -364,6 +391,30 @@ function WorkCard({ live }: { live: { data: NetworkLive | undefined; error: unkn
   );
 }
 
+function SwitchRow({
+  id,
+  checked,
+  title,
+  hint,
+  onChange,
+}: {
+  id: string;
+  checked: boolean;
+  title: string;
+  hint: string;
+  onChange: (value: boolean) => void;
+}): ReactElement {
+  return (
+    <div className="flex items-start gap-3 rounded-lg border p-3 text-sm">
+      <Switch id={id} className="mt-0.5" checked={checked} onCheckedChange={onChange} />
+      <label htmlFor={id} className="flex flex-col gap-0.5">
+        <span className="font-medium">{title}</span>
+        <span className="text-xs text-muted-foreground">{hint}</span>
+      </label>
+    </div>
+  );
+}
+
 function SteeringCard({
   form,
   data,
@@ -417,6 +468,28 @@ function SteeringCard({
             );
           })}
         </div>
+        {form.steering === 'rss' && !rssMissing && (
+          <>
+            <SwitchRow
+              id="wifiAll"
+              checked={form.wifiAll}
+              title="Wi-Fi threads on every CPU"
+              hint="The Wi-Fi driver’s threads may run on CPU 0 too, so they wait less for a free CPU under load, for a little more CPU in all. Off keeps them on CPUs 1–3, with the receive rings."
+              onChange={(v) => {
+                set('wifiAll', v);
+              }}
+            />
+            <SwitchRow
+              id="ringsRt"
+              checked={form.ringsRt}
+              title="Internet receive threads first"
+              hint="The receive rings’ threads run as soon as they wake (real-time priority) instead of waiting behind other work on their CPU: shorter delays under load, for a little more CPU."
+              onChange={(v) => {
+                set('ringsRt', v);
+              }}
+            />
+          </>
+        )}
         {queue !== undefined && (
           <div className="flex items-start gap-3 rounded-lg border border-dashed p-3 text-sm">
             <Switch
@@ -449,8 +522,7 @@ function holdMs(bytes: number, kbit: number): string {
 }
 
 function groReason(port: GroPort): string {
-  if (port.offload) return 'flow offloading is on';
-  return port.whole ? 'flow offloading is off and Smart Queue takes GRO packets whole' : 'Smart Queue splits GRO packets';
+  return port.whole ? 'Smart Queue takes GRO packets whole' : 'Smart Queue splits GRO packets';
 }
 
 function groNow(port: GroPort): string {
@@ -478,13 +550,13 @@ function GroCard({
   const q = data.sqm;
   const plain = form.gro === 'plain' || (form.gro === 'auto' && port?.auto === 'plain');
   const groHint: Record<Gro, string> = {
-    auto: `Fraglist GRO while the firewall’s flow offloading is on, plain GRO when it’s off and Smart Queue takes GRO packets whole.${
+    auto: `Plain GRO, up to 16 KB a group, when Smart Queue takes GRO packets whole; fraglist GRO otherwise.${
       port === undefined ? '' : ` Now ${port.auto === 'plain' ? 'plain' : 'fraglist'}: ${groReason(port)}.`
     }`,
     fraglist:
-      'OpenWrt’s default: a group keeps its packets, so the Wi-Fi port only has to unchain them again. The cheapest with flow offloading on, for TCP and UDP alike.',
+      'OpenWrt’s default: a group keeps its packets, so the Wi-Fi port only has to unchain them again, and groups up to 64 KB. Taken whole, a group that size holds Smart Queue’s queue longer, and a ping waits behind it.',
     plain:
-      'The packets are merged into one. May save CPU with flow offloading off. With it on: no saving for TCP, and more CPU for UDP, which the Wi-Fi port has to copy and checksum apart.',
+      'The packets are merged into one, in groups no bigger than the largest GRO packet below. Smaller groups let pings and games through Smart Queue sooner. With flow offloading on, UDP costs more CPU (the Wi-Fi port copies and checksums it apart), so UDP GRO forwarding stays off.',
     off: 'Every packet goes through Smart Queue and the firewall on its own: far more CPU. For troubleshooting.',
   };
   return (
@@ -528,7 +600,7 @@ function GroCard({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="auto">Automatic: on with plain GRO (default)</SelectItem>
+              <SelectItem value="auto">Automatic: on with plain GRO while flow offloading is off (default)</SelectItem>
               <SelectItem value="on">On</SelectItem>
               <SelectItem value="off">Off</SelectItem>
             </SelectContent>
@@ -581,7 +653,7 @@ function GroCard({
             <SelectContent>
               {[...groSizes, ...(groSizes.includes(form.groMax) ? [] : [form.groMax])].map((v) => (
                 <SelectItem key={v === '' ? 'default' : v} value={v === '' ? 'default' : v}>
-                  {v === '' ? '64 KB (default)' : sizeLabel(v)}
+                  {v === '' ? 'Automatic: 16 KB when Smart Queue takes groups whole, else 64 KB (default)' : sizeLabel(v)}
                 </SelectItem>
               ))}
             </SelectContent>
@@ -593,6 +665,92 @@ function GroCard({
             <InfoRow label="Smart Queue">{port.whole ? 'takes GRO packets whole' : 'splits GRO packets'}</InfoRow>
             <InfoRow label="Flow offloading">{port.offload ? 'on (Firewall)' : 'off (Firewall)'}</InfoRow>
           </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function InterruptCard({
+  form,
+  status,
+  set,
+}: {
+  form: TuningForm;
+  status: TuningStatus | undefined;
+  set: <K extends keyof TuningForm>(key: K, value: TuningForm[K]) => void;
+}): ReactElement {
+  const now = status?.knobs.rx_delay;
+  const choices = [...rxDelayChoices, ...(rxDelayChoices.includes(form.rxDelay) ? [] : [form.rxDelay])];
+  return (
+    <Card>
+      <CardHeading
+        icon={EthernetPortIcon}
+        title="Receive interrupts"
+        description="How long the Ethernet may hold back an interrupt to collect more packets before a CPU handles them."
+      />
+      <CardContent className="divide-y">
+        <Field
+          id="rxDelay"
+          label="Longest delay"
+          hint="Shorter: received packets reach their CPU sooner, so pings and games wait less while something downloads, for more interrupts and a little more CPU under load. One setting for every port."
+        >
+          <Select
+            value={form.rxDelay === '' ? 'default' : form.rxDelay}
+            onValueChange={(v) => {
+              set('rxDelay', v === 'default' ? '' : v);
+            }}
+          >
+            <SelectTrigger id="rxDelay">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {choices.map((v) => (
+                <SelectItem key={v === '' ? 'default' : v} value={v === '' ? 'default' : v}>
+                  {v === '' ? `${rxDelayLabel('')} (default)` : v === '0' ? 'No limit: the driver’s own choice, up to 260 µs' : rxDelayLabel(v)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        {status !== undefined && (
+          <InfoRow label="In use now">{now === null || now === undefined ? 'Not in this image' : rxDelayLabel(now)}</InfoRow>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function EcnCard({
+  form,
+  status,
+  set,
+}: {
+  form: TuningForm;
+  status: TuningStatus | undefined;
+  set: <K extends keyof TuningForm>(key: K, value: TuningForm[K]) => void;
+}): ReactElement {
+  return (
+    <Card>
+      <CardHeading
+        icon={GaugeIcon}
+        title="Smart Queue: ECN"
+        description="How Smart Queue (CAKE) treats downloads that ask to be slowed by marks (ECN) rather than drops."
+      />
+      <CardContent className="flex flex-col gap-3">
+        <SwitchRow
+          id="ecnDrop"
+          checked={form.ecnDrop}
+          title="Drop from downloads that ignore the marks"
+          hint="Some servers answer Smart Queue’s marks and keep sending as fast as before, so their queue stays long. Those downloads are then dropped from, as one without ECN is, and slow down; they may be a little slower. L4S traffic is always marked."
+          onChange={(v) => {
+            set('ecnDrop', v);
+          }}
+        />
+        {status !== undefined && (
+          <div className="border-t">
+            <InfoRow label="In use now">{ecnNow(status.knobs.cake_ecn, status.knobs.cake_loaded)}</InfoRow>
+          </div>
         )}
       </CardContent>
     </Card>
@@ -613,17 +771,18 @@ function AqlCard({
   const radios = status?.radios ?? [];
   const first = radios[0];
   const same = first !== undefined && radios.every((r) => r.low === first.low && r.high === first.high);
+  const retriesNow = status?.knobs.wifi_retries ?? null;
   return (
     <Card>
       <CardHeading
         icon={WifiIcon}
-        title="Wi-Fi queue (AQL)"
-        description="How much airtime of best-effort traffic each device may have waiting in the Wi-Fi driver."
+        title="Wi-Fi driver"
+        description="How much airtime of best-effort traffic each device may have waiting in the Wi-Fi driver (AQL), and how often it sends a frame."
       />
       <CardContent className="divide-y">
         <Field
           id="aql"
-          label="Limit"
+          label="Queue limit (AQL)"
           hint="Shorter keeps latency down when a device’s Wi-Fi is slower than the download. Every radio takes it at once."
         >
           <Select
@@ -670,14 +829,38 @@ function AqlCard({
             </Field>
           </>
         )}
+        <Field
+          id="retries"
+          label="Sends per frame"
+          hint="How many times the driver sends a data frame before it gives up on it. Fewer: when the air is busy, a device’s later frames wait less behind one that keeps failing, and TCP resends what was given up. For a crowded neighbourhood; otherwise leave it."
+        >
+          <Select
+            value={form.retries === '' ? 'default' : form.retries}
+            onValueChange={(v) => {
+              set('retries', v === 'default' ? '' : v);
+            }}
+          >
+            <SelectTrigger id="retries">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[...retryChoices, ...(retryChoices.includes(form.retries) ? [] : [form.retries])].map((v) => (
+                <SelectItem key={v === '' ? 'default' : v} value={v === '' ? 'default' : v}>
+                  {v === '' ? `${retriesLabel('')} (default, as stock)` : retriesLabel(v)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        {retriesNow !== null && <InfoRow label="Sends in use now">{retriesLabel(retriesNow)}</InfoRow>}
         {status !== undefined &&
           (same || first === undefined ? (
-            <InfoRow label={radios.length > 1 ? `In use now, ${String(radios.length)} radios` : 'In use now'}>
+            <InfoRow label={radios.length > 1 ? `Queue limit in use now, ${String(radios.length)} radios` : 'Queue limit in use now'}>
               {first === undefined ? 'no radios' : `${formatNumber(first.low)} / ${formatNumber(first.high)} µs`}
             </InfoRow>
           ) : (
             radios.map((r) => (
-              <InfoRow key={r.phy} label={`In use now, ${r.phy}`}>
+              <InfoRow key={r.phy} label={`Queue limit in use now, ${r.phy}`}>
                 {formatNumber(r.low)} / {formatNumber(r.high)} µs
               </InfoRow>
             ))
@@ -789,8 +972,6 @@ export function TuningPage(): ReactElement {
   };
   const dirty = edit !== undefined && data !== undefined && meaning(edit, data) !== meaning(data.form, data);
   const atDefaults = data !== undefined && meaning(data.form, data) === meaning(defaults, data);
-  // GRO settings beat the default only without flow offloading
-  const showGro = data !== undefined && (!data.offload || groChanged(data.form));
   const applying = state.phase === 'applying';
 
   const restore = (): void => {
@@ -803,9 +984,7 @@ export function TuningPage(): ReactElement {
     <>
       <PageHeader
         title="Performance Tuning"
-        description={`How the router handles heavy traffic: which CPUs do the network work${
-          showGro ? ', how the internet port groups what it receives,' : ''
-        } and the Wi-Fi driver’s queue. Changes apply at once; Wi-Fi and the internet stay up.`}
+        description="How the router handles heavy traffic: which CPUs do the network work, how the internet port groups and hands over what it receives, how Smart Queue treats ECN, and the Wi-Fi driver. Changes apply at once; Wi-Fi and the internet stay up."
         actions={
           <Button
             variant="outline"
@@ -829,7 +1008,9 @@ export function TuningPage(): ReactElement {
         ) : (
           <div className="grid items-start gap-4 xl:grid-cols-2">
             <SteeringCard form={form} data={data} live={live.data} set={set} />
-            {showGro && <GroCard form={form} data={data} port={status.data?.gro[0]} set={set} />}
+            <GroCard form={form} data={data} port={status.data?.gro[0]} set={set} />
+            <InterruptCard form={form} status={status.data} set={set} />
+            <EcnCard form={form} status={status.data} set={set} />
             <AqlCard form={form} errors={errors} status={status.data} set={set} />
             <WaitsCard status={status.data} live={live.data} />
           </div>
@@ -858,10 +1039,23 @@ export function TuningPage(): ReactElement {
             <ul className="flex flex-col gap-2 text-sm">
               <RestoreItem label="Wi-Fi queue" to={aqlLabel(defaults)} from={data.form.aql === 'default' ? undefined : aqlLabel(data.form)} />
               <RestoreItem
+                label="Wi-Fi sends per frame"
+                to={retriesLabel(defaults.retries)}
+                from={data.form.retries === defaults.retries ? undefined : retriesLabel(data.form.retries)}
+              />
+              <RestoreItem
                 label="Packet steering"
                 to={steeringOptions[defaults.steering].label}
                 from={data.form.steering === defaults.steering ? undefined : steeringOptions[data.form.steering].label}
               />
+              <RestoreItem label="Wi-Fi threads on every CPU" to="On" from={data.form.wifiAll ? undefined : 'Off'} />
+              <RestoreItem label="Internet receive threads first" to="On" from={data.form.ringsRt ? undefined : 'Off'} />
+              <RestoreItem
+                label="Longest receive interrupt delay"
+                to={rxDelayLabel(defaults.rxDelay)}
+                from={data.form.rxDelay === defaults.rxDelay ? undefined : rxDelayLabel(data.form.rxDelay)}
+              />
+              <RestoreItem label="Smart Queue drops downloads that ignore ECN marks" to="On" from={data.form.ecnDrop ? undefined : 'Off'} />
               {queueSwitch(defaults, data) !== undefined && (
                 <RestoreItem label="Smart Queue" to="multi-queue CAKE" from="single-queue CAKE" />
               )}
@@ -877,7 +1071,7 @@ export function TuningPage(): ReactElement {
                     to="Automatic"
                     from={data.form.udpFwd === defaults.udpFwd ? undefined : data.form.udpFwd === 'on' ? 'On' : 'Off'}
                   />
-                  <RestoreItem label="Largest GRO packet" to="64 KB" from={data.form.groMax === '' ? undefined : sizeLabel(data.form.groMax)} />
+                  <RestoreItem label="Largest GRO packet" to="Automatic" from={data.form.groMax === '' ? undefined : sizeLabel(data.form.groMax)} />
                   <RestoreItem
                     label="Smart Queue takes GRO packets whole"
                     to="Automatic: from 500 Mbit/s"

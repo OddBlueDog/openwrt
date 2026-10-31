@@ -88,6 +88,9 @@ load_config_param() {
 		append_param_arg "cache" "size" "--cache-size"
 		append_param_arg "cache" "min_ttl" "--cache-min-ttl"
 		append_param_arg "cache" "max_ttl" "--cache-max-ttl"
+		# MilkFlint: how long an expired answer may still be given out with
+		# cache_optimistic, a duration ("12h", dnsproxy's default)
+		append_param_arg "cache" "optimistic_max_age" "--optimistic-max-age"
 	}
 
 	is_enabled "dns64" "enabled" && {

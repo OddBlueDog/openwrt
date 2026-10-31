@@ -3,8 +3,8 @@
 # everything it adds to the devices' lines (channel use, MU/OFDMA, 802.11k,
 # Network Quality; an older config without these options has them on too);
 # the radar log on; the logs kept across reboots only once that's turned
-# on; 3 MB per log. The debug log's counters and snapshots are off: they're
-# for chasing a dropout.
+# on; 3 MB per log. The debug log's counters and snapshots and the DNS log
+# are off: they're for chasing a dropout or slow lookups.
 [ -f /etc/config/milkflint ] || touch /etc/config/milkflint
 if ! uci -q get milkflint.logs > /dev/null; then
 	uci -q batch <<-UCI
@@ -20,6 +20,7 @@ if ! uci -q get milkflint.logs > /dev/null; then
 		set milkflint.logs.radar='1'
 		set milkflint.logs.debug_counters='0'
 		set milkflint.logs.debug_snapshot='0'
+		set milkflint.logs.dns='0'
 		commit milkflint
 	UCI
 fi

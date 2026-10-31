@@ -1,0 +1,29 @@
+#!/bin/sh
+# The longest the Ethernet's receive interrupt is held back for more
+# packets, from milkflint.steering.rx_delay: microseconds, 0 for no limit
+# (the driver's adaptive moderation picks, up to 260 µs), unset for
+# MilkFlint's 40. Shorter: received packets wait less for their CPU, for a
+# few more interrupts under load. The driver (mtk_eth's rx_dim_max_us) takes
+# it at its next moderation step, within milliseconds under traffic.
+# milkflint-tuning runs this at boot and when the setting changes.
+#
+#   rx-delay
+
+DEFAULT=40
+P=/sys/module/mtk_eth/parameters/rx_dim_max_us
+
+# an image without the parameter (mtk_eth_soc 990-14) has nothing to set
+[ -w "$P" ] || exit 0
+us=$(uci -q get milkflint.steering.rx_delay)
+case "$us" in
+'') us=$DEFAULT ;;
+*[!0-9]*)
+	logger -t milkflint-tuning "milkflint.steering.rx_delay isn't a number of µs: using $DEFAULT"
+	us=$DEFAULT
+	;;
+esac
+# as a plain number: the kernel would read 080 as octal
+us=$(expr "$us" + 0)
+[ "$us" -le 1000 ] || us=$DEFAULT
+echo "$us" > "$P"
+exit 0

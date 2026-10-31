@@ -1,8 +1,9 @@
 #!/usr/bin/ucode
 // MilkFlint network quality probe (procd service milkflint-network-quality, ui
 // feature "network-quality"). Every `interval` seconds it times a ping to
-// the WAN gateway, a ping to an internet target and a DNS lookup through the
-// upstream resolver, and keeps the last hour of samples in RAM for the
+// the WAN gateway, a ping to an internet target and a DNS lookup at each DNS
+// server devices use (dns_targets(): the DNS page's servers, else the
+// resolver the WAN gave us), and keeps the last hour of samples in RAM for the
 // milkflint.netquality rpcd object, with whether the gateway has ever
 // answered (many providers' gateways never answer pings: the page and the
 // log keeper leave those out rather than call them lost). Once a minute it
@@ -138,13 +139,54 @@ function gateway() {
 }
 
 // the first upstream resolver the WAN connection gave us (else dnsmasq)
-function dns_server() {
+function wan_dns_server() {
 	for (let line in split(readfile('/tmp/resolv.conf.d/resolv.conf.auto') ?? '', '\n')) {
 		const m = match(line, /^nameserver ([0-9.]+)/);
 		if (m)
 			return m[1];
 	}
 	return '127.0.0.1';
+}
+
+function as_list(v) {
+	return (type(v) == 'array') ? v : (v != null && v != '') ? [ v ] : [];
+}
+
+// The DNS servers devices' lookups go to, as the DNS page set them
+// (milkflint.dns.mode), each { key, host, addr }, at most four:
+// - encrypted: dnsproxy's upstreams, then its fallback, keyed by host name
+//   and asked over plain DNS at its address (one.one.one.one: 1.1.1.1,
+//   looked up through the router once an hour like the routes): the same
+//   resolver the encrypted lookups reach, without the encryption;
+// - static: the IPv4 servers dnsmasq forwards to;
+// - automatic (or anything else): the resolver the WAN connection gave us.
+function dns_targets() {
+	const c = cursor();
+	const mode = c.get('milkflint', 'dns', 'mode');
+	const out = [];
+	if (mode == 'encrypted' && c.get('dnsproxy', 'global', 'enabled') == '1') {
+		for (let url in [ ...as_list(c.get('dnsproxy', 'servers', 'upstream')), ...as_list(c.get('dnsproxy', 'servers', 'fallback')) ]) {
+			// a DNS stamp (sdns://) or an IPv6 address can't be asked this way
+			const m = match(url, /^(https|tls|quic):\/\/([A-Za-z0-9.-]+)/);
+			if (m && !length(filter(out, (t) => t.key == m[2])))
+				push(out, { key: m[2], host: m[2], addr: route_addr(m[2]) });
+		}
+	}
+	else if (mode == 'static') {
+		let servers = [];
+		c.foreach('dhcp', 'dnsmasq', (sec) => {
+			if (!length(servers))
+				servers = as_list(sec.server);
+		});
+		for (let sv in servers)
+			if (match(sv, /^[0-9.]+$/))
+				push(out, { key: sv, host: sv, addr: sv });
+	}
+	if (!length(out)) {
+		const ns = wan_dns_server();
+		push(out, { key: ns, host: ns, addr: ns });
+	}
+	return slice(out, 0, 4);
 }
 
 // time to resolve `domain` at `server`, in ms, or null on failure
@@ -203,7 +245,8 @@ function merge(stats) {
 function append(path, line) {
 	const fd = open(path, 'a');
 	if (fd) {
-		// numbers and fixed keys only, so without %J's spaces (~140 B a line)
+		// numbers, fixed keys and host names only, so without %J's spaces
+		// (~140 B a line, ~45 B more for each DNS server)
 		fd.write(replace(sprintf('%J', line), / /g, '') + '\n');
 		fd.close();
 	}
@@ -220,14 +263,16 @@ function record_quarter(line) {
 		const gw = merge(map(quarter_minutes, (m) => m.gateway));
 		if (gw != null)
 			ql.gateway = gw;
-		const routes = {};
-		for (let m in quarter_minutes)
-			for (let k, v in m.routes ?? {})
-				push(routes[k] ??= [], v);
-		if (length(routes)) {
-			ql.routes = {};
-			for (let k, v in routes)
-				ql.routes[k] = merge(v);
+		for (let field in [ 'routes', 'dns_servers' ]) {
+			const by = {};
+			for (let m in quarter_minutes)
+				for (let k, v in m[field] ?? {})
+					push(by[k] ??= [], v);
+			if (length(by)) {
+				ql[field] = {};
+				for (let k, v in by)
+					ql[field][k] = merge(v);
+			}
 		}
 		append(`${HISTORY}/${day_name(quarter)}-15m.jsonl`, ql);
 	}
@@ -252,6 +297,17 @@ function record_minute(t, rounds, s, with_gateway) {
 		line.routes = {};
 		for (let rt in s.routes)
 			line.routes[rt.key] = minute_stat(map(routed, (r) => r.routes[rt.key]));
+	}
+	// each DNS server over the rounds that asked it (the DNS page may have
+	// changed them during the minute)
+	const asked = {};
+	for (let r in rounds)
+		for (let k, v in r.dns_servers ?? {})
+			push(asked[k] ??= [], v);
+	if (length(asked)) {
+		line.dns_servers = {};
+		for (let k, v in asked)
+			line.dns_servers[k] = minute_stat(v);
 	}
 	mkdir(HISTORY);
 	append(`${HISTORY}/${day_name(t)}.jsonl`, line);
@@ -288,7 +344,7 @@ while (true) {
 	const keep = int(3600 / s.interval);
 	const started = now_ms();
 	const gw = gateway();
-	const ns = dns_server();
+	const dns_ts = dns_targets();
 	if (gw != null && gw != gw_addr) {
 		gw_addr = gw;
 		gw_answers = false;
@@ -301,8 +357,12 @@ while (true) {
 		t: time(),
 		gateway: gw_ms,
 		internet: ping(s.ping_target, 2),
-		dns: dns_lookup(s.dns_domain, ns)
+		dns_servers: {}
 	};
+	for (let d in dns_ts)
+		sample.dns_servers[d.key] = (d.addr != null) ? dns_lookup(s.dns_domain, d.addr) : null;
+	// the first (main) server's: the score's, the log keeper's
+	sample.dns = sample.dns_servers[dns_ts[0].key];
 	if (length(s.routes) && sample.t - route_at >= ROUTE_EVERY) {
 		route_at = sample.t;
 		sample.routes = route_round(s.routes);
@@ -321,7 +381,8 @@ while (true) {
 	writefile(STATE + '.tmp', sprintf('%J', {
 		interval: s.interval,
 		targets: {
-			gateway: gw, internet: s.ping_target, dns_server: ns, dns_domain: s.dns_domain,
+			gateway: gw, internet: s.ping_target, dns_server: dns_ts[0].addr ?? dns_ts[0].host, dns_domain: s.dns_domain,
+			dns_servers: dns_ts,
 			routes: map(s.routes, (r) => ({ key: r.key, label: r.label, host: r.host, addr: addrs[r.host]?.addr }))
 		},
 		resolver: resolv ? 'resolv' : 'nslookup',

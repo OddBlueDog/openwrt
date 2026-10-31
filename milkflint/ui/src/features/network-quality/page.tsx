@@ -20,8 +20,9 @@ import { cn } from '@/lib/utils';
 import { type Live, useLive, WINDOW_SECONDS } from './live';
 import { Button } from '@/components/ui/button';
 import { usePoll } from '@/hooks/use-poll';
-import { type Bucket, getHistory, type History, type Route, type Sample, type Stat } from './api';
-import { type Probe, type ProbeSummary, rating, summarize, summarizeRoute } from './score';
+import { type Bucket, type DnsTarget, getHistory, type History, type Route, type Sample, type Stat } from './api';
+import { type DnsLine, dnsLines, providerName } from './dns-lines';
+import { type Probe, type ProbeSummary, rating, summarize, summarizeDnsServer, summarizeRoute } from './score';
 import { ScoreRing } from './score-ring';
 
 const pingTargets = [
@@ -87,6 +88,23 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
 
 const ROUTE_EVERY = 30;
 const routeColors = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)'];
+// the DNS servers asked now: blue, amber, then paler ones (the probe asks
+// four at most); servers asked earlier in the span, and the line from before
+// the probe asked each, muted
+const dnsColors = [
+  'var(--chart-2)',
+  'var(--chart-4)',
+  'color-mix(in oklab, var(--chart-2) 55%, var(--muted-foreground))',
+  'color-mix(in oklab, var(--chart-4) 55%, var(--muted-foreground))',
+];
+const dnsColor = (l: DnsLine, order: readonly string[]): string =>
+  l.current ? (dnsColors[order.indexOf(l.key)] ?? 'var(--chart-2)') : 'var(--muted-foreground)';
+
+/** A DNS server's row: its provider's name when it's one of the DNS page's. */
+function dnsRowLabel(d: DnsTarget): string {
+  const name = providerName(d.key);
+  return name === undefined ? 'DNS lookup' : `DNS · ${name}`;
+}
 
 // The charts' time span: the last hour from the live samples, or the
 // probe's minute history merged into `step`-second buckets.
@@ -138,6 +156,8 @@ interface ChartData {
   description: string;
   /** Values for a probe (live samples or history buckets). */
   probe: (key: Probe) => (number | undefined)[];
+  /** A line per DNS server. */
+  dns: DnsLine[];
   route: (key: string) => (number | undefined)[];
   /** Epoch seconds of a slot of each chart, for hovering. */
   timeOf: (slot: number) => number | undefined;
@@ -152,7 +172,7 @@ const roundTime =
   (slot: number): number | undefined =>
     rounds[slot - (slots - rounds.length)]?.t;
 
-function liveChart(samples: readonly Sample[], interval: number): ChartData {
+function liveChart(samples: readonly Sample[], interval: number, dnsOrder: readonly string[]): ChartData {
   const rounds = samples.filter((s) => s.routes !== undefined);
   const slots = Math.round(3600 / interval);
   const routeSlots = Math.round(3600 / ROUTE_EVERY);
@@ -162,13 +182,19 @@ function liveChart(samples: readonly Sample[], interval: number): ChartData {
     spanLabel: '1 h',
     description: `Every ${String(interval)} s; gaps are probes with no answer`,
     probe: (key) => samples.map((s) => s[key] ?? undefined),
+    dns: dnsLines(
+      samples,
+      (s) => s.dns_servers,
+      (s) => s.dns,
+      dnsOrder,
+    ),
     route: (key) => rounds.map((s) => s.routes?.[key] ?? undefined),
     timeOf: roundTime(samples, slots),
     routeTimeOf: roundTime(rounds, routeSlots),
   };
 }
 
-function historyChart(span: Span, history: History | undefined, loading: boolean): ChartData {
+function historyChart(span: Span, history: History | undefined, loading: boolean, dnsOrder: readonly string[]): ChartData {
   const empty = (): (number | undefined)[] => [];
   const description = `Typical per ${String((span.step ?? 60) / 60)} min over the last ${span.label}; gaps: no answer or not recorded`;
   if (history === undefined) {
@@ -179,6 +205,7 @@ function historyChart(span: Span, history: History | undefined, loading: boolean
       spanLabel: span.spanLabel,
       description,
       probe: empty,
+      dns: [],
       route: empty,
       timeOf: () => undefined,
       routeTimeOf: () => undefined,
@@ -187,12 +214,20 @@ function historyChart(span: Span, history: History | undefined, loading: boolean
   }
   const slots = Math.round((history.now - history.start) / history.step);
   const timeOf = (slot: number): number => history.start + slot * history.step;
+  const bySlot: (Bucket | undefined)[] = Array.from({ length: slots }, () => undefined);
+  for (const b of history.buckets) if (b.i < slots) bySlot[b.i] = b;
   return {
     slots,
     routeSlots: slots,
     spanLabel: span.spanLabel,
     description,
     probe: (key) => historySeries(history, (b) => b[key]),
+    dns: dnsLines(
+      bySlot,
+      (b) => (b?.dns_servers === undefined ? undefined : Object.fromEntries(Object.entries(b.dns_servers).map(([k, v]) => [k, v?.[0] ?? null]))),
+      (b) => b?.dns?.[0],
+      dnsOrder,
+    ),
     route: (key) => historySeries(history, (b) => b.routes?.[key]),
     timeOf,
     routeTimeOf: timeOf,
@@ -280,7 +315,15 @@ function Results({ live }: { live: Live }): ReactElement {
     60_000,
     span.key,
   );
-  const chart = span.step === undefined ? liveChart(samples, interval) : historyChart(span, history.data, history.loading);
+  const dnsTargets = targets?.dns_servers ?? [];
+  const dnsOrder = dnsTargets.map((d) => d.key);
+  const chart = span.step === undefined ? liveChart(samples, interval, dnsOrder) : historyChart(span, history.data, history.loading, dnsOrder);
+  // the latency chart's lines: internet, each DNS server, the gateway
+  const lines = [
+    { label: 'Internet', color: 'var(--chart-1)', values: chart.probe('internet') },
+    ...chart.dns.map((l) => ({ label: l.key === '' ? l.label : `DNS · ${l.label}`, color: dnsColor(l, dnsOrder), values: l.values })),
+    { label: 'Gateway', color: 'var(--chart-3)', values: chart.probe('gateway') },
+  ];
   const picker = <SpanPicker span={span} onChange={setSpan} />;
 
   if (samples.length === 0) {
@@ -327,25 +370,44 @@ function Results({ live }: { live: Live }): ReactElement {
           <CardHeading icon={ActivityIcon} title="Response times" description="Typical values over the last 5 minutes" />
           <CardContent>
             <div className="divide-y">
-              {probes.map((p) => (
-                <ProbeBar
-                  key={p.key}
-                  label={p.label}
-                  scaleMs={p.scaleMs}
-                  summary={summary.probes[p.key]}
-                  silent={p.key === 'gateway' && summary.gatewaySilent}
-                  target={
-                    p.key === 'gateway'
-                      ? (targets?.gateway ?? undefined)
-                      : p.key === 'internet'
-                        ? targets?.internet
-                        : targets === null
-                          ? undefined
-                          : `${targets.dns_domain} @ ${targets.dns_server}`
-                  }
-                />
-              ))}
+              {probes.map((p) =>
+                p.key === 'dns' && dnsTargets.length > 0 && recent.some((s) => s.dns_servers !== undefined) ? (
+                  // a row per DNS server the DNS page uses
+                  dnsTargets.map((d) => (
+                    <ProbeBar
+                      key={`dns:${d.key}`}
+                      label={dnsRowLabel(d)}
+                      scaleMs={p.scaleMs}
+                      summary={summarizeDnsServer(recent, d.key)}
+                      target={`${targets?.dns_domain ?? ''} @ ${d.addr ?? d.host}`}
+                    />
+                  ))
+                ) : (
+                  <ProbeBar
+                    key={p.key}
+                    label={p.label}
+                    scaleMs={p.scaleMs}
+                    summary={summary.probes[p.key]}
+                    silent={p.key === 'gateway' && summary.gatewaySilent}
+                    target={
+                      p.key === 'gateway'
+                        ? (targets?.gateway ?? undefined)
+                        : p.key === 'internet'
+                          ? targets?.internet
+                          : targets === null
+                            ? undefined
+                            : `${targets.dns_domain} @ ${targets.dns_server}`
+                    }
+                  />
+                ),
+              )}
             </div>
+            {dnsTargets.length > 1 && (
+              <p className="pt-2 text-xs text-muted-foreground">
+                Each DNS server is asked over plain DNS at its address, the same server your encrypted lookups reach; the score uses the
+                first.
+              </p>
+            )}
             {summary.gatewaySilent && (
               <p className="pt-2 text-xs text-muted-foreground">
                 The gateway doesn&apos;t answer pings (common with providers), so it&apos;s left out of the score.
@@ -365,11 +427,7 @@ function Results({ live }: { live: Live }): ReactElement {
         <CardHeading icon={ActivityIcon} title="Latency" description={chart.description} action={picker} />
         <CardContent>
           <div className="mb-3 flex flex-wrap gap-5 text-xs text-muted-foreground">
-            {[
-              { label: 'Internet', color: 'var(--chart-1)' },
-              { label: 'DNS', color: 'var(--chart-2)' },
-              { label: 'Gateway', color: 'var(--chart-3)' },
-            ].map((l) => (
+            {lines.map((l) => (
               <span key={l.label} className="flex items-center gap-1.5">
                 <span className="size-2 rounded-full" style={{ background: l.color }} />
                 {l.label}
@@ -387,11 +445,7 @@ function Results({ live }: { live: Live }): ReactElement {
               hoverFormat={ms}
               timeOf={chart.timeOf}
               minMax={50}
-              series={[
-                { label: 'Internet', color: 'var(--chart-1)', values: chart.probe('internet') },
-                { label: 'DNS', color: 'var(--chart-2)', values: chart.probe('dns') },
-                { label: 'Gateway', color: 'var(--chart-3)', values: chart.probe('gateway') },
-              ]}
+              series={lines}
             />
           )}
         </CardContent>
@@ -502,7 +556,7 @@ export function NetworkQualityPage(): ReactElement {
           <Alert variant="info">
             <RadarIcon />
             <AlertTitle>Network Quality is off</AlertTitle>
-            <AlertDescription>Turn it on to measure latency continuously. It sends one small ping and one DNS query per round, and a ping each to three test servers once a minute.</AlertDescription>
+            <AlertDescription>Turn it on to measure latency continuously. It sends one small ping and a DNS query to each DNS server per round, and a ping each to three test servers once a minute.</AlertDescription>
           </Alert>
         )}
 
@@ -545,7 +599,12 @@ export function NetworkQualityPage(): ReactElement {
                   />
                 </Field>
               )}
-              <Field id="nq-dns" label="DNS test domain" hint="Looked up through your internet provider's DNS server." error={errors.dnsDomain}>
+              <Field
+                id="nq-dns"
+                label="DNS test domain"
+                hint="Looked up at each DNS server the DNS page uses, or your internet provider's when DNS is Automatic."
+                error={errors.dnsDomain}
+              >
                 <Input
                   id="nq-dns"
                   className="font-mono"

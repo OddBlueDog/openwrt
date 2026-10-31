@@ -1,5 +1,7 @@
-# MilkFlint: a shorter Wi-Fi hardware queue for best-effort traffic, on every
-# radio as it appears (at boot, or when the driver loads again).
+# MilkFlint: a shorter Wi-Fi hardware queue for best-effort traffic, and the
+# Wi-Fi retry limit (milkflint.wifi.retries, /usr/libexec/milkflint/
+# wifi-retries), on every radio as it appears (at boot, or when the driver
+# loads again, which puts its retry limit back to 15).
 # Installed as /etc/hotplug.d/ieee80211/30-milkflint-aql; hotplug-call
 # sources it, so it returns rather than exits.
 #
@@ -27,4 +29,5 @@
 		i=$((i + 1))
 	done
 	/usr/libexec/milkflint/wifi-aql "$phy"
+	/usr/libexec/milkflint/wifi-retries
 ) > /dev/null 2>&1 &

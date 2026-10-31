@@ -1,6 +1,7 @@
 // rpcd plugin for the "logs" feature: the system log, the kernel log, the
 // Wi-Fi log, the radar log (the "wifi" feature's radar-log), the debug log
-// (counters and snapshots) and the kernel's last crash reports (pstore).
+// (counters and snapshots), the DNS log and the kernel's last crash reports
+// (pstore).
 // With milkflint.logs.persist on, the system and kernel logs come from the
 // copy /usr/libexec/milkflint/logs-keeper keeps on the router's storage,
 // which goes back past the last reboot.
@@ -37,7 +38,8 @@ function settings() {
 		net: s.wifi_net != '0',
 		radar: s.radar != '0',
 		counters: s.debug_counters == '1',
-		snapshot: s.debug_snapshot == '1'
+		snapshot: s.debug_snapshot == '1',
+		dns: s.dns == '1'
 	};
 }
 
@@ -89,7 +91,7 @@ return {
 				const n = (type(req.args.lines) == 'int' && req.args.lines > 0 && req.args.lines <= 5000) ? req.args.lines : 500;
 				const s = settings();
 				const kind = req.args.kind;
-				if (kind == 'wifi' || kind == 'debug')
+				if (kind == 'wifi' || kind == 'debug' || kind == 'dns')
 					return { lines: tail(`${s.persist ? DISK : RAM}/${kind}.log`, n) };
 				// "<ctime> [<epoch>.<ms>] <interface>: <event>": without the
 				// epoch, which is only there for the radar log's own restarts
@@ -102,7 +104,13 @@ return {
 						return { lines: run(`cat ${DISK}/system.log.old ${DISK}/system.log | grep ' kernel: ' | tail -n ${n}`) };
 					return { lines: tail(DISK + '/system.log', n) };
 				}
-				return { lines: run((kind == 'kernel') ? `dmesg | tail -n ${n}` : `logread -l ${n}`) };
+				if (kind == 'kernel')
+					return { lines: run(`dmesg | tail -n ${n}`) };
+				// with the DNS log on, dnsmasq logs every lookup: the keeper
+				// keeps those out of system.log, and they're left out here
+				if (s.dns)
+					return { lines: run(`logread | grep -v -E ' dnsmasq\\[[0-9]+\\]: [0-9]+ [^ ]+/[0-9]+ ' | tail -n ${n}`) };
+				return { lines: run(`logread -l ${n}`) };
 			}
 		},
 		// where the logs are kept, how big they are, and whether the keeper runs
@@ -130,12 +138,14 @@ return {
 					radar: s.radar,
 					counters: s.counters,
 					snapshot: s.snapshot,
+					dns: s.dns,
 					recording,
 					dir: s.persist ? DISK : RAM,
 					system_bytes: s.persist ? bytes(DISK + '/system.log') : null,
 					wifi_bytes: s.wifi ? bytes(`${s.persist ? DISK : RAM}/wifi.log`) : null,
 					radar_bytes: s.radar ? bytes(RADAR) : null,
 					debug_bytes: (s.counters || s.snapshot) ? bytes(`${s.persist ? DISK : RAM}/debug.log`) : null,
+					dns_bytes: s.dns ? bytes(`${s.persist ? DISK : RAM}/dns.log`) : null,
 					crash_reports: length(filter(crash_files(), (f) => match(f, /^dmesg/)))
 				};
 			}
