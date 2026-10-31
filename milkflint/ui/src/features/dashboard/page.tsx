@@ -16,6 +16,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ipv4 } from '@/lib/api/network';
 import { firmwareName } from '@/lib/api/system';
+import { useRouterMode } from '@/lib/router-mode';
 import { formatBitrate, formatBytes, formatDuration, formatPercent } from '@/lib/format';
 import { errorMessage } from '@/lib/utils';
 import { ClientsCard } from './clients-card';
@@ -52,7 +53,10 @@ function StatCards({ d }: { d: Dashboard }): ReactElement {
   const latest = d.history[d.history.length - 1];
   const bands = new Map<string, number>();
   for (const c of d.clients) bands.set(c.band ?? 'Other', (bands.get(c.band ?? 'Other') ?? 0) + 1);
-  const online = d.wan?.up === true;
+  // in access point mode the way out is the LAN, to the main router
+  const ap = useRouterMode() === 'ap';
+  const gateway = d.lan?.route?.find((r) => r.target === '0.0.0.0' && r.mask === 0)?.nexthop;
+  const online = ap ? d.lan?.up === true && gateway !== undefined : d.wan?.up === true;
 
   return (
     <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -116,17 +120,21 @@ function StatCards({ d }: { d: Dashboard }): ReactElement {
 
       <StatCard
         icon={GlobeIcon}
-        title="Internet"
+        title={ap ? 'Main router' : 'Internet'}
         value={
           <span className="flex items-center gap-2">
             <span className={online ? 'size-2.5 rounded-full bg-success' : 'size-2.5 rounded-full bg-destructive'} />
-            {online ? 'Online' : 'Offline'}
+            {ap ? (online ? 'Connected' : 'Not connected') : online ? 'Online' : 'Offline'}
           </span>
         }
         detail={
-          online
-            ? `${ipv4(d.wan) ?? 'no IPv4'} · up ${formatDuration(d.wan?.uptime ?? 0)}`
-            : `WAN ${d.wan === undefined ? 'not configured' : 'down'}`
+          ap
+            ? online
+              ? `${ipv4(d.lan) ?? 'no IPv4'} · via ${gateway ?? ''}`
+              : 'No address from it yet'
+            : online
+              ? `${ipv4(d.wan) ?? 'no IPv4'} · up ${formatDuration(d.wan?.uptime ?? 0)}`
+              : `WAN ${d.wan === undefined ? 'not configured' : 'down'}`
         }
         spark={d.history.map((s) => s.wanDown)}
         sparkMax={Math.max(1, ...d.history.map((s) => s.wanDown ?? 0))}

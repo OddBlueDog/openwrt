@@ -28,5 +28,7 @@ export interface Feature {
   group?: GroupId;
   /** Position within its group (or in the menu, among top-level pages and groups). */
   order: number;
+  /** Only for the main router: out of the menu in access point mode, where another router does it. */
+  routerOnly?: true;
   page: LazyExoticComponent<ComponentType>;
 }

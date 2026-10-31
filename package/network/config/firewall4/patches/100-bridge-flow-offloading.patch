@@ -1,0 +1,148 @@
+From: MilkFlint <milkflint@localhost>
+Date: Sat, 31 Oct 2026 12:00:00 +0000
+Subject: [PATCH] firewall4: offload what the bridges forward (flow_offloading_bridge)
+
+With the defaults section's flow_offloading_bridge set, the ruleset gets a
+bridge table: a bridge flow table (no devices: the kernel's covers every
+bridge) and a forward chain that adds TCP and UDP connections to it, so
+what a bridge forwards from one port to another takes the kernel's
+software fast path. Off (the default), an existing table goes. It's
+independent of flow_offloading, so an access point can have it without
+routed offloading, and a router the other way round.
+
+The kernel's support is checked first, as for hardware offloading: without
+it the option is ignored with a warning and the ruleset loads as before.
+fw4 stop deletes the bridge table along with the inet one.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/root/sbin/fw4
++++ b/root/sbin/fw4
+@@ -50,6 +50,7 @@
+ 		flock -x 1000
+ 
+ 		nft delete table inet fw4
++		nft list table bridge fw4 >/dev/null 2>&1 && nft delete table bridge fw4
+ 		rm -f $STATE
+ 
+ 	} 1000>$LOCK
+--- a/root/usr/share/firewall4/templates/ruleset.uc
++++ b/root/usr/share/firewall4/templates/ruleset.uc
+@@ -1,5 +1,6 @@
+ {%
+ 	let flowtable_devices = fw4.resolve_offload_devices();
++	let bridge_offload = fw4.resolve_bridge_offload();
+ 	let available_helpers = filter(fw4.helpers(), h => h.available);
+ 	let defined_ipsets = fw4.ipsets();
+ 	let zones_with_limits = filter(fw4.zones(), z => z.log_limit);
+@@ -469,4 +470,31 @@
+ 	}
+ {% fw4.includes('table-append') %}
+ }
++{% if (bridge_offload): %}
++
++table bridge fw4
++flush table bridge fw4
++{%  if (fw4.check_bridge_flowtable()): %}
++delete flowtable bridge fw4 ft
++{%  endif %}
++
++table bridge fw4 {
++	#
++	# Flowtable: connections a bridge forwards from one port to another
++	#
++
++	flowtable ft {
++		hook ingress priority 0;
++		counter;
++	}
++
++	chain forward {
++		type filter hook forward priority filter; policy accept;
++		meta l4proto { tcp, udp } flow add @ft;
++	}
++}
++{% elif (fw4.check_bridge_table()): %}
++
++delete table bridge fw4
++{% endif %}
+ {% fw4.includes('ruleset-append') %}
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -489,7 +489,24 @@
+ 	return (rc == 0);
+ }
+ 
++function nft_try_bridge_offload() {
++	let nft_test = `
++		add table bridge fw4-bridge-offload-test;
++		add flowtable bridge fw4-bridge-offload-test ft {
++			hook ingress priority 0;
++		}
++		add chain bridge fw4-bridge-offload-test forward {
++			type filter hook forward priority filter;
++		}
++		add rule bridge fw4-bridge-offload-test forward meta l4proto { tcp, udp } flow add @ft
++	`;
+ 
++	let rc = system(`/usr/sbin/nft -c '${replace(nft_test, "'", "'\\''")}' 2>/dev/null`);
++
++	return (rc == 0);
++}
++
++
+ return {
+ 	read_kernel_version: function() {
+ 		let fd = fs.open("/proc/version", "r"),
+@@ -557,6 +574,20 @@
+ 		return devices;
+ 	},
+ 
++	resolve_bridge_offload: function() {
++		if (!this.default_option("flow_offloading_bridge"))
++			return false;
++
++		if (!nft_try_bridge_offload()) {
++			this.warn('Bridge flow offloading unavailable');
++			this.state.defaults.flow_offloading_bridge = false;
++
++			return false;
++		}
++
++		return true;
++	},
++
+ 	check_set_types: function() {
+ 		let sets = {};
+ 
+@@ -575,6 +606,22 @@
+ 		return false;
+ 	},
+ 
++	check_bridge_table: function() {
++		for (let item in nft_json_command("list", "tables"))
++			if (item.table?.family == "bridge" && item.table?.name == "fw4")
++				return true;
++
++		return false;
++	},
++
++	check_bridge_flowtable: function() {
++		for (let item in nft_json_command("list", "flowtables", "bridge"))
++			if (item.flowtable?.table == "fw4" && item.flowtable?.name == "ft")
++				return true;
++
++		return false;
++	},
++
+ 	read_state: function() {
+ 		let fd = fs.open(STATEFILE, "r");
+ 		let state = null;
+@@ -1971,6 +2018,7 @@
+ 			disable_ipv6: [ "bool", null, UNSUPPORTED ],
+ 			flow_offloading: [ "bool", "0" ],
+ 			flow_offloading_hw: [ "bool", "0" ],
++			flow_offloading_bridge: [ "bool", "0" ],
+ 
+ 			auto_includes: [ "bool", "1" ]
+ 		});

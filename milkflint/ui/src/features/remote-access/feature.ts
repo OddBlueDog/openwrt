@@ -9,5 +9,6 @@ export const feature = {
   icon: SmartphoneIcon,
   group: 'vpn',
   order: 10,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.RemoteAccessPage),
 } satisfies Feature;

@@ -28,9 +28,10 @@
 // - counters=1, snapshot=1 (debug_counters, debug_snapshot: off unless a
 //   dropout is being chased): the debug log, debug.log. counters=1 adds
 //   every `interval` seconds the load and the packets at each hop (CPU and
-//   softirqs per core, the network threads, interrupts, CAKE on eth1 and
-//   ifb4eth1, eth1's BQL, packets per interface), and once a minute the
-//   ceilings (conntrack, memory), eth1's link, the WAN and restarts of
+//   softirqs per core, the network threads, interrupts, CAKE on the WAN
+//   port (eth1 on the GL-MT6000) and its ifb, the WAN port's BQL, packets
+//   per interface), and once a minute the ceilings (conntrack, memory), the
+//   WAN port's link, the WAN and restarts of
 //   netifd, hostapd, dnsmasq and dnsproxy. snapshot=1 records everything at
 //   once, at most once a minute, when a Network Quality round loses the
 //   internet or DNS or a device gets NO TX.
@@ -86,6 +87,19 @@ const HALF = setting('size', 3, 1, 100) * 1024 * 1024 / 2;
 const INTERVAL = setting('interval', 10, 2, 300);
 const DIR = PERSIST ? DISK : RAM;
 const START_MS = time() * 1000;
+
+// the WAN port (`ports wan`: eth1 on the GL-MT6000, wan on the EX5601), whose
+// link, queues and CAKE the debug counters follow, and Smart Queue's ifb for
+// its downloads (before the functions that use them: a name declared later
+// is a global to them, undeclared)
+function wan_port() {
+	const p = popen('/usr/libexec/milkflint/ports wan 2>/dev/null', 'r');
+	const dev = trim(p?.read('all') ?? '');
+	p?.close();
+	return match(dev, /^[A-Za-z0-9_-]+$/) ? dev : 'eth1';
+}
+const WAN = wan_port();
+const IFB = 'ifb4' + WAN;
 
 // ---- the log files -------------------------------------------------------
 
@@ -218,7 +232,7 @@ function is_wifi(rest) {
 }
 
 // System log lines the debug counters copy, highlighted: services starting
-// again, the WAN going down or up, eth1's link.
+// again, the WAN going down or up, the WAN port's link.
 function notable(rest) {
 	const m = match(rest, /^[a-z0-9]+\.[a-z]+ ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
 	if (!m)
@@ -229,7 +243,7 @@ function notable(rest) {
 	if (tag == 'netifd')
 		return match(msg, /Interface 'wan6?' /) != null;
 	if (tag == 'kernel')
-		return match(msg, /eth1: Link is/) != null;
+		return index(msg, `${WAN}: Link is`) >= 0;
 	if (tag == 'dnsmasq')
 		return match(msg, /^started, version/) != null;
 	if (tag == 'dnsproxy')
@@ -805,7 +819,7 @@ function sections(text) {
 	return out;
 }
 
-const TC = "echo '@ eth1'; tc -s -j qdisc show dev eth1; echo; echo '@ ifb4eth1'; tc -s -j qdisc show dev ifb4eth1";
+const TC = `echo '@ ${WAN}'; tc -s -j qdisc show dev ${WAN}; echo; echo '@ ${IFB}'; tc -s -j qdisc show dev ${IFB}`;
 
 // per CPU, from /proc/stat: jiffies in all, idle (with iowait), irq, softirq
 function cpu_times() {
@@ -945,7 +959,7 @@ function irq_text(a, b, secs) {
 }
 
 // packets, errors and drops of each hop, from /proc/net/dev
-const HOPS = /^(eth1|ifb4eth1|br-lan|phy[0-9]+-ap[0-9]+)$/;
+const HOPS = regexp(`^(${WAN}|${IFB}|br-lan|phy[0-9]+-ap[0-9]+)$`);
 function if_counts() {
 	const out = {};
 	for (let l in lines_of('/proc/net/dev')) {
@@ -960,7 +974,7 @@ function if_counts() {
 
 // the hops in the order a download takes them
 function hop_rank(name) {
-	return (name == 'eth1') ? 0 : (name == 'ifb4eth1') ? 1 : (name == 'br-lan') ? 2 : 3;
+	return (name == WAN) ? 0 : (name == IFB) ? 1 : (name == 'br-lan') ? 2 : 3;
 }
 
 // "eth1 rx 1234 tx 567, ..., phy7-ap0 rx 480 tx 1150 (tx drop +3)" per
@@ -987,11 +1001,11 @@ function if_text(a, b, secs) {
 	return join(', ', parts);
 }
 
-// eth1's transmit queues, numbered
+// the WAN port's transmit queues, numbered
 let eth_queues = null;
-function eth1_queues() {
+function wan_queues() {
 	if (eth_queues == null)
-		eth_queues = sort(glob('/sys/class/net/eth1/queues/tx-*') ?? [], (x, y) => int(substr(x, index(x, 'tx-') + 3)) - int(substr(y, index(y, 'tx-') + 3)));
+		eth_queues = sort(glob(`/sys/class/net/${WAN}/queues/tx-*`) ?? [], (x, y) => int(substr(x, index(x, 'tx-') + 3)) - int(substr(y, index(y, 'tx-') + 3)));
 	return eth_queues;
 }
 
@@ -1000,7 +1014,7 @@ function eth1_queues() {
 // in flight while nothing goes out is a stalled transmitter
 function bql_text() {
 	const parts = [];
-	for (let q in eth1_queues()) {
+	for (let q in wan_queues()) {
 		const n = int(trim(readfile(q + '/byte_queue_limits/inflight') ?? '0'));
 		if (n > 0)
 			push(parts, sprintf('%s %d of %s B', substr(q, index(q, 'tx-')), n, trim(readfile(q + '/byte_queue_limits/limit') ?? '?')));
@@ -1008,19 +1022,19 @@ function bql_text() {
 	return join(', ', parts);
 }
 
-// the netdev watchdog's timeouts on eth1 (the driver reset a stuck queue)
+// the netdev watchdog's timeouts on the WAN port (the driver reset a stuck queue)
 function tx_timeouts() {
 	let n = 0;
-	for (let q in eth1_queues())
+	for (let q in wan_queues())
 		n += int(trim(readfile(q + '/tx_timeout') ?? '0'));
 	return n;
 }
 
-// CAKE on eth1 (upload) and ifb4eth1 (download), from `tc -s -j`: each
+// CAKE on the WAN port (upload) and its ifb (download), from `tc -s -j`: each
 // CAKE qdisc by "<dev> <parent>", and what each device's root is
 function cake_now(sec) {
 	const out = { q: {}, root: {} };
-	for (let dev in [ 'eth1', 'ifb4eth1' ]) {
+	for (let dev in [ WAN, IFB ]) {
 		let list = null;
 		try {
 			list = json(trim(sec[dev] ?? '') || '[]');
@@ -1072,7 +1086,7 @@ function cake_text(a, b, secs) {
 		push(parts, t);
 	}
 	if (!length(parts))
-		return length(keys(b.q)) ? 'idle' : 'no CAKE on eth1 or ifb4eth1';
+		return length(keys(b.q)) ? 'idle' : `no CAKE on ${WAN} or ${IFB}`;
 	return join('; ', parts);
 }
 
@@ -1145,7 +1159,7 @@ function service_label(k) {
 	return (inst == 'instance1' || inst == name) ? name : k;
 }
 
-// "1000Mb/s Full" from `ethtool eth1`
+// "1000Mb/s Full" from `ethtool <WAN port>`
 function link_speed(text) {
 	const s = match(text ?? '', /Speed: ([^\n]*)/), d = match(text ?? '', /Duplex: ([^\n]*)/);
 	return s ? (s[1] + (d ? ' ' + d[1] : '')) : null;
@@ -1153,13 +1167,13 @@ function link_speed(text) {
 
 let cnt = null;		// the counters at the last tick
 let cake_prev = null;	// CAKE's at the last tick that had them
-let slow = null;	// once a minute: eth1's link, the WAN, the services
+let slow = null;	// once a minute: the WAN port's link, the WAN, the services
 
 function counters(conn, minute) {
 	if (minute)
 		find_net_threads();
 	const now = { t: now_s(), cpu: cpu_times(), irq: irq_counts(), thr: proc_times(net_threads), sn: softnet(), ifs: if_counts() };
-	const out = bounded(TC + (minute ? "; echo; echo '@ link'; ethtool eth1" : ''), 2000);
+	const out = bounded(TC + (minute ? `; echo; echo '@ link'; ethtool ${WAN}` : ''), 2000);
 	const sec = (out != null) ? sections(out) : null;
 	const cake = (sec != null) ? cake_now(sec) : null;
 	const p = cnt;
@@ -1177,12 +1191,12 @@ function counters(conn, minute) {
 		debug_line(match(sn, /dropped/) ? 'warn' : 'info', 'counters', text + (sn != '' ? `; softnet ${sn}` : ''));
 		if (cake != null) {
 			const bql = bql_text();
-			debug_line('info', 'counters', `cake: ${cake_text(cake_prev, cake, now.t - (cake_prev?.t ?? now.t) || secs)}${bql != '' ? `; bql eth1 ${bql}` : ''}`);
+			debug_line('info', 'counters', `cake: ${cake_text(cake_prev, cake, now.t - (cake_prev?.t ?? now.t) || secs)}${bql != '' ? `; bql ${WAN} ${bql}` : ''}`);
 		}
 		debug_line('info', 'counters', `pkt/s: ${if_text(p.ifs, now.ifs, secs)}`);
 	}
 	if (cake != null) {
-		for (let dev in [ 'eth1', 'ifb4eth1' ])
+		for (let dev in [ WAN, IFB ])
 			if (cake_prev != null && cake_prev.root[dev] != cake.root[dev])
 				debug_line('warn', 'counters', `QDISC ${dev}: ${cake_prev.root[dev] ?? 'none'} -> ${cake.root[dev] ?? 'none'} (SQM set it up again: its counters start over)`);
 		cake.t = now.t;
@@ -1191,27 +1205,27 @@ function counters(conn, minute) {
 	if (!minute)
 		return;
 
-	// once a minute: the ceilings, eth1's link, the WAN, the services
+	// once a minute: the ceilings, the WAN port's link, the WAN, the services
 	const cur = {
-		carrier: int(trim(readfile('/sys/class/net/eth1/carrier_changes') ?? '0')),
+		carrier: int(trim(readfile(`/sys/class/net/${WAN}/carrier_changes`) ?? '0')),
 		timeouts: tx_timeouts(),
 		speed: (sec != null) ? link_speed(sec.link) : slow?.speed,
 		wan: wan_status(conn, slow?.wan),
 		svc: service_pids(conn, slow?.svc)
 	};
 	const res = resources();
-	debug_line(res.level, 'counters', `res: ${res.text}; eth1 ${cur.speed ?? '?'}, carrier changes ${cur.carrier}, tx timeouts ${cur.timeouts}; ${wan_text(cur.wan)}`);
+	debug_line(res.level, 'counters', `res: ${res.text}; ${WAN} ${cur.speed ?? '?'}, carrier changes ${cur.carrier}, tx timeouts ${cur.timeouts}; ${wan_text(cur.wan)}`);
 	if (slow == null) {
 		debug_line('info', 'counters', `services: ${join(', ', map(sort(keys(cur.svc)), (k) => `${service_label(k)} ${cur.svc[k] ? 'pid ' + cur.svc[k] : 'not running'}`))}`);
 		slow = cur;
 		return;
 	}
 	if (cur.carrier != slow.carrier)
-		debug_line('warn', 'counters', `LINK eth1 carrier changes ${slow.carrier} -> ${cur.carrier} (the WAN cable's link went down and up)`);
+		debug_line('warn', 'counters', `LINK ${WAN} carrier changes ${slow.carrier} -> ${cur.carrier} (the WAN cable's link went down and up)`);
 	if (cur.speed != null && slow.speed != null && cur.speed != slow.speed)
-		debug_line('warn', 'counters', `LINK eth1 ${slow.speed} -> ${cur.speed}`);
+		debug_line('warn', 'counters', `LINK ${WAN} ${slow.speed} -> ${cur.speed}`);
 	if (cur.timeouts > slow.timeouts)
-		debug_line('warn', 'counters', `TX TIMEOUT eth1 +${cur.timeouts - slow.timeouts} (the kernel found a transmit queue stuck and reset it)`);
+		debug_line('warn', 'counters', `TX TIMEOUT ${WAN} +${cur.timeouts - slow.timeouts} (the kernel found a transmit queue stuck and reset it)`);
 	for (let w, s in cur.wan) {
 		const was = slow.wan[w];
 		if (!was)
@@ -1320,12 +1334,12 @@ function snapshot(conn, reason) {
 	line('info', `pkt/s (1 s): ${if_text(a.ifs, b.ifs, secs)}`);
 
 	// the queues
-	const out = bounded(TC + "; echo; echo '@ ethtool'; ethtool -S eth1", 3000);
+	const out = bounded(TC + `; echo; echo '@ ethtool'; ethtool -S ${WAN}`, 3000);
 	if (out == null)
 		line('warn', "tc and ethtool didn't answer: the kernel's network lock (rtnl) may be stuck");
 	else {
 		const sec = sections(out);
-		for (let dev in [ 'eth1', 'ifb4eth1' ]) {
+		for (let dev in [ WAN, IFB ]) {
 			let list = null;
 			try {
 				list = json(trim(sec[dev] ?? '') || '[]');
@@ -1361,10 +1375,10 @@ function snapshot(conn, reason) {
 		for (let m in match(sec.ethtool ?? '', /([A-Za-z0-9_]+): ([0-9]+)/g))
 			if (m[2] != '0')
 				push(nz, `${m[1]} ${m[2]}`);
-		line('info', `ethtool -S eth1: ${length(nz) ? join(', ', nz) : 'all 0'}`);
+		line('info', `ethtool -S ${WAN}: ${length(nz) ? join(', ', nz) : 'all 0'}`);
 	}
 	const bql = bql_text();
-	line('info', `bql eth1: ${bql != '' ? bql : 'nothing in flight'}; tx timeouts ${tx_timeouts()}`);
+	line('info', `bql ${WAN}: ${bql != '' ? bql : 'nothing in flight'}; tx timeouts ${tx_timeouts()}`);
 
 	// Wi-Fi: the driver's queues (these files only read memory and
 	// registers: no firmware commands, which would hang with the firmware)

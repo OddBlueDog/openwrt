@@ -1,0 +1,2144 @@
+From: MilkFlint <milkflint@localhost>
+Date: Sat, 31 Oct 2026 12:00:00 +0000
+Subject: [PATCH] netfilter: flowtable: a software fast path for bridged
+ connections
+
+A connection a bridge forwards between two of its ports (a Wi-Fi client
+and a wired one behind an access point) takes the bridge's whole receive
+path for every frame, and with bridge conntrack, conntrack too. Add a flow
+table type for the bridge family, nf_flow_table_bridge: nftables' "flow
+add" in a bridge forward chain puts a connection into it, and its frames
+then go from the port they arrive on straight to the port the bridge sent
+the connection's frames to.
+
+The fast path sits on the bridge's prerouting hook, right after the bridge
+received a frame on a port and before conntrack, and sends the frame on as
+it came: a bridge doesn't rewrite frames, so neither does the fast path
+(no TTL or hop limit change, no new MAC header, no VLAN tags to pop or
+push). It covers every bridge of the network namespace, so the flow table
+needs no devices, and ports that join a bridge later (Wi-Fi interfaces,
+which come and go) are covered without reloading the ruleset.
+
+Only what it can do exactly as the bridge does is taken: untagged IPv4
+and IPv6 TCP and UDP, without IPv4 options, fragments or IPv6 extension
+headers, on a bridge without VLAN filtering, between two ports that
+forward (STP), aren't locked (802.1X, MAB) and aren't isolated from each
+other, to a unicast address the fdb has on the egress port (so never from
+a flooded copy). Everything else goes the bridge's way.
+
+A frame takes a flow only with the flow's ingress port and both of its MAC
+addresses. One connection can cross a bridge more than once, as when a
+router behind it routes between two subnets that both reach it through
+the bridge; each crossing has frames of its own (other ports, other
+addresses), and they go the bridge's way rather than taking another
+crossing's flow. The ports and the bridge are checked on every frame: an
+egress port that stops forwarding, leaves the bridge or is isolated ends
+the flow, and an ingress port that doesn't forward, a bridge that starts
+filtering VLANs or a dormant table sends the frame the bridge's way.
+
+When the fdb moves an address to another port (a client roamed to another
+access point) or drops it, the flows towards it are torn down at once:
+the bridge tells switchdev of every fdb change, with or without hardware
+under the ports, and the flow table listens. About once a second each
+direction of a flow also sends a frame the bridge's own way. The bridge
+keeps learning both addresses, so their fdb entries don't age out under a
+busy flow and leave the bridge flooding, and the frame reaches the
+forward chain, where nft_flow_offload hands it to the flow table's new
+flow_check(): a flow whose frames the bridge now sends to another port is
+torn down there too. The connection's next frames make a new one. A TCP
+FIN or RST ends a flow as on the routed fast path.
+
+nft_flow_offload takes the bridge family and, for a flow table type with
+flow_alloc(), gets the flow from it, made from the packet in the forward
+hook, instead of looking up a route; it refuses before allocating
+anything what the fast path wouldn't take. There's no hardware offload: a bridge flow
+table with "flags offload" is refused, as matching only the 5-tuple (as a
+PPE does) can't tell one crossing from another. br_fdb_find_rcu() is
+exported for the flow table's fdb check.
+
+OpenWrt's pull request 24038 (a backport of Eric Woudstra's bridge
+fastpath series for 6.18) does this through the forward path walk instead,
+with hardware offload; this one is smaller, for 6.12, and differs where
+that one was seen to go wrong: frames of another crossing take a flow
+there (loops through a router behind the bridge), egress VLAN tags are
+lost, TTLs are decremented, fdb entries age out under offloaded flows, and
+Wi-Fi interfaces need a ruleset reload to be covered.
+
+A KUnit suite (CONFIG_NF_FLOW_TABLE_BRIDGE_KUNIT_TEST) covers the packets
+taken, the flows made and refused, what the fast path sends and how, and
+when it leaves a frame to the bridge or ends a flow.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -16,6 +16,7 @@
+ struct nf_flowtable;
+ struct nf_flow_rule;
+ struct flow_offload;
++struct nft_pktinfo;
+ enum flow_offload_tuple_dir;
+ 
+ struct nf_flow_key {
+@@ -64,6 +65,16 @@ struct nf_flowtable_type {
+ 	void				(*free)(struct nf_flowtable *ft);
+ 	void				(*get)(struct nf_flowtable *ft);
+ 	void				(*put)(struct nf_flowtable *ft);
++	/* A flowtable that doesn't route (the bridge's): nft_flow_offload
++	 * gets a new flow from flow_alloc() instead of a route (NULL: the
++	 * packet's connection can't have one), and shows flow_check() a
++	 * packet of a connection that already has a flow.
++	 */
++	struct flow_offload *		(*flow_alloc)(struct nf_conn *ct,
++						      const struct nft_pktinfo *pkt,
++						      enum ip_conntrack_dir dir);
++	void				(*flow_check)(struct nf_flowtable *ft,
++						      const struct nft_pktinfo *pkt);
+ 	nf_hookfn			*hook;
+ 	struct module			*owner;
+ };
+@@ -145,7 +156,14 @@ struct flow_offload_tuple {
+ 		};
+ 		struct {
+ 			u32		ifidx;
+-			u32		hw_ifidx;
++			union {
++				u32	hw_ifidx;
++				/* a bridge flow (no hardware offload):
++				 * when a packet of this direction last
++				 * went through the bridge itself
++				 */
++				u32	br_checked;
++			};
+ 			u8		h_source[ETH_ALEN];
+ 			u8		h_dest[ETH_ALEN];
+ 		} out;
+@@ -175,6 +193,7 @@ enum nf_flow_flags {
+ enum flow_offload_type {
+ 	NF_FLOW_OFFLOAD_UNSPEC	= 0,
+ 	NF_FLOW_OFFLOAD_ROUTE,
++	NF_FLOW_OFFLOAD_BRIDGE,
+ };
+ 
+ struct flow_offload {
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -273,6 +273,7 @@ struct net_bridge_fdb_entry *br_fdb_find_rcu(struct net_bridge *br,
+ {
+ 	return fdb_find_rcu(&br->fdb_hash_tbl, addr, vid);
+ }
++EXPORT_SYMBOL_GPL(br_fdb_find_rcu);
+ 
+ /* When a static FDB entry is added, the mac address from the entry is
+  * added to the bridge private HW address list and all required ports
+--- a/net/bridge/netfilter/Kconfig
++++ b/net/bridge/netfilter/Kconfig
+@@ -39,6 +39,26 @@ config NF_CONNTRACK_BRIDGE
+ 
+ 	  To compile it as a module, choose M here.  If unsure, say N.
+ 
++config NF_FLOW_TABLE_BRIDGE
++	tristate "Netfilter flow table bridge module"
++	depends on NF_TABLES_BRIDGE && NF_FLOW_TABLE && NF_CONNTRACK_BRIDGE
++	help
++	  A flow table for the bridge family: the connections a bridge
++	  forwards from one port to another, added with nftables'
++	  "flow add" in a bridge forward chain, then take a software fast
++	  path from the port they arrive on to the one the bridge sends
++	  them to, past the rest of the bridge and conntrack.
++
++	  To compile it as a module, choose M here.
++
++config NF_FLOW_TABLE_BRIDGE_KUNIT_TEST
++	bool "KUnit tests for the bridge flow table" if !KUNIT_ALL_TESTS
++	depends on NF_FLOW_TABLE_BRIDGE && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for the bridge flow table's fast path and the flows
++	  it takes, built into the module and run when it loads.
++
+ # old sockopt interface and eval loop
+ config BRIDGE_NF_EBTABLES_LEGACY
+ 	tristate
+--- a/net/bridge/netfilter/Makefile
++++ b/net/bridge/netfilter/Makefile
+@@ -9,6 +9,9 @@ obj-$(CONFIG_NFT_BRIDGE_REJECT)  += nft_reject_bridge.o
+ # connection tracking
+ obj-$(CONFIG_NF_CONNTRACK_BRIDGE) += nf_conntrack_bridge.o
+ 
++# flow table
++obj-$(CONFIG_NF_FLOW_TABLE_BRIDGE) += nf_flow_table_bridge.o
++
+ obj-$(CONFIG_BRIDGE_NF_EBTABLES_LEGACY) += ebtables.o
+ 
+ # tables
+--- /dev/null
++++ b/net/bridge/netfilter/nf_flow_table_bridge.c
+@@ -0,0 +1,669 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* The bridge's flow table: a software fast path for the connections a
++ * bridge forwards from one of its ports to another.
++ *
++ * nft_flow_offload adds a connection to it from a bridge forward chain
++ * ("flow add @ft", with bridge conntrack). Its frames are then taken at the
++ * bridge's prerouting hook, as soon as the bridge has received them on a
++ * port, and sent on as they came to the port the bridge sent the
++ * connection's frames to: a bridge doesn't rewrite a frame, so neither does
++ * the fast path (no TTL or hop limit change, no new MAC header). What they
++ * skip is the rest of the bridge's way (learning, the fdb lookup, its
++ * forward and postrouting hooks) and conntrack.
++ *
++ * Only what the fast path does exactly what the bridge would is taken:
++ * untagged IPv4 and IPv6 TCP and UDP, without IPv4 options, fragments or
++ * IPv6 extension headers, on a bridge that doesn't filter VLANs, between
++ * two of its ports that forward (STP), aren't locked (802.1X, MAB) and
++ * aren't isolated from each other, to an address the fdb has on the egress
++ * port. A frame takes it only with the ingress port and both MAC addresses
++ * of its flow: one connection can cross a bridge more than once (a router
++ * behind it routing between two subnets that are both on the bridge), and
++ * each crossing has frames of its own, which go the bridge's way. The port
++ * and the bridge are checked again on every frame, so one that stops
++ * forwarding, leaves the bridge or starts filtering VLANs stops the fast
++ * path at once.
++ *
++ * When the fdb moves an address to another port (a client roamed to another
++ * access point) or drops it, the flows towards it go at once: the bridge
++ * tells switchdev of every fdb change, with or without hardware under the
++ * ports. About once a second each direction of a flow also sends a frame
++ * the bridge's own way. The bridge then keeps learning both addresses, so
++ * their fdb entries don't age out under a busy flow, and nft_flow_offload
++ * shows that frame to nf_flow_bridge_flow_check(): a flow the bridge no
++ * longer sends to the same port is torn down there too. A connection whose
++ * flow went makes a new one with its next frames.
++ *
++ * The fast path hooks the bridge's prerouting, so a flow table of this type
++ * covers every bridge of its network namespace and needs no devices; the
++ * rules choose what goes into it. There's no hardware offload: a flow table
++ * of this type with "flags offload" is refused.
++ */
++#include <linux/etherdevice.h>
++#include <linux/if_vlan.h>
++#include <linux/init.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_bridge.h>
++#include <linux/rhashtable.h>
++#include <linux/tcp.h>
++#include <linux/udp.h>
++#include <kunit/static_stub.h>
++#include <net/ip.h>
++#include <net/netfilter/nf_conntrack_acct.h>
++#include <net/netfilter/nf_flow_table.h>
++#include <net/netfilter/nf_tables.h>
++#include <net/switchdev.h>
++
++#include "../br_private.h"
++
++/* Before conntrack (-200), after "raw" chains (-300) */
++#define NF_FLOW_BRIDGE_PRIORITY	(NF_BR_PRI_FILTER_BRIDGED - 1)
++
++/* The prerouting hook of each flow table of this type */
++struct nf_flow_bridge {
++	struct list_head	list;
++	struct nf_flowtable	*flowtable;
++	struct nf_hook_ops	ops;
++};
++
++static LIST_HEAD(nf_flow_bridge_list);
++static DEFINE_MUTEX(nf_flow_bridge_mutex);
++
++/* The key of the flow an untagged IPv4 or IPv6 TCP or UDP packet belongs
++ * to, as it arrived on @in (skb->data at its network header), and where its
++ * transport header starts. Unlike the routed fast path's, any TTL or hop
++ * limit: a bridge doesn't look at them.
++ */
++static int nf_flow_bridge_tuple(struct sk_buff *skb, const struct net_device *in,
++				struct flow_offload_tuple *tuple,
++				unsigned int *thoff)
++{
++	struct flow_ports *ports;
++	unsigned int hdrsize;
++	u8 l4proto;
++
++	if (skb_network_offset(skb))
++		return -1;
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP): {
++		const struct iphdr *iph;
++
++		if (!pskb_may_pull(skb, sizeof(*iph)))
++			return -1;
++
++		iph = ip_hdr(skb);
++		if (iph->ihl != 5 || ip_is_fragment(iph))
++			return -1;
++
++		l4proto = iph->protocol;
++		*thoff = sizeof(*iph);
++		break;
++	}
++	case htons(ETH_P_IPV6):
++		if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
++			return -1;
++
++		l4proto = ipv6_hdr(skb)->nexthdr;
++		*thoff = sizeof(struct ipv6hdr);
++		break;
++	default:
++		return -1;
++	}
++
++	switch (l4proto) {
++	case IPPROTO_TCP:
++		hdrsize = sizeof(struct tcphdr);
++		break;
++	case IPPROTO_UDP:
++		hdrsize = sizeof(struct udphdr);
++		break;
++	default:
++		return -1;
++	}
++
++	if (!pskb_may_pull(skb, *thoff + hdrsize))
++		return -1;
++
++	if (skb->protocol == htons(ETH_P_IP)) {
++		const struct iphdr *iph = ip_hdr(skb);
++
++		tuple->src_v4.s_addr	= iph->saddr;
++		tuple->dst_v4.s_addr	= iph->daddr;
++		tuple->l3proto		= AF_INET;
++	} else {
++		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
++
++		tuple->src_v6		= ip6h->saddr;
++		tuple->dst_v6		= ip6h->daddr;
++		tuple->l3proto		= AF_INET6;
++	}
++
++	ports = (struct flow_ports *)(skb_network_header(skb) + *thoff);
++	tuple->src_port		= ports->source;
++	tuple->dst_port		= ports->dest;
++	tuple->l4proto		= l4proto;
++	tuple->iifidx		= in->ifindex;
++
++	return 0;
++}
++
++/* @dev's bridge port, or NULL if it isn't one (any more) */
++static struct net_bridge_port *nf_flow_bridge_port(const struct net_device *dev)
++{
++	return netif_is_bridge_port(dev) ? br_port_get_rcu(dev) : NULL;
++}
++
++/* Frames may take the fast path from @p: it forwards (STP), isn't locked
++ * (802.1X, MAB: the bridge checks the source of each frame), and its bridge
++ * doesn't filter VLANs (a frame's VLAN is then the ports' business, which
++ * the fast path doesn't follow).
++ */
++static bool nf_flow_bridge_port_ok(const struct net_bridge_port *p)
++{
++	return p && p->state == BR_STATE_FORWARDING &&
++	       !(p->flags & (BR_PORT_LOCKED | BR_PORT_MAB)) &&
++	       !br_opt_get(p->br, BROPT_VLAN_ENABLED);
++}
++
++/* ... and the bridge sends them from @p on @q: another port of the same
++ * bridge that forwards, not isolated from @p
++ */
++static bool nf_flow_bridge_ports_ok(const struct net_bridge_port *p,
++				    const struct net_bridge_port *q)
++{
++	return q && q != p && q->br == p->br &&
++	       q->state == BR_STATE_FORWARDING &&
++	       !(p->flags & q->flags & BR_ISOLATED);
++}
++
++/* The port the fdb of @br (no VLAN filtering) has @addr on */
++static struct net_bridge_port *nf_flow_bridge_fdb_port(struct net_bridge *br,
++							const unsigned char *addr)
++{
++	struct net_bridge_fdb_entry *f;
++
++	KUNIT_STATIC_STUB_REDIRECT(nf_flow_bridge_fdb_port, br, addr);
++
++	f = br_fdb_find_rcu(br, addr, 0);
++	return f ? READ_ONCE(f->dst) : NULL;
++}
++
++static struct net_device *nf_flow_bridge_dev(struct net *net, int ifindex)
++{
++	KUNIT_STATIC_STUB_REDIRECT(nf_flow_bridge_dev, net, ifindex);
++
++	return dev_get_by_index_rcu(net, ifindex);
++}
++
++/* nf_tables stops a dormant table's hooks; this one is the bridge's */
++static bool nf_flow_bridge_dormant(const struct nf_flowtable *flowtable)
++{
++	const struct nft_flowtable *ft =
++		container_of(flowtable, struct nft_flowtable, data);
++
++	return ft->table->flags & NFT_TABLE_F_DORMANT;
++}
++
++/* A TCP FIN or RST: the connection is closing, the rest goes the slow way */
++static bool nf_flow_bridge_closing(const struct sk_buff *skb, u8 l4proto,
++				   unsigned int thoff)
++{
++	const struct tcphdr *tcph;
++
++	if (l4proto != IPPROTO_TCP)
++		return false;
++
++	tcph = (const struct tcphdr *)(skb_network_header(skb) + thoff);
++	return tcph->fin || tcph->rst;
++}
++
++/* What the bridge would send on @dev: no bigger than its MTU, or GSO, and
++ * not LRO (__br_forward() drops it, with a warning)
++ */
++static bool nf_flow_bridge_fits(const struct sk_buff *skb,
++				const struct net_device *dev)
++{
++	const struct skb_shared_info *shinfo = skb_shinfo(skb);
++
++	if (unlikely(shinfo->gso_size && !shinfo->gso_type))
++		return false;
++
++	return skb->len <= dev->mtu || skb_is_gso(skb);
++}
++
++static void nf_flow_bridge_queue(struct sk_buff *skb)
++{
++	KUNIT_STATIC_STUB_REDIRECT(nf_flow_bridge_queue, skb);
++
++	dev_queue_xmit(skb);
++}
++
++/* The frame as it came, on @dev, as the bridge sends one it forwards */
++static void nf_flow_bridge_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	skb_push(skb, ETH_HLEN);
++	skb->dev = dev;
++	skb_forward_csum(skb);
++	skb_clear_tstamp(skb);
++#ifdef CONFIG_NET_SWITCHDEV
++	skb->offload_fwd_mark = 0;
++#endif
++	nf_flow_bridge_queue(skb);
++}
++
++static unsigned int nf_flow_bridge_hook(void *priv, struct sk_buff *skb,
++					const struct nf_hook_state *state)
++{
++	struct flow_offload_tuple_rhash *tuplehash;
++	struct nf_flowtable *flowtable = priv;
++	struct flow_offload_tuple tuple = {};
++	struct net_bridge_port *p, *q;
++	enum flow_offload_tuple_dir dir;
++	struct flow_offload_tuple *t;
++	struct flow_offload *flow;
++	struct net_device *outdev;
++	const struct ethhdr *eth;
++	unsigned int thoff;
++	u32 now;
++
++	if (skb_vlan_tag_present(skb) ||
++	    nf_flow_bridge_tuple(skb, state->in, &tuple, &thoff) < 0)
++		return NF_ACCEPT;
++
++	p = nf_flow_bridge_port(state->in);
++	if (!nf_flow_bridge_port_ok(p))
++		return NF_ACCEPT;
++
++	tuplehash = flow_offload_lookup(flowtable, &tuple);
++	if (!tuplehash || nf_flow_bridge_dormant(flowtable))
++		return NF_ACCEPT;
++
++	dir = tuplehash->tuple.dir;
++	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	t = &tuplehash->tuple;
++
++	/* the same connection crossing the bridge another way */
++	eth = eth_hdr(skb);
++	if (!ether_addr_equal(eth->h_dest, t->out.h_dest) ||
++	    !ether_addr_equal(eth->h_source, t->out.h_source))
++		return NF_ACCEPT;
++
++	outdev = nf_flow_bridge_dev(state->net, t->out.ifidx);
++	q = outdev ? nf_flow_bridge_port(outdev) : NULL;
++	if (!nf_flow_bridge_ports_ok(p, q) ||
++	    nf_flow_bridge_closing(skb, t->l4proto, thoff)) {
++		flow_offload_teardown(flow);
++		return NF_ACCEPT;
++	}
++
++	flow_offload_refresh(flowtable, flow, false);
++
++	/* about once a second, the bridge's way (see the top) */
++	now = nf_flowtable_time_stamp;
++	if (now - READ_ONCE(t->out.br_checked) >= HZ) {
++		WRITE_ONCE(t->out.br_checked, now);
++		return NF_ACCEPT;
++	}
++
++	if (unlikely(!nf_flow_bridge_fits(skb, outdev)))
++		return NF_ACCEPT;
++
++	if (flowtable->flags & NF_FLOWTABLE_COUNTER)
++		nf_ct_acct_update(flow->ct, dir, skb->len);
++
++	nf_flow_bridge_xmit(skb, outdev);
++
++	return NF_STOLEN;
++}
++
++/* A new flow, from the connection's packet in the bridge's forward hook
++ * (from the port it came on to the one the bridge sends it on, as it will
++ * leave): the fast path takes the rest of its direction from that ingress
++ * port with these addresses to that egress port, and the other direction
++ * the other way round. NULL, before anything is allocated, for a packet
++ * whose connection can't have one.
++ */
++static struct flow_offload *nf_flow_bridge_flow_alloc(struct nf_conn *ct,
++						      const struct nft_pktinfo *pkt,
++						      enum ip_conntrack_dir dir)
++{
++	const struct net_device *in = nft_in(pkt), *out = nft_out(pkt);
++	u8 l4proto = nf_ct_protonum(ct);
++	const struct sk_buff *skb = pkt->skb;
++	struct flow_offload_tuple *t, *r;
++	struct net_bridge_port *p, *q;
++	struct flow_offload *flow;
++	const struct ethhdr *eth;
++	u32 now;
++
++	if ((l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP) ||
++	    ct->status & IPS_NAT_MASK)
++		return NULL;
++
++	if (!in || !out || skb_vlan_tag_present(skb) ||
++	    (skb->protocol != htons(ETH_P_IP) &&
++	     skb->protocol != htons(ETH_P_IPV6)))
++		return NULL;
++
++	p = nf_flow_bridge_port(in);
++	q = nf_flow_bridge_port(out);
++	if (!nf_flow_bridge_port_ok(p) || !nf_flow_bridge_port_ok(q) ||
++	    !nf_flow_bridge_ports_ok(p, q))
++		return NULL;
++
++	/* a unicast frame the fdb sends there, not a flooded copy */
++	eth = eth_hdr(skb);
++	if (!is_valid_ether_addr(eth->h_source) ||
++	    !is_valid_ether_addr(eth->h_dest) ||
++	    nf_flow_bridge_fdb_port(p->br, eth->h_dest) != q ||
++	    nf_flow_bridge_fdb_port(p->br, eth->h_source) != p)
++		return NULL;
++
++	flow = flow_offload_alloc(ct);
++	if (!flow)
++		return NULL;
++
++	t = &flow->tuplehash[dir].tuple;
++	r = &flow->tuplehash[!dir].tuple;
++	now = nf_flowtable_time_stamp;
++
++	t->iifidx = in->ifindex;
++	t->mtu = out->mtu;
++	t->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
++	t->out.ifidx = out->ifindex;
++	t->out.br_checked = now;
++	ether_addr_copy(t->out.h_source, eth->h_source);
++	ether_addr_copy(t->out.h_dest, eth->h_dest);
++
++	r->iifidx = out->ifindex;
++	r->mtu = in->mtu;
++	r->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
++	r->out.ifidx = in->ifindex;
++	r->out.br_checked = now;
++	ether_addr_copy(r->out.h_source, eth->h_dest);
++	ether_addr_copy(r->out.h_dest, eth->h_source);
++
++	flow->type = NF_FLOW_OFFLOAD_BRIDGE;
++
++	return flow;
++}
++
++/* A packet of a connection that already has a flow, in the bridge's forward
++ * hook: the fast path's frame of a second, or one it left to the bridge.
++ * If the bridge now sends this direction's frames to another port, the
++ * flow goes.
++ */
++static void nf_flow_bridge_flow_check(struct nf_flowtable *flowtable,
++				      const struct nft_pktinfo *pkt)
++{
++	const struct net_device *in = nft_in(pkt), *out = nft_out(pkt);
++	struct flow_offload_tuple_rhash *tuplehash;
++	struct flow_offload_tuple tuple = {};
++	const struct flow_offload_tuple *t;
++	enum flow_offload_tuple_dir dir;
++	struct sk_buff *skb = pkt->skb;
++	const struct ethhdr *eth;
++	unsigned int thoff;
++
++	if (!in || !out || skb_vlan_tag_present(skb) ||
++	    nf_flow_bridge_tuple(skb, in, &tuple, &thoff) < 0)
++		return;
++
++	tuplehash = flow_offload_lookup(flowtable, &tuple);
++	if (!tuplehash)
++		return;
++
++	t = &tuplehash->tuple;
++	dir = t->dir;
++	eth = eth_hdr(skb);
++	if (ether_addr_equal(eth->h_dest, t->out.h_dest) &&
++	    ether_addr_equal(eth->h_source, t->out.h_source) &&
++	    t->out.ifidx != out->ifindex)
++		flow_offload_teardown(container_of(tuplehash, struct flow_offload,
++						   tuplehash[dir]));
++}
++
++/* Where the fdb now has an address: on a port it moved to, or no longer on
++ * the port it went from. The bridge tells switchdev of each (learnt, moved,
++ * aged out or deleted, with or without hardware under the port), and the
++ * flows towards that address the change concerns go at once, without
++ * waiting for their next frame through the bridge.
++ */
++struct nf_flow_bridge_fdb {
++	u8		addr[ETH_ALEN];
++	int		ifindex;
++	bool		gone;
++	possible_net_t	net;
++};
++
++#define NF_FLOW_BRIDGE_FDB_MAX	32
++
++/* changes waiting for the work; past the limit, every flow goes */
++struct nf_flow_bridge_fdb_batch {
++	unsigned int			n;
++	bool				overflow;
++	struct nf_flow_bridge_fdb	changes[NF_FLOW_BRIDGE_FDB_MAX];
++};
++
++static atomic_t nf_flow_bridge_tables = ATOMIC_INIT(0);
++static DEFINE_SPINLOCK(nf_flow_bridge_fdb_lock);
++static struct nf_flow_bridge_fdb_batch nf_flow_bridge_fdb_pending;
++static struct work_struct nf_flow_bridge_fdb_work;
++
++static void nf_flow_bridge_fdb_flow(struct nf_flowtable *flowtable,
++				    struct flow_offload *flow, void *data)
++{
++	const struct nf_flow_bridge_fdb_batch *batch = data;
++	const struct net *net = read_pnet(&flowtable->net);
++	int dir;
++	u32 i;
++
++	if (batch->overflow) {
++		flow_offload_teardown(flow);
++		return;
++	}
++
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		const struct flow_offload_tuple *t = &flow->tuplehash[dir].tuple;
++
++		for (i = 0; i < batch->n; i++) {
++			const struct nf_flow_bridge_fdb *c = &batch->changes[i];
++
++			if (!net_eq(read_pnet(&c->net), net) ||
++			    !ether_addr_equal(t->out.h_dest, c->addr))
++				continue;
++			if (c->gone ? t->out.ifidx == c->ifindex :
++				      t->out.ifidx != c->ifindex) {
++				flow_offload_teardown(flow);
++				return;
++			}
++		}
++	}
++}
++
++static void nf_flow_bridge_fdb_run(struct work_struct *work)
++{
++	struct nf_flow_bridge_fdb_batch *batch;
++	struct nf_flow_bridge *fb;
++
++	batch = kmalloc(sizeof(*batch), GFP_KERNEL);
++	spin_lock_bh(&nf_flow_bridge_fdb_lock);
++	if (batch)
++		*batch = nf_flow_bridge_fdb_pending;
++	nf_flow_bridge_fdb_pending.n = 0;
++	nf_flow_bridge_fdb_pending.overflow = false;
++	spin_unlock_bh(&nf_flow_bridge_fdb_lock);
++	if (!batch)
++		return;
++
++	mutex_lock(&nf_flow_bridge_mutex);
++	list_for_each_entry(fb, &nf_flow_bridge_list, list)
++		nf_flow_table_iterate(fb->flowtable, nf_flow_bridge_fdb_flow, batch);
++	mutex_unlock(&nf_flow_bridge_mutex);
++	kfree(batch);
++}
++
++static int nf_flow_bridge_fdb_event(struct notifier_block *nb,
++				    unsigned long event, void *ptr)
++{
++	struct net_device *dev = switchdev_notifier_info_to_dev(ptr);
++	const struct switchdev_notifier_fdb_info *info;
++	struct nf_flow_bridge_fdb *c;
++
++	if ((event != SWITCHDEV_FDB_ADD_TO_DEVICE &&
++	     event != SWITCHDEV_FDB_DEL_TO_DEVICE) ||
++	    !atomic_read(&nf_flow_bridge_tables))
++		return NOTIFY_DONE;
++
++	/* VLAN filtering bridges have no flows; a local address isn't forwarded */
++	info = container_of(ptr, struct switchdev_notifier_fdb_info, info);
++	if (info->vid || info->is_local || !netif_is_bridge_port(dev))
++		return NOTIFY_DONE;
++
++	spin_lock_bh(&nf_flow_bridge_fdb_lock);
++	if (nf_flow_bridge_fdb_pending.n < NF_FLOW_BRIDGE_FDB_MAX) {
++		c = &nf_flow_bridge_fdb_pending.changes[nf_flow_bridge_fdb_pending.n++];
++		ether_addr_copy(c->addr, info->addr);
++		c->ifindex = dev->ifindex;
++		c->gone = event == SWITCHDEV_FDB_DEL_TO_DEVICE;
++		write_pnet(&c->net, dev_net(dev));
++	} else {
++		nf_flow_bridge_fdb_pending.overflow = true;
++	}
++	spin_unlock_bh(&nf_flow_bridge_fdb_lock);
++	schedule_work(&nf_flow_bridge_fdb_work);
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block nf_flow_bridge_fdb_nb = {
++	.notifier_call = nf_flow_bridge_fdb_event,
++};
++
++/* A device listed in the flow table: nothing to do there */
++static unsigned int nf_flow_bridge_dev_hook(void *priv, struct sk_buff *skb,
++					    const struct nf_hook_state *state)
++{
++	return NF_ACCEPT;
++}
++
++static int nf_flow_bridge_setup(struct nf_flowtable *flowtable,
++				struct net_device *dev,
++				enum flow_block_command cmd)
++{
++	return 0;
++}
++
++static int nf_flow_bridge_init(struct nf_flowtable *flowtable)
++{
++	struct nf_flow_bridge *fb;
++	int err;
++
++	if (nf_flowtable_hw_offload(flowtable))
++		return -EOPNOTSUPP;
++
++	fb = kzalloc(sizeof(*fb), GFP_KERNEL_ACCOUNT);
++	if (!fb)
++		return -ENOMEM;
++
++	err = nf_flow_table_init(flowtable);
++	if (err < 0)
++		goto err_free;
++
++	fb->flowtable = flowtable;
++	fb->ops.hook = nf_flow_bridge_hook;
++	fb->ops.priv = flowtable;
++	fb->ops.pf = NFPROTO_BRIDGE;
++	fb->ops.hooknum = NF_BR_PRE_ROUTING;
++	fb->ops.priority = NF_FLOW_BRIDGE_PRIORITY;
++
++	err = nf_register_net_hook(read_pnet(&flowtable->net), &fb->ops);
++	if (err < 0)
++		goto err_table;
++
++	mutex_lock(&nf_flow_bridge_mutex);
++	list_add(&fb->list, &nf_flow_bridge_list);
++	mutex_unlock(&nf_flow_bridge_mutex);
++	atomic_inc(&nf_flow_bridge_tables);
++
++	return 0;
++
++err_table:
++	nf_flow_table_free(flowtable);
++err_free:
++	kfree(fb);
++	return err;
++}
++
++static void nf_flow_bridge_free(struct nf_flowtable *flowtable)
++{
++	struct nf_flow_bridge *fb, *found = NULL;
++
++	mutex_lock(&nf_flow_bridge_mutex);
++	list_for_each_entry(fb, &nf_flow_bridge_list, list) {
++		if (fb->flowtable == flowtable) {
++			list_del(&fb->list);
++			found = fb;
++			break;
++		}
++	}
++	mutex_unlock(&nf_flow_bridge_mutex);
++
++	/* no packet is in the hook after this, then the flows go */
++	if (found) {
++		atomic_dec(&nf_flow_bridge_tables);
++		nf_unregister_net_hook(read_pnet(&flowtable->net), &found->ops);
++		kfree(found);
++	}
++
++	nf_flow_table_free(flowtable);
++}
++
++static struct nf_flowtable_type flowtable_bridge = {
++	.family		= NFPROTO_BRIDGE,
++	.init		= nf_flow_bridge_init,
++	.setup		= nf_flow_bridge_setup,
++	.free		= nf_flow_bridge_free,
++	.flow_alloc	= nf_flow_bridge_flow_alloc,
++	.flow_check	= nf_flow_bridge_flow_check,
++	.hook		= nf_flow_bridge_dev_hook,
++	.owner		= THIS_MODULE,
++};
++
++static int __init nf_flow_bridge_module_init(void)
++{
++	int err;
++
++	INIT_WORK(&nf_flow_bridge_fdb_work, nf_flow_bridge_fdb_run);
++	err = register_switchdev_notifier(&nf_flow_bridge_fdb_nb);
++	if (err < 0)
++		return err;
++
++	nft_register_flowtable_type(&flowtable_bridge);
++
++	return 0;
++}
++
++static void __exit nf_flow_bridge_module_exit(void)
++{
++	nft_unregister_flowtable_type(&flowtable_bridge);
++	unregister_switchdev_notifier(&nf_flow_bridge_fdb_nb);
++	cancel_work_sync(&nf_flow_bridge_fdb_work);
++}
++
++module_init(nf_flow_bridge_module_init);
++module_exit(nf_flow_bridge_module_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_ALIAS_NF_FLOWTABLE(AF_BRIDGE);
++MODULE_DESCRIPTION("Netfilter flow table bridge module");
++
++
++#if IS_ENABLED(CONFIG_NF_FLOW_TABLE_BRIDGE_KUNIT_TEST)
++#include "nf_flow_table_bridge_test.c"
++#endif
+--- /dev/null
++++ b/net/bridge/netfilter/nf_flow_table_bridge_test.c
+@@ -0,0 +1,1232 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* KUnit tests for the bridge's flow table: which packets it parses, which
++ * ports and frames make a flow, what the fast path forwards and how (as it
++ * came), and when it leaves a frame to the bridge or tears a flow down.
++ * Built into nf_flow_table_bridge.ko (#included at the end of
++ * nf_flow_table_bridge.c) when CONFIG_NF_FLOW_TABLE_BRIDGE_KUNIT_TEST is
++ * set; the suite runs when it loads.
++ *
++ * The bridge is three ports of a bridge that isn't registered: 0 has host
++ * A (a LAN port), 1 host B (Wi-Fi) and 2 a router R behind the bridge. The
++ * fdb, the ifindex lookup and the transmit are static stubs.
++ */
++#include <kunit/test.h>
++#include <net/ipv6.h>
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_zones.h>
++
++#define NF_FLOW_BRIDGE_TEST_PORTS	3
++#define NF_FLOW_BRIDGE_TEST_IFINDEX	9000
++
++static const u8 nf_flow_bridge_test_a[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x0a };
++static const u8 nf_flow_bridge_test_b[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x0b };
++static const u8 nf_flow_bridge_test_r[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0x01 };
++static const u8 nf_flow_bridge_test_mcast[ETH_ALEN] = { 0x01, 0, 0x5e, 0, 0, 0xfb };
++
++#define NF_FLOW_BRIDGE_TEST_IP_A	htonl(0xc0a8010a)	/* 192.168.1.10 */
++#define NF_FLOW_BRIDGE_TEST_IP_B	htonl(0xc0a80114)	/* 192.168.1.20 */
++
++static const struct in6_addr nf_flow_bridge_test_ip6_a = {
++	.s6_addr = { 0xfd, 0x88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x0a } };
++static const struct in6_addr nf_flow_bridge_test_ip6_b = {
++	.s6_addr = { 0xfd, 0x88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x14 } };
++
++struct nf_flow_bridge_test {
++	struct nft_table	table;
++	struct nft_flowtable	ft;
++	struct net_bridge	*br, *other_br;
++	struct net_device	*dev[NF_FLOW_BRIDGE_TEST_PORTS];
++	struct net_bridge_port	*port[NF_FLOW_BRIDGE_TEST_PORTS];
++	/* where the fdb has each host */
++	struct net_bridge_port	*fdb_a, *fdb_b, *fdb_r;
++	/* what the fast path sent */
++	struct sk_buff		*sent;
++	unsigned int		sends;
++};
++
++/* A packet of the test connection, A:40000 -> B:443 (or its reply) */
++struct nf_flow_bridge_test_pkt {
++	const u8	*src, *dst;	/* MAC addresses */
++	bool		ipv6;
++	bool		reply;
++	u8		l4proto;	/* TCP if 0 */
++	u16		sport;		/* A's port, 40000 if 0 */
++	bool		fin, rst;
++};
++
++static struct nf_flow_bridge_test *nf_flow_bridge_test_ctx(void)
++{
++	return kunit_get_current_test()->priv;
++}
++
++static struct net_bridge_port *
++nf_flow_bridge_test_fdb_port(struct net_bridge *br, const unsigned char *addr)
++{
++	struct nf_flow_bridge_test *ctx = nf_flow_bridge_test_ctx();
++
++	if (br != ctx->br)
++		return NULL;
++	if (ether_addr_equal(addr, nf_flow_bridge_test_a))
++		return ctx->fdb_a;
++	if (ether_addr_equal(addr, nf_flow_bridge_test_b))
++		return ctx->fdb_b;
++	if (ether_addr_equal(addr, nf_flow_bridge_test_r))
++		return ctx->fdb_r;
++	return NULL;
++}
++
++static struct net_device *nf_flow_bridge_test_dev(struct net *net, int ifindex)
++{
++	struct nf_flow_bridge_test *ctx = nf_flow_bridge_test_ctx();
++	int i;
++
++	for (i = 0; i < NF_FLOW_BRIDGE_TEST_PORTS; i++)
++		if (ctx->dev[i]->ifindex == ifindex)
++			return ctx->dev[i];
++	return NULL;
++}
++
++static void nf_flow_bridge_test_queue(struct sk_buff *skb)
++{
++	struct nf_flow_bridge_test *ctx = nf_flow_bridge_test_ctx();
++
++	ctx->sent = skb;
++	ctx->sends++;
++}
++
++static void nf_flow_bridge_test_free_netdev(void *dev)
++{
++	free_netdev(dev);
++}
++
++static void nf_flow_bridge_test_free_table(void *flowtable)
++{
++	nf_flow_table_free(flowtable);
++}
++
++static void nf_flow_bridge_test_put_ct(void *ct)
++{
++	nf_ct_put(ct);
++}
++
++static void nf_flow_bridge_test_free_skb(void *skb)
++{
++	kfree_skb(skb);
++}
++
++static int nf_flow_bridge_test_init(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx;
++	int i, err;
++
++	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ctx);
++	test->priv = ctx;
++
++	ctx->br = kunit_kzalloc(test, sizeof(*ctx->br), GFP_KERNEL);
++	ctx->other_br = kunit_kzalloc(test, sizeof(*ctx->other_br), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ctx->br);
++	KUNIT_ASSERT_NOT_NULL(test, ctx->other_br);
++
++	for (i = 0; i < NF_FLOW_BRIDGE_TEST_PORTS; i++) {
++		struct net_device *dev;
++		struct net_bridge_port *p;
++
++		dev = alloc_netdev(0, "nfbt%d", NET_NAME_ENUM, ether_setup);
++		KUNIT_ASSERT_NOT_NULL(test, dev);
++		err = kunit_add_action_or_reset(test, nf_flow_bridge_test_free_netdev, dev);
++		KUNIT_ASSERT_EQ(test, err, 0);
++
++		p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(test, p);
++		p->br = ctx->br;
++		p->dev = dev;
++		p->state = BR_STATE_FORWARDING;
++
++		dev->ifindex = NF_FLOW_BRIDGE_TEST_IFINDEX + i;
++		dev->mtu = ETH_DATA_LEN;
++		dev->priv_flags |= IFF_BRIDGE_PORT;
++		rcu_assign_pointer(dev->rx_handler_data, p);
++
++		ctx->dev[i] = dev;
++		ctx->port[i] = p;
++	}
++	ctx->fdb_a = ctx->port[0];
++	ctx->fdb_b = ctx->port[1];
++	ctx->fdb_r = ctx->port[2];
++
++	ctx->ft.table = &ctx->table;
++	ctx->ft.data.type = &flowtable_bridge;
++	write_pnet(&ctx->ft.data.net, &init_net);
++	err = nf_flow_table_init(&ctx->ft.data);
++	KUNIT_ASSERT_EQ(test, err, 0);
++	err = kunit_add_action_or_reset(test, nf_flow_bridge_test_free_table,
++					&ctx->ft.data);
++	KUNIT_ASSERT_EQ(test, err, 0);
++
++	kunit_activate_static_stub(test, nf_flow_bridge_fdb_port,
++				   nf_flow_bridge_test_fdb_port);
++	kunit_activate_static_stub(test, nf_flow_bridge_dev,
++				   nf_flow_bridge_test_dev);
++	kunit_activate_static_stub(test, nf_flow_bridge_queue,
++				   nf_flow_bridge_test_queue);
++	return 0;
++}
++
++/* The frame as a bridge port hands it to the bridge: skb->data at the
++ * network header, the MAC header just before it
++ */
++static struct sk_buff *nf_flow_bridge_test_skb(struct kunit *test,
++					       struct net_device *in,
++					       const struct nf_flow_bridge_test_pkt *pkt)
++{
++	u16 sport = htons(pkt->sport ?: 40000), dport = htons(443);
++	u8 l4proto = pkt->l4proto ?: IPPROTO_TCP;
++	unsigned int l4len, payload = 16;
++	struct sk_buff *skb;
++	struct ethhdr *eth;
++	void *l4;
++	int err;
++
++	skb = alloc_skb(256, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	err = kunit_add_action_or_reset(test, nf_flow_bridge_test_free_skb, skb);
++	KUNIT_ASSERT_EQ(test, err, 0);
++	skb_reserve(skb, 64);
++
++	if (pkt->reply)
++		swap(sport, dport);
++
++	eth = skb_put(skb, ETH_HLEN);
++	ether_addr_copy(eth->h_source, pkt->src);
++	ether_addr_copy(eth->h_dest, pkt->dst);
++	eth->h_proto = htons(pkt->ipv6 ? ETH_P_IPV6 : ETH_P_IP);
++	skb_reset_mac_header(skb);
++	skb->mac_len = ETH_HLEN;
++
++	l4len = (l4proto == IPPROTO_UDP ? sizeof(struct udphdr) :
++		 sizeof(struct tcphdr)) + payload;
++
++	if (pkt->ipv6) {
++		struct ipv6hdr *ip6h = skb_put_zero(skb, sizeof(*ip6h));
++
++		ip6h->version = 6;
++		ip6h->payload_len = htons(l4len);
++		ip6h->nexthdr = l4proto;
++		ip6h->hop_limit = 64;
++		ip6h->saddr = pkt->reply ? nf_flow_bridge_test_ip6_b :
++					   nf_flow_bridge_test_ip6_a;
++		ip6h->daddr = pkt->reply ? nf_flow_bridge_test_ip6_a :
++					   nf_flow_bridge_test_ip6_b;
++	} else {
++		struct iphdr *iph = skb_put_zero(skb, sizeof(*iph));
++
++		iph->version = 4;
++		iph->ihl = 5;
++		iph->tot_len = htons(sizeof(*iph) + l4len);
++		iph->ttl = 64;
++		iph->protocol = l4proto;
++		iph->saddr = pkt->reply ? NF_FLOW_BRIDGE_TEST_IP_B :
++					  NF_FLOW_BRIDGE_TEST_IP_A;
++		iph->daddr = pkt->reply ? NF_FLOW_BRIDGE_TEST_IP_A :
++					  NF_FLOW_BRIDGE_TEST_IP_B;
++		iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
++	}
++
++	l4 = skb_put_zero(skb, l4len);
++	if (l4proto == IPPROTO_UDP) {
++		struct udphdr *udph = l4;
++
++		udph->source = sport;
++		udph->dest = dport;
++		udph->len = htons(l4len);
++	} else {
++		struct tcphdr *tcph = l4;
++
++		tcph->source = sport;
++		tcph->dest = dport;
++		tcph->doff = sizeof(*tcph) / 4;
++		tcph->ack = 1;
++		tcph->fin = pkt->fin;
++		tcph->rst = pkt->rst;
++	}
++
++	skb_pull(skb, ETH_HLEN);
++	skb_reset_network_header(skb);
++	skb->protocol = eth->h_proto;
++	skb->dev = in;
++	skb->pkt_type = PACKET_OTHERHOST;
++	return skb;
++}
++
++/* The connection's conntrack entry, which the flows take references on */
++static struct nf_conn *nf_flow_bridge_test_ct(struct kunit *test,
++					      const struct nf_flow_bridge_test_pkt *pkt)
++{
++	struct nf_conntrack_tuple orig = {}, reply = {};
++	u8 l4proto = pkt->l4proto ?: IPPROTO_TCP;
++	u16 sport = htons(pkt->sport ?: 40000);
++	struct nf_conn *ct;
++	int err;
++
++	orig.src.l3num = reply.src.l3num = pkt->ipv6 ? AF_INET6 : AF_INET;
++	if (pkt->ipv6) {
++		orig.src.u3.in6 = reply.dst.u3.in6 = nf_flow_bridge_test_ip6_a;
++		orig.dst.u3.in6 = reply.src.u3.in6 = nf_flow_bridge_test_ip6_b;
++	} else {
++		orig.src.u3.ip = reply.dst.u3.ip = NF_FLOW_BRIDGE_TEST_IP_A;
++		orig.dst.u3.ip = reply.src.u3.ip = NF_FLOW_BRIDGE_TEST_IP_B;
++	}
++	orig.src.u.all = reply.dst.u.all = sport;
++	orig.dst.u.all = reply.src.u.all = htons(443);
++	orig.dst.protonum = reply.dst.protonum = l4proto;
++	orig.dst.dir = IP_CT_DIR_ORIGINAL;
++	reply.dst.dir = IP_CT_DIR_REPLY;
++
++	ct = nf_conntrack_alloc(&init_net, &nf_ct_zone_dflt, &orig, &reply,
++				GFP_KERNEL);
++	KUNIT_ASSERT_FALSE(test, IS_ERR(ct));
++	refcount_set(&ct->ct_general.use, 1);
++	if (l4proto == IPPROTO_TCP)
++		ct->proto.tcp.state = TCP_CONNTRACK_ESTABLISHED;
++	err = kunit_add_action_or_reset(test, nf_flow_bridge_test_put_ct, ct);
++	KUNIT_ASSERT_EQ(test, err, 0);
++	return ct;
++}
++
++/* The flow nft_flow_offload gets for its packet in the bridge's forward
++ * hook, @in to @out
++ */
++static struct flow_offload *nf_flow_bridge_test_flow_alloc(struct nf_conn *ct,
++							    struct sk_buff *skb,
++							    struct net_device *in,
++							    struct net_device *out,
++							    enum ip_conntrack_dir dir)
++{
++	struct nf_hook_state state = {
++		.hook = NF_BR_FORWARD, .pf = NFPROTO_BRIDGE,
++		.in = in, .out = out, .net = &init_net,
++	};
++	struct nft_pktinfo pkt = { .skb = skb, .state = &state };
++	struct flow_offload *flow;
++
++	rcu_read_lock();
++	flow = nf_flow_bridge_flow_alloc(ct, &pkt, dir);
++	rcu_read_unlock();
++	return flow;
++}
++
++static void nf_flow_bridge_test_check(struct sk_buff *skb,
++				      struct net_device *in,
++				      struct net_device *out)
++{
++	struct nf_flow_bridge_test *ctx = nf_flow_bridge_test_ctx();
++	struct nf_hook_state state = {
++		.hook = NF_BR_FORWARD, .pf = NFPROTO_BRIDGE,
++		.in = in, .out = out, .net = &init_net,
++	};
++	struct nft_pktinfo pkt = { .skb = skb, .state = &state };
++
++	rcu_read_lock();
++	nf_flow_bridge_flow_check(&ctx->ft.data, &pkt);
++	rcu_read_unlock();
++}
++
++static unsigned int nf_flow_bridge_test_hook(struct sk_buff *skb,
++					     struct net_device *in)
++{
++	struct nf_flow_bridge_test *ctx = nf_flow_bridge_test_ctx();
++	struct nf_hook_state state = {
++		.hook = NF_BR_PRE_ROUTING, .pf = NFPROTO_BRIDGE,
++		.in = in, .net = &init_net,
++	};
++	unsigned int verdict;
++
++	rcu_read_lock();
++	verdict = nf_flow_bridge_hook(&ctx->ft.data, skb, &state);
++	rcu_read_unlock();
++	return verdict;
++}
++
++/* The connection as the bridge forwarded a packet of it from port 0 (A) to
++ * port 1 (B), offloaded
++ */
++static struct flow_offload *nf_flow_bridge_test_flow(struct kunit *test,
++						     struct nf_flow_bridge_test_pkt pkt)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow;
++	struct sk_buff *skb;
++
++	pkt.src = nf_flow_bridge_test_a;
++	pkt.dst = nf_flow_bridge_test_b;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	flow = nf_flow_bridge_test_flow_alloc(nf_flow_bridge_test_ct(test, &pkt), skb,
++					      ctx->dev[0], ctx->dev[1], IP_CT_DIR_ORIGINAL);
++	if (!flow)
++		KUNIT_FAIL_AND_ABORT(test, "the test flow wasn't made");
++	if (flow_offload_add(&ctx->ft.data, flow) < 0) {
++		flow_offload_free(flow);
++		KUNIT_FAIL_AND_ABORT(test, "the test flow wasn't added");
++	}
++	return flow;
++}
++
++static bool nf_flow_bridge_test_torn_down(const struct flow_offload *flow)
++{
++	return test_bit(NF_FLOW_TEARDOWN, &flow->flags);
++}
++
++/* The flow's key: the 5-tuple, the ingress port, where L4 starts */
++static void nf_flow_bridge_test_tuple_ipv4(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	struct sk_buff *skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	struct flow_offload_tuple tuple = {};
++	unsigned char *data = skb->data;
++	unsigned int thoff;
++
++	KUNIT_ASSERT_EQ(test, nf_flow_bridge_tuple(skb, ctx->dev[0], &tuple, &thoff), 0);
++	KUNIT_EXPECT_EQ(test, tuple.src_v4.s_addr, NF_FLOW_BRIDGE_TEST_IP_A);
++	KUNIT_EXPECT_EQ(test, tuple.dst_v4.s_addr, NF_FLOW_BRIDGE_TEST_IP_B);
++	KUNIT_EXPECT_EQ(test, tuple.src_port, htons(40000));
++	KUNIT_EXPECT_EQ(test, tuple.dst_port, htons(443));
++	KUNIT_EXPECT_EQ(test, tuple.l3proto, AF_INET);
++	KUNIT_EXPECT_EQ(test, tuple.l4proto, IPPROTO_TCP);
++	KUNIT_EXPECT_EQ(test, tuple.iifidx, ctx->dev[0]->ifindex);
++	KUNIT_EXPECT_EQ(test, (int)tuple.encap_num, 0);
++	KUNIT_EXPECT_EQ(test, thoff, sizeof(struct iphdr));
++	KUNIT_EXPECT_PTR_EQ(test, skb->data, data);
++}
++
++static void nf_flow_bridge_test_tuple_ipv6(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_b, .dst = nf_flow_bridge_test_a,
++		.ipv6 = true, .reply = true, .l4proto = IPPROTO_UDP,
++	};
++	struct sk_buff *skb = nf_flow_bridge_test_skb(test, ctx->dev[1], &pkt);
++	struct flow_offload_tuple tuple = {};
++	unsigned int thoff;
++
++	KUNIT_ASSERT_EQ(test, nf_flow_bridge_tuple(skb, ctx->dev[1], &tuple, &thoff), 0);
++	KUNIT_EXPECT_TRUE(test, ipv6_addr_equal(&tuple.src_v6, &nf_flow_bridge_test_ip6_b));
++	KUNIT_EXPECT_TRUE(test, ipv6_addr_equal(&tuple.dst_v6, &nf_flow_bridge_test_ip6_a));
++	KUNIT_EXPECT_EQ(test, tuple.src_port, htons(443));
++	KUNIT_EXPECT_EQ(test, tuple.dst_port, htons(40000));
++	KUNIT_EXPECT_EQ(test, tuple.l3proto, AF_INET6);
++	KUNIT_EXPECT_EQ(test, tuple.l4proto, IPPROTO_UDP);
++	KUNIT_EXPECT_EQ(test, tuple.iifidx, ctx->dev[1]->ifindex);
++	KUNIT_EXPECT_EQ(test, thoff, sizeof(struct ipv6hdr));
++}
++
++/* What the fast path leaves to the bridge: IPv4 options and fragments,
++ * protocols other than TCP and UDP, IPv6 extension headers, a packet too
++ * short for its headers, anything not IP, and skb->data not at the network
++ * header
++ */
++static void nf_flow_bridge_test_tuple_rejects(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	struct nf_flow_bridge_test_pkt pkt6 = pkt;
++	struct flow_offload_tuple tuple = {};
++	struct net_device *in = ctx->dev[0];
++	struct sk_buff *skb;
++	unsigned int thoff;
++
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	ip_hdr(skb)->ihl = 6;
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	ip_hdr(skb)->frag_off = htons(IP_MF);
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	ip_hdr(skb)->frag_off = htons(8);
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	ip_hdr(skb)->protocol = IPPROTO_ICMP;
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++
++	pkt6.ipv6 = true;
++	skb = nf_flow_bridge_test_skb(test, in, &pkt6);
++	ipv6_hdr(skb)->nexthdr = NEXTHDR_HOP;
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	skb_trim(skb, sizeof(struct iphdr) + 4);
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	skb->protocol = htons(ETH_P_ARP);
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	skb_push(skb, 2);
++	KUNIT_EXPECT_LT(test, nf_flow_bridge_tuple(skb, in, &tuple, &thoff), 0);
++}
++
++/* A bridge forwards a packet whatever its TTL or hop limit, so they don't
++ * keep it off the fast path (the routed one leaves 1 to the slow path)
++ */
++static void nf_flow_bridge_test_tuple_ttl(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	struct flow_offload_tuple tuple = {};
++	struct sk_buff *skb;
++	unsigned int thoff;
++
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	ip_hdr(skb)->ttl = 1;
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_tuple(skb, ctx->dev[0], &tuple, &thoff), 0);
++
++	pkt.ipv6 = true;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	ipv6_hdr(skb)->hop_limit = 1;
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_tuple(skb, ctx->dev[0], &tuple, &thoff), 0);
++}
++
++/* A port frames may come from: forwarding, not locked, no VLAN filtering */
++static void nf_flow_bridge_test_port_ok(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	static const u8 not_forwarding[] = {
++		BR_STATE_DISABLED, BR_STATE_LISTENING, BR_STATE_LEARNING,
++		BR_STATE_BLOCKING,
++	};
++	struct net_bridge_port *p = ctx->port[0];
++	int i;
++
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_port_ok(p));
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_port_ok(NULL));
++
++	for (i = 0; i < ARRAY_SIZE(not_forwarding); i++) {
++		p->state = not_forwarding[i];
++		KUNIT_EXPECT_FALSE(test, nf_flow_bridge_port_ok(p));
++	}
++	p->state = BR_STATE_FORWARDING;
++
++	p->flags = BR_PORT_LOCKED;
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_port_ok(p));
++	p->flags = BR_PORT_MAB;
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_port_ok(p));
++	p->flags = BR_ISOLATED | BR_LEARNING | BR_FLOOD;
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_port_ok(p));
++	p->flags = 0;
++
++	__set_bit(BROPT_VLAN_ENABLED, &ctx->br->options);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_port_ok(p));
++}
++
++/* ... and one the bridge sends them on from there */
++static void nf_flow_bridge_test_ports_ok(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct net_bridge_port *p = ctx->port[0], *q = ctx->port[1];
++
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_ports_ok(p, q));
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_ports_ok(p, NULL));
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_ports_ok(p, p));
++
++	q->state = BR_STATE_BLOCKING;
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_ports_ok(p, q));
++	q->state = BR_STATE_FORWARDING;
++
++	q->br = ctx->other_br;
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_ports_ok(p, q));
++	q->br = ctx->br;
++
++	/* isolated ports reach the others, not each other */
++	q->flags = BR_ISOLATED;
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_ports_ok(p, q));
++	p->flags = BR_ISOLATED;
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_ports_ok(p, q));
++}
++
++/* A new flow takes the ports and addresses of the forwarded packet in its
++ * direction and the other way round in the other, sends both directions
++ * as they come, and is a bridge flow
++ */
++static void nf_flow_bridge_test_flow_fills(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test,
++				(struct nf_flow_bridge_test_pkt){});
++	struct flow_offload_tuple *t = &flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple;
++	struct flow_offload_tuple *r = &flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple;
++
++	KUNIT_EXPECT_EQ(test, flow->type, NF_FLOW_OFFLOAD_BRIDGE);
++
++	KUNIT_EXPECT_EQ(test, t->iifidx, ctx->dev[0]->ifindex);
++	KUNIT_EXPECT_EQ(test, t->out.ifidx, ctx->dev[1]->ifindex);
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(t->out.h_source, nf_flow_bridge_test_a));
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(t->out.h_dest, nf_flow_bridge_test_b));
++	KUNIT_EXPECT_EQ(test, (int)t->xmit_type, FLOW_OFFLOAD_XMIT_DIRECT);
++	KUNIT_EXPECT_EQ(test, t->mtu, ETH_DATA_LEN);
++	KUNIT_EXPECT_EQ(test, (int)t->encap_num, 0);
++	KUNIT_EXPECT_LE(test, nf_flowtable_time_stamp - t->out.br_checked, 1);
++
++	KUNIT_EXPECT_EQ(test, r->iifidx, ctx->dev[1]->ifindex);
++	KUNIT_EXPECT_EQ(test, r->out.ifidx, ctx->dev[0]->ifindex);
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(r->out.h_source, nf_flow_bridge_test_b));
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(r->out.h_dest, nf_flow_bridge_test_a));
++	KUNIT_EXPECT_EQ(test, (int)r->xmit_type, FLOW_OFFLOAD_XMIT_DIRECT);
++	KUNIT_EXPECT_EQ(test, (int)r->encap_num, 0);
++}
++
++/* Made from a packet of the reply direction, the same flow */
++static void nf_flow_bridge_test_flow_fills_reply(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_b, .dst = nf_flow_bridge_test_a,
++		.reply = true,
++	};
++	struct sk_buff *skb = nf_flow_bridge_test_skb(test, ctx->dev[1], &pkt);
++	struct flow_offload_tuple *t, *r;
++	struct flow_offload *flow;
++
++	flow = nf_flow_bridge_test_flow_alloc(nf_flow_bridge_test_ct(test, &pkt), skb,
++					      ctx->dev[1], ctx->dev[0], IP_CT_DIR_REPLY);
++	KUNIT_ASSERT_NOT_NULL(test, flow);
++	t = &flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple;
++	r = &flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple;
++	KUNIT_EXPECT_EQ(test, t->iifidx, ctx->dev[0]->ifindex);
++	KUNIT_EXPECT_EQ(test, t->out.ifidx, ctx->dev[1]->ifindex);
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(t->out.h_source, nf_flow_bridge_test_a));
++	KUNIT_EXPECT_EQ(test, r->iifidx, ctx->dev[1]->ifindex);
++	KUNIT_EXPECT_EQ(test, r->out.ifidx, ctx->dev[0]->ifindex);
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(r->out.h_source, nf_flow_bridge_test_b));
++	flow_offload_free(flow);
++}
++
++/* expects no flow from the packet A -> B forwarded from @in to @out */
++static void nf_flow_bridge_test_expect_no_flow(struct kunit *test,
++					       struct nf_flow_bridge_test_pkt pkt,
++					       struct net_device *in,
++					       struct net_device *out,
++					       void (*change)(struct sk_buff *skb,
++							      struct nf_conn *ct))
++{
++	struct flow_offload *flow;
++	struct sk_buff *skb;
++	struct nf_conn *ct;
++
++	pkt.src = pkt.src ?: nf_flow_bridge_test_a;
++	pkt.dst = pkt.dst ?: nf_flow_bridge_test_b;
++	ct = nf_flow_bridge_test_ct(test, &pkt);
++	skb = nf_flow_bridge_test_skb(test, in, &pkt);
++	if (change)
++		change(skb, ct);
++	flow = nf_flow_bridge_test_flow_alloc(ct, skb, in, out, IP_CT_DIR_ORIGINAL);
++	KUNIT_EXPECT_NULL(test, flow);
++	if (flow)
++		flow_offload_free(flow);
++	/* nothing was allocated: only the test's own reference */
++	KUNIT_EXPECT_EQ(test, refcount_read(&ct->ct_general.use), 1);
++}
++
++static void nf_flow_bridge_test_snat(struct sk_buff *skb, struct nf_conn *ct)
++{
++	ct->status |= IPS_SRC_NAT;
++}
++
++static void nf_flow_bridge_test_dnat(struct sk_buff *skb, struct nf_conn *ct)
++{
++	ct->status |= IPS_DST_NAT;
++}
++
++static void nf_flow_bridge_test_tag(struct sk_buff *skb, struct nf_conn *ct)
++{
++	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), 5);
++}
++
++static void nf_flow_bridge_test_not_ip(struct sk_buff *skb, struct nf_conn *ct)
++{
++	skb->protocol = htons(ETH_P_PPP_SES);
++}
++
++/* No flow from what the fast path couldn't do as the bridge does: NAT,
++ * GRE, a hairpin, a tagged or non-IP frame, VLAN filtering, ports that
++ * don't forward or are locked, two bridges, a device that isn't a port, a
++ * multicast or broadcast destination, a frame the fdb doesn't send there
++ * (flooded) or from a source it has elsewhere
++ */
++static void nf_flow_bridge_test_flow_rejects(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct net_device *a = ctx->dev[0], *b = ctx->dev[1];
++	struct nf_flow_bridge_test_pkt pkt = {};
++
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, nf_flow_bridge_test_snat);
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, nf_flow_bridge_test_dnat);
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, a, NULL);
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, nf_flow_bridge_test_tag);
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, nf_flow_bridge_test_not_ip);
++
++	pkt.l4proto = IPPROTO_GRE;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	pkt.l4proto = 0;
++
++	__set_bit(BROPT_VLAN_ENABLED, &ctx->br->options);
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	__clear_bit(BROPT_VLAN_ENABLED, &ctx->br->options);
++
++	ctx->port[0]->state = BR_STATE_LEARNING;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->port[0]->state = BR_STATE_FORWARDING;
++	ctx->port[1]->state = BR_STATE_BLOCKING;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->port[1]->state = BR_STATE_FORWARDING;
++
++	ctx->port[0]->flags = BR_PORT_LOCKED;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->port[0]->flags = 0;
++	ctx->port[1]->flags = BR_PORT_MAB;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->port[1]->flags = 0;
++
++	ctx->port[1]->br = ctx->other_br;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->port[1]->br = ctx->br;
++
++	b->priv_flags &= ~IFF_BRIDGE_PORT;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	b->priv_flags |= IFF_BRIDGE_PORT;
++
++	pkt.dst = nf_flow_bridge_test_mcast;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	pkt.dst = (const u8 *)"\xff\xff\xff\xff\xff\xff";
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	pkt.dst = NULL;
++
++	/* the copy a flooded frame sends to port 1, B being behind port 2 */
++	ctx->fdb_b = ctx->port[2];
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->fdb_b = NULL;
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->fdb_b = ctx->port[1];
++
++	ctx->fdb_a = ctx->port[2];
++	nf_flow_bridge_test_expect_no_flow(test, pkt, a, b, NULL);
++	ctx->fdb_a = ctx->port[0];
++}
++
++static void nf_flow_bridge_test_expect_sent(struct kunit *test, struct sk_buff *skb,
++					    struct net_device *out, const u8 *src,
++					    const u8 *dst)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	const struct ethhdr *eth;
++
++	KUNIT_ASSERT_PTR_EQ(test, ctx->sent, skb);
++	KUNIT_EXPECT_PTR_EQ(test, skb->dev, out);
++	/* the whole frame, MAC header first, with its own addresses */
++	KUNIT_EXPECT_PTR_EQ(test, skb->data, skb_mac_header(skb));
++	eth = (const struct ethhdr *)skb->data;
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(eth->h_source, src));
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(eth->h_dest, dst));
++}
++
++/* A frame of the flow goes to the egress port as it came: the same MAC
++ * header, TTL and IP checksum, a CHECKSUM_COMPLETE dropped as the bridge
++ * drops it, no switchdev forwarding mark
++ */
++static void nf_flow_bridge_test_hook_forwards(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test,
++				(struct nf_flow_bridge_test_pkt){});
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	struct sk_buff *skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	__sum16 check = ip_hdr(skb)->check;
++
++	skb->ip_summed = CHECKSUM_COMPLETE;
++#ifdef CONFIG_NET_SWITCHDEV
++	skb->offload_fwd_mark = 1;
++#endif
++	KUNIT_ASSERT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_STOLEN);
++	nf_flow_bridge_test_expect_sent(test, skb, ctx->dev[1], nf_flow_bridge_test_a,
++					nf_flow_bridge_test_b);
++	KUNIT_EXPECT_EQ(test, ip_hdr(skb)->ttl, 64);
++	KUNIT_EXPECT_EQ(test, ip_hdr(skb)->check, check);
++	KUNIT_EXPECT_EQ(test, skb->protocol, htons(ETH_P_IP));
++	KUNIT_EXPECT_EQ(test, (int)skb->ip_summed, CHECKSUM_NONE);
++#ifdef CONFIG_NET_SWITCHDEV
++	KUNIT_EXPECT_EQ(test, (int)skb->offload_fwd_mark, 0);
++#endif
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++}
++
++/* ... and one of its other direction the other way, IPv6 likewise */
++static void nf_flow_bridge_test_hook_reply(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_b, .dst = nf_flow_bridge_test_a,
++		.reply = true,
++	};
++	struct sk_buff *skb;
++
++	nf_flow_bridge_test_flow(test, (struct nf_flow_bridge_test_pkt){});
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[1], &pkt);
++	KUNIT_ASSERT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[1]), NF_STOLEN);
++	nf_flow_bridge_test_expect_sent(test, skb, ctx->dev[0], nf_flow_bridge_test_b,
++					nf_flow_bridge_test_a);
++
++	nf_flow_bridge_test_flow(test, (struct nf_flow_bridge_test_pkt){ .ipv6 = true });
++	pkt.ipv6 = true;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[1], &pkt);
++	KUNIT_ASSERT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[1]), NF_STOLEN);
++	nf_flow_bridge_test_expect_sent(test, skb, ctx->dev[0], nf_flow_bridge_test_b,
++					nf_flow_bridge_test_a);
++	KUNIT_EXPECT_EQ(test, ipv6_hdr(skb)->hop_limit, 64);
++}
++
++/* The same connection crossing the bridge another way (to the router
++ * behind it, or from another port) goes the bridge's way, and the flow
++ * stays
++ */
++static void nf_flow_bridge_test_hook_other_crossing(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test,
++				(struct nf_flow_bridge_test_pkt){});
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_r, .dst = nf_flow_bridge_test_b,
++	};
++	struct sk_buff *skb;
++
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++	pkt.src = nf_flow_bridge_test_a;
++	pkt.dst = nf_flow_bridge_test_r;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++
++	pkt.dst = nf_flow_bridge_test_b;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[2], &pkt);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[2]), NF_ACCEPT);
++
++	KUNIT_EXPECT_EQ(test, ctx->sends, 0);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++}
++
++/* The flow on @sport and a frame of it from A: left to the bridge, and
++ * whether the flow went
++ */
++static void nf_flow_bridge_test_expect_slow(struct kunit *test, u16 sport,
++					    void (*change)(struct nf_flow_bridge_test *ctx),
++					    bool torn_down)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++		.sport = sport,
++	};
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test, pkt);
++	struct sk_buff *skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	unsigned char *data = skb->data;
++
++	change(ctx);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++	KUNIT_EXPECT_PTR_EQ(test, skb->data, data);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_torn_down(flow), torn_down);
++	KUNIT_EXPECT_EQ(test, ctx->sends, 0);
++}
++
++static void nf_flow_bridge_test_out_blocking(struct nf_flow_bridge_test *ctx)
++{
++	ctx->port[1]->state = BR_STATE_BLOCKING;
++}
++
++static void nf_flow_bridge_test_out_left(struct nf_flow_bridge_test *ctx)
++{
++	ctx->dev[1]->priv_flags &= ~IFF_BRIDGE_PORT;
++}
++
++static void nf_flow_bridge_test_out_moved(struct nf_flow_bridge_test *ctx)
++{
++	ctx->port[1]->br = ctx->other_br;
++}
++
++static void nf_flow_bridge_test_isolated(struct nf_flow_bridge_test *ctx)
++{
++	ctx->port[0]->flags = BR_ISOLATED;
++	ctx->port[1]->flags = BR_ISOLATED;
++}
++
++static void nf_flow_bridge_test_out_gone(struct nf_flow_bridge_test *ctx)
++{
++	ctx->dev[1]->ifindex = NF_FLOW_BRIDGE_TEST_IFINDEX + 99;
++}
++
++/* An egress port that stops forwarding, leaves the bridge, joins another,
++ * is isolated from the ingress port or is gone: the flow goes
++ */
++static void nf_flow_bridge_test_hook_egress_changed(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++
++	nf_flow_bridge_test_expect_slow(test, 40001, nf_flow_bridge_test_out_blocking, true);
++	ctx->port[1]->state = BR_STATE_FORWARDING;
++	nf_flow_bridge_test_expect_slow(test, 40002, nf_flow_bridge_test_out_left, true);
++	ctx->dev[1]->priv_flags |= IFF_BRIDGE_PORT;
++	nf_flow_bridge_test_expect_slow(test, 40003, nf_flow_bridge_test_out_moved, true);
++	ctx->port[1]->br = ctx->br;
++	nf_flow_bridge_test_expect_slow(test, 40004, nf_flow_bridge_test_isolated, true);
++	ctx->port[0]->flags = 0;
++	ctx->port[1]->flags = 0;
++	nf_flow_bridge_test_expect_slow(test, 40005, nf_flow_bridge_test_out_gone, true);
++}
++
++static void nf_flow_bridge_test_in_learning(struct nf_flow_bridge_test *ctx)
++{
++	ctx->port[0]->state = BR_STATE_LEARNING;
++}
++
++static void nf_flow_bridge_test_in_locked(struct nf_flow_bridge_test *ctx)
++{
++	ctx->port[0]->flags = BR_PORT_LOCKED;
++}
++
++static void nf_flow_bridge_test_vlan_filtering(struct nf_flow_bridge_test *ctx)
++{
++	__set_bit(BROPT_VLAN_ENABLED, &ctx->br->options);
++}
++
++static void nf_flow_bridge_test_dormant(struct nf_flow_bridge_test *ctx)
++{
++	ctx->table.flags = NFT_TABLE_F_DORMANT;
++}
++
++/* An ingress port that doesn't forward or is locked, a bridge that now
++ * filters VLANs, a dormant table: the bridge's way, the flow stays (for
++ * when they change back, or until it expires)
++ */
++static void nf_flow_bridge_test_hook_ingress(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++
++	nf_flow_bridge_test_expect_slow(test, 40001, nf_flow_bridge_test_in_learning, false);
++	ctx->port[0]->state = BR_STATE_FORWARDING;
++	nf_flow_bridge_test_expect_slow(test, 40002, nf_flow_bridge_test_in_locked, false);
++	ctx->port[0]->flags = 0;
++	nf_flow_bridge_test_expect_slow(test, 40003, nf_flow_bridge_test_vlan_filtering, false);
++	__clear_bit(BROPT_VLAN_ENABLED, &ctx->br->options);
++	nf_flow_bridge_test_expect_slow(test, 40004, nf_flow_bridge_test_dormant, false);
++}
++
++/* A tagged frame of the flow: the bridge's way */
++static void nf_flow_bridge_test_hook_tagged(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test,
++				(struct nf_flow_bridge_test_pkt){});
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	struct sk_buff *skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++
++	__vlan_hwaccel_put_tag(skb, htons(ETH_P_8021Q), 1);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++	KUNIT_EXPECT_EQ(test, ctx->sends, 0);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++}
++
++/* A TCP FIN or RST ends the flow and goes the bridge's way; UDP has no
++ * such thing
++ */
++static void nf_flow_bridge_test_hook_closing(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_test_pkt fin = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++		.sport = 40001, .fin = true,
++	};
++	struct nf_flow_bridge_test_pkt rst = fin;
++	struct flow_offload *flow;
++	struct sk_buff *skb;
++
++	flow = nf_flow_bridge_test_flow(test, fin);
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &fin);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_test_torn_down(flow));
++
++	rst.sport = 40002;
++	rst.fin = false;
++	rst.rst = true;
++	flow = nf_flow_bridge_test_flow(test, rst);
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &rst);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_test_torn_down(flow));
++
++	KUNIT_EXPECT_EQ(test, ctx->sends, 0);
++}
++
++/* About once a second a direction's frame goes the bridge's way, then the
++ * fast path's again; the other direction keeps its own second
++ */
++static void nf_flow_bridge_test_hook_bridge_check(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test,
++				(struct nf_flow_bridge_test_pkt){});
++	struct flow_offload_tuple *t = &flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple;
++	struct flow_offload_tuple *r = &flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple;
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	u32 reply_checked = r->out.br_checked;
++	struct sk_buff *skb;
++
++	t->out.br_checked = nf_flowtable_time_stamp - HZ;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++	KUNIT_EXPECT_LE(test, nf_flowtable_time_stamp - t->out.br_checked, 1);
++	KUNIT_EXPECT_EQ(test, r->out.br_checked, reply_checked);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_STOLEN);
++	KUNIT_EXPECT_EQ(test, ctx->sends, 1);
++}
++
++/* Bigger than the egress port's MTU: the bridge's way, unless it's GSO;
++ * LRO (gso_size without a type) too, which the bridge drops
++ */
++static void nf_flow_bridge_test_hook_mtu(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test,
++				(struct nf_flow_bridge_test_pkt){});
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	struct sk_buff *skb;
++
++	ctx->dev[1]->mtu = 40;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	skb_shinfo(skb)->gso_size = 1000;
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_ACCEPT);
++
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	skb_shinfo(skb)->gso_size = 1000;
++	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_test_hook(skb, ctx->dev[0]), NF_STOLEN);
++	KUNIT_EXPECT_EQ(test, ctx->sends, 1);
++}
++
++/* In the bridge's forward hook: a frame of the flow's direction that the
++ * bridge now sends to another port (its destination moved) ends the flow;
++ * one it sends to the same port, another crossing's or a frame without a
++ * flow doesn't
++ */
++static void nf_flow_bridge_test_flow_check(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct flow_offload *flow = nf_flow_bridge_test_flow(test,
++				(struct nf_flow_bridge_test_pkt){});
++	struct nf_flow_bridge_test_pkt pkt = {
++		.src = nf_flow_bridge_test_a, .dst = nf_flow_bridge_test_b,
++	};
++	struct sk_buff *skb;
++
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	nf_flow_bridge_test_check(skb, ctx->dev[0], ctx->dev[1]);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++
++	pkt.src = nf_flow_bridge_test_r;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	nf_flow_bridge_test_check(skb, ctx->dev[0], ctx->dev[2]);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++
++	pkt.src = nf_flow_bridge_test_a;
++	pkt.sport = 40001;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	nf_flow_bridge_test_check(skb, ctx->dev[0], ctx->dev[2]);
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_torn_down(flow));
++
++	pkt.sport = 0;
++	skb = nf_flow_bridge_test_skb(test, ctx->dev[0], &pkt);
++	nf_flow_bridge_test_check(skb, ctx->dev[0], ctx->dev[2]);
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_test_torn_down(flow));
++}
++
++/* A flow table of this type refuses hardware offload; without it, it has
++ * its hook and gives it back
++ */
++static void nf_flow_bridge_test_table(struct kunit *test)
++{
++	struct nft_flowtable *ft = kunit_kzalloc(test, sizeof(*ft), GFP_KERNEL);
++	struct nft_table *table = kunit_kzalloc(test, sizeof(*table), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, ft);
++	KUNIT_ASSERT_NOT_NULL(test, table);
++	ft->table = table;
++	ft->data.type = &flowtable_bridge;
++	write_pnet(&ft->data.net, &init_net);
++
++	ft->data.flags = NF_FLOWTABLE_HW_OFFLOAD;
++	KUNIT_EXPECT_EQ(test, nf_flow_bridge_init(&ft->data), -EOPNOTSUPP);
++
++	ft->data.flags = NF_FLOWTABLE_COUNTER;
++	KUNIT_ASSERT_EQ(test, nf_flow_bridge_init(&ft->data), 0);
++	mutex_lock(&nf_flow_bridge_mutex);
++	KUNIT_EXPECT_FALSE(test, list_empty(&nf_flow_bridge_list));
++	mutex_unlock(&nf_flow_bridge_mutex);
++	nf_flow_bridge_free(&ft->data);
++	mutex_lock(&nf_flow_bridge_mutex);
++	KUNIT_EXPECT_TRUE(test, list_empty(&nf_flow_bridge_list));
++	mutex_unlock(&nf_flow_bridge_mutex);
++}
++
++/* fdb changes for the flow A (port 0) -> B (port 1), one at a time */
++static bool nf_flow_bridge_test_fdb(struct kunit *test, const u8 *addr, int port,
++				    bool gone, struct net *net)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_fdb_batch *batch = kunit_kzalloc(test, sizeof(*batch), GFP_KERNEL);
++	struct flow_offload *flow;
++	static u16 sport = 41000;
++
++	KUNIT_ASSERT_NOT_NULL(test, batch);
++	flow = nf_flow_bridge_test_flow(test, (struct nf_flow_bridge_test_pkt){ .sport = sport++ });
++	batch->n = 1;
++	ether_addr_copy(batch->changes[0].addr, addr);
++	batch->changes[0].ifindex = ctx->dev[port]->ifindex;
++	batch->changes[0].gone = gone;
++	write_pnet(&batch->changes[0].net, net);
++	nf_flow_bridge_fdb_flow(&ctx->ft.data, flow, batch);
++	return nf_flow_bridge_test_torn_down(flow);
++}
++
++/* An address that moves to another port ends the flows towards it, one
++ * that's learnt again on the same port doesn't; one that goes from the
++ * flow's egress port ends them, from another port doesn't; either
++ * direction's destination counts; another namespace's fdb doesn't;
++ * overflowing the batch ends every flow
++ */
++static void nf_flow_bridge_test_fdb_changes(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct nf_flow_bridge_fdb_batch *all;
++	struct flow_offload *flow;
++
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_test_fdb(test, nf_flow_bridge_test_b, 2, false, &init_net));
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_fdb(test, nf_flow_bridge_test_b, 1, false, &init_net));
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_test_fdb(test, nf_flow_bridge_test_b, 1, true, &init_net));
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_fdb(test, nf_flow_bridge_test_b, 2, true, &init_net));
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_test_fdb(test, nf_flow_bridge_test_a, 2, false, &init_net));
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_fdb(test, nf_flow_bridge_test_r, 2, false, &init_net));
++	KUNIT_EXPECT_FALSE(test, nf_flow_bridge_test_fdb(test, nf_flow_bridge_test_b, 2, false,
++							 (struct net *)&ctx->table));
++
++	all = kunit_kzalloc(test, sizeof(*all), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, all);
++	all->overflow = true;
++	flow = nf_flow_bridge_test_flow(test, (struct nf_flow_bridge_test_pkt){ .sport = 42000 });
++	nf_flow_bridge_fdb_flow(&ctx->ft.data, flow, all);
++	KUNIT_EXPECT_TRUE(test, nf_flow_bridge_test_torn_down(flow));
++}
++
++/* The bridge's switchdev fdb events queue a change: a port's learnt
++ * address, added or gone; not a VLAN's, a local one or a device's that
++ * isn't a port; and nothing while no flow table of this type exists
++ */
++static void nf_flow_bridge_test_fdb_event(struct kunit *test)
++{
++	struct nf_flow_bridge_test *ctx = test->priv;
++	struct switchdev_notifier_fdb_info info = {
++		.info.dev = ctx->dev[2],
++		.addr = nf_flow_bridge_test_b,
++	};
++	struct nf_flow_bridge_fdb c;
++	unsigned int n;
++
++	atomic_inc(&nf_flow_bridge_tables);
++	cancel_work_sync(&nf_flow_bridge_fdb_work);
++	spin_lock_bh(&nf_flow_bridge_fdb_lock);
++	nf_flow_bridge_fdb_pending.n = 0;
++	spin_unlock_bh(&nf_flow_bridge_fdb_lock);
++
++	nf_flow_bridge_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info.info);
++	nf_flow_bridge_fdb_event(NULL, SWITCHDEV_FDB_DEL_TO_DEVICE, &info.info);
++	info.vid = 5;
++	nf_flow_bridge_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info.info);
++	info.vid = 0;
++	info.is_local = true;
++	nf_flow_bridge_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info.info);
++	info.is_local = false;
++	nf_flow_bridge_fdb_event(NULL, SWITCHDEV_PORT_ATTR_SET, &info.info);
++	ctx->dev[2]->priv_flags &= ~IFF_BRIDGE_PORT;
++	nf_flow_bridge_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info.info);
++	ctx->dev[2]->priv_flags |= IFF_BRIDGE_PORT;
++	atomic_dec(&nf_flow_bridge_tables);
++	nf_flow_bridge_fdb_event(NULL, SWITCHDEV_FDB_ADD_TO_DEVICE, &info.info);
++
++	cancel_work_sync(&nf_flow_bridge_fdb_work);
++	spin_lock_bh(&nf_flow_bridge_fdb_lock);
++	n = nf_flow_bridge_fdb_pending.n;
++	c = nf_flow_bridge_fdb_pending.changes[1];
++	nf_flow_bridge_fdb_pending.n = 0;
++	spin_unlock_bh(&nf_flow_bridge_fdb_lock);
++
++	KUNIT_EXPECT_EQ(test, n, 2);
++	KUNIT_EXPECT_TRUE(test, ether_addr_equal(c.addr, nf_flow_bridge_test_b));
++	KUNIT_EXPECT_EQ(test, c.ifindex, ctx->dev[2]->ifindex);
++	KUNIT_EXPECT_TRUE(test, c.gone);
++	KUNIT_EXPECT_TRUE(test, net_eq(read_pnet(&c.net), &init_net));
++}
++
++static struct kunit_case nf_flow_bridge_test_cases[] = {
++	KUNIT_CASE(nf_flow_bridge_test_tuple_ipv4),
++	KUNIT_CASE(nf_flow_bridge_test_tuple_ipv6),
++	KUNIT_CASE(nf_flow_bridge_test_tuple_rejects),
++	KUNIT_CASE(nf_flow_bridge_test_tuple_ttl),
++	KUNIT_CASE(nf_flow_bridge_test_port_ok),
++	KUNIT_CASE(nf_flow_bridge_test_ports_ok),
++	KUNIT_CASE(nf_flow_bridge_test_flow_fills),
++	KUNIT_CASE(nf_flow_bridge_test_flow_fills_reply),
++	KUNIT_CASE(nf_flow_bridge_test_flow_rejects),
++	KUNIT_CASE(nf_flow_bridge_test_hook_forwards),
++	KUNIT_CASE(nf_flow_bridge_test_hook_reply),
++	KUNIT_CASE(nf_flow_bridge_test_hook_other_crossing),
++	KUNIT_CASE(nf_flow_bridge_test_hook_egress_changed),
++	KUNIT_CASE(nf_flow_bridge_test_hook_ingress),
++	KUNIT_CASE(nf_flow_bridge_test_hook_tagged),
++	KUNIT_CASE(nf_flow_bridge_test_hook_closing),
++	KUNIT_CASE(nf_flow_bridge_test_hook_bridge_check),
++	KUNIT_CASE(nf_flow_bridge_test_hook_mtu),
++	KUNIT_CASE(nf_flow_bridge_test_flow_check),
++	KUNIT_CASE(nf_flow_bridge_test_fdb_changes),
++	KUNIT_CASE(nf_flow_bridge_test_fdb_event),
++	KUNIT_CASE(nf_flow_bridge_test_table),
++	{}
++};
++
++static struct kunit_suite nf_flow_bridge_test_suite = {
++	.name = "nf_flow_table_bridge",
++	.init = nf_flow_bridge_test_init,
++	.test_cases = nf_flow_bridge_test_cases,
++};
++
++kunit_test_suite(nf_flow_bridge_test_suite);
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -328,6 +328,9 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 
+ 	switch (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.dst.protonum) {
+ 	case IPPROTO_TCP:
++		/* a bridge chain sees frames it didn't parse as IP (thoff 0) */
++		if (!nft_thoff(pkt))
++			goto out;
+ 		tcph = skb_header_pointer(pkt->skb, nft_thoff(pkt),
+ 					  sizeof(_tcph), &_tcph);
+ 		if (unlikely(!tcph || tcph->fin || tcph->rst ||
+@@ -360,18 +363,28 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 	if (!nf_ct_is_confirmed(ct))
+ 		goto out;
+ 
+-	if (test_and_set_bit(IPS_OFFLOAD_BIT, &ct->status))
++	if (test_and_set_bit(IPS_OFFLOAD_BIT, &ct->status)) {
++		if (flowtable->type->flow_check)
++			flowtable->type->flow_check(flowtable, pkt);
+ 		goto out;
++	}
+ 
+ 	dir = CTINFO2DIR(ctinfo);
+-	if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
+-		goto err_flow_route;
+-
+-	flow = flow_offload_alloc(ct);
+-	if (!flow)
+-		goto err_flow_alloc;
+-
+-	flow_offload_route_init(flow, &route);
++	if (flowtable->type->flow_alloc) {
++		/* the bridge's: the ports and addresses of this packet */
++		flow = flowtable->type->flow_alloc(ct, pkt, dir);
++		if (!flow)
++			goto err_flow_route;
++	} else {
++		if (nft_flow_route(pkt, ct, &route, dir, priv->flowtable) < 0)
++			goto err_flow_route;
++
++		flow = flow_offload_alloc(ct);
++		if (!flow)
++			goto err_flow_alloc;
++
++		flow_offload_route_init(flow, &route);
++	}
+ 	if (tcph)
+ 		flow_offload_ct_tcp(ct);
+ 
+@@ -398,9 +411,11 @@ static int nft_flow_offload_validate(const struct nft_ctx *ctx,
+ {
+ 	unsigned int hook_mask = (1 << NF_INET_FORWARD);
+ 
++	/* NF_BR_FORWARD is NF_INET_FORWARD */
+ 	if (ctx->family != NFPROTO_IPV4 &&
+ 	    ctx->family != NFPROTO_IPV6 &&
+-	    ctx->family != NFPROTO_INET)
++	    ctx->family != NFPROTO_INET &&
++	    ctx->family != NFPROTO_BRIDGE)
+ 		return -EOPNOTSUPP;
+ 
+ 	return nft_chain_validate_hooks(ctx->chain, hook_mask);

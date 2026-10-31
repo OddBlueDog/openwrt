@@ -1,0 +1,453 @@
+#!/usr/bin/ucode
+// Switches MilkFlint between router and access point mode (ui feature
+// "mode"). The feature's rpcd plugin starts this in the background with the
+// request in /tmp/milkflint/mode-request.json; it writes its progress to
+// /tmp/milkflint/mode.json.
+//
+// Access point mode adds the WAN port to the LAN bridge, has the LAN take
+// its address from the main router (or a fixed one), stops the LAN's DHCP
+// server and IPv6 router adverts, sets wan and wan6 to proto none, and turns
+// off what only a router needs: Smart Queue on the WAN port, UPnP, and the
+// Wi-Fi networks that aren't on the LAN (guest networks, which route out
+// through the WAN). It sets fw4's flow_offloading_bridge as asked. What
+// router mode had there is kept in /etc/config/milkflint_router, section by
+// section, and switching back puts it back, with flow_offloading_bridge
+// always off (unset, fw4's default).
+//
+// Before changing anything it copies the configs it touches. Then, with the
+// new mode applied (apply()), it waits for it to work: the LAN up as it's
+// now configured (its protocol, its address if fixed), and in access point
+// mode a gateway that answers (ping, or ARP for one that ignores pings). If
+// that doesn't happen in time, the copies go back and the
+// router is as it was. mode-switch-watchdog does the same if this dies
+// halfway.
+//
+// Router mode also turns on and starts the firewall, dnsmasq and odhcpd if
+// they're off, as OpenWrt's access point recipe leaves them: switching back
+// from an access point set up by hand mustn't leave a router without its
+// firewall. Without kept router settings it puts OpenWrt's defaults back.
+'use strict';
+
+import { access, mkdir, popen, readfile, readlink, rename, unlink, writefile } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+
+const DIR = '/tmp/milkflint';
+const STATE = DIR + '/mode.json';
+const REQUEST = DIR + '/mode-request.json';
+const COPY = DIR + '/mode-before';
+const SAVED = 'milkflint_router';
+const CONFIGS = [ 'network', 'dhcp', 'firewall', 'sqm', 'upnpd', 'wireless', 'milkflint', SAVED ];
+const WAIT_S = { ap: 120, router: 45 };
+// the configs a switch writes whose services apply them
+const SERVICE_CONFIGS = [ 'network', 'dhcp', 'firewall', 'sqm', 'upnpd', 'wireless' ];
+// the options of the LAN interface that addressing sets, in either mode
+const LAN_ADDRESSING = [ 'ipaddr', 'netmask', 'gateway', 'dns', 'broadcast', 'ip6assign', 'ip6hint', 'ip6class', 'ip6ifaceid' ];
+
+let st;
+
+function save() {
+	writefile(`${STATE}.tmp`, sprintf('%J', st));
+	rename(`${STATE}.tmp`, STATE);
+}
+
+function log(msg) {
+	system([ 'logger', '-t', 'mode-switch', msg ]);
+}
+
+const as_list = (v) => (type(v) == 'array') ? v : ((v != null) ? split(v, /\s+/) : []);
+
+function wan_port(c) {
+	let board;
+	try {
+		board = json(readfile('/etc/board.json') ?? '{}');
+	}
+	catch (e) {
+		board = {};
+	}
+	const dev = board?.network?.wan?.device ?? c.get('network', 'wan', 'device');
+	return (type(dev) == 'string' && match(dev, /^[A-Za-z0-9_-]+/)) ? match(dev, /^[A-Za-z0-9_-]+/)[0] : null;
+}
+
+function device_section(c, name) {
+	let sec = null;
+	c.foreach('network', 'device', (s) => {
+		if (sec == null && s.name == name)
+			sec = s['.name'];
+	});
+	return sec;
+}
+
+function defaults_section(c) {
+	let sec = null;
+	c.foreach('firewall', 'defaults', (s) => {
+		sec ??= s['.name'];
+	});
+	return sec;
+}
+
+// a section, its type and options, into another config's section; false
+// (and that section gone) if there's nothing to copy
+function copy(c, from, fsec, to, tsec) {
+	const s = c.get_all(from, fsec);
+	c.delete(to, tsec);
+	if (s == null)
+		return false;
+	c.set(to, tsec, s['.type']);
+	for (let k, v in s)
+		if (substr(k, 0, 1) != '.')
+			c.set(to, tsec, k, v);
+	return true;
+}
+
+// a kept section back where it is: its options as they were, in their
+// order, none of access point mode's; a new one if it went. False if
+// nothing was kept.
+function put_back_section(c, fsec, to, tsec) {
+	const saved = c.get_all(SAVED, fsec);
+	if (saved == null)
+		return false;
+	const cur = c.get_all(to, tsec);
+	if (cur == null || cur['.type'] != saved['.type'])
+		return copy(c, SAVED, fsec, to, tsec);
+	for (let k in keys(cur))
+		if (substr(k, 0, 1) != '.')
+			c.delete(to, tsec, k);
+	for (let k, v in saved)
+		if (substr(k, 0, 1) != '.')
+			c.set(to, tsec, k, v);
+	return true;
+}
+
+function set_list(c, config, sec, option, values) {
+	if (length(values))
+		c.set(config, sec, option, values);
+	else
+		c.delete(config, sec, option);
+}
+
+function set_mode(c, m) {
+	if (c.get('milkflint', 'mode') == null)
+		c.set('milkflint', 'mode', 'mode');
+	c.set('milkflint', 'mode', 'mode', m);
+}
+
+function commit(c) {
+	for (let cfg in CONFIGS)
+		if (access(`/etc/config/${cfg}`))
+			c.commit(cfg);
+}
+
+function to_ap(req) {
+	if (!access(`/etc/config/${SAVED}`))
+		writefile(`/etc/config/${SAVED}`, '');
+	const c = cursor();
+	const port = wan_port(c);
+	const brsec = device_section(c, c.get('network', 'lan', 'device') ?? 'br-lan');
+	const fw = defaults_section(c);
+	if (port == null || brsec == null)
+		return 'no WAN port or LAN bridge';
+
+	// what router mode has, for switching back
+	for (let s in [ 'lan', 'wan', 'wan6' ])
+		copy(c, 'network', s, SAVED, `network_${s}`);
+	copy(c, 'dhcp', 'lan', SAVED, 'dhcp_lan');
+	c.delete(SAVED, 'mode');
+	c.set(SAVED, 'mode', 'mode');
+	const ports = as_list(c.get('network', brsec, 'ports'));
+	c.set(SAVED, 'mode', 'bridge', brsec);
+	set_list(c, SAVED, 'mode', 'ports', ports);
+	c.set(SAVED, 'mode', 'port', port);
+	const queues = [];
+	c.foreach('sqm', 'queue', (q) => {
+		if (q.enabled == '1' && (q.interface == port || index(q.interface ?? '', port + '.') == 0))
+			push(queues, q['.name']);
+	});
+	set_list(c, SAVED, 'mode', 'sqm', queues);
+	const upnp = c.get('upnpd', 'config', 'enabled');
+	if (upnp != null)
+		c.set(SAVED, 'mode', 'upnpd', upnp);
+	const wifi = [];
+	c.foreach('wireless', 'wifi-iface', (w) => {
+		if (w.disabled != '1' && !('lan' in as_list(w.network)))
+			push(wifi, w['.name']);
+	});
+	set_list(c, SAVED, 'mode', 'wifi', wifi);
+
+	// access point mode
+	if (!(port in ports))
+		push(ports, port);
+	c.set('network', brsec, 'ports', ports);
+	for (let o in LAN_ADDRESSING)
+		c.delete('network', 'lan', o);
+	c.set('network', 'lan', 'proto', req.proto);
+	if (req.proto == 'static') {
+		c.set('network', 'lan', 'ipaddr', req.ipaddr);
+		c.set('network', 'lan', 'netmask', req.netmask);
+		c.set('network', 'lan', 'gateway', req.gateway);
+		set_list(c, 'network', 'lan', 'dns', req.dns ?? []);
+	}
+	for (let s in [ 'wan', 'wan6' ]) {
+		if (c.get('network', s) == null)
+			continue;
+		c.delete('network', s, 'device');
+		c.set('network', s, 'proto', 'none');
+		c.set('network', s, 'auto', '0');
+	}
+	if (c.get('dhcp', 'lan') != null) {
+		c.set('dhcp', 'lan', 'ignore', '1');
+		c.set('dhcp', 'lan', 'dhcpv6', 'disabled');
+		c.set('dhcp', 'lan', 'ra', 'disabled');
+		c.set('dhcp', 'lan', 'ndp', 'disabled');
+	}
+	if (fw != null)
+		c.set('firewall', fw, 'flow_offloading_bridge', req.bridge_offload ? '1' : '0');
+	for (let q in queues)
+		c.set('sqm', q, 'enabled', '0');
+	if (upnp != null)
+		c.set('upnpd', 'config', 'enabled', '0');
+	for (let w in wifi)
+		c.set('wireless', w, 'disabled', '1');
+	set_mode(c, 'ap');
+	commit(c);
+	return null;
+}
+
+// router mode as OpenWrt sets it up, where nothing was kept
+function router_default(c, s, port) {
+	switch (s) {
+	case 'lan':
+		c.set('network', 'lan', 'interface');
+		c.set('network', 'lan', 'device', 'br-lan');
+		c.set('network', 'lan', 'proto', 'static');
+		c.set('network', 'lan', 'ipaddr', [ '192.168.1.1/24' ]);
+		c.set('network', 'lan', 'ip6assign', '60');
+		break;
+	case 'wan':
+	case 'wan6':
+		c.set('network', s, 'interface');
+		c.set('network', s, 'device', port);
+		c.set('network', s, 'proto', (s == 'wan') ? 'dhcp' : 'dhcpv6');
+		break;
+	}
+}
+
+function to_router() {
+	const c = cursor();
+	const m = c.get_all(SAVED, 'mode');
+	const port = m?.port ?? wan_port(c);
+	for (let s in [ 'lan', 'wan', 'wan6' ]) {
+		if (!put_back_section(c, `network_${s}`, 'network', s)) {
+			c.delete('network', s);
+			router_default(c, s, port);
+		}
+	}
+	if (!put_back_section(c, 'dhcp_lan', 'dhcp', 'lan')) {
+		// OpenWrt's (dnsmasq's section, odhcpd's first-boot options), in
+		// place of the access point's: its ignore '1' would keep the DHCP
+		// server off
+		c.delete('dhcp', 'lan');
+		c.set('dhcp', 'lan', 'dhcp');
+		c.set('dhcp', 'lan', 'interface', 'lan');
+		c.set('dhcp', 'lan', 'start', '100');
+		c.set('dhcp', 'lan', 'limit', '150');
+		c.set('dhcp', 'lan', 'leasetime', '12h');
+		c.set('dhcp', 'lan', 'dhcpv4', 'server');
+		c.set('dhcp', 'lan', 'dhcpv6', 'server');
+		c.set('dhcp', 'lan', 'ra', 'server');
+		c.set('dhcp', 'lan', 'ra_slaac', '1');
+		c.set('dhcp', 'lan', 'ra_flags', [ 'managed-config', 'other-config' ]);
+	}
+	const brsec = m?.bridge ?? device_section(c, c.get('network', 'lan', 'device') ?? 'br-lan');
+	if (brsec != null && c.get('network', brsec) != null) {
+		const ports = (m?.ports != null) ? as_list(m.ports) :
+			filter(as_list(c.get('network', brsec, 'ports')), (p) => p != port);
+		set_list(c, 'network', brsec, 'ports', ports);
+	}
+	// the bridge fast path is for access point mode only: on a router, bridge
+	// conntrack would sit in front of every LAN packet, routed ones too
+	const fw = defaults_section(c);
+	if (fw != null)
+		c.delete('firewall', fw, 'flow_offloading_bridge');
+	for (let q in as_list(m?.sqm))
+		if (c.get('sqm', q) != null)
+			c.set('sqm', q, 'enabled', '1');
+	if (m?.upnpd != null && c.get('upnpd', 'config') != null)
+		c.set('upnpd', 'config', 'enabled', m.upnpd);
+	for (let w in as_list(m?.wifi))
+		if (c.get('wireless', w) != null)
+			c.delete('wireless', w, 'disabled');
+	set_mode(c, 'router');
+	for (let s in [ 'network_lan', 'network_wan', 'network_wan6', 'dhcp_lan', 'mode' ])
+		c.delete(SAVED, s);
+	commit(c);
+	return null;
+}
+
+// what a router needs that OpenWrt's access point recipe turns off: on and
+// running for router mode, the ones that were off listed
+const ROUTER_SERVICES = [ 'firewall', 'dnsmasq', 'odhcpd' ];
+
+function services_on() {
+	const turned = [];
+	for (let svc in ROUTER_SERVICES) {
+		const init = `/etc/init.d/${svc}`;
+		if (!access(init))
+			continue;
+		if (system([ init, 'enabled' ]) != 0) {
+			system([ init, 'enable' ]);
+			push(turned, svc);
+		}
+		system([ init, 'start' ]);
+	}
+	return turned;
+}
+
+function services_back(turned) {
+	for (let svc in turned ?? []) {
+		system([ `/etc/init.d/${svc}`, 'stop' ]);
+		system([ `/etc/init.d/${svc}`, 'disable' ]);
+	}
+}
+
+function copy_configs() {
+	system([ 'rm', '-rf', COPY ]);
+	mkdir(COPY);
+	for (let cfg in CONFIGS) {
+		const text = readfile(`/etc/config/${cfg}`);
+		if (text != null)
+			writefile(`${COPY}/${cfg}`, text);
+	}
+	writefile(`${COPY}/.complete`, '');
+}
+
+// the services apply the configs as they are now. reload_config alone tells
+// them only of configs that changed since it last ran: one changed and
+// applied another way since (an access point set up by hand, with
+// /etc/init.d/network reload) and now written back as it was then would look
+// unchanged to it, and stay as it runs. Each service compares the config with
+// what it runs, so telling it again does no harm.
+function apply() {
+	system('reload_config');
+	for (let cfg in SERVICE_CONFIGS)
+		system([ 'ubus', 'call', 'service', 'event',
+			sprintf('%J', { type: 'config.change', data: { package: cfg } }) ]);
+}
+
+function put_back() {
+	for (let cfg in CONFIGS) {
+		const text = readfile(`${COPY}/${cfg}`);
+		if (text != null)
+			writefile(`/etc/config/${cfg}`, text);
+		else
+			unlink(`/etc/config/${cfg}`);
+	}
+	apply();
+}
+
+function addressing(bus) {
+	const s = bus?.call('network.interface.lan', 'status', {});
+	const a = s?.['ipv4-address']?.[0];
+	let gateway = null;
+	for (let r in s?.route ?? [])
+		if (r.target == '0.0.0.0' && r.mask == 0)
+			gateway = r.nexthop;
+	return { up: s?.up == true, proto: s?.proto, ipaddr: a?.address, prefix: a?.mask, gateway };
+}
+
+// the gateway answers a ping, or at least ARP (some routers ignore pings)
+function answers(gw) {
+	if (system([ 'ping', '-c', '1', '-W', '1', gw ]) == 0)
+		return true;
+	const p = popen(`ip -4 neigh show ${gw} 2>/dev/null`);
+	const out = p?.read('all') ?? '';
+	p?.close();
+	return match(out, /lladdr/) != null && match(out, /FAILED|INCOMPLETE/) == null;
+}
+
+// what the LAN has once the new mode works, or null: up as it's configured
+// now (the same protocol, and a fixed address if it has one), not still as
+// the mode before had it
+function works(target, req, bus) {
+	const a = addressing(bus);
+	if (!a.up || a.ipaddr == null)
+		return null;
+	const lan = cursor().get_all('network', 'lan') ?? {};
+	if (a.proto != lan.proto)
+		return null;
+	if (lan.proto == 'static' && a.ipaddr != split(as_list(lan.ipaddr)[0] ?? '', '/')[0])
+		return null;
+	if (target == 'router')
+		return a;
+	const gw = a.gateway ?? req.gateway;
+	if (type(gw) != 'string' || !match(gw, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/))
+		return null;
+	a.gateway = gw;
+	return answers(gw) ? a : null;
+}
+
+let req;
+try {
+	req = json(readfile(REQUEST) ?? 'null');
+}
+catch (e) {
+	req = null;
+}
+mkdir(DIR);
+const pid = +readlink('/proc/self');
+if (!(req?.mode in [ 'ap', 'router' ])) {
+	st = { state: 'failed', error: 'no request', finished: time() };
+	save();
+	exit(1);
+}
+const target = req.mode;
+const from = (target == 'ap') ? 'router' : 'ap';
+st = { state: 'switching', target, from, started: time(), pid };
+save();
+
+copy_configs();
+system([ 'start-stop-daemon', '-S', '-b', '-x', '/usr/libexec/milkflint/mode-switch-watchdog', '--', `${pid}` ]);
+log(`switching to ${target == 'ap' ? 'access point' : 'router'} mode`);
+
+const err = (target == 'ap') ? to_ap(req) : to_router();
+if (err != null) {
+	put_back();
+	st = { ...st, state: 'failed', mode: from, error: err, finished: time() };
+	save();
+	log(`not switched: ${err}`);
+	exit(1);
+}
+apply();
+if (target == 'router') {
+	st.services_on = services_on();
+	save();
+}
+
+const bus = connect();
+const deadline = time() + WAIT_S[target];
+let got = null;
+while (time() < deadline) {
+	sleep(2000);
+	got = works(target, req, bus);
+	if (got != null)
+		break;
+}
+bus?.disconnect();
+
+if (got == null) {
+	put_back();
+	services_back(st.services_on);
+	st = {
+		...st, state: 'failed', mode: from, finished: time(),
+		error: (target == 'ap') ?
+			`no address and gateway from the main router within ${WAIT_S.ap} s` :
+			`the LAN didn't come up within ${WAIT_S.router} s`,
+	};
+	save();
+	log(`back in ${from == 'ap' ? 'access point' : 'router'} mode: ${st.error}`);
+	exit(1);
+}
+
+st = { ...st, state: 'done', mode: target, finished: time(), address: got.ipaddr, prefix: got.prefix, gateway: got.gateway };
+save();
+log(`in ${target == 'ap' ? 'access point' : 'router'} mode, at ${got.ipaddr}`);

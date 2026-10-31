@@ -9,5 +9,6 @@ export const feature = {
   icon: PlugZapIcon,
   group: 'security',
   order: 40,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.UpnpPage),
 } satisfies Feature;

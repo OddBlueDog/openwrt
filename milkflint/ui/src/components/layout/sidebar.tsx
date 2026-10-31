@@ -1,9 +1,10 @@
 import { ChevronDownIcon, ExternalLinkIcon, LogOutIcon, SlidersHorizontalIcon } from 'lucide-react';
 import { type ComponentProps, type ReactElement, useId, useState } from 'react';
-import { menu, menuGroups } from '@/features';
+import { menuFor, menuGroups } from '@/features';
 import type { Feature, GroupId } from '@/features/types';
 import { type Board, firmwareName } from '@/lib/api/system';
 import { href, type Route } from '@/lib/router';
+import { useRouterMode } from '@/lib/router-mode';
 import { logout } from '@/lib/session';
 import { cn } from '@/lib/utils';
 import { ThemeToggle } from './theme-toggle';
@@ -74,6 +75,7 @@ export function Sidebar({
   board: Board | undefined;
   onNavigate?: () => void;
 }): ReactElement {
+  const menu = menuFor(useRouterMode());
   const activeGroup = menuGroups.find((g) => g.features.some((f) => f.id === active))?.id;
   const [open, setOpen] = useState<ReadonlySet<GroupId>>(() => new Set(activeGroup === undefined ? [] : [activeGroup]));
   const isOpen = (id: GroupId): boolean => open.has(id) || id === activeGroup;

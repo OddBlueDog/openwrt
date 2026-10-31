@@ -448,7 +448,7 @@ function SettingsCard({ onApplied }: { onApplied: () => void }): ReactElement | 
             className={side}
             id="logs-counters"
             label="Debug counters"
-            hint="For chasing a dropout: every interval, the load and packets at each hop (CPU, CAKE, eth1, Wi-Fi), and once a minute memory, the WAN and service restarts, in the debug log."
+            hint="For chasing a dropout: every interval, the load and packets at each hop (CPU, CAKE, the WAN port, Wi-Fi), and once a minute memory, the WAN and service restarts, in the debug log."
           >
             <Switch
               id="logs-counters"

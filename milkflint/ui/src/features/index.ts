@@ -13,6 +13,7 @@ import { feature as internet } from './internet/feature';
 import { feature as ipv6 } from './ipv6/feature';
 import { feature as lan } from './lan/feature';
 import { feature as logs } from './logs/feature';
+import { feature as mode } from './mode/feature';
 import { feature as networkQuality } from './network-quality/feature';
 import { feature as radarScan } from './radar-scan/feature';
 import { feature as remoteAccess } from './remote-access/feature';
@@ -21,6 +22,7 @@ import { feature as sqm } from './sqm/feature';
 import { feature as systemOverview } from './system-overview/feature';
 import { feature as time } from './time/feature';
 import { feature as tuning } from './tuning/feature';
+import type { RouterMode } from '@/lib/router-mode';
 import type { Feature, Group } from './types';
 import { feature as upgrade } from './upgrade/feature';
 import { feature as upnp } from './upnp/feature';
@@ -33,6 +35,7 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   dashboard,
   internet,
   dns,
+  mode,
   wifi,
   'wifi-guest': wifiGuest,
   'wifi-scan': wifiScan,
@@ -79,3 +82,14 @@ export const menu: readonly MenuEntry[] = [
   ...topLevel.map((feature): MenuEntry & { order: number } => ({ kind: 'page', feature, order: feature.order })),
   ...menuGroups.map((group): MenuEntry & { order: number } => ({ kind: 'group', group, order: group.order })),
 ].sort((a, b) => a.order - b.order);
+
+/** The menu in access point mode: without the pages only a router needs, and any group left empty. */
+const accessPointMenu: readonly MenuEntry[] = menu.flatMap((entry): MenuEntry[] => {
+  if (entry.kind === 'page') return entry.feature.routerOnly === true ? [] : [entry];
+  const features = entry.group.features.filter((f) => f.routerOnly !== true);
+  return features.length === 0 ? [] : [{ kind: 'group', group: { ...entry.group, features } }];
+});
+
+export function menuFor(routerMode: RouterMode | undefined): readonly MenuEntry[] {
+  return routerMode === 'ap' ? accessPointMenu : menu;
+}

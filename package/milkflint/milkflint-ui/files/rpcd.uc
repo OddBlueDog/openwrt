@@ -84,8 +84,15 @@ function steering(dev) {
 // (pdma0-3) and the QDMA send side.
 const RING_GIC = [221, 222, 223, 224];
 const TX_GIC = 229;
-// the RSS table is the frame engine's, shared by its ports (packet-steering.sh)
-const RSS_DEV = 'eth1';
+// the RSS table is the frame engine's, shared by its ports, and set on the
+// MAC that isn't the switch's (packet-steering.sh): eth1 on the GL-MT6000,
+// wan on the EX5601
+function rss_dev() {
+	const p = popen('/usr/libexec/milkflint/ports rss 2>/dev/null', 'r');
+	const dev = trim(p?.read('all') ?? '');
+	p?.close();
+	return match(dev, /^[A-Za-z0-9_-]+$/) ? dev : 'eth1';
+}
 
 // Interrupts from /proc/interrupts: { irq, gic, name, count } for each
 // numbered line, `count` summed over the CPUs.
@@ -142,7 +149,8 @@ function net_threads() {
 // The RSS indirection table (ethtool -x): how many of its entries point at
 // each ring, and the hash function. null without ethtool or RSS.
 function rss_table() {
-	const fd = popen(`ethtool -x ${RSS_DEV} 2>/dev/null`, 'r');
+	const dev = rss_dev();
+	const fd = popen(`ethtool -x ${dev} 2>/dev/null`, 'r');
 	if (!fd)
 		return null;
 	const text = fd.read('all') ?? '';
@@ -160,7 +168,7 @@ function rss_table() {
 				table[+r]++;
 	}
 	const hash = match(text, /\n[ \t]+([a-z0-9-]+): on/);
-	return { dev: RSS_DEV, rings: +rings[1], table, hash: hash?.[1] };
+	return { dev, rings: +rings[1], table, hash: hash?.[1] };
 }
 
 // Where the network work runs, for the Tuning and Smart Queue pages: each

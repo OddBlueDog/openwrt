@@ -9,5 +9,6 @@ export const feature = {
   icon: UsersIcon,
   group: 'wifi',
   order: 20,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.GuestWifiPage),
 } satisfies Feature;

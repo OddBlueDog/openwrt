@@ -1,10 +1,11 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { MenuIcon, TriangleAlertIcon } from 'lucide-react';
-import { type ReactElement, type ReactNode, useState } from 'react';
+import { type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { usePoll } from '@/hooks/use-poll';
 import { getBoard } from '@/lib/api/system';
 import type { Route } from '@/lib/router';
+import { refreshRouterMode } from '@/lib/router-mode';
 import { useSession } from '@/lib/session';
 import { Logo, Sidebar } from './sidebar';
 
@@ -13,6 +14,10 @@ export function AppShell({ route, children }: { route: Route; children: ReactNod
   const [menuOpen, setMenuOpen] = useState(false);
   const session = useSession();
   const password = session.status === 'authenticated' && route !== 'admin-password' ? session.adminPassword : 'set';
+
+  useEffect(() => {
+    void refreshRouterMode();
+  }, []);
 
   return (
     <div className="min-h-dvh lg:grid lg:grid-cols-[15.5rem_1fr]">

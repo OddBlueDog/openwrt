@@ -9,5 +9,6 @@ export const feature = {
   icon: BrickWallIcon,
   group: 'security',
   order: 10,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.FirewallPage),
 } satisfies Feature;

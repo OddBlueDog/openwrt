@@ -1,0 +1,42 @@
+#!/bin/sh
+# The network ports MilkFlint's scripts need, by role rather than by name,
+# so they work on any MT7986 board (ui feature "tuning"):
+#   ports rss   the frame engine's MAC that isn't the switch's, whose RSS
+#               table packet steering sets: eth1 (the WAN) on the GL-MT6000,
+#               wan on the EX5601/T-56; eth1 if there's none
+#   ports wan   the board's WAN port (/etc/board.json), else the wan
+#               interface's device without a VLAN, else eth1
+# SYSFS and BOARD_JSON point elsewhere for tests.
+SYSFS=${SYSFS:-/sys}
+BOARD_JSON=${BOARD_JSON:-/etc/board.json}
+
+rss() {
+	for n in "$SYSFS"/class/net/*; do
+		case "$(readlink "$n/device" 2> /dev/null)" in
+		*/15100000.ethernet)
+			# a DSA conduit has dsa/: that's the switch's MAC
+			[ -e "$n/dsa" ] || { basename "$n"; return; }
+			;;
+		esac
+	done
+	echo eth1
+}
+
+wan() {
+	dev=$(jsonfilter -i "$BOARD_JSON" -e '@.network.wan.device' 2> /dev/null)
+	[ -n "$dev" ] || dev=$(uci -q get network.wan.device)
+	dev=${dev%%.*}
+	case "$dev" in
+	'' | @* | *[!A-Za-z0-9_-]*) echo eth1 ;;
+	*) echo "$dev" ;;
+	esac
+}
+
+case "$1" in
+rss) rss ;;
+wan) wan ;;
+*)
+	echo "usage: ports rss|wan" >&2
+	exit 1
+	;;
+esac

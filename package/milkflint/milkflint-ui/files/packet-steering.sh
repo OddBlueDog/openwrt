@@ -42,8 +42,10 @@
 
 NAPI_CPUS=1
 WORK_CPUS=e
-# the RSS table is the frame engine's, shared by eth0 and eth1
-RSS_DEV=eth1
+# the RSS table is the frame engine's, shared by its two MACs; it's set on
+# the one that isn't the switch's (eth1 on the GL-MT6000, wan on the EX5601)
+RSS_DEV=$(/usr/libexec/milkflint/ports rss 2> /dev/null)
+[ -n "$RSS_DEV" ] || RSS_DEV=eth1
 
 # the frame engine's interrupt for GIC SPI number $1 (pdma0-3: 221-224)
 eth_irq() {

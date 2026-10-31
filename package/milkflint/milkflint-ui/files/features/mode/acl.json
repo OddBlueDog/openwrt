@@ -1,0 +1,11 @@
+{
+	"milkflint-mode": {
+		"description": "MilkFlint web interface: router or access point mode",
+		"read": {
+			"ubus": { "milkflint.mode": [ "status" ] }
+		},
+		"write": {
+			"ubus": { "milkflint.mode": [ "switch" ] }
+		}
+	}
+}

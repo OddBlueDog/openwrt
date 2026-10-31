@@ -1384,6 +1384,40 @@ endef
 $(eval $(call KernelPackage,nft-offload))
 
 
+define KernelPackage/nf-conntrack-bridge
+  SUBMENU:=$(NF_MENU)
+  TITLE:=Bridge connection tracking
+  DEPENDS:=+kmod-nf-conntrack +IPV6:kmod-nf-conntrack6
+  KCONFIG:=CONFIG_NF_CONNTRACK_BRIDGE
+  FILES:=$(LINUX_DIR)/net/bridge/netfilter/nf_conntrack_bridge.ko
+  AUTOLOAD:=$(call AutoProbe,nf_conntrack_bridge)
+endef
+
+define KernelPackage/nf-conntrack-bridge/description
+ Connection tracking of what a bridge forwards, for nftables bridge
+ tables (ct expressions, flow offloading), without br_netfilter.
+endef
+
+$(eval $(call KernelPackage,nf-conntrack-bridge))
+
+
+define KernelPackage/nft-bridge-offload
+  SUBMENU:=$(NF_MENU)
+  TITLE:=Netfilter nf_tables bridge flow offload support
+  DEPENDS:=+kmod-nft-offload +kmod-nft-bridge +kmod-nf-conntrack-bridge
+  KCONFIG:=CONFIG_NF_FLOW_TABLE_BRIDGE
+  FILES:=$(LINUX_DIR)/net/bridge/netfilter/nf_flow_table_bridge.ko
+  AUTOLOAD:=$(call AutoProbe,nf_flow_table_bridge)
+endef
+
+define KernelPackage/nft-bridge-offload/description
+ A software fast path for the connections a bridge forwards from one
+ port to another: a bridge flow table for nftables' flow add.
+endef
+
+$(eval $(call KernelPackage,nft-bridge-offload))
+
+
 define KernelPackage/nft-netdev
   SUBMENU:=$(NF_MENU)
   TITLE:=Netfilter nf_tables netdev support

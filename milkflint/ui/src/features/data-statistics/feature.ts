@@ -9,5 +9,6 @@ export const feature = {
   icon: ChartColumnIcon,
   group: 'flow-control',
   order: 15,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.DataStatisticsPage),
 } satisfies Feature;

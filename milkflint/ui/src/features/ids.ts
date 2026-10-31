@@ -4,6 +4,7 @@ export const featureIds = [
   'dashboard',
   'internet',
   'dns',
+  'mode',
   'wifi',
   'wifi-guest',
   'wifi-scan',

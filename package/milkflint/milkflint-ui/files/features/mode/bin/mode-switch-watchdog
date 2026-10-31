@@ -1,0 +1,46 @@
+#!/bin/sh
+# Watchdog for mode-switch (ui feature "mode"), which rewrites the network,
+# DHCP and firewall configs to switch between router and access point mode.
+# If its process dies before it has finished (the state file still says
+# switching), this puts back the configs it copied before changing anything
+# and reloads them, so the router is as it was. mode-switch starts it,
+# detached, with its pid, after taking the copies.
+#   mode-switch-watchdog PID
+PID=$1
+STATE=/tmp/milkflint/mode.json
+COPY=/tmp/milkflint/mode-before
+CONFIGS="network dhcp firewall sqm upnpd wireless milkflint milkflint_router"
+
+switching() {
+	[ "$(jsonfilter -i "$STATE" -e @.state 2> /dev/null)" = switching ]
+}
+
+while kill -0 "$PID" 2> /dev/null; do
+	sleep 2
+done
+switching || exit 0
+[ -f "$COPY/.complete" ] || exit 0
+
+for c in $CONFIGS; do
+	if [ -f "$COPY/$c" ]; then
+		cp "$COPY/$c" "/etc/config/$c"
+	else
+		rm -f "/etc/config/$c"
+	fi
+done
+# as mode-switch's apply(): reload_config, then each service told anyway
+reload_config
+for c in network dhcp firewall sqm upnpd wireless; do
+	ubus call service event "{\"type\":\"config.change\",\"data\":{\"package\":\"$c\"}}"
+done
+logger -t mode-switch "the switch stopped halfway: the previous mode is back"
+ucode -e "
+	import { readfile, rename, writefile } from 'fs';
+	let s = json(readfile('$STATE') ?? '{}') ?? {};
+	s.state = 'failed';
+	s.mode = s.from;
+	s.error = 'the switch stopped halfway';
+	s.finished = time();
+	writefile('$STATE.tmp', sprintf('%J', s));
+	rename('$STATE.tmp', '$STATE');
+"

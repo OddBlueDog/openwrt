@@ -9,5 +9,6 @@ export const feature = {
   icon: Globe2Icon,
   group: 'network',
   order: 20,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.Ipv6Page),
 } satisfies Feature;

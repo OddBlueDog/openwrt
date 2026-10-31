@@ -9,5 +9,6 @@ export const feature = {
   icon: GaugeIcon,
   group: 'flow-control',
   order: 20,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.SqmPage),
 } satisfies Feature;

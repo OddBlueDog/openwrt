@@ -18,7 +18,10 @@ It also has its own web interface for the everyday settings, served at the
 router's address; LuCI stays installed under "Advanced".
 
 MilkFlint is experimental (an alpha). Images are on the
-[Releases](https://github.com/OddBlueDog/openwrt/releases) page.
+[Releases](https://github.com/OddBlueDog/openwrt/releases) page. The same
+build also makes images for the Zyxel EX5601-T0 (also sold as the EX5601-T1
+and Telenor's T-56), which has the same MT7986: those are more experimental
+still, built but not tested on the hardware here (see below).
 
 ## Installing
 
@@ -44,6 +47,24 @@ Then plug a cable into a LAN port and open <http://192.168.1.1>. There's no
 password yet: sign in with it empty and set one under System → Admin
 Password. Wi-Fi is off until you set it up on the Wi-Fi page, with your
 country.
+
+### Zyxel EX5601-T0 / T-56 (experimental)
+
+Built from the same tree, not tested on the hardware here: reports welcome.
+Install OpenWrt on it first, following
+[OpenWrt's EX5601-T0 page](https://openwrt.org/toh/zyxel/ex5601-t0), and
+make sure you can recover it from there (serial console, recovery image)
+before you flash anything else. Then flash the MilkFlint image for the
+flash layout it has, which `cat /tmp/sysinfo/board_name` tells:
+
+- `zyxel,ex5601-t0-ubootmod` (OpenWrt's U-Boot):
+  `milkflint-*-zyxel_ex5601-t0-ubootmod-squashfs-sysupgrade.itb`
+- `zyxel,ex5601-t0-stock` (Zyxel's bootloader):
+  `milkflint-*-zyxel_ex5601-t0-stock-squashfs-sysupgrade.bin`
+
+OpenWrt refuses an image for the other layout. Never flash the preloader or
+bl31-uboot images unless OpenWrt's page tells you to: they replace the
+bootloader. Its WAN port is `wan`, its LAN ports `lan1` to `lan4`.
 
 ## This branch
 
@@ -78,7 +99,8 @@ make -j$(nproc)
 `feeds install` says it isn't overriding the core packages in
 `package/milkflint/`: that's how they replace the feeds' copies. The images
 are in `bin/targets/mediatek/filogic/`; flash the
-`milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin` one (see Installing).
+`milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin` one, or the EX5601's
+for its layout (see Installing).
 
 To build the web interface after changing it (Node.js 24 and pnpm):
 

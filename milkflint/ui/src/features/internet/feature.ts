@@ -8,5 +8,6 @@ export const feature = {
   description: 'How the router connects to your provider, and which DNS it uses.',
   icon: GlobeIcon,
   order: 10,
+  routerOnly: true,
   page: lazyPage(() => import('./page'), (m) => m.InternetPage),
 } satisfies Feature;
