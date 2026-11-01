@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 03:09:24 +0000
+Subject: [PATCH] milkflint tests: a missing firmware file's error, the same
+ only without the sysfs fallback
+
+mt7915_mcu2_init_no_ram_code and _no_patch request the missing file
+once for the error to expect, then check the driver's own request fails
+with it. With the firmware loader's sysfs fallback (OpenWrt's kernels
+have it), each request waits for procd to answer the uevent, which it
+does with -ENOMEM for a file that isn't there, or times out after 60 s
+with -ETIMEDOUT. On a slow boot the first answer came near the timeout,
+so the two requests sometimes failed differently. The VM now boots with
+the fallback ignored; the helper's comment says why it must be.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/mcu2-test.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 0e90ce14..70671be4 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -434,7 +434,10 @@ static void mt7915_mcu2_chip_ready(struct mt7915_dev *dev)
+ }
+ 
+ /* what loading firmware file @name fails with here (the VM has no MT7986
+- * firmware); skips the test if the file is there after all
++ * firmware); skips the test if the file is there after all. The driver's
++ * own request fails the same way only if neither asks userspace: with the
++ * loader's sysfs fallback, procd's answer races its 60 s timeout, so the
++ * VM boots with the fallback ignored (kernel.firmware_config).
+  */
+ static int mt7915_mcu2_fw_missing(struct kunit *test, struct mt7915_dev *dev,
+ 				  const char *name)

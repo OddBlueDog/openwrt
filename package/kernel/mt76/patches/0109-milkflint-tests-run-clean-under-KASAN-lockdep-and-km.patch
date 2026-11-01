@@ -1,0 +1,481 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 02:14:02 +0000
+Subject: [PATCH] milkflint tests: run clean under KASAN, lockdep and kmemleak
+
+A KUnit kernel with KASAN, UBSAN, lockdep and kmemleak found these in
+the tests themselves; the driver code they call was right each time:
+
+- mt76-agg-rx compared all of jiffies with the 32-bit reorder_time,
+  which agg-rx.c compares as 32 bits (time_before32()): the check
+  fails once jiffies passes 2^32, five minutes after boot.
+- mt76-eeprom stripped the device's OF nodes in a kunit action
+  registered after the nodes' own, so it ran after their release and
+  walked freed memory. It's the suite's exit now, which runs first.
+- mt76_test_reset_device's second band had no tx_lock set up, which
+  registering it does (mt76_phy_init()).
+- mt76_test_dfs_state_cac checked a radar channel without the wiphy
+  mutex that cfg80211 asserts there; mac80211 holds it when it calls
+  the driver.
+- The fake's register xarray took its lock with interrupts on, while
+  the irq tasklet and code under the driver's irq_lock write registers
+  too. It takes it with interrupts off now.
+- Tests called softirq-path code with BH on, or without the rx poll's
+  RCU read section: the txwi cache, tx_queue_skb(), txwi_free() and
+  mt7915_mac_tx_free(). They call it as the driver does now.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/mac-test.c |  9 ++++++
+ tests/agg-rx-test.c     |  4 ++-
+ tests/connac-mac-test.c | 22 ++++++++++++++
+ tests/core-test.c       |  6 ++++
+ tests/dma-test.c        | 67 ++++++++++++++++++++++++++++++-----------
+ tests/eeprom-test.c     | 14 ++++++---
+ tests/fake.h            | 10 ++++--
+ tests/record-test.c     |  2 +-
+ 8 files changed, 109 insertions(+), 25 deletions(-)
+
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 15ab5c12..0b77385b 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -214,7 +214,12 @@ static void mt7915_test_tx_free_short_event(struct kunit *test)
+ 	struct mt7915_dev *dev = mt7915_test_tx_dev(test);
+ 	u8 ev[4] = {};
+ 
++	/* as the rx poll runs it: BH off, RCU read section */
++	local_bh_disable();
++	rcu_read_lock();
+ 	mt7915_mac_tx_free(dev, ev, sizeof(ev));
++	rcu_read_unlock();
++	local_bh_enable();
+ 
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 0);
+ }
+@@ -235,7 +240,11 @@ static void mt7915_test_tx_free_truncated_event(struct kunit *test)
+ 	ev.info[0] = cpu_to_le32(FIELD_PREP(MT_TX_FREE_MSDU_ID, 5));
+ 	q->blocked = true;
+ 
++	local_bh_disable();
++	rcu_read_lock();
+ 	mt7915_mac_tx_free(dev, &ev, sizeof(ev));
++	rcu_read_unlock();
++	local_bh_enable();
+ 
+ 	KUNIT_EXPECT_FALSE(test, q->blocked);
+ }
+diff --git a/tests/agg-rx-test.c b/tests/agg-rx-test.c
+index 46c4b428..6f697074 100644
+--- a/tests/agg-rx-test.c
++++ b/tests/agg-rx-test.c
+@@ -410,8 +410,10 @@ static void mt76_test_aggr_hole(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&a->frames));
+ 	KUNIT_EXPECT_EQ(test, tid->nframes, 1);
+ 	KUNIT_EXPECT_PTR_EQ(test, tid->reorder_buf[102 % 8], skb);
++	/* reorder_time is 32 bits, as agg-rx.c compares it (time_before32()):
++	 * jiffies passes 2^32 five minutes after boot */
+ 	KUNIT_EXPECT_LE(test,
+-			jiffies - mt76_test_aggr_status(skb)->reorder_time, 3);
++			(u32)jiffies - mt76_test_aggr_status(skb)->reorder_time, 3);
+ 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&tid->reorder_work));
+ 	KUNIT_EXPECT_TRUE(test, tid->started);
+ 
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 428d1ce1..854c55e5 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -1579,7 +1579,13 @@ static void mt76_connac_test_txwi_free(struct kunit *test)
+ 	txp->buf[1] = cpu_to_le32(mt76_connac_test_map(test, dev, 512));
+ 	txp->len[1] = cpu_to_le16(512);
+ 
++	/* as mt7915_mac_tx_free() runs it: in NAPI (BH off), in the rx
++	 * poll's RCU read section */
++	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_connac2_txwi_free(dev, t, NULL, &free_list);
++	rcu_read_unlock();
++	local_bh_enable();
+ 
+ 	KUNIT_EXPECT_PTR_EQ(test, list_first_entry_or_null(&free_list,
+ 				struct sk_buff, list), skb);
+@@ -1620,7 +1626,9 @@ static void mt76_connac_test_txwi_free_sta(struct kunit *test)
+ 
+ 	/* the TXD names another (unregistered) entry */
+ 	t = mt76_connac_test_txwi(test, dev, 3, skb);
++	local_bh_disable();
+ 	mt76_connac2_txwi_free(dev, t, sta, &free_list);
++	local_bh_enable();
+ 
+ 	KUNIT_EXPECT_PTR_EQ(test, list_first_entry_or_null(&free_list,
+ 				struct sk_buff, list), skb);
+@@ -1631,7 +1639,9 @@ static void mt76_connac_test_txwi_free_sta(struct kunit *test)
+ 
+ 	/* no frame (already reported): only the descriptor goes back */
+ 	list_del(&t->list);
++	local_bh_disable();
+ 	mt76_connac2_txwi_free(dev, t, sta, &free_list);
++	local_bh_enable();
+ 	KUNIT_EXPECT_TRUE(test, mt76_connac_test_cached(dev, t));
+ 	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets), 1);
+ 
+@@ -1660,7 +1670,11 @@ static void mt76_connac_test_txwi_free_hw_txp(struct kunit *test)
+ 	txp->ptr[0].buf1 = cpu_to_le32(mt76_connac_test_map(test, dev, 256));
+ 	txp->ptr[0].len1 = cpu_to_le16(256 | MT_TXD_LEN_LAST);
+ 
++	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_connac2_txwi_free(dev, t, NULL, NULL);
++	rcu_read_unlock();
++	local_bh_enable();
+ 	KUNIT_EXPECT_TRUE(test, mt76_connac_test_cached(dev, t));
+ 	list_del(&t->list);
+ 
+@@ -1674,7 +1688,11 @@ static void mt76_connac_test_txwi_free_hw_txp(struct kunit *test)
+ 	txp->ptr[0].len1 = cpu_to_le16(128);
+ 	txp->ptr[1].buf0 = cpu_to_le32(mt76_connac_test_map(test, dev, 128));
+ 	txp->ptr[1].len0 = cpu_to_le16(128 | MT_TXD_LEN_LAST);
++	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_connac2_txwi_free(dev, t, NULL, NULL);
++	rcu_read_unlock();
++	local_bh_enable();
+ 	KUNIT_EXPECT_TRUE(test, mt76_connac_test_cached(dev, t));
+ 	list_del(&t->list);
+ 
+@@ -1685,7 +1703,11 @@ static void mt76_connac_test_txwi_free_hw_txp(struct kunit *test)
+ 					    MT_TXD_SIZE);
+ 	txp->ptr[0].buf0 = cpu_to_le32(mt76_connac_test_map(test, dev, 128));
+ 	txp->ptr[0].len0 = cpu_to_le16(128 | MT_TXD_LEN_MSDU_LAST);
++	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_connac2_txwi_free(dev, t, NULL, NULL);
++	rcu_read_unlock();
++	local_bh_enable();
+ 	KUNIT_EXPECT_TRUE(test, mt76_connac_test_cached(dev, t));
+ 	list_del(&t->list);
+ }
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 60e24a78..7cde4b9d 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -372,6 +372,9 @@ static void mt76_test_dfs_state_cac(struct kunit *test)
+ 	dev->region = NL80211_DFS_ETSI;
+ 	phy->radar_enabled = true;
+ 
++	/* as mac80211 calls the driver (mt7915_set_channel()): cfg80211's
++	 * check of a radar channel asserts the wiphy mutex is held */
++	wiphy_lock(phy->hw->wiphy);
+ 	chan->dfs_state = NL80211_DFS_USABLE;
+ 	KUNIT_EXPECT_EQ(test, mt76_phy_dfs_state(phy), MT_DFS_STATE_CAC);
+ 
+@@ -381,6 +384,7 @@ static void mt76_test_dfs_state_cac(struct kunit *test)
+ 	/* not monitoring and radar detection off: disabled */
+ 	phy->radar_enabled = false;
+ 	KUNIT_EXPECT_EQ(test, mt76_phy_dfs_state(phy), MT_DFS_STATE_DISABLED);
++	wiphy_unlock(phy->hw->wiphy);
+ }
+ 
+ static bool mt76_test_wcid_used(u32 *mask, int idx)
+@@ -3232,7 +3236,9 @@ static void mt76_test_reset_device(struct kunit *test)
+ 	KUNIT_ASSERT_NOT_NULL(test, a);
+ 	KUNIT_ASSERT_NOT_NULL(test, b);
+ 	KUNIT_ASSERT_NOT_NULL(test, band1);
++	/* what registering it would set up (mt76_phy_init()) */
+ 	INIT_LIST_HEAD(&band1->tx_list);
++	spin_lock_init(&band1->tx_lock);
+ 	dev->phys[MT_BAND1] = band1;
+ 
+ 	mt76_wcid_init(a, MT_BAND0);
+diff --git a/tests/dma-test.c b/tests/dma-test.c
+index bd1f1397..19b5e6c1 100644
+--- a/tests/dma-test.c
++++ b/tests/dma-test.c
+@@ -632,10 +632,14 @@ static void mt76_dma_test_txwi_cache(struct kunit *test)
+ {
+ 	struct mt76_dma_test *t = mt76_dma_test_init(test, NULL);
+ 	struct mt76_dev *dev = t->dev;
+-	struct mt76_txwi_cache *a, *b;
++	struct mt76_txwi_cache *a, *b, *first, *second;
+ 
++	/* with BH off, as the driver takes and returns them (the tx paths,
++	 * tx cleanup): the cache's lock is taken in softirq too */
++	local_bh_disable();
+ 	a = mt76_get_txwi(dev);
+ 	b = mt76_get_txwi(dev);
++	local_bh_enable();
+ 	KUNIT_ASSERT_NOT_NULL(test, a);
+ 	KUNIT_ASSERT_NOT_NULL(test, b);
+ 	KUNIT_EXPECT_PTR_NE(test, a, b);
+@@ -644,18 +648,26 @@ static void mt76_dma_test_txwi_cache(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, mt76_dma_test_maps(dev, b->dma_addr,
+ 						   mt76_get_txwi_ptr(dev, b)));
+ 
++	local_bh_disable();
+ 	mt76_put_txwi(dev, a);
+ 	mt76_put_txwi(dev, b);
+ 	mt76_put_txwi(dev, NULL);
++	local_bh_enable();
+ 	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->txwi_cache), 2);
+ 
+ 	/* newest first, without a new allocation */
+-	KUNIT_EXPECT_PTR_EQ(test, mt76_get_txwi(dev), b);
+-	KUNIT_EXPECT_PTR_EQ(test, mt76_get_txwi(dev), a);
++	local_bh_disable();
++	first = mt76_get_txwi(dev);
++	second = mt76_get_txwi(dev);
++	local_bh_enable();
++	KUNIT_EXPECT_PTR_EQ(test, first, b);
++	KUNIT_EXPECT_PTR_EQ(test, second, a);
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
+ 
++	local_bh_disable();
+ 	mt76_put_txwi(dev, a);
+ 	mt76_put_txwi(dev, b);
++	local_bh_enable();
+ 	mt76_free_pending_txwi(dev);
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
+ }
+@@ -696,6 +708,22 @@ static void mt76_dma_test_rxwi_cache(struct kunit *test)
+ 
+ /* --- tx -------------------------------------------------------------------------- */
+ 
++/* queue_ops->tx_queue_skb() with BH off, as the driver's tx paths call it
++ * (mt76_txq_schedule(), mt76_tx_worker_run()): the txwi cache's lock is
++ * taken in softirq too
++ */
++static int mt76_dma_test_tx(struct mt76_phy *phy, struct mt76_queue *q,
++			    enum mt76_txq_id qid, struct sk_buff *skb,
++			    struct mt76_wcid *wcid, struct ieee80211_sta *sta)
++{
++	int ret;
++
++	local_bh_disable();
++	ret = phy->dev->queue_ops->tx_queue_skb(phy, q, qid, skb, wcid, sta);
++	local_bh_enable();
++	return ret;
++}
++
+ /* A linear frame takes one descriptor: the txwi in buf0, the frame in buf1.
+  * The driver gets the txwi to fill; the hardware is only told about the
+  * frame once the queue is kicked.
+@@ -723,7 +751,7 @@ static void mt76_dma_test_tx_queue_skb(struct kunit *test)
+ 	dev->phy.band_idx = MT_BAND1;
+ 	t->tx_info = 0xc0000a50;
+ 
+-	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_ASSERT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_VI, skb, wcid, sta), 0);
+ 
+ 	KUNIT_EXPECT_EQ(test, t->n_prepare, 1);
+@@ -790,7 +818,7 @@ static void mt76_dma_test_tx_queue_skb_frags(struct kunit *test)
+ 	/* txwi + head + 2 fragments: two full descriptors */
+ 	skb = mt76_dma_test_skb(t, 60, 0x01);
+ 	mt76_dma_test_add_frags(t, skb, 2, 40);
+-	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_ASSERT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), 1);
+ 	KUNIT_EXPECT_EQ(test, t->prepare_nbuf, 4);
+ 	KUNIT_EXPECT_EQ(test, q->queued, 2);
+@@ -827,7 +855,7 @@ static void mt76_dma_test_tx_queue_skb_frags(struct kunit *test)
+ 	/* txwi + head + 1 fragment: the last descriptor is half used */
+ 	skb = mt76_dma_test_skb(t, 50, 0x02);
+ 	mt76_dma_test_add_frags(t, skb, 1, 30);
+-	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_ASSERT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), 3);
+ 	ctrl = le32_to_cpu(q->desc[3].ctrl);
+ 	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl), 30);
+@@ -854,7 +882,7 @@ static void mt76_dma_test_tx_queue_skb_max_frags(struct kunit *test)
+ 
+ 	skb = mt76_dma_test_skb(t, 20, 0x01);
+ 	mt76_dma_test_add_frags(t, skb, 30, 8);
+-	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_ASSERT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), 15);
+ 	KUNIT_EXPECT_EQ(test, t->prepare_nbuf, 32);
+ 	KUNIT_EXPECT_EQ(test, q->queued, 16);
+@@ -863,7 +891,7 @@ static void mt76_dma_test_tx_queue_skb_max_frags(struct kunit *test)
+ 
+ 	skb = mt76_dma_test_skb(t, 20, 0x02);
+ 	mt76_dma_test_add_frags(t, skb, 31, 8);
+-	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), -ENOMEM);
+ 	KUNIT_EXPECT_EQ(test, t->n_prepare, 1);
+ 	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
+@@ -886,7 +914,7 @@ static void mt76_dma_test_tx_queue_skb_full(struct kunit *test)
+ 	q->queued = 6;
+ 	skb = mt76_dma_test_skb(t, 100, 0x01);
+ 
+-	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), -ENOMEM);
+ 	KUNIT_EXPECT_EQ(test, t->n_prepare, 0);
+ 	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
+@@ -899,7 +927,7 @@ static void mt76_dma_test_tx_queue_skb_full(struct kunit *test)
+ 	/* two left: it fits */
+ 	q->queued = 5;
+ 	skb = mt76_dma_test_skb(t, 100, 0x02);
+-	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), 0);
+ 	KUNIT_EXPECT_EQ(test, q->queued, 6);
+ 	/* the cached txwi was reused */
+@@ -919,7 +947,7 @@ static void mt76_dma_test_tx_queue_skb_reset(struct kunit *test)
+ 	skb = mt76_dma_test_skb(t, 100, 0x01);
+ 	set_bit(MT76_RESET, &dev->phy.state);
+ 
+-	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), -ENOMEM);
+ 	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
+ 	KUNIT_EXPECT_EQ(test, t->n_prepare, 0);
+@@ -943,7 +971,7 @@ static void mt76_dma_test_tx_queue_skb_prepare_error(struct kunit *test)
+ 	mt76_dma_test_add_frags(t, skb, 1, 20);
+ 	t->prepare_ret = -EINVAL;
+ 
+-	KUNIT_EXPECT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), -EINVAL);
+ 	KUNIT_EXPECT_EQ(test, t->n_prepare, 1);
+ 	KUNIT_EXPECT_EQ(test, t->n_freed, 1);
+@@ -972,7 +1000,7 @@ static void mt76_dma_test_tx_queue_skb_pad(struct kunit *test)
+ 	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
+ 					 IEEE80211_STYPE_QOS_DATA);
+ 
+-	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_ASSERT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), 0);
+ 	KUNIT_EXPECT_EQ(test, skb->len, 42);
+ 	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN1,
+@@ -1077,7 +1105,7 @@ static void mt76_dma_test_queue_frames(struct mt76_dma_test *t,
+ 
+ 	for (i = 0; i < n; i++) {
+ 		skbs[i] = mt76_dma_test_skb(t, 50 + i, i);
+-		KUNIT_ASSERT_GE(t->test, dev->queue_ops->tx_queue_skb(&dev->phy,
++		KUNIT_ASSERT_GE(t->test, mt76_dma_test_tx(&dev->phy,
+ 				q, MT_TXQ_BE, skbs[i], NULL, NULL), 0);
+ 	}
+ 	dev->queue_ops->kick(dev, q);
+@@ -1171,7 +1199,7 @@ static void mt76_dma_test_tx_cleanup_multi_desc(struct kunit *test)
+ 	q = mt76_dma_test_tx_queue(t, 0, 8);
+ 	skb = mt76_dma_test_skb(t, 60, 0x01);
+ 	mt76_dma_test_add_frags(t, skb, 2, 40);
+-	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb(&dev->phy, q,
++	KUNIT_ASSERT_EQ(test, mt76_dma_test_tx(&dev->phy, q,
+ 			MT_TXQ_BE, skb, NULL, NULL), 1);
+ 	txwi = q->entry[1].txwi;
+ 
+@@ -1262,9 +1290,12 @@ static void mt76_dma_test_tx_cleanup_no_free(struct kunit *test)
+ 	KUNIT_ASSERT_EQ(test, t->n_done, 2);
+ 	KUNIT_EXPECT_NOT_NULL(test, t->done[0].txwi);
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&dev->txwi_cache));
+-	/* the driver's job: give them back */
++	/* the driver's job: give them back (with BH off, as its tx-free
++	 * path does) */
++	local_bh_disable();
+ 	mt76_put_txwi(dev, t->done[0].txwi);
+ 	mt76_put_txwi(dev, t->done[1].txwi);
++	local_bh_enable();
+ }
+ 
+ /* Cleaning up a missing or unallocated queue does nothing. */
+@@ -1935,12 +1966,14 @@ static void mt76_dma_test_init_cleanup(struct kunit *test)
+ 	dev->phy.q_tx[MT_TXQ_BE] = txq;
+ 	dev->q_mcu[MT_MCUQ_WM] = mcuq;
+ 	skb = mt76_dma_test_skb(t, 40, 0);
+-	KUNIT_ASSERT_GE(test, dev->queue_ops->tx_queue_skb(&dev->phy, txq,
++	KUNIT_ASSERT_GE(test, mt76_dma_test_tx(&dev->phy, txq,
+ 			MT_TXQ_BE, skb, NULL, NULL), 0);
+ 	skb = mt76_dma_test_skb(t, 40, 0);
+ 	KUNIT_ASSERT_EQ(test, dev->queue_ops->tx_queue_skb_raw(dev, mcuq, skb,
+ 			0), 0);
++	local_bh_disable();
+ 	mt76_put_txwi(dev, mt76_get_txwi(dev));
++	local_bh_enable();
+ 	mt76_put_rxwi(dev, mt76_get_rxwi(dev));
+ 
+ 	KUNIT_ASSERT_EQ(test, dev->queue_ops->init(dev, mt76_dma_rx_poll), 0);
+diff --git a/tests/eeprom-test.c b/tests/eeprom-test.c
+index 1ae703f3..19cac357 100644
+--- a/tests/eeprom-test.c
++++ b/tests/eeprom-test.c
+@@ -111,10 +111,16 @@ static void mt76_eeprom_test_strip(struct device_node *np)
+ 		mt76_eeprom_test_strip(child);
+ }
+ 
+-static void mt76_eeprom_test_of_reset(void *data)
++/* The suite's exit: it runs before kunit frees what the test allocated,
++ * the nodes and properties among them, which a kunit action registered
++ * when the node is made would walk after their release.
++ */
++static void mt76_eeprom_test_of_reset(struct kunit *test)
+ {
+-	struct device *dev = data;
++	struct device *dev = test->priv;
+ 
++	if (!dev)
++		return;
+ 	if (dev->of_node)
+ 		mt76_eeprom_test_strip(dev->of_node);
+ 	dev->of_node = NULL;
+@@ -127,8 +133,7 @@ static struct device_node *mt76_eeprom_test_of(struct kunit *test,
+ 	struct device_node *np = mt76_eeprom_test_node(test, NULL, "wifi");
+ 
+ 	dev->dev->of_node = np;
+-	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+-			mt76_eeprom_test_of_reset, dev->dev), 0);
++	test->priv = dev->dev;
+ 	return np;
+ }
+ 
+@@ -823,6 +828,7 @@ static struct kunit_case mt76_eeprom_test_cases[] = {
+ 
+ static struct kunit_suite mt76_eeprom_test_suite = {
+ 	.name = "mt76-eeprom",
++	.exit = mt76_eeprom_test_of_reset,
+ 	.test_cases = mt76_eeprom_test_cases,
+ };
+ 
+diff --git a/tests/fake.h b/tests/fake.h
+index 5ece04ac..c531a39f 100644
+--- a/tests/fake.h
++++ b/tests/fake.h
+@@ -76,7 +76,13 @@ static inline u32 mt76_test_reg(struct mt76_test_fake *fake, u32 addr)
+ static inline void mt76_test_set_reg(struct mt76_test_fake *fake, u32 addr,
+ 				     u32 val)
+ {
+-	xa_store(&fake->regs, addr, xa_mk_value(val), GFP_ATOMIC);
++	unsigned long flags;
++
++	/* from any context: the irq tasklet writes registers too, and the
++	 * driver writes some with interrupts off (its irq_lock) */
++	xa_lock_irqsave(&fake->regs, flags);
++	__xa_store(&fake->regs, addr, xa_mk_value(val), GFP_ATOMIC);
++	xa_unlock_irqrestore(&fake->regs, flags);
+ }
+ 
+ static inline u32 __mt76_test_rr(struct mt76_test_fake *fake, u32 addr)
+@@ -303,7 +309,7 @@ mt76_test_fake_attach(struct kunit *test, struct mt76_dev *dev)
+ 	KUNIT_ASSERT_NOT_NULL(test, fake);
+ 	fake->test = test;
+ 	fake->dev = dev;
+-	xa_init(&fake->regs);
++	xa_init_flags(&fake->regs, XA_FLAGS_LOCK_IRQ);
+ 	INIT_LIST_HEAD(&fake->msgs);
+ 	mt76_test_fake = fake;
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+diff --git a/tests/record-test.c b/tests/record-test.c
+index 719b6acc..cdbe88aa 100644
+--- a/tests/record-test.c
++++ b/tests/record-test.c
+@@ -158,7 +158,7 @@ static void mt76_record_test_reset(struct mt76_test_fake *fake)
+ {
+ 	skb_queue_purge(&fake->dev->mcu.res_q);
+ 	xa_destroy(&fake->regs);
+-	xa_init(&fake->regs);
++	xa_init_flags(&fake->regs, XA_FLAGS_LOCK_IRQ);
+ 	INIT_LIST_HEAD(&fake->msgs);
+ 	fake->n_msgs = 0;
+ 	fake->seq = 0;
