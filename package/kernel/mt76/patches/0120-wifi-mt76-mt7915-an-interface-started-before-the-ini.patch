@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 17:39:56 +0000
+Subject: [PATCH] wifi: mt76: mt7915: an interface started before the init work
+ runs it itself
+
+mt7915_start() flushes init_work so the eeprom, MAC and beamforming
+setup is done before an interface starts. But mt7915_register_device()
+queues init_work only after mt76_register_device() and the second
+band's registration, and userspace can bring an interface up as soon
+as the wiphy is registered: flush_work() on a work not yet queued
+returns at once, the start's firmware commands then time out and a
+full reset follows (mt76 #959).
+
+The setup is now mt7915_late_init(), run once under the device mutex:
+by init_work as before, or by mt7915_start() when it gets there first,
+init_work then finding it done. Waiting in the start for the work to
+be queued instead would deadlock: the start holds RTNL, which the
+second band's registration needs before the work is queued. Running
+the setup before registration instead would miss the LED pin that
+registration reads. The normal order at boot is unchanged.
+
+KUnit: mt7915_main_test_start_before_init starts band 0 with the setup
+not done (the eeprom goes to the firmware first), then the work and
+band 1's start send nothing more; mt7915_init_test_init_work checks
+the setup runs once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c            | 26 +++++++++++++++++++++++---
+ mt7915/main.c            |  2 ++
+ mt7915/mt7915.h          |  3 +++
+ mt7915/tests/init-test.c | 13 +++++++++++--
+ mt7915/tests/main-test.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 77 insertions(+), 5 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 9523300f..376a84c1 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -816,14 +816,34 @@ unreg:
+ 	return ret;
+ }
+ 
+-static void mt7915_init_work(struct work_struct *work)
++/* The setup after registration: the eeprom to the firmware, the MAC and
++ * beamforming. init_work does it, and mt7915_start() waits for that; but
++ * userspace can bring an interface up as soon as the wiphy is registered,
++ * before init_work is even queued, and then the start's firmware commands
++ * time out (mt76 #959). So the start does it itself if it hasn't run yet,
++ * and init_work finds it done. Once, under the device mutex.
++ */
++void mt7915_late_init(struct mt7915_dev *dev)
+ {
+-	struct mt7915_dev *dev = container_of(work, struct mt7915_dev,
+-				 init_work);
++	lockdep_assert_held(&dev->mt76.mutex);
++
++	if (dev->late_init_done)
++		return;
+ 
+ 	mt7915_mcu_set_eeprom(dev);
+ 	mt7915_mac_init(dev);
+ 	mt7915_txbf_init(dev);
++	dev->late_init_done = true;
++}
++
++static void mt7915_init_work(struct work_struct *work)
++{
++	struct mt7915_dev *dev = container_of(work, struct mt7915_dev,
++				 init_work);
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7915_late_init(dev);
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ void mt7915_wfsys_reset(struct mt7915_dev *dev)
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 72787ef8..c838f155 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -102,6 +102,8 @@ static int mt7915_start(struct ieee80211_hw *hw)
+ 	flush_work(&dev->init_work);
+ 
+ 	mutex_lock(&dev->mt76.mutex);
++	/* brought up before init_work was queued */
++	mt7915_late_init(dev);
+ 	mt7915_hw_phy(hw)->restart_pending = false;
+ 	ret = mt7915_run(hw);
+ 	mutex_unlock(&dev->mt76.mutex);
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index f67ee46e..1842ac60 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -343,6 +343,8 @@ struct mt7915_dev {
+ 	u32 hif_idx;
+ 
+ 	struct work_struct init_work;
++	/* mt7915_late_init() has run; under mt76.mutex */
++	bool late_init_done;
+ 	struct work_struct rc_work;
+ 	struct work_struct dump_work;
+ 	struct work_struct reset_work;
+@@ -544,6 +546,7 @@ u64 __mt7915_get_tsf(struct ieee80211_hw *hw, struct mt7915_vif *mvif);
+ u32 mt7915_wed_init_buf(void *ptr, dma_addr_t phys, int token_id);
+ 
+ int mt7915_register_device(struct mt7915_dev *dev);
++void mt7915_late_init(struct mt7915_dev *dev);
+ void mt7915_unregister_device(struct mt7915_dev *dev);
+ int mt7915_eeprom_init(struct mt7915_dev *dev);
+ void mt7915_eeprom_parse_hw_cap(struct mt7915_dev *dev,
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 9c2258ed..01147bbd 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -99,7 +99,7 @@ static void mt7915_init_test_unregister_ext(void *data)
+ /* Register @dev the way mt7915_register_device() does, from band config
+  * on, without mt7915_init_hardware()'s DMA and firmware: the fake firmware
+  * stands in, the eeprom is the caller's, wcid 0 is the global one. The
+- * init work isn't queued. mac80211 makes no default interface. Undone when
++ * init work isn't queued; its setup counts as done, as once it has run. mac80211 makes no default interface. Undone when
+  * the test ends.
+  */
+ static void mt7915_init_test_register(struct kunit *test,
+@@ -117,6 +117,7 @@ static void mt7915_init_test_register(struct kunit *test,
+ 	phy2 = mt7915_alloc_ext_phy(dev);
+ 	KUNIT_ASSERT_FALSE(test, IS_ERR(phy2));
+ 	INIT_WORK(&dev->init_work, mt7915_init_work);
++	dev->late_init_done = true;
+ 	if (dma) {
+ 		/* the DMA rings, as mt7915_init_hardware() sets them up */
+ 		KUNIT_ASSERT_EQ(test, mt7915_dma_init(dev, phy2), 0);
+@@ -1357,7 +1358,7 @@ static void mt7915_init_test_txbf_init(struct kunit *test)
+ 
+ /* The init work after registration hands the eeprom to the firmware
+  * (efuse mode, or the whole buffer in flash mode), then inits the MAC and
+- * beamforming.
++ * beamforming, once.
+  */
+ static void mt7915_init_test_init_work(struct kunit *test)
+ {
+@@ -1368,8 +1369,10 @@ static void mt7915_init_test_init_work(struct kunit *test)
+ 	struct mt76_test_msg *msg;
+ 
+ 	mt7915_init_test_clear(fake);
++	dev->late_init_done = false;
+ 	queue_work(system_wq, &dev->init_work);
+ 	flush_work(&dev->init_work);
++	KUNIT_EXPECT_TRUE(test, dev->late_init_done);
+ 	msg = mt76_test_msg(fake, 0);
+ 	KUNIT_ASSERT_NOT_NULL(test, msg);
+ 	KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(EFUSE_BUFFER_MODE));
+@@ -1380,9 +1383,15 @@ static void mt7915_init_test_init_work(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_test_find_msg(fake,
+ 			MCU_EXT_CMD(TXBF_ACTION))->data[0], MT_BF_TYPE_UPDATE);
+ 
++	/* once: run again (by a start, or the work), it sends nothing */
++	mt7915_init_test_clear(fake);
++	mt7915_init_work(&dev->init_work);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++
+ 	/* flash mode: the eeprom in 1 KiB pages */
+ 	mt7915_init_test_clear(fake);
+ 	dev->flash_mode = true;
++	dev->late_init_done = false;
+ 	mt7915_init_work(&dev->init_work);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
+ 			MCU_EXT_CMD(EFUSE_BUFFER_MODE)), 4);
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index fbd52aef..7ec90494 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -340,6 +340,43 @@ static void mt7915_main_test_start_stop(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, msg->data[1], 0);
+ }
+ 
++/* mt76 #959: an interface brought up right after registration, before
++ * the init work was queued (flush_work() doesn't wait for a work not yet
++ * queued). The start does the setup first, eeprom to the firmware before
++ * its own commands, and the init work, queued after it, sends nothing.
++ */
++static void mt7915_main_test_start_before_init(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt76_test_msg *msg;
++
++	dev->late_init_done = false;
++	KUNIT_ASSERT_EQ(test, mt7915_start(hw), 0);
++	KUNIT_EXPECT_TRUE(test, dev->late_init_done);
++	msg = mt76_test_msg(fake, 0);
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_EQ(test, msg->cmd, MCU_EXT_CMD(EFUSE_BUFFER_MODE));
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(TXBF_ACTION)), 3);
++	KUNIT_EXPECT_NOT_NULL(test, mt76_test_find_msg(fake,
++			MCU_EXT_CMD(SET_RX_PATH)));
++
++	mt7915_main_test_clear(fake);
++	ieee80211_queue_work(hw, &dev->init_work);
++	flush_work(&dev->init_work);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++
++	/* the other band's start doesn't do it again */
++	KUNIT_ASSERT_EQ(test, mt7915_start(mt7915_main_test_hw2(dev)), 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(EFUSE_BUFFER_MODE)), 0);
++
++	mt7915_stop(mt7915_main_test_hw2(dev), false);
++	mt7915_stop(hw, false);
++}
++
+ static bool mt7915_main_test_band_msgs(struct mt76_test_fake *fake, int cmd,
+ 				       u8 band)
+ {
+@@ -3258,6 +3295,7 @@ static void mt7915_main_test_radar_background(struct kunit *test)
+ 
+ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_start_stop),
++	KUNIT_CASE(mt7915_main_test_start_before_init),
+ 	KUNIT_CASE(mt7915_main_test_start_stop_dbdc),
+ 	KUNIT_CASE(mt7915_main_test_start_errors),
+ 	KUNIT_CASE(mt7915_main_test_reconfig_complete),

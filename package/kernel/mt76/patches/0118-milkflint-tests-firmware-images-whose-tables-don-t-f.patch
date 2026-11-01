@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:45:52 +0000
+Subject: [PATCH] milkflint tests: firmware images whose tables don't fit
+
+The RAM region table and its regions, and the patch section table and
+its sections, must fit in the image: a byte too long, a huge length, a
+section starting past the end, or one table entry too many is refused,
+and the loaders then send nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/connac-mcu-test.c | 120 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 120 insertions(+)
+
+diff --git a/tests/connac-mcu-test.c b/tests/connac-mcu-test.c
+index 145d7ff1..8c222715 100644
+--- a/tests/connac-mcu-test.c
++++ b/tests/connac-mcu-test.c
+@@ -1980,6 +1980,7 @@ static void mt76_connac_mcu_test_alloc_fails(struct kunit *test)
+ #define MT76_CONNAC_MCU_TEST_WM		"milkflint-kunit-connac-wm.bin"
+ #define MT76_CONNAC_MCU_TEST_WA		"milkflint-kunit-connac-wa.bin"
+ #define MT76_CONNAC_MCU_TEST_SHORT	"milkflint-kunit-connac-short.bin"
++#define MT76_CONNAC_MCU_TEST_OVERRUN	"milkflint-kunit-connac-overrun.bin"
+ /* request_firmware() fails at once for an empty name: no file system, no
+  * user space fallback
+  */
+@@ -2274,6 +2275,18 @@ static void mt76_connac_mcu_test_load_patch_errors(struct kunit *test)
+ 	/* the first section went, the second wasn't started */
+ 	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, 5);
+ 
++	/* a section running past the end of the image: none is sent */
++	fw = mt76_connac_mcu_test_patch_image(test, &len, 0, 0);
++	((struct mt76_connac2_patch_sec *)(fw +
++		sizeof(struct mt76_connac2_patch_hdr)))[1].info.len =
++		cpu_to_be32(MT76_CONNAC_MCU_TEST_PATCH_LEN1 + 1);
++	mt76_connac_mcu_test_write_fw(test, MT76_CONNAC_MCU_TEST_OVERRUN, fw,
++				      len);
++	mt76_test_fake->n_msgs = 0;
++	INIT_LIST_HEAD(&mt76_test_fake->msgs);
++	LOAD(MT76_CONNAC_MCU_TEST_OVERRUN, -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, 2);
++
+ 	mt76_connac_mcu_test_write_patch(test, MT76_CONNAC_MCU_TEST_PATCH, 0,
+ 					 0, NULL);
+ 	mt76_connac_mcu_test_fail(MCU_CMD(PATCH_START_REQ), 1, -EIO);
+@@ -2415,7 +2428,9 @@ static void mt76_connac_mcu_test_load_ram_errors(struct kunit *test)
+ {
+ 	struct mt76_dev *dev = mt76_connac_mcu_test_dev(test);
+ 	char *ver = dev->hw->wiphy->fw_version;
++	struct mt76_connac2_fw_region *region;
+ 	u8 short_fw[16] = {};
++	u8 *wa;
+ 
+ 	mt76_connac_mcu_test_write_ram(test, MT76_CONNAC_MCU_TEST_WM,
+ 				       "WM_1.2.3.4", mt76_connac_mcu_test_wm,
+@@ -2423,11 +2438,23 @@ static void mt76_connac_mcu_test_load_ram_errors(struct kunit *test)
+ 				       NULL);
+ 	mt76_connac_mcu_test_write_fw(test, MT76_CONNAC_MCU_TEST_SHORT,
+ 				      short_fw, sizeof(short_fw));
++	/* a region one byte longer than the data in front of the table */
++	mt76_connac_mcu_test_write_ram(test, MT76_CONNAC_MCU_TEST_OVERRUN,
++				       "WA_5.6.7.8", mt76_connac_mcu_test_wa,
++				       ARRAY_SIZE(mt76_connac_mcu_test_wa),
++				       &wa);
++	region = (struct mt76_connac2_fw_region *)(wa + 100);
++	region->len = cpu_to_le32(101);
++	mt76_connac_mcu_test_write_fw(test, MT76_CONNAC_MCU_TEST_OVERRUN, wa,
++			100 + sizeof(*region) +
++			sizeof(struct mt76_connac2_fw_trailer));
+ 
+ 	KUNIT_EXPECT_EQ(test, mt76_connac2_load_ram(dev,
+ 			MT76_CONNAC_MCU_TEST_NONE, NULL), -EINVAL);
+ 	KUNIT_EXPECT_EQ(test, mt76_connac2_load_ram(dev,
+ 			MT76_CONNAC_MCU_TEST_SHORT, NULL), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_load_ram(dev,
++			MT76_CONNAC_MCU_TEST_OVERRUN, NULL), -EINVAL);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_fake->n_msgs, 0);
+ 
+ 	mt76_connac_mcu_test_fail(MCU_CMD(TARGET_ADDRESS_LEN_REQ), 1, -EIO);
+@@ -2459,6 +2486,97 @@ static void mt76_connac_mcu_test_load_ram_errors(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_connac_mcu_test_fw.n_fail_cmd, 2);
+ }
+ 
++/* A RAM image's region table and its regions' data must fit in front of
++ * the trailer; what they add up to is the data's length. Anything else
++ * would be read from past the image and sent to the chip.
++ */
++static void mt76_connac_mcu_test_fw_check(struct kunit *test)
++{
++	struct mt76_connac2_fw_region *region;
++	struct mt76_connac2_fw_trailer *hdr;
++	struct firmware fw = {};
++	size_t len = 0;
++	u8 *buf;
++
++	KUNIT_EXPECT_EQ(test, mt76_connac2_fw_check(NULL, NULL), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_fw_check(&fw, NULL), -EINVAL);
++
++	/* 100 bytes of data in two regions, their table, the trailer */
++	fw.size = 100 + 2 * sizeof(*region) + sizeof(*hdr);
++	buf = kunit_kzalloc(test, fw.size, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, buf);
++	fw.data = buf;
++	region = (struct mt76_connac2_fw_region *)(buf + 100);
++	hdr = (struct mt76_connac2_fw_trailer *)(region + 2);
++	hdr->n_region = 2;
++	region[0].len = cpu_to_le32(60);
++	region[1].len = cpu_to_le32(40);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_fw_check(&fw, &len), 0);
++	KUNIT_EXPECT_EQ(test, len, 100);
++
++	/* a byte more than there is, or a huge length */
++	region[1].len = cpu_to_le32(41);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_fw_check(&fw, NULL), -EINVAL);
++	region[1].len = cpu_to_le32(U32_MAX);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_fw_check(&fw, NULL), -EINVAL);
++	region[1].len = cpu_to_le32(40);
++
++	/* one region more than the image has room for */
++	hdr->n_region = (fw.size - sizeof(*hdr)) / sizeof(*region) + 1;
++	KUNIT_EXPECT_EQ(test, mt76_connac2_fw_check(&fw, NULL), -EINVAL);
++	hdr->n_region = 2;
++
++	/* too short for the trailer */
++	fw.size = sizeof(*hdr) - 1;
++	KUNIT_EXPECT_EQ(test, mt76_connac2_fw_check(&fw, NULL), -EINVAL);
++}
++
++/* A patch's section table and every section must fit in the image. */
++static void mt76_connac_mcu_test_patch_check(struct kunit *test)
++{
++	struct mt76_connac2_patch_hdr *hdr;
++	struct mt76_connac2_patch_sec *sec;
++	struct firmware fw = {};
++	u8 *buf;
++
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(NULL), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), -EINVAL);
++
++	/* the header, two sections, then their 60 and 40 bytes */
++	fw.size = sizeof(*hdr) + 2 * sizeof(*sec) + 100;
++	buf = kunit_kzalloc(test, fw.size, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, buf);
++	fw.data = buf;
++	hdr = (struct mt76_connac2_patch_hdr *)buf;
++	hdr->desc.n_region = cpu_to_be32(2);
++	sec = (struct mt76_connac2_patch_sec *)(hdr + 1);
++	sec[0].offs = cpu_to_be32(fw.size - 100);
++	sec[0].info.len = cpu_to_be32(60);
++	sec[1].offs = cpu_to_be32(fw.size - 40);
++	sec[1].info.len = cpu_to_be32(40);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), 0);
++
++	/* a byte past the end, a huge length, or starting past the end */
++	sec[1].info.len = cpu_to_be32(41);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), -EINVAL);
++	sec[1].info.len = cpu_to_be32(U32_MAX);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), -EINVAL);
++	sec[1].offs = cpu_to_be32(fw.size + 1);
++	sec[1].info.len = 0;
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), -EINVAL);
++	/* an empty section right at the end is fine */
++	sec[1].offs = cpu_to_be32(fw.size);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), 0);
++
++	/* one section more than the image has room for */
++	hdr->desc.n_region = cpu_to_be32((fw.size - sizeof(*hdr)) /
++					 sizeof(*sec) + 1);
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), -EINVAL);
++
++	fw.size = sizeof(*hdr) - 1;
++	KUNIT_EXPECT_EQ(test, mt76_connac2_patch_check(&fw), -EINVAL);
++}
++
+ /* --- connac2 message header ----------------------------------------------- */
+ 
+ /* a message as mt76_mcu_msg_alloc() makes it: zeroed headroom for the TXD */
+@@ -2647,6 +2765,8 @@ static struct kunit_case mt76_connac_mcu_test_cases[] = {
+ 	KUNIT_CASE(mt76_connac_mcu_test_load_patch_errors),
+ 	KUNIT_CASE(mt76_connac_mcu_test_load_ram),
+ 	KUNIT_CASE(mt76_connac_mcu_test_load_ram_errors),
++	KUNIT_CASE(mt76_connac_mcu_test_fw_check),
++	KUNIT_CASE(mt76_connac_mcu_test_patch_check),
+ 	KUNIT_CASE(mt76_connac_mcu_test_fill_ext),
+ 	KUNIT_CASE(mt76_connac_mcu_test_fill_kinds),
+ 	KUNIT_CASE(mt76_connac_mcu_test_fill_uni),

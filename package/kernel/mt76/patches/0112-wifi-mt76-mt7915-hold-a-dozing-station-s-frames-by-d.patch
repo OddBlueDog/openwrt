@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:09:34 +0000
+Subject: [PATCH] wifi: mt76: mt7915: hold a dozing station's frames by default
+ (ps_sync on)
+
+ps_sync was switched off to send like stock mt76, when the driver didn't
+read the 2026-05 firmware's PS sync layout yet and the switch did
+nothing. It reads it now, and with that firmware part of what is handed
+to the hardware for a dozing station is lost: a macOS client that dozes
+in and out while it scans misses downlink frames each time. Held until
+the firmware reports it awake, as the PS series meant (upstream mt76
+#1163 reports the same loss with this firmware), none are lost, and a
+station that isn't dozing is unaffected.
+
+The KUnit tests' default follows; the doze-record test sets the switch
+off itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mcu.c             | 8 ++++++--
+ mt7915/tests/mcu2-test.c | 9 ++++++---
+ 2 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index e369d5d3..1465157f 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -42,9 +42,13 @@ MODULE_PARM_DESC(sr_scene_detect, "Enable firmware scene detection algorithm");
+ /* stock mt76 does these differently; each is a switch
+  * for an A/B on the router, the first two set as stock
+  */
+-static bool ps_sync;
++/* On by default: with the 2026-05 firmware, part of what is handed to the
++ * hardware for a dozing station is lost (a macOS client dozes in and out
++ * while it scans); held until it wakes, none of it is.
++ */
++static bool ps_sync = true;
+ module_param(ps_sync, bool, 0644);
+-MODULE_PARM_DESC(ps_sync, "Hold back a station's frames while the firmware reports it dozing (off: hand them to the hardware, as stock mt76 does)");
++MODULE_PARM_DESC(ps_sync, "Hold back a station's frames while the firmware reports it dozing (default on; off: hand them to the hardware, as stock mt76 does)");
+ 
+ bool mt7915_vow_stock = true;
+ module_param_named(vow_stock, mt7915_vow_stock, bool, 0444);
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 70671be4..38fc631b 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -1482,7 +1482,7 @@ static void mt7915_mcu2_drop_wcids(void *data)
+  */
+ static void mt7915_mcu2_ps_sync_default(void *data)
+ {
+-	ps_sync = false;
++	ps_sync = true;
+ }
+ 
+ static void mt7915_mcu2_events_ps_sync(struct kunit *test)
+@@ -1491,7 +1491,7 @@ static void mt7915_mcu2_events_ps_sync(struct kunit *test)
+ 	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
+ 	struct mt7915_sta *hi, *lo, *notsta;
+ 
+-	/* the ps_sync switch on; off (the default) is checked below */
++	/* the ps_sync switch on (the default); off is checked below */
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+ 			mt7915_mcu2_ps_sync_default, NULL), 0);
+ 	ps_sync = true;
+@@ -1520,7 +1520,7 @@ static void mt7915_mcu2_events_ps_sync(struct kunit *test)
+ 	mt7915_mcu2_ps_event(test, dev, 0x124, true);
+ }
+ 
+-/* With the ps_sync switch off (the default, as stock), a station the firmware reports dozing isn't
++/* With the ps_sync switch off (as stock), a station the firmware reports dozing isn't
+  * held, and one already held is let go by its next event, dozing or not.
+  */
+ static void mt7915_mcu2_events_ps_sync_off(struct kunit *test)
+@@ -1619,6 +1619,9 @@ static void mt7915_mcu2_events_ps_record(struct kunit *test)
+ 	rcu_assign_pointer(dev->mt76.wcid[0x23], &msta->wcid);
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+ 			mt7915_mcu2_drop_wcids, dev), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_ps_sync_default, NULL), 0);
++	ps_sync = false;
+ 
+ 	mt7915_sta_ps_stats(msta, &st);
+ 	KUNIT_EXPECT_FALSE(test, st.dozing);

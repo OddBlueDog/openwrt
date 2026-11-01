@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:41:56 +0000
+Subject: [PATCH] milkflint tests: channel MIB counters that step backwards
+
+A counter below its baseline adds nothing and becomes the new baseline;
+the others still add what they grew; all of them back near zero (the
+firmware restarted) leaves the survey as it was.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/mcu2-test.c | 50 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 38fc631b..59ff18e4 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -2070,6 +2070,55 @@ static void mt7915_mcu2_chan_mib(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, state->cc_busy, 1290);
+ }
+ 
++/* A counter that steps backwards adds nothing (rather than wrapping to
++ * near 2^64, which froze hostapd's BSS load) and becomes the new baseline;
++ * the others still add what they grew.
++ */
++static void mt7915_mcu2_chan_mib_backwards(struct kunit *test)
++{
++	static const u64 first[] = { 100, 200, 300, 400 };
++	static const u64 tx_back[] = { 150, 100, 390, 480 };
++	static const u64 third[] = { 200, 160, 400, 500 };
++	static const u64 all_back[] = { 10, 20, 30, 40 };
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_channel_state *state;
++
++	state = kunit_kzalloc(test, sizeof(*state), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, state);
++	dev->mphy.chan_state = state;
++
++	mt7915_mcu2_mib_reply(test, 0, first, 4);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_get_chan_mib_info(&dev->phy, false),
++			0);
++
++	mt7915_mcu2_mib_reply(test, 0, tx_back, 4);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_get_chan_mib_info(&dev->phy, false),
++			0);
++	KUNIT_EXPECT_EQ(test, state->cc_tx, 200);
++	KUNIT_EXPECT_EQ(test, state->cc_bss_rx, 390);
++	KUNIT_EXPECT_EQ(test, state->cc_rx, 870);
++	KUNIT_EXPECT_EQ(test, state->cc_busy, 1120);
++	KUNIT_EXPECT_EQ(test, dev->phy.state_ts.cc_tx, 100);
++
++	mt7915_mcu2_mib_reply(test, 0, third, 4);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_get_chan_mib_info(&dev->phy, false),
++			0);
++	KUNIT_EXPECT_EQ(test, state->cc_tx, 260);
++	KUNIT_EXPECT_EQ(test, state->cc_bss_rx, 400);
++	KUNIT_EXPECT_EQ(test, state->cc_rx, 900);
++	KUNIT_EXPECT_EQ(test, state->cc_busy, 1260);
++
++	/* all of them back near zero (the firmware restarted) */
++	mt7915_mcu2_mib_reply(test, 0, all_back, 4);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_get_chan_mib_info(&dev->phy, false),
++			0);
++	KUNIT_EXPECT_EQ(test, state->cc_tx, 260);
++	KUNIT_EXPECT_EQ(test, state->cc_bss_rx, 400);
++	KUNIT_EXPECT_EQ(test, state->cc_rx, 900);
++	KUNIT_EXPECT_EQ(test, state->cc_busy, 1260);
++	KUNIT_EXPECT_EQ(test, dev->phy.state_ts.cc_busy, 10 + 20 + 30 + 40);
++}
++
+ /* A reply too short for the counters is refused and changes nothing; a
+  * firmware error comes back.
+  */
+@@ -2710,6 +2759,7 @@ static struct kunit_case mt7915_mcu2_chan_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_chan_info_testmode),
+ #endif
+ 	KUNIT_CASE(mt7915_mcu2_chan_mib),
++	KUNIT_CASE(mt7915_mcu2_chan_mib_backwards),
+ 	KUNIT_CASE(mt7915_mcu2_chan_mib_errors),
+ 	KUNIT_CASE(mt7915_mcu2_chan_mib_mt7915),
+ 	KUNIT_CASE(mt7915_mcu2_dpd_idx),

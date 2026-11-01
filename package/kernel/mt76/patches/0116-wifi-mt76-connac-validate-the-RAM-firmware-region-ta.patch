@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 24 Oct 2026 09:19:22 +0200
+Subject: [PATCH] wifi: mt76: connac: validate the RAM firmware region table
+
+mt76_connac2_load_ram() and mt76_connac3_load_phy_ram() only check that
+the firmware image holds the trailer. The region table in front of the
+trailer and the region lengths come from the image and are not checked
+against its size. A malformed image makes the driver read past the
+image and send that data to the device.
+
+Add mt76_connac2_fw_check(), which checks that the region table and the
+sum of the region lengths fit in the image, and reject an image that
+fails it.
+
+Fixes: e57b7901469f ("mt76: add mac80211 driver for MT7915 PCIe-based chipsets")
+Fixes: 1c099ab44727 ("mt76: mt7921: add MCU support")
+Fixes: 4f8ded4d5f0e ("wifi: mt76: mt7925: add MT7928 FWDL support")
+Link: https://patch.msgid.link/20261024071927.2279668-6-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit ba86572bd0d4b7a838ae5dfa933b85859587cca1)
+---
+ mt76_connac_mcu.c | 39 ++++++++++++++++++++++++++++++++++++---
+ mt76_connac_mcu.h |  3 +++
+ 2 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/mt76_connac_mcu.c b/mt76_connac_mcu.c
+index 3807f58b..45c4e221 100644
+--- a/mt76_connac_mcu.c
++++ b/mt76_connac_mcu.c
+@@ -3042,6 +3042,39 @@ s8 mt76_connac_get_rate_power_limit(struct mt76_phy *phy,
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac_get_rate_power_limit);
+ 
++int mt76_connac2_fw_check(const struct firmware *fw, size_t *data_len)
++{
++	const struct mt76_connac2_fw_region *region;
++	const struct mt76_connac2_fw_trailer *hdr;
++	size_t avail, len = 0;
++	int i;
++
++	if (!fw || !fw->data || fw->size < sizeof(*hdr))
++		return -EINVAL;
++
++	hdr = (const void *)(fw->data + fw->size - sizeof(*hdr));
++	avail = fw->size - sizeof(*hdr);
++	if (hdr->n_region > avail / sizeof(*region))
++		return -EINVAL;
++
++	avail -= hdr->n_region * sizeof(*region);
++	region = (const void *)(fw->data + avail);
++	for (i = 0; i < hdr->n_region; i++) {
++		u32 region_len = le32_to_cpu(region[i].len);
++
++		if (region_len > avail - len)
++			return -EINVAL;
++
++		len += region_len;
++	}
++
++	if (data_len)
++		*data_len = len;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mt76_connac2_fw_check);
++
+ static int
+ mt76_connac_mcu_send_ram_firmware(struct mt76_dev *dev,
+ 				  const struct mt76_connac2_fw_trailer *hdr,
+@@ -3155,7 +3188,7 @@ int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
++	if (mt76_connac2_fw_check(fw, NULL)) {
+ 		dev_err(dev->dev, "Invalid firmware\n");
+ 		ret = -EINVAL;
+ 		goto out;
+@@ -3184,7 +3217,7 @@ int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
++	if (mt76_connac2_fw_check(fw, NULL)) {
+ 		dev_err(dev->dev, "Invalid firmware\n");
+ 		ret = -EINVAL;
+ 		goto out;
+@@ -3221,7 +3254,7 @@ int mt76_connac3_load_phy_ram(struct mt76_dev *dev, const char *fw_name)
+ 	if (ret)
+ 		return ret;
+ 
+-	if (!fw || !fw->data || fw->size < sizeof(*hdr)) {
++	if (mt76_connac2_fw_check(fw, NULL)) {
+ 		dev_err(dev->dev, "Invalid PHY firmware\n");
+ 		ret = -EINVAL;
+ 		goto out;
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index fdcb98ed..2221a295 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -6,6 +6,8 @@
+ 
+ #include "mt76_connac.h"
+ 
++struct firmware;
++
+ #define FW_FEATURE_SET_ENCRYPT		BIT(0)
+ #define FW_FEATURE_SET_KEY_IDX		GENMASK(2, 1)
+ #define FW_FEATURE_ENCRY_MODE		BIT(4)
+@@ -2149,6 +2151,7 @@ int mt76_connac_mcu_del_wtbl_all(struct mt76_dev *dev);
+ int mt76_connac_mcu_rdd_cmd(struct mt76_dev *dev, int cmd, u8 index,
+ 			    u8 rx_sel, u8 val);
+ int mt76_connac_mcu_sta_wed_update(struct mt76_dev *dev, struct sk_buff *skb);
++int mt76_connac2_fw_check(const struct firmware *fw, size_t *data_len);
+ int mt76_connac2_load_ram(struct mt76_dev *dev, const char *fw_wm,
+ 			  const char *fw_wa);
+ int mt76_connac3_load_phy_ram(struct mt76_dev *dev, const char *fw_name);
