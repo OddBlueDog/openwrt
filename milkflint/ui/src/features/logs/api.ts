@@ -4,14 +4,22 @@ import { bool, type Change, getConfig, str } from '@/lib/api/uci';
 
 export type LogKind = 'system' | 'kernel' | 'wifi' | 'radar' | 'debug' | 'dns' | 'crash';
 
+const readSchema = z.object({
+  lines: z.array(z.string()),
+  /** fewer lines than asked for: only the newest that fit in one reply (absent from older routers) */
+  truncated: z.boolean().optional(),
+});
+export type LogLines = z.output<typeof readSchema>;
+
 /**
  * The last `lines` lines of the system log, the kernel log, the Wi-Fi log,
- * the radar log, the debug log, the DNS log or the kernel's crash reports. With the logs
+ * the radar log, the debug log, the DNS log, or the kernel's crash reports and the memory
+ * errors KFENCE caught. With the logs
  * kept across reboots, the system and kernel logs come from the router's
  * saved copy, which goes back past the last restart.
  */
-export function readLog(kind: LogKind, lines: number): Promise<string[]> {
-  return call('milkflint.logs', 'read', { kind, lines }, z.object({ lines: z.array(z.string()) })).then((r) => r.lines);
+export function readLog(kind: LogKind, lines: number): Promise<LogLines> {
+  return call('milkflint.logs', 'read', { kind, lines }, readSchema);
 }
 
 const statusSchema = z.object({
@@ -41,6 +49,8 @@ const statusSchema = z.object({
   dns_bytes: z.number().nullish(),
   /** the kernel's crash reports kept since the last restart (pstore) */
   crash_reports: z.number().optional(),
+  /** memory errors KFENCE reported in the kernel log, which ran on (absent from older routers) */
+  memory_reports: z.number().optional(),
 });
 export type LogStatus = z.output<typeof statusSchema>;
 

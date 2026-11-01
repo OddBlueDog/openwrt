@@ -46,9 +46,18 @@ export type Change =
   /** sections moved to positions 0, 1, 2…: list every section of the config to keep the rest in place */
   | { op: 'order'; config: string; sections: string[] };
 
-/** Stage changes after dropping anything already staged for those configs. */
+/**
+ * Stage changes after dropping everything this session already has staged.
+ * rpcd applies all of a session's staged changes, and a rollback stages
+ * again what it undid, so a save after one (the firewall's check failing,
+ * or the router undoing a change the browser couldn't confirm) would apply
+ * the undone change too, without that page's checks.
+ */
 export async function stage(changes: readonly Change[]): Promise<void> {
-  const configs = [...new Set(changes.map((c) => c.config))];
+  const staged = await call('uci', 'changes', {}, z.object({ changes: z.record(z.string(), z.unknown()) }))
+    .then((r) => Object.keys(r.changes))
+    .catch((): string[] => []);
+  const configs = [...new Set([...staged, ...changes.map((c) => c.config)])];
   await Promise.all(configs.map((config) => exec('uci', 'revert', { config }).catch(() => undefined)));
   for (const c of changes) {
     switch (c.op) {

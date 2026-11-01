@@ -48,7 +48,7 @@ const placeholders: Record<LogKind, string> = {
   radar: 'Filter, e.g. RADAR-DETECTED or CAC',
   debug: 'Filter, e.g. snapshot, cake or RESTART',
   dns: 'Filter, e.g. slow, a device or a site',
-  crash: 'Filter, e.g. Oops, panic or mt7915',
+  crash: 'Filter, e.g. Oops, KFENCE or mt7915',
 };
 
 function severity(line: string): 'error' | 'warning' | undefined {
@@ -72,7 +72,7 @@ function source(kind: LogKind, status: LogStatus | undefined): string {
     const bytes = status.radar_bytes ?? null;
     return `kept across restarts${bytes === null ? '' : `, ${formatBytes(bytes)} saved`}`;
   }
-  if (kind === 'crash') return 'kept until the router loses power';
+  if (kind === 'crash') return `crashes kept until the router loses power, memory errors ${status.persist ? 'with the saved logs' : 'since the last restart'}`;
   const bytes =
     kind === 'wifi'
       ? status.wifi_bytes
@@ -96,7 +96,7 @@ export function LogsPage(): ReactElement {
   const { data: status, refresh: refreshStatus } = usePoll(getLogStatus, 15_000);
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return (data ?? []).filter((l) => q === '' || l.toLowerCase().includes(q));
+    return (data?.lines ?? []).filter((l) => q === '' || l.toLowerCase().includes(q));
   }, [data, query]);
 
   useEffect(() => {
@@ -104,7 +104,7 @@ export function LogsPage(): ReactElement {
   }, [shown, follow]);
 
   const download = (): void => {
-    const url = URL.createObjectURL(new Blob([`${(data ?? []).join('\n')}\n`], { type: 'text/plain' }));
+    const url = URL.createObjectURL(new Blob([`${(data?.lines ?? []).join('\n')}\n`], { type: 'text/plain' }));
     const a = document.createElement('a');
     a.href = url;
     a.download = `${kind}-log-${new Date().toISOString().slice(0, 19).replaceAll(':', '')}.txt`;
@@ -113,6 +113,7 @@ export function LogsPage(): ReactElement {
   };
 
   const where = source(kind, status);
+  const reports = (status?.crash_reports ?? 0) + (status?.memory_reports ?? 0);
   const onApplied = useCallback(() => {
     refreshStatus();
     refresh();
@@ -120,13 +121,17 @@ export function LogsPage(): ReactElement {
 
   return (
     <>
-      <PageHeader title="Logs" description="The system, kernel, Wi-Fi, radar, debug and DNS logs, and the kernel's crash reports, newest at the bottom." />
+      <PageHeader title="Logs" description="The system, kernel, Wi-Fi, radar, debug and DNS logs, and the kernel's crash and memory error reports, newest at the bottom." />
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_26rem]">
         <Card>
           <CardHeading
             icon={ScrollTextIcon}
             title={kinds.find((k) => k.id === kind)?.title ?? 'Log'}
-            description={data === undefined ? 'Loading…' : `${String(shown.length)} of ${String(data.length)} lines${where === '' ? '' : `, ${where}`}`}
+            description={
+              data === undefined
+                ? 'Loading…'
+                : `${String(shown.length)} of ${String(data.lines.length)} lines${data.truncated === true ? ', the newest that fit in one reply' : ''}${where === '' ? '' : `, ${where}`}`
+            }
           />
           <CardContent className="flex flex-col gap-3">
             <div role="radiogroup" aria-label="Log" className="grid grid-cols-4 self-start rounded-md border bg-muted/50 p-0.5 text-xs sm:flex">
@@ -142,9 +147,7 @@ export function LogsPage(): ReactElement {
                   className={cn('rounded-sm px-2.5 py-1 whitespace-nowrap text-muted-foreground', kind === k.id && 'bg-card text-foreground shadow-xs')}
                 >
                   {k.label}
-                  {k.id === 'crash' && (status?.crash_reports ?? 0) > 0 && (
-                    <span className="ml-1 tabular text-destructive">{String(status?.crash_reports)}</span>
-                  )}
+                  {k.id === 'crash' && reports > 0 && <span className="ml-1 tabular text-destructive">{String(reports)}</span>}
                 </button>
               ))}
             </div>
@@ -162,12 +165,13 @@ export function LogsPage(): ReactElement {
                 <AlertDescription>Turn it on in the settings below. Older lines from when it was on are still shown.</AlertDescription>
               </Alert>
             )}
-            {kind === 'crash' && data?.length === 0 && (
+            {kind === 'crash' && data?.lines.length === 0 && (
               <Alert variant="success">
                 <ShieldCheckIcon />
                 <AlertTitle>No crash reports</AlertTitle>
                 <AlertDescription>
-                  If the kernel crashes, its last lines are kept through the restart that follows and show here, until the router loses power.
+                  If the kernel crashes, its last lines are kept through the restart that follows and show here, until the router loses power. So do
+                  the memory errors its checker (KFENCE) catches while it keeps running.
                 </AlertDescription>
               </Alert>
             )}
@@ -243,7 +247,7 @@ export function LogsPage(): ReactElement {
                   );
                 })}
                 {data !== undefined && shown.length === 0 && (
-                  <div className="text-muted-foreground">{data.length === 0 ? 'Nothing logged yet.' : 'No lines match.'}</div>
+                  <div className="text-muted-foreground">{data.lines.length === 0 ? 'Nothing logged yet.' : 'No lines match.'}</div>
                 )}
               </pre>
             )}
