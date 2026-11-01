@@ -6,7 +6,9 @@
 # and, for chasing a dropout, the debug log (milkflint.logs.debug_counters,
 # debug_snapshot; off by default), and the DNS log (milkflint.logs.dns, off
 # by default; the Logs page turns dnsmasq's logqueries on with it), each up
-# to milkflint.logs.size MB. The
+# to milkflint.logs.size MB. It also turns the kernel's memory error checker,
+# KFENCE, on or off (milkflint.logs.kfence, off by default), at boot and
+# whenever the settings change. The
 # settings are its arguments, so procd restarts it when they change and
 # leaves it alone when another page saves (it doesn't compare the
 # environment).
@@ -44,8 +46,19 @@ muru() {
 	return 0
 }
 
+# KFENCE (milkflint.logs.kfence): the kernel boots with it off; an interval
+# starts it (its pool is set up the first time), 0 stops it. Only a change
+# is written.
+kfence() {
+	local f=/sys/module/kfence/parameters/sample_interval want=0
+	[ "$(uci -q get milkflint.logs.kfence)" = "1" ] && want=100
+	[ -w $f ] && [ "$(cat $f 2> /dev/null)" != "$want" ] && echo "$want" > $f
+	return 0
+}
+
 start_service() {
 	local persist=0 wifi counters=0 snapshot=0 dns=0
+	kfence
 	[ "$(uci -q get milkflint.logs.persist)" = "1" ] && persist=1
 	wifi=$(on wifi)
 	[ "$(uci -q get milkflint.logs.debug_counters)" = "1" ] && counters=1

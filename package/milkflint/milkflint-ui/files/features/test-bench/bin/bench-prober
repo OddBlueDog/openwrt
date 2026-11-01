@@ -1,0 +1,211 @@
+#!/usr/bin/ucode
+// The router's pings during a test bench run (ui feature "test-bench"):
+// ICMP echo, RATE a second each, to every member and to two internet
+// targets (Network Quality's ping target, and the Vultr host the run's plan
+// names), each with its own sequence numbers, so loss counts exactly. A
+// reply's time is the kernel's receive timestamp (SO_TIMESTAMP), so a busy
+// moment in this process doesn't add to it. bench-runner starts it, in its
+// own process group (its watchdog's kill ends it too); it stops with the
+// run. Every second it appends what it knows to probes.jsonl:
+//   {"t": <router ms>, "r": {"<target>": [[n, sent, rtt ms | null], ...]}}
+// (null: no reply within LOST_MS), and the last second's figures to
+// live-probes.json.
+'use strict';
+
+import { readfile, readlink, rename, stat, writefile, open } from 'fs';
+import * as socket from 'socket';
+import * as resolv from 'resolv';
+import { cursor } from 'uci';
+
+const DIR = '/tmp/milkflint-bench';
+const REQUEST = DIR + '/request.json';
+// pings a second to each target, and how long a reply may take
+const RATE = 5;
+const LOST_MS = 3000;
+// the internet targets a plan may name (as Network Quality's routes)
+const FAR = { uk: 'lon-gb-ping.vultr.com', eu: 'fra-de-ping.vultr.com', us: 'nj-us-ping.vultr.com' };
+const ICMP = 1;
+
+function mono_ms() {
+	const c = clock(true);
+	return c[0] * 1000 + c[1] / 1000000.0;
+}
+
+// the wall clock, as the kernel's receive timestamps are
+function wall_ms() {
+	const c = clock();
+	return c[0] * 1000 + c[1] / 1000000.0;
+}
+
+function save_json(path, v) {
+	writefile(path + '.tmp', sprintf('%J', v));
+	rename(path + '.tmp', path);
+}
+
+let req = null;
+try {
+	req = json(readfile(REQUEST) ?? 'null');
+}
+catch (e) {
+	// no run
+}
+if (type(req) != 'object' || type(req.id) != 'string' || !match(req.id, /^[0-9a-f]{12}$/))
+	exit(1);
+const RUN = `${DIR}/runs/${req.id}`;
+const pid = +replace(readlink('/proc/self') ?? '', /^.*\//, '');
+writefile(`${RUN}/prober.pid`, `${pid}`);
+const ID = pid & 0xffff;
+
+const is_ipv4 = (s) => type(s) == 'string' && match(s, /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/);
+
+function resolve4(host) {
+	if (is_ipv4(host))
+		return host;
+	if (type(host) != 'string' || !match(host, /^[A-Za-z0-9.-]{1,253}$/))
+		return null;
+	const r = resolv.query([ host ], { type: [ 'A' ], timeout: 2000 });
+	const a = r?.[host]?.A;
+	return (type(a) == 'array' && is_ipv4(a[0])) ? a[0] : null;
+}
+
+// what to ping: the members (IPv4 only, for now), the WAN ping target and the far host
+const targets = [];
+for (let m in req.members ?? [])
+	if (is_ipv4(m.ip))
+		push(targets, { key: m.id, ip: m.ip });
+const near = resolve4(cursor().get('milkflint', 'netquality', 'ping_target') ?? '1.1.1.1');
+if (near)
+	push(targets, { key: 'wan', ip: near });
+const far = resolve4(FAR[req.options?.latency] ?? FAR.uk);
+if (far)
+	push(targets, { key: 'far', ip: far });
+save_json(`${RUN}/probes-targets.json`, map(targets, (x) => ({ key: x.key, ip: x.ip })));
+
+const sock = socket.create(socket.AF_INET, socket.SOCK_RAW | socket.SOCK_NONBLOCK, ICMP);
+if (!sock)
+	exit(1);
+sock.setopt(socket.SOL_SOCKET, socket.SO_TIMESTAMP, true);
+
+function checksum(p) {
+	let sum = 0;
+	for (let i = 0; i < length(p); i += 2)
+		sum += (ord(p, i) << 8) + (i + 1 < length(p) ? ord(p, i + 1) : 0);
+	while (sum >> 16)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return ~sum & 0xffff;
+}
+
+function echo(seq) {
+	const body = chr(ID >> 8, ID & 255, seq >> 8, seq & 255) + 'milkflnt';
+	const c = checksum(chr(8, 0, 0, 0) + body);
+	return chr(8, 0, c >> 8, c & 255) + body;
+}
+
+// seq -> the probe; each target also numbers its own probes (n), for loss
+const pending = {};
+const done = {};
+let seq = 0;
+for (let x in targets) {
+	x.n = 0;
+	done[x.key] = [];
+}
+
+function send(x) {
+	seq = (seq + 1) & 0xffff;
+	const p = { key: x.key, n: x.n++, sent: mono_ms(), wall: wall_ms() };
+	pending[seq] = p;
+	if (sock.send(echo(seq), 0, { address: x.ip, port: 0 }) == null)
+		p.failed = true;
+}
+
+function receive() {
+	for (;;) {
+		const m = sock.recvmsg(256, 64);
+		if (!m || type(m.data) != 'string')
+			return;
+		const d = m.data;
+		const ihl = (ord(d, 0) & 15) * 4;
+		if (length(d) < ihl + 8 || ord(d, ihl) != 0)
+			continue;
+		if (((ord(d, ihl + 4) << 8) | ord(d, ihl + 5)) != ID)
+			continue;
+		const s = (ord(d, ihl + 6) << 8) | ord(d, ihl + 7);
+		const p = pending[s];
+		if (!p)
+			continue;
+		let at = wall_ms();
+		for (let a in m.ancillary ?? [])
+			if (type(a.data) == 'object' && a.data.sec != null)
+				at = a.data.sec * 1000 + a.data.usec / 1000.0;
+		delete pending[s];
+		push(done[p.key], [ p.n, int(p.sent), int((at - p.wall) * 100 + 0.5) / 100.0 ]);
+	}
+}
+
+// the probes a second old or more, and those LOST_MS old without a reply
+function expire(t) {
+	for (let s, p in pending)
+		if (t - p.sent >= LOST_MS) {
+			delete pending[s];
+			push(done[p.key], [ p.n, int(p.sent), null ]);
+		}
+}
+
+function median(v) {
+	v = sort(v, (a, b) => a - b);
+	return length(v) ? v[int(length(v) / 2)] : null;
+}
+
+const out = open(`${RUN}/probes.jsonl`, 'a');
+function flush(t) {
+	const line = { t: int(t), r: {} };
+	const live = { t: int(t) };
+	for (let key, list in done) {
+		if (!length(list))
+			continue;
+		line.r[key] = list;
+		const rtts = filter(map(list, (x) => x[2]), (v) => v != null);
+		live[key] = [ median(rtts), length(list) - length(rtts), length(list) ];
+		done[key] = [];
+	}
+	out?.write(sprintf('%J\n', line));
+	out?.flush();
+	save_json(`${RUN}/live-probes.json`, live);
+}
+
+// pings start with the run and stop with it (it ends, is stopped, or the
+// runner is gone); the replies on their way are waited for, LOST_MS at most
+const runner = +trim(readfile(`${RUN}/runner.pid`) ?? '');
+const gap = length(targets) ? 1000.0 / RATE / length(targets) : 1000;
+let next_send = max(mono_ms(), req.t0 ?? 0), turn = 0, next_flush = mono_ms() + 1000, drain_until = null, next_check = 0;
+for (;;) {
+	const t = mono_ms();
+	// whether the run is over: four times a second is soon enough
+	if (drain_until == null && t >= next_check) {
+		next_check = t + 250;
+		if (t >= (req.end ?? 0) || stat(`${RUN}/end.json`) != null || stat(`${RUN}/stop`) != null ||
+		    !(runner > 0 && index(readfile(`/proc/${runner}/cmdline`) ?? '', 'bench-runner') >= 0))
+			drain_until = t + LOST_MS;
+	}
+	if (drain_until != null && (t >= drain_until || !length(pending)))
+		break;
+	if (drain_until == null && length(targets) && t >= next_send) {
+		send(targets[turn]);
+		turn = (turn + 1) % length(targets);
+		next_send += gap;
+		if (next_send < t)
+			next_send = t + gap;
+	}
+	socket.poll(max(1, int(min(next_send, next_flush) - mono_ms())), sock);
+	receive();
+	if (mono_ms() >= next_flush) {
+		expire(mono_ms());
+		flush(mono_ms());
+		next_flush += 1000;
+	}
+}
+receive();
+expire(mono_ms() + LOST_MS);
+flush(mono_ms());
+out?.close();
+sock.close();

@@ -232,8 +232,21 @@ function phy_port(dev) {
 
 // Thermal zones and hwmon sensors (on the MT7986: the SoC, each Wi-Fi band's
 // phy and the 2.5G Ethernet PHYs), with what each one measures: `wiphy` for
-// a radio, `port` for an Ethernet PHY.
+// a radio, `port` for an Ethernet PHY. A radio's reading is a firmware
+// query, which waits up to 2 s holding the driver's lock: the dashboard's
+// sensor-history reads those once a minute and leaves them in WIFI_TEMPS,
+// so rpcd never waits on the Wi-Fi chip for them.
+const WIFI_TEMPS = '/tmp/milkflint/wifi-temps.json';
 function temperatures() {
+	let wifi = null;
+	try {
+		wifi = json(readfile(WIFI_TEMPS) ?? 'null');
+	}
+	catch (e) {
+		wifi = null;
+	}
+	if (time() - (wifi?.t ?? 0) > 180)
+		wifi = null;
 	const out = [];
 	for (let tz in lsdir('/sys/class/thermal') ?? []) {
 		if (!match(tz, /^thermal_zone[0-9]+$/))
@@ -255,7 +268,7 @@ function temperatures() {
 			const m = match(f, /^temp([0-9]+)_input$/);
 			if (!m)
 				continue;
-			const t = num(readfile(`${base}/${f}`));
+			const t = wiphy ? wifi?.temps?.[`${hw}/${f}`] : num(readfile(`${base}/${f}`));
 			const label = trim(readfile(`${base}/temp${m[1]}_label`) ?? '');
 			if (t != null)
 				push(out, { name: label ? `${name} ${label}` : name, celsius: t / 1000.0, wiphy, port });

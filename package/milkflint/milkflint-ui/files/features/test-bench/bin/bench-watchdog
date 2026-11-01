@@ -1,0 +1,44 @@
+#!/bin/sh
+# Watchdog for bench-runner (ui feature "test-bench"). If the runner is
+# still running at DEADLINE (the router's monotonic clock, in seconds), this
+# kills it and everything it started (its process group) and ends its run;
+# if it died without saying how its run ended, this says so. bench-runner
+# starts it in its own session, before anything else.
+#   bench-watchdog PID DEADLINE RUN
+PID=$1
+DEADLINE=$2
+RUN=$3
+case "$PID" in '' | *[!0-9]*) exit 1 ;; esac
+case "$DEADLINE" in '' | *[!0-9]*) exit 1 ;; esac
+case "$RUN" in '' | *[!0-9a-f]*) exit 1 ;; esac
+DIR=/tmp/milkflint-bench/runs/$RUN
+
+running() {
+	grep -q bench-runner "/proc/$PID/cmdline" 2> /dev/null
+}
+
+now() {
+	ucode -e 'print(clock(true)[0])'
+}
+
+# end.json, unless the runner wrote it: REASON is one of ours, no quotes in it
+ended() {
+	[ -f "$DIR/end.json" ] && return
+	ucode -e "import { writefile } from 'fs'; const c = clock(true);
+		writefile('$DIR/end.json', sprintf('%J', { reason: '$1', by: 'watchdog', at: c[0] * 1000 + c[1] / 1000000 }));"
+}
+
+while sleep 2; do
+	if ! running; then
+		ended 'the router stopped recording unexpectedly'
+		exit 0
+	fi
+	[ "$(now)" -lt "$DEADLINE" ] && continue
+	group=$(cut -d ' ' -f 5 "/proc/$PID/stat" 2> /dev/null)
+	mine=$(cut -d ' ' -f 5 /proc/$$/stat)
+	case "$group" in '' | *[!0-9]*) ;; *) [ "$group" -gt 1 ] && [ "$group" != "$mine" ] && kill -9 -- "-$group" 2> /dev/null ;; esac
+	kill -9 "$PID" 2> /dev/null
+	ended 'the run went past its end, so its watchdog stopped it'
+	logger -t bench-watchdog "test bench run $RUN went past its end: stopped"
+	exit 0
+done

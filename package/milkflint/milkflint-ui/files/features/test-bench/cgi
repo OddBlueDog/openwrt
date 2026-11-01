@@ -1,0 +1,73 @@
+#!/usr/bin/ucode
+// Join a test bench (ui feature "test-bench"; /cgi-bin/milkflint-test-bench).
+// Trades the bench's join token (its QR code) or code, or a member's own
+// key when it joins again, for an rpcd session that may call only the
+// member methods (milkflint.bench.member). It's a CGI rather than an rpcd
+// method because rpcd can't create a session while it answers a call, and
+// because only the web server knows the device's address (REMOTE_ADDR),
+// which the bench needs to find how the device is connected.
+//   POST, Content-Type: application/json
+//   {"token"|"code"|"member"+"key", "name"?, "platform"?}
+//   -> {"sid", "member", "key", "bench", "name"} or {"error"}
+'use strict';
+
+import { stdin } from 'fs';
+import { connect } from 'ubus';
+
+const MAX_BODY = 2048;
+
+function reply(status, body) {
+	print(`Status: ${status}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n`);
+	print(sprintf('%J\n', body));
+	exit(0);
+}
+
+const env = getenv();
+if (env.REQUEST_METHOD != 'POST')
+	reply('405 Method Not Allowed', { error: 'POST only' });
+// another site's page can't send application/json here without a CORS
+// preflight, which this never answers
+if (!match(env.CONTENT_TYPE ?? '', /^application\/json[ \t]*(;|$)/))
+	reply('415 Unsupported Media Type', { error: 'application/json only' });
+const size = +(env.CONTENT_LENGTH ?? '');
+if (!(size > 0 && size <= MAX_BODY))
+	reply('413 Payload Too Large', { error: 'invalid length' });
+
+let body = null;
+try {
+	body = json(stdin.read(size));
+}
+catch (e) {
+	// not JSON
+}
+if (type(body) != 'object')
+	reply('400 Bad Request', { error: 'invalid body' });
+
+const args = {};
+for (let k in [ 'token', 'code', 'member', 'key', 'name', 'platform' ]) {
+	if (body[k] == null)
+		continue;
+	if (type(body[k]) != 'string' || length(body[k]) > 64)
+		reply('400 Bad Request', { error: `invalid ${k}` });
+	args[k] = body[k];
+}
+
+// uhttpd listening on [::] gives IPv4 clients as ::ffff:a.b.c.d
+const ip = replace(env.REMOTE_ADDR ?? '', /^::ffff:([0-9.]+)$/, '$1');
+
+const bus = connect();
+if (!bus)
+	reply('503 Service Unavailable', { error: 'the router is busy' });
+const ok = bus.call('milkflint.bench.join', 'check', args);
+if (!ok || ok.error)
+	reply('403 Forbidden', { error: ok?.error ?? 'the router is busy' });
+const sid = bus.call('session', 'create', { timeout: ok.timeout })?.ubus_rpc_session;
+if (type(sid) != 'string')
+	reply('503 Service Unavailable', { error: 'no session' });
+bus.call('session', 'grant', { ubus_rpc_session: sid, scope: 'ubus', objects: map(ok.methods, (m) => [ 'milkflint.bench.member', m ]) });
+const done = bus.call('milkflint.bench.join', 'commit', { ...args, sid, ip, ua: env.HTTP_USER_AGENT ?? '' });
+if (!done || done.error) {
+	bus.call('session', 'destroy', { ubus_rpc_session: sid });
+	reply('403 Forbidden', { error: done?.error ?? 'the router is busy' });
+}
+reply('200 OK', { sid, ...done });

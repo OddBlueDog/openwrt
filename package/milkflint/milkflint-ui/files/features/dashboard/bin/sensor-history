@@ -3,14 +3,20 @@
 // "dashboard"). Every INTERVAL seconds it reads the router's temperatures,
 // through the milkflint ubus object so they're named as the dashboard names
 // them, and keeps the last hour in RAM for the milkflint.sensors rpcd
-// object. It only reads.
+// object. The Wi-Fi radios' own it reads every WIFI_EVERY seconds, here,
+// for that object to report (WIFI_TEMPS). It only reads.
 'use strict';
 
-import { readfile, writefile, rename, mkdir, popen } from 'fs';
+import { readfile, writefile, rename, mkdir, popen, lsdir, realpath } from 'fs';
 
 const DIR = '/tmp/milkflint';
 const STATE = DIR + '/sensors.json';
+const WIFI_TEMPS = DIR + '/wifi-temps.json';
+// until when (epoch s) the logs keeper saw the Wi-Fi firmware in trouble:
+// no queries to it till then
+const WIFI_QUIET = DIR + '/wifi-quiet';
 const INTERVAL = 10;
+const WIFI_EVERY = 60;
 const KEEP = 3600 / INTERVAL;
 
 function now_ms() {
@@ -37,6 +43,27 @@ function temperatures() {
 	return out;
 }
 
+// The Wi-Fi radios' temperatures (hwmon temp*_input under a wiphy, in m°C,
+// by "hwmonN/tempM_input"), for milkflint.stats. Each reading is a firmware
+// query that waits up to 2 s holding the driver's lock (and a firmware that
+// doesn't answer gets the chip reset): so once a minute, and here rather
+// than in rpcd, which the web interface waits on.
+function wifi_temps() {
+	const temps = {};
+	for (let hw in lsdir('/sys/class/hwmon') ?? []) {
+		const base = `/sys/class/hwmon/${hw}`;
+		if (!match(realpath(`${base}/device`) ?? '', /\/ieee80211\/phy[0-9]+$/))
+			continue;
+		for (let f in lsdir(base) ?? []) {
+			const v = match(f, /^temp[0-9]+_input$/) ? trim(readfile(`${base}/${f}`) ?? '') : '';
+			if (match(v, /^-?[0-9]+$/))
+				temps[`${hw}/${f}`] = int(v);
+		}
+	}
+	writefile(WIFI_TEMPS + '.tmp', sprintf('%J', { t: time(), temps }));
+	rename(WIFI_TEMPS + '.tmp', WIFI_TEMPS);
+}
+
 mkdir(DIR);
 
 // carry on from the last run (a restart of the service, not of the router)
@@ -50,8 +77,16 @@ catch (e) {
 	// start fresh
 }
 
+let wifi_read = 0;
 while (true) {
 	const started = now_ms();
+	const quiet = int(trim(readfile(WIFI_QUIET) ?? '0'));
+	// (a clock that jumped back leaves a quiet time too far ahead: ignored)
+	const calm = !(quiet > time() && quiet - time() <= 600);
+	if (calm && time() - wifi_read >= WIFI_EVERY) {
+		wifi_read = time();
+		wifi_temps();
+	}
 	push(samples, { t: time(), c: temperatures() });
 	if (length(samples) > KEEP)
 		samples = slice(samples, length(samples) - KEEP);

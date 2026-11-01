@@ -12,7 +12,7 @@ define Package/milkflint-ui
   CATEGORY:=LuCI
   TITLE:=MilkFlint web interface (dashboard and main settings)
   DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +rpcd-mod-iwinfo +uhttpd +uhttpd-mod-ubus \
-	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-resolv +ethtool +milkflint-rtprio
+	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-resolv +ucode-mod-nl80211 +ucode-mod-socket +ethtool +milkflint-rtprio
   PKGARCH:=all
 endef
 
@@ -30,11 +30,12 @@ define Build/Compile
 endef
 
 # Core files, then each feature's router side by convention
-# (files/features/<id>/: rpcd.uc, acl.json, init, uci-defaults, preinit, bin/*).
-# A preinit hook runs after preinit restores the config a sysupgrade kept
-# (80_mount_root), before anything in /etc/init.d.
+# (files/features/<id>/: rpcd.uc, acl.json, init, uci-defaults, preinit, cgi,
+# bin/*). A preinit hook runs after preinit restores the config a sysupgrade
+# kept (80_mount_root), before anything in /etc/init.d. A cgi is served at
+# /cgi-bin/milkflint-<id>.
 define Package/milkflint-ui/install
-	$(INSTALL_DIR) $(1)/www/milkflint $(1)/usr/share/rpcd/acl.d $(1)/usr/share/rpcd/ucode \
+	$(INSTALL_DIR) $(1)/www/milkflint $(1)/www/cgi-bin $(1)/usr/share/rpcd/acl.d $(1)/usr/share/rpcd/ucode \
 		$(1)/etc/uci-defaults $(1)/etc/init.d $(1)/usr/libexec/milkflint $(1)/usr/libexec/platform \
 		$(1)/etc/hotplug.d/ieee80211 $(1)/etc/hotplug.d/iface $(1)/lib/preinit $(1)/etc/sysctl.d
 	$(CP) ./htdocs/* $(1)/www/milkflint/
@@ -54,6 +55,7 @@ define Package/milkflint-ui/install
 		[ ! -f $$$$f/init ] || $(INSTALL_BIN) $$$$f/init $(1)/etc/init.d/milkflint-$$$$id; \
 		[ ! -f $$$$f/uci-defaults ] || $(INSTALL_BIN) $$$$f/uci-defaults $(1)/etc/uci-defaults/91-milkflint-$$$$id; \
 		[ ! -f $$$$f/preinit ] || $(INSTALL_DATA) $$$$f/preinit $(1)/lib/preinit/81_milkflint-$$$$id; \
+		[ ! -f $$$$f/cgi ] || $(INSTALL_BIN) $$$$f/cgi $(1)/www/cgi-bin/milkflint-$$$$id; \
 		[ ! -d $$$$f/bin ] || $(INSTALL_BIN) $$$$f/bin/* $(1)/usr/libexec/milkflint/; \
 	done
 endef

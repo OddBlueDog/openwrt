@@ -1,0 +1,559 @@
+#!/usr/bin/ucode
+// The router's side of a test bench run (ui feature "test-bench"): it
+// records once a second what the router does (CPU per core and the network
+// threads, softirqs and softnet drops, interface counters, Smart Queue's
+// CAKE per tin and queue, connection tracking), every 2 s the members'
+// Wi-Fi stations, every 5 s how many connections are offloaded, the
+// Ethernet driver's drop counters and dnsmasq's. It starts bench-prober,
+// which pings the members and the internet. It ends the run when the
+// schedule is over, when a member stops it (the stop file), or when no
+// member has been heard from for HEARD_MS. Its rpcd plugin writes the run to
+// REQUEST and starts it detached; its watchdog (bench-watchdog) kills it
+// and everything it started if it overruns. It only reads: it never
+// changes a setting, a queue or the flow table.
+'use strict';
+
+import { glob, open, popen, readfile, readlink, rename, stat, unlink, writefile } from 'fs';
+import { connect } from 'ubus';
+
+let nl80211 = null, rtnl = null;
+try {
+	nl80211 = require('nl80211');
+}
+catch (e) {
+	// no Wi-Fi stations then
+}
+try {
+	rtnl = require('rtnl');
+}
+catch (e) {
+	// no members' Wi-Fi stations then (their MACs come from the neighbour table)
+}
+
+const DIR = '/tmp/milkflint-bench';
+const REQUEST = DIR + '/request.json';
+const HEARTBEAT = DIR + '/heartbeat';
+const WATCHDOG = '/usr/libexec/milkflint/bench-watchdog';
+const PROBER = '/usr/libexec/milkflint/bench-prober';
+const DNS = '/usr/libexec/milkflint/bench-dns';
+const DEBUGFS = '/sys/kernel/debug/ieee80211';
+// the members' polls are its heartbeat
+const HEARD_MS = 15000;
+// the watchdog's deadline: the schedule's end and this, never more than MAX_MS after the start
+const SLACK_MS = 20000;
+const MAX_MS = 660000;
+const TICK_MS = 200;
+const SAMPLE_MS = 1000;
+// a run is 600 s at most: this many samples is a bound, not a limit hit
+const MAX_SAMPLES = 720;
+
+function now_ms() {
+	const c = clock(true);
+	return c[0] * 1000 + c[1] / 1000000.0;
+}
+
+function save_json(path, v) {
+	writefile(path + '.tmp', sprintf('%J', v));
+	rename(path + '.tmp', path);
+}
+
+function lines_of(path) {
+	return split(trim(readfile(path) ?? ''), '\n');
+}
+
+// 0.123456 -> 0.123: what the report needs, and a third of the size
+function r3(x) {
+	return int(x * 1000 + 0.5) / 1000.0;
+}
+
+let req = null;
+try {
+	req = json(readfile(REQUEST) ?? 'null');
+}
+catch (e) {
+	// no run to do
+}
+if (type(req) != 'object' || type(req.id) != 'string' || !match(req.id, /^[0-9a-f]{12}$/) || type(req.end) != 'int')
+	exit(1);
+
+const RUN = `${DIR}/runs/${req.id}`;
+const started = now_ms();
+const pid = +replace(readlink('/proc/self') ?? '', /^.*\//, '');
+if (!(pid > 0))
+	exit(1);
+writefile(`${RUN}/runner.pid`, `${pid}`);
+const deadline = min(req.end + SLACK_MS, started + MAX_MS);
+system(`setsid ${WATCHDOG} ${pid} ${int(deadline / 1000) + 1} ${req.id} < /dev/null > /dev/null 2>&1 &`);
+// in this process's group, so the watchdog's kill ends them too; a rehearsal sends nothing
+if (req.schedule?.dry != true) {
+	system(`${PROBER} < /dev/null > /dev/null 2>&1 &`);
+	system(`${DNS} < /dev/null > /dev/null 2>&1 &`);
+}
+
+// the WAN port (`ports wan`), and Smart Queue's ifb for its downloads (as logs-keeper finds them)
+function wan_port() {
+	const p = popen('/usr/libexec/milkflint/ports wan 2>/dev/null', 'r');
+	const dev = trim(p?.read('all') ?? '');
+	p?.close();
+	return match(dev, /^[A-Za-z0-9_-]+$/) ? dev : 'eth1';
+}
+const WAN = wan_port();
+const IFB = 'ifb4' + WAN;
+
+// ---- Once a second ----
+
+// per CPU, from /proc/stat: jiffies in all, idle (with iowait), irq, softirq (as logs-keeper's cpu_times)
+function cpu_times() {
+	const out = [];
+	for (let l in lines_of('/proc/stat')) {
+		const m = match(l, /^cpu([0-9]+) +(.*)$/);
+		if (!m)
+			continue;
+		const f = map(split(m[2], ' '), (x) => int(x));
+		let all = 0;
+		for (let i = 0; i < 8 && i < length(f); i++)
+			all += f[i];
+		out[int(m[1])] = { all, idle: f[3] + f[4], irq: f[5], si: f[6] };
+	}
+	return out;
+}
+
+// NET_RX and NET_TX softirqs so far, per CPU
+function net_softirqs() {
+	const out = { rx: [], tx: [] };
+	for (let l in lines_of('/proc/softirqs')) {
+		const m = match(l, /^ *NET_(RX|TX): +(.*)$/);
+		if (m)
+			out[lc(m[1])] = map(split(trim(m[2]), / +/), (x) => int(x));
+	}
+	return out;
+}
+
+// per CPU: packets the backlog processed, dropped (backlog full), squeezed (out of budget or time)
+function softnet() {
+	const out = [];
+	for (let l in lines_of('/proc/net/softnet_stat')) {
+		const f = split(l, ' ');
+		if (length(f) >= 3)
+			push(out, [ hex(f[0]), hex(f[1]), hex(f[2]) ]);
+	}
+	return out;
+}
+
+// the threads that move packets (ksoftirqd, NAPI, mt76's tx worker) and the
+// bench's own way in (rpcd, uhttpd): pid -> name, found again every 30 s
+const WATCHED = /^(ksoftirqd\/|napi\/|mt76-|rpcd$|uhttpd$|dnsmasq$)/;
+let watched = {}, watched_at = 0;
+function find_watched(t) {
+	if (t - watched_at < 30000)
+		return;
+	watched_at = t;
+	watched = {};
+	for (let d in glob('/proc/[0-9]*') ?? []) {
+		const name = trim(readfile(d + '/comm') ?? '');
+		if (match(name, WATCHED))
+			watched[substr(d, 6)] = name;
+	}
+}
+
+// a process's CPU so far, in ticks (1/100 s); `children`: with its waited-for children's
+function proc_ticks(p, children) {
+	const m = match(trim(readfile(`/proc/${p}/stat`) ?? ''), /^[0-9]+ \(.*\) (.*)$/);
+	if (!m)
+		return null;
+	const f = split(m[1], ' ');
+	return int(f[11]) + int(f[12]) + (children ? int(f[13]) + int(f[14]) : 0);
+}
+
+// the network's interfaces: the WAN port, its ifb, the bridge, the switch's ports, the Wi-Fi APs
+const IFACES = regexp(`^(${WAN}|${IFB}|eth[0-9]+|lan[0-9]+|br-lan|phy[0-9]+-ap[0-9]+|wlan[0-9.-]+)$`);
+function if_counts() {
+	const out = {};
+	for (let l in lines_of('/proc/net/dev')) {
+		const m = match(l, /^ *([^ :]+): *(.*)$/);
+		if (!m || !match(m[1], IFACES))
+			continue;
+		const f = map(split(m[2], / +/), (x) => int(x));
+		// rx bytes, tx bytes, rx packets, tx packets, rx drops, tx drops, rx errors, tx errors
+		out[m[1]] = [ f[0], f[8], f[1], f[9], f[3], f[11], f[2], f[10] ];
+	}
+	return out;
+}
+
+// Runs `cmd` in the background and waits up to `ms` for its output: tc and
+// ethtool need the kernel's network lock (rtnl), and block while it's
+// stuck; the recorder mustn't block with them. A run that hasn't finished
+// stops new ones until it does (as logs-keeper's bounded()).
+const JOB = RUN + '/job.out';
+const job = { pid: null };
+function bounded(cmd, ms) {
+	if (job.pid != null) {
+		if (stat(`/proc/${job.pid}`) != null)
+			return null;
+		job.pid = null;
+	}
+	unlink(JOB);
+	const fd = popen(`{ { ${cmd}; } > ${JOB}.tmp 2> /dev/null; mv ${JOB}.tmp ${JOB}; } > /dev/null 2>&1 & echo $!`, 'r');
+	if (!fd)
+		return null;
+	const p = trim(fd.read('all'));
+	fd.close();
+	for (let waited = 0; waited <= ms; waited += 5) {
+		const out = readfile(JOB);
+		if (out != null)
+			return out;
+		sleep(5);
+	}
+	job.pid = p;
+	return null;
+}
+
+// a bounded job's output: "@ <name>" lines start each command's part
+function sections(text) {
+	const out = {};
+	for (let part in split('\n' + (text ?? ''), '\n@ ')) {
+		const i = index(part, '\n');
+		if (i > 0)
+			out[substr(part, 0, i)] = substr(part, i + 1);
+	}
+	return out;
+}
+
+const TC = `echo '@ ${WAN}'; tc -s -j qdisc show dev ${WAN}; echo; echo '@ ${IFB}'; tc -s -j qdisc show dev ${IFB}`;
+
+// each CAKE qdisc on the WAN port (upload) and its ifb (download), by
+// "<dev> <handle or parent>": its counters and, per tin, sent bytes, drops,
+// ECN marks, backlog and its delays (target, peak, average, sparse), µs
+function cake_now(sec) {
+	const out = {};
+	for (let dev in [ WAN, IFB ]) {
+		let list = null;
+		try {
+			list = json(trim(sec[dev] ?? '') || '[]');
+		}
+		catch (e) {
+			list = null;
+		}
+		for (let q in (type(list) == 'array') ? list : []) {
+			if (q.kind != 'cake')
+				continue;
+			// bytes, packets, drops, backlog (bytes), then the tins
+			out[`${dev} ${q.root ? q.handle : q.parent}`] = [ q.bytes ?? 0, q.packets ?? 0, q.drops ?? 0, q.backlog ?? 0,
+				map(q.tins ?? [], (t) => [ t.sent_bytes ?? 0, t.drops ?? 0, t.ecn_mark ?? 0, t.backlog_bytes ?? 0,
+					t.target_us ?? 0, t.peak_delay_us ?? 0, t.avg_delay_us ?? 0, t.sparse_flows ?? 0, t.bulk_flows ?? 0 ]) ];
+		}
+	}
+	return out;
+}
+
+// ---- Every 2 s: the members' Wi-Fi ----
+
+// member id -> MAC, from the neighbour table (refreshed with the stations)
+function member_macs() {
+	const out = {};
+	if (!rtnl)
+		return out;
+	const c = rtnl.const;
+	const by_ip = {};
+	for (let family in [ c.AF_INET, c.AF_INET6 ])
+		for (let n in rtnl.request(c.RTM_GETNEIGH, c.NLM_F_DUMP, { family }) ?? [])
+			if (n.dst && n.lladdr && n.lladdr != '00:00:00:00:00:00')
+				by_ip[n.dst] = lc(n.lladdr);
+	for (let m in req.members ?? [])
+		if (by_ip[m.ip])
+			out[by_ip[m.ip]] = m.id;
+	return out;
+}
+
+// the airtime a station has used (mac80211's "RX: n us", "TX: n us") and
+// what AQL has queued for it, µs (as logs-keeper reads them)
+function station_debug(phy, dev, mac) {
+	const s = readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/airtime`) ?? '';
+	const rx = match(s, /RX: ([0-9]+) us/), tx = match(s, /TX: ([0-9]+) us/);
+	let aql = null;
+	const q = match(readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/aql`) ?? '', /Q depth:([^\n]*)/);
+	if (q) {
+		aql = 0;
+		for (let n in match(q[1], /([0-9]+) us/g))
+			aql += int(n[1]);
+	}
+	return { air_rx: rx ? int(rx[1]) : null, air_tx: tx ? int(tx[1]) : null, aql };
+}
+
+// each AP's stations: the members' own, and every station's counters summed
+function stations(macs) {
+	const out = { sta: {}, ap: {} };
+	if (!nl80211)
+		return out;
+	const c = nl80211.const;
+	for (let i in nl80211.request(c.NL80211_CMD_GET_INTERFACE, c.NLM_F_DUMP) ?? []) {
+		if (i.iftype != c.NL80211_IFTYPE_AP || !i.ifname)
+			continue;
+		const phy = trim(readfile(`/sys/class/net/${i.ifname}/phy80211/name`) ?? '');
+		const ap = [ 0, 0, 0, 0, 0 ];	// stations, tx packets, tx retries, tx failed, airtime (µs)
+		for (let s in nl80211.request(c.NL80211_CMD_GET_STATION, c.NLM_F_DUMP, { dev: i.ifname }) ?? []) {
+			const st = s.sta_info ?? {};
+			const mac = lc(s.mac ?? '');
+			const d = station_debug(phy, i.ifname, mac);
+			ap[0]++;
+			ap[1] += st.tx_packets ?? 0;
+			ap[2] += st.tx_retries ?? 0;
+			ap[3] += st.tx_failed ?? 0;
+			ap[4] += (d.air_tx ?? 0) + (d.air_rx ?? 0);
+			const id = macs[mac];
+			if (id == null)
+				continue;
+			// counters so far; the report takes their differences
+			out.sta[id] = {
+				dev: i.ifname, signal: st.signal, tx_mbit: st.tx_bitrate?.bitrate != null ? st.tx_bitrate.bitrate / 10.0 : null,
+				rx_mbit: st.rx_bitrate?.bitrate != null ? st.rx_bitrate.bitrate / 10.0 : null,
+				c: [ st.tx_packets ?? 0, st.tx_retries ?? 0, st.tx_failed ?? 0, st.rx_packets ?? 0, st.tx_bytes64 ?? st.tx_bytes ?? 0,
+					st.rx_bytes64 ?? st.rx_bytes ?? 0, d.air_tx, d.air_rx ],
+				aql: d.aql
+			};
+		}
+		out.ap[i.ifname] = ap;
+	}
+	return out;
+}
+
+// ---- Every 5 s ----
+
+// the router's own IPv4 addresses: a member's connections to them (its
+// page, the bench's polls) never leave the router, so offloading can't
+// take them
+function local_addresses() {
+	const out = {};
+	if (!rtnl)
+		return out;
+	for (let a in rtnl.request(rtnl.const.RTM_GETADDR, rtnl.const.NLM_F_DUMP, { family: rtnl.const.AF_INET }) ?? [])
+		if (a.local)
+			out[a.local] = true;
+	return out;
+}
+const LOCAL = local_addresses();
+
+// connections tracked and offloaded (software flow offloading), in all and
+// each member's own (its address as the original source or destination),
+// leaving out those to the router itself. The kernel's formatting of the
+// table is most of the cost, so this reads it whole and looks with index(),
+// no regexp per line.
+function conntrack(members) {
+	const text = readfile('/proc/net/nf_conntrack');
+	if (text == null)
+		return null;
+	const out = { n: 0, off: 0, m: {} };
+	const keys = map(members, (m) => [ m.id, ` src=${m.ip} `, ` dst=${m.ip} ` ]);
+	for (let l in split(text, '\n')) {
+		if (!length(l))
+			continue;
+		out.n++;
+		const off = index(l, '[OFFLOAD]') >= 0;
+		if (off)
+			out.off++;
+		// a member's address anywhere on the line: its own connections, either way
+		for (let k in keys) {
+			const s = index(l, k[1]), d = index(l, k[2]);
+			if (s < 0 && d < 0)
+				continue;
+			// the original direction's destination: the router's own address, not one offloading takes
+			const d0 = index(l, ' dst=') + 5;
+			const d1 = index(substr(l, d0, 48), ' ');
+			if (d1 > 0 && LOCAL[substr(l, d0, d1)])
+				break;
+			// flows, offloaded; of them TCP, UDP; established (offloaded, or TCP
+			// ESTABLISHED, or UDP answered both ways), the ones offloading takes
+			if (!out.m[k[0]])
+				out.m[k[0]] = [ 0, 0, 0, 0, 0 ];
+			const m = out.m[k[0]];
+			const tcp = index(l, ' tcp ') >= 0, udp = !tcp && index(l, ' udp ') >= 0;
+			m[0]++;
+			if (off)
+				m[1]++;
+			if (tcp)
+				m[2]++;
+			else if (udp)
+				m[3]++;
+			if (off || (tcp && index(l, ' ESTABLISHED ') >= 0) || (udp && index(l, '[ASSURED]') >= 0))
+				m[4]++;
+			break;
+		}
+	}
+	return out;
+}
+
+// the Ethernet driver's counters of things gone wrong (drops, errors,
+// overflows), from `ethtool -S`; the report keeps those that moved
+const ETH = `echo '@ ${WAN}'; ethtool -S ${WAN}; echo '@ eth0'; ethtool -S eth0`;
+function eth_counters(sec) {
+	const out = {};
+	for (let dev, text in sec) {
+		const c = {};
+		for (let l in split(text, '\n')) {
+			const m = match(l, /^ *([^:]+): *([0-9]+)$/);
+			if (m && match(m[1], /drop|err|fifo|over|miss|discard|fail|abort|timeout|full/i))
+				c[trim(m[1])] = int(m[2]);
+		}
+		if (length(c))
+			out[dev] = c;
+	}
+	return out;
+}
+
+const bus = connect();
+
+// ---- The loop ----
+
+const CT_EVERY_MS = 10000;
+const CT_SHARE = 0.01;
+let ct_next = 0;
+
+let prev = null, samples = 0, macs = {}, last_live = null;
+const out = open(`${RUN}/router.jsonl`, 'a');
+const self_start = proc_ticks('self', true);
+
+function delta(a, b) {
+	return (a != null && b != null && b >= a) ? b - a : null;
+}
+
+function sample(t, n) {
+	find_watched(t);
+	const cur = {
+		t, cpu: cpu_times(), sirq: net_softirqs(), sn: softnet(), if: if_counts(),
+		th: {}, self: proc_ticks('self', true)
+	};
+	for (let p, name in watched)
+		cur.th[p] = [ name, proc_ticks(p, false) ];
+	const prober = +trim(readfile(`${RUN}/prober.pid`) ?? '');
+	cur.prober = prober > 0 ? proc_ticks(prober, false) : null;
+	const dns = +trim(readfile(`${RUN}/dns.pid`) ?? '');
+	cur.dns = dns > 0 ? proc_ticks(dns, false) : null;
+	const tc = sections(bounded(TC, 2000));
+	const line = { t: r3(t), cake: cake_now(tc), ct: int(trim(readfile('/proc/sys/net/netfilter/nf_conntrack_count') ?? '0')) };
+	// the first sample names the WAN port (its download queue is IFB)
+	if (n == 0)
+		line.wan = WAN;
+	if (prev && t > prev.t) {
+		const dt = (t - prev.t) / 1000.0;
+		line.dt = r3(dt);
+		line.cpu = [];
+		for (let i = 0; i < length(cur.cpu); i++) {
+			const p = prev.cpu[i], q = cur.cpu[i];
+			const all = (p && q) ? q.all - p.all : 0;
+			line.cpu[i] = all > 0 ? [ r3(1.0 * (all - (q.idle - p.idle)) / all), r3(1.0 * (q.si - p.si) / all), r3(1.0 * (q.irq - p.irq) / all) ] : null;
+		}
+		line.sirq = [];
+		for (let i = 0; i < length(cur.sirq.rx); i++)
+			line.sirq[i] = [ delta(prev.sirq.rx[i], cur.sirq.rx[i]), delta(prev.sirq.tx[i], cur.sirq.tx[i]) ];
+		line.sn = [];
+		for (let i = 0; i < length(cur.sn); i++)
+			line.sn[i] = map(cur.sn[i], (v, k) => delta(prev.sn[i]?.[k], v));
+		line.if = {};
+		for (let name, c in cur.if) {
+			const p = prev.if[name];
+			if (!p)
+				continue;
+			const d = map(c, (v, k) => delta(p[k], v));
+			// an idle interface is left out
+			if (d[0] || d[1] || d[4] || d[5] || d[6] || d[7])
+				line.if[name] = d;
+		}
+		line.th = {};
+		for (let p, x in cur.th) {
+			const was = prev.th[p];
+			const d = (was && was[0] == x[0]) ? delta(was[1], x[1]) : null;
+			// ticks are 1/100 s: the share of a CPU, summed by name (two dnsmasq processes)
+			if (d != null && d > 0)
+				line.th[x[0]] = (line.th[x[0]] ?? 0) + d / (dt * 100);
+		}
+		for (let name, share in line.th)
+			line.th[name] = r3(share);
+		// the recorder's own CPU, with what it ran (tc, ethtool), the prober's and bench-dns's
+		line.self = [
+			r3((delta(prev.self, cur.self) ?? 0) / (dt * 100)), r3((delta(prev.prober, cur.prober) ?? 0) / (dt * 100)),
+			r3((delta(prev.dns, cur.dns) ?? 0) / (dt * 100))
+		];
+	}
+	if (n % 2 == 0) {
+		if (n % 10 == 0)
+			macs = member_macs();
+		line.wifi = stations(macs);
+	}
+	// the connection scan: every CT_EVERY s, further apart when it costs
+	// more than CT_SHARE of a CPU (a big table)
+	if (t >= ct_next) {
+		const c0 = now_ms();
+		line.ct_scan = conntrack(req.members ?? []);
+		const took = now_ms() - c0;
+		line.ct_scan.ms = r3(took);
+		ct_next = t + max(CT_EVERY_MS, took / CT_SHARE);
+	}
+	if (n % 5 == 0) {
+		line.eth = eth_counters(sections(bounded(ETH, 2000)));
+		// dnsmasq's DNS counters (cache inserts, forwarded, answered locally, stale, unanswered)
+		const dns = bus?.call('dnsmasq', 'metrics', {});
+		if (type(dns) == 'object') {
+			line.dns = {};
+			for (let k, v in dns)
+				if (match(k, /^dns_/) && !match(k, /^dnssec/))
+					line.dns[substr(k, 4)] = v;
+		}
+	}
+	line.cost_ms = r3(now_ms() - t);
+	prev = cur;
+	return line;
+}
+
+// what the bench's pages show while the run is on: the last sample, in short
+function live(line) {
+	const l = { t: line.t, cpu: map(line.cpu ?? [], (c) => c ? [ c[0], c[1] ] : null), self: line.self };
+	const w = line.if?.[WAN];
+	if (w && line.dt)
+		l.wan = [ int(w[0] * 8 / line.dt), int(w[1] * 8 / line.dt) ];
+	for (let k, q in line.cake) {
+		const down = index(k, IFB + ' ') == 0;
+		let av = 0, pk = 0;
+		for (let t in q[4]) {
+			av = max(av, t[6]);
+			pk = max(pk, t[5]);
+		}
+		const slot = down ? 'down' : 'up';
+		l[slot] = [ max(l[slot]?.[0] ?? 0, av), max(l[slot]?.[1] ?? 0, pk) ];
+	}
+	if (line.ct_scan)
+		l.off = [ line.ct_scan.off, line.ct_scan.n ];
+	else if (last_live?.off)
+		l.off = last_live.off;
+	last_live = l;
+	return l;
+}
+
+function finish(reason) {
+	out?.close();
+	save_json(`${RUN}/end.json`, { reason, at: now_ms() });
+	exit(0);
+}
+
+let next = now_ms();
+for (;;) {
+	const t = now_ms();
+	const stop = readfile(`${RUN}/stop`);
+	if (stop != null)
+		finish(length(stop) ? substr(stop, 0, 80) : 'stopped');
+	if (t >= req.end)
+		finish('completed');
+	const heard = +(readfile(HEARTBEAT) ?? '0');
+	if (t >= req.t0 && t - max(heard, started) > HEARD_MS)
+		finish('no member has been heard from for 15 s');
+	if (t >= next && samples < MAX_SAMPLES) {
+		const line = sample(t, samples++);
+		out?.write(sprintf('%J\n', line));
+		out?.flush();
+		save_json(`${RUN}/live.json`, live(line));
+		next += SAMPLE_MS;
+		// fell behind (a slow tc): no catching up in a burst
+		if (next < now_ms())
+			next = now_ms() + SAMPLE_MS;
+	}
+	sleep(min(TICK_MS, max(1, int(next - now_ms()))));
+}

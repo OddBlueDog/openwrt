@@ -1,0 +1,263 @@
+#!/usr/bin/ucode
+// The router's DNS lookups during a test bench run (ui feature
+// "test-bench"), in its DNS and busy-household phases: the same sites the
+// members' browsers load, looked up over UDP, one at a time, every ROUND_MS:
+// - "cold": a made-up name under the site (mfb-<random>.<site>), through
+//   dnsmasq: nothing has it cached, so dnsmasq asks its upstream;
+// - "up": another made-up name, straight to that upstream (dnsproxy for
+//   encrypted DNS, else the first server dnsmasq uses): the difference is
+//   what dnsmasq adds;
+// - "warm" and "again": the site's own host through dnsmasq twice; the
+//   second should come from dnsmasq's cache.
+// Each lookup's time runs from its send to the kernel's receive timestamp
+// (SO_TIMESTAMP). dnsmasq's forwarded-queries counter, read before and
+// after each lookup through dnsmasq, tells a cached answer (no change) from
+// a forwarded one; another device's lookup at that moment can make a cached
+// answer look forwarded. bench-runner starts it; it stops with the run.
+// One line per lookup in dns.jsonl:
+//   {"t": <router ms>, "p": <phase>, "s": "<site>", "k": "cold|up|warm|again",
+//    "ms": <ms | null>, "rc": <rcode | null>, "n": <A answers>, "ttl": <lowest TTL | null>, "fw": <forwarded | null>}
+// (null ms: no answer in TIMEOUT_MS), after a first line saying what the
+// upstream is: {"upstream": "dnsproxy" | "server" | null}. No addresses.
+'use strict';
+
+import { open, readfile, readlink, rename, stat, writefile } from 'fs';
+import * as socket from 'socket';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+
+const DIR = '/tmp/milkflint-bench';
+const REQUEST = DIR + '/request.json';
+// the sites, as the UI's list (features/test-bench/pages.ts): [site, the host a browser loads]
+const SITES = [
+	[ 'google.com', 'www.google.com' ],
+	[ 'youtube.com', 'www.youtube.com' ],
+	[ 'facebook.com', 'www.facebook.com' ],
+	[ 'instagram.com', 'www.instagram.com' ],
+	[ 'reddit.com', 'www.reddit.com' ],
+	[ 'bbc.co.uk', 'www.bbc.co.uk' ],
+	[ 'wikipedia.org', 'www.wikipedia.org' ],
+	[ 'amazon.co.uk', 'www.amazon.co.uk' ],
+	[ 'netflix.com', 'www.netflix.com' ],
+	[ 'apple.com', 'www.apple.com' ]
+];
+const MAX_CUSTOM = 8;
+// a round of lookups at most this often in a phase; one lookup waits this long for its answer
+const ROUND_MS = 10000;
+const TIMEOUT_MS = 3000;
+const DNSMASQ = { address: '127.0.0.1', port: 53 };
+
+function mono_ms() {
+	const c = clock(true);
+	return c[0] * 1000 + c[1] / 1000000.0;
+}
+
+function wall_ms() {
+	const c = clock();
+	return c[0] * 1000 + c[1] / 1000000.0;
+}
+
+const valid_host = (s) => type(s) == 'string' && length(s) <= 253 &&
+	match(s, /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/);
+
+let req = null;
+try {
+	req = json(readfile(REQUEST) ?? 'null');
+}
+catch (e) {
+	// no run
+}
+if (type(req) != 'object' || type(req.id) != 'string' || !match(req.id, /^[0-9a-f]{12}$/))
+	exit(1);
+const RUN = `${DIR}/runs/${req.id}`;
+const pid = +replace(readlink('/proc/self') ?? '', /^.*\//, '');
+writefile(`${RUN}/dns.pid`, `${pid}`);
+
+const sites = [ ...SITES ];
+for (let i, name in req.options?.custom_sites ?? [])
+	if (i < MAX_CUSTOM && valid_host(name))
+		push(sites, [ name, name ]);
+
+// the phases with lookups, as router-time windows
+const windows = [];
+for (let i, p in req.schedule?.phases ?? [])
+	if (p.kind in [ 'dns', 'household' ])
+		push(windows, { p: i, from: req.t0 + p.start, to: req.t0 + p.start + p.dur });
+if (!length(windows))
+	exit(0);
+
+// dnsmasq's upstream: the first server it's set to forward to (not one for a
+// domain of its own), or else the first in the resolv file it reads
+function upstream() {
+	const c = cursor();
+	let s = null;
+	c.foreach('dhcp', 'dnsmasq', (x) => {
+		s ??= x;
+	});
+	const servers = s?.server == null ? [] : type(s.server) == 'array' ? s.server : [ s.server ];
+	for (let v in servers) {
+		const m = match(v, /^([0-9.]+|[0-9a-fA-F:]+)(#([0-9]{1,5}))?$/);
+		if (m)
+			return { address: m[1], port: m[3] ? +m[3] : 53, kind: (m[1] == '127.0.0.1' && m[3] == '5453') ? 'dnsproxy' : 'server' };
+	}
+	if (s?.noresolv == '1')
+		return null;
+	const file = readfile(s?.resolvfile ?? '/tmp/resolv.conf.d/resolv.conf.auto') ?? '';
+	for (let line in split(file, '\n')) {
+		const m = match(line, /^nameserver[ \t]+([0-9.]+|[0-9a-fA-F:]+)[ \t]*$/);
+		if (m)
+			return { address: m[1], port: 53, kind: 'server' };
+	}
+	return null;
+}
+
+const up = upstream();
+const socks = {};
+function sock_for(address) {
+	const fam = index(address, ':') >= 0 ? socket.AF_INET6 : socket.AF_INET;
+	if (!socks[fam]) {
+		socks[fam] = socket.create(fam, socket.SOCK_DGRAM | socket.SOCK_NONBLOCK, 0);
+		socks[fam]?.setopt(socket.SOL_SOCKET, socket.SO_TIMESTAMP, true);
+	}
+	return socks[fam];
+}
+
+const urandom = open('/dev/urandom', 'r');
+function random_hex(n) {
+	const b = urandom?.read(n) ?? '';
+	let s = '';
+	for (let i = 0; i < length(b); i++)
+		s += sprintf('%02x', ord(b, i));
+	return s;
+}
+
+const u16 = (d, i) => (ord(d, i) << 8) | ord(d, i + 1);
+const u32 = (d, i) => (ord(d, i) << 24) | (ord(d, i + 1) << 16) | (ord(d, i + 2) << 8) | ord(d, i + 3);
+
+// an A query with recursion desired
+function packet(id, name) {
+	let q = chr(id >> 8, id & 255, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0);
+	for (let label in split(name, '.'))
+		q += chr(length(label)) + label;
+	return q + chr(0, 0, 1, 0, 1);
+}
+
+function skip_name(d, i) {
+	for (let n = 0; n < 128 && i < length(d); n++) {
+		const l = ord(d, i);
+		if (l == 0)
+			return i + 1;
+		if ((l & 0xc0) == 0xc0)
+			return i + 2;
+		i += l + 1;
+	}
+	return null;
+}
+
+// a reply's rcode, A answers and lowest TTL, or null if it isn't the reply to `id`
+function parse(d, id) {
+	if (length(d) < 12 || u16(d, 0) != id || !(ord(d, 2) & 0x80))
+		return null;
+	const out = { rc: ord(d, 3) & 15, n: 0, ttl: null };
+	let i = 12;
+	for (let q = u16(d, 4); q > 0 && i != null; q--)
+		i = skip_name(d, i) + 4;
+	for (let a = u16(d, 6); a > 0 && i != null && i + 10 <= length(d); a--) {
+		i = skip_name(d, i);
+		if (i == null || i + 10 > length(d))
+			break;
+		const ttl = u32(d, i + 4);
+		if (u16(d, i) == 1)
+			out.n++;
+		if (out.ttl == null || ttl < out.ttl)
+			out.ttl = ttl;
+		i += 10 + u16(d, i + 8);
+	}
+	return out;
+}
+
+// one lookup: its time in ms (null: no answer in TIMEOUT_MS) and what came back
+function lookup(server, name) {
+	const s = sock_for(server.address);
+	const id = +('0x' + random_hex(2));
+	const sent = mono_ms(), wall = wall_ms();
+	if (!s || s.send(packet(id, name), 0, { address: server.address, port: server.port }) == null)
+		return { ms: null, rc: null, n: 0, ttl: null };
+	for (;;) {
+		const left = TIMEOUT_MS - (mono_ms() - sent);
+		if (left <= 0)
+			return { ms: null, rc: null, n: 0, ttl: null };
+		socket.poll(max(1, int(left)), s);
+		for (;;) {
+			const m = s.recvmsg(1500, 64);
+			if (!m || type(m.data) != 'string')
+				break;
+			const r = parse(m.data, id);
+			if (!r)
+				continue;
+			let at = wall_ms();
+			for (let a in m.ancillary ?? [])
+				if (type(a.data) == 'object' && a.data.sec != null)
+					at = a.data.sec * 1000 + a.data.usec / 1000.0;
+			r.ms = int((at - wall) * 1000 + 0.5) / 1000.0;
+			return r;
+		}
+	}
+}
+
+const bus = connect();
+const forwarded = () => bus?.call('dnsmasq', 'metrics', {})?.dns_queries_forwarded;
+
+const out = open(`${RUN}/dns.jsonl`, 'a');
+out?.write(sprintf('%J\n', { upstream: up?.kind }));
+out?.flush();
+
+function record(t, p, site, k, r, fw) {
+	out?.write(sprintf('%J\n', { t: int(t), p, s: site, k, ms: r.ms, rc: r.rc, n: r.n, ttl: r.ttl, fw }));
+	out?.flush();
+}
+
+// through dnsmasq, with its forwarded counter's change
+function via_dnsmasq(t, p, site, k, name) {
+	const before = forwarded();
+	const r = lookup(DNSMASQ, name);
+	const after = forwarded();
+	record(t, p, site, k, r, (type(before) == 'int' && type(after) == 'int') ? after - before : null);
+}
+
+// the run's over: it ended, was stopped, or the runner's gone
+const runner = +trim(readfile(`${RUN}/runner.pid`) ?? '');
+function over(t) {
+	return t >= (req.end ?? 0) || stat(`${RUN}/end.json`) != null || stat(`${RUN}/stop`) != null ||
+		!(runner > 0 && index(readfile(`/proc/${runner}/cmdline`) ?? '', 'bench-runner') >= 0);
+}
+
+function round(w) {
+	for (let x in sites) {
+		const t = mono_ms();
+		if (t >= w.to || over(t))
+			return;
+		const site = x[0], host = x[1];
+		via_dnsmasq(t, w.p, site, 'cold', `mfb-${random_hex(5)}.${site}`);
+		if (up)
+			record(mono_ms(), w.p, site, 'up', lookup(up, `mfb-${random_hex(5)}.${site}`), null);
+		via_dnsmasq(mono_ms(), w.p, site, 'warm', host);
+		via_dnsmasq(mono_ms(), w.p, site, 'again', host);
+	}
+}
+
+for (let w in windows) {
+	// rounds start half a second into the phase, ROUND_MS apart, none in its last two seconds
+	for (let at = w.from + 500; at < w.to - 2000; at += ROUND_MS) {
+		for (;;) {
+			const t = mono_ms();
+			if (over(t))
+				exit(0);
+			if (t >= at)
+				break;
+			socket.poll(int(min(250, at - t)) + 1);
+		}
+		round(w);
+	}
+}
+out?.close();

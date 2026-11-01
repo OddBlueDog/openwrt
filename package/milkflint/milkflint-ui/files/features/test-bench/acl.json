@@ -1,0 +1,17 @@
+{
+	"milkflint-test-bench": {
+		"description": "MilkFlint web interface: test bench",
+		"read": {
+			"ubus": {
+				"milkflint.bench": [ "status", "runs", "run_get" ],
+				"milkflint.bench.member": [ "sync", "poll", "runs", "run_get" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"milkflint.bench": [ "create", "close", "rotate", "coordinate", "run_delete" ],
+				"milkflint.bench.member": [ "rename", "report", "signal", "stop", "leave", "start", "handoff", "kick" ]
+			}
+		}
+	}
+}

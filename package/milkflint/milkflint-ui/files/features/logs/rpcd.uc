@@ -1,7 +1,8 @@
 // rpcd plugin for the "logs" feature: the system log, the kernel log, the
 // Wi-Fi log, the radar log (the "wifi" feature's radar-log), the debug log
 // (counters and snapshots), the DNS log, and the kernel's last crash reports
-// (pstore) with the memory errors KFENCE caught.
+// (pstore) with the memory errors KFENCE caught, while it's on
+// (milkflint.logs.kfence, off by default: the init script turns it on).
 // With milkflint.logs.persist on, the system and kernel logs come from the
 // copy /usr/libexec/milkflint/logs-keeper keeps on the router's storage,
 // which goes back past the last reboot.
@@ -19,6 +20,8 @@ const RADAR = '/root/milkflint-wifi/radar.log';
 const PSTORE = '/sys/fs/pstore';
 // a KFENCE report: from this line to the next row of ='s, which ends it
 const KFENCE = 'BUG: KFENCE: ';
+const KFENCE_STATS = '/sys/kernel/debug/kfence/stats';
+const KFENCE_INTERVAL = '/sys/module/kfence/parameters/sample_interval';
 
 function run(cmd) {
 	const fd = popen(cmd + ' 2>/dev/null', 'r');
@@ -41,8 +44,19 @@ function settings() {
 		radar: s.radar != '0',
 		counters: s.debug_counters == '1',
 		snapshot: s.debug_snapshot == '1',
-		dns: s.dns == '1'
+		dns: s.dns == '1',
+		kfence: s.kfence == '1'
 	};
+}
+
+// whether KFENCE is watching allocations now; null when the kernel has none.
+// Its stats only appear once it has run: a kernel that booted with it off
+// has just the interval until then.
+function kfence_active() {
+	const m = match(readfile(KFENCE_STATS) ?? '', /(^|\n)enabled: ([01])/);
+	if (m)
+		return m[2] == '1';
+	return stat(KFENCE_INTERVAL) ? false : null;
 }
 
 // the last n lines of <path>.old and <path> together
@@ -178,6 +192,8 @@ return {
 					counters: s.counters,
 					snapshot: s.snapshot,
 					dns: s.dns,
+					kfence: s.kfence,
+					kfence_active: kfence_active(),
 					recording,
 					dir: s.persist ? DISK : RAM,
 					system_bytes: s.persist ? bytes(DISK + '/system.log') : null,

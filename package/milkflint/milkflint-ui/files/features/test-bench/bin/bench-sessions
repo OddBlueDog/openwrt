@@ -1,0 +1,15 @@
+#!/usr/bin/ucode
+// Ends the rpcd sessions of test bench members that left or were taken off,
+// or whose bench closed (ui feature "test-bench"). Its rpcd plugin starts it
+// in the background: rpcd can't take a call to its own session object while
+// it answers one.
+//   bench-sessions SID...
+'use strict';
+
+import { connect } from 'ubus';
+
+const bus = connect();
+for (let sid in ARGV)
+	if (match(sid, /^[0-9a-f]{32}$/))
+		bus?.call('session', 'destroy', { ubus_rpc_session: sid });
+bus?.disconnect();

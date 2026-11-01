@@ -14,9 +14,11 @@
 //   used, and with the MilkFlint driver how much of the time it slept (the
 //   firmware's power save reports). For each radio with such a device, how
 //   busy the channel was and with what. Also the Network Quality probe's
-//   rounds since the last line, each radio once a minute (with its TWT
-//   agreements, and its MU/OFDMA and beamforming counters over the minute),
-//   and the firmware's error counters when they change. A device that has a
+//   rounds since the last line, and each radio once a minute (with its TWT
+//   agreements, and its MU/OFDMA and beamforming counters over the
+//   minute). The firmware's errors and resets are the driver's own kernel
+//   lines: their counters (debugfs sys_recovery) are chip registers, which
+//   a read can catch mid-reset, so they aren't polled. A device that has a
 //   hard time (no tx, failures, retries, a legacy rate) is asked how it
 //   hears us, at most once a minute (every 10 minutes when it's fine): an
 //   802.11k link measurement, or a beacon report from its scan table,
@@ -54,6 +56,7 @@
 
 import { open, stat, rename, mkdir, readfile, writefile, popen, glob, unlink } from 'fs';
 import { connect } from 'ubus';
+import * as nl80211 from 'nl80211';
 
 const DISK = '/root/milkflint-logs';
 const RAM = '/tmp/milkflint-logs';
@@ -412,6 +415,33 @@ if (DNS) {
 }
 
 // one line from `logread -f -t`: "<ctime> [<epoch>.<ms>] <facility.level> <tag>: <message>"
+// ---- the Wi-Fi firmware in trouble -------------------------------------------
+
+// The driver's and mac80211's lines when the firmware stops answering or
+// the chip is being reset: a command that timed out (which starts a chip
+// reset), a firmware crash, an error recovery (L1 SER) and its escalation,
+// a failed reset, mac80211 restarting the radios. For QUIET_S after one,
+// nothing here asks the firmware (the devices' numbers, which include a
+// query for each one's receive rate; the channel survey; the MU counters;
+// the 802.11k requests), and the dashboard's temperature reading waits too
+// (QUIET_FILE): a reader waiting on a firmware in trouble holds the
+// driver's lock, with the kernel's network lock waiting behind it, and a
+// query that times out starts another reset.
+const FW_TROUBLE = /mt7915e [^ ]+: (Message [0-9a-f]+ \(seq [0-9]+\) timeout|.*firmware crash|L1 SER|chip full reset|band[0-9]: PLE error)|Hardware restart was requested/;
+const QUIET_S = 120;
+const QUIET_FILE = '/tmp/milkflint/wifi-quiet';
+let quiet_until = 0;
+
+function fw_trouble(what) {
+	const was = time() < quiet_until;
+	quiet_until = time() + QUIET_S;
+	mkdir('/tmp/milkflint');
+	writefile(QUIET_FILE, `${quiet_until}\n`);
+	if (!was)
+		wifi_log?.file.write(`${stamp()} daemon.warn wifi-stats: the Wi-Fi firmware is in trouble (${what}): ` +
+			`no firmware queries from the logs or the dashboard until ${QUIET_S} s after its last such line`);
+}
+
 function on_log_line(line) {
 	const m = match(line, /^(.{24}) \[([0-9]+)\.([0-9]+)\] (.*)$/);
 	if (!m) {
@@ -420,6 +450,10 @@ function on_log_line(line) {
 	}
 	const ms = int(m[2]) * 1000 + int(m[3]);
 	const text = m[1] + ' ' + m[4];
+	// only what happens from now on: the RAM buffer's lines are the past
+	const trouble = ms > START_MS ? match(m[4], FW_TROUBLE) : null;
+	if (trouble)
+		fw_trouble(trouble[1] ?? trouble[0]);
 	let wrote = false;
 	// the DNS log: lookups are timed and kept out of system.log, the DNS
 	// services' lines copied
@@ -534,23 +568,6 @@ function airtime_of(phy, dev, mac) {
 	const s = readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/airtime`) ?? '';
 	const rx = match(s, /RX: ([0-9]+) us/), tx = match(s, /TX: ([0-9]+) us/);
 	return (rx && tx) ? { rx: int(rx[1]), tx: int(tx[1]) } : null;
-}
-
-
-// the firmware's error counters, from the driver (the same for both bands)
-function firmware() {
-	const f = glob(`${DEBUGFS}/phy*/mt76/sys_recovery`)?.[0];
-	const s = f ? readfile(f) : null;
-	if (!s)
-		return null;
-	const parts = [];
-	for (let m in match(s, /(SER_[A-Z0-9_]+) *= *(0x[0-9a-f]+)/g))
-		if (hex(m[2]) != 0)
-			push(parts, `${m[1]} ${m[2]}`);
-	const r = match(s, /SYS_RESET_COUNT: WM ([0-9]+), WA ([0-9]+)/);
-	if (r)
-		push(parts, `resets WM ${r[1]} WA ${r[2]}`);
-	return join(', ', parts);
 }
 
 // device names from the DHCP leases
@@ -671,7 +688,7 @@ function station_text(st) {
 
 let prev = {};		// "<dev> <mac>": the counters at the last sample
 let stations = [];	// the last sample's devices, for a snapshot
-let fw_prev = null;
+let noises = {};	// dev: the channel's noise floor (dBm) at its last survey
 // the last sample's radios ({ dev, phy, bssid, active: a device line was
 // written }), for radio_lines(), and its devices with traffic ({ dev, mac,
 // bssid, why: set when it had a hard time }), for the 802.11k requests
@@ -695,6 +712,37 @@ function trouble_of(d, s) {
 	return null;
 }
 
+// The access points hostapd runs ({ dev, phy, bssid }), from its ubus
+// objects and sysfs: nothing asks the driver.
+function access_points(conn) {
+	const out = [];
+	for (let obj in conn.list() ?? []) {
+		const dev = match(obj, /^hostapd\.(.+)$/)?.[1];
+		const phy = dev ? trim(readfile(`/sys/class/net/${dev}/phy80211/name`) ?? '') : '';
+		if (phy != '')
+			push(out, { dev, phy, bssid: lc(trim(readfile(`/sys/class/net/${dev}/address`) ?? '')) });
+	}
+	return out;
+}
+
+// An interface's devices from the kernel's station table (nl80211), in
+// the shape of iwinfo's assoclist. Not iwinfo's: it runs in rpcd and adds
+// a survey for the noise figure, a firmware query, so with the firmware
+// slow to answer rpcd (and the web interface with it) waited
+// on the Wi-Fi chip at every sample.
+function station_dump(dev) {
+	const res = nl80211.request(nl80211.const.NL80211_CMD_GET_STATION, nl80211.const.NLM_F_DUMP, { dev });
+	const kbits = (r) => (r?.bitrate32 ?? r?.bitrate ?? 0) * 100;
+	return map(type(res) == 'array' ? res : [], (r) => {
+		const i = r.sta_info ?? {};
+		return {
+			mac: r.mac, signal: i.signal, inactive: i.inactive_time,
+			tx: { packets: i.tx_packets, bytes: i.tx_bytes64 ?? i.tx_bytes, retries: i.tx_retries, failed: i.tx_failed, rate: kbits(i.tx_bitrate) },
+			rx: { packets: i.rx_packets, bytes: i.rx_bytes64 ?? i.rx_bytes, rate: kbits(i.rx_bitrate) }
+		};
+	});
+}
+
 // Each radio's devices: their lines in the Wi-Fi log (with wifi=1), and
 // the devices that got NO TX.
 function sample(conn, minute) {
@@ -703,20 +751,19 @@ function sample(conn, minute) {
 	stations = [];
 	radios = [];
 	to_ask = [];
-	for (let dev in conn.call('iwinfo', 'devices', {})?.devices ?? []) {
-		const info = conn.call('iwinfo', 'info', { device: dev });
-		if (info?.mode != 'Master')
-			continue;
-		const phy = info.phy;
-		const radio = { dev, phy, bssid: lc(info.bssid ?? ''), active: false };
+	for (let ap in access_points(conn)) {
+		const dev = ap.dev, phy = ap.phy;
+		const radio = { dev, phy, bssid: ap.bssid, active: false };
 		push(radios, radio);
-		const list = conn.call('iwinfo', 'assoclist', { device: dev })?.results ?? [];
+		const list = station_dump(dev);
 		if (minute && wifi_log) {
-			const f = info.frequency ?? 0;
+			// hostapd's own state: its channel, without asking the driver
+			const status = conn.call(`hostapd.${dev}`, 'get_status') ?? {};
+			const f = status.freq ?? 0;
 			const band = (f > 5925) ? '6 GHz' : (f > 4900) ? '5 GHz' : '2.4 GHz';
 			const q = phy_queued(phy);
-			wifi_line('info', sprintf('%s: %s ch %s, %d device%s%s%s', dev, band, info.channel ?? '?', length(list),
-				length(list) == 1 ? '' : 's', info.noise ? `, noise ${info.noise} dBm` : '',
+			wifi_line('info', sprintf('%s: %s ch %s, %d device%s%s%s', dev, band, status.channel ?? '?', length(list),
+				length(list) == 1 ? '' : 's', noises[dev] ? `, noise ${noises[dev]} dBm` : '',
 				q != null ? `, queued ${ms_of_us(q)}` : ''));
 		}
 		for (let s in list) {
@@ -1380,8 +1427,11 @@ function snapshot(conn, reason) {
 	const bql = bql_text();
 	line('info', `bql ${WAN}: ${bql != '' ? bql : 'nothing in flight'}; tx timeouts ${tx_timeouts()}`);
 
-	// Wi-Fi: the driver's queues (these files only read memory and
-	// registers: no firmware commands, which would hang with the firmware)
+	// Wi-Fi: the driver's queues, from the driver's memory. Not hw-queues or
+	// sys_recovery: they read (and hw-queues writes) chip registers, with no
+	// lock against a chip reset, and a snapshot is taken when things go
+	// wrong, the likeliest time for one. No firmware commands either, which
+	// would hang with the firmware.
 	for (let dir in glob(`${DEBUGFS}/phy*`) ?? []) {
 		const phy = substr(dir, length(DEBUGFS) + 1);
 		const xq = readfile(dir + '/mt76/xmit-queues');
@@ -1391,9 +1441,6 @@ function snapshot(conn, reason) {
 				push(parts, `${m[1]} ${m[2]} (${m[3]}/${m[4]})`);
 			line('info', `${phy} xmit-queues, queued (head/tail): ${join(', ', parts)}`);
 		}
-		const hq = readfile(dir + '/mt76/hw-queues');
-		if (hq)
-			line('info', `${phy} hw-queues: ${join(' | ', filter(map(split(hq, '\n'), (l) => trim(l)), (l) => l != ''))}`);
 		const aql = readfile(dir + '/aql_pending');
 		if (aql) {
 			const parts = [];
@@ -1402,9 +1449,6 @@ function snapshot(conn, reason) {
 			line('info', `${phy} aql_pending (us): ${join(', ', parts)}`);
 		}
 	}
-	const fw = firmware();
-	if (fw != null)
-		line('info', `firmware errors: ${fw == '' ? 'none' : fw}`);
 	if (!length(stations))
 		line('info', 'devices: none');
 	for (let st in stations) {
@@ -1444,10 +1488,11 @@ function survey(dev) {
 			const m = match(block, regexp(what + ':\\s+([0-9]+) ms'));
 			return m ? int(m[1]) : null;
 		};
+		const noise = match(block, /noise:\s+(-?[0-9]+) dBm/);
 		return {
 			active: get('channel active time'), busy: get('channel busy time'),
 			rx: get('channel receive time'), bss_rx: get('channel BSS receive time'),
-			tx: get('channel transmit time')
+			tx: get('channel transmit time'), noise: noise ? int(noise[1]) : null
 		};
 	}
 	return null;
@@ -1699,8 +1744,10 @@ function radio_lines(minute) {
 		if (CHANNEL) {
 			const sv = survey(r.dev);
 			const ct = channel_text(chan_prev[r.dev], sv);
-			if (sv)
+			if (sv) {
 				chan_prev[r.dev] = sv;
+				noises[r.dev] = sv.noise;
+			}
 			if (ct && (r.active || minute))
 				wifi_line('info', `${r.dev}: ${ct}`);
 		}
@@ -1735,31 +1782,26 @@ function tick() {
 	if (net != null)
 		push(trouble, net);
 
-	if (WIFI) {
-		const fw = firmware();
-		if (fw != null && fw != fw_prev) {
-			wifi_line(fw_prev == null ? 'info' : 'warn', `firmware errors: ${fw == '' ? 'none' : fw}`);
-			fw_prev = fw;
-		}
-	}
-
 	// 5 s at most per call: a stuck daemon mustn't hold up the system log
 	const conn = connect(null, 5);
-	if (conn && (WIFI || SNAPSHOT)) {
+	// the firmware in trouble: no Wi-Fi samples (the last one stays for a snapshot)
+	const calm = time() >= quiet_until;
+	if (conn && (WIFI || SNAPSHOT) && calm) {
 		const notx = sample(conn, minute);
 		if (length(notx))
 			push(trouble, `NO TX: ${join(', ', notx)}`);
 	}
-	if (conn && WIFI)
+	if (conn && WIFI && calm)
 		radio_lines(minute);
 	if (conn && RRM) {
 		rrm_subscribe(map(radios, (r) => r.dev));
 		rrm_replies();
-		if (minute)
+		if (minute && calm)
 			for (let r in radios)
 				rrm_caps(conn, r.dev);
-		for (let a in to_ask)
-			rrm_ask(conn, a.dev, a.mac, a.bssid, a.why);
+		if (calm)
+			for (let a in to_ask)
+				rrm_ask(conn, a.dev, a.mac, a.bssid, a.why);
 	}
 	if (COUNTERS)
 		counters(conn, minute);
