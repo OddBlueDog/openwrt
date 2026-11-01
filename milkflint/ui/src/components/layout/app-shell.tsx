@@ -20,7 +20,7 @@ export function AppShell({ route, children }: { route: Route; children: ReactNod
   }, []);
 
   return (
-    <div className="min-h-dvh lg:grid lg:grid-cols-[15.5rem_1fr]">
+    <div className="min-h-dvh lg:grid lg:grid-cols-[15.5rem_minmax(0,1fr)]">
       <aside className="sticky top-0 hidden h-dvh border-r lg:block">
         <Sidebar active={route} board={board} />
       </aside>

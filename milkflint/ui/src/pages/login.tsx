@@ -73,9 +73,14 @@ export function LoginPage({ reason }: { reason: 'expired' | 'logged-out' | undef
           </Button>
         </form>
         <div className="mt-6 flex items-center justify-between gap-4 text-xs text-muted-foreground">
-          <a href="/cgi-bin/luci/" className="hover:text-foreground">
-            Advanced (LuCI)
-          </a>
+          <span className="flex gap-4">
+            <a href="#/test-bench/join" className="hover:text-foreground">
+              Join a test bench
+            </a>
+            <a href="/cgi-bin/luci/" className="hover:text-foreground">
+              Advanced (LuCI)
+            </a>
+          </span>
           <ThemeToggle className="w-28" />
         </div>
       </div>

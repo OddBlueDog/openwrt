@@ -9,6 +9,7 @@ import {
   ServerOffIcon,
   SettingsIcon,
   ShieldCheckIcon,
+  ShieldOffIcon,
   WifiOffIcon,
 } from 'lucide-react';
 import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -72,7 +73,10 @@ function source(kind: LogKind, status: LogStatus | undefined): string {
     const bytes = status.radar_bytes ?? null;
     return `kept across restarts${bytes === null ? '' : `, ${formatBytes(bytes)} saved`}`;
   }
-  if (kind === 'crash') return `crashes kept until the router loses power, memory errors ${status.persist ? 'with the saved logs' : 'since the last restart'}`;
+  if (kind === 'crash') {
+    if (status.kfence_active === false) return 'crashes kept until the router loses power; the memory error checker is off';
+    return `crashes kept until the router loses power, memory errors ${status.persist ? 'with the saved logs' : 'since the last restart'}`;
+  }
   const bytes =
     kind === 'wifi'
       ? status.wifi_bytes
@@ -171,7 +175,17 @@ export function LogsPage(): ReactElement {
                 <AlertTitle>No crash reports</AlertTitle>
                 <AlertDescription>
                   If the kernel crashes, its last lines are kept through the restart that follows and show here, until the router loses power. So do
-                  the memory errors its checker (KFENCE) catches while it keeps running.
+                  the memory errors its checker (KFENCE) catches while it keeps running, when that's on.
+                </AlertDescription>
+              </Alert>
+            )}
+            {kind === 'crash' && status?.kfence_active === false && (
+              <Alert variant="info">
+                <ShieldOffIcon />
+                <AlertTitle>The memory error checker is off</AlertTitle>
+                <AlertDescription>
+                  Turn it on in the settings below while chasing a crash: the kernel then reports memory it misuses here, with the code that did it.
+                  Crashes are kept either way.
                 </AlertDescription>
               </Alert>
             )}
@@ -490,6 +504,21 @@ function SettingsCard({ onApplied }: { onApplied: () => void }): ReactElement | 
               checked={form.dns}
               onCheckedChange={(v) => {
                 set('dns', v);
+              }}
+            />
+          </Field>
+          <Field
+            className={side}
+            id="logs-kfence"
+            label="Memory error checker"
+            hint="For chasing a crash: the kernel's KFENCE watches a sample of its memory allocations, one every tenth of a second, and reports a use-after-free or out-of-bounds access, with the code that made it, on the Crashes tab. It uses 2 MB of memory and a little CPU while it's on, and turning it on or off needs no restart."
+          >
+            <Switch
+              id="logs-kfence"
+              className="mt-2 xl:mt-0"
+              checked={form.kfence}
+              onCheckedChange={(v) => {
+                set('kfence', v);
               }}
             />
           </Field>

@@ -15,6 +15,7 @@ export const featureIds = [
   'remote-access',
   'vpn-client',
   'network-quality',
+  'test-bench',
   'data-statistics',
   'sqm',
   'tuning',

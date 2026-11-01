@@ -1,6 +1,6 @@
 // OpenWrt's configuration (UCI) through rpcd. Changes are staged in this
-// session's own change set, then applied together with rollback armed: the
-// router undoes them unless the browser confirms it can still reach it.
+// session's own change set, then applied together: unchecked, or with
+// rollback armed (the router undoes them unless the browser confirms).
 import { z } from 'zod';
 import { call, exec, UbusError, UbusStatus } from '@/lib/ubus';
 
@@ -49,9 +49,8 @@ export type Change =
 /**
  * Stage changes after dropping everything this session already has staged.
  * rpcd applies all of a session's staged changes, and a rollback stages
- * again what it undid, so a save after one (the firewall's check failing,
- * or the router undoing a change the browser couldn't confirm) would apply
- * the undone change too, without that page's checks.
+ * again what it undid, so a save after one (the firewall's check failing)
+ * would apply the undone change too, without that page's checks.
  */
 export async function stage(changes: readonly Change[]): Promise<void> {
   const staged = await call('uci', 'changes', {}, z.object({ changes: z.record(z.string(), z.unknown()) }))
@@ -101,10 +100,7 @@ export async function applyWithRollback(timeoutSeconds: number): Promise<boolean
   }
 }
 
-/**
- * Apply staged changes with no rollback. Only for changes the browser can't
- * confirm, like moving the router to a new LAN address.
- */
+/** Apply staged changes with no rollback, as LuCI's "Apply unchecked" does. */
 export async function applyUnchecked(): Promise<boolean> {
   try {
     await exec('uci', 'apply', { rollback: false });

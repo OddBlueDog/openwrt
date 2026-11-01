@@ -25,6 +25,15 @@ export function useRoute(): Route {
   return useSyncExternalStore(subscribe, current);
 }
 
+/** What follows the route's id: "join/abc" for #/test-bench/join/abc. */
+function subPath(): string {
+  return window.location.hash.replace(/^#\/?/, '').split('/').slice(1).join('/');
+}
+
+export function useSubPath(): string {
+  return useSyncExternalStore(subscribe, subPath);
+}
+
 export function href(route: Route): string {
   return `#/${route}`;
 }

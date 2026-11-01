@@ -202,8 +202,7 @@ export function LanPage(): ReactElement {
                       <TriangleAlertIcon />
                       <AlertTitle>This moves the router</AlertTitle>
                       <AlertDescription>
-                        Afterwards it answers at http://{form.ipaddr}/, and devices need to reconnect. It can&apos;t be
-                        undone automatically.
+                        Afterwards it answers at http://{form.ipaddr}/, and devices need to reconnect.
                       </AlertDescription>
                     </Alert>
                   </div>

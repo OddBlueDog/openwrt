@@ -122,9 +122,10 @@ async function flush(): Promise<void> {
     if (reply === undefined) {
       p.reject(new UbusError(p.object, p.method, UbusStatus.unknownError));
     } else if (reply.error !== undefined) {
-      // -32002: access denied. For a logged-in session that's an expired
+      // -32002: access denied. For the signed-in session that's an expired
       // session, or a call its permissions (ACL) don't allow: checked below.
-      if (reply.error.code === -32002 && p.session !== NULL_SESSION) denied.push(p);
+      // Another session's (a test bench member's) is its caller's to handle.
+      if (reply.error.code === -32002 && p.session !== NULL_SESSION && p.session === sessionId) denied.push(p);
       else p.reject(new UbusError(p.object, p.method, UbusStatus.permissionDenied));
     } else if (reply.result === undefined) {
       p.reject(new UbusError(p.object, p.method, UbusStatus.unknownError));
@@ -174,20 +175,26 @@ function enqueue(object: string, method: string, params: Record<string, unknown>
   });
 }
 
+/** Which session a call is made with: the signed-in one unless `session` is given (a test bench member's). */
+export interface CallOptions {
+  session?: string;
+}
+
 /** Call `object.method` with `params` and check the result against `schema`. */
 export async function call<S extends z.ZodType>(
   object: string,
   method: string,
   params: Record<string, unknown>,
   schema: S,
+  options: CallOptions = {},
 ): Promise<z.output<S>> {
-  const data = await enqueue(object, method, params, sessionId);
+  const data = await enqueue(object, method, params, options.session ?? sessionId);
   return schema.parse(data);
 }
 
 /** Like `call`, for methods that return nothing useful. */
-export async function exec(object: string, method: string, params: Record<string, unknown> = {}): Promise<void> {
-  await enqueue(object, method, params, sessionId);
+export async function exec(object: string, method: string, params: Record<string, unknown> = {}, options: CallOptions = {}): Promise<void> {
+  await enqueue(object, method, params, options.session ?? sessionId);
 }
 
 /** A call made without a session (only `session.login` is allowed that way). */

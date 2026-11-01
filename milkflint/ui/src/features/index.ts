@@ -20,6 +20,7 @@ import { feature as remoteAccess } from './remote-access/feature';
 import { feature as schedules } from './schedules/feature';
 import { feature as sqm } from './sqm/feature';
 import { feature as systemOverview } from './system-overview/feature';
+import { feature as testBench } from './test-bench/feature';
 import { feature as time } from './time/feature';
 import { feature as tuning } from './tuning/feature';
 import type { RouterMode } from '@/lib/router-mode';
@@ -46,6 +47,7 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   'remote-access': remoteAccess,
   'vpn-client': vpnClient,
   'network-quality': networkQuality,
+  'test-bench': testBench,
   'data-statistics': dataStatistics,
   sqm,
   tuning,

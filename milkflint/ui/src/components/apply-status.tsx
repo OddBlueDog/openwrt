@@ -1,22 +1,10 @@
-import { CheckCircle2Icon, LoaderCircleIcon, TriangleAlertIcon, Undo2Icon } from 'lucide-react';
-import { type ReactElement, useEffect, useState } from 'react';
+import { CheckCircle2Icon, LoaderCircleIcon, TriangleAlertIcon } from 'lucide-react';
+import type { ReactElement } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import type { ApplyState } from '@/hooks/use-apply';
 
 /** What happened to the last save, shown above a page's form. */
 export function ApplyStatus({ state }: { state: ApplyState }): ReactElement | null {
-  const [now, setNow] = useState(() => Date.now());
-
-  useEffect(() => {
-    if (state.phase !== 'applying') return undefined;
-    const t = window.setInterval(() => {
-      setNow(Date.now());
-    }, 500);
-    return () => {
-      window.clearInterval(t);
-    };
-  }, [state.phase]);
-
   switch (state.phase) {
     case 'idle':
       return null;
@@ -25,11 +13,6 @@ export function ApplyStatus({ state }: { state: ApplyState }): ReactElement | nu
         <Alert variant="info">
           <LoaderCircleIcon className="animate-spin" />
           <AlertTitle>Applying…</AlertTitle>
-          <AlertDescription>
-            {state.note !== undefined && <>{state.note} </>}
-            The router is restarting what changed. If it can&apos;t be reached in{' '}
-            {Math.max(0, Math.ceil((state.deadline - now) / 1000))} s, it undoes the change by itself.
-          </AlertDescription>
         </Alert>
       );
     case 'done':
@@ -37,6 +20,7 @@ export function ApplyStatus({ state }: { state: ApplyState }): ReactElement | nu
         <Alert variant="success">
           <CheckCircle2Icon />
           <AlertTitle>{state.nothingChanged ? 'Nothing to change' : 'Saved and applied'}</AlertTitle>
+          {state.note !== undefined && <AlertDescription>{state.note}</AlertDescription>}
         </Alert>
       );
     case 'moved':
@@ -50,16 +34,6 @@ export function ApplyStatus({ state }: { state: ApplyState }): ReactElement | nu
               {state.url}
             </a>
             .
-          </AlertDescription>
-        </Alert>
-      );
-    case 'rolled-back':
-      return (
-        <Alert variant="warning">
-          <Undo2Icon />
-          <AlertTitle>The change was undone</AlertTitle>
-          <AlertDescription>
-            The router couldn&apos;t be reached after applying it, so it went back to the previous settings.
           </AlertDescription>
         </Alert>
       );

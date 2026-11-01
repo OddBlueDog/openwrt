@@ -37,6 +37,10 @@ const statusSchema = z.object({
   snapshot: z.boolean().optional(),
   /** the DNS log (absent from older routers) */
   dns: z.boolean().optional(),
+  /** the memory error checker (KFENCE) is turned on (absent from older routers) */
+  kfence: z.boolean().optional(),
+  /** KFENCE is watching allocations now; null when the kernel has none (absent from older routers) */
+  kfence_active: z.boolean().nullish(),
   /** the log keeper is running */
   recording: z.boolean(),
   /** where the logs are written */
@@ -49,7 +53,7 @@ const statusSchema = z.object({
   dns_bytes: z.number().nullish(),
   /** the kernel's crash reports kept since the last restart (pstore) */
   crash_reports: z.number().optional(),
-  /** memory errors KFENCE reported in the kernel log, which ran on (absent from older routers) */
+  /** memory errors KFENCE reported in the kernel log, which ran on, while it was on (absent from older routers) */
   memory_reports: z.number().optional(),
 });
 export type LogStatus = z.output<typeof statusSchema>;
@@ -82,6 +86,8 @@ export interface LogSettings {
   snapshot: boolean;
   /** the DNS log: slow and unanswered lookups, a summary every minute (dns) */
   dns: boolean;
+  /** the kernel's memory error checker, KFENCE, whose reports the Crashes tab shows (kfence) */
+  kfence: boolean;
   /** dnsmasq's section, whose logqueries goes with `dns`; not edited */
   dnsmasq: string | undefined;
 }
@@ -102,6 +108,7 @@ export async function getLogSettings(): Promise<LogSettings> {
     counters: bool(s, 'debug_counters', false),
     snapshot: bool(s, 'debug_snapshot', false),
     dns: bool(s, 'dns', false),
+    kfence: bool(s, 'kfence', false),
     dnsmasq: dhcp.find((x) => x['.type'] === 'dnsmasq')?.['.name'],
   };
 }
@@ -134,6 +141,7 @@ export function logSettingsChanges(f: LogSettings, before: LogSettings): Change[
         debug_counters: f.counters ? '1' : '0',
         debug_snapshot: f.snapshot ? '1' : '0',
         dns: f.dns ? '1' : '0',
+        kfence: f.kfence ? '1' : '0',
       },
     },
     ...dnsmasq,

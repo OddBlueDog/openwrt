@@ -13,7 +13,7 @@ import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
-import { ROLLBACK_SECONDS, useApply } from '@/hooks/use-apply';
+import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
 import { bool, type Change, getConfig, str } from '@/lib/api/uci';
@@ -970,7 +970,7 @@ export function WifiPage(): ReactElement {
       for (const radio of data.radios) changes.push({ op: 'set', config: 'wireless', section: radio, values: { country } });
     }
     // A radio that restarts on radar channels stays off for its radar check:
-    // a browser on it can't confirm until it's back, so wait that much longer.
+    // say so, as devices on it are gone for that long.
     const radarS = Math.max(
       0,
       ...forms.map((f, i) => (countryDirty || JSON.stringify(f) !== JSON.stringify(data.forms[i]) ? radarCheckSeconds(f, data.options[f.radio]) : 0)),
@@ -980,7 +980,6 @@ export function WifiPage(): ReactElement {
       radarS === 0
         ? undefined
         : {
-            timeoutSeconds: ROLLBACK_SECONDS + radarS,
             note: `The 5 GHz network goes off for ${radarS <= 60 ? 'about a minute' : `about ${String(Math.ceil(radarS / 60))} minutes`} while the router listens for radar on its channels; devices on it reconnect after that.`,
           },
     );
