@@ -740,22 +740,10 @@ uc_hostapd_iface_switch_channel(uc_vm_t *vm, size_t nargs)
 	intval = ucv_int64_get(ucv_object_get(info, "oper_chwidth", NULL));
 	if (errno)
 		intval = hostapd_get_oper_chwidth(conf);
-	switch (intval) {
-	case CONF_OPER_CHWIDTH_80MHZ:
-	case CONF_OPER_CHWIDTH_80P80MHZ:
-		/* 80+80 uses an 80 MHz primary segment plus center_freq2 */
-		csa.freq_params.bandwidth = 80;
-		break;
-	case CONF_OPER_CHWIDTH_160MHZ:
-		csa.freq_params.bandwidth = 160;
-		break;
-	case CONF_OPER_CHWIDTH_320MHZ:
-		csa.freq_params.bandwidth = 320;
-		break;
-	default:
+	if (intval)
+		csa.freq_params.bandwidth = 40 << intval;
+	else
 		csa.freq_params.bandwidth = csa.freq_params.sec_channel_offset ? 40 : 20;
-		break;
-	}
 
 	if ((intval = ucv_int64_get(ucv_object_get(info, "frequency", NULL))) && !errno)
 		csa.freq_params.freq = intval;
@@ -764,43 +752,10 @@ uc_hostapd_iface_switch_channel(uc_vm_t *vm, size_t nargs)
 	if ((intval = ucv_int64_get(ucv_object_get(info, "center_freq2", NULL))) && !errno)
 		csa.freq_params.center_freq2 = intval;
 
-	/* mac80211 completes the switch only if every BSS of the radio
-	 * takes part */
-	for (i = 0; i < iface->num_bss && !ret; i++)
+	for (i = 0; i < iface->num_bss; i++)
 		ret = hostapd_switch_channel(iface->bss[i], &csa);
 
 	return ucv_boolean_new(!ret);
-}
-
-static uc_value_t *
-uc_hostapd_iface_csa_in_progress(uc_vm_t *vm, size_t nargs)
-{
-	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
-
-	if (!iface)
-		return NULL;
-
-	return ucv_boolean_new(hostapd_csa_in_progress(iface));
-}
-
-/* The channel the interface runs, which a channel switch hostapd made by
- * itself (a radar) moves away from the one its configuration names. */
-static uc_value_t *
-uc_hostapd_iface_freq_running(uc_vm_t *vm, size_t nargs)
-{
-	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
-	uc_value_t *ret;
-
-	if (!iface || !iface->freq)
-		return NULL;
-
-	ret = ucv_object_new(vm);
-	ucv_object_add(ret, "frequency", ucv_int64_new(iface->freq));
-	ucv_object_add(ret, "sec_channel", ucv_int64_new(iface->conf->secondary_channel));
-	ucv_object_add(ret, "center_seg0_idx",
-		       ucv_int64_new(hostapd_get_oper_centr_freq_seg0_idx(iface->conf)));
-
-	return ret;
 }
 
 static uc_value_t *
@@ -1023,8 +978,6 @@ int hostapd_ucode_init(struct hapd_interfaces *ifaces)
 		{ "stop", uc_hostapd_iface_stop },
 		{ "start", uc_hostapd_iface_start },
 		{ "switch_channel", uc_hostapd_iface_switch_channel },
-		{ "csa_in_progress", uc_hostapd_iface_csa_in_progress },
-		{ "freq_running", uc_hostapd_iface_freq_running },
 	};
 	uc_value_t *data, *proto;
 
