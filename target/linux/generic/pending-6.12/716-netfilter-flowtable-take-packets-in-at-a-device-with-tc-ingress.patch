@@ -1,0 +1,543 @@
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 2 Nov 2026 12:00:00 +0000
+Subject: [PATCH] netfilter: flowtable: take packets in at a device with tc
+ ingress
+
+The software fast path takes a flow's packets in at the bottom of its
+route's device path when the flowtable has that device: a PPPoE download
+at the Ethernet port, PPPoE header and all, rather than at pppoe-wan.
+Everything pppoe-wan's receive path would do is skipped, tc ingress
+included, and that is where sqm-scripts shapes downloads (a redirect to
+its ifb). With software flow offloading on and SQM on pppoe-wan, a
+download went unshaped as soon as it was offloaded, while uploads, still
+sent out of pppoe-wan, were shaped.
+
+nft_dev_path_info() now stops at a device with tc ingress (an ingress or
+clsact qdisc, or a tcx program): the fast path takes the packets in there,
+after tc (ifb runs the device's netfilter ingress hook on what it hands
+back), if the flowtable has that device too, and otherwise leaves them to
+the slow path. Not for hardware offloading, which forwards past tc
+whatever the device.
+
+A flow offloaded before its device got tc ingress keeps its old path: if
+the fast path takes a direction's packets in below the device the slow
+path would (the one the other direction goes out of), and that device has
+tc ingress now, the flow is torn down, as for a stale route, and offloaded
+again from that device. It costs a comparison per packet, and for such
+flows a read of the device's tc ingress.
+
+A KUnit suite for nft_flow_offload (CONFIG_NFT_FLOW_OFFLOAD_KUNIT_TEST)
+checks the paths: PPPoE unshaped and shaped, PPPoE on a VLAN, a shaped
+Ethernet port and bridge, and hardware offloading; the nf_flow_table suite
+gets cases for flows from before.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -100,6 +100,20 @@
+ static inline bool nf_flowtable_hw_offload(struct nf_flowtable *flowtable)
+ {
+ 	return flowtable->flags & NF_FLOWTABLE_HW_OFFLOAD;
++}
++
++/* Whether tc runs on what @dev receives: an ingress or clsact qdisc, or a
++ * tcx program. sqm-scripts' ingress shaping is one, redirecting downloads to
++ * its ifb. The software fast path mustn't take packets in below such a
++ * device, or they skip it.
++ */
++static inline bool nf_flow_dev_has_tc_ingress(const struct net_device *dev)
++{
++#ifdef CONFIG_NET_XGRESS
++	return rcu_access_pointer(dev->tcx_ingress) != NULL;
++#else
++	return false;
++#endif
+ }
+ 
+ enum flow_offload_tuple_dir {
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -522,6 +522,15 @@
+ 	  This option adds the "flow_offload" expression that you can use to
+ 	  choose what flows are placed into the hardware.
+ 
++config NFT_FLOW_OFFLOAD_KUNIT_TEST
++	bool "KUnit tests for the flow_offload expression's paths" if !KUNIT_ALL_TESTS
++	depends on NFT_FLOW_OFFLOAD && KUNIT
++	default KUNIT_ALL_TESTS
++	help
++	  KUnit tests for where the flow_offload expression has the software
++	  fast path take a flow's packets in, built into the nft_flow_offload
++	  module and run when it loads.
++
+ config NFT_CONNLIMIT
+ 	tristate "Netfilter nf_tables connlimit module"
+ 	depends on NF_CONNTRACK
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -266,6 +266,28 @@
+ 		return true;
+ 
+ 	return dst_check(tuple->dst_cache, tuple->dst_cookie);
++}
++
++/* Whether the fast path takes this direction's packets in below the device
++ * the slow path would (the one the other direction goes out of), and that
++ * device has tc ingress now: a PPPoE download taken in at the Ethernet port,
++ * offloaded before SQM started shaping pppoe-wan, would never meet the
++ * shaping. nft_flow_offload offloads no new flow that way; one from before
++ * goes back to the slow path, to be offloaded again from that device.
++ */
++static bool nf_flow_skips_tc_ingress(const struct flow_offload *flow,
++				     enum flow_offload_tuple_dir dir)
++{
++	const struct flow_offload_tuple *other = &flow->tuplehash[!dir].tuple;
++	const struct net_device *dev;
++
++	if (other->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH &&
++	    other->xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
++		return false;
++
++	dev = other->dst_cache->dev;
++	return dev->ifindex != flow->tuplehash[dir].tuple.iifidx &&
++	       nf_flow_dev_has_tc_ingress(dev);
+ }
+ 
+ static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
+@@ -439,7 +461,8 @@
+ 	if (nf_flow_state_check(flow, iph->protocol, skb, thoff))
+ 		return 0;
+ 
+-	if (!nf_flow_dst_check(&tuplehash->tuple)) {
++	if (!nf_flow_dst_check(&tuplehash->tuple) ||
++	    unlikely(nf_flow_skips_tc_ingress(flow, dir))) {
+ 		flow_offload_teardown(flow);
+ 		return 0;
+ 	}
+@@ -721,7 +744,8 @@
+ 	if (nf_flow_state_check(flow, ip6h->nexthdr, skb, thoff))
+ 		return 0;
+ 
+-	if (!nf_flow_dst_check(&tuplehash->tuple)) {
++	if (!nf_flow_dst_check(&tuplehash->tuple) ||
++	    unlikely(nf_flow_skips_tc_ingress(flow, dir))) {
+ 		flow_offload_teardown(flow);
+ 		return 0;
+ 	}
+--- a/net/netfilter/nf_flow_table_ip_test.c
++++ b/net/netfilter/nf_flow_table_ip_test.c
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* KUnit tests for the flow table's software fast path: a packet it forwards
+  * leaves with its conntrack entry attached, as one from the slow path does,
+- * where something after the flowtable reads it.
++ * where something after the flowtable reads it; and a flow whose packets
++ * would skip a device's tc ingress goes back to the slow path.
+  * Built into nf_flow_table.ko (#included at the end of nf_flow_table_ip.c)
+  * when CONFIG_NF_FLOW_TABLE_KUNIT_TEST is set; the suite runs when it loads.
+  */
+@@ -278,8 +279,121 @@
+ 	KUNIT_EXPECT_EQ(test, t.src.u.tcp.port, htons(80));
+ 	KUNIT_EXPECT_EQ(test, t.dst.u3.ip, NF_FLOW_TEST_CLIENT);
+ 	KUNIT_EXPECT_EQ(test, t.dst.u.tcp.port, htons(50000));
++}
++
++/* A device, never registered: only its index and tc ingress are read */
++static struct net_device *nf_flow_test_dev(struct kunit *test, int ifindex)
++{
++	struct net_device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	dev->ifindex = ifindex;
++	return dev;
++}
++
++/* tc ingress on the device, as an ingress qdisc gives it: only whether it
++ * has one is read, and no packet goes through it
++ */
++static void nf_flow_test_tc_ingress(struct kunit *test, struct net_device *dev)
++{
++#ifdef CONFIG_NET_XGRESS
++	void *entry = kunit_kzalloc(test, 64, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, entry);
++	RCU_INIT_POINTER(dev->tcx_ingress, (struct bpf_mprog_entry *)entry);
++#else
++	kunit_skip(test, "no tc ingress in this kernel");
++#endif
++}
++
++/* The direction's route: out of @dev, as the slow path sends it */
++static void nf_flow_test_route(struct kunit *test, struct flow_offload *flow,
++			       enum flow_offload_tuple_dir dir, struct net_device *dev)
++{
++	struct dst_entry *dst = kunit_kzalloc(test, sizeof(*dst), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, dst);
++	dst->dev = dev;
++	flow->tuplehash[dir].tuple.xmit_type = FLOW_OFFLOAD_XMIT_NEIGH;
++	flow->tuplehash[dir].tuple.dst_cache = dst;
++}
++
++/* A masqueraded connection over a PPPoE WAN: the upload taken in at br-lan
++ * and sent out of pppoe-wan; the download sent out of br-lan, taken in at
++ * @in: the Ethernet port under pppoe-wan (with its PPPoE header) or
++ * pppoe-wan itself
++ */
++static struct flow_offload *nf_flow_test_pppoe(struct kunit *test, struct net_device *lan,
++					       struct net_device *ppp, struct net_device *in)
++{
++	struct flow_offload *flow = nf_flow_test_flow(test);
++
++	flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.iifidx = lan->ifindex;
++	nf_flow_test_route(test, flow, FLOW_OFFLOAD_DIR_ORIGINAL, ppp);
++	flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].tuple.iifidx = in->ifindex;
++	nf_flow_test_route(test, flow, FLOW_OFFLOAD_DIR_REPLY, lan);
++	return flow;
++}
++
++/* Offloaded at the port while pppoe-wan was unshaped: both directions keep
++ * the fast path
++ */
++static void nf_flow_test_ingress_none(struct kunit *test)
++{
++	struct net_device *lan = nf_flow_test_dev(test, 1);
++	struct net_device *ppp = nf_flow_test_dev(test, 10);
++	struct net_device *port = nf_flow_test_dev(test, 11);
++	struct flow_offload *flow = nf_flow_test_pppoe(test, lan, ppp, port);
++
++	KUNIT_EXPECT_FALSE(test, nf_flow_skips_tc_ingress(flow, FLOW_OFFLOAD_DIR_ORIGINAL));
++	KUNIT_EXPECT_FALSE(test, nf_flow_skips_tc_ingress(flow, FLOW_OFFLOAD_DIR_REPLY));
+ }
+ 
++/* SQM started shaping pppoe-wan since: the download, taken in at the port,
++ * would skip it, so the flow goes back to the slow path; the upload alone
++ * wouldn't
++ */
++static void nf_flow_test_ingress_shaped(struct kunit *test)
++{
++	struct net_device *lan = nf_flow_test_dev(test, 1);
++	struct net_device *ppp = nf_flow_test_dev(test, 10);
++	struct net_device *port = nf_flow_test_dev(test, 11);
++	struct flow_offload *flow = nf_flow_test_pppoe(test, lan, ppp, port);
++
++	nf_flow_test_tc_ingress(test, ppp);
++	KUNIT_EXPECT_FALSE(test, nf_flow_skips_tc_ingress(flow, FLOW_OFFLOAD_DIR_ORIGINAL));
++	KUNIT_EXPECT_TRUE(test, nf_flow_skips_tc_ingress(flow, FLOW_OFFLOAD_DIR_REPLY));
++}
++
++/* Offloaded at pppoe-wan itself, as nft_flow_offload does while it's
++ * shaped: the download meets tc first (ifb hands it to the flowtable)
++ */
++static void nf_flow_test_ingress_at_device(struct kunit *test)
++{
++	struct net_device *lan = nf_flow_test_dev(test, 1);
++	struct net_device *ppp = nf_flow_test_dev(test, 10);
++	struct flow_offload *flow = nf_flow_test_pppoe(test, lan, ppp, ppp);
++
++	nf_flow_test_tc_ingress(test, ppp);
++	KUNIT_EXPECT_FALSE(test, nf_flow_skips_tc_ingress(flow, FLOW_OFFLOAD_DIR_REPLY));
++}
++
++/* An upload sent straight to its port (hardware offloading's way, with no
++ * route kept): nothing to go by, the flow stays
++ */
++static void nf_flow_test_ingress_direct(struct kunit *test)
++{
++	struct net_device *lan = nf_flow_test_dev(test, 1);
++	struct net_device *ppp = nf_flow_test_dev(test, 10);
++	struct net_device *port = nf_flow_test_dev(test, 11);
++	struct flow_offload *flow = nf_flow_test_pppoe(test, lan, ppp, port);
++
++	nf_flow_test_tc_ingress(test, ppp);
++	flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
++	flow->tuplehash[FLOW_OFFLOAD_DIR_ORIGINAL].tuple.out.ifidx = port->ifindex;
++	KUNIT_EXPECT_FALSE(test, nf_flow_skips_tc_ingress(flow, FLOW_OFFLOAD_DIR_REPLY));
++}
++
+ static struct kunit_case nf_flow_test_cases[] = {
+ 	KUNIT_CASE(nf_flow_test_set_ct),
+ 	KUNIT_CASE(nf_flow_test_set_ct_plain),
+@@ -289,6 +403,10 @@
+ 	KUNIT_CASE(nf_flow_test_put_with_skb),
+ 	KUNIT_CASE(nf_flow_test_keeps_ct),
+ 	KUNIT_CASE(nf_flow_test_tuple_skb),
++	KUNIT_CASE(nf_flow_test_ingress_none),
++	KUNIT_CASE(nf_flow_test_ingress_shaped),
++	KUNIT_CASE(nf_flow_test_ingress_at_device),
++	KUNIT_CASE(nf_flow_test_ingress_direct),
+ 	{}
+ };
+ 
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -103,6 +103,16 @@
+ 
+ 	for (i = 0; i < stack->num_paths; i++) {
+ 		path = &stack->path[i];
++		/* A device with tc ingress (pppoe-wan shaped by SQM) takes
++		 * the packets in itself: from further down, the fast path
++		 * would forward them before its tc saw them. Not in hardware,
++		 * which forwards past tc whatever the device.
++		 */
++		if (i + 1 < stack->num_paths && !nf_flowtable_hw_offload(flowtable) &&
++		    nf_flow_dev_has_tc_ingress(path->dev)) {
++			info->indev = path->dev;
++			break;
++		}
+ 		switch (path->type) {
+ 		case DEV_PATH_ETHERNET:
+ 		case DEV_PATH_DSA:
+@@ -531,3 +541,7 @@
+ MODULE_AUTHOR("Pablo Neira Ayuso <pablo@netfilter.org>");
+ MODULE_ALIAS_NFT_EXPR("flow_offload");
+ MODULE_DESCRIPTION("nftables hardware flow offload module");
++
++#if IS_ENABLED(CONFIG_NFT_FLOW_OFFLOAD_KUNIT_TEST)
++#include "nft_flow_offload_test.c"
++#endif
+--- /dev/null
++++ b/net/netfilter/nft_flow_offload_test.c
+@@ -0,0 +1,241 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* KUnit tests for where the software fast path takes a flow's packets in:
++ * nft_dev_path_info() follows a route's device down its path (PPPoE, VLAN,
++ * bridge) to the device the packets arrive on, and stops at one with tc
++ * ingress, so that they meet it first (sqm-scripts shaping pppoe-wan).
++ * Built into nft_flow_offload.ko (#included at the end of
++ * nft_flow_offload.c) when CONFIG_NFT_FLOW_OFFLOAD_KUNIT_TEST is set; the
++ * suite runs when it loads.
++ */
++#include <kunit/test.h>
++
++#define NFT_FLOW_TEST_SESSION	0x1234
++#define NFT_FLOW_TEST_VLAN	7
++
++static const u8 nft_flow_test_peer[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0xfe };
++static const u8 nft_flow_test_ha[ETH_ALEN] = { 0x02, 0, 0, 0, 0, 0xfd };
++
++/* An Ethernet device as a path has it, never registered: only what
++ * nft_dev_path_info() reads is filled in. Its address ends in its index.
++ */
++static struct net_device *nft_flow_test_dev(struct kunit *test, int ifindex)
++{
++	struct net_device *dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	u8 *addr = kunit_kzalloc(test, ETH_ALEN, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, addr);
++	addr[0] = 0x02;
++	addr[5] = ifindex;
++	dev->ifindex = ifindex;
++	dev->type = ARPHRD_ETHER;
++	dev->addr_len = ETH_ALEN;
++	dev->dev_addr = addr;
++	return dev;
++}
++
++/* tc ingress on the device, as an ingress qdisc gives it: only whether it
++ * has one is read, and no packet goes through it
++ */
++static void nft_flow_test_tc_ingress(struct kunit *test, struct net_device *dev)
++{
++#ifdef CONFIG_NET_XGRESS
++	void *entry = kunit_kzalloc(test, 64, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, entry);
++	RCU_INIT_POINTER(dev->tcx_ingress, (struct bpf_mprog_entry *)entry);
++#else
++	kunit_skip(test, "no tc ingress in this kernel");
++#endif
++}
++
++static struct net_device_path *nft_flow_test_push(struct net_device_path_stack *stack,
++						  enum net_device_path_type type,
++						  const struct net_device *dev)
++{
++	struct net_device_path *path = &stack->path[stack->num_paths++];
++
++	memset(path, 0, sizeof(*path));
++	path->type = type;
++	path->dev = dev;
++	return path;
++}
++
++static void nft_flow_test_push_pppoe(struct net_device_path_stack *stack,
++				     const struct net_device *dev)
++{
++	struct net_device_path *path = nft_flow_test_push(stack, DEV_PATH_PPPOE, dev);
++
++	path->encap.id = NFT_FLOW_TEST_SESSION;
++	path->encap.proto = htons(ETH_P_PPP_SES);
++	memcpy(path->encap.h_dest, nft_flow_test_peer, ETH_ALEN);
++}
++
++static void nft_flow_test_push_vlan(struct net_device_path_stack *stack,
++				    const struct net_device *dev)
++{
++	struct net_device_path *path = nft_flow_test_push(stack, DEV_PATH_VLAN, dev);
++
++	path->encap.id = NFT_FLOW_TEST_VLAN;
++	path->encap.proto = htons(ETH_P_8021Q);
++}
++
++/* the stack's forward info, for a software flowtable or a hardware one */
++static struct nft_forward_info *nft_flow_test_info(struct kunit *test,
++						   const struct net_device_path_stack *stack,
++						   bool hw)
++{
++	struct nft_forward_info *info = kunit_kzalloc(test, sizeof(*info), GFP_KERNEL);
++	struct nf_flowtable *ft = kunit_kzalloc(test, sizeof(*ft), GFP_KERNEL);
++	unsigned char ha[ETH_ALEN];
++
++	KUNIT_ASSERT_NOT_NULL(test, info);
++	KUNIT_ASSERT_NOT_NULL(test, ft);
++	if (hw)
++		ft->flags = NF_FLOWTABLE_HW_OFFLOAD;
++	memcpy(ha, nft_flow_test_ha, ETH_ALEN);
++	nft_dev_path_info(stack, info, ha, ft);
++	return info;
++}
++
++/* pppoe-wan over its Ethernet port, unshaped: downloads are taken in at
++ * the port with the session's PPPoE header, as before
++ */
++static void nft_flow_test_pppoe(struct kunit *test)
++{
++	struct net_device *ppp = nft_flow_test_dev(test, 10);
++	struct net_device *port = nft_flow_test_dev(test, 11);
++	struct net_device_path_stack stack = {};
++	struct nft_forward_info *info;
++
++	nft_flow_test_push_pppoe(&stack, ppp);
++	nft_flow_test_push(&stack, DEV_PATH_ETHERNET, port);
++	info = nft_flow_test_info(test, &stack, false);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, port);
++	KUNIT_ASSERT_EQ(test, info->num_encaps, 1);
++	KUNIT_EXPECT_EQ(test, info->encap[0].id, NFT_FLOW_TEST_SESSION);
++	KUNIT_EXPECT_EQ(test, info->encap[0].proto, htons(ETH_P_PPP_SES));
++	KUNIT_EXPECT_MEMEQ(test, info->h_dest, nft_flow_test_peer, ETH_ALEN);
++	KUNIT_EXPECT_NE(test, info->xmit_type, FLOW_OFFLOAD_XMIT_DIRECT);
++}
++
++/* pppoe-wan shaped (SQM's tc ingress on it): downloads are taken in at
++ * pppoe-wan itself, after its tc, so with no PPPoE header left
++ */
++static void nft_flow_test_pppoe_shaped(struct kunit *test)
++{
++	struct net_device *ppp = nft_flow_test_dev(test, 10);
++	struct net_device *port = nft_flow_test_dev(test, 11);
++	struct net_device_path_stack stack = {};
++	struct nft_forward_info *info;
++
++	nft_flow_test_tc_ingress(test, ppp);
++	nft_flow_test_push_pppoe(&stack, ppp);
++	nft_flow_test_push(&stack, DEV_PATH_ETHERNET, port);
++	info = nft_flow_test_info(test, &stack, false);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, ppp);
++	KUNIT_EXPECT_EQ(test, info->num_encaps, 0);
++	KUNIT_EXPECT_PTR_EQ(test, info->outdev, ppp);
++	KUNIT_EXPECT_NE(test, info->xmit_type, FLOW_OFFLOAD_XMIT_DIRECT);
++}
++
++/* PPPoE on a VLAN: shaping the VLAN device stops the path there, with the
++ * PPPoE header still on and the VLAN tag off; shaping the port at the
++ * bottom changes nothing, as the packets are taken in there anyway
++ */
++static void nft_flow_test_pppoe_vlan(struct kunit *test)
++{
++	struct net_device *ppp = nft_flow_test_dev(test, 10);
++	struct net_device *vlan = nft_flow_test_dev(test, 12);
++	struct net_device *port = nft_flow_test_dev(test, 11);
++	struct net_device_path_stack stack = {};
++	struct nft_forward_info *info;
++
++	nft_flow_test_push_pppoe(&stack, ppp);
++	nft_flow_test_push_vlan(&stack, vlan);
++	nft_flow_test_push(&stack, DEV_PATH_ETHERNET, port);
++
++	nft_flow_test_tc_ingress(test, port);
++	info = nft_flow_test_info(test, &stack, false);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, port);
++	KUNIT_EXPECT_EQ(test, info->num_encaps, 2);
++
++	nft_flow_test_tc_ingress(test, vlan);
++	info = nft_flow_test_info(test, &stack, false);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, vlan);
++	KUNIT_ASSERT_EQ(test, info->num_encaps, 1);
++	KUNIT_EXPECT_EQ(test, info->encap[0].proto, htons(ETH_P_PPP_SES));
++}
++
++/* A plain Ethernet WAN shaped on its port: the port is the route's device
++ * and takes the packets in either way
++ */
++static void nft_flow_test_ethernet_shaped(struct kunit *test)
++{
++	struct net_device *port = nft_flow_test_dev(test, 11);
++	struct net_device_path_stack stack = {};
++	struct nft_forward_info *info;
++
++	nft_flow_test_tc_ingress(test, port);
++	nft_flow_test_push(&stack, DEV_PATH_ETHERNET, port);
++	info = nft_flow_test_info(test, &stack, false);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, port);
++	KUNIT_EXPECT_EQ(test, info->num_encaps, 0);
++	KUNIT_EXPECT_MEMEQ(test, info->h_source, port->dev_addr, ETH_ALEN);
++}
++
++/* A bridge shaped (a guest network's speed limit): its packets are taken in
++ * at the bridge, not sent straight to and from its port
++ */
++static void nft_flow_test_bridge_shaped(struct kunit *test)
++{
++	struct net_device *br = nft_flow_test_dev(test, 20);
++	struct net_device *port = nft_flow_test_dev(test, 21);
++	struct net_device_path_stack stack = {};
++	struct nft_forward_info *info;
++
++	nft_flow_test_push(&stack, DEV_PATH_BRIDGE, br);
++	nft_flow_test_push(&stack, DEV_PATH_ETHERNET, port);
++	info = nft_flow_test_info(test, &stack, false);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, port);
++	KUNIT_EXPECT_EQ(test, info->xmit_type, FLOW_OFFLOAD_XMIT_DIRECT);
++
++	nft_flow_test_tc_ingress(test, br);
++	info = nft_flow_test_info(test, &stack, false);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, br);
++	KUNIT_EXPECT_NE(test, info->xmit_type, FLOW_OFFLOAD_XMIT_DIRECT);
++}
++
++/* Hardware offloading forwards past tc anyway: its path stays as it was */
++static void nft_flow_test_hw(struct kunit *test)
++{
++	struct net_device *ppp = nft_flow_test_dev(test, 10);
++	struct net_device *port = nft_flow_test_dev(test, 11);
++	struct net_device_path_stack stack = {};
++	struct nft_forward_info *info;
++
++	nft_flow_test_tc_ingress(test, ppp);
++	nft_flow_test_push_pppoe(&stack, ppp);
++	nft_flow_test_push(&stack, DEV_PATH_ETHERNET, port);
++	info = nft_flow_test_info(test, &stack, true);
++	KUNIT_EXPECT_PTR_EQ(test, info->indev, port);
++	KUNIT_EXPECT_EQ(test, info->num_encaps, 1);
++	KUNIT_EXPECT_EQ(test, info->xmit_type, FLOW_OFFLOAD_XMIT_DIRECT);
++}
++
++static struct kunit_case nft_flow_test_cases[] = {
++	KUNIT_CASE(nft_flow_test_pppoe),
++	KUNIT_CASE(nft_flow_test_pppoe_shaped),
++	KUNIT_CASE(nft_flow_test_pppoe_vlan),
++	KUNIT_CASE(nft_flow_test_ethernet_shaped),
++	KUNIT_CASE(nft_flow_test_bridge_shaped),
++	KUNIT_CASE(nft_flow_test_hw),
++	{}
++};
++
++static struct kunit_suite nft_flow_test_suite = {
++	.name = "nft_flow_offload",
++	.test_cases = nft_flow_test_cases,
++};
++
++kunit_test_suite(nft_flow_test_suite);
