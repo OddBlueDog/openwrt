@@ -1,0 +1,65 @@
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 2 Nov 2026 12:00:00 +0000
+Subject: [PATCH] firewall4: the PPPoE session's device in the software flow
+ table
+
+The software flow table had each zone's interfaces' devices as netifd
+names them: for a PPPoE interface its Ethernet port, not the session's
+device (pppoe-wan). The kernel's fast path then takes the session's
+downloads in at the port, PPPoE header and all, past pppoe-wan, where SQM
+shapes them. With pppoe-wan in the table as well (while it's up), the
+kernel takes them in there instead whenever pppoe-wan has tc ingress, and
+at the port, as before, when it doesn't. Hardware offloading's devices
+are unchanged.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -563,8 +563,11 @@
+ 		if (!devices) {
+ 			devices = [];
+ 
++			// a PPPoE session's device too (pppoe-wan), up: the kernel's
++			// fast path takes its downloads in there instead of at the
++			// Ethernet port while it has tc ingress (SQM's shaping)
+ 			for (let zone in this.zones())
+-				for (let device in zone.related_physdevs)
++				for (let device in [ ...zone.related_physdevs, ...(zone.related_pppoe_devs ?? []) ])
+ 					if (fs.access(`/sys/class/net/${device}`))
+ 						push(devices, device);
+ 
+@@ -667,6 +670,7 @@
+ 					up: ifc.up,
+ 					device: ifc.l3_device ?? ifc.device,
+ 					physdev: ifc.device,
++					proto: ifc.proto,
+ 					zone: ifc.data?.zone
+ 				};
+ 
+@@ -2094,6 +2098,7 @@
+ 
+ 		let match_devices = [];
+ 		let related_physdevs = [];
++		let related_pppoe_devs = [];
+ 		let related_subnets = [];
+ 		let related_ubus_networks = [];
+ 		let match_subnets, masq_src_subnets, masq_dest_subnets;
+@@ -2119,6 +2124,9 @@
+ 				if (net.physdev && !e.invert)
+ 					push(related_physdevs, net.physdev);
+ 
++				if (net.proto == "pppoe" && net.device && net.device != net.physdev && !e.invert)
++					push(related_pppoe_devs, net.device);
++
+ 				push(related_subnets, ...(net.ipaddrs || []));
+ 			}
+ 		}
+@@ -2252,6 +2260,7 @@
+ 
+ 		zone.related_subnets = related_subnets;
+ 		zone.related_physdevs = related_physdevs;
++		zone.related_pppoe_devs = related_pppoe_devs;
+ 
+ 		if (zone.masq || zone.masq6)
+ 			zone.dflags.snat = true;
