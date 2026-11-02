@@ -1,0 +1,49 @@
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 2 Nov 2026 19:00:00 +0000
+Subject: [PATCH] firewall4: SYN flood protection per source address
+
+The SYN flood limit (synflood_rate, synflood_burst) was one bucket for
+every new TCP connection to the router, from any address and any zone:
+anything on the internet sending SYNs at the router's address used up the
+LAN's allowance as well, and the router's own pages, SSH and DNS over TCP
+then waited a second for each dropped SYN to be sent again, as did a busy
+device's neighbours. Each source address now has a bucket of its own, in
+a dynamic set per family that forgets an address a minute after its last
+SYN. When a set is full, new addresses aren't limited until there's room,
+rather than dropped: the kernel's SYN cookies still guard the listening
+sockets, and a flood from many addresses can't shut the household out.
+Forwarded connections are untouched, as before.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/root/usr/share/firewall4/templates/ruleset.uc
++++ b/root/usr/share/firewall4/templates/ruleset.uc
+@@ -211,11 +211,25 @@
+ {% if (fw4.default_option("synflood_protect") && fw4.default_option("synflood_rate")):
+ 	let r = fw4.default_option("synflood_rate");
+ 	let b = fw4.default_option("synflood_burst");
++	let limit = `limit rate over ${r.rate}/${r.unit}` + (b ? ` burst ${b} packets` : '');
+ %}
++	set syn_flood_v4 {
++		type ipv4_addr
++		size 8192
++		flags dynamic,timeout
++		timeout 1m
++	}
++
++	set syn_flood_v6 {
++		type ipv6_addr
++		size 8192
++		flags dynamic,timeout
++		timeout 1m
++	}
++
+ 	chain syn_flood {
+-		limit rate {{ r.rate }}/{{ r.unit }}
+-		{%- if (b): %} burst {{ b }} packets{% endif %} return comment "!fw4: Accept SYN packets below rate-limit"
+-		drop comment "!fw4: Drop excess packets"
++		update @syn_flood_v4 { ip saddr {{ limit }} } counter drop comment "!fw4: Drop SYN packets over the rate limit, per source address"
++		update @syn_flood_v6 { ip6 saddr {{ limit }} } counter drop comment "!fw4: Drop SYN packets over the rate limit, per source address"
+ 	}
+ 
+ {% endif %}
