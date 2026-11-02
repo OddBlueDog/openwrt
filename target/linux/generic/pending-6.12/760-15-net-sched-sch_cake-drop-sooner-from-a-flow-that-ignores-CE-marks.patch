@@ -1,0 +1,121 @@
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 2 Nov 2026 22:30:00 +0000
+Subject: [PATCH] net/sched: sch_cake: drop sooner from a flow that ignores CE marks
+
+760-14 drops the ECT(0) packets of a flow that ignores CAKE's marks once
+its COBALT count reaches ecn_fail_count, 256 by default. CoDel's count
+grows with the square of the time it has signalled: a flow over target
+without a break reaches a count of n after about 2 * interval * sqrt(n),
+so 256 took over three seconds at the default rtt of 100 ms. A sender
+that ignores the marks builds up its queue all that while, and again on
+each new connection: much of a speed test's download, and the start of
+any bulk transfer from such a server.
+
+Default to 8: about 0.6 s, and the 8 strikes over twice the target that
+the switch also needs. A flow that slows down for its marks has had over
+a dozen of them by then and is back under twice the target.
+
+KUnit: the switch test asserted a count of at least REC_INV_SQRT_CACHE;
+it now runs at the module's count and at 256, which takes
+cobalt_set_count() past the cache, and checks the restarted rate to 0.2%
+(past the cache, the step to the next count is one Newton iteration, as
+everywhere in COBALT, off by about 3 / (8 * count^2)). A flow marked
+again after its count decays is marked until the count and the strikes
+get there once more, and then dropped, rather than for 50 signals.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -477,11 +477,16 @@ static void cobalt_vars_init(struct cobalt_vars *vars)
+  * twice the target at COBALT_ECN_STRIKES signals in a row, has its ECT(0)
+  * packets dropped from then on, from the drop rate a count of
+  * ecn_fail_count gives, until its count decays to 0 and it is marked again.
+- * Responsive flows, ECN or not, stay far below such a count. ECT(1) (L4S)
+- * is never dropped this way, nor is a GSO batch of more than
+- * COBALT_ECN_MAX_SEGS packets (it is marked). 0: always mark, as upstream.
++ * Signalled without a break, a flow reaches a count of n in about
++ * 2 * interval * sqrt(n): 8 takes about 0.6 s at the default rtt, plus the
++ * strikes, and a flow that slows down for its marks has had over a dozen by
++ * then and left the queue, ECN or not. A sender that ignores them grows its
++ * queue all that while, and again on each new connection: at a count of 256,
++ * for three seconds. ECT(1) (L4S) is never dropped this way, nor is a GSO
++ * batch of more than COBALT_ECN_MAX_SEGS packets (it is marked). 0: always
++ * mark, as upstream.
+  */
+-static unsigned int ecn_fail_count __read_mostly = 256;
++static unsigned int ecn_fail_count __read_mostly = 8;
+ module_param(ecn_fail_count, uint, 0644);
+ MODULE_PARM_DESC(ecn_fail_count, "COBALT count at which a flow that ignores ECN marks is dropped instead (0: always mark)");
+ 
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1745,17 +1745,16 @@ static u32 cake_test_ecn_run(struct cake_test_ecn *e, 
+ }
+ 
+ /* An ECT(0) flow far over target (20 ms) is marked, not dropped, until its
+- * count reaches ecn_fail_count and it has stayed over twice the target for
+- * COBALT_ECN_STRIKES more signals; from then on its packets are dropped,
+- * from the drop rate a count of ecn_fail_count gives (1/sqrt exact).
++ * count reaches ecn_fail_count (@fail, set) and it has stayed over twice the
++ * target for COBALT_ECN_STRIKES more signals; from then on its packets are
++ * dropped, from the drop rate a count of ecn_fail_count gives (1/sqrt exact).
+  */
+-static void cake_test_ecn_ignored_switches(struct kunit *test)
++static void cake_test_ecn_switch_at(struct kunit *test, u32 fail)
+ {
+ 	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
+ 	struct cake_test_ecn e;
+-	u32 fail = READ_ONCE(ecn_fail_count), drops, want;
++	u32 drops, want;
+ 
+-	KUNIT_ASSERT_GE(test, fail, REC_INV_SQRT_CACHE);
+ 	cake_test_ecn_init(&e);
+ 	drops = cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC,
+ 				  fail + COBALT_ECN_STRIKES - 2);
+@@ -1769,9 +1768,12 @@ static void cake_test_ecn_ignored_switches(struct kuni
+ 	KUNIT_EXPECT_FALSE(test, e.v.ecn_marked);
+ 	/* restarted at ecn_fail_count, plus this signal */
+ 	KUNIT_EXPECT_EQ(test, e.v.count, fail + 1);
+-	/* 2^32 / sqrt(count), within 0.1% */
++	/* 2^32 / sqrt(count), within 0.2%: from the cache under
++	 * REC_INV_SQRT_CACHE, else one Newton iteration from count's, as in
++	 * COBALT, off by about 3 / (8 * count^2)
++	 */
+ 	want = int_sqrt64(div64_u64(U64_MAX, fail + 1));
+-	KUNIT_EXPECT_LE(test, abs((s64)e.v.rec_inv_sqrt - (s64)want), (s64)(want >> 10));
++	KUNIT_EXPECT_LE(test, abs((s64)e.v.rec_inv_sqrt - (s64)want), (s64)(want >> 9));
+ 
+ 	/* and stays dropped */
+ 	drops = cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 100);
+@@ -1780,6 +1782,19 @@ static void cake_test_ecn_ignored_switches(struct kuni
+ 	KUNIT_EXPECT_EQ(test, ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK, INET_ECN_ECT_0);
+ }
+ 
++/* At the module's count, and at 256: a restart past the 1/sqrt cache, which
++ * cobalt_set_count() works out by Newton iterations
++ */
++static void cake_test_ecn_ignored_switches(struct kunit *test)
++{
++	u32 fail = READ_ONCE(ecn_fail_count);
++
++	cake_test_ecn_switch_at(test, fail);
++	WRITE_ONCE(ecn_fail_count, 256);
++	cake_test_ecn_switch_at(test, 256);
++	WRITE_ONCE(ecn_fail_count, fail);
++}
++
+ /* The same over IPv4 */
+ static void cake_test_ecn_ignored_ipv4(struct kunit *test)
+ {
+@@ -1921,7 +1936,10 @@ static void cake_test_ecn_decays_back(struct kunit *te
+ 	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
+ 	KUNIT_EXPECT_EQ(test, e.v.ecn_strikes, 0);
+ 	e.drops = 0;
+-	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 50), 0);
++	/* marked again, until the count and the strikes get there once more */
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC,
++						fail + COBALT_ECN_STRIKES - 2), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 1), 1);
+ }
+ 
+ static int cake_test_init(struct kunit *test)
