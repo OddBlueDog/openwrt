@@ -217,6 +217,17 @@ if VERSIONOPT
 			 %P .. Product name or "Generic"
 			 %h .. Hardware revision or "v0"
 
+	config VERSION_KMODS_REPO
+		string
+		prompt "Kernel module repository"
+		default ""
+		help
+			A repository of this build's kernel modules, for a kernel that
+			isn't the release's (whose kmods won't install on it). Images
+			list <url>/targets/<target>/<subtarget>/kmods/<kernel>/packages.adb
+			in /etc/apk/repositories.d/kmods.list, <kernel> being
+			<version>-<release>-<vermagic> as on downloads.openwrt.org.
+
 	config VERSION_HOME_URL
 		string
 		prompt "Release Homepage"

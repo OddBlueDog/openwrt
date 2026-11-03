@@ -74,6 +74,10 @@ define prepare_rootfs
 	fi)
 	@mkdir -p $(1)/etc/rc.d
 	@mkdir -p $(1)/var/lock
+	$(if $(CONFIG_USE_APK),$(if $(LINUX_VERMAGIC),$(if $(call qstrip,$(CONFIG_VERSION_KMODS_REPO)), \
+		@mkdir -p $(1)/etc/apk/repositories.d; \
+		echo '$(call qstrip,$(CONFIG_VERSION_KMODS_REPO))/targets/$(BOARD)/$(SUBTARGET)/kmods/$(LINUX_VERSION)-$(LINUX_RELEASE)-$(LINUX_VERMAGIC)/packages.adb' \
+			> $(1)/etc/apk/repositories.d/kmods.list)))
 	@( \
 		cd $(1); \
 		if [ -n "$(CONFIG_USE_APK)" ]; then \
