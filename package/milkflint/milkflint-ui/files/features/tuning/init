@@ -15,9 +15,10 @@
 #   receive threads at normal priority (packet-steering.sh too);
 # - milkflint.steering.rx_delay: the longest the Ethernet's receive
 #   interrupt waits, in µs (/usr/libexec/milkflint/rx-delay);
-# - milkflint.cake.ecn_drop "0": Smart Queue always marks ECN downloads, even
-#   ones that ignore the marks (/usr/libexec/milkflint/cake-ecn; the iface
-#   hotplug 12-milkflint-cake-ecn runs it after sqm too);
+# - milkflint.cake.ecn_drop: after how many ignored marks Smart Queue drops
+#   from an ECN download that ignores them, "0" never (it always marks)
+#   (/usr/libexec/milkflint/cake-ecn; the iface hotplug 12-milkflint-cake-ecn
+#   runs it after sqm too);
 # - milkflint.wifi.retries: how often the Wi-Fi driver sends a data frame
 #   before it gives up (/usr/libexec/milkflint/wifi-retries; the ieee80211
 #   hotplug runs it for each radio too);

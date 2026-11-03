@@ -148,6 +148,13 @@ function wan_dns_server() {
 	return '127.0.0.1';
 }
 
+// encrypted DNS hosts whose addresses don't answer plain DNS, and a name of
+// the same resolver that does (Cloudflare's DoH name is served by its web
+// front ends; its DoT name is the 1.1.1.1 resolver itself)
+const PLAIN_HOST = {
+	'cloudflare-dns.com': 'one.one.one.one'
+};
+
 function as_list(v) {
 	return (type(v) == 'array') ? v : (v != null && v != '') ? [ v ] : [];
 }
@@ -156,8 +163,9 @@ function as_list(v) {
 // (milkflint.dns.mode), each { key, host, addr }, at most four:
 // - encrypted: dnsproxy's upstreams, then its fallback, keyed by host name
 //   and asked over plain DNS at its address (one.one.one.one: 1.1.1.1,
-//   looked up through the router once an hour like the routes): the same
-//   resolver the encrypted lookups reach, without the encryption;
+//   looked up through the router once an hour like the routes; PLAIN_HOST's
+//   at their other name's): the same resolver the encrypted lookups reach,
+//   without the encryption;
 // - static: the IPv4 servers dnsmasq forwards to;
 // - automatic (or anything else): the resolver the WAN connection gave us.
 function dns_targets() {
@@ -169,7 +177,7 @@ function dns_targets() {
 			// a DNS stamp (sdns://) or an IPv6 address can't be asked this way
 			const m = match(url, /^(https|tls|quic):\/\/([A-Za-z0-9.-]+)/);
 			if (m && !length(filter(out, (t) => t.key == m[2])))
-				push(out, { key: m[2], host: m[2], addr: route_addr(m[2]) });
+				push(out, { key: m[2], host: m[2], addr: route_addr(PLAIN_HOST[m[2]] ?? m[2]) });
 		}
 	}
 	else if (mode == 'static') {

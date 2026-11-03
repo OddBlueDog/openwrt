@@ -140,6 +140,27 @@ if [ -z "$(uci -q get milkflint.defaults.flow_offload)" ]; then
 	UCI
 fi
 
+# SYN flood protection lets each address open 200 new connections a second
+# to the router, and 400 at once, instead of fw4's 25 and 50. Our fw4 counts
+# every address on its own (source/patches/0053), so this is per device,
+# and nothing that goes through the router (to the internet) is counted at
+# all; past the limit, the kernel's SYN cookies still guard the router.
+# Only where no rate is set: one chosen on the Firewall page (which also
+# turns the protection off) or in LuCI stays. Once, like ping_off.
+if [ -z "$(uci -q get milkflint.defaults.synflood)" ]; then
+	for section in $(uci -q show firewall | sed -n "s/^firewall\.\([^.=]*\)=defaults$/\1/p"); do
+		[ -n "$(uci -q get "firewall.$section.synflood_rate")" ] && continue
+		uci set "firewall.$section.synflood_rate=200/second"
+		uci set "firewall.$section.synflood_burst=400"
+	done
+	uci -q commit firewall
+	uci -q batch <<-UCI
+		set milkflint.defaults=defaults
+		set milkflint.defaults.synflood='1'
+		commit milkflint
+	UCI
+fi
+
 # Download shaping of 500 Mbit/s and more uses CAKE's no-split-gso: CAKE
 # takes GRO packets whole instead of splitting each one (64 KB is ~1 ms at
 # 500 Mbit/s), which saves CPU at those speeds. The web interface keeps it in
