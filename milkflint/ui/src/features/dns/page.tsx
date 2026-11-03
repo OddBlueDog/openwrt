@@ -3,7 +3,10 @@ import {
   LockIcon,
   LockOpenIcon,
   type LucideIcon,
+  MonitorSmartphoneIcon,
   PlusIcon,
+  RouterIcon,
+  ServerCogIcon,
   ServerIcon,
   ShieldCheckIcon,
   TagIcon,
@@ -29,12 +32,13 @@ import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
-import { ipToInt } from '@/lib/api/network';
+import { ipToInt, prefixLength } from '@/lib/api/network';
 import { bool, type Change, getConfig, list, type Section, str } from '@/lib/api/uci';
 import { Choice, Segmented } from '../firewall/parts';
 import { SERVER } from '../remote-access/sections';
 import { type GuestId, isGuestNetwork } from '../wifi-guest/guest';
 import { getDnsStatus } from './api';
+import { type DeviceDns, deviceDnsChanges, homeDhcp, loops, readDeviceDns, validateDeviceDns } from './device-dns';
 import { addIntercept, INTERCEPT_SECTIONS, type InterceptZone, interceptOn, interceptSection } from './intercept';
 import { isProviderId, type Proto, protoLabels, protoOf, type ProviderId, providers } from './providers';
 import {
@@ -134,6 +138,8 @@ interface DnsForm {
   rebind: boolean;
   domain: string;
   records: DnsRecord[];
+  /** The DNS server the home network's devices are told to use. */
+  devices: DeviceDns;
 }
 
 interface DnsData {
@@ -149,6 +155,10 @@ interface DnsData {
   interceptZones: InterceptZone[];
   proxyInstalled: boolean;
   proxyEnabled: boolean;
+  /** The home network's DHCP section, where the devices' DNS server is set. */
+  lanDhcp: Section | undefined;
+  routerIp: string;
+  prefix: number;
 }
 
 let nextKey = 0;
@@ -158,12 +168,16 @@ function protosOf(provider: ProviderId | 'custom'): readonly Proto[] {
 }
 
 async function loadDns(): Promise<DnsData> {
-  const [dhcp, milkflint, firewall, proxy] = await Promise.all([
+  const [dhcp, milkflint, firewall, proxy, network] = await Promise.all([
     getConfig('dhcp'),
     getConfig('milkflint').catch((): Section[] => []),
     getConfig('firewall'),
     getConfig('dnsproxy').catch((): Section[] => []),
+    getConfig('network'),
   ]);
+  const lanDhcp = homeDhcp(dhcp);
+  const lan = network.find((s) => s['.name'] === 'lan');
+  const ipaddr = str(lan, 'ipaddr');
   const dnsmasq = dhcp.find((s) => s['.type'] === 'dnsmasq');
   const rf = milkflint.find((s) => s['.name'] === 'dns');
   const mode = str(rf, 'mode');
@@ -194,6 +208,7 @@ async function loadDns(): Promise<DnsData> {
       records: dhcp
         .filter((s) => s['.type'] === 'domain')
         .map((s) => ({ key: s['.name'], section: s['.name'], name: str(s, 'name') ?? '', ip: str(s, 'ip') ?? '' })),
+      devices: readDeviceDns(lanDhcp),
     },
     dnsmasq: dnsmasq?.['.name'],
     servers: list(dnsmasq, 'server'),
@@ -214,6 +229,9 @@ async function loadDns(): Promise<DnsData> {
     ],
     proxyInstalled: proxy.some((s) => s['.name'] === 'global'),
     proxyEnabled: bool(proxy.find((s) => s['.name'] === 'global'), 'enabled'),
+    lanDhcp,
+    routerIp: ipaddr?.split('/')[0] ?? '192.168.1.1',
+    prefix: ipaddr?.includes('/') === true ? Number(ipaddr.split('/')[1]) : prefixLength(str(lan, 'netmask')),
   };
 }
 
@@ -241,13 +259,14 @@ function plan(f: DnsForm): { dnsmasq: string[]; proxy: ProxyServers | undefined 
 
 const NAME = /^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 
-type FormErrors = Partial<Record<'custom' | 'backup' | 'backupCustom' | 'domain', string>>;
+type FormErrors = Partial<Record<'custom' | 'backup' | 'backupCustom' | 'domain' | 'ownIpv4' | 'ownIpv6', string>>;
 
 const ADDRESS_LIST = 'One or more IP addresses, separated by commas.';
 const ENCRYPTED_URL = 'An address starting https://, tls://, quic:// or sdns://.';
 
-function validate(f: DnsForm): { form: FormErrors; records: Record<string, string> } {
-  const form: FormErrors = {};
+function validate(f: DnsForm, data: DnsData): { form: FormErrors; records: Record<string, string> } {
+  const own = validateDeviceDns(f.devices, data.routerIp, data.prefix);
+  const form: FormErrors = { ...(own.ipv4 === undefined ? {} : { ownIpv4: own.ipv4 }), ...(own.ipv6 === undefined ? {} : { ownIpv6: own.ipv6 }) };
   const records: Record<string, string> = {};
   if (f.mode !== 'auto') {
     const ok = f.mode === 'static' ? isAddressList : isEncryptedUrl;
@@ -360,8 +379,11 @@ function toChanges(f: DnsForm, data: DnsData): Change[] {
     }
   }
 
-  // one redirect per zone: the home network's and each guest network's
-  const wanted = f.intercept ? data.interceptZones : [];
+  if (data.lanDhcp !== undefined) changes.push(...deviceDnsChanges(data.lanDhcp['.name'], data.lanDhcp, f.devices));
+
+  // one redirect per zone: the home network's and each guest network's; none
+  // while devices use another server, whose own lookups it would catch too
+  const wanted = f.intercept && !f.devices.own ? data.interceptZones : [];
   for (const zone of wanted) {
     const s = data.intercepts.find((x) => x.section === interceptSection(zone));
     if (s === undefined) changes.push(addIntercept(zone));
@@ -537,11 +559,12 @@ export function DnsPage(): ReactElement {
   const set = <K extends keyof DnsForm>(key: K, value: DnsForm[K]): void => {
     update((f) => ({ ...f, [key]: value }));
   };
-  const errors = form === undefined ? { form: {}, records: {} } : validate(form);
+  const errors = form === undefined || data === undefined ? { form: {}, records: {} } : validate(form, data);
   const invalid = Object.keys(errors.form).length > 0 || Object.keys(errors.records).length > 0;
   // on, but a guest network has no redirect of its own yet (made before the switch covered them)
   const uncovered =
     form?.intercept === true &&
+    !form.devices.own &&
     data?.form.intercept === true &&
     data.interceptZones.some((z) => !data.intercepts.some((x) => x.section === interceptSection(z) && x.enabled));
   const dirty = (edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data?.form)) || uncovered;
@@ -718,7 +741,7 @@ export function DnsPage(): ReactElement {
                         {filter !== undefined && <WarningBox title="They don’t filter the same">{filter}</WarningBox>}
                         {dnssec !== undefined && <WarningBox title="Doesn’t check DNSSEC">{dnssec}</WarningBox>}
                         {backupDnssec !== undefined && <WarningBox title="The second server doesn’t check DNSSEC">{backupDnssec}</WarningBox>}
-                        {sends.length > 0 && Object.keys(errors.form).every((k) => k === 'domain') && (
+                        {sends.length > 0 && Object.keys(errors.form).every((k) => k === 'domain' || k.startsWith('own')) && (
                           <p className="text-xs text-muted-foreground">
                             Sends to <span className="font-mono break-all text-foreground">{sends.join(', ')}</span>
                           </p>
@@ -775,6 +798,98 @@ export function DnsPage(): ReactElement {
                   </Card>
                 )}
 
+                <Card className="xl:col-span-2">
+                  <CardHeading
+                    icon={MonitorSmartphoneIcon}
+                    title="Your devices’ DNS server"
+                    description={form.devices.own ? 'Devices on your home network ask another server directly.' : 'Devices ask the router.'}
+                  />
+                  <CardContent className="flex flex-col gap-4">
+                    <Choice
+                      label="Your devices’ DNS server"
+                      columns={2}
+                      value={form.devices.own ? 'own' : 'router'}
+                      options={[
+                        {
+                          value: 'router',
+                          label: 'This router',
+                          hint: 'Devices ask the router, which uses the DNS servers above and answers names on your network.',
+                          icon: RouterIcon,
+                        },
+                        {
+                          value: 'own',
+                          label: 'Another server on your network',
+                          hint: 'Such as a Pi-hole or AdGuard Home: devices ask it directly, so it sees and filters each device’s lookups.',
+                          icon: ServerCogIcon,
+                        },
+                      ]}
+                      onChange={(v) => {
+                        update((f) => ({ ...f, devices: { ...f.devices, own: v === 'own' } }));
+                      }}
+                    />
+                    {form.devices.own && (
+                      <>
+                        <div className="divide-y">
+                          <Field
+                            id="dns-own-ipv4"
+                            label="IPv4 address"
+                            hint="Give the server an address that doesn’t change (a reservation). Two addresses for two servers."
+                            error={errors.form.ownIpv4}
+                          >
+                            <Input
+                              id="dns-own-ipv4"
+                              className="font-mono"
+                              autoComplete="off"
+                              spellCheck={false}
+                              placeholder={data.routerIp.replace(/\.\d+$/, '.53')}
+                              value={form.devices.ipv4}
+                              aria-invalid={errors.form.ownIpv4 !== undefined}
+                              onChange={(e) => {
+                                const ipv4 = e.target.value;
+                                update((f) => ({ ...f, devices: { ...f.devices, ipv4 } }));
+                              }}
+                            />
+                          </Field>
+                          <Field
+                            id="dns-own-ipv6"
+                            label="IPv6 address (optional)"
+                            hint="If it has one that doesn’t change. Without one, the router stops offering itself for DNS over IPv6, so devices can’t skip your server that way."
+                            error={errors.form.ownIpv6}
+                          >
+                            <Input
+                              id="dns-own-ipv6"
+                              className="font-mono"
+                              autoComplete="off"
+                              spellCheck={false}
+                              placeholder="fd00::53"
+                              value={form.devices.ipv6}
+                              aria-invalid={errors.form.ownIpv6 !== undefined}
+                              onChange={(e) => {
+                                const ipv6 = e.target.value;
+                                update((f) => ({ ...f, devices: { ...f.devices, ipv6 } }));
+                              }}
+                            />
+                          </Field>
+                        </div>
+                        <ul className="flex max-w-3xl list-disc flex-col gap-1 pl-4 text-xs text-muted-foreground">
+                          <li>
+                            For its own lookups, your server can use the router (<span className="font-mono text-foreground">{data.routerIp}</span>): it then
+                            gets the DNS servers above, and names on your network (name.{form.domain}).
+                          </li>
+                          <li>Devices switch when they next renew their address; reconnecting one switches it at once.</li>
+                          <li>Guest networks keep using the router.</li>
+                        </ul>
+                        {form.mode === 'static' && loops(form.devices, planned.dnsmasq) && (
+                          <WarningBox title="Lookups could go round in circles">
+                            The router sends its own lookups to your server. If your server sends its lookups to the router too, none get answered: give one
+                            of them a server on the internet.
+                          </WarningBox>
+                        )}
+                      </>
+                    )}
+                  </CardContent>
+                </Card>
+
                 <Card>
                   <CardHeading icon={ShieldCheckIcon} title="Protection" />
                   <CardContent className="divide-y">
@@ -785,11 +900,15 @@ export function DnsPage(): ReactElement {
                     >
                       <Switch
                         id="dns-intercept"
-                        checked={form.intercept}
+                        checked={form.intercept && !form.devices.own}
+                        disabled={form.devices.own}
                         onCheckedChange={(v) => {
                           set('intercept', v);
                         }}
                       />
+                      {form.devices.own && (
+                        <p className="text-xs text-muted-foreground">Off while devices use another DNS server: it would catch that server’s own lookups too.</p>
+                      )}
                       {uncovered && <p className="text-xs text-muted-foreground">Not on every guest network yet: save to add it there.</p>}
                     </Field>
                     <Field

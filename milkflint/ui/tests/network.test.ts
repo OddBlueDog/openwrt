@@ -4,7 +4,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { wanBehindNat } from '../src/features/firewall/api.ts';
-import { inSubnet, intToIp, ipToInt, prefixLength } from '../src/lib/api/network.ts';
+import { globalIpv6, hintName, inSubnet, intToIp, ipToInt, isPrivateMac, prefixLength } from '../src/lib/api/network.ts';
+import { describeRate, generationOf } from '../src/lib/api/wireless.ts';
 
 test('a netmask or a prefix length, as a prefix length', () => {
   assert.equal(prefixLength(undefined), 24);
@@ -49,4 +50,37 @@ test('a private or shared (CGNAT) internet address means nothing reaches port fo
   for (const a of ['172.15.0.1', '172.32.0.1', '100.63.0.1', '100.128.0.1', '81.2.69.142', '192.169.0.1']) {
     assert.equal(wanBehindNat(a), undefined, a);
   }
+});
+
+test('private (made-up) MAC addresses: the locally administered bit', () => {
+  for (const mac of ['02:00:00:00:00:01', '0A:12:34:56:78:9A', '3e:00:00:00:00:02', 'f6:aa:bb:cc:dd:ee']) assert.equal(isPrivateMac(mac), true, mac);
+  for (const mac of ['00:00:5e:00:53:01', 'A4:83:E7:12:34:56', '94:00:00:00:00:01', '']) assert.equal(isPrivateMac(mac), false, mac);
+});
+
+test('hint names lose the local domain', () => {
+  assert.equal(hintName({ name: 'iPhone.lan' }), 'iPhone');
+  assert.equal(hintName({ name: 'printer' }), 'printer');
+  assert.equal(hintName({ name: '' }), undefined);
+  assert.equal(hintName({}), undefined);
+  assert.equal(hintName(undefined), undefined);
+});
+
+test('only global IPv6 addresses', () => {
+  assert.deepEqual(
+    globalIpv6(['2001:db8:1:2::618', 'fd00:1:2::618', 'fe80::1', 'FC00::1', '2001:db8::1']),
+    ['2001:db8:1:2::618', '2001:db8::1'],
+  );
+  assert.deepEqual(globalIpv6(undefined), []);
+});
+
+test('the Wi-Fi generation of a rate', () => {
+  assert.equal(generationOf(undefined), undefined);
+  assert.equal(generationOf({ he: true }), undefined, 'no rate, nothing to go by');
+  assert.equal(generationOf({ rate: 1200900, he: true, vht: false }), 6);
+  assert.equal(generationOf({ rate: 2882400, eht: true, he: false }), 7);
+  assert.equal(generationOf({ rate: 866700, vht: true }), 5);
+  assert.equal(generationOf({ rate: 144400, ht: true }), 4);
+  assert.equal(generationOf({ rate: 6000 }), 0);
+  assert.equal(describeRate({ rate: 1200900, he: true, mcs: 11, nss: 2, mhz: 80 }), 'Wi-Fi 6 · MCS 11 · 2×2 · 80 MHz');
+  assert.equal(describeRate({ rate: 6000 }), 'legacy');
 });

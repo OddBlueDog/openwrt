@@ -87,6 +87,7 @@ const rate = z
     eht: z.boolean().optional(),
     short_gi: z.boolean().optional(),
     packets: z.number().optional(),
+    bytes: z.number().optional(),
   })
   .loose();
 
@@ -110,11 +111,17 @@ export function getStations(device: string): Promise<Station[]> {
   return call('iwinfo', 'assoclist', { device }, z.object({ results: z.array(station) })).then((r) => r.results);
 }
 
+/** The Wi-Fi generation a rate was sent at: 7, 6, 5, 4, or 0 for the older ones (a/b/g). */
+export function generationOf(r: z.output<typeof rate> | undefined): number | undefined {
+  if (r?.rate === undefined) return undefined;
+  return r.eht === true ? 7 : r.he === true ? 6 : r.vht === true ? 5 : r.ht === true ? 4 : 0;
+}
+
 /** "HE MCS 9, 2×2, 80 MHz" style summary of a station's rate. */
 export function describeRate(r: z.output<typeof rate> | undefined): string | undefined {
-  if (r?.rate === undefined) return undefined;
-  const gen = r.eht === true ? 'Wi-Fi 7' : r.he === true ? 'Wi-Fi 6' : r.vht === true ? 'Wi-Fi 5' : r.ht === true ? 'Wi-Fi 4' : 'legacy';
-  const parts = [gen];
+  const g = generationOf(r);
+  if (r === undefined || g === undefined) return undefined;
+  const parts = [g === 0 ? 'legacy' : `Wi-Fi ${String(g)}`];
   if (r.mcs !== undefined) parts.push(`MCS ${String(r.mcs)}`);
   if (r.nss !== undefined) parts.push(`${String(r.nss)}×${String(r.nss)}`);
   if (r.mhz !== undefined) parts.push(`${String(r.mhz)} MHz`);

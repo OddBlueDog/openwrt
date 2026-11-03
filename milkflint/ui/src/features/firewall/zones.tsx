@@ -18,7 +18,23 @@ import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import type { Counters, FirewallData } from './api';
 import type { Actions } from './forms';
-import { editSection, enabledChange, isInternetZone, managedBy, type Policy, type Values, type Zone, zoneTitle, zoneUsers } from './model';
+import {
+  editSection,
+  enabledChange,
+  isInternetZone,
+  managedBy,
+  type Policy,
+  SYN_RATE_FW4,
+  SYN_RATE_MILKFLINT,
+  synRateError,
+  synRateLabel,
+  synRateText,
+  synRateValues,
+  type Values,
+  type Zone,
+  zoneTitle,
+  zoneUsers,
+} from './model';
 import { NatTable } from './nat';
 import { Segmented, SwitchRow } from './parts';
 import { FieldLabel, Opt, UciPreview } from './sheet-parts';
@@ -396,6 +412,8 @@ interface DefaultsForm {
   output: Policy;
   forward: Policy;
   synFlood: boolean;
+  /** new connections a second per address, as typed; '' is fw4's own */
+  synRate: string;
   dropInvalid: boolean;
   offload: boolean;
   offloadHw: boolean;
@@ -409,11 +427,13 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
     output: d.output,
     forward: d.forward,
     synFlood: d.synFlood,
+    synRate: synRateText(d.synRate),
     dropInvalid: d.dropInvalid,
     offload: d.offload,
     offloadHw: d.offloadHw,
   };
   const [f, setF] = useState(was);
+  const rateError = f.synRate === was.synRate ? undefined : synRateError(f.synRate);
   const set = <K extends keyof DefaultsForm>(key: K, value: DefaultsForm[K]): void => {
     setF((x) => ({ ...x, [key]: value }));
   };
@@ -423,6 +443,7 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
   if (f.output !== was.output) values['output'] = f.output;
   if (f.forward !== was.forward) values['forward'] = f.forward;
   if (f.synFlood !== was.synFlood) values[d.synFloodOption] = bit(f.synFlood);
+  if (f.synRate !== was.synRate && rateError === undefined) Object.assign(values, synRateValues(f.synRate));
   if (f.dropInvalid !== was.dropInvalid) values['drop_invalid'] = bit(f.dropInvalid);
   if (f.offload !== was.offload) values['flow_offloading'] = bit(f.offload);
   if (f.offloadHw !== was.offloadHw) values['flow_offloading_hw'] = bit(f.offloadHw);
@@ -493,7 +514,31 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
                 set('output', p);
               }}
             />
-            {toggle('synFlood', 'SYN flood protection', d.synFloodOption, 'Limits how fast new connections to the router may arrive.')}
+            {toggle(
+              'synFlood',
+              'SYN flood protection',
+              d.synFloodOption,
+              'Limits how fast each address may open new connections to the router itself. Connections through the router to the internet aren’t counted.',
+            )}
+            <div className="grid gap-1.5">
+              <FieldLabel htmlFor={`${id}-synrate`} label="New connections a second, per address" opt="synflood_rate" />
+              <Input
+                id={`${id}-synrate`}
+                inputMode="numeric"
+                className="font-mono"
+                value={f.synRate}
+                placeholder={String(SYN_RATE_FW4)}
+                disabled={!f.synFlood}
+                aria-invalid={rateError !== undefined}
+                onChange={(e) => {
+                  set('synRate', e.target.value.trim());
+                }}
+              />
+              <p className={cn('text-xs', rateError === undefined ? 'text-muted-foreground' : 'text-destructive')}>
+                {rateError ??
+                  `Each device, and each address on the internet, may open this many to the router (its pages, SSH, DNS over TCP), and twice as many at once (synflood_burst); more wait a second to be sent again. Empty is OpenWrt’s ${String(SYN_RATE_FW4)}; MilkFlint sets ${String(SYN_RATE_MILKFLINT)}.`}
+              </p>
+            </div>
             {toggle('dropInvalid', 'Drop invalid packets', 'drop_invalid', 'Packets that belong to no known connection. Off is OpenWrt’s default.')}
             {toggle(
               'offload',
@@ -531,7 +576,7 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
               Cancel
             </Button>
             <Button
-              disabled={changes.length === 0}
+              disabled={changes.length === 0 || rateError !== undefined}
               onClick={() => {
                 onSave(changes);
               }}
@@ -610,7 +655,7 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
       <SettingsIcon /> Edit
     </HeaderButton>
   );
-  const defaultsNotes = [cfg.defaults.synFlood && 'SYN flood protection', cfg.defaults.dropInvalid && 'drops invalid', cfg.defaults.offloadHw ? 'hardware offloading' : cfg.defaults.offload && 'software offloading'].filter(
+  const defaultsNotes = [cfg.defaults.synFlood ? `SYN flood protection ${synRateLabel(cfg.defaults.synRate)}` : 'no SYN flood protection', cfg.defaults.dropInvalid && 'drops invalid', cfg.defaults.offloadHw ? 'hardware offloading' : cfg.defaults.offload && 'software offloading'].filter(
     (x): x is string => typeof x === 'string',
   );
   const zoneActions = (z: Zone): ReactElement => (

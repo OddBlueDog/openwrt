@@ -3,10 +3,20 @@
 // from the difference between two samples.
 import { useRef } from 'react';
 import { usePoll } from '@/hooks/use-poll';
-import { getDevices, getInterfaces, getLeases, type NetworkInterface } from '@/lib/api/network';
+import {
+  getDevices,
+  getHostHints,
+  getInterfaces,
+  getLeases,
+  globalIpv6,
+  hintName,
+  isPrivateMac,
+  type NetworkInterface,
+} from '@/lib/api/network';
 import { getSqmStatus, getStats, type Stats } from '@/lib/api/stats';
 import { getBoard, getInfo, type Board, type SystemInfo } from '@/lib/api/system';
-import { bandOf, describeRate, getAccessPoints, getWirelessStatus } from '@/lib/api/wireless';
+import { getConfig, list, str } from '@/lib/api/uci';
+import { bandOf, describeRate, generationOf, getAccessPoints, getWirelessStatus } from '@/lib/api/wireless';
 import { directionsOf, type DirectionSummary, summarize } from '../sqm/cake';
 
 export const POLL_MS = 2000;
@@ -39,8 +49,17 @@ export interface Radio {
 
 export interface Client {
   mac: string;
-  hostname: string | undefined;
+  /** The name you gave it (All devices), else the one it sent, else one the router learned another way. */
+  name: string | undefined;
+  nameFrom: 'you' | 'device' | 'router' | undefined;
+  /** It uses a private (made-up) MAC address. */
+  privateMac: boolean;
+  /** The newest Wi-Fi generation it's been seen using (7, 6, 5, 4; 0 for older). */
+  generation: number | undefined;
   ip: string | undefined;
+  /** The address reserved for it (it always gets this one). */
+  reservedIp: string | undefined;
+  ipv6: string[];
   band: string | undefined;
   ssid: string | undefined;
   signal: number | undefined;
@@ -49,6 +68,9 @@ export interface Client {
   txRate: number | undefined;
   rxDescription: string | undefined;
   txDescription: string | undefined;
+  /** Bytes since it joined: to it and from it. */
+  txBytes: number | undefined;
+  rxBytes: number | undefined;
   connectedSeconds: number | undefined;
 }
 
@@ -108,9 +130,11 @@ function sum(values: readonly (number | undefined)[]): number | undefined {
 export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
   const counters = useRef<Counters | undefined>(undefined);
   const history = useRef<Sample[]>([]);
+  // The newest generation each client has used: a quiet one's rates fall back to older ones.
+  const generations = useRef(new Map<string, number>());
 
   return usePoll(async (): Promise<Dashboard> => {
-    const [board, info, stats, devices, interfaces, wireless, leases, sqm] = await Promise.all([
+    const [board, info, stats, devices, interfaces, wireless, leases, hints, dhcp, sqm] = await Promise.all([
       getBoard(),
       getInfo(),
       getStats(),
@@ -118,6 +142,8 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
       getInterfaces(),
       getWirelessStatus(),
       getLeases().catch(() => []),
+      getHostHints().catch(() => ({})),
+      getConfig('dhcp').catch(() => []),
       getSqmStatus().catch(() => undefined),
     ]);
     const now = performance.now();
@@ -148,14 +174,35 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
       };
       });
 
+    // Names as All devices finds them.
     const leaseByMac = new Map(leases.map((l) => [l.macaddr.toLowerCase(), l]));
+    const hintByMac = new Map(Object.entries(hints).map(([mac, h]) => [mac.toLowerCase(), h]));
+    const hostByMac = new Map(
+      dhcp.filter((s) => s['.type'] === 'host').flatMap((h) => list(h, 'mac').map((mac) => [mac.toLowerCase(), h] as const)),
+    );
+    const seen = new Map<string, number>();
     const clients: Client[] = live.flatMap((l) =>
-      l.stations.map((s) => {
-        const lease = leaseByMac.get(s.mac.toLowerCase());
+      l.stations.map((s): Client => {
+        const mac = s.mac.toLowerCase();
+        const lease = leaseByMac.get(mac);
+        const hint = hintByMac.get(mac);
+        const host = hostByMac.get(mac);
+        const name = str(host, 'name') ?? lease?.hostname ?? hintName(hint);
+        const generation = [generationOf(s.rx), generationOf(s.tx), generations.current.get(mac)].reduce<number | undefined>(
+          (a, b) => (b === undefined ? a : Math.max(a ?? 0, b)),
+          undefined,
+        );
+        if (generation !== undefined) seen.set(mac, generation);
         return {
-          mac: s.mac,
-          hostname: lease?.hostname,
-          ip: lease?.ipaddr,
+          mac,
+          name,
+          nameFrom:
+            name === undefined ? undefined : str(host, 'name') !== undefined ? 'you' : lease?.hostname !== undefined ? 'device' : 'router',
+          privateMac: isPrivateMac(mac),
+          generation,
+          ip: lease?.ipaddr ?? hint?.ipaddrs?.[0] ?? str(host, 'ip'),
+          reservedIp: str(host, 'ip'),
+          ipv6: globalIpv6(hint?.ip6addrs),
           band: bandOf(l.info?.frequency),
           ssid: l.ssid,
           signal: s.signal_avg ?? s.signal,
@@ -163,10 +210,13 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
           txRate: s.tx?.rate === undefined ? undefined : s.tx.rate * 1000,
           rxDescription: describeRate(s.rx),
           txDescription: describeRate(s.tx),
+          txBytes: s.tx?.bytes,
+          rxBytes: s.rx?.bytes,
           connectedSeconds: s.connected_time,
         };
       }),
     );
+    generations.current = seen;
     clients.sort((a, b) => (b.signal ?? -200) - (a.signal ?? -200));
 
     const wan = interfaces.find((i) => i.interface === 'wan');

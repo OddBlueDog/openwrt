@@ -104,6 +104,27 @@ export function getHostHints(): Promise<Record<string, HostHint>> {
   return call('luci-rpc', 'getHostHints', {}, z.record(z.string(), hintSchema));
 }
 
+/** A hint's name without the local domain: "iPhone.lan" -> "iPhone". */
+export function hintName(h: HostHint | undefined): string | undefined {
+  const name = h?.name?.split('.')[0];
+  return name === '' ? undefined : name;
+}
+
+/**
+ * A MAC the device made up rather than its maker's (the locally administered
+ * bit): phones' and laptops' private Wi-Fi addresses, which say nothing about
+ * who made the device.
+ */
+export function isPrivateMac(mac: string): boolean {
+  const first = parseInt(mac.slice(0, 2), 16);
+  return !Number.isNaN(first) && (first & 0x02) !== 0;
+}
+
+/** Global IPv6 addresses: not link-local (fe80::/10) or unique local (fc00::/7). */
+export function globalIpv6(addrs: readonly string[] | undefined): string[] {
+  return (addrs ?? []).filter((a) => !/^f[cde]/i.test(a));
+}
+
 /** "192.168.1.1" + "255.255.255.0" or "24" -> prefix length. */
 export function prefixLength(netmask: string | undefined): number {
   if (netmask === undefined) return 24;

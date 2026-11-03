@@ -4,10 +4,78 @@ import { SignalBars } from '@/components/charts/signal-bars';
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { formatBitrate, formatDuration } from '@/lib/format';
+import { formatBitrate, formatBytes, formatDuration } from '@/lib/format';
 import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
-import type { Dashboard } from './use-dashboard';
+import type { Client, Dashboard } from './use-dashboard';
+
+/** Its name, or what kind of device it is when it has none. */
+function label(c: Client): string {
+  if (c.name !== undefined) return c.name;
+  return c.generation === undefined || c.generation === 0 ? 'Wi-Fi device' : `Wi-Fi ${String(c.generation)} device`;
+}
+
+function whereTheNameIsFrom(c: Client): string {
+  switch (c.nameFrom) {
+    case 'you':
+      return 'You named it on All devices.';
+    case 'device':
+      return 'It sent this name when it asked for an address.';
+    case 'router':
+      return 'The router knows it by this name.';
+    case undefined:
+      return c.privateMac
+        ? 'It sent no name, and its private address doesn’t say who made it. You can name it on All devices.'
+        : 'It sent no name. You can name it on All devices.';
+  }
+}
+
+/** What the row doesn't already show. */
+function Details({ c }: { c: Client }): ReactElement {
+  return (
+    <TooltipContent side="bottom" align="start" className="max-w-sm text-pretty">
+      <p className="font-medium">{c.name ?? 'No name'}</p>
+      <p className="mt-0.5 opacity-80">{whereTheNameIsFrom(c)}</p>
+      <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+        <dt className="opacity-70">MAC</dt>
+        <dd className="font-mono">
+          {c.mac}
+          {c.privateMac && <span className="font-sans opacity-70"> · private</span>}
+        </dd>
+        {c.ssid !== undefined && (
+          <>
+            <dt className="opacity-70">Network</dt>
+            <dd>{c.ssid}</dd>
+          </>
+        )}
+        {c.reservedIp !== undefined && (
+          <>
+            <dt className="opacity-70">Address</dt>
+            <dd>Reserved: always gets {c.reservedIp}</dd>
+          </>
+        )}
+        {c.ipv6.length > 0 && (
+          <>
+            <dt className="opacity-70">IPv6</dt>
+            <dd className="font-mono break-all">
+              {c.ipv6.map((a) => (
+                <div key={a}>{a}</div>
+              ))}
+            </dd>
+          </>
+        )}
+        {c.txBytes !== undefined && c.rxBytes !== undefined && (
+          <>
+            <dt className="opacity-70">Since joining</dt>
+            <dd className="tabular">
+              {formatBytes(c.txBytes)} down · {formatBytes(c.rxBytes)} up
+            </dd>
+          </>
+        )}
+      </dl>
+    </TooltipContent>
+  );
+}
 
 export function ClientsCard({ d, className }: { d: Dashboard; className?: string }): ReactElement {
   return (
@@ -43,11 +111,29 @@ export function ClientsCard({ d, className }: { d: Dashboard; className?: string
                 <TableRow key={c.mac}>
                   <TableCell>
                     <div className="flex items-center gap-3">
-                      <div className="flex size-8 items-center justify-center rounded-full bg-secondary">
-                        <SmartphoneIcon className="size-4 text-muted-foreground" />
-                      </div>
+                      <Tooltip>
+                        <TooltipTrigger
+                          aria-label={`About ${label(c)}`}
+                          className="flex size-8 shrink-0 cursor-default items-center justify-center rounded-full bg-secondary outline-none focus-visible:ring-[3px] focus-visible:ring-ring/40"
+                        >
+                          <SmartphoneIcon className="size-4 text-muted-foreground" />
+                        </TooltipTrigger>
+                        <Details c={c} />
+                      </Tooltip>
                       <div>
-                        <div className="font-medium">{c.hostname ?? 'Unnamed device'}</div>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <span
+                              className={cn(
+                                'cursor-default underline decoration-dotted decoration-muted-foreground/50 underline-offset-4',
+                                c.name === undefined ? 'text-muted-foreground' : 'font-medium',
+                              )}
+                            >
+                              {label(c)}
+                            </span>
+                          </TooltipTrigger>
+                          <Details c={c} />
+                        </Tooltip>
                         <div className="font-mono text-[11px] text-muted-foreground">{c.ip ?? c.mac}</div>
                       </div>
                     </div>

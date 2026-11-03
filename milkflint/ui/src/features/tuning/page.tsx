@@ -1,4 +1,4 @@
-import { ActivityIcon, CpuIcon, EthernetPortIcon, GaugeIcon, LayersIcon, RotateCcwIcon, TimerIcon, WifiIcon } from 'lucide-react';
+import { ActivityIcon, CpuIcon, EthernetPortIcon, GaugeIcon, LayersIcon, RotateCcwIcon, TimerIcon, WifiIcon, ZapIcon } from 'lucide-react';
 import { type ReactElement, useCallback, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading, InfoRow } from '@/components/card-heading';
@@ -21,6 +21,7 @@ import { type NetworkLive, useNetworkLive } from '@/hooks/use-network-live';
 import { usePoll } from '@/hooks/use-poll';
 import { bool, type Change, getConfig, type Section, str } from '@/lib/api/uci';
 import { formatNumber, formatPercent } from '@/lib/format';
+import { href } from '@/lib/router';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
 import { GSO, takesWhole, type Whole, wholeSetting, wholeValue, withOpts, words } from '../sqm/gso';
@@ -28,6 +29,8 @@ import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
 import { type GroPort, getTuningStatus, type TuningStatus } from './api';
 import {
+  ecnDropChoices,
+  ecnDropLabel,
   ecnNow,
   type Knobs,
   knobDefaults,
@@ -56,7 +59,10 @@ import {
 //   Automatic is plain GRO up to 16 KB when the download CAKE takes GRO
 //   packets whole, fraglist GRO otherwise;
 // - the latency settings in ./knobs.ts: milkflint.steering.wifi_all,
-//   .rings_rt and .rx_delay, milkflint.cake.ecn_drop, milkflint.wifi.retries.
+//   .rings_rt and .rx_delay, milkflint.cake.ecn_drop, milkflint.wifi.retries;
+// - firewall's defaults flow_offloading: software flow offloading, as the
+//   Firewall page sets it ("1" in the image). Turning it off turns hardware
+//   offloading (flow_offloading_hw) off too, as that needs it.
 // Unset everywhere is what the image does: Restore defaults unsets them.
 // Moving to or from RSS can also switch Smart Queue's multi-queue CAKE
 // (sqm's use_mq), which only spreads over CPUs when RSS does.
@@ -79,6 +85,8 @@ interface TuningForm extends Knobs {
   /** the largest plain GRO packet in bytes, "" for the kernel's 64 KB */
   groMax: string;
   whole: Whole;
+  /** software flow offloading */
+  offload: boolean;
 }
 
 interface TuningData {
@@ -87,8 +95,8 @@ interface TuningData {
   /** network's globals section, and its packet_steering */
   globals: string | undefined;
   packetSteering: string | undefined;
-  /** the firewall's software or hardware flow offloading is on */
-  offload: boolean;
+  /** the firewall's defaults section, and whether hardware flow offloading is on */
+  firewall: { section: string; hardware: boolean } | undefined;
   /** Smart Queue's WAN queue section: multi-queue, download speed (kbit/s), CAKE's download options */
   sqm: { section: string; multiQueue: boolean; download: number; iqdiscOpts: string | undefined } | undefined;
 }
@@ -104,6 +112,7 @@ const defaults: TuningForm = {
   udpFwd: 'auto',
   groMax: '',
   whole: 'auto',
+  offload: true,
 };
 
 const groLabels: Record<Gro, string> = {
@@ -176,12 +185,13 @@ async function loadTuning(): Promise<TuningData> {
       udpFwd: udpFwd === '1' ? 'on' : udpFwd === '0' ? 'off' : 'auto',
       groMax: /^\d{4,5}$/.test(groMax) ? groMax : '',
       whole: wholeSetting(str(gro, 'whole')),
+      offload: bool(fwDefaults, 'flow_offloading'),
       ...readKnobs((name, option) => str(section(name), option)),
     },
     milkflint,
     globals: globals?.['.name'],
     packetSteering,
-    offload: bool(fwDefaults, 'flow_offloading') || bool(fwDefaults, 'flow_offloading_hw'),
+    firewall: fwDefaults === undefined ? undefined : { section: fwDefaults['.name'], hardware: bool(fwDefaults, 'flow_offloading_hw') },
     sqm:
       queue === undefined
         ? undefined
@@ -229,6 +239,7 @@ function meaning(f: TuningForm, data: TuningData | undefined): string {
     f.udpFwd,
     f.groMax,
     f.whole,
+    data?.firewall === undefined ? null : f.offload,
     f.wifiAll,
     f.ringsRt,
     f.rxDelay,
@@ -326,6 +337,11 @@ function toChanges(f: TuningForm, data: TuningData): Change[] {
         whole: wholeValue(f.whole),
       }),
     );
+  }
+  if (f.offload !== was.offload && data.firewall !== undefined) {
+    const values: Record<string, string> = { flow_offloading: f.offload ? '1' : '0' };
+    if (!f.offload && data.firewall.hardware) values['flow_offloading_hw'] = '0';
+    changes.push({ op: 'set', config: 'firewall', section: data.firewall.section, values });
   }
   // CAKE's own option, as the Smart Queue page writes it: when the setting
   // changed and CAKE doesn't already do what it asks
@@ -663,8 +679,55 @@ function GroCard({
           <>
             <InfoRow label={`In use now on ${port.dev}`}>{groNow(port)}</InfoRow>
             <InfoRow label="Smart Queue">{port.whole ? 'takes GRO packets whole' : 'splits GRO packets'}</InfoRow>
-            <InfoRow label="Flow offloading">{port.offload ? 'on (Firewall)' : 'off (Firewall)'}</InfoRow>
+            <InfoRow label="Flow offloading">{port.offload ? 'on' : 'off'}</InfoRow>
           </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function OffloadCard({
+  form,
+  data,
+  set,
+}: {
+  form: TuningForm;
+  data: TuningData;
+  set: <K extends keyof TuningForm>(key: K, value: TuningForm[K]) => void;
+}): ReactElement {
+  const hardware = data.firewall?.hardware === true;
+  return (
+    <Card>
+      <CardHeading
+        icon={ZapIcon}
+        title="Flow offloading"
+        description="A shortcut through the router for connections the firewall has already let through."
+      />
+      <CardContent className="flex flex-col gap-3">
+        {data.firewall === undefined ? (
+          <p className="text-sm text-muted-foreground">The firewall has no defaults section to set it in.</p>
+        ) : (
+          <SwitchRow
+            id="offload"
+            checked={form.offload}
+            title="Software flow offloading"
+            hint={`Once a connection is established, its packets skip most of the firewall and routing work: much less CPU at high speeds. Smart Queue still shapes them. Off sends every packet the long way, for troubleshooting.${
+              !form.offload && hardware ? ' Hardware offloading, which needs it, is turned off too.' : ''
+            }`}
+            onChange={(v) => {
+              set('offload', v);
+            }}
+          />
+        )}
+        {data.firewall !== undefined && (
+          <div className="border-t">
+            <InfoRow label="Hardware offloading">
+              <a href={href('firewall')} className="hover:underline">
+                {hardware ? 'on: Smart Queue can’t shape it (Firewall)' : 'off (Firewall)'}
+              </a>
+            </InfoRow>
+          </div>
         )}
       </CardContent>
     </Card>
@@ -737,21 +800,31 @@ function EcnCard({
         title="Smart Queue: ECN"
         description="How Smart Queue (CAKE) treats downloads that ask to be slowed by marks (ECN) rather than drops."
       />
-      <CardContent className="flex flex-col gap-3">
-        <SwitchRow
+      <CardContent className="divide-y">
+        <Field
           id="ecnDrop"
-          checked={form.ecnDrop}
-          title="Drop from downloads that ignore the marks"
-          hint="Some servers answer Smart Queue’s marks and keep sending as fast as before, so their queue stays long. Those downloads are then dropped from, as one without ECN is, and slow down; they may be a little slower. L4S traffic is always marked."
-          onChange={(v) => {
-            set('ecnDrop', v);
-          }}
-        />
-        {status !== undefined && (
-          <div className="border-t">
-            <InfoRow label="In use now">{ecnNow(status.knobs.cake_ecn, status.knobs.cake_loaded)}</InfoRow>
-          </div>
-        )}
+          label="Drop from downloads that ignore the marks"
+          hint="Some servers answer Smart Queue’s marks and keep sending as fast as before, and their queue grows until Smart Queue drops from them instead, as from a download without ECN; then they slow down. Sooner keeps that queue short; the times are at the Standard latency target, half that at Low (Smart Queue page). L4S traffic is always marked."
+        >
+          <Select
+            value={form.ecnDrop === '' ? 'default' : form.ecnDrop}
+            onValueChange={(v) => {
+              set('ecnDrop', v === 'default' ? '' : v);
+            }}
+          >
+            <SelectTrigger id="ecnDrop">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[...ecnDropChoices, ...(ecnDropChoices.includes(form.ecnDrop) ? [] : [form.ecnDrop])].map((v) => (
+                <SelectItem key={v === '' ? 'default' : v} value={v === '' ? 'default' : v}>
+                  {v === '' ? `${ecnDropLabel('')} (default)` : v === '0' ? `${ecnDropLabel(v)} (as CAKE upstream)` : ecnDropLabel(v)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        {status !== undefined && <InfoRow label="In use now">{ecnNow(status.knobs.cake_ecn, status.knobs.cake_loaded)}</InfoRow>}
       </CardContent>
     </Card>
   );
@@ -984,7 +1057,7 @@ export function TuningPage(): ReactElement {
     <>
       <PageHeader
         title="Performance Tuning"
-        description="How the router handles heavy traffic: which CPUs do the network work, how the internet port groups and hands over what it receives, how Smart Queue treats ECN, and the Wi-Fi driver. Changes apply at once; Wi-Fi and the internet stay up."
+        description="How the router handles heavy traffic: which CPUs do the network work, how the internet port groups and hands over what it receives, flow offloading, how Smart Queue treats ECN, and the Wi-Fi driver. Changes apply at once; Wi-Fi and the internet stay up."
         actions={
           <Button
             variant="outline"
@@ -1009,6 +1082,7 @@ export function TuningPage(): ReactElement {
           <div className="grid items-start gap-4 xl:grid-cols-2">
             <SteeringCard form={form} data={data} live={live.data} set={set} />
             <GroCard form={form} data={data} port={status.data?.gro[0]} set={set} />
+            <OffloadCard form={form} data={data} set={set} />
             <InterruptCard form={form} status={status.data} set={set} />
             <EcnCard form={form} status={status.data} set={set} />
             <AqlCard form={form} errors={errors} status={status.data} set={set} />
@@ -1055,7 +1129,14 @@ export function TuningPage(): ReactElement {
                 to={rxDelayLabel(defaults.rxDelay)}
                 from={data.form.rxDelay === defaults.rxDelay ? undefined : rxDelayLabel(data.form.rxDelay)}
               />
-              <RestoreItem label="Smart Queue drops downloads that ignore ECN marks" to="On" from={data.form.ecnDrop ? undefined : 'Off'} />
+              <RestoreItem
+                label="Smart Queue drops from downloads that ignore ECN marks"
+                to={ecnDropLabel(defaults.ecnDrop)}
+                from={data.form.ecnDrop === defaults.ecnDrop ? undefined : ecnDropLabel(data.form.ecnDrop)}
+              />
+              {data.firewall !== undefined && (
+                <RestoreItem label="Software flow offloading" to="On" from={data.form.offload ? undefined : 'Off'} />
+              )}
               {queueSwitch(defaults, data) !== undefined && (
                 <RestoreItem label="Smart Queue" to="multi-queue CAKE" from="single-queue CAKE" />
               )}

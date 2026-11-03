@@ -21,7 +21,7 @@ import { Switch } from '@/components/ui/switch';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { useApply } from '@/hooks/use-apply';
 import { usePoll } from '@/hooks/use-poll';
-import { getHostHints, getLeases, getNeighbors, inSubnet, ipToInt, isReachable, prefixLength } from '@/lib/api/network';
+import { getHostHints, getLeases, getNeighbors, hintName, inSubnet, ipToInt, isReachable, prefixLength } from '@/lib/api/network';
 import { type Change, getConfig, list, type Section, str } from '@/lib/api/uci';
 import { bandOf, getAccessPoints } from '@/lib/api/wireless';
 import { formatBitrate, formatDuration } from '@/lib/format';
@@ -76,7 +76,7 @@ async function loadClients(): Promise<ClientsData> {
   }
   for (const [mac, h] of Object.entries(hints)) {
     const d = devices.get(mac.toLowerCase());
-    if (d !== undefined) d.name = h.name ?? d.name;
+    if (d !== undefined) d.name = hintName(h) ?? d.name;
   }
   for (const l of leases) {
     const d = get(l.macaddr);

@@ -33,6 +33,8 @@ export interface Defaults {
   synFlood: boolean;
   /** which option holds it: fw4 reads both, OpenWrt's own config has syn_flood */
   synFloodOption: 'syn_flood' | 'synflood_protect';
+  /** synflood_rate as set ("50/second"); unset is fw4's own, SYN_RATE_FW4 */
+  synRate: string | undefined;
   dropInvalid: boolean;
   offload: boolean;
   offloadHw: boolean;
@@ -200,6 +202,7 @@ export function parseFirewall(sections: readonly Section[], milkflint: readonly 
     forward: toPolicy(str(d, 'forward'), 'DROP'),
     synFlood: bool(d, 'synflood_protect', bool(d, 'syn_flood')),
     synFloodOption: str(d, 'synflood_protect') !== undefined ? 'synflood_protect' : 'syn_flood',
+    synRate: str(d, 'synflood_rate'),
     dropInvalid: bool(d, 'drop_invalid'),
     offload: bool(d, 'flow_offloading'),
     offloadHw: bool(d, 'flow_offloading_hw'),
@@ -531,6 +534,58 @@ export function editSection(type: string, section: Section | undefined, values: 
   if (Object.keys(set).length > 0) changes.push({ op: 'set', config: 'firewall', section: section['.name'], values: set });
   if (unset.length > 0) changes.push({ op: 'unset', config: 'firewall', section: section['.name'], options: unset });
   return changes;
+}
+
+// SYN flood protection's rate: new TCP connections each address may open to
+// the router itself a second (our fw4 counts every source address on its
+// own: source/patches/0053), with twice that at once, fw4's own ratio.
+// Connections through the router aren't counted.
+/** fw4's rate when synflood_rate is unset (25/second, 50 at once). */
+export const SYN_RATE_FW4 = 25;
+/** what MilkFlint sets (its uci-defaults): 200/second, 400 at once */
+export const SYN_RATE_MILKFLINT = 200;
+export const SYN_RATE_MAX = 10_000;
+const SYN_UNITS = [
+  ['second', 1],
+  ['minute', 60],
+  ['hour', 3600],
+  ['day', 86_400],
+] as const;
+
+/** synflood_rate as fw4 reads it ("50/second", "50/s", "3000/minute", "50") in connections a second; undefined if fw4 wouldn't take it. */
+export function synRatePerSecond(value: string | undefined): number | undefined {
+  const m = /^(\d+)(?:\/([a-z]+))?$/i.exec(value ?? '');
+  if (m === null) return undefined;
+  const unit = (m[2] ?? 'second').toLowerCase();
+  const u = SYN_UNITS.find(([name]) => name.startsWith(unit));
+  return u === undefined ? undefined : Number(m[1]) / u[1];
+}
+
+/** The rate field as the page shows it: a whole number a second, or what's set if it's in other units. */
+export function synRateText(value: string | undefined): string {
+  const n = synRatePerSecond(value);
+  return value === undefined ? '' : n !== undefined && Number.isInteger(n) ? String(n) : value;
+}
+
+/** The rule in a few words for the zones table: "200/s per address", or what's set if it's in other units. */
+export function synRateLabel(value: string | undefined): string {
+  const n = synRatePerSecond(value ?? String(SYN_RATE_FW4));
+  return n !== undefined && Number.isInteger(n) ? `${String(n)}/s per address` : `${value ?? ''} per address`;
+}
+
+/** Why the field's text isn't a rate the page can set; '' (fw4's own) is one. */
+export function synRateError(text: string): string | undefined {
+  if (text === '') return undefined;
+  if (!/^\d+$/.test(text)) return 'A whole number of new connections a second.';
+  const n = Number(text);
+  return n < 1 || n > SYN_RATE_MAX ? `From 1 to ${String(SYN_RATE_MAX)} a second.` : undefined;
+}
+
+/** The options for the field's text: N a second and 2N at once, or both unset (fw4's own). */
+export function synRateValues(text: string): Values {
+  if (text === '') return { synflood_rate: undefined, synflood_burst: undefined };
+  const n = Number(text);
+  return { synflood_rate: `${String(n)}/second`, synflood_burst: String(2 * n) };
 }
 
 /** Enabled is fw4's default: unset rather than "1", as LuCI does. */

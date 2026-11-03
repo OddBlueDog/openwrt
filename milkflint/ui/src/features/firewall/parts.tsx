@@ -24,11 +24,11 @@ export function Choice<T extends string>({
   value: T;
   options: readonly { value: T; label: string; hint?: string; icon?: LucideIcon; tone?: 'allow' | 'block' }[];
   onChange: (value: T) => void;
-  columns?: 1 | 3;
+  columns?: 1 | 2 | 3;
 }): ReactElement {
   const id = useId();
   return (
-    <div role="radiogroup" aria-label={label} className={cn('grid gap-2', columns === 3 && 'sm:grid-cols-3')}>
+    <div role="radiogroup" aria-label={label} className={cn('grid gap-2', columns === 2 && 'sm:grid-cols-2', columns === 3 && 'sm:grid-cols-3')}>
       {options.map((o) => {
         const selected = o.value === value;
         const Icon = o.icon;
