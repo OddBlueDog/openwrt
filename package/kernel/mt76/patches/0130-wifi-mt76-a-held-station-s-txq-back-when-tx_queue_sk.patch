@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:28:13 +0000
+Subject: [PATCH] wifi: mt76: a held station's txq back when tx_queue_skb()
+ fails
+
+In mt76_txq_schedule_list(), the branch for a station the driver holds
+(dozing, PS buffering in the hardware) returned on an error from
+mt76_txq_send_burst() without giving the txq back to mac80211, unlike
+the awake branch. The frame tx_queue_skb() failed on (no token, no
+txwi, a DMA mapping error) was dropped there with its airtime released,
+so nothing of the station was in flight to re-arm it either: the rest of
+its frames stayed off the active list, none in the firmware to set its
+TIM bit, until new traffic for that TID came or the station woke by
+itself.
+
+Give the txq back, and schedule the worker again: no completion and
+nothing from a dozing station will. Each failure drops a frame, so this
+ends.
+
+The power save simulation's failure cases found it (a later commit).
+Reported by a Gemini review.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tx.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/tx.c b/tx.c
+index cd3f8dd8..497da7b3 100644
+--- a/tx.c
++++ b/tx.c
+@@ -682,8 +682,19 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
+ 			if (!mt76_txq_stopped(q))
+ 				n_frames = mt76_txq_send_burst(phy, q, mtxq, wcid);
+ 
+-			if (unlikely(n_frames < 0))
++			/*
++			 * The frame tx_queue_skb() failed on was dropped, its
++			 * airtime released: no completion will re-arm this
++			 * station (mt76_tx_ps_rearm()), and a dozing one sends
++			 * nothing to wake us either. Back on the list, and the
++			 * worker comes round again (each failure drops a frame,
++			 * so this ends).
++			 */
++			if (unlikely(n_frames < 0)) {
++				ieee80211_return_txq(phy->hw, txq, false);
++				mt76_worker_schedule(&dev->tx_worker);
+ 				return n_frames;
++			}
+ 
+ 			/*
+ 			 * Keep the station in the airtime scheduler only while it

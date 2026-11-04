@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:28:13 +0000
+Subject: [PATCH] wifi: mt76: mt7915: no rx BA session without a reorder buffer
+
+mt7915_ampdu_action() ignored mt76_rx_aggr_start() failing (no memory,
+or now a window of 0) and went on to give the firmware the recipient
+entry and accept the session. With SUPPORTS_REORDERING_BUFFER mac80211
+keeps no reorder buffer of its own, so the station's A-MPDUs would then
+be passed on out of order, and CCMP's replay check drops a retried
+frame behind a newer one.
+
+Refuse the session when the reorder buffer can't be set up.
+
+mt7915_main_test_ampdu_rx_no_buffer checks it. Reported by a Gemini
+review.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/main.c            | 10 ++++++++--
+ mt7915/tests/main-test.c | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 4d307ae8..01a90101 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1047,8 +1047,14 @@ mt7915_ampdu_action(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	mutex_lock(&dev->mt76.mutex);
+ 	switch (action) {
+ 	case IEEE80211_AMPDU_RX_START:
+-		mt76_rx_aggr_start(&dev->mt76, &msta->wcid, tid, ssn,
+-				   params->buf_size);
++		/*
++		 * With SUPPORTS_REORDERING_BUFFER mac80211 keeps no reorder
++		 * buffer of its own: no session without ours.
++		 */
++		ret = mt76_rx_aggr_start(&dev->mt76, &msta->wcid, tid, ssn,
++					 params->buf_size);
++		if (ret)
++			break;
+ 		ret = mt7915_mcu_add_rx_ba(dev, params, true);
+ 		/*
+ 		 * Declined: mac80211 keeps no session, so no RX_STOP will come
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 444eed9e..83ee1e28 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2306,6 +2306,33 @@ static void mt7915_main_test_ampdu_rx_declined(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_ampdu_action(hw, vif, &p), 0);
+ }
+ 
++/* A reorder buffer that can't be set up (here: no window) refuses the
++ * session before the firmware hears of it: with SUPPORTS_REORDERING_BUFFER
++ * mac80211 keeps none of its own, so an accepted session without one would
++ * pass the station's frames on out of order.
++ */
++static void mt7915_main_test_ampdu_rx_no_buffer(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_ampdu_params p;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	sta = mt7915_main_test_add_sta(test, hw, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	mt7915_main_test_clear(fake);
++
++	mt7915_main_test_ba_params(&p, sta, IEEE80211_AMPDU_RX_START);
++	p.buf_size = 0;
++	KUNIT_EXPECT_LT(test, mt7915_ampdu_action(hw, vif, &p), 0);
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(msta->wcid.aggr[5]));
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++}
++
+ /* stands in for mac80211's __ieee80211_schedule_txq() (static stub):
+  * the txqs given back with ieee80211_return_txq()
+  */
+@@ -3439,6 +3466,7 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_tx),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_rx),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_rx_declined),
++	KUNIT_CASE(mt7915_main_test_ampdu_rx_no_buffer),
+ 	KUNIT_CASE(mt7915_main_test_add_interface_after_reset),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_tx),
+ 	KUNIT_CASE(mt7915_main_test_sta_flags),

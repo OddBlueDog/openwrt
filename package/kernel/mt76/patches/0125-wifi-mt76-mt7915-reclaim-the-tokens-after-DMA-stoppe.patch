@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:08:07 +0000
+Subject: [PATCH] wifi: mt76: mt7915: reclaim the tokens after DMA stopped on a
+ full reset
+
+mt7915_mac_restart() reclaimed the tx tokens before mt7915_dma_reset()
+stopped WFDMA: each frame in flight was completed and its buffers
+unmapped while the tx descriptors still pointed at them and DMA still
+ran, as it does when the firmware is alive under load and a full reset
+follows an MCU timeout. The device could then read freed memory and send
+what's there. mt7915_dma_reset() itself says WFDMA must stop before the
+buffers its descriptors point to are freed, and the SER path already
+resets DMA first.
+
+Reset DMA first, then reclaim the tokens: the rings are fresh by then
+and nothing points at the freed buffers.
+
+mt7915_test_mac_restart checks the frame in flight is freed only after
+tx DMA stopped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 10 ++++++++--
+ mt7915/tests/mac-test.c | 34 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 151e8a69..99204da1 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1423,11 +1423,17 @@ mt7915_mac_restart(struct mt7915_dev *dev)
+ 	}
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
++	/*
++	 * DMA stopped and the rings reset before the tokens are reclaimed:
++	 * freeing a frame unmaps its buffers, which the tx descriptors still
++	 * point to while WFDMA runs (it does until mt7915_dma_reset() stops
++	 * it). The SER path takes the same order.
++	 */
++	mt7915_dma_reset(dev, true);
++
+ 	/* token reinit */
+ 	mt7915_mac_reset_tokens(dev);
+ 
+-	mt7915_dma_reset(dev, true);
+-
+ 	mt76_for_each_q_rx(mdev, i) {
+ 		if (mdev->q_rx[i].ndesc) {
+ 			napi_enable(&dev->mt76.napi[i]);
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 0b77385b..23b19b40 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -4795,8 +4795,27 @@ static void mt7915_test_soc(struct kunit *test, struct mt7915_dev *dev,
+ 			mt7915_test_soc_stop, soc), 0);
+ }
+ 
+-/* A full chip restart: tx stopped, tokens reclaimed, WFDMA and the WiFi
+- * subsystem reset and DMA restarted, then the firmware reloaded. Here the
++/* whether the frame in flight was already freed when tx DMA was first
++ * stopped (-1: not stopped yet)
++ */
++static struct sk_buff *mt7915_test_restart_skb;
++static int mt7915_test_restart_freed_at_stop;
++static u32 mt7915_test_restart_glo;	/* GLO_CFG's address, as the fake sees it */
++
++static void mt7915_test_restart_wr(struct mt76_test_fake *fake, u32 addr,
++				   u32 val)
++{
++	if (addr != mt7915_test_restart_glo ||
++	    (val & BIT(0)) ||	/* MT_WFDMA0_GLO_CFG_TX_DMA_EN */
++	    mt7915_test_restart_freed_at_stop >= 0)
++		return;
++	mt7915_test_restart_freed_at_stop =
++		mt7915_test_skb_freed(mt7915_test_restart_skb);
++}
++
++/* A full chip restart: tx stopped, WFDMA and the WiFi subsystem reset,
++ * tokens reclaimed (after DMA stopped) and DMA restarted, then the firmware
++ * reloaded. Here the
+  * RAM firmware isn't there (no files in the test VM), so the restart
+  * fails; the reset flags are cleared and tx NAPI is back either way.
+  */
+@@ -4816,6 +4835,12 @@ static void mt7915_test_mac_restart(struct kunit *test)
+ 	mt7915_test_token(test, dev, 0, &skb);
+ 	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+ 	set_bit(MT76_RESET, &phy1->mt76->state);
++	/* WFDMA running, as it is until the reset stops it */
++	mt76_set(dev, MT_WFDMA0_GLO_CFG, MT_WFDMA0_GLO_CFG_TX_DMA_EN);
++	mt7915_test_restart_glo = fake->last_addr;
++	mt7915_test_restart_skb = skb;
++	mt7915_test_restart_freed_at_stop = -1;
++	fake->wr_hook = mt7915_test_restart_wr;
+ 	/* the MT7986 has no second host interface: its registers aren't ours */
+ 	mt76_wr(dev, MT_INT1_MASK_CSR, 0x5a5a);
+ 	mt76_wr(dev, MT_INT1_SOURCE_CSR, 0xa5a5);
+@@ -4833,6 +4858,11 @@ static void mt7915_test_mac_restart(struct kunit *test)
+ 			dev->mt76.mmio.irqmask);
+ 	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb));
+ 	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, 0);
++	/* the frame in flight freed only once tx DMA had stopped: its
++	 * descriptors pointed at it until then
++	 */
++	KUNIT_EXPECT_EQ(test, mt7915_test_restart_freed_at_stop, 0);
++	fake->wr_hook = NULL;
+ 	/* DMA re-enabled after the reset */
+ 	KUNIT_EXPECT_TRUE(test, mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
+ 			  MT_WFDMA0_GLO_CFG_TX_DMA_EN);

@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 10:59:03 +0000
+Subject: [PATCH] wifi: mt76: stop a burst once its station dozes
+
+With hardware PS buffering, mt76_txq_send_burst() gives a dozing
+station one frame per AC at a time and holds the rest in mac80211's
+txqs. It checks MT_WCID_FLAG_PS only before the burst's first frame,
+though: when the PS sync event that sets it arrives while a burst is
+going out (mt7915 handles them in its MCU NAPI, maybe on another CPU),
+the burst carries on and hands the dozing station's frames to the
+hardware until the ring, AQL or the txq stops it. Those are the frames
+the PS buffering keeps from the firmware, which loses some of what it
+holds for a dozing station with the 2026-05 firmware (mt76 #1163).
+
+Check the flag for each frame of the burst, and leave the rest to the
+PS path: the txq goes back on the active list, and the next round
+finds the station dozing and its airtime pending.
+
+The power save simulation that follows (tests/ps-sim-test.c, its
+mid-burst case) found it:
+1397 frames in a run went to the hardware past the one per AC while
+held; none with this.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tx.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/tx.c b/tx.c
+index 2bae1b3b..81f8df12 100644
+--- a/tx.c
++++ b/tx.c
+@@ -590,6 +590,14 @@ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
+ 		if (stop || mt76_txq_stopped(q))
+ 			break;
+ 
++		/*
++		 * The station began to doze while the burst went out (its PS
++		 * sync event, on another CPU): the rest waits, as for any
++		 * dozing station, instead of piling up in the hardware.
++		 */
++		if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))
++			break;
++
+ 		skb = mt76_txq_dequeue(phy, mtxq);
+ 		if (!skb)
+ 			break;

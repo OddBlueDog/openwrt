@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:28:13 +0000
+Subject: [PATCH] wifi: mt76: a station removed after a full reset, before it
+ was re-added
+
+mt7915_mac_full_reset() holds the device mutex through the firmware's
+reload, seconds long. A station removal that comes meanwhile (hostapd
+dropping a client the hang made look gone) waits for it, then runs
+before mac80211's restart work has re-added anyone: on a station
+mt76_reset_device() already took off the books. phy->num_sta went below
+zero (unsigned: it wrapped), the station's bit in the wcid mask was
+cleared though the index may belong to someone else by then (the global
+wcid takes the lowest free one right after the reset), and the restarted
+firmware got a disconnect and WTBL update for a station it never had.
+
+__mt76_sta_remove() leaves num_sta and the mask alone for a wcid still
+marked MT_WCID_FLAG_RESET (one mac80211 re-adds is cleared by
+mt76_sta_add()), and mt7915 sends no disconnect, TWT teardown or WTBL
+update for it.
+
+mt7915_main_test_sta_remove_after_reset checks it. Reported by a Gemini
+review.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c               |  9 ++++++++
+ mt7915/main.c            | 19 +++++++++++----
+ mt7915/tests/main-test.c | 50 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index 7cdee77f..8d31d3ee 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1733,6 +1733,15 @@ void __mt76_sta_remove(struct mt76_phy *phy, struct ieee80211_vif *vif,
+ 	if (dev->drv->sta_remove)
+ 		dev->drv->sta_remove(dev, vif, sta);
+ 
++	/*
++	 * Removed after a full reset, before mac80211's restart work re-added
++	 * it (its removal waited for the reset's mutex): mt76_reset_device()
++	 * took it off the books already, and its index may be someone else's
++	 * by now (the global wcid's, an interface's).
++	 */
++	if (test_and_clear_bit(MT_WCID_FLAG_RESET, &wcid->flags))
++		return;
++
+ 	mt76_wcid_mask_clear(dev->wcid_mask, idx);
+ 	phy->num_sta--;
+ }
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 01a90101..f9b285bf 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -930,10 +930,17 @@ __mt7915_mac_sta_event(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 		return mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_PORT_SECURE, false);
+ 
+ 	case MT76_STA_EVENT_DISASSOC:
+-		for (i = 0; i < ARRAY_SIZE(msta->twt.flow); i++)
+-			mt7915_mac_twt_teardown_flow(dev, msta, i);
++		/*
++		 * Not re-added since a full reset: the restarted firmware has
++		 * no record or TWT agreement of it (mt7915_mac_twt_reset()).
++		 */
++		if (!test_bit(MT_WCID_FLAG_RESET, &msta->wcid.flags)) {
++			for (i = 0; i < ARRAY_SIZE(msta->twt.flow); i++)
++				mt7915_mac_twt_teardown_flow(dev, msta, i);
+ 
+-		mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_DISCONNECT, false);
++			mt7915_mcu_add_sta(dev, vif, sta,
++					   CONN_STATE_DISCONNECT, false);
++		}
+ 		msta->wcid.tx_info &= ~MT_WCID_TX_INFO_SET;
+ 		msta->wcid.sta_disabled = 1;
+ 		msta->wcid.sta = 0;
+@@ -972,8 +979,10 @@ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+ 
+-	mt7915_mac_wtbl_update(dev, msta->wcid.idx,
+-			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
++	/* after a full reset, its WTBL entry may be someone else's now */
++	if (!test_bit(MT_WCID_FLAG_RESET, &msta->wcid.flags))
++		mt7915_mac_wtbl_update(dev, msta->wcid.idx,
++				       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+ 
+ 	spin_lock_bh(&mdev->sta_poll_lock);
+ 	if (!list_empty(&msta->wcid.poll_list))
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 83ee1e28..cf01bfc2 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2333,6 +2333,55 @@ static void mt7915_main_test_ampdu_rx_no_buffer(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
+ }
+ 
++/*
++ * A station removed after a full reset, before mac80211's restart work
++ * re-added it (its removal waited for the reset to let go of the mutex):
++ * the restarted firmware never heard of it, and mt76_reset_device()
++ * already took it off the books. No firmware commands for it, and
++ * phy->num_sta and the wcid mask stay as the reset left them.
++ */
++static void mt7915_main_test_sta_remove_after_reset(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	int idx;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	sta = mt7915_main_test_add_sta(test, hw, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	KUNIT_ASSERT_EQ(test, mt76_sta_state(hw, vif, sta, IEEE80211_STA_NONE,
++					     IEEE80211_STA_AUTH), 0);
++	KUNIT_ASSERT_EQ(test, mt76_sta_state(hw, vif, sta, IEEE80211_STA_AUTH,
++					     IEEE80211_STA_ASSOC), 0);
++	idx = msta->wcid.idx;
++	KUNIT_ASSERT_EQ(test, dev->mphy.num_sta, 1);
++
++	mutex_lock(&dev->mt76.mutex);
++	mt76_reset_device(&dev->mt76);
++	/* the reset hands the index out again (mt7915_mac_full_reset() gives
++	 * the global wcid the lowest free one)
++	 */
++	mt76_wcid_mask_set(dev->mt76.wcid_mask, idx);
++	mutex_unlock(&dev->mt76.mutex);
++	KUNIT_EXPECT_EQ(test, dev->mphy.num_sta, 0);
++	mt7915_main_test_clear(fake);
++
++	KUNIT_EXPECT_EQ(test, mt76_sta_state(hw, vif, sta, IEEE80211_STA_ASSOC,
++					     IEEE80211_STA_AUTH), 0);
++	KUNIT_EXPECT_EQ(test, mt76_sta_state(hw, vif, sta, IEEE80211_STA_AUTH,
++					     IEEE80211_STA_NONE), 0);
++	KUNIT_EXPECT_EQ(test, mt76_sta_state(hw, vif, sta, IEEE80211_STA_NONE,
++					     IEEE80211_STA_NOTEXIST), 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(STA_REC_UPDATE)), 0);
++	KUNIT_EXPECT_EQ(test, dev->mphy.num_sta, 0);
++	KUNIT_EXPECT_TRUE(test, dev->mt76.wcid_mask[idx / 32] & BIT(idx % 32));
++}
++
+ /* stands in for mac80211's __ieee80211_schedule_txq() (static stub):
+  * the txqs given back with ieee80211_return_txq()
+  */
+@@ -3467,6 +3516,7 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_ampdu_rx),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_rx_declined),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_rx_no_buffer),
++	KUNIT_CASE(mt7915_main_test_sta_remove_after_reset),
+ 	KUNIT_CASE(mt7915_main_test_add_interface_after_reset),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_tx),
+ 	KUNIT_CASE(mt7915_main_test_sta_flags),

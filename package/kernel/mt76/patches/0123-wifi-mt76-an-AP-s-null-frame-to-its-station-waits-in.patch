@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:08:07 +0000
+Subject: [PATCH] wifi: mt76: an AP's null frame to its station waits in its AC
+ queue
+
+hostapd checks a station that has been silent for ap_max_inactivity with
+a poll, a null frame through nl80211 probe_client, and disassociates it
+"due to inactivity" if no ACK comes within AP_DISASSOC_DELAY (3 s). With
+no mgmt txq (mt7915 sets no STA_MMPDU_TXQ), mac80211 hands it to
+mt76_tx(), and mt76_txq_schedule_pending_wcid() puts every frame without
+data that isn't a bufferable MMPDU on the PS queue, which the firmware
+sends on ALTX at once, without PS buffering (since da6d90e4). A dozing
+station doesn't hear it, though it would have woken for it at the next
+beacon had it waited, and gets disassociated.
+
+With PS buffering in the hardware, a null frame an AP sends one of its
+stations now stays in its AC queue (VO) like data, and the firmware
+holds it until the station wakes. A station that has left still doesn't
+ACK it. A PS response, a station interface's own null frames (its PM
+signalling) and frames for a wcid without a station keep the PS queue.
+
+mt76_tx_test_schedule_poll_null and _sw_ps check the routing. The power
+save simulation's polls (tests/ps-sim-test.c, next commits) found it:
+phones and sensors missed most polls before, none after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/tx-test.c | 109 ++++++++++++++++++++++++++++++++++++++++++++++++
+ tx.c            |  32 +++++++++++++-
+ 2 files changed, 140 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tx-test.c b/tests/tx-test.c
+index 5a95e6e2..088d24a1 100644
+--- a/tests/tx-test.c
++++ b/tests/tx-test.c
+@@ -550,6 +550,113 @@ static void mt76_tx_test_schedule_held(struct kunit *test)
+  * rates set, still on the normal pending list; deauths and disassocs always
+  * do, data and 802.3-offloaded frames never.
+  */
++/* the mt7915's: a management queue and PS buffering in the hardware */
++static const struct mt76_driver_ops mt76_tx_test_drv_mgmt_hw_ps = {
++	.drv_flags = MT_DRV_HW_MGMT_TXQ | MT_DRV_HW_PS_BUFFERING,
++	.tx_complete_skb = mt76_tx_test_complete,
++};
++
++/* A null frame of @vif (a QoS one if @qos), on VO as mac80211's
++ * ieee80211_probe_client() sends it.
++ */
++static struct sk_buff *mt76_tx_test_null(struct mt76_tx_test *t,
++					 struct ieee80211_vif *vif, bool qos)
++{
++	struct sk_buff *skb;
++
++	skb = mt76_tx_test_frame(t, IEEE80211_FTYPE_DATA |
++				 (qos ? IEEE80211_STYPE_QOS_NULLFUNC :
++					IEEE80211_STYPE_NULLFUNC),
++				 IEEE80211_AC_VO);
++	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
++	IEEE80211_SKB_CB(skb)->control.vif = vif;
++	return skb;
++}
++
++/*
++ * hostapd's inactivity poll, a null frame from the AP to its station, waits
++ * in the station's AC queue with PS buffering in the hardware: on the PS
++ * queue (ALTX) it would go out at once and a dozing station would miss it.
++ * A PS response, a station interface's null frame (its PM signalling) and
++ * one for a wcid with no station still take the PS queue.
++ */
++static void mt76_tx_test_schedule_poll_null(struct kunit *test)
++{
++	struct sk_buff *poll, *qpoll, *resp, *own, *nosta_null, *deauth;
++	struct ieee80211_vif *ap, *client;
++	struct mt76_wcid *wcid, *nosta;
++	struct mt76_tx_test *t;
++	struct mt76_phy *phy;
++
++	t = mt76_tx_test_init(test, &mt76_tx_test_drv_mgmt_hw_ps);
++	phy = &t->dev->phy;
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	nosta = mt76_tx_test_wcid(t, 2, 0, false, true);
++	ap = kunit_kzalloc(test, sizeof(*ap), GFP_KERNEL);
++	client = kunit_kzalloc(test, sizeof(*client), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ap);
++	KUNIT_ASSERT_NOT_NULL(test, client);
++	ap->type = NL80211_IFTYPE_AP;
++	client->type = NL80211_IFTYPE_STATION;
++
++	poll = mt76_tx_test_null(t, ap, false);
++	qpoll = mt76_tx_test_null(t, ap, true);
++	resp = mt76_tx_test_null(t, ap, true);
++	IEEE80211_SKB_CB(resp)->control.flags |= IEEE80211_TX_CTRL_PS_RESPONSE;
++	own = mt76_tx_test_null(t, client, false);
++	nosta_null = mt76_tx_test_null(t, ap, true);
++	deauth = mt76_tx_test_frame(t, MT76_TX_TEST_MGMT(DEAUTH),
++				    IEEE80211_AC_VO);
++	IEEE80211_SKB_CB(deauth)->control.vif = ap;
++
++	mt76_tx_test_pend(phy, wcid, poll, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, qpoll, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, resp, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, own, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, wcid, deauth, &wcid->tx_pending);
++	mt76_tx_test_pend(phy, nosta, nosta_null, &nosta->tx_pending);
++
++	mt76_txq_schedule_pending(phy);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 6);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[0].skb, poll);
++	KUNIT_EXPECT_EQ(test, t->rec[0].qid, MT_TXQ_VO);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[1].skb, qpoll);
++	KUNIT_EXPECT_EQ(test, t->rec[1].qid, MT_TXQ_VO);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[2].skb, resp);
++	KUNIT_EXPECT_EQ(test, t->rec[2].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[3].skb, own);
++	KUNIT_EXPECT_EQ(test, t->rec[3].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[4].skb, deauth);
++	KUNIT_EXPECT_EQ(test, t->rec[4].qid, MT_TXQ_PSD);
++	KUNIT_EXPECT_PTR_EQ(test, t->rec[5].skb, nosta_null);
++	KUNIT_EXPECT_EQ(test, t->rec[5].qid, MT_TXQ_PSD);
++}
++
++/* Without PS buffering in the hardware (mac80211 buffers), the poll keeps
++ * the PS queue: mac80211 only hands it over once the station is awake.
++ */
++static void mt76_tx_test_schedule_poll_null_sw_ps(struct kunit *test)
++{
++	struct ieee80211_vif *ap;
++	struct mt76_wcid *wcid;
++	struct mt76_tx_test *t;
++	struct sk_buff *poll;
++
++	t = mt76_tx_test_init(test, &mt76_tx_test_drv_mgmt_txq);
++	wcid = mt76_tx_test_wcid(t, 1, 0, true, true);
++	ap = kunit_kzalloc(test, sizeof(*ap), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ap);
++	ap->type = NL80211_IFTYPE_AP;
++
++	poll = mt76_tx_test_null(t, ap, true);
++	mt76_tx_test_pend(&t->dev->phy, wcid, poll, &wcid->tx_pending);
++	mt76_txq_schedule_pending(&t->dev->phy);
++
++	KUNIT_ASSERT_EQ(test, t->n_queued, 1);
++	KUNIT_EXPECT_EQ(test, t->rec[0].qid, MT_TXQ_PSD);
++}
++
+ static void mt76_tx_test_schedule_mgmt_txq(struct kunit *test)
+ {
+ 	struct mt76_tx_test *t;
+@@ -1581,6 +1688,8 @@ static struct kunit_case mt76_tx_test_cases[] = {
+ 	KUNIT_CASE(mt76_tx_test_schedule_stopped),
+ 	KUNIT_CASE(mt76_tx_test_schedule_held),
+ 	KUNIT_CASE(mt76_tx_test_schedule_mgmt_txq),
++	KUNIT_CASE(mt76_tx_test_schedule_poll_null),
++	KUNIT_CASE(mt76_tx_test_schedule_poll_null_sw_ps),
+ 	KUNIT_CASE(mt76_tx_test_schedule_no_mgmt_txq),
+ 	KUNIT_CASE(mt76_tx_test_worker),
+ 	KUNIT_CASE(mt76_tx_test_wake_tx_queue),
+diff --git a/tx.c b/tx.c
+index eee9146d..cd3f8dd8 100644
+--- a/tx.c
++++ b/tx.c
+@@ -756,6 +756,36 @@ void mt76_txq_schedule(struct mt76_phy *phy, enum mt76_txq_id qid)
+ }
+ EXPORT_SYMBOL_GPL(mt76_txq_schedule);
+ 
++/*
++ * Whether a frame without data for a station may wait in the station's AC
++ * queue, buffered by the hardware while the station dozes, rather than go
++ * out at once on the PS queue (ALTX, no PS buffering): a bufferable
++ * management frame, and with PS buffering in the hardware also a null
++ * frame an AP sends its station. That one is hostapd's inactivity poll
++ * (nl80211 probe_client): on ALTX a dozing station misses it, though it
++ * would wake for it at the next beacon, and hostapd disassociates it "due
++ * to inactivity". A station that has left doesn't ACK it either way.
++ */
++static bool
++mt76_tx_ps_bufferable(struct mt76_dev *dev, struct mt76_wcid *wcid,
++		      struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_vif *vif = info->control.vif;
++
++	if (ieee80211_is_bufferable_mmpdu(skb))
++		return true;
++
++	if (!(dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING) || !wcid->sta ||
++	    !vif || vif->type != NL80211_IFTYPE_AP ||
++	    (info->control.flags & IEEE80211_TX_CTRL_PS_RESPONSE))
++		return false;
++
++	return ieee80211_is_nullfunc(hdr->frame_control) ||
++	       ieee80211_is_qos_nullfunc(hdr->frame_control);
++}
++
+ static int
+ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
+ 			       struct sk_buff_head *head)
+@@ -776,7 +806,7 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
+ 		    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
+ 		    !ieee80211_is_data_present(hdr->frame_control) &&
+ 		    (!(wcid->tx_info & MT_WCID_TX_INFO_SET) ||
+-		     !ieee80211_is_bufferable_mmpdu(skb) ||
++		     !mt76_tx_ps_bufferable(dev, wcid, skb) ||
+ 		     ieee80211_is_deauth(hdr->frame_control) ||
+ 		     ieee80211_is_disassoc(hdr->frame_control) ||
+ 		     head == &wcid->tx_offchannel))

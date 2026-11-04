@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:28:13 +0000
+Subject: [PATCH] milkflint tests: tx_queue_skb() failures and polls per AC in
+ the power save simulation
+
+- tx_queue_skb() failing now and then for data frames, as
+  mt76_dma_tx_queue_skb() does without a token, txwi or DMA mapping: the
+  frame reported dropped there, -ENOMEM back (cases seed 14 and the
+  32-seed mix);
+- polls that stay in their AC queue count against a held station's one
+  frame per AC like data.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/ps-sim-test.c | 43 +++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index 614e2190..f3323eae 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -163,6 +163,7 @@ struct psim_cfg {
+ 	unsigned int midburst;		/* per mille: a doze event lands mid-burst */
+ 	bool probes;			/* hostapd polls inactive stations */
+ 	unsigned int resets;		/* per mille per step: a full reset */
++	unsigned int queue_fail;	/* per mille of data frames tx_queue_skb fails */
+ 	bool one_hash;			/* every frame hashes alike: fq collisions */
+ 	enum psim_kind kinds[PSIM_MAX_STA];
+ 	int n_sta;
+@@ -192,6 +193,7 @@ struct psim {
+ 	unsigned int n_altx;
+ 	unsigned int n_probe_missed;
+ 	unsigned int n_resets;
++	unsigned long queue_fails;
+ 	unsigned long reset_lost;	/* sent to a sleeper the firmware had awake */
+ 	bool resetting;
+ 	unsigned long reset_probes_lost;	/* polls among reset_lost */
+@@ -362,6 +364,27 @@ static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 	KUNIT_ASSERT_LT(test, (int)q->queued, q->ndesc);
+ 
+ 	ac = psim_tid_to_ac[f->tid];
++	if (s->cfg->queue_fail && !f->poll &&
++	    psim_chance(s, s->cfg->queue_fail)) {
++		/*
++		 * mt76_dma_tx_queue_skb() failing: no token left, no txwi, a
++		 * DMA mapping error. It reports the frame dropped itself.
++		 */
++		struct ieee80211_tx_status status = {
++			.sta = sta,
++			.skb = skb,
++			.info = IEEE80211_SKB_CB(skb),
++		};
++
++		f->state = PF_FAILED;
++		ps->failed++;
++		ps->backlog--;
++		s->queue_fails++;
++		spin_lock_bh(&s->dev->rx_lock);
++		ieee80211_tx_status_ext(phy->hw, &status);
++		spin_unlock_bh(&s->dev->rx_lock);
++		return -ENOMEM;
++	}
+ 	f->state = PF_HW;
+ 	if (f->poll && qid == MT_TXQ_PSD) {
+ 		/*
+@@ -374,10 +397,10 @@ static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 		__skb_queue_tail(&psim_skbs, skb);
+ 		goto out;
+ 	}
+-	if (!f->poll && test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
++	if (test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
+ 		/*
+-		 * Held: one frame at a time per AC, once the AC has no
+-		 * airtime pending (it has this frame's now).
++		 * Held: one frame at a time per AC, once the AC has nothing
++		 * in flight (data or a poll waiting in the same AC queue).
+ 		 */
+ 		f->ps = true;
+ 		if (++ps->ps_out[ac] > 1 && ps->late_hits)
+@@ -940,6 +963,8 @@ static unsigned int psim_air(struct psim *s, struct psim_sta *ps,
+ 		KUNIT_ASSERT_EQ(s->test, f->state, PF_HW);
+ 		if (f->poll) {
+ 			/* buffered, it goes out once the station is awake */
++			if (f->ps)
++				ps->ps_out[ac]--;
+ 			f->state = PF_ACKED;
+ 			psim_probe_done(s, ps, f, true);
+ 			n++;
+@@ -1553,6 +1578,8 @@ static void psim_report(struct psim *s)
+ 				   psim_kind_name[ps->kind], ps->probes,
+ 				   ps->probes_acked, ps->probes_missed);
+ 	}
++	if (s->queue_fails)
++		kunit_info(s->test, "tx_queue_skb failures %lu\n", s->queue_fails);
+ 	if (s->n_resets)
+ 		kunit_info(s->test, "full resets %u, frames the firmware then sent to sleeping stations %lu (polls %lu), polls freed waiting in mt76 %lu\n",
+ 			   s->n_resets, s->reset_lost, s->reset_probes_lost,
+@@ -1707,6 +1734,9 @@ static const struct psim_cfg psim_cases[] = {
+ 	  .probes = true, PSIM_ALL_KINDS },
+ 	{ .seed = 11, .steps = 20000, .ps_sync = false, .event_delay = 3,
+ 	  .probes = true, PSIM_ALL_KINDS },
++	/* tx_queue_skb failing now and then (out of tokens) */
++	{ .seed = 14, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .queue_fail = 5, .probes = true, PSIM_ALL_KINDS },
+ 	/* full resets (firmware crash recovery) in the middle of it all */
+ 	{ .seed = 12, .steps = 20000, .ps_sync = true, .event_delay = 3,
+ 	  .resets = 1, .probes = true, .leave = 2, .late_free = 300,
+@@ -1729,7 +1759,7 @@ static const struct psim_cfg psim_cases[] = {
+ static void psim_case_desc(const struct psim_cfg *cfg, char *desc)
+ {
+ 	snprintf(desc, KUNIT_PARAM_DESC_SIZE,
+-		 "seed %u ps_sync %d delay %u%s%s%s%s%s%s%s%s", cfg->seed, cfg->ps_sync,
++		 "seed %u ps_sync %d delay %u%s%s%s%s%s%s%s%s%s", cfg->seed, cfg->ps_sync,
+ 		 cfg->event_delay, cfg->offchannel ? " scans" : "",
+ 		 cfg->leave ? " leavers" : "",
+ 		 cfg->lost_events ? " lost-events" : "",
+@@ -1737,7 +1767,8 @@ static void psim_case_desc(const struct psim_cfg *cfg, char *desc)
+ 		 cfg->one_hash ? " one-hash" : "",
+ 		 cfg->late_free ? " late-frees" : "",
+ 		 cfg->probes ? " polls" : "",
+-		 cfg->resets ? " resets" : "");
++		 cfg->resets ? " resets" : "",
++		 cfg->queue_fail ? " queue-fails" : "");
+ }
+ 
+ KUNIT_ARRAY_PARAM(psim, psim_cases, psim_case_desc);
+@@ -1764,7 +1795,7 @@ static const void *psim_seed_params(const void *prev, char *desc)
+ 				.ps_sync = true, .event_delay = 5,
+ 				.offchannel = true, .leave = 3,
+ 				.late_free = 400, .probes = true,
+-				PSIM_ALL_KINDS,
++				.queue_fail = 2, PSIM_ALL_KINDS,
+ 			};
+ 		cfg = psim_seed_cfgs;
+ 	} else if (++cfg >= psim_seed_cfgs + PSIM_SEEDS) {

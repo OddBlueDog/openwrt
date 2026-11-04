@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:08:07 +0000
+Subject: [PATCH] wifi: mt76: reorder slots for a window rounded up to a power
+ of two
+
+A buffered frame's slot is its sequence number modulo the BA window. A
+window that doesn't divide 4096 maps two sequence numbers within one
+window to the same slot where they wrap (with 63: 4095 and 0), and the
+second is freed as a duplicate, though its block ack went out: the
+transmitter never sends it again. An ADDBA request may carry any window
+up to the maximum.
+
+Round the window up to a power of two for the reorder buffer: the slots
+stay apart, and the transmitter still sends no further than the window
+it agreed to. mac80211's own reorder buffer has the same arithmetic.
+
+The rx block ack simulation (tests/rx-sim-test.c, a later commit) found
+it: with windows of 63 and 48, frames were lost at a wrap and one was
+passed on out of order; none with this.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agg-rx.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 456441aa..251675f2 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -267,6 +267,15 @@ int mt76_rx_aggr_start(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tidno,
+ 
+ 	mt76_rx_aggr_stop(dev, wcid, tidno);
+ 
++	/*
++	 * A frame's slot is its sequence number modulo the window. Unless the
++	 * window divides 4096 (a power of two), two sequence numbers within
++	 * one window share a slot where they wrap (with 63: 4095 and 0), and
++	 * the second is dropped as a duplicate though the transmitter has its
++	 * block ack. A window rounded up keeps them apart; the transmitter
++	 * still sends no further than the window it agreed to.
++	 */
++	size = roundup_pow_of_two(size);
+ 	tid = kzalloc(struct_size(tid, reorder_buf, size), GFP_KERNEL);
+ 	if (!tid)
+ 		return -ENOMEM;

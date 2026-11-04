@@ -1,0 +1,1569 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 10:59:03 +0000
+Subject: [PATCH] milkflint tests: a power save simulation on mac80211's own
+ stations
+
+tx-test.c checks the PS pieces one at a time on bare stations. How they
+work together, under mac80211's real fq flows, AQL and airtime
+scheduler, wasn't tested: a lost wakeup, a txq left off the active list,
+a dozing station whose TIM bit never gets set, airtime that is never
+given back.
+
+mt76-ps-sim runs mt76's tx path on a hw that is allocated but never
+registered, with an AP interface and sta_info stations added and
+removed through mt76_sta_state(), as mt7915 drives mac80211 on the
+GL-MT6000. Under it, a model of the firmware and the air: per-station
+buffers it sends from while the station is awake and holds while it
+dozes (its TIM bit set while it holds any), PS sync events that reach
+the driver late, tx-free events completing frames as mt7915 does.
+Its clients: a laptop that never dozes, phones that doze when idle and
+wake for their TIM bit, a Mac that leaves the channel to scan, a sensor
+that fetches one frame per PS-Poll, and a station that flips every step
+or two. Seeded randomness, so a failure replays; the tx worker runs only
+when something scheduled it.
+
+Checked as it runs and at the end: no frame freed without going on the
+air, each TID in order, an awake backlog drains, a held station has a
+frame in the firmware for each AC with frames queued and no more than
+one, AQL and non-AQL accounting back to zero. Cases add late events,
+lost events, AP scans, stations that leave (their frames dropped at
+once or completing late), doze events mid-burst, one fq bucket for
+every frame, and ps_sync off; 32 more seeds run the mix.
+
+tx.c sees mac80211's internal headers in this build only (Makefile).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Makefile            |    6 +
+ tests/ps-sim-test.c | 1493 +++++++++++++++++++++++++++++++++++++++++++
+ tx.c                |    1 +
+ 3 files changed, 1500 insertions(+)
+ create mode 100644 tests/ps-sim-test.c
+
+diff --git a/Makefile b/Makefile
+index da760841..07cd3c07 100644
+--- a/Makefile
++++ b/Makefile
+@@ -5,6 +5,12 @@ ccflags-y += -Werror -DCONFIG_MT76_LEDS
+ ifneq ($(MT76_RECORD),)
+ ccflags-y += -DCONFIG_MT76_RECORD
+ endif
++# milkflint's KUnit tests (QEMU test build only): the power save simulation
++# (tests/ps-sim-test.c) runs mt76 on mac80211's own stations and txqs, so
++# tx.c sees mac80211's internal headers there
++ifneq ($(findstring -DCONFIG_MT76_KUNIT_TEST,$(NOSTDINC_FLAGS)),)
++CFLAGS_tx.o += -I$(firstword $(wildcard $(KBUILD_EXTMOD)/../mac80211-*/backports-*/net/mac80211))
++endif
+ obj-m := mt76.o
+ obj-$(CONFIG_MT76_USB) += mt76-usb.o
+ obj-$(CONFIG_MT76_SDIO) += mt76-sdio.o
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+new file mode 100644
+index 00000000..b5691809
+--- /dev/null
++++ b/tests/ps-sim-test.c
+@@ -0,0 +1,1493 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * A power save simulation for mt76's tx path (milkflint's QEMU test build
++ * only; included at the end of tx.c, after tx-test.c).
++ *
++ * Unlike tx-test.c, the stations and txqs here are mac80211's own: a hw
++ * that is allocated but never registered, with mac80211's fq/codel flows,
++ * AQL and airtime scheduler, one AP interface and real sta_info stations,
++ * set up as mt7915 drives mac80211
++ * on the GL-MT6000 (802.3 tx encap, AP_LINK_PS, AQL, airtime fairness).
++ * Stations come and go through mt76_sta_state(), as mac80211 calls it.
++ *
++ * Under mt76's scheduler sits a model of the MT7986 firmware and the air:
++ *
++ * - The hardware ring is shared by all ACs, as on connac: the driver's
++ *   frames land in it, and DMA moves them into the firmware's per-station,
++ *   per-AC buffers, in order.
++ * - The firmware sends a station's frames while it is awake. While it
++ *   dozes they wait there (the firmware's own PS buffering), and its TIM
++ *   bit is set while any do.
++ * - Each doze and wake is reported as a PS sync event that reaches the
++ *   driver some steps later, where mt7915_mcu_rx_ps_sync() turns it into
++ *   mt76_sta_ps_transition() (dozing && ps_sync).
++ * - A tx-free event completes what was sent, as mt7915_mac_tx_free() does:
++ *   DMA cleanup, __mt76_tx_complete_skb() per frame, then the tx worker is
++ *   scheduled. The airtime used goes to mac80211's scheduler, as
++ *   mt7915_mac_sta_poll() reports it.
++ *
++ * The clients: a laptop that never dozes, a phone that dozes when idle and
++ * wakes for its TIM bit, a Mac that leaves the channel to scan whatever is
++ * queued, a sensor that stays asleep and fetches one frame per PS-Poll
++ * (more data from the firmware's buffer), and a station that flips between
++ * doze and wake every step or two.
++ *
++ * Everything random comes from a seeded PRNG, so a failing seed replays.
++ * The tx worker is parked: it runs only when something scheduled it, so a
++ * lost wakeup shows. Checked as it runs and at the end (everyone awake, run
++ * until quiet):
++ *
++ * - every frame is delivered or fails on the air: none is freed anywhere
++ *   else (except those of a station that leaves);
++ * - each TID's frames arrive in order;
++ * - an awake station's backlog drains;
++ * - a station the driver holds frames for has one in the firmware per AC
++ *   with frames queued (or the firmware has nothing to set its TIM bit for,
++ *   and it is never told to wake), and never more than one queued while
++ *   the AC has airtime pending;
++ * - AQL and non-AQL accounting go back to zero.
++ */
++/*
++ * mac80211's sta_info.h declares the same EWMA as mt76.h (signal): its copy
++ * gets other names here (DECLARE_EWMA pastes them, and the result is
++ * expanded again)
++ */
++#define ewma_signal		psim_mac80211_ewma_signal
++#define ewma_signal_init	psim_mac80211_ewma_signal_init
++#define ewma_signal_read	psim_mac80211_ewma_signal_read
++#define ewma_signal_add		psim_mac80211_ewma_signal_add
++#include "ieee80211_i.h"
++#include "sta_info.h"
++#undef ewma_signal
++#undef ewma_signal_init
++#undef ewma_signal_read
++#undef ewma_signal_add
++
++/* MODULE_IMPORT_NS() of either form: 6.12 stringifies its argument, 6.13+
++ * takes a string (and backports' module.h may or may not have caught up)
++ */
++MODULE_INFO(import_ns, "EXPORTED_FOR_KUNIT_TESTING");
++
++#define PSIM_MAX_STA		6
++#define PSIM_NDESC		256
++#define PSIM_MAX_FRAMES		(1 << 16)
++#define PSIM_BEACON		20	/* steps between beacons (DTIM 1) */
++#define PSIM_STALL		60	/* steps an awake backlog may sit */
++#define PSIM_BACKLOG		256	/* frames a station may have queued */
++
++enum psim_kind {
++	PSIM_LAPTOP,
++	PSIM_PHONE,
++	PSIM_SCANNER,
++	PSIM_SENSOR,
++	PSIM_FLAPPER,
++	__PSIM_KINDS,
++};
++
++static const char * const psim_kind_name[] = {
++	"laptop", "phone", "scanner", "sensor", "flapper",
++};
++
++enum psim_fstate {
++	PF_UNUSED,
++	PF_QUEUED,	/* in mac80211 or mt76 */
++	PF_HW,		/* handed to the hardware */
++	PF_ACKED,
++	PF_FAILED,
++	PF_DROPPED,	/* freed without going on the air */
++};
++
++struct psim_frame {
++	u8 state;
++	u8 sta;
++	u8 tid;
++	u8 gen;		/* the station's association it was for */
++	bool ps;	/* queued to the hardware while the driver held the sta */
++	u32 seq;
++	u32 step;	/* when it was queued in mac80211 */
++};
++
++struct psim_event {
++	struct list_head list;
++	u32 due;
++	u8 sta;
++	u8 gen;
++	bool dozing;
++};
++
++struct psim_sta {
++	struct sta_info *si;
++	enum psim_kind kind;
++	bool present;
++	u8 gen;
++	u16 idx;		/* its wcid */
++
++	bool dozing;		/* the truth, as the firmware knows it */
++	bool polling;		/* sensor: fetching with PS-Poll */
++	u32 wake_until;		/* scanner: back on channel; phone: idle */
++	unsigned int idle;
++
++	/* the firmware's buffers: frame ids, oldest first */
++	u32 fw[IEEE80211_NUM_ACS][PSIM_BACKLOG * 2];
++	unsigned int fw_head[IEEE80211_NUM_ACS], fw_len[IEEE80211_NUM_ACS];
++	unsigned int ps_out[IEEE80211_NUM_ACS];
++	unsigned int late_hits;	/* completions of a former station's frames */
++
++	u32 seq[IEEE80211_NUM_TIDS];
++	u32 last_rx[IEEE80211_NUM_TIDS];
++	bool rx_any[IEEE80211_NUM_TIDS];
++	unsigned int backlog;	/* frames queued and not yet done */
++	unsigned int stall;	/* steps awake with a backlog and no progress */
++	bool progress;
++	u32 airtime[IEEE80211_NUM_ACS];	/* to report to mac80211 */
++
++	/* for the report */
++	unsigned long queued, acked, failed, dropped, polls, wakes;
++	unsigned long latency_sum, latency_max;
++};
++
++struct psim_cfg {
++	u32 seed;
++	unsigned int steps;
++	bool ps_sync;			/* the driver holds a dozing sta's frames */
++	unsigned int event_delay;	/* max steps an event is late */
++	unsigned int lost_events;	/* per mille of PS sync events lost */
++	unsigned int leave;		/* per mille per step: a station leaves */
++	unsigned int late_free;		/* per mille: a leaver's frames complete late */
++	bool offchannel;		/* the AP scans now and then */
++	unsigned int midburst;		/* per mille: a doze event lands mid-burst */
++	bool one_hash;			/* every frame hashes alike: fq collisions */
++	enum psim_kind kinds[PSIM_MAX_STA];
++	int n_sta;
++};
++
++struct psim {
++	struct kunit *test;
++	const struct psim_cfg *cfg;
++	struct mt76_dev *dev;
++	struct ieee80211_hw *hw;
++	struct ieee80211_local *local;
++	struct ieee80211_sub_if_data *sdata;
++	struct txq_info *vif_txqi;
++	struct net_device *ndev;
++	struct ieee80211_supported_band sband;
++	struct mt76_queue *q;
++	bool flows;
++
++	struct psim_sta sta[PSIM_MAX_STA];
++	unsigned long wcid_used;
++	/* frames of stations that left, completing late */
++	u32 late[PSIM_BACKLOG * 4];
++	u16 late_idx[PSIM_BACKLOG * 4];
++	unsigned int n_late;
++
++	struct psim_frame *frames;
++	u32 n_frames;
++	struct list_head events;
++	u32 step;
++	u32 rng;
++	atomic_t worker_due;
++	bool quiesce;
++	unsigned int offchannel_until;
++
++	/* what went wrong, the first of each kind reported in full (noted
++	 * where the driver may hold locks, printed in psim_check())
++	 */
++	char note[8][160];
++	unsigned int n_notes;
++	unsigned int n_vanished, n_order, n_stall, n_tim, n_ps_burst;
++	/* more than one frame while held, after a former station's frames
++	 * completed on this one's wcid and released its airtime
++	 */
++	unsigned int n_ps_burst_late;
++	unsigned long tim_warn;		/* an AC held with nothing in the fw */
++	unsigned long events_lost;
++};
++
++static struct psim *psim_ctx;
++
++static __printf(2, 3) void psim_note(struct psim *s, const char *fmt, ...)
++{
++	va_list args;
++
++	if (s->n_notes >= ARRAY_SIZE(s->note))
++		return;
++	va_start(args, fmt);
++	vsnprintf(s->note[s->n_notes++], sizeof(s->note[0]), fmt, args);
++	va_end(args);
++}
++
++static void psim_print_notes(struct psim *s)
++{
++	unsigned int i;
++
++	for (i = 0; i < s->n_notes; i++)
++		kunit_info(s->test, "%s", s->note[i]);
++	s->n_notes = 0;
++}
++
++/* the skbs the firmware model holds, whatever station they are for */
++static struct sk_buff_head psim_skbs;
++
++static const u8 psim_ap_addr[ETH_ALEN] = { 0x02, 0x50, 0x53, 0x00, 0x00, 0x01 };
++static const u8 psim_lan_addr[ETH_ALEN] = { 0x02, 0x4c, 0x41, 0x4e, 0x00, 0x01 };
++static const u8 psim_tid_to_ac[8] = {
++	IEEE80211_AC_BE, IEEE80211_AC_BK, IEEE80211_AC_BK, IEEE80211_AC_BE,
++	IEEE80211_AC_VI, IEEE80211_AC_VI, IEEE80211_AC_VO, IEEE80211_AC_VO,
++};
++static const u8 psim_tids[] = { 0, 0, 0, 0, 0, 3, 5, 6, 1 };
++
++static u32 psim_rand(struct psim *s)
++{
++	/* xorshift32 */
++	s->rng ^= s->rng << 13;
++	s->rng ^= s->rng >> 17;
++	s->rng ^= s->rng << 5;
++	return s->rng;
++}
++
++static bool psim_chance(struct psim *s, unsigned int per_mille)
++{
++	return psim_rand(s) % 1000 < per_mille;
++}
++
++static unsigned int psim_range(struct psim *s, unsigned int lo, unsigned int hi)
++{
++	return lo + psim_rand(s) % (hi - lo + 1);
++}
++
++static struct mt76_wcid *psim_wcid(struct psim_sta *ps)
++{
++	return (struct mt76_wcid *)ps->si->sta.drv_priv;
++}
++
++/* the mac80211 hw ops: what mt76 drivers give it for the tx side */
++static const struct ieee80211_ops psim_hw_ops = {
++	.tx = mt76_test_tx,
++	.start = mt76_test_start,
++	.stop = mt76_test_stop,
++	.add_interface = mt76_test_add_interface,
++	.remove_interface = mt76_test_remove_interface,
++	.config = mt76_test_config,
++	.configure_filter = mt76_test_configure_filter,
++	.wake_tx_queue = mt76_wake_tx_queue,
++	.add_chanctx = ieee80211_emulate_add_chanctx,
++	.remove_chanctx = ieee80211_emulate_remove_chanctx,
++	.change_chanctx = ieee80211_emulate_change_chanctx,
++	.switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx,
++};
++
++static int psim_drv_sta_add(struct mt76_dev *dev, struct ieee80211_vif *vif,
++			    struct ieee80211_sta *sta)
++{
++	struct mt76_wcid *wcid = (struct mt76_wcid *)sta->drv_priv;
++	struct psim *s = psim_ctx;
++	int idx;
++
++	/* the lowest free index, as mt76_wcid_alloc() hands them out */
++	idx = find_next_zero_bit(&s->wcid_used, BITS_PER_LONG, 1);
++	if (idx >= BITS_PER_LONG)
++		return -ENOSPC;
++	__set_bit(idx, &s->wcid_used);
++	wcid->idx = idx;
++	wcid->sta = 1;
++	wcid->tx_info = MT_WCID_TX_INFO_SET;
++	return 0;
++}
++
++static void psim_drv_sta_remove(struct mt76_dev *dev, struct ieee80211_vif *vif,
++				struct ieee80211_sta *sta)
++{
++	struct mt76_wcid *wcid = (struct mt76_wcid *)sta->drv_priv;
++
++	__clear_bit(wcid->idx, &psim_ctx->wcid_used);
++}
++
++static void psim_drv_tx_complete(struct mt76_dev *dev,
++				 struct mt76_queue_entry *e)
++{
++}
++
++/* mt7915's tx-side driver flags */
++static const struct mt76_driver_ops psim_drv = {
++	.drv_flags = MT_DRV_TXWI_NO_FREE | MT_DRV_HW_MGMT_TXQ |
++		     MT_DRV_AMSDU_OFFLOAD | MT_DRV_HW_PS_BUFFERING,
++	.sta_add = psim_drv_sta_add,
++	.sta_remove = psim_drv_sta_remove,
++	.tx_complete_skb = psim_drv_tx_complete,
++};
++
++static u32 psim_skb_id(struct sk_buff *skb)
++{
++	return skb->mark - 1;
++}
++
++/* The hardware ring: the driver's frame goes into the firmware's buffer
++ * for its station and AC (DMA moves it there; psim_dma() frees the ring).
++ */
++static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
++			  enum mt76_txq_id qid, struct sk_buff *skb,
++			  struct mt76_wcid *wcid, struct ieee80211_sta *sta)
++{
++	struct psim *s = psim_ctx;
++	struct kunit *test = s->test;
++	u32 id = psim_skb_id(skb);
++	struct psim_frame *f;
++	struct psim_sta *ps;
++	int idx, ac, pos;
++
++	KUNIT_ASSERT_LT(test, id, s->n_frames);
++	f = &s->frames[id];
++	KUNIT_ASSERT_EQ_MSG(test, f->state, PF_QUEUED,
++			    "frame %u handed to the hardware twice", id);
++	ps = &s->sta[f->sta];
++	KUNIT_ASSERT_TRUE(test, ps->present && ps->gen == f->gen);
++	KUNIT_ASSERT_PTR_EQ(test, wcid, psim_wcid(ps));
++	KUNIT_ASSERT_LT(test, (int)q->queued, q->ndesc);
++
++	ac = psim_tid_to_ac[f->tid];
++	f->state = PF_HW;
++	if (test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
++		/*
++		 * Held: one frame at a time per AC, once the AC has no
++		 * airtime pending (it has this frame's now).
++		 */
++		f->ps = true;
++		if (++ps->ps_out[ac] > 1 && ps->late_hits)
++			s->n_ps_burst_late++;
++		else if (ps->ps_out[ac] > 1 && !s->n_ps_burst++)
++			psim_note(s, "step %u: %s got %u frames on AC %d while held (AQL pending %d us)\n",
++				  s->step, psim_kind_name[ps->kind],
++				  ps->ps_out[ac], ac,
++				  atomic_read(&ps->si->airtime[ac].aql_tx_pending));
++	}
++
++	KUNIT_ASSERT_LT(test, ps->fw_len[ac], ARRAY_SIZE(ps->fw[ac]));
++	pos = (ps->fw_head[ac] + ps->fw_len[ac]) % ARRAY_SIZE(ps->fw[ac]);
++	ps->fw[ac][pos] = id;
++	ps->fw_len[ac]++;
++	ps->progress = true;
++	__skb_queue_tail(&psim_skbs, skb);
++
++	/*
++	 * mt7915 handles PS sync events in its MCU NAPI, maybe on another
++	 * CPU while the tx worker is in the middle of a burst: the next doze
++	 * event lands now (only a doze: set_bit, nothing locked).
++	 */
++	if (s->cfg->midburst && !list_empty(&s->events) &&
++	    psim_chance(s, s->cfg->midburst)) {
++		struct psim_event *ev = list_first_entry(&s->events,
++						struct psim_event, list);
++		struct psim_sta *eps = &s->sta[ev->sta];
++
++		if (ev->dozing && eps->present && eps->gen == ev->gen) {
++			list_del(&ev->list);
++			mt76_sta_ps_transition(s->dev, psim_wcid(eps),
++					       s->cfg->ps_sync);
++			kfree(ev);
++		}
++	}
++
++	/* the skb stays with the firmware model until it completes */
++	idx = q->head;
++	q->head = (q->head + 1) % q->ndesc;
++	q->queued++;
++	return idx;
++}
++
++static void psim_dma(struct psim *s)
++{
++	struct mt76_queue *q = s->q;
++	bool stopped = q->queued + MT_TXQ_FREE_THR >= q->ndesc;
++
++	q->queued = 0;
++	q->tail = q->head;
++	/* as mt76_dma_tx_cleanup() wakes tx once a stopped ring has room */
++	if (stopped)
++		mt76_worker_schedule(&s->dev->tx_worker);
++}
++
++static void psim_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q,
++			    bool flush)
++{
++	struct psim *s = psim_ctx;
++
++	/* the scheduler asks before the ring fills; DMA may not be done */
++	if (flush || psim_chance(s, 500))
++		psim_dma(s);
++}
++
++static void psim_kick(struct mt76_dev *dev, struct mt76_queue *q)
++{
++}
++
++static const struct mt76_queue_ops psim_queue_ops = {
++	.tx_queue_skb = psim_queue_skb,
++	.tx_cleanup = psim_tx_cleanup,
++	.kick = psim_kick,
++};
++
++/* what the skbs are freed with: one that never went on the air vanished */
++static void psim_skb_destructor(struct sk_buff *skb)
++{
++	struct psim *s = psim_ctx;
++	struct psim_frame *f;
++	u32 id;
++
++	if (!s || !skb->mark)
++		return;
++	id = psim_skb_id(skb);
++	if (id >= s->n_frames)
++		return;
++	f = &s->frames[id];
++	if (f->state == PF_ACKED || f->state == PF_FAILED)
++		return;
++	if (f->state == PF_QUEUED || f->state == PF_HW) {
++		struct psim_sta *ps = &s->sta[f->sta];
++		bool hw = f->state == PF_HW;
++
++		f->state = PF_DROPPED;
++		/* a station that left takes its frames with it */
++		if (!ps->present || ps->gen != f->gen)
++			return;
++		ps->dropped++;
++		if (ps->backlog)
++			ps->backlog--;
++		if (!s->n_vanished++)
++			psim_note(s, "step %u: %s's frame %u (tid %u seq %u) freed while %s, without going on the air\n",
++				  s->step, psim_kind_name[ps->kind], id,
++				  f->tid, f->seq,
++				  hw ? "in the hardware" : "queued");
++	}
++}
++
++static void psim_free(void *data)
++{
++	struct psim *s = data;
++	struct psim_event *ev, *tmp;
++	int i;
++
++	list_for_each_entry_safe(ev, tmp, &s->events, list) {
++		list_del(&ev->list);
++		kfree(ev);
++	}
++	/* what the firmware model still held (a test that stopped early) */
++	s->quiesce = true;
++	skb_queue_purge(&psim_skbs);
++	if (!s->hw)
++		return;
++
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++
++		if (!ps->si)
++			continue;
++		if (ps->present) {
++			mt76_sta_pre_rcu_remove(s->hw, &s->sdata->vif,
++						&ps->si->sta);
++			synchronize_rcu();
++			mt76_worker_enable(&s->dev->tx_worker);
++			mt76_sta_state(s->hw, &s->sdata->vif, &ps->si->sta,
++				       IEEE80211_STA_NONE,
++				       IEEE80211_STA_NOTEXIST);
++			mt76_worker_disable(&s->dev->tx_worker);
++		}
++		wiphy_lock(s->hw->wiphy);
++		ieee80211_purge_sta_txqs(ps->si);
++		sta_info_free(s->local, ps->si);
++		wiphy_unlock(s->hw->wiphy);
++		ps->si = NULL;
++	}
++	if (s->vif_txqi)
++		ieee80211_txq_purge(s->local, s->vif_txqi);
++	if (s->flows)
++		ieee80211_txq_teardown_flows(s->local);
++	kfree(s->vif_txqi);
++	kfree(s->sdata);
++	if (s->ndev)
++		free_netdev(s->ndev);
++	psim_ctx = NULL;
++}
++
++static struct ieee80211_channel psim_chan = {
++	.band = NL80211_BAND_5GHZ,
++	.center_freq = 5180,
++	.hw_value = 36,
++};
++
++static struct ieee80211_rate psim_rates[] = {
++	{ .bitrate = 60, .flags = IEEE80211_RATE_MANDATORY_A },
++	{ .bitrate = 120, .flags = IEEE80211_RATE_MANDATORY_A },
++	{ .bitrate = 240, .flags = IEEE80211_RATE_MANDATORY_A },
++	{ .bitrate = 540 },
++};
++
++static void psim_worker_stub(struct mt76_worker *w)
++{
++	/* the kthread only runs between unparking and parking again */
++	atomic_set(&psim_ctx->worker_due, 1);
++}
++
++static int psim_sta_join(struct psim *s, int i);
++
++static struct psim *psim_init(struct kunit *test, const struct psim_cfg *cfg)
++{
++	struct ieee80211_sub_if_data *sdata;
++	struct mt76_phy *phy;
++	struct ieee80211_hw *hw;
++	struct mt76_dev *dev;
++	struct mt76_queue *q;
++	struct psim *s;
++	int i, ac;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	s->test = test;
++	s->cfg = cfg;
++	s->rng = cfg->seed ?: 1;
++	INIT_LIST_HEAD(&s->events);
++	s->frames = kunit_kcalloc(test, PSIM_MAX_FRAMES, sizeof(*s->frames),
++				  GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s->frames);
++	psim_ctx = s;
++
++	dev = mt76_test_dev(test, sizeof(*dev), &psim_hw_ops, &psim_drv);
++	s->dev = dev;
++	hw = dev->hw;
++	s->hw = hw;
++	s->local = hw_to_local(hw);
++	phy = &dev->phy;
++	dev->queue_ops = &psim_queue_ops;
++	/* freed before the device (KUnit runs actions in reverse) */
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, psim_free, s), 0);
++
++	/* one ring for every data AC and the PS queue, as on connac */
++	q = devm_kzalloc(dev->dev, sizeof(*q), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, q);
++	q->entry = devm_kcalloc(dev->dev, PSIM_NDESC, sizeof(*q->entry),
++				GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, q->entry);
++	q->ndesc = PSIM_NDESC;
++	spin_lock_init(&q->lock);
++	spin_lock_init(&q->cleanup_lock);
++	s->q = q;
++	INIT_LIST_HEAD(&phy->tx_list);
++	spin_lock_init(&phy->tx_lock);
++	for (i = 0; i < __MT_TXQ_MAX; i++)
++		phy->q_tx[i] = q;
++
++	/* parked: mt76_worker_schedule() only sets its flag */
++	KUNIT_ASSERT_EQ(test, mt76_worker_setup(hw, &dev->tx_worker,
++			psim_worker_stub, "psim"), 0);
++	mt76_worker_disable(&dev->tx_worker);
++
++	/* what mt76_phy_init() and mt7915 set that matters on the tx side */
++	hw->queues = IEEE80211_NUM_ACS;
++	hw->txq_data_size = sizeof(struct mt76_txq);
++	hw->sta_data_size = sizeof(struct mt76_wcid);
++	hw->vif_data_size = sizeof(struct mt76_vif_link);
++	ieee80211_hw_set(hw, HAS_RATE_CONTROL);
++	ieee80211_hw_set(hw, SUPPORTS_TX_ENCAP_OFFLOAD);
++	ieee80211_hw_set(hw, SUPPORTS_RX_DECAP_OFFLOAD);
++	ieee80211_hw_set(hw, AP_LINK_PS);
++	ieee80211_hw_set(hw, AMPDU_AGGREGATION);
++	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
++	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_AQL);
++	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_AIRTIME_FAIRNESS);
++
++	s->sband.band = NL80211_BAND_5GHZ;
++	s->sband.channels = &psim_chan;
++	s->sband.n_channels = 1;
++	s->sband.bitrates = psim_rates;
++	s->sband.n_bitrates = ARRAY_SIZE(psim_rates);
++	s->sband.ht_cap.ht_supported = true;
++	s->sband.vht_cap.vht_supported = true;
++	hw->wiphy->bands[NL80211_BAND_5GHZ] = &s->sband;
++
++	KUNIT_ASSERT_EQ(test, 0, ieee80211_txq_setup_flows(s->local));
++	s->flows = true;
++	/* nothing may be dropped for sitting in a txq: a dozing station's
++	 * frames wait as long as it sleeps
++	 */
++	s->local->cparams.target = MS2TIME(100000);
++	s->local->cparams.interval = MS2TIME(100000);
++	s->local->fq.limit = PSIM_MAX_FRAMES;
++	s->local->fq.memory_limit = 64 << 20;
++
++	/* the AP interface, as ieee80211_if_add() and do_open() leave it */
++	sdata = kzalloc(sizeof(*sdata) + hw->vif_data_size, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, sdata);
++	s->sdata = sdata;
++	s->ndev = alloc_netdev_dummy(0);
++	KUNIT_ASSERT_NOT_NULL(test, s->ndev);
++	strscpy(sdata->name, "psim0");
++	sdata->local = s->local;
++	sdata->wdev.wiphy = hw->wiphy;
++	sdata->wdev.iftype = NL80211_IFTYPE_AP;
++	sdata->vif.type = NL80211_IFTYPE_AP;
++	memcpy(sdata->vif.addr, psim_ap_addr, ETH_ALEN);
++	sdata->flags = IEEE80211_SDATA_IN_DRIVER;
++	sdata->control_port_protocol = cpu_to_be16(ETH_P_PAE);
++	sdata->bss = &sdata->u.ap;
++	INIT_LIST_HEAD(&sdata->u.ap.vlans);
++	skb_queue_head_init(&sdata->u.ap.ps.bc_buf);
++	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++)
++		sdata->vif.hw_queue[ac] = ac;
++	sdata->deflink.sdata = sdata;
++	sdata->deflink.conf = &sdata->vif.bss_conf;
++	sdata->vif.bss_conf.vif = &sdata->vif;
++	memcpy(sdata->vif.bss_conf.addr, psim_ap_addr, ETH_ALEN);
++	sdata->vif.bss_conf.bssid = sdata->vif.bss_conf.addr;
++	rcu_assign_pointer(sdata->vif.link_conf[0], &sdata->vif.bss_conf);
++	rcu_assign_pointer(sdata->link[0], &sdata->deflink);
++
++	s->vif_txqi = kzalloc(sizeof(struct txq_info) + hw->txq_data_size,
++			      GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s->vif_txqi);
++	ieee80211_txq_init(sdata, NULL, s->vif_txqi, 0);
++
++	for (i = 0; i < cfg->n_sta; i++) {
++		s->sta[i].kind = cfg->kinds[i];
++		KUNIT_ASSERT_EQ(test, psim_sta_join(s, i), 0);
++	}
++
++	return s;
++}
++
++/* A station associates: allocated as ieee80211_add_station() does, added
++ * to the driver through mt76_sta_state() as sta_info_insert() would.
++ */
++static int psim_sta_join(struct psim *s, int i)
++{
++	struct psim_sta *ps = &s->sta[i];
++	u8 addr[ETH_ALEN] = { 0x02, 0x53, 0x54, 0x41, ps->gen + 1, i };
++	struct sta_info *si;
++	int ret, tid;
++
++	KUNIT_ASSERT_NULL(s->test, ps->si);
++	si = sta_info_alloc(s->sdata, addr, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(s->test, si);
++	si->uploaded = true;
++	si->sta.wme = true;
++	set_bit(WLAN_STA_AUTH, &si->_flags);
++	set_bit(WLAN_STA_ASSOC, &si->_flags);
++	set_bit(WLAN_STA_AUTHORIZED, &si->_flags);
++	/* HE80 MCS 9 2SS: airtime estimates are known */
++	si->deflink.tx_stats.last_rate_info = (struct rate_info) {
++		.flags = RATE_INFO_FLAGS_HE_MCS,
++		.mcs = 9,
++		.nss = 2,
++		.bw = RATE_INFO_BW_80,
++		.he_gi = NL80211_RATE_INFO_HE_GI_0_8,
++	};
++
++	ret = mt76_sta_state(s->hw, &s->sdata->vif, &si->sta,
++			     IEEE80211_STA_NOTEXIST, IEEE80211_STA_NONE);
++	if (ret) {
++		sta_info_free(s->local, si);
++		return ret;
++	}
++
++	ps->si = si;
++	ps->present = true;
++	ps->idx = ((struct mt76_wcid *)si->sta.drv_priv)->idx;
++	ps->dozing = false;
++	ps->polling = false;
++	ps->idle = 0;
++	ps->stall = 0;
++	ps->backlog = 0;
++	memset(ps->fw_len, 0, sizeof(ps->fw_len));
++	memset(ps->ps_out, 0, sizeof(ps->ps_out));
++	memset(ps->airtime, 0, sizeof(ps->airtime));
++	ps->late_hits = 0;
++	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++) {
++		ps->seq[tid] = 0;
++		ps->rx_any[tid] = false;
++	}
++	return 0;
++}
++
++static void psim_event(struct psim *s, struct psim_sta *ps, bool dozing)
++{
++	struct psim_event *ev, *pos;
++
++	if (s->cfg->lost_events && !s->quiesce &&
++	    psim_chance(s, s->cfg->lost_events)) {
++		s->events_lost++;
++		return;
++	}
++
++	ev = kzalloc(sizeof(*ev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(s->test, ev);
++	ev->sta = ps - s->sta;
++	ev->gen = ps->gen;
++	ev->dozing = dozing;
++	ev->due = s->step + (s->quiesce ? 0 :
++			     psim_range(s, 0, s->cfg->event_delay));
++	/* the firmware's events arrive in the order it sent them */
++	list_for_each_entry(pos, &s->events, list)
++		if (pos->due > ev->due)
++			pos->due = ev->due;
++	list_add_tail(&ev->list, &s->events);
++}
++
++static void psim_set_dozing(struct psim *s, struct psim_sta *ps, bool dozing)
++{
++	if (ps->dozing == dozing)
++		return;
++	ps->dozing = dozing;
++	if (!dozing)
++		ps->wakes++;
++	psim_event(s, ps, dozing);
++}
++
++/* PS sync events whose time has come: mt7915_mcu_rx_ps_sync() */
++static void psim_deliver_events(struct psim *s)
++{
++	struct psim_event *ev, *tmp;
++
++	list_for_each_entry_safe(ev, tmp, &s->events, list) {
++		struct psim_sta *ps = &s->sta[ev->sta];
++
++		if (ev->due > s->step)
++			break;
++		list_del(&ev->list);
++		/* mt76_wcid_ptr() finds no station: dropped */
++		if (ps->present && ps->gen == ev->gen)
++			mt76_sta_ps_transition(s->dev, psim_wcid(ps),
++					       s->cfg->ps_sync && ev->dozing);
++		kfree(ev);
++	}
++}
++
++static bool psim_fw_pending(struct psim_sta *ps)
++{
++	int ac;
++
++	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++)
++		if (ps->fw_len[ac])
++			return true;
++	return false;
++}
++
++/* the frame that leaves the firmware's buffer next, highest AC first */
++static int psim_fw_next(struct psim_sta *ps, u32 *id)
++{
++	int ac;
++
++	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++		if (!ps->fw_len[ac])
++			continue;
++		*id = ps->fw[ac][ps->fw_head[ac]];
++		ps->fw_head[ac] = (ps->fw_head[ac] + 1) % ARRAY_SIZE(ps->fw[ac]);
++		ps->fw_len[ac]--;
++		return ac;
++	}
++	return -1;
++}
++
++static void psim_complete(struct psim *s, u16 idx, struct sk_buff *skb,
++			  bool acked)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++
++	/* the status mt7915's tx-free event gives */
++	memset(&info->status, 0, sizeof(info->status));
++	info->status.rates[0].idx = -1;
++	if (acked)
++		info->flags |= IEEE80211_TX_STAT_ACK;
++	__mt76_tx_complete_skb(s->dev, idx, skb, NULL);
++}
++
++/* the skb of frame @id, out of the firmware model */
++static struct sk_buff *psim_take_skb(u32 id)
++{
++	struct sk_buff *skb;
++
++	skb_queue_walk(&psim_skbs, skb)
++		if (psim_skb_id(skb) == id) {
++			__skb_unlink(skb, &psim_skbs);
++			return skb;
++		}
++	return NULL;
++}
++
++/* The air: the firmware sends up to @burst frames of @ps, and they are
++ * acked or fail; the completions go out as one tx-free event.
++ */
++static unsigned int psim_air(struct psim *s, struct psim_sta *ps,
++			     unsigned int burst)
++{
++	struct mt76_wcid *wcid = psim_wcid(ps);
++	unsigned int n = 0;
++	u32 id;
++	int ac;
++
++	while (n < burst && (ac = psim_fw_next(ps, &id)) >= 0) {
++		struct psim_frame *f = &s->frames[id];
++		struct sk_buff *skb = psim_take_skb(id);
++		bool acked = !psim_chance(s, 30);
++		u32 lat = s->step - f->step;
++
++		KUNIT_ASSERT_NOT_NULL(s->test, skb);
++		KUNIT_ASSERT_EQ(s->test, f->state, PF_HW);
++		if (f->ps)
++			ps->ps_out[ac]--;
++		f->state = acked ? PF_ACKED : PF_FAILED;
++		if (acked) {
++			ps->acked++;
++			if (ps->rx_any[f->tid] &&
++			    f->seq <= ps->last_rx[f->tid] && !s->n_order++)
++				psim_note(s, "step %u: %s got tid %u seq %u after seq %u\n",
++					  s->step, psim_kind_name[ps->kind],
++					  f->tid, f->seq,
++					  ps->last_rx[f->tid]);
++			ps->rx_any[f->tid] = true;
++			ps->last_rx[f->tid] = f->seq;
++		} else {
++			ps->failed++;
++		}
++		ps->latency_sum += lat;
++		ps->latency_max = max_t(unsigned long, ps->latency_max, lat);
++		ps->airtime[ac] += ieee80211_info_get_tx_time_est(IEEE80211_SKB_CB(skb)) ?: 10;
++		ps->backlog--;
++		ps->progress = true;
++		n++;
++		psim_complete(s, wcid->idx, skb, acked);
++	}
++	return n;
++}
++
++/* A tx-free event's other half, as mt7915_mac_tx_free_done() does it. */
++static void psim_tx_free_done(struct psim *s)
++{
++	/* a TID of each AC */
++	static const u8 ac_tid[IEEE80211_NUM_ACS] = { 6, 5, 0, 1 };
++	int i, ac;
++
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++
++		if (!ps->present)
++			continue;
++		/* mt7915_mac_sta_poll(): the airtime used, per AC */
++		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++			if (!ps->airtime[ac])
++				continue;
++			ieee80211_sta_register_airtime(&ps->si->sta, ac_tid[ac],
++						       ps->airtime[ac], 0);
++			ps->airtime[ac] = 0;
++		}
++	}
++	mt76_worker_schedule(&s->dev->tx_worker);
++}
++
++/* What a station does this step, by kind. */
++static void psim_behave(struct psim *s, struct psim_sta *ps, bool beacon)
++{
++	bool tim = psim_fw_pending(ps);
++
++	if (s->quiesce) {
++		psim_set_dozing(s, ps, false);
++		ps->polling = false;
++		return;
++	}
++
++	switch (ps->kind) {
++	case PSIM_LAPTOP:
++		break;
++	case PSIM_PHONE:
++		if (!ps->dozing) {
++			/* asleep after a few idle steps */
++			if (ps->progress)
++				ps->idle = 0;
++			else if (++ps->idle > psim_range(s, 3, 15))
++				psim_set_dozing(s, ps, true);
++		} else if ((beacon && tim) || psim_chance(s, 3)) {
++			/* its TIM bit, or an app sends */
++			psim_set_dozing(s, ps, false);
++			ps->idle = 0;
++		}
++		break;
++	case PSIM_SCANNER:
++		if (!ps->dozing && psim_chance(s, 15)) {
++			/* off channel for a scan, whatever is queued */
++			psim_set_dozing(s, ps, true);
++			ps->wake_until = s->step + psim_range(s, 3, 40);
++		} else if (ps->dozing && s->step >= ps->wake_until) {
++			psim_set_dozing(s, ps, false);
++		}
++		break;
++	case PSIM_SENSOR:
++		if (!ps->dozing) {
++			if (s->step >= ps->wake_until)
++				psim_set_dozing(s, ps, true);
++		} else if (psim_chance(s, 1)) {
++			/* it reports in now and then */
++			psim_set_dozing(s, ps, false);
++			ps->wake_until = s->step + psim_range(s, 1, 5);
++		} else if (beacon && tim) {
++			/* PS-Poll: no PM change, no PS sync event */
++			ps->polling = true;
++		}
++		break;
++	case PSIM_FLAPPER:
++		if (psim_chance(s, 500))
++			psim_set_dozing(s, ps, !ps->dozing);
++		break;
++	default:
++		break;
++	}
++}
++
++static void psim_transmit(struct psim *s)
++{
++	int i;
++	bool any = false;
++
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++
++		if (!ps->present)
++			continue;
++		if (!ps->dozing) {
++			if (psim_air(s, ps, s->quiesce ? 1024 :
++				     psim_range(s, 1, 48)))
++				any = true;
++		} else if (ps->polling) {
++			/* one frame per PS-Poll, more data from the buffer */
++			ps->polls++;
++			if (psim_air(s, ps, 1))
++				any = true;
++			ps->polling = psim_fw_pending(ps);
++		}
++	}
++
++	/* the late completions of stations that left */
++	if (s->n_late && (s->quiesce || psim_chance(s, 300))) {
++		unsigned int j;
++
++		for (j = 0; j < s->n_late; j++) {
++			struct sk_buff *skb = psim_take_skb(s->late[j]);
++			int k;
++
++			/* the wcid may be a new station's by now */
++			for (k = 0; k < s->cfg->n_sta; k++)
++				if (s->sta[k].present &&
++				    s->sta[k].idx == s->late_idx[j])
++					s->sta[k].late_hits++;
++
++			KUNIT_ASSERT_NOT_NULL(s->test, skb);
++			s->frames[s->late[j]].state = PF_FAILED;
++			psim_complete(s, s->late_idx[j], skb, false);
++		}
++		s->n_late = 0;
++		any = true;
++	}
++
++	if (any || psim_chance(s, 700))
++		psim_dma(s);
++	if (any)
++		psim_tx_free_done(s);
++}
++
++static void psim_enqueue(struct psim *s, struct psim_sta *ps, u8 tid)
++{
++	struct ieee80211_txq *txq = ps->si->sta.txq[tid];
++	unsigned int len = psim_range(s, 64, 1500);
++	struct ieee80211_tx_info *info;
++	struct psim_frame *f;
++	struct sk_buff *skb;
++	struct ethhdr *eth;
++	u8 ac = psim_tid_to_ac[tid];
++	u32 id;
++
++	if (s->n_frames >= PSIM_MAX_FRAMES)
++		return;
++	id = s->n_frames++;
++	f = &s->frames[id];
++	f->state = PF_QUEUED;
++	f->sta = ps - s->sta;
++	f->tid = tid;
++	f->gen = ps->gen;
++	f->seq = ps->seq[tid]++;
++	f->step = s->step;
++
++	skb = alloc_skb(len + 64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(s->test, skb);
++	skb_reserve(skb, 64);
++	eth = skb_put_zero(skb, len);
++	memcpy(eth->h_dest, ps->si->sta.addr, ETH_ALEN);
++	memcpy(eth->h_source, psim_lan_addr, ETH_ALEN);
++	eth->h_proto = htons(ETH_P_IP);
++	skb->priority = tid;
++	skb->dev = s->ndev;
++	skb->mark = id + 1;
++	/*
++	 * A flow per station and TID, each in an fq bucket of its own
++	 * (fq_flow_idx() takes the top 12 bits), as real traffic mostly is;
++	 * or the blank headers' hash for all (one_hash): every station's
++	 * frames then share fq's bucket
++	 */
++	if (!s->cfg->one_hash)
++		skb_set_hash(skb, ((f->sta * IEEE80211_NUM_TIDS + tid + 1) << 24) |
++			     (f->gen << 8), PKT_HASH_TYPE_L4);
++	skb->destructor = psim_skb_destructor;
++	skb_set_queue_mapping(skb, ac);
++
++	info = IEEE80211_SKB_CB(skb);
++	memset(info, 0, sizeof(*info));
++	info->hw_queue = s->sdata->vif.hw_queue[ac];
++	info->band = NL80211_BAND_5GHZ;
++	info->flags = IEEE80211_TX_CTL_HW_80211_ENCAP;
++	info->control.vif = &s->sdata->vif;
++
++	ps->queued++;
++	ps->backlog++;
++	/* ieee80211_queue_skb(): enqueue, schedule, wake the driver */
++	ieee80211_txq_enqueue(s->local, to_txq_info(txq), skb);
++	ieee80211_schedule_txq(s->hw, txq);
++	mt76_wake_tx_queue(s->hw, txq);
++}
++
++static void psim_traffic(struct psim *s)
++{
++	static const unsigned int rate[] = {
++		[PSIM_LAPTOP] = 400, [PSIM_PHONE] = 120, [PSIM_SCANNER] = 250,
++		[PSIM_SENSOR] = 15, [PSIM_FLAPPER] = 250,
++	};
++	int i, n;
++
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++		u8 tid;
++
++		if (!ps->present || !psim_chance(s, rate[ps->kind]))
++			continue;
++		tid = psim_tids[psim_rand(s) % ARRAY_SIZE(psim_tids)];
++		for (n = psim_range(s, 1, 12); n; n--)
++			if (ps->backlog < PSIM_BACKLOG)
++				psim_enqueue(s, ps, tid);
++	}
++}
++
++/* the tx worker, if anything scheduled it */
++static bool psim_worker(struct psim *s)
++{
++	struct mt76_dev *dev = s->dev;
++
++	if (!test_and_clear_bit(MT76_WORKER_SCHEDULED, &dev->tx_worker.state) &&
++	    !atomic_xchg(&s->worker_due, 0))
++		return false;
++	mt76_tx_worker_run(dev);
++	return true;
++}
++
++/* A station leaves: mac80211's __sta_info_destroy() order. What the
++ * firmware still buffers for it is flushed now, or (late_free) completes
++ * after it has gone, maybe once its wcid belongs to a new station.
++ */
++static void psim_sta_leave(struct psim *s, int i)
++{
++	struct psim_sta *ps = &s->sta[i];
++	struct mt76_dev *dev = s->dev;
++	bool late = psim_chance(s, s->cfg->late_free);
++	u16 idx = ps->idx;
++	bool due;
++	u32 id;
++	int ac;
++
++	mt76_sta_pre_rcu_remove(s->hw, &s->sdata->vif, &ps->si->sta);
++	synchronize_rcu();
++
++	/* sta_remove: STA_REC removed, the firmware drops what it holds */
++	while ((ac = psim_fw_next(ps, &id)) >= 0) {
++		if (late && s->n_late < ARRAY_SIZE(s->late)) {
++			s->late[s->n_late] = id;
++			s->late_idx[s->n_late++] = idx;
++			continue;
++		}
++		s->frames[id].state = PF_FAILED;
++		psim_complete(s, idx, psim_take_skb(id), false);
++	}
++
++	due = test_bit(MT76_WORKER_SCHEDULED, &dev->tx_worker.state);
++	/* running, as mt76_sta_remove() expects to find it */
++	mt76_worker_enable(&dev->tx_worker);
++	mt76_sta_state(s->hw, &s->sdata->vif, &ps->si->sta,
++		       IEEE80211_STA_NONE, IEEE80211_STA_NOTEXIST);
++	/* mt76_sta_remove() parked and unparked the worker (and scheduled
++	 * it): park it again, keep what it was asked for
++	 */
++	mt76_worker_disable(&dev->tx_worker);
++	atomic_set(&s->worker_due, 1);
++	if (due)
++		set_bit(MT76_WORKER_SCHEDULED, &dev->tx_worker.state);
++
++	ps->present = false;
++	wiphy_lock(s->hw->wiphy);
++	ieee80211_purge_sta_txqs(ps->si);
++	sta_info_free(s->local, ps->si);
++	wiphy_unlock(s->hw->wiphy);
++	ps->si = NULL;
++	ps->gen++;
++
++	/* and associates again */
++	KUNIT_ASSERT_EQ(s->test, psim_sta_join(s, i), 0);
++}
++
++/* The checks that hold after every step. */
++static void psim_check(struct psim *s)
++{
++	struct mt76_dev *dev = s->dev;
++	bool blocked = test_bit(MT76_RESET, &dev->phy.state) ||
++		       dev->phy.offchannel || mt76_txq_stopped(s->q) ||
++		       test_bit(MT76_WORKER_SCHEDULED, &dev->tx_worker.state) ||
++		       atomic_read(&s->worker_due);
++	int i, tid;
++
++	psim_print_notes(s);
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++		struct mt76_wcid *wcid;
++		unsigned long frames, bytes;
++		bool queued[IEEE80211_NUM_ACS] = {};
++		bool any = false;
++		int ac;
++
++		if (!ps->present)
++			continue;
++		wcid = psim_wcid(ps);
++		for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++) {
++			ieee80211_txq_get_depth(ps->si->sta.txq[tid], &frames,
++						&bytes);
++			if (frames) {
++				queued[psim_tid_to_ac[tid & 7]] = true;
++				any = true;
++			}
++		}
++
++		/*
++		 * Held by the driver: each AC with frames in mac80211 has
++		 * one in the firmware, or nothing sets the TIM bit for them.
++		 */
++		if (!blocked && test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
++			bool fw_any = psim_fw_pending(ps);
++
++			for (ac = 0; ac < IEEE80211_NUM_ACS; ac++)
++				if (queued[ac] && !ps->fw_len[ac])
++					s->tim_warn++;
++			if (any && !fw_any && !s->n_tim++)
++				kunit_info(s->test, "step %u: %s held with frames queued and none in the firmware: its TIM bit stays clear\n",
++					   s->step, psim_kind_name[ps->kind]);
++		}
++
++		/* awake on both sides: the backlog moves */
++		if (!ps->dozing && !test_bit(MT_WCID_FLAG_PS, &wcid->flags) &&
++		    any && !ps->progress && !blocked) {
++			if (++ps->stall == PSIM_STALL && !s->n_stall++)
++				kunit_info(s->test, "step %u: %s awake, %u frames queued, nothing sent for %u steps\n",
++					   s->step, psim_kind_name[ps->kind],
++					   ps->backlog, PSIM_STALL);
++		} else {
++			ps->stall = 0;
++		}
++		ps->progress = false;
++	}
++}
++
++static void psim_step(struct psim *s)
++{
++	bool beacon = !(s->step % PSIM_BEACON);
++	unsigned int order = psim_rand(s);
++	int i, k;
++
++	s->step++;
++	if (!s->quiesce)
++		psim_traffic(s);
++
++	/* the firmware's events, the stations and the air, in some order */
++	for (k = 0; k < 3; k++) {
++		switch ((order >> (2 * k)) % 3) {
++		case 0:
++			psim_deliver_events(s);
++			break;
++		case 1:
++			for (i = 0; i < s->cfg->n_sta; i++)
++				if (s->sta[i].present)
++					psim_behave(s, &s->sta[i], beacon);
++			break;
++		default:
++			psim_transmit(s);
++			break;
++		}
++		if (psim_chance(s, 300))
++			psim_worker(s);
++	}
++
++	/* the AP scans now and then (mt76_set_channel()) */
++	if (s->cfg->offchannel && !s->quiesce) {
++		if (!s->dev->phy.offchannel && psim_chance(s, 3)) {
++			s->dev->phy.offchannel = true;
++			s->offchannel_until = s->step + psim_range(s, 5, 50);
++		} else if (s->dev->phy.offchannel &&
++			   s->step >= s->offchannel_until) {
++			s->dev->phy.offchannel = false;
++			mt76_worker_schedule(&s->dev->tx_worker);
++		}
++	}
++	if (s->quiesce && s->dev->phy.offchannel) {
++		s->dev->phy.offchannel = false;
++		mt76_worker_schedule(&s->dev->tx_worker);
++	}
++
++	if (s->cfg->leave && !s->quiesce && psim_chance(s, s->cfg->leave)) {
++		i = psim_rand(s) % s->cfg->n_sta;
++		if (s->sta[i].kind != PSIM_LAPTOP)
++			psim_sta_leave(s, i);
++	}
++
++	while (psim_worker(s))
++		;
++	psim_check(s);
++}
++
++static bool psim_busy(struct psim *s)
++{
++	int i;
++
++	if (!list_empty(&s->events) || s->n_late)
++		return true;
++	for (i = 0; i < s->cfg->n_sta; i++)
++		if (s->sta[i].present && s->sta[i].backlog)
++			return true;
++	return false;
++}
++
++static void psim_report(struct psim *s)
++{
++	int i;
++
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++		unsigned long done = ps->acked + ps->failed;
++
++		kunit_info(s->test, "%-8s queued %lu acked %lu failed %lu dropped %lu wakes %lu polls %lu latency avg %lu max %lu steps%s\n",
++			   psim_kind_name[ps->kind], ps->queued, ps->acked,
++			   ps->failed, ps->dropped, ps->wakes, ps->polls,
++			   done ? ps->latency_sum / done : 0, ps->latency_max,
++			   ps->gen ? " (rejoined)" : "");
++	}
++	if (s->events_lost || s->tim_warn || s->n_ps_burst_late ||
++	    (s->cfg->one_hash && s->n_order))
++		kunit_info(s->test, "events lost %lu, AC-steps held with nothing in the firmware %lu, extra frames while held after late completions %u, out of order (fq collisions) %u\n",
++			   s->events_lost, s->tim_warn, s->n_ps_burst_late,
++			   s->cfg->one_hash ? s->n_order : 0);
++}
++
++static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
++{
++	struct psim *s;
++	unsigned int n;
++	int i, ac;
++	u32 id;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, cfg);
++
++	for (n = 0; n < cfg->steps; n++)
++		psim_step(s);
++
++	/*
++	 * Lost wake events leave the driver holding an awake station until
++	 * its next doze and wake. Count them, then have the firmware report
++	 * everyone again so the end checks look at the rest.
++	 */
++	for (i = 0; i < cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++
++		struct psim_event *ev;
++		bool on_its_way = false;
++
++		list_for_each_entry(ev, &s->events, list)
++			if (ev->sta == i && ev->gen == ps->gen)
++				on_its_way = true;
++		if (ps->present && !ps->dozing && !on_its_way &&
++		    test_bit(MT_WCID_FLAG_PS, &psim_wcid(ps)->flags))
++			kunit_info(test, "%s held while awake at the end (a lost wake event)\n",
++				   psim_kind_name[ps->kind]);
++	}
++
++	/* everyone awake, every event delivered, until nothing moves */
++	s->quiesce = true;
++	if (cfg->lost_events)
++		for (i = 0; i < cfg->n_sta; i++)
++			if (s->sta[i].present)
++				psim_event(s, &s->sta[i], s->sta[i].dozing);
++	for (n = 0; n < 2000 && psim_busy(s); n++)
++		psim_step(s);
++	for (n = 0; n < 10; n++)
++		psim_step(s);
++
++	psim_print_notes(s);
++	psim_report(s);
++
++	KUNIT_EXPECT_EQ_MSG(test, s->n_vanished, 0,
++			    "frames freed without going on the air");
++	/*
++	 * In one fq bucket, a station's frames end up in two flows when
++	 * another station held the bucket's flow at first (its tin's default
++	 * flow, then the bucket's): mac80211's fq can then send newer ones
++	 * first. Holding frames makes those collisions last; that's fq's,
++	 * reported above.
++	 */
++	if (!cfg->one_hash)
++		KUNIT_EXPECT_EQ_MSG(test, s->n_order, 0, "frames out of order");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_stall, 0, "awake stations stalled");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_tim, 0,
++			    "held stations with nothing in the firmware");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_ps_burst, 0,
++			    "more than one frame per AC while held");
++	KUNIT_EXPECT_FALSE_MSG(test, psim_busy(s), "still busy after %u steps",
++			       n);
++
++	for (i = 0; i < cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++		struct mt76_wcid *wcid;
++
++		if (!ps->present)
++			continue;
++		wcid = psim_wcid(ps);
++		KUNIT_EXPECT_EQ_MSG(test, ps->backlog, 0, "%s",
++				    psim_kind_name[ps->kind]);
++		KUNIT_EXPECT_FALSE_MSG(test,
++				       test_bit(MT_WCID_FLAG_PS, &wcid->flags),
++				       "%s still held", psim_kind_name[ps->kind]);
++		KUNIT_EXPECT_EQ_MSG(test,
++				    atomic_read(&wcid->non_aql_packets), 0,
++				    "%s non-AQL", psim_kind_name[ps->kind]);
++		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++			KUNIT_EXPECT_EQ_MSG(test, ps->fw_len[ac], 0, "%s AC %d",
++					    psim_kind_name[ps->kind], ac);
++			KUNIT_EXPECT_EQ_MSG(test,
++				atomic_read(&ps->si->airtime[ac].aql_tx_pending),
++				0, "%s AQL AC %d", psim_kind_name[ps->kind], ac);
++		}
++	}
++	KUNIT_EXPECT_EQ(test, atomic_read(&s->local->aql_total_pending_airtime),
++			0);
++	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++)
++		KUNIT_EXPECT_EQ(test,
++			atomic_read(&s->local->aql_ac_pending_airtime[ac]), 0);
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&psim_skbs));
++
++	/* every frame ended on the air, or with the station that left */
++	for (id = 0; id < s->n_frames; id++) {
++		struct psim_frame *f = &s->frames[id];
++
++		if (f->state == PF_ACKED || f->state == PF_FAILED)
++			continue;
++		if (f->state == PF_DROPPED &&
++		    (f->gen != s->sta[f->sta].gen || !s->sta[f->sta].present))
++			continue;
++		KUNIT_FAIL(test, "frame %u (%s tid %u seq %u) ended in state %u",
++			   id, psim_kind_name[s->sta[f->sta].kind], f->tid,
++			   f->seq, f->state);
++		break;
++	}
++	skb_queue_purge(&psim_skbs);
++}
++
++/* the five kinds of client, the laptop first */
++#define PSIM_ALL_KINDS \
++	.kinds = { PSIM_LAPTOP, PSIM_PHONE, PSIM_SCANNER, PSIM_SENSOR, \
++		   PSIM_FLAPPER, PSIM_PHONE }, \
++	.n_sta = 6
++
++static const struct psim_cfg psim_cases[] = {
++	{ .seed = 1, .steps = 20000, .ps_sync = true, .event_delay = 2,
++	  PSIM_ALL_KINDS },
++	{ .seed = 2, .steps = 20000, .ps_sync = true, .event_delay = 8,
++	  PSIM_ALL_KINDS },
++	{ .seed = 3, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .offchannel = true, PSIM_ALL_KINDS },
++	{ .seed = 4, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .leave = 3, .late_free = 500, PSIM_ALL_KINDS },
++	{ .seed = 5, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .lost_events = 20, PSIM_ALL_KINDS },
++	{ .seed = 6, .steps = 20000, .ps_sync = true, .event_delay = 4,
++	  .offchannel = true, .leave = 2, .late_free = 300,
++	  .lost_events = 5, PSIM_ALL_KINDS },
++	/* doze events landing in the middle of the tx worker's bursts */
++	{ .seed = 8, .steps = 20000, .ps_sync = true, .event_delay = 4,
++	  .midburst = 200, PSIM_ALL_KINDS },
++	/* every frame in fq's same bucket: with and without holding */
++	{ .seed = 9, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .one_hash = true, PSIM_ALL_KINDS },
++	{ .seed = 9, .steps = 20000, .ps_sync = false, .event_delay = 3,
++	  .one_hash = true, PSIM_ALL_KINDS },
++	/* leavers whose frames the firmware drops at once */
++	{ .seed = 10, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .leave = 3, PSIM_ALL_KINDS },
++	/* as stock mt76: every event says awake, nothing is held */
++	{ .seed = 7, .steps = 20000, .ps_sync = false, .event_delay = 3,
++	  .offchannel = true, .leave = 2, PSIM_ALL_KINDS },
++};
++
++static void psim_case_desc(const struct psim_cfg *cfg, char *desc)
++{
++	snprintf(desc, KUNIT_PARAM_DESC_SIZE,
++		 "seed %u ps_sync %d delay %u%s%s%s%s%s%s", cfg->seed, cfg->ps_sync,
++		 cfg->event_delay, cfg->offchannel ? " scans" : "",
++		 cfg->leave ? " leavers" : "",
++		 cfg->lost_events ? " lost-events" : "",
++		 cfg->midburst ? " mid-burst" : "",
++		 cfg->one_hash ? " one-hash" : "",
++		 cfg->late_free ? " late-frees" : "");
++}
++
++KUNIT_ARRAY_PARAM(psim, psim_cases, psim_case_desc);
++
++static void mt76_psim_test_run(struct kunit *test)
++{
++	psim_run(test, test->param_value);
++}
++
++/* the same mix with many seeds, shorter */
++#define PSIM_SEEDS	32
++
++static struct psim_cfg psim_seed_cfgs[PSIM_SEEDS];
++
++static const void *psim_seed_params(const void *prev, char *desc)
++{
++	const struct psim_cfg *cfg = prev;
++	int i;
++
++	if (!prev) {
++		for (i = 0; i < PSIM_SEEDS; i++)
++			psim_seed_cfgs[i] = (struct psim_cfg) {
++				.seed = 100 + i, .steps = 3000,
++				.ps_sync = true, .event_delay = 5,
++				.offchannel = true, .leave = 3,
++				.late_free = 400, PSIM_ALL_KINDS,
++			};
++		cfg = psim_seed_cfgs;
++	} else if (++cfg >= psim_seed_cfgs + PSIM_SEEDS) {
++		return NULL;
++	}
++	psim_case_desc(cfg, desc);
++	return cfg;
++}
++
++static struct kunit_case mt76_psim_test_cases[] = {
++	KUNIT_CASE_PARAM(mt76_psim_test_run, psim_gen_params),
++	KUNIT_CASE_PARAM(mt76_psim_test_run, psim_seed_params),
++	{}
++};
++
++static struct kunit_suite mt76_psim_test_suite = {
++	.name = "mt76-ps-sim",
++	.test_cases = mt76_psim_test_cases,
++};
++
++kunit_test_suites(&mt76_psim_test_suite);
+diff --git a/tx.c b/tx.c
+index 81f8df12..eee9146d 100644
+--- a/tx.c
++++ b/tx.c
+@@ -1130,4 +1130,5 @@ EXPORT_SYMBOL_GPL(mt76_rx_token_release);
+ 
+ #if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
+ #include "tests/tx-test.c"
++#include "tests/ps-sim-test.c"
+ #endif

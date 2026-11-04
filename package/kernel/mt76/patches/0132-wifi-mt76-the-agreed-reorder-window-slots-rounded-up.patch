@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:28:13 +0000
+Subject: [PATCH] wifi: mt76: the agreed reorder window, slots rounded up apart
+
+0124 rounded the BA window itself up to a power of two, to keep the
+slots of two in-window sequence numbers apart at the 4096 wrap. That
+also moved the point where the window slides: a transmitter that gave a
+frame up without a BAR (or whose BAR was lost) moves on as soon as it
+sends past its own window, and with a window of 65 rounded to 128 the
+reorder buffer held the next 63 frames back until its timeout (40-100
+ms) instead.
+
+Keep the agreed window (tid->win) for sliding it, and the rounded-up
+count (tid->size) for the slots only. A window of 0, which nothing can
+be rounded up from (roundup_pow_of_two(0) is undefined), is refused.
+
+mt76_test_aggr_window_odd: 1-64 with 0 lost, then 65 passes 1-65 on at
+once. mt76_test_aggr_start_no_window: refused, nothing left. Reported by
+a Gemini review.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agg-rx.c            | 29 +++++++++++++++++------------
+ mt76.h              |  3 ++-
+ tests/agg-rx-test.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 59 insertions(+), 13 deletions(-)
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 5429e619..9dff1f13 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -233,10 +233,12 @@ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames)
+ 
+ 	/*
+ 	 * Frame sequence number exceeds buffering window, free up some space
+-	 * by releasing previous frames
++	 * by releasing previous frames. The window is the agreed one, not the
++	 * slots rounded up: a transmitter that gave a frame up without a BAR
++	 * moves on past it as soon as it sends beyond its own window.
+ 	 */
+-	if (!ieee80211_sn_less(seqno, head + size)) {
+-		head = ieee80211_sn_inc(ieee80211_sn_sub(seqno, size));
++	if (!ieee80211_sn_less(seqno, head + tid->win)) {
++		head = ieee80211_sn_inc(ieee80211_sn_sub(seqno, tid->win));
+ 		mt76_rx_aggr_release_frames(tid, frames, head);
+ 	}
+ 
+@@ -267,22 +269,25 @@ int mt76_rx_aggr_start(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tidno,
+ 
+ 	mt76_rx_aggr_stop(dev, wcid, tidno);
+ 
++	if (!size)
++		return -EINVAL;
++
+ 	/*
+-	 * A frame's slot is its sequence number modulo the window. Unless the
+-	 * window divides 4096 (a power of two), two sequence numbers within
+-	 * one window share a slot where they wrap (with 63: 4095 and 0), and
+-	 * the second is dropped as a duplicate though the transmitter has its
+-	 * block ack. A window rounded up keeps them apart; the transmitter
+-	 * still sends no further than the window it agreed to.
++	 * A frame's slot is its sequence number modulo the slots. Unless they
++	 * divide 4096 (a power of two), two sequence numbers within one window
++	 * share a slot where they wrap (with 63: 4095 and 0), and the second
++	 * is dropped as a duplicate though the transmitter has its block ack.
++	 * Slots rounded up keep them apart; the window stays as agreed.
+ 	 */
+-	size = roundup_pow_of_two(size);
+-	tid = kzalloc(struct_size(tid, reorder_buf, size), GFP_KERNEL);
++	tid = kzalloc(struct_size(tid, reorder_buf, roundup_pow_of_two(size)),
++		      GFP_KERNEL);
+ 	if (!tid)
+ 		return -ENOMEM;
+ 
+ 	tid->dev = dev;
+ 	tid->head = ssn;
+-	tid->size = size;
++	tid->size = roundup_pow_of_two(size);
++	tid->win = size;
+ 	tid->num = tidno;
+ 	INIT_DELAYED_WORK(&tid->reorder_work, mt76_rx_aggr_reorder_work);
+ 	spin_lock_init(&tid->lock);
+diff --git a/mt76.h b/mt76.h
+index e1c0d70e..539dbfc2 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -482,7 +482,8 @@ struct mt76_rx_tid {
+ 
+ 	u16 id;
+ 	u16 head;
+-	u16 size;
++	u16 size;	/* slots: the window rounded up to a power of two */
++	u16 win;	/* the window the session agreed */
+ 	u16 nframes;
+ 
+ 	u8 num;
+diff --git a/tests/agg-rx-test.c b/tests/agg-rx-test.c
+index 6f697074..df4fbd44 100644
+--- a/tests/agg-rx-test.c
++++ b/tests/agg-rx-test.c
+@@ -454,6 +454,44 @@ static void mt76_test_aggr_window(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, tid->nframes, 1);
+ }
+ 
++/*
++ * A window that isn't a power of two (65, its slots rounded up to 128)
++ * still moves on at the window the session agreed: the transmitter gave
++ * up on 0 and its BAR never came, and 65, past the agreed window, passes
++ * 1-65 on at once instead of waiting for the reorder timeout.
++ */
++static void mt76_test_aggr_window_odd(struct kunit *test)
++{
++	struct mt76_test_aggr *a = mt76_test_aggr(test, true, 0, 65);
++	struct mt76_rx_tid *tid = mt76_test_aggr_tid(a, 0);
++	int sn;
++
++	for (sn = 1; sn <= 64; sn++)
++		mt76_test_aggr_rx(a, mt76_test_aggr_skb(test, a->wcid, sn));
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&a->frames));
++	KUNIT_EXPECT_EQ(test, tid->nframes, 64);
++
++	mt76_test_aggr_rx(a, mt76_test_aggr_skb(test, a->wcid, 65));
++	KUNIT_EXPECT_EQ(test, skb_queue_len(&a->frames), 65);
++	KUNIT_EXPECT_EQ(test, tid->head, 66);
++	KUNIT_EXPECT_EQ(test, tid->nframes, 0);
++	__skb_queue_purge(&a->frames);
++}
++
++/* A session with no window is refused (an exported function: nothing to
++ * round up), and no reorder buffer is left.
++ */
++static void mt76_test_aggr_start_no_window(struct kunit *test)
++{
++	struct mt76_test_aggr *a = mt76_test_aggr(test, false, 100, 64);
++
++	mutex_lock(&a->dev->mutex);
++	KUNIT_EXPECT_EQ(test, mt76_rx_aggr_start(a->dev, a->wcid, 1, 100, 0),
++			-EINVAL);
++	mutex_unlock(&a->dev->mutex);
++	KUNIT_EXPECT_NULL(test, mt76_test_aggr_tid(a, 1));
++}
++
+ /* Sequence numbers wrap at 4096. */
+ static void mt76_test_aggr_wrap(struct kunit *test)
+ {
+@@ -708,6 +746,8 @@ static struct kunit_case mt76_agg_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_aggr_in_order),
+ 	KUNIT_CASE(mt76_test_aggr_hole),
+ 	KUNIT_CASE(mt76_test_aggr_window),
++	KUNIT_CASE(mt76_test_aggr_window_odd),
++	KUNIT_CASE(mt76_test_aggr_start_no_window),
+ 	KUNIT_CASE(mt76_test_aggr_wrap),
+ 	KUNIT_CASE(mt76_test_aggr_link_wcid),
+ 	KUNIT_CASE(mt76_test_aggr_bar_release),

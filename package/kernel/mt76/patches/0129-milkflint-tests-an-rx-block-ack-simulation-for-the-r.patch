@@ -1,0 +1,339 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:08:07 +0000
+Subject: [PATCH] milkflint tests: an rx block ack simulation for the reorder
+ buffer
+
+mt76-rx-sim: a transmitter sends A-MPDUs within its BA window, the air
+loses MPDUs and block acks (so frames come again), after a few tries it
+gives a frame up and sends a BAR, across about three sequence number
+wraps. Every MPDU goes through mt76_rx_aggr_reorder(). Checked: what's
+passed on is in order and each frame once, and every frame that arrived
+is passed on unless it came behind the window. Windows of 64, 256, 1024
+and 32, and of 6, 48, 63, 100 and 255 as ADDBA requests may carry.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agg-rx.c            |   1 +
+ tests/rx-sim-test.c | 302 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 303 insertions(+)
+ create mode 100644 tests/rx-sim-test.c
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 251675f2..5429e619 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -332,4 +332,5 @@ EXPORT_SYMBOL_GPL(mt76_rx_aggr_stop);
+ 
+ #if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
+ #include "tests/agg-rx-test.c"
++#include "tests/rx-sim-test.c"
+ #endif
+diff --git a/tests/rx-sim-test.c b/tests/rx-sim-test.c
+new file mode 100644
+index 00000000..8c553f26
+--- /dev/null
++++ b/tests/rx-sim-test.c
+@@ -0,0 +1,302 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * A block ack session simulation for mt76's rx reorder buffer (milkflint's
++ * QEMU test build only; included at the end of agg-rx.c, after
++ * agg-rx-test.c, whose helpers it uses).
++ *
++ * A transmitter (the BA originator, as a client sending to the AP) sends
++ * A-MPDUs within its window: what the last block ack didn't confirm first,
++ * then new frames. The air loses some MPDUs, and some block acks, so the
++ * transmitter sends frames again that the AP already has. After a few
++ * tries it gives a frame up, moves its window on and sends a BAR. Each
++ * MPDU that arrives goes through mt76_rx_aggr_reorder() as mt76's rx path
++ * hands it over, across several wraps of the 12-bit sequence numbers.
++ *
++ * Checked: what the reorder buffer passes on is in order and each frame
++ * once; every frame that arrived is passed on, unless it came after the
++ * window had moved past it (a duplicate, or one the transmitter gave up on
++ * and a BAR released). The reorder timeout's work is cancelled after each
++ * frame: the run takes far less than its 100 ms, and here it's the
++ * synchronous path under test (agg-rx-test.c tests the work).
++ *
++ * Window sizes: the powers of two clients ask for (64, 256 for HE, 1024
++ * for EHT), and others an ADDBA request may carry (6, 48, 63, 100).
++ */
++
++#define RXSIM_FRAMES	12000		/* about three sequence number wraps */
++#define RXSIM_RETRIES	4		/* tries before the transmitter gives up */
++
++struct rxsim_cfg {
++	u32 seed;
++	u16 ssn;
++	u16 size;
++	unsigned int loss;		/* per mille of MPDUs lost */
++	unsigned int ba_loss;		/* per mille of block acks lost */
++};
++
++struct rxsim {
++	struct kunit *test;
++	struct mt76_test_aggr *a;
++	const struct rxsim_cfg *cfg;
++	u32 rng;
++
++	/* per frame, by its number since the session started */
++	u8 *tx_tries;
++	bool *tx_acked;			/* what the transmitter knows */
++	bool *tx_given_up;
++	bool *rx_got;			/* it arrived */
++	bool *rx_late;			/* it arrived behind the window */
++	bool *delivered;
++	u32 win, next;			/* the transmitter's window and next new */
++
++	u32 last_delivered;
++	bool any_delivered;
++	unsigned int n_order, n_twice, n_lost, n_bars, n_dups, n_rx;
++	u32 first_lost;
++};
++
++static u32 rxsim_rand(struct rxsim *s)
++{
++	s->rng ^= s->rng << 13;
++	s->rng ^= s->rng >> 17;
++	s->rng ^= s->rng << 5;
++	return s->rng;
++}
++
++static bool rxsim_chance(struct rxsim *s, unsigned int per_mille)
++{
++	return rxsim_rand(s) % 1000 < per_mille;
++}
++
++static u16 rxsim_sn(struct rxsim *s, u32 n)
++{
++	return (s->cfg->ssn + n) & IEEE80211_SN_MASK;
++}
++
++/* what the reorder buffer passed on */
++static void rxsim_collect(struct rxsim *s)
++{
++	struct sk_buff *skb;
++
++	while ((skb = __skb_dequeue(&s->a->frames)) != NULL) {
++		u32 n = skb->mark - 1;
++
++		skb->destructor = NULL;
++		if (n < RXSIM_FRAMES) {
++			if (s->delivered[n] && !s->n_twice++)
++				kunit_info(s->test, "frame %u (sn %u) passed on twice\n",
++					   n, rxsim_sn(s, n));
++			if (s->any_delivered && n <= s->last_delivered &&
++			    !s->n_order++)
++				kunit_info(s->test, "frame %u (sn %u) passed on after frame %u\n",
++					   n, rxsim_sn(s, n), s->last_delivered);
++			s->delivered[n] = true;
++			s->last_delivered = n;
++			s->any_delivered = true;
++		}
++		kfree_skb(skb);
++	}
++}
++
++static void rxsim_rx(struct rxsim *s, struct sk_buff *skb)
++{
++	struct mt76_rx_tid *tid;
++
++	local_bh_disable();
++	rcu_read_lock();
++	mt76_rx_aggr_reorder(skb, &s->a->frames);
++	tid = rcu_dereference(s->a->wcid->aggr[0]);
++	if (tid)
++		cancel_delayed_work(&tid->reorder_work);
++	rcu_read_unlock();
++	local_bh_enable();
++	rxsim_collect(s);
++}
++
++/* MPDU @n arrives at the AP */
++static void rxsim_mpdu(struct rxsim *s, u32 n)
++{
++	struct mt76_rx_tid *tid;
++	struct sk_buff *skb;
++	u16 sn = rxsim_sn(s, n);
++
++	rcu_read_lock();
++	tid = rcu_dereference(s->a->wcid->aggr[0]);
++	/* behind the window already: the reorder buffer may drop it */
++	if (tid && tid->started && ieee80211_sn_less(sn, tid->head))
++		s->rx_late[n] = true;
++	rcu_read_unlock();
++
++	if (s->rx_got[n])
++		s->n_dups++;
++	s->rx_got[n] = true;
++	s->n_rx++;
++	skb = mt76_test_aggr_skb(s->test, s->a->wcid, sn);
++	skb->mark = n + 1;
++	rxsim_rx(s, skb);
++}
++
++/* a BAR for the transmitter's window start, as it sends one after giving
++ * frames up (mt76_rx_aggr_check_ctl())
++ */
++static void rxsim_bar(struct rxsim *s)
++{
++	struct mt76_rx_status *status;
++	struct ieee80211_bar *bar;
++	struct sk_buff *skb;
++
++	skb = alloc_skb(sizeof(*bar) + 16, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(s->test, skb);
++	bar = skb_put_zero(skb, sizeof(*bar));
++	bar->frame_control = cpu_to_le16(IEEE80211_FTYPE_CTL |
++					 IEEE80211_STYPE_BACK_REQ);
++	bar->control = cpu_to_le16(0);	/* TID 0 */
++	bar->start_seq_num = cpu_to_le16(IEEE80211_SN_TO_SEQ(rxsim_sn(s, s->win)));
++	status = (struct mt76_rx_status *)skb->cb;
++	status->wcid = s->a->wcid;
++	status->aggr = 0;
++	status->band = NL80211_BAND_2GHZ;
++	status->freq = 2412;
++	s->n_bars++;
++	rxsim_rx(s, skb);
++}
++
++/* one A-MPDU and its block ack */
++static void rxsim_ampdu(struct rxsim *s)
++{
++	u32 sent[256], n;
++	unsigned int len = 0, max = 1 + rxsim_rand(s) % min_t(u32, s->cfg->size, 64);
++	bool ba_lost = rxsim_chance(s, s->cfg->ba_loss);
++	bool gave_up = false;
++	unsigned int i;
++
++	/* retransmissions first, then new frames, all within the window */
++	for (n = s->win; n < s->next && len < max; n++)
++		if (!s->tx_acked[n] && !s->tx_given_up[n])
++			sent[len++] = n;
++	while (len < max && s->next < RXSIM_FRAMES &&
++	       s->next < s->win + s->cfg->size)
++		sent[len++] = s->next++;
++
++	for (i = 0; i < len; i++) {
++		n = sent[i];
++		s->tx_tries[n]++;
++		if (rxsim_chance(s, s->cfg->loss))
++			continue;
++		rxsim_mpdu(s, n);
++		if (!ba_lost)
++			s->tx_acked[n] = true;
++	}
++	/* now and then a frame it already has, again */
++	if (s->win < s->next && rxsim_chance(s, 20)) {
++		n = s->win + rxsim_rand(s) % (s->next - s->win);
++		if (s->rx_got[n])
++			rxsim_mpdu(s, n);
++	}
++
++	for (i = 0; i < len; i++) {
++		n = sent[i];
++		if (!s->tx_acked[n] && s->tx_tries[n] >= RXSIM_RETRIES) {
++			s->tx_given_up[n] = true;
++			gave_up = true;
++		}
++	}
++	while (s->win < s->next &&
++	       (s->tx_acked[s->win] || s->tx_given_up[s->win]))
++		s->win++;
++	if (gave_up)
++		rxsim_bar(s);
++}
++
++static void rxsim_run(struct kunit *test, const struct rxsim_cfg *cfg)
++{
++	struct rxsim *s;
++	u32 n;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	s->test = test;
++	s->cfg = cfg;
++	s->rng = cfg->seed ?: 1;
++#define RXSIM_ARRAY(f) do {						\
++		s->f = kunit_kcalloc(test, RXSIM_FRAMES, sizeof(*s->f),	\
++				     GFP_KERNEL);			\
++		KUNIT_ASSERT_NOT_NULL(test, s->f);			\
++	} while (0)
++	RXSIM_ARRAY(tx_tries);
++	RXSIM_ARRAY(tx_acked);
++	RXSIM_ARRAY(tx_given_up);
++	RXSIM_ARRAY(rx_got);
++	RXSIM_ARRAY(rx_late);
++	RXSIM_ARRAY(delivered);
++#undef RXSIM_ARRAY
++
++	s->a = mt76_test_aggr(test, true, cfg->ssn, cfg->size);
++
++	while (s->win < RXSIM_FRAMES)
++		rxsim_ampdu(s);
++	/* everything is acked or given up: a last BAR moves the window on */
++	rxsim_bar(s);
++
++	for (n = 0; n < RXSIM_FRAMES; n++) {
++		if (!s->rx_got[n] || s->delivered[n] || s->rx_late[n])
++			continue;
++		if (!s->n_lost++)
++			s->first_lost = n;
++	}
++
++	kunit_info(test, "size %u ssn %u: %u MPDUs arrived (%u again), %u BARs, passed on %s; lost by the reorder buffer %u%s\n",
++		   cfg->size, cfg->ssn, s->n_rx, s->n_dups, s->n_bars,
++		   s->n_order || s->n_twice ? "out of order or twice" : "in order",
++		   s->n_lost, s->n_lost ? " (first: see below)" : "");
++	if (s->n_lost)
++		kunit_info(test, "first lost: frame %u, sn %u, after %u of the session's frames\n",
++			   s->first_lost, rxsim_sn(s, s->first_lost),
++			   s->first_lost);
++
++	KUNIT_EXPECT_EQ_MSG(test, s->n_order, 0, "passed on out of order");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_twice, 0, "passed on twice");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_lost, 0,
++			    "frames that arrived within the window were dropped");
++}
++
++static const struct rxsim_cfg rxsim_cases[] = {
++	{ .seed = 1, .ssn = 0, .size = 64, .loss = 100, .ba_loss = 20 },
++	{ .seed = 2, .ssn = 4000, .size = 256, .loss = 100, .ba_loss = 20 },
++	{ .seed = 3, .ssn = 3500, .size = 1024, .loss = 50, .ba_loss = 10 },
++	{ .seed = 4, .ssn = 4090, .size = 32, .loss = 150, .ba_loss = 30 },
++	{ .seed = 5, .ssn = 4000, .size = 63, .loss = 100, .ba_loss = 20 },
++	{ .seed = 6, .ssn = 4095, .size = 6, .loss = 150, .ba_loss = 30 },
++	{ .seed = 7, .ssn = 1234, .size = 48, .loss = 100, .ba_loss = 20 },
++	{ .seed = 8, .ssn = 3000, .size = 100, .loss = 100, .ba_loss = 20 },
++	{ .seed = 9, .ssn = 4000, .size = 6, .loss = 200, .ba_loss = 50 },
++	{ .seed = 10, .ssn = 4050, .size = 100, .loss = 150, .ba_loss = 30 },
++	{ .seed = 11, .ssn = 3900, .size = 255, .loss = 100, .ba_loss = 20 },
++	{ .seed = 12, .ssn = 4060, .size = 63, .loss = 200, .ba_loss = 50 },
++	{ .seed = 13, .ssn = 4080, .size = 48, .loss = 200, .ba_loss = 50 },
++};
++
++static void rxsim_case_desc(const struct rxsim_cfg *cfg, char *desc)
++{
++	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "size %u ssn %u loss %u/1000",
++		 cfg->size, cfg->ssn, cfg->loss);
++}
++
++KUNIT_ARRAY_PARAM(rxsim, rxsim_cases, rxsim_case_desc);
++
++static void mt76_rxsim_test_run(struct kunit *test)
++{
++	rxsim_run(test, test->param_value);
++}
++
++static struct kunit_case mt76_rxsim_test_cases[] = {
++	KUNIT_CASE_PARAM(mt76_rxsim_test_run, rxsim_gen_params),
++	{}
++};
++
++static struct kunit_suite mt76_rxsim_test_suite = {
++	.name = "mt76-rx-sim",
++	.test_cases = mt76_rxsim_test_cases,
++};
++
++kunit_test_suites(&mt76_rxsim_test_suite);

@@ -1,0 +1,524 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:08:07 +0000
+Subject: [PATCH] milkflint tests: hostapd's polls and full resets in the power
+ save simulation
+
+- polls: hostapd's inactivity poll (a QoS null from mt76_tx(), as
+  ieee80211_probe_client() sends it) for each station now and then,
+  with the firmware model sending the PS queue on ALTX at once; a poll
+  not ACKed within AP_DISASSOC_DELAY counts as a disassociation.
+- full resets: as mt7915_mac_full_reset() goes (tx stopped, the
+  firmware's frames reclaimed with their wcid, mt76_reset_device(),
+  every station re-added through mt76_sta_state()); the restarted
+  firmware has every station awake until its next PM change, so frames
+  it then sends a sleeping one are lost (counted, not the driver's).
+- cases with polls (ps_sync on and off), with resets, and polls in the
+  32-seed mix.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/ps-sim-test.c | 313 ++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 304 insertions(+), 9 deletions(-)
+
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index b5691809..614e2190 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -74,6 +74,7 @@ MODULE_INFO(import_ns, "EXPORTED_FOR_KUNIT_TESTING");
+ #define PSIM_BEACON		20	/* steps between beacons (DTIM 1) */
+ #define PSIM_STALL		60	/* steps an awake backlog may sit */
+ #define PSIM_BACKLOG		256	/* frames a station may have queued */
++#define PSIM_POLL_WINDOW	600	/* steps hostapd waits for a poll's ACK (3 s) */
+ 
+ enum psim_kind {
+ 	PSIM_LAPTOP,
+@@ -103,6 +104,8 @@ struct psim_frame {
+ 	u8 tid;
+ 	u8 gen;		/* the station's association it was for */
+ 	bool ps;	/* queued to the hardware while the driver held the sta */
++	bool poll;	/* hostapd's inactivity poll (a QoS null), not data */
++	bool altx_dozing; /* sent on ALTX, at once: was the station asleep */
+ 	u32 seq;
+ 	u32 step;	/* when it was queued in mac80211 */
+ };
+@@ -123,6 +126,7 @@ struct psim_sta {
+ 	u16 idx;		/* its wcid */
+ 
+ 	bool dozing;		/* the truth, as the firmware knows it */
++	bool fw_awake;		/* after a full reset the firmware has it awake */
+ 	bool polling;		/* sensor: fetching with PS-Poll */
+ 	u32 wake_until;		/* scanner: back on channel; phone: idle */
+ 	unsigned int idle;
+@@ -143,6 +147,7 @@ struct psim_sta {
+ 
+ 	/* for the report */
+ 	unsigned long queued, acked, failed, dropped, polls, wakes;
++	unsigned long probes, probes_acked, probes_missed;
+ 	unsigned long latency_sum, latency_max;
+ };
+ 
+@@ -156,6 +161,8 @@ struct psim_cfg {
+ 	unsigned int late_free;		/* per mille: a leaver's frames complete late */
+ 	bool offchannel;		/* the AP scans now and then */
+ 	unsigned int midburst;		/* per mille: a doze event lands mid-burst */
++	bool probes;			/* hostapd polls inactive stations */
++	unsigned int resets;		/* per mille per step: a full reset */
+ 	bool one_hash;			/* every frame hashes alike: fq collisions */
+ 	enum psim_kind kinds[PSIM_MAX_STA];
+ 	int n_sta;
+@@ -180,6 +187,15 @@ struct psim {
+ 	u32 late[PSIM_BACKLOG * 4];
+ 	u16 late_idx[PSIM_BACKLOG * 4];
+ 	unsigned int n_late;
++	/* polls sent on ALTX, completing at the next tx-free event */
++	u32 altx[64];
++	unsigned int n_altx;
++	unsigned int n_probe_missed;
++	unsigned int n_resets;
++	unsigned long reset_lost;	/* sent to a sleeper the firmware had awake */
++	bool resetting;
++	unsigned long reset_probes_lost;	/* polls among reset_lost */
++	unsigned long reset_dropped;	/* pending in mt76, freed by the reset */
+ 
+ 	struct psim_frame *frames;
+ 	u32 n_frames;
+@@ -347,7 +363,18 @@ static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 
+ 	ac = psim_tid_to_ac[f->tid];
+ 	f->state = PF_HW;
+-	if (test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
++	if (f->poll && qid == MT_TXQ_PSD) {
++		/*
++		 * The PS queue: the firmware sends it on ALTX, at once, without
++		 * PS buffering. A station asleep now doesn't hear it.
++		 */
++		KUNIT_ASSERT_LT(test, s->n_altx, ARRAY_SIZE(s->altx));
++		f->altx_dozing = ps->dozing;
++		s->altx[s->n_altx++] = id;
++		__skb_queue_tail(&psim_skbs, skb);
++		goto out;
++	}
++	if (!f->poll && test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
+ 		/*
+ 		 * Held: one frame at a time per AC, once the AC has no
+ 		 * airtime pending (it has this frame's now).
+@@ -388,6 +415,7 @@ static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 		}
+ 	}
+ 
++out:
+ 	/* the skb stays with the firmware model until it completes */
+ 	idx = q->head;
+ 	q->head = (q->head + 1) % q->ndesc;
+@@ -450,8 +478,13 @@ static void psim_skb_destructor(struct sk_buff *skb)
+ 		/* a station that left takes its frames with it */
+ 		if (!ps->present || ps->gen != f->gen)
+ 			return;
++		/* mt76_reset_device() frees what waits in mt76's own lists */
++		if (s->resetting && f->poll) {
++			s->reset_dropped++;
++			return;
++		}
+ 		ps->dropped++;
+-		if (ps->backlog)
++		if (ps->backlog && !f->poll)
+ 			ps->backlog--;
+ 		if (!s->n_vanished++)
+ 			psim_note(s, "step %u: %s's frame %u (tid %u seq %u) freed while %s, without going on the air\n",
+@@ -736,6 +769,8 @@ static void psim_set_dozing(struct psim *s, struct psim_sta *ps, bool dozing)
+ 	if (ps->dozing == dozing)
+ 		return;
+ 	ps->dozing = dozing;
++	/* its PM bit again: the firmware knows now */
++	ps->fw_awake = false;
+ 	if (!dozing)
+ 		ps->wakes++;
+ 	psim_event(s, ps, dozing);
+@@ -812,6 +847,78 @@ static struct sk_buff *psim_take_skb(u32 id)
+ 	return NULL;
+ }
+ 
++/* hostapd's view: the poll was ACKed within AP_DISASSOC_DELAY, or the
++ * station is disassociated "due to inactivity"
++ */
++static void psim_probe_done(struct psim *s, struct psim_sta *ps,
++			    struct psim_frame *f, bool acked)
++{
++	u32 lat = s->step - f->step;
++
++	if (acked && lat <= PSIM_POLL_WINDOW) {
++		ps->probes_acked++;
++		return;
++	}
++	ps->probes_missed++;
++	if (!s->n_probe_missed++)
++		psim_note(s, "step %u: %s missed hostapd's poll (%s, after %u steps): disassociated due to inactivity\n",
++			  s->step, psim_kind_name[ps->kind],
++			  acked ? "ACKed too late" : "sent while it slept",
++			  lat);
++}
++
++/*
++ * hostapd_drv_poll_client() for a station silent for ap_max_inactivity:
++ * nl80211 probe_client, which mac80211 (ieee80211_probe_client()) sends as
++ * a QoS null on VO with a tx status asked for. With no mgmt txq (mt7915
++ * sets no STA_MMPDU_TXQ), it reaches the driver through mt76_tx().
++ */
++static void psim_send_probe(struct psim *s, struct psim_sta *ps)
++{
++	struct ieee80211_tx_info *info;
++	struct ieee80211_qos_hdr *hdr;
++	struct psim_frame *f;
++	struct sk_buff *skb;
++	u32 id;
++
++	if (s->n_frames >= PSIM_MAX_FRAMES)
++		return;
++	id = s->n_frames++;
++	f = &s->frames[id];
++	f->state = PF_QUEUED;
++	f->sta = ps - s->sta;
++	f->tid = 7;
++	f->gen = ps->gen;
++	f->step = s->step;
++	f->poll = true;
++
++	skb = alloc_skb(sizeof(*hdr) + 64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(s->test, skb);
++	skb_reserve(skb, 64);
++	hdr = skb_put_zero(skb, sizeof(*hdr));
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 IEEE80211_STYPE_QOS_NULLFUNC |
++					 IEEE80211_FCTL_FROMDS);
++	memcpy(hdr->addr1, ps->si->sta.addr, ETH_ALEN);
++	memcpy(hdr->addr2, psim_ap_addr, ETH_ALEN);
++	memcpy(hdr->addr3, psim_ap_addr, ETH_ALEN);
++	hdr->qos_ctrl = cpu_to_le16(7);
++	skb->priority = 7;
++	skb->mark = id + 1;
++	skb->destructor = psim_skb_destructor;
++	skb_set_queue_mapping(skb, IEEE80211_AC_VO);
++
++	info = IEEE80211_SKB_CB(skb);
++	memset(info, 0, sizeof(*info));
++	info->flags = IEEE80211_TX_CTL_REQ_TX_STATUS;
++	info->band = NL80211_BAND_5GHZ;
++	info->hw_queue = s->sdata->vif.hw_queue[IEEE80211_AC_VO];
++	info->control.vif = &s->sdata->vif;
++
++	ps->probes++;
++	mt76_tx(&s->dev->phy, &ps->si->sta, psim_wcid(ps), skb);
++}
++
+ /* The air: the firmware sends up to @burst frames of @ps, and they are
+  * acked or fail; the completions go out as one tx-free event.
+  */
+@@ -831,6 +938,15 @@ static unsigned int psim_air(struct psim *s, struct psim_sta *ps,
+ 
+ 		KUNIT_ASSERT_NOT_NULL(s->test, skb);
+ 		KUNIT_ASSERT_EQ(s->test, f->state, PF_HW);
++		if (f->poll) {
++			/* buffered, it goes out once the station is awake */
++			f->state = PF_ACKED;
++			psim_probe_done(s, ps, f, true);
++			n++;
++			ps->progress = true;
++			psim_complete(s, wcid->idx, skb, true);
++			continue;
++		}
+ 		if (f->ps)
+ 			ps->ps_out[ac]--;
+ 		f->state = acked ? PF_ACKED : PF_FAILED;
+@@ -858,6 +974,123 @@ static unsigned int psim_air(struct psim *s, struct psim_sta *ps,
+ 	return n;
+ }
+ 
++/* frames the firmware sends to a station that doesn't hear them */
++static unsigned int psim_air_lost(struct psim *s, struct psim_sta *ps,
++				  unsigned int burst)
++{
++	struct mt76_wcid *wcid = psim_wcid(ps);
++	unsigned int n = 0;
++	u32 id;
++	int ac;
++
++	while (n < burst && (ac = psim_fw_next(ps, &id)) >= 0) {
++		struct psim_frame *f = &s->frames[id];
++		struct sk_buff *skb = psim_take_skb(id);
++
++		KUNIT_ASSERT_NOT_NULL(s->test, skb);
++		if (f->ps)
++			ps->ps_out[ac]--;
++		f->state = PF_FAILED;
++		if (f->poll) {
++			/* not the driver's: the firmware lost track */
++			ps->probes_missed++;
++			s->reset_probes_lost++;
++		} else {
++			ps->backlog--;
++		}
++		ps->failed++;
++		s->reset_lost++;
++		ps->progress = true;
++		n++;
++		psim_complete(s, wcid->idx, skb, false);
++	}
++	return n;
++}
++
++/*
++ * A full reset, as mt7915_mac_full_reset() goes: tx stops (MT76_RESET), the
++ * restarted firmware frees what it held (mt7915_mac_reset_tokens(): each
++ * frame completed with its wcid, still published), mt76_reset_device()
++ * unpublishes every station, and mac80211's restart work re-adds them
++ * (mt76_sta_state() from NOTEXIST, mt76_sta_add() returning their txqs).
++ * PS sync events in flight are gone; the firmware has every station awake.
++ */
++static void psim_full_reset(struct psim *s)
++{
++	struct mt76_dev *dev = s->dev;
++	unsigned int j;
++	int i, ac;
++	u32 id;
++
++	s->n_resets++;
++	set_bit(MT76_RESET, &dev->phy.state);
++	/* the worker, if it runs now, must leave the txqs listed */
++	mt76_tx_worker_run(dev);
++
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++
++		if (!ps->present)
++			continue;
++		while ((ac = psim_fw_next(ps, &id)) >= 0) {
++			struct psim_frame *f = &s->frames[id];
++
++			f->state = PF_FAILED;
++			if (f->ps)
++				ps->ps_out[ac]--;
++			if (!f->poll)
++				ps->backlog--;
++			ps->failed++;
++			psim_complete(s, ps->idx, psim_take_skb(id), false);
++		}
++	}
++	for (j = 0; j < s->n_altx; j++) {
++		struct psim_frame *f = &s->frames[s->altx[j]];
++
++		f->state = PF_FAILED;
++		psim_complete(s, 0, psim_take_skb(s->altx[j]), false);
++	}
++	s->n_altx = 0;
++	for (j = 0; j < s->n_late; j++) {
++		s->frames[s->late[j]].state = PF_FAILED;
++		psim_complete(s, s->late_idx[j], psim_take_skb(s->late[j]), false);
++	}
++	s->n_late = 0;
++	psim_dma(s);
++
++	while (!list_empty(&s->events)) {
++		struct psim_event *ev = list_first_entry(&s->events,
++						struct psim_event, list);
++
++		list_del(&ev->list);
++		kfree(ev);
++	}
++
++	mutex_lock(&dev->mutex);
++	s->resetting = true;
++	mt76_reset_device(dev);
++	s->resetting = false;
++	mutex_unlock(&dev->mutex);
++	s->wcid_used = 0;
++	clear_bit(MT76_RESET, &dev->phy.state);
++
++	for (i = 0; i < s->cfg->n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++		struct mt76_wcid *wcid;
++
++		if (!ps->present)
++			continue;
++		wcid = psim_wcid(ps);
++		KUNIT_EXPECT_FALSE(s->test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++		KUNIT_ASSERT_EQ(s->test, mt76_sta_state(s->hw, &s->sdata->vif,
++				&ps->si->sta, IEEE80211_STA_NOTEXIST,
++				IEEE80211_STA_NONE), 0);
++		ps->idx = wcid->idx;
++		ps->fw_awake = ps->dozing;
++		memset(ps->ps_out, 0, sizeof(ps->ps_out));
++	}
++}
++
+ /* A tx-free event's other half, as mt7915_mac_tx_free_done() does it. */
+ static void psim_tx_free_done(struct psim *s)
+ {
+@@ -950,7 +1183,14 @@ static void psim_transmit(struct psim *s)
+ 
+ 		if (!ps->present)
+ 			continue;
+-		if (!ps->dozing) {
++		if (ps->dozing && ps->fw_awake) {
++			/* the firmware sends, the station sleeps: no ACK */
++			unsigned long acked = ps->acked;
++
++			if (psim_air_lost(s, ps, psim_range(s, 1, 48)))
++				any = true;
++			KUNIT_EXPECT_EQ(s->test, ps->acked, acked);
++		} else if (!ps->dozing) {
+ 			if (psim_air(s, ps, s->quiesce ? 1024 :
+ 				     psim_range(s, 1, 48)))
+ 				any = true;
+@@ -963,6 +1203,27 @@ static void psim_transmit(struct psim *s)
+ 		}
+ 	}
+ 
++	/* what went out on ALTX: heard by those that were awake */
++	if (s->n_altx) {
++		unsigned int j;
++
++		for (j = 0; j < s->n_altx; j++) {
++			struct psim_frame *f = &s->frames[s->altx[j]];
++			struct psim_sta *ps = &s->sta[f->sta];
++			struct sk_buff *skb = psim_take_skb(s->altx[j]);
++			bool here = ps->present && ps->gen == f->gen;
++			bool acked = here && !f->altx_dozing;
++
++			KUNIT_ASSERT_NOT_NULL(s->test, skb);
++			f->state = acked ? PF_ACKED : PF_FAILED;
++			if (here)
++				psim_probe_done(s, ps, f, acked);
++			psim_complete(s, here ? ps->idx : 0, skb, acked);
++		}
++		s->n_altx = 0;
++		any = true;
++	}
++
+ 	/* the late completions of stations that left */
+ 	if (s->n_late && (s->quiesce || psim_chance(s, 300))) {
+ 		unsigned int j;
+@@ -1099,6 +1360,8 @@ static void psim_sta_leave(struct psim *s, int i)
+ 
+ 	mt76_sta_pre_rcu_remove(s->hw, &s->sdata->vif, &ps->si->sta);
+ 	synchronize_rcu();
++	/* what the driver frees from here on goes with the station */
++	ps->present = false;
+ 
+ 	/* sta_remove: STA_REC removed, the firmware drops what it holds */
+ 	while ((ac = psim_fw_next(ps, &id)) >= 0) {
+@@ -1124,7 +1387,6 @@ static void psim_sta_leave(struct psim *s, int i)
+ 	if (due)
+ 		set_bit(MT76_WORKER_SCHEDULED, &dev->tx_worker.state);
+ 
+-	ps->present = false;
+ 	wiphy_lock(s->hw->wiphy);
+ 	ieee80211_purge_sta_txqs(ps->si);
+ 	sta_info_free(s->local, ps->si);
+@@ -1205,6 +1467,11 @@ static void psim_step(struct psim *s)
+ 	s->step++;
+ 	if (!s->quiesce)
+ 		psim_traffic(s);
++	/* hostapd's inactivity timer: about every 500 steps per station */
++	if (s->cfg->probes && !s->quiesce)
++		for (i = 0; i < s->cfg->n_sta; i++)
++			if (s->sta[i].present && psim_chance(s, 2))
++				psim_send_probe(s, &s->sta[i]);
+ 
+ 	/* the firmware's events, the stations and the air, in some order */
+ 	for (k = 0; k < 3; k++) {
+@@ -1241,6 +1508,9 @@ static void psim_step(struct psim *s)
+ 		mt76_worker_schedule(&s->dev->tx_worker);
+ 	}
+ 
++	if (s->cfg->resets && !s->quiesce && psim_chance(s, s->cfg->resets))
++		psim_full_reset(s);
++
+ 	if (s->cfg->leave && !s->quiesce && psim_chance(s, s->cfg->leave)) {
+ 		i = psim_rand(s) % s->cfg->n_sta;
+ 		if (s->sta[i].kind != PSIM_LAPTOP)
+@@ -1256,10 +1526,11 @@ static bool psim_busy(struct psim *s)
+ {
+ 	int i;
+ 
+-	if (!list_empty(&s->events) || s->n_late)
++	if (!list_empty(&s->events) || s->n_late || s->n_altx)
+ 		return true;
+ 	for (i = 0; i < s->cfg->n_sta; i++)
+-		if (s->sta[i].present && s->sta[i].backlog)
++		if (s->sta[i].present &&
++		    (s->sta[i].backlog || psim_fw_pending(&s->sta[i])))
+ 			return true;
+ 	return false;
+ }
+@@ -1277,7 +1548,15 @@ static void psim_report(struct psim *s)
+ 			   ps->failed, ps->dropped, ps->wakes, ps->polls,
+ 			   done ? ps->latency_sum / done : 0, ps->latency_max,
+ 			   ps->gen ? " (rejoined)" : "");
++		if (ps->probes)
++			kunit_info(s->test, "%-8s hostapd polls %lu, ACKed in time %lu, missed %lu\n",
++				   psim_kind_name[ps->kind], ps->probes,
++				   ps->probes_acked, ps->probes_missed);
+ 	}
++	if (s->n_resets)
++		kunit_info(s->test, "full resets %u, frames the firmware then sent to sleeping stations %lu (polls %lu), polls freed waiting in mt76 %lu\n",
++			   s->n_resets, s->reset_lost, s->reset_probes_lost,
++			   s->reset_dropped);
+ 	if (s->events_lost || s->tim_warn || s->n_ps_burst_late ||
+ 	    (s->cfg->one_hash && s->n_order))
+ 		kunit_info(s->test, "events lost %lu, AC-steps held with nothing in the firmware %lu, extra frames while held after late completions %u, out of order (fq collisions) %u\n",
+@@ -1348,6 +1627,8 @@ static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
+ 			    "held stations with nothing in the firmware");
+ 	KUNIT_EXPECT_EQ_MSG(test, s->n_ps_burst, 0,
+ 			    "more than one frame per AC while held");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_probe_missed, 0,
++			    "hostapd polls missed: stations disassociated");
+ 	KUNIT_EXPECT_FALSE_MSG(test, psim_busy(s), "still busy after %u steps",
+ 			       n);
+ 
+@@ -1421,6 +1702,17 @@ static const struct psim_cfg psim_cases[] = {
+ 	/* doze events landing in the middle of the tx worker's bursts */
+ 	{ .seed = 8, .steps = 20000, .ps_sync = true, .event_delay = 4,
+ 	  .midburst = 200, PSIM_ALL_KINDS },
++	/* hostapd polls inactive stations, as with ap_max_inactivity */
++	{ .seed = 11, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .probes = true, PSIM_ALL_KINDS },
++	{ .seed = 11, .steps = 20000, .ps_sync = false, .event_delay = 3,
++	  .probes = true, PSIM_ALL_KINDS },
++	/* full resets (firmware crash recovery) in the middle of it all */
++	{ .seed = 12, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .resets = 1, .probes = true, .leave = 2, .late_free = 300,
++	  PSIM_ALL_KINDS },
++	{ .seed = 13, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .resets = 3, .offchannel = true, PSIM_ALL_KINDS },
+ 	/* every frame in fq's same bucket: with and without holding */
+ 	{ .seed = 9, .steps = 20000, .ps_sync = true, .event_delay = 3,
+ 	  .one_hash = true, PSIM_ALL_KINDS },
+@@ -1437,13 +1729,15 @@ static const struct psim_cfg psim_cases[] = {
+ static void psim_case_desc(const struct psim_cfg *cfg, char *desc)
+ {
+ 	snprintf(desc, KUNIT_PARAM_DESC_SIZE,
+-		 "seed %u ps_sync %d delay %u%s%s%s%s%s%s", cfg->seed, cfg->ps_sync,
++		 "seed %u ps_sync %d delay %u%s%s%s%s%s%s%s%s", cfg->seed, cfg->ps_sync,
+ 		 cfg->event_delay, cfg->offchannel ? " scans" : "",
+ 		 cfg->leave ? " leavers" : "",
+ 		 cfg->lost_events ? " lost-events" : "",
+ 		 cfg->midburst ? " mid-burst" : "",
+ 		 cfg->one_hash ? " one-hash" : "",
+-		 cfg->late_free ? " late-frees" : "");
++		 cfg->late_free ? " late-frees" : "",
++		 cfg->probes ? " polls" : "",
++		 cfg->resets ? " resets" : "");
+ }
+ 
+ KUNIT_ARRAY_PARAM(psim, psim_cases, psim_case_desc);
+@@ -1469,7 +1763,8 @@ static const void *psim_seed_params(const void *prev, char *desc)
+ 				.seed = 100 + i, .steps = 3000,
+ 				.ps_sync = true, .event_delay = 5,
+ 				.offchannel = true, .leave = 3,
+-				.late_free = 400, PSIM_ALL_KINDS,
++				.late_free = 400, .probes = true,
++				PSIM_ALL_KINDS,
+ 			};
+ 		cfg = psim_seed_cfgs;
+ 	} else if (++cfg >= psim_seed_cfgs + PSIM_SEEDS) {

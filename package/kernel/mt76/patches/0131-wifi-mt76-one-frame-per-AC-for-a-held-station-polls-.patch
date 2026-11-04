@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:28:13 +0000
+Subject: [PATCH] wifi: mt76: one frame per AC for a held station, polls
+ included
+
+A station the driver holds gets one frame per AC at a time, gated on
+the AC's pending AQL airtime. Two ways round it:
+
+- frames on the tx_pending path (hostapd's inactivity poll, bufferable
+  management frames) that stay in their AC queue went to the hardware
+  regardless (mt76_txq_schedule_pending_wcid());
+- those carry no airtime estimate (not in AQL, counted in
+  non_aql_packets), so a data frame went right behind one too.
+
+Either left two frames of a dozing station in the firmware, the loss
+the PS buffering is there to avoid with the 2026-05 firmware: the poll
+or the data frame. One gate, mt76_tx_ps_busy(), now holds both paths
+while the station has a frame of the AC in flight or one without an
+airtime estimate; the frame's completion re-arms the station.
+
+The power save simulation, counting polls like data, found it (a later
+commit). Reported by a Gemini review.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tx.c | 46 ++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/tx.c b/tx.c
+index 497da7b3..72220435 100644
+--- a/tx.c
++++ b/tx.c
+@@ -541,6 +541,37 @@ mt76_txq_stopped(struct mt76_queue *q)
+ 	       q->queued + MT_TXQ_FREE_THR >= q->ndesc;
+ }
+ 
++/*
++ * A station the driver holds (dozing, PS buffering in the hardware) gets one
++ * frame per AC at a time, enough for the firmware to set its TIM bit. The
++ * next waits while one of its AC is in flight (its airtime pending), or a
++ * frame without an airtime estimate is (a poll, a management frame: not in
++ * AQL, so counted in non_aql_packets instead). Its completion re-arms the
++ * station (mt76_tx_ps_rearm()).
++ */
++static bool
++mt76_tx_ps_busy(struct mt76_phy *phy, struct mt76_wcid *wcid,
++		struct ieee80211_txq *txq)
++{
++	if (atomic_read(&mt76_wcid_primary(wcid)->non_aql_packets))
++		return true;
++
++	return txq && ieee80211_txq_aql_pending(phy->hw, txq);
++}
++
++/* a txq of @sta's for AC @ac, for its pending airtime */
++static struct ieee80211_txq *
++mt76_sta_ac_txq(struct ieee80211_sta *sta, u8 ac)
++{
++	int i;
++
++	for (i = 0; i < IEEE80211_NUM_TIDS; i++)
++		if (sta->txq[i] && sta->txq[i]->ac == ac)
++			return sta->txq[i];
++
++	return NULL;
++}
++
+ static int
+ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
+ 		    struct mt76_txq *mtxq, struct mt76_wcid *wcid)
+@@ -557,7 +588,7 @@ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
+ 	if (test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
+ 		if (!(dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING))
+ 			return 0;
+-		if (ieee80211_txq_aql_pending(phy->hw, txq))
++		if (mt76_tx_ps_busy(phy, wcid, txq))
+ 			return 0;
+ 	}
+ 
+@@ -829,10 +860,21 @@ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
+ 			break;
+ 		}
+ 
++		/*
++		 * Held, a frame that stays in its AC queue (a poll, a
++		 * bufferable management frame) waits like data: the rest of
++		 * this list goes once the station's frame in flight is done.
++		 */
++		sta = wcid_to_sta(wcid);
++		if (qid < MT_TXQ_PSD && sta &&
++		    (dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING) &&
++		    test_bit(MT_WCID_FLAG_PS, &wcid->flags) &&
++		    mt76_tx_ps_busy(phy, wcid, mt76_sta_ac_txq(sta, qid)))
++			break;
++
+ 		__skb_unlink(skb, head);
+ 		spin_unlock(&head->lock);
+ 
+-		sta = wcid_to_sta(wcid);
+ 		spin_lock(&q->lock);
+ 		__mt76_tx_queue_skb(phy, qid, skb, wcid, sta, NULL);
+ 		dev->queue_ops->kick(dev, q);

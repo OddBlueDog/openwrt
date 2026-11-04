@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 13:28:13 +0000
+Subject: [PATCH] wifi: mt76: mt7915: no token freed past a v3 tx-free event's
+ count
+
+A v3 tx-free event packs two MSDU IDs a word, and with an odd count the
+last word's other half is padding (0x7fff). The inner loop took both
+halves of every word whatever the count: a last half holding anything
+but the padding value freed that token, a live frame's while the
+hardware still had it. The outer loop already stops at the count; stop
+the inner one there too.
+
+mt7915_test_tx_free_v3_odd puts a live token's number in that half.
+Reported by a Gemini review.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            |  3 ++-
+ mt7915/tests/mac-test.c | 44 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 99204da1..1014830e 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -963,7 +963,8 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 		if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3))
+ 			continue;
+ 
+-		for (i = 0; i < 1 + v3; i++) {
++		/* an odd count: the last word's other half is padding */
++		for (i = 0; i < 1 + v3 && count < total; i++) {
+ 			if (v3) {
+ 				msdu = (info >> (15 * i)) & MT_TX_FREE_MSDU_ID_V3;
+ 				if (msdu == MT_TX_FREE_MSDU_ID_V3)
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 23b19b40..052f3815 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -2658,6 +2658,49 @@ static void mt7915_test_tx_free_v3(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 4);
+ }
+ 
++/*
++ * A v3 event packs two MSDU IDs a word; with an odd count the last word's
++ * other half is padding (0x7fff). Past the event's count it is never a
++ * token to free, whatever it holds: here a live token's number.
++ */
++static void mt7915_test_tx_free_v3_odd(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct sk_buff *skb[2];
++	u32 info[3];
++	__le32 *ev;
++	int id[2];
++
++	mt7915_test_sta(test, dev, 9, mvif);
++	mt7915_test_band1(test, env);
++	id[0] = mt7915_test_token(test, dev, 9, &skb[0]);
++	id[1] = mt7915_test_token(test, dev, 9, &skb[1]);
++
++	info[0] = MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 9);
++	info[1] = MT_TX_FREE_MPDU_HEADER_V3 |
++		  FIELD_PREP(MT_TX_FREE_COUNT_V3, 1);
++	info[2] = id[1] | (id[0] << 15);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 1,
++			       FIELD_PREP(MT_TX_FREE_VER, 4), info, 3);
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 5 * 4));
++	KUNIT_EXPECT_NULL(test, idr_find(&dev->mt76.token, id[1]));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb[1]));
++	KUNIT_EXPECT_NOT_NULL(test, idr_find(&dev->mt76.token, id[0]));
++	KUNIT_EXPECT_FALSE(test, mt7915_test_skb_freed(skb[0]));
++
++	/* its own event, padded as the firmware does */
++	info[2] = id[0] | (MT_TX_FREE_MSDU_ID_V3 << 15);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 1,
++			       FIELD_PREP(MT_TX_FREE_VER, 4), info, 3);
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 5 * 4));
++	KUNIT_EXPECT_NULL(test, idr_find(&dev->mt76.token, id[0]));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb[0]));
++	kfree_skb(skb[0]);
++	kfree_skb(skb[1]);
++}
++
+ /* Each MPDU header's transmission count lands in its bucket: 1, 2, 3-4,
+  * 5-8 and 9+ (v3 events carry up to 15).
+  */
+@@ -5338,6 +5381,7 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_tx_free),
+ 	KUNIT_CASE(mt7915_test_tx_free_frags),
+ 	KUNIT_CASE(mt7915_test_tx_free_v3),
++	KUNIT_CASE(mt7915_test_tx_free_v3_odd),
+ 	KUNIT_CASE(mt7915_test_tx_free_attempts),
+ 	KUNIT_CASE(mt7915_test_tx_free_unknown),
+ 	KUNIT_CASE(mt7915_test_tx_free_v0),

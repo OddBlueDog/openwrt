@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:08:07 +0000
+Subject: [PATCH] wifi: mt76: mt7915: give the interface's txq back after a
+ full reset
+
+While mt76_reset_device() has the interface's own wcid unpublished,
+mt76_txq_schedule_list() skips its txq (its multicast frames) when
+ieee80211_next_txq() hands it over, which leaves it off mac80211's
+active list. mt76_sta_add() gives a station's txqs back when mac80211
+re-adds it (MT_WCID_FLAG_RESET); mt7915_add_interface() didn't for the
+interface's, so queued broadcast and multicast frames (ARP, DHCP, ND,
+mDNS) waited for the next one, and the wcid kept MT_WCID_FLAG_RESET.
+
+Do it there the same way.
+
+mt7915_main_test_add_interface_after_reset checks it (with a static stub
+for __ieee80211_schedule_txq()).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/main.c            | 13 ++++++++
+ mt7915/tests/main-test.c | 68 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 81 insertions(+)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 32cbb15d..4d307ae8 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -280,6 +280,19 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
+ 	mt7915_mcu_add_bss_info(phy, vif, true);
+ 	mt7915_mcu_add_sta(dev, vif, NULL, CONN_STATE_PORT_SECURE, true);
+ 
++	/*
++	 * Re-added after a full reset: while mt76_reset_device() had the
++	 * interface's wcid unpublished, mt76_txq_schedule_list() skipped its
++	 * txq (its multicast frames) when ieee80211_next_txq() handed it
++	 * over, which leaves it off mac80211's active list until the next
++	 * multicast frame. Give it back, as mt76_sta_add() does a station's.
++	 */
++	if (test_and_clear_bit(MT_WCID_FLAG_RESET, &mvif->sta.wcid.flags) &&
++	    vif->txq) {
++		ieee80211_return_txq(hw, vif->txq, false);
++		mt76_worker_schedule(&dev->mt76.tx_worker);
++	}
++
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	if (!is_mt7915(&dev->mt76) && !mt7915_vow_stock)
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 56de530d..444eed9e 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -16,6 +16,7 @@
+  * interface, stopping a tx BA session) aren't reached.
+  */
+ #include <kunit/test.h>
++#include <kunit/static_stub.h>
+ #include "fake.h"
+ #include "../eeprom.h"
+ 
+@@ -2305,6 +2306,72 @@ static void mt7915_main_test_ampdu_rx_declined(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_ampdu_action(hw, vif, &p), 0);
+ }
+ 
++/* stands in for mac80211's __ieee80211_schedule_txq() (static stub):
++ * the txqs given back with ieee80211_return_txq()
++ */
++static struct {
++	int n;
++	struct ieee80211_txq *txq;
++} mt7915_main_test_sched;
++
++static void mt7915_main_test_schedule_txq(struct ieee80211_hw *hw,
++					  struct ieee80211_txq *txq,
++					  bool force)
++{
++	mt7915_main_test_sched.n++;
++	mt7915_main_test_sched.txq = txq;
++}
++
++/*
++ * An interface mac80211 adds again after a full reset gets its txq (its
++ * multicast frames) given back: the tx scheduler took it off the active
++ * list while mt76_reset_device() had the interface's wcid unpublished. A
++ * new interface has none to give back.
++ */
++static void mt7915_main_test_add_interface_after_reset(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	struct mt7915_vif *mvif;
++	struct ieee80211_txq *txq;
++
++	memset(&mt7915_main_test_sched, 0, sizeof(mt7915_main_test_sched));
++	kunit_activate_static_stub(test, __ieee80211_schedule_txq,
++				   mt7915_main_test_schedule_txq);
++
++	vif = mt7915_main_test_vif(test, NL80211_IFTYPE_AP, 1);
++	txq = kunit_kzalloc(test, sizeof(*txq) + sizeof(struct mt76_txq),
++			    GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, txq);
++	txq->vif = vif;
++	vif->txq = txq;
++	mvif = mt7915_main_test_mvif(vif);
++
++	KUNIT_ASSERT_EQ(test, mt7915_add_interface(hw, vif), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_sched.n, 0);
++
++	/* mt7915_mac_full_reset(): masks cleared, the wcids unpublished */
++	mutex_lock(&dev->mt76.mutex);
++	dev->phy.omac_mask = 0;
++	mt76_reset_device(&dev->mt76);
++	mutex_unlock(&dev->mt76.mutex);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_RESET,
++					 &mvif->sta.wcid.flags));
++
++	/* ieee80211_reconfig(): the interface first */
++	KUNIT_ASSERT_EQ(test, mt7915_add_interface(hw, vif), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_sched.n, 1);
++	KUNIT_EXPECT_PTR_EQ(test, mt7915_main_test_sched.txq, txq);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_RESET,
++					  &mvif->sta.wcid.flags));
++	KUNIT_EXPECT_EQ(test, ((struct mt76_txq *)txq->drv_priv)->wcid,
++			mvif->sta.wcid.idx);
++	KUNIT_EXPECT_PTR_EQ(test,
++			    rcu_access_pointer(dev->mt76.wcid[mvif->sta.wcid.idx]),
++			    &mvif->sta.wcid);
++}
++
+ /* tx BA: starting is immediate and only marks the tid; once operational
+  * the txq aggregates and the firmware gets an originator entry; stopping
+  * (flush) undoes both. A session without A-MSDU turns A-MSDU off for the
+@@ -3372,6 +3439,7 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_tx),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_rx),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_rx_declined),
++	KUNIT_CASE(mt7915_main_test_add_interface_after_reset),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_tx),
+ 	KUNIT_CASE(mt7915_main_test_sta_flags),
+ 	KUNIT_CASE(mt7915_main_test_sta_airtime),
