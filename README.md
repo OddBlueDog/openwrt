@@ -48,6 +48,16 @@ password yet: sign in with it empty and set one under System → Admin
 Password. Wi-Fi is off until you set it up on the Wi-Fi page, with your
 country.
 
+### Kernel modules
+
+MilkFlint's kernel isn't OpenWrt's, so OpenWrt's kernel modules (`kmod-*`)
+don't install on it. Each image lists its own kernel's modules instead, in
+MilkFlint's feed at <https://milkflint-packages.pages.dev>, signed with the
+key the images already trust: `apk update` then `apk add kmod-…` (or
+LuCI's Software page) works as on OpenWrt. Modules built for another
+MilkFlint's kernel are refused. The MT7921/MT7925 and MT7996 Wi-Fi cards'
+drivers aren't in the feed.
+
 ### Zyxel EX5601-T0 / T-56 (experimental)
 
 Built from the same tree, not tested on the hardware here: reports welcome.
@@ -104,6 +114,13 @@ make -j$(nproc)
 are in `bin/targets/mediatek/filogic/`; flash the
 `milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin` one, or the EX5601's
 for its layout (see Installing).
+
+The configuration builds every kernel module as a package for the feed
+(`CONFIG_ALL_KMODS`), which takes a while; take it out of `.config` before
+`make defconfig` for the images alone. The images list MilkFlint's feed
+for their kernel (`CONFIG_VERSION_KMODS_REPO`), which only has the
+releases' kernels: if you change the kernel, its modules are the
+`kmod-*.apk` files in `bin/targets/mediatek/filogic/packages/`.
 
 To build the web interface after changing it (Node.js 24 and pnpm):
 
