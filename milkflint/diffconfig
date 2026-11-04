@@ -14,7 +14,7 @@ CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_zyxel_ex5601-t0-stock=y
 CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_zyxel_ex5601-t0-ubootmod=y
 
 # The firmware is MilkFlint, with its own version number on top of the
-# OpenWrt release ("MilkFlint 0.42a (OpenWrt 25.12.6)" in the banner and
+# OpenWrt release ("MilkFlint 0.43a (OpenWrt 25.12.6)" in the banner and
 # os-release). Images are named
 # milkflint-<version>-<revision>-mediatek-filogic-<board>-* (glinet_gl-mt6000,
 # zyxel_ex5601-t0-stock, zyxel_ex5601-t0-ubootmod).
@@ -22,7 +22,7 @@ CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_zyxel_ex5601-t0-ubootmod=y
 CONFIG_IMAGEOPT=y
 CONFIG_VERSIONOPT=y
 CONFIG_VERSION_DIST="MilkFlint"
-CONFIG_VERSION_NUMBER="0.42a"
+CONFIG_VERSION_NUMBER="0.43a"
 CONFIG_VERSION_CODE_FILENAMES=y
 CONFIG_VERSION_MANUFACTURER="MilkFlint"
 CONFIG_VERSION_MANUFACTURER_URL="https://github.com/OddBlueDog/openwrt"
@@ -32,6 +32,33 @@ CONFIG_VERSION_SUPPORT_URL="https://github.com/OddBlueDog/openwrt/issues"
 CONFIG_VERSION_FIRMWARE_URL="https://github.com/OddBlueDog/openwrt/releases"
 CONFIG_KERNEL_BUILD_USER="builder"
 CONFIG_KERNEL_BUILD_DOMAIN="milkflint"
+# Kernel modules come from MilkFlint's own feed, since OpenWrt's don't fit
+# this kernel: every kmod is built, and each image lists its kernel's folder
+# there
+CONFIG_ALL_KMODS=y
+CONFIG_VERSION_KMODS_REPO="https://milkflint-packages.pages.dev"
+# except the MT7921/MT7925 and MT7996 (Wi-Fi 7) cards' drivers: our mt76
+# fork's code for them needs a newer mac80211 than ours, and mt76 builds all
+# its drivers together, so they'd fail the Flint 2's mt7915e with them
+# CONFIG_PACKAGE_kmod-mt7996e is not set
+# CONFIG_PACKAGE_kmod-mt7996-firmware is not set
+# CONFIG_PACKAGE_kmod-mt7996-233-firmware is not set
+# CONFIG_PACKAGE_kmod-mt7996-firmware-common is not set
+# CONFIG_PACKAGE_kmod-mt7992-firmware is not set
+# CONFIG_PACKAGE_kmod-mt7992-23-firmware is not set
+# CONFIG_PACKAGE_kmod-mt7990-firmware is not set
+# CONFIG_PACKAGE_kmod-mt792x-common is not set
+# CONFIG_PACKAGE_kmod-mt792x-usb is not set
+# CONFIG_PACKAGE_kmod-mt7921-common is not set
+# CONFIG_PACKAGE_kmod-mt7921-firmware is not set
+# CONFIG_PACKAGE_kmod-mt7921e is not set
+# CONFIG_PACKAGE_kmod-mt7921s is not set
+# CONFIG_PACKAGE_kmod-mt7921u is not set
+# CONFIG_PACKAGE_kmod-mt7922-firmware is not set
+# CONFIG_PACKAGE_kmod-mt7925-common is not set
+# CONFIG_PACKAGE_kmod-mt7925-firmware is not set
+# CONFIG_PACKAGE_kmod-mt7925e is not set
+# CONFIG_PACKAGE_kmod-mt7925u is not set
 
 CONFIG_PACKAGE_luci=y
 
