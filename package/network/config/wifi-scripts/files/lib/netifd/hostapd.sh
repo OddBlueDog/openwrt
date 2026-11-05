@@ -1121,7 +1121,7 @@ hostapd_set_bss_options() {
 			append bss_conf "anqp_3gpp_cell_net=$iw_anqp_3gpp_cell_net_conf" "$N"
 	fi
 
-	set_default iw_qos_map_set 0,0,2,16,1,1,255,255,18,22,24,38,40,40,44,46,48,56
+	set_default iw_qos_map_set 1,1,8,1,18,3,20,3,22,3,24,4,26,4,28,4,30,4,32,4,34,4,36,4,38,4,40,5,44,6,46,6,0,63,255,255,255,255,255,255,255,255,255,255,255,255,255,255
 	case "$iw_qos_map_set" in
 		*,*);;
 		*) iw_qos_map_set="";;
