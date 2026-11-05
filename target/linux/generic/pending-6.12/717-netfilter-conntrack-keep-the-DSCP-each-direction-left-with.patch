@@ -1,0 +1,391 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 5 Nov 2026 16:30:00 +0000
+Subject: [PATCH] netfilter: conntrack: keep the DSCP each direction left with
+
+ISPs clear the DSCP of what comes in or set their own, so nothing that
+looks at it on the way to a LAN device can go by what the connection asked
+for. The device's own marks are on what it sends, and a connection has room
+to keep them: two bytes in a hole of struct nf_conn, without touching
+ct->mark, which policy routing and the firewall use.
+
+nf_conntrack's parameter dscp_learn keeps, for each direction, the DSCP its
+packets last left the router with: in nf_confirm() on the way out, after
+every mangle rule, and in the flowtable's fast path, which an established
+connection takes past that. It is a static key: off, no packet's path has
+more than a nop. An ICMP error about a connection doesn't count.
+nf_ct_get_peer_dscp() gives a packet what the other direction left with, from
+the entry attached or looked up from its tuple, IPv4 and IPv6, through
+nf_ct_hook so that its user doesn't need conntrack loaded.
+
+KUnit: the fast path's direction, ECN bits left out, last value kept, and
+what a packet of either direction is given.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -450,6 +450,7 @@
+ struct nf_conntrack_tuple;
+ bool nf_ct_get_tuple_skb(struct nf_conntrack_tuple *dst_tuple,
+ 			 const struct sk_buff *skb);
++bool nf_ct_get_peer_dscp(const struct sk_buff *skb, u8 *dscp);
+ #else
+ static inline void nf_ct_attach(struct sk_buff *new, struct sk_buff *skb) {}
+ static inline void nf_ct_set_closing(struct nf_conntrack *nfct) {}
+@@ -459,6 +460,10 @@
+ {
+ 	return false;
+ }
++static inline bool nf_ct_get_peer_dscp(const struct sk_buff *skb, u8 *dscp)
++{
++	return false;
++}
+ #endif
+ 
+ struct nf_conn;
+@@ -469,6 +474,7 @@
+ 	void (*destroy)(struct nf_conntrack *);
+ 	bool (*get_tuple_skb)(struct nf_conntrack_tuple *,
+ 			      const struct sk_buff *);
++	bool (*get_peer_dscp)(const struct sk_buff *, u8 *);
+ 	void (*attach)(struct sk_buff *nskb, const struct sk_buff *skb);
+ 	void (*set_closing)(struct nf_conntrack *nfct);
+ 	int (*confirm)(struct sk_buff *skb);
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -15,6 +15,7 @@
+ 
+ #include <linux/bitops.h>
+ #include <linux/compiler.h>
++#include <linux/jump_label.h>
+ 
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_conntrack_tcp.h>
+@@ -114,6 +115,11 @@
+ 	u_int32_t mark;
+ #endif
+ 
++	/* The DSCP each direction's packets last left the router with, while
++	 * nf_conntrack.dscp_learn is on (nf_ct_get_peer_dscp()).
++	 */
++	u8 dscp[IP_CT_DIR_MAX];
++
+ #ifdef CONFIG_NF_CONNTRACK_SECMARK
+ 	u_int32_t secmark;
+ #endif
+@@ -124,6 +130,18 @@
+ 	/* Storage reserved for other modules, must be the last member */
+ 	union nf_conntrack_proto proto;
+ };
++
++DECLARE_STATIC_KEY_FALSE(nf_ct_dscp_learn_key);
++
++/* @dsfield: the packet's DS field, ECN bits and all */
++static inline void nf_ct_dscp_learn(struct nf_conn *ct,
++				    enum ip_conntrack_dir dir, u8 dsfield)
++{
++	u8 dscp = dsfield >> 2;
++
++	if (READ_ONCE(ct->dscp[dir]) != dscp)
++		WRITE_ONCE(ct->dscp[dir], dscp);
++}
+ 
+ static inline struct nf_conn *
+ nf_ct_to_nf_conn(const struct nf_conntrack *nfct)
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -754,6 +754,24 @@
+ }
+ EXPORT_SYMBOL(nf_ct_get_tuple_skb);
+ 
++/* The DSCP the other end of this packet's connection last sent with, as it
++ * left the router (nf_conntrack.dscp_learn): false if the packet has no
++ * connection, or conntrack isn't loaded.
++ */
++bool nf_ct_get_peer_dscp(const struct sk_buff *skb, u8 *dscp)
++{
++	const struct nf_ct_hook *ct_hook;
++	bool ret = false;
++
++	rcu_read_lock();
++	ct_hook = rcu_dereference(nf_ct_hook);
++	if (ct_hook)
++		ret = ct_hook->get_peer_dscp(skb, dscp);
++	rcu_read_unlock();
++	return ret;
++}
++EXPORT_SYMBOL(nf_ct_get_peer_dscp);
++
+ /* Built-in default zone used e.g. by modules. */
+ const struct nf_conntrack_zone nf_ct_zone_dflt = {
+ 	.id	= NF_CT_DEFAULT_ZONE_ID,
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -25,6 +25,7 @@
+ #include <linux/err.h>
+ #include <linux/percpu.h>
+ #include <linux/moduleparam.h>
++#include <linux/if_vlan.h>
+ #include <linux/notifier.h>
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+@@ -60,6 +61,40 @@
+ __cacheline_aligned_in_smp DEFINE_SPINLOCK(nf_conntrack_expect_lock);
+ EXPORT_SYMBOL_GPL(nf_conntrack_expect_lock);
+ 
++/* Each connection keeps the DSCP each direction last left the router with,
++ * for what a shaper on the way in can give the other direction: an ISP may
++ * have cleared or changed it. Off: nothing on any packet's path.
++ */
++DEFINE_STATIC_KEY_FALSE(nf_ct_dscp_learn_key);
++EXPORT_SYMBOL_GPL(nf_ct_dscp_learn_key);
++
++static int nf_ct_dscp_learn_set(const char *val, const struct kernel_param *kp)
++{
++	bool on;
++	int ret = kstrtobool(val, &on);
++
++	if (ret)
++		return ret;
++	if (on)
++		static_branch_enable(&nf_ct_dscp_learn_key);
++	else
++		static_branch_disable(&nf_ct_dscp_learn_key);
++	return 0;
++}
++
++static int nf_ct_dscp_learn_get(char *buffer, const struct kernel_param *kp)
++{
++	return sysfs_emit(buffer, "%c\n",
++			  static_key_enabled(&nf_ct_dscp_learn_key) ? 'Y' : 'N');
++}
++
++static const struct kernel_param_ops nf_ct_dscp_learn_ops = {
++	.set = nf_ct_dscp_learn_set,
++	.get = nf_ct_dscp_learn_get,
++};
++module_param_cb(dscp_learn, &nf_ct_dscp_learn_ops, NULL, 0644);
++MODULE_PARM_DESC(dscp_learn, "Keep the DSCP each direction of a connection last left the router with");
++
+ struct hlist_nulls_head *nf_conntrack_hash __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_conntrack_hash);
+ 
+@@ -2300,6 +2335,46 @@
+ 	return true;
+ }
+ 
++static bool nf_conntrack_get_peer_dscp(const struct sk_buff *skb, u8 *dscp)
++{
++	const struct nf_conntrack_tuple_hash *hash;
++	struct nf_conntrack_tuple tuple;
++	enum ip_conntrack_info ctinfo;
++	struct nf_conn *ct;
++	u16 l3num;
++
++	ct = nf_ct_get(skb, &ctinfo);
++	if (ct) {
++		*dscp = READ_ONCE(ct->dscp[!CTINFO2DIR(ctinfo)]);
++		return true;
++	}
++
++	switch (skb_protocol(skb, true)) {
++	case htons(ETH_P_IP):
++		l3num = NFPROTO_IPV4;
++		break;
++	case htons(ETH_P_IPV6):
++		l3num = NFPROTO_IPV6;
++		break;
++	default:
++		return false;
++	}
++
++	if (!nf_ct_get_tuplepr(skb, skb_network_offset(skb), l3num,
++			       dev_net(skb->dev), &tuple))
++		return false;
++
++	hash = nf_conntrack_find_get(dev_net(skb->dev), &nf_ct_zone_dflt, &tuple);
++	if (!hash)
++		return false;
++
++	ct = nf_ct_tuplehash_to_ctrack(hash);
++	*dscp = READ_ONCE(ct->dscp[!NF_CT_DIRECTION(hash)]);
++	nf_ct_put(ct);
++
++	return true;
++}
++
+ /* Bring out ya dead! */
+ static struct nf_conn *
+ get_next_corpse(int (*iter)(struct nf_conn *i, void *data),
+@@ -2716,6 +2791,7 @@
+ 	.update		= nf_conntrack_update,
+ 	.destroy	= nf_ct_destroy,
+ 	.get_tuple_skb  = nf_conntrack_get_tuple_skb,
++	.get_peer_dscp	= nf_conntrack_get_peer_dscp,
+ 	.attach		= nf_conntrack_attach,
+ 	.set_closing	= nf_conntrack_set_closing,
+ 	.confirm	= __nf_conntrack_confirm,
+--- a/net/netfilter/nf_conntrack_proto.c
++++ b/net/netfilter/nf_conntrack_proto.c
+@@ -24,6 +24,7 @@
+ #include <linux/sysctl.h>
+ #include <net/route.h>
+ #include <net/ip.h>
++#include <net/dsfield.h>
+ 
+ #include <linux/netfilter_ipv4.h>
+ #include <linux/netfilter_ipv6.h>
+@@ -137,6 +138,28 @@
+ 	return false;
+ }
+ 
++/* What a packet of the connection leaves with: not an ICMP error about it. */
++static void nf_confirm_dscp_learn(struct nf_conn *ct,
++				  enum ip_conntrack_info ctinfo,
++				  const struct sk_buff *skb,
++				  const struct nf_hook_state *state)
++{
++	if (state->hook != NF_INET_POST_ROUTING ||
++	    ctinfo == IP_CT_RELATED || ctinfo == IP_CT_RELATED_REPLY)
++		return;
++
++	switch (state->pf) {
++	case NFPROTO_IPV4:
++		nf_ct_dscp_learn(ct, CTINFO2DIR(ctinfo),
++				 ipv4_get_dsfield(ip_hdr(skb)));
++		break;
++	case NFPROTO_IPV6:
++		nf_ct_dscp_learn(ct, CTINFO2DIR(ctinfo),
++				 ipv6_get_dsfield(ipv6_hdr(skb)));
++		break;
++	}
++}
++
+ unsigned int nf_confirm(void *priv,
+ 			struct sk_buff *skb,
+ 			const struct nf_hook_state *state)
+@@ -153,6 +176,9 @@
+ 	ct = nf_ct_get(skb, &ctinfo);
+ 	if (!ct || in_vrf_postrouting(state))
+ 		return NF_ACCEPT;
++
++	if (static_branch_unlikely(&nf_ct_dscp_learn_key))
++		nf_confirm_dscp_learn(ct, ctinfo, skb, state);
+ 
+ 	help = nfct_help(ct);
+ 
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -9,6 +9,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/if_ether.h>
+ #include <net/gso.h>
++#include <net/dsfield.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+ #include <net/ip6_route.h>
+@@ -439,6 +440,14 @@
+ 		  IP_CT_ESTABLISHED : IP_CT_ESTABLISHED_REPLY);
+ }
+ 
++/* An established connection goes on leaving through here, past nf_confirm(). */
++static void nf_flow_dscp_learn(struct flow_offload *flow,
++			       enum flow_offload_tuple_dir dir, u8 dsfield)
++{
++	if (static_branch_unlikely(&nf_ct_dscp_learn_key))
++		nf_ct_dscp_learn(flow->ct, (enum ip_conntrack_dir)dir, dsfield);
++}
++
+ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 				   struct nf_flowtable *flow_table,
+ 				   struct flow_offload_tuple_rhash *tuplehash,
+@@ -478,6 +487,7 @@
+ 	iph = ip_hdr(skb);
+ 	nf_flow_nat_ip(flow, skb, thoff, dir, iph);
+ 
++	nf_flow_dscp_learn(flow, dir, ipv4_get_dsfield(iph));
+ 	ip_decrease_ttl(iph);
+ 	skb_clear_tstamp(skb);
+ 
+@@ -760,6 +770,7 @@
+ 	ip6h = ipv6_hdr(skb);
+ 	nf_flow_nat_ipv6(flow, skb, dir, ip6h);
+ 
++	nf_flow_dscp_learn(flow, dir, ipv6_get_dsfield(ip6h));
+ 	ip6h->hop_limit--;
+ 	skb_clear_tstamp(skb);
+ 
+--- a/net/netfilter/nf_flow_table_ip_test.c
++++ b/net/netfilter/nf_flow_table_ip_test.c
+@@ -281,6 +281,62 @@
+ 	KUNIT_EXPECT_EQ(test, t.dst.u.tcp.port, htons(50000));
+ }
+ 
++static void nf_flow_test_dscp_key_off(void *data)
++{
++	static_branch_disable(&nf_ct_dscp_learn_key);
++}
++
++/* An offloaded connection is past nf_confirm(), so the fast path has to keep
++ * each direction's DSCP, when asked to: the last one, without the ECN bits.
++ */
++static void nf_flow_test_dscp_learn(struct kunit *test)
++{
++	struct flow_offload *flow = nf_flow_test_flow(test);
++	struct nf_conn *ct = flow->ct;
++
++	nf_flow_dscp_learn(flow, FLOW_OFFLOAD_DIR_ORIGINAL, 0xb8);
++	KUNIT_EXPECT_EQ(test, ct->dscp[IP_CT_DIR_ORIGINAL], 0);
++
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			nf_flow_test_dscp_key_off, NULL), 0);
++	static_branch_enable(&nf_ct_dscp_learn_key);
++
++	nf_flow_dscp_learn(flow, FLOW_OFFLOAD_DIR_ORIGINAL, 0xb8 | INET_ECN_CE);
++	KUNIT_EXPECT_EQ(test, ct->dscp[IP_CT_DIR_ORIGINAL], 46);
++	KUNIT_EXPECT_EQ(test, ct->dscp[IP_CT_DIR_REPLY], 0);
++
++	nf_flow_dscp_learn(flow, FLOW_OFFLOAD_DIR_REPLY, 0x20 | INET_ECN_ECT_1);
++	KUNIT_EXPECT_EQ(test, ct->dscp[IP_CT_DIR_REPLY], 8);
++	KUNIT_EXPECT_EQ(test, ct->dscp[IP_CT_DIR_ORIGINAL], 46);
++
++	nf_flow_dscp_learn(flow, FLOW_OFFLOAD_DIR_ORIGINAL, 0);
++	KUNIT_EXPECT_EQ(test, ct->dscp[IP_CT_DIR_ORIGINAL], 0);
++}
++
++/* What a packet asks for is what the other direction left with: a download's
++ * from its upload, a port-forwarded request's from the server's replies.
++ */
++static void nf_flow_test_peer_dscp(struct kunit *test)
++{
++	struct flow_offload *flow = nf_flow_test_flow(test);
++	struct sk_buff *skb = nf_flow_test_skb(test);
++	u8 dscp = 0xff;
++
++	flow->ct->dscp[IP_CT_DIR_ORIGINAL] = 46;
++	flow->ct->dscp[IP_CT_DIR_REPLY] = 8;
++
++	nf_conntrack_get(&flow->ct->ct_general);
++	nf_ct_set(skb, flow->ct, IP_CT_ESTABLISHED_REPLY);
++	KUNIT_ASSERT_TRUE(test, nf_ct_get_peer_dscp(skb, &dscp));
++	KUNIT_EXPECT_EQ(test, dscp, 46);
++
++	nf_reset_ct(skb);
++	nf_conntrack_get(&flow->ct->ct_general);
++	nf_ct_set(skb, flow->ct, IP_CT_ESTABLISHED);
++	KUNIT_ASSERT_TRUE(test, nf_ct_get_peer_dscp(skb, &dscp));
++	KUNIT_EXPECT_EQ(test, dscp, 8);
++}
++
+ /* A device, never registered: only its index and tc ingress are read */
+ static struct net_device *nf_flow_test_dev(struct kunit *test, int ifindex)
+ {
+@@ -403,6 +459,8 @@
+ 	KUNIT_CASE(nf_flow_test_put_with_skb),
+ 	KUNIT_CASE(nf_flow_test_keeps_ct),
+ 	KUNIT_CASE(nf_flow_test_tuple_skb),
++	KUNIT_CASE(nf_flow_test_dscp_learn),
++	KUNIT_CASE(nf_flow_test_peer_dscp),
+ 	KUNIT_CASE(nf_flow_test_ingress_none),
+ 	KUNIT_CASE(nf_flow_test_ingress_shaped),
+ 	KUNIT_CASE(nf_flow_test_ingress_at_device),

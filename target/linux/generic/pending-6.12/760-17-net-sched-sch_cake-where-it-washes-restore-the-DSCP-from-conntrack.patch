@@ -1,0 +1,395 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 5 Nov 2026 16:30:00 +0000
+Subject: [PATCH] net/sched: sch_cake: where it washes, restore the DSCP from conntrack
+
+wash clears what the internet set, and the download's diffserv tins (with
+besteffort off) and on Wi-Fi the access category have nothing left to go by.
+With the module parameter dscp_restore, a CAKE that washes what came in
+through a device's ingress writes the DSCP the connection's other end last
+sent with instead (nf_conntrack's dscp_learn), or 0 with none, and chooses the
+tin by it. ECN bits are kept and the IPv4 header checksum follows. A
+CHECKSUM_COMPLETE skb stays right for IPv6 too, which plain wash left wrong.
+Elsewhere it's wash as before: the parameter off, a CAKE on a device's way
+out, a packet ifb has handed back (from_ingress stays set on it, redirected
+doesn't).
+
+KUnit: any DSCP over any other with each ECN codepoint, IPv4 and IPv6, the
+checksums, both directions of a connection, and each case of plain wash.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -1973,7 +1973,10 @@
+ 	return idx + (tin << 16);
+ }
+ 
+-static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash)
++/* @to: what wash writes to the DSCP, ECN bits kept. Returns the DSCP the packet
++ * came with.
++ */
++static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash, u8 to)
+ {
+ 	const int offset = skb_network_offset(skb);
+ 	u16 *buf, buf_;
+@@ -1988,14 +1991,17 @@
+ 		/* ToS is in the second byte of iphdr */
+ 		dscp = ipv4_get_dsfield((struct iphdr *)buf) >> 2;
+ 
+-		if (wash && dscp) {
++		if (wash && dscp != to) {
+ 			const int wlen = offset + sizeof(struct iphdr);
+ 
+ 			if (!pskb_may_pull(skb, wlen) ||
+ 			    skb_try_make_writable(skb, wlen))
+ 				return 0;
+ 
+-			ipv4_change_dsfield(ip_hdr(skb), INET_ECN_MASK, 0);
++			/* the header checksum goes with it, so what
++			 * CHECKSUM_COMPLETE covers adds up the same
++			 */
++			ipv4_change_dsfield(ip_hdr(skb), INET_ECN_MASK, to << 2);
+ 		}
+ 
+ 		return dscp;
+@@ -2008,14 +2014,21 @@
+ 		/* Traffic class is in the first and second bytes of ipv6hdr */
+ 		dscp = ipv6_get_dsfield((struct ipv6hdr *)buf) >> 2;
+ 
+-		if (wash && dscp) {
++		if (wash && dscp != to) {
+ 			const int wlen = offset + sizeof(struct ipv6hdr);
++			struct ipv6hdr *ip6h;
++			__be32 from;
+ 
+ 			if (!pskb_may_pull(skb, wlen) ||
+ 			    skb_try_make_writable(skb, wlen))
+ 				return 0;
+ 
+-			ipv6_change_dsfield(ipv6_hdr(skb), INET_ECN_MASK, 0);
++			ip6h = ipv6_hdr(skb);
++			from = *(__be32 *)ip6h;
++			ipv6_change_dsfield(ip6h, INET_ECN_MASK, to << 2);
++			if (skb->ip_summed == CHECKSUM_COMPLETE)
++				skb->csum = csum_add(csum_sub(skb->csum, (__force __wsum)from),
++						     (__force __wsum)*(__be32 *)ip6h);
+ 		}
+ 
+ 		return dscp;
+@@ -2029,6 +2042,48 @@
+ 	}
+ }
+ 
++/* ISPs clear or change the DSCP of what comes in, which is why a download's
++ * CAKE washes it. With dscp_restore, a packet that came in through a device's
++ * ingress (ifb) gets instead the DSCP its connection's other end last sent
++ * with (nf_conntrack's dscp_learn), or 0 with none. Diffserv tins, and on
++ * Wi-Fi the access category, then go by what the LAN device asked for.
++ */
++static bool dscp_restore __read_mostly;
++module_param(dscp_restore, bool, 0644);
++MODULE_PARM_DESC(dscp_restore, "Where CAKE washes what came in through a device's ingress, give packets the DSCP their connection's other end sent with");
++
++/* Not skb->from_ingress alone: nothing clears it once ifb has handed the
++ * packet back, and it may reach another CAKE on its way out.
++ */
++static bool cake_redirected_from_ingress(const struct sk_buff *skb)
++{
++#ifdef CONFIG_NET_REDIRECT
++	return skb->redirected && skb->from_ingress;
++#else
++	return false;
++#endif
++}
++
++/* The DSCP to choose the tin by, for a CAKE that washes */
++static u8 cake_wash_diffserv(struct sk_buff *skb)
++{
++	__be16 proto;
++	u8 to = 0;
++
++	if (!READ_ONCE(dscp_restore) || !cake_redirected_from_ingress(skb))
++		return cake_handle_diffserv(skb, true, 0);
++
++	proto = skb_protocol(skb, true);
++	if (proto != htons(ETH_P_IP) && proto != htons(ETH_P_IPV6))
++		return cake_handle_diffserv(skb, true, 0);
++
++	if (!nf_ct_get_peer_dscp(skb, &to))
++		to = 0;
++	cake_handle_diffserv(skb, true, to);
++
++	return to;
++}
++
+ static struct cake_tin_data *cake_select_tin(struct Qdisc *sch,
+ 					     struct sk_buff *skb)
+ {
+@@ -2045,7 +2100,7 @@
+ 	mark = (skb->mark & q->fwmark_mask) >> q->fwmark_shft;
+ 	wash = !!(q->rate_flags & CAKE_FLAG_WASH);
+ 	if (wash)
+-		dscp = cake_handle_diffserv(skb, wash);
++		dscp = cake_wash_diffserv(skb);
+ 
+ 	if (q->tin_mode == CAKE_DIFFSERV_BESTEFFORT)
+ 		tin = 0;
+@@ -2060,7 +2115,7 @@
+ 
+ 	else {
+ 		if (!wash)
+-			dscp = cake_handle_diffserv(skb, wash);
++			dscp = cake_handle_diffserv(skb, false, 0);
+ 		tin = qd->tin_index[dscp];
+ 
+ 		if (unlikely(tin >= qd->tin_cnt))
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1582,6 +1582,231 @@
+ }
+ #endif
+ 
++/* --- dscp_restore ---------------------------------------------------------- */
++
++static u8 cake_test_dsfield(struct sk_buff *skb)
++{
++	return skb->protocol == htons(ETH_P_IPV6) ? ipv6_get_dsfield(ipv6_hdr(skb)) :
++						    ipv4_get_dsfield(ip_hdr(skb));
++}
++
++/* A packet with this whole DS field, its IPv4 header checksum right */
++static void cake_test_set_dsfield(struct sk_buff *skb, u8 dsfield)
++{
++	if (skb->protocol == htons(ETH_P_IPV6)) {
++		ipv6_change_dsfield(ipv6_hdr(skb), 0, dsfield);
++	} else {
++		ip_hdr(skb)->tos = dsfield;
++		ip_send_check(ip_hdr(skb));
++	}
++}
++
++/* Any DSCP can be written over any other: the ECN bits stay as they are, a CE
++ * mark or L4S's ECT(1) above all, the IPv4 header checksum still holds, and
++ * the DSCP the packet came with is what's returned.
++ */
++static void cake_test_diffserv_write(struct kunit *test)
++{
++	static const u8 from[] = { 0, 1, 8, 46, 48, 63 };
++	static const u8 to[] = { 0, 1, 8, 34, 46, 63 };
++	int v6, ecn, f, t;
++
++	for (v6 = 0; v6 < 2; v6++)
++	for (ecn = 0; ecn <= INET_ECN_MASK; ecn++)
++	for (f = 0; f < ARRAY_SIZE(from); f++)
++	for (t = 0; t < ARRAY_SIZE(to); t++) {
++		struct sk_buff *skb = cake_test_skb(test, v6, IPPROTO_TCP, 2, 40000, 0);
++		u8 flow_lbl = 0xa5;
++
++		cake_test_set_dsfield(skb, from[f] << 2 | ecn);
++		if (v6)
++			ipv6_hdr(skb)->flow_lbl[1] = flow_lbl;
++
++		KUNIT_EXPECT_EQ(test, cake_handle_diffserv(skb, true, to[t]), from[f]);
++		KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), to[t] << 2 | ecn);
++		if (v6) {
++			KUNIT_EXPECT_EQ(test, (int)ipv6_hdr(skb)->version, 6);
++			KUNIT_EXPECT_EQ(test, ipv6_hdr(skb)->flow_lbl[1], flow_lbl);
++		} else {
++			KUNIT_EXPECT_EQ(test, ip_fast_csum(ip_hdr(skb), ip_hdr(skb)->ihl), 0);
++		}
++	}
++}
++
++/* Without wash nothing is written */
++static void cake_test_diffserv_no_wash(struct kunit *test)
++{
++	int v6;
++
++	for (v6 = 0; v6 < 2; v6++) {
++		struct sk_buff *skb = cake_test_skb(test, v6, IPPROTO_TCP, 2, 40000, 0);
++
++		cake_test_set_dsfield(skb, 46 << 2 | INET_ECN_ECT_0);
++		KUNIT_EXPECT_EQ(test, cake_handle_diffserv(skb, false, 8), 46);
++		KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 46 << 2 | INET_ECN_ECT_0);
++	}
++}
++
++/* A receive checksum over the packet still adds up after the DSCP changes */
++static void cake_test_diffserv_csum_complete(struct kunit *test)
++{
++	int v6;
++
++	for (v6 = 0; v6 < 2; v6++) {
++		struct sk_buff *skb = cake_test_skb(test, v6, IPPROTO_TCP, 2, 40000, 0);
++
++		cake_test_set_dsfield(skb, 48 << 2 | INET_ECN_ECT_0);
++		skb->ip_summed = CHECKSUM_COMPLETE;
++		skb->csum = csum_partial(skb->data, skb->len, 0);
++
++		cake_handle_diffserv(skb, true, 46);
++		KUNIT_EXPECT_EQ(test, csum_fold(skb->csum),
++				csum_fold(csum_partial(skb->data, skb->len, 0)));
++	}
++}
++
++#if IS_ENABLED(CONFIG_NF_CONNTRACK) && defined(CONFIG_NET_REDIRECT)
++static void cake_test_dscp_restore_back(void *old)
++{
++	dscp_restore = *(bool *)old;
++}
++
++static void cake_test_dscp_restore_set(struct kunit *test, bool on)
++{
++	bool *old = kunit_kzalloc(test, sizeof(*old), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, old);
++	*old = dscp_restore;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			cake_test_dscp_restore_back, old), 0);
++	dscp_restore = on;
++}
++
++/* A download from the internet, through ifb from wan's ingress: its entry's
++ * reply direction, the LAN host having sent with @sent
++ */
++static struct sk_buff *cake_test_download(struct kunit *test, u8 sent)
++{
++	struct sk_buff *skb = cake_test_nat_skb(test, 2, 61002, true, 0);
++	enum ip_conntrack_info ctinfo;
++	struct nf_conn *ct = nf_ct_get(skb, &ctinfo);
++
++	ct->dscp[IP_CT_DIR_ORIGINAL] = sent;
++	nf_ct_set(skb, ct, IP_CT_ESTABLISHED_REPLY);
++	skb->redirected = 1;
++	skb->from_ingress = 1;
++	return skb;
++}
++
++/* The restored DSCP goes on the packet and picks the tin, over whatever the
++ * internet set, and a CE mark survives it.
++ */
++static void cake_test_wash_restores(struct kunit *test)
++{
++	struct sk_buff *skb;
++
++	if (!rcu_access_pointer(nf_ct_hook))
++		kunit_skip(test, "nf_conntrack isn't loaded");
++	cake_test_dscp_restore_set(test, true);
++
++	skb = cake_test_download(test, 46);
++	cake_test_set_dsfield(skb, 0);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 46);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 46 << 2);
++
++	skb = cake_test_download(test, 46);
++	cake_test_set_dsfield(skb, 48 << 2 | INET_ECN_CE);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 46);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 46 << 2 | INET_ECN_CE);
++	KUNIT_EXPECT_EQ(test, ip_fast_csum(ip_hdr(skb), ip_hdr(skb)->ihl), 0);
++
++	/* a host that marks nothing: what the internet set goes */
++	skb = cake_test_download(test, 0);
++	cake_test_set_dsfield(skb, 48 << 2 | INET_ECN_ECT_0);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), INET_ECN_ECT_0);
++}
++
++/* A connection from the internet to a LAN server: the request gets what the
++ * server's replies left with.
++ */
++static void cake_test_wash_restores_original_dir(struct kunit *test)
++{
++	struct sk_buff *skb;
++	enum ip_conntrack_info ctinfo;
++	struct nf_conn *ct;
++
++	if (!rcu_access_pointer(nf_ct_hook))
++		kunit_skip(test, "nf_conntrack isn't loaded");
++	cake_test_dscp_restore_set(test, true);
++
++	skb = cake_test_download(test, 46);
++	ct = nf_ct_get(skb, &ctinfo);
++	ct->dscp[IP_CT_DIR_REPLY] = 34;
++	nf_ct_set(skb, ct, IP_CT_ESTABLISHED);
++	cake_test_set_dsfield(skb, 0);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 34);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 34 << 2);
++}
++
++/* Anywhere else it's plain wash: the parameter off (the tin still goes by the
++ * DSCP the packet came with, as upstream), a CAKE on a device's way out, a
++ * packet ifb has already handed back, or no connection in conntrack.
++ */
++static void cake_test_wash_plain(struct kunit *test)
++{
++	struct sk_buff *skb;
++
++	if (!rcu_access_pointer(nf_ct_hook))
++		kunit_skip(test, "nf_conntrack isn't loaded");
++
++	cake_test_dscp_restore_set(test, false);
++	skb = cake_test_download(test, 46);
++	cake_test_set_dsfield(skb, 48 << 2);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 48);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 0);
++
++	dscp_restore = true;
++	skb = cake_test_download(test, 46);
++	skb->redirected = 0;
++	skb->from_ingress = 0;
++	cake_test_set_dsfield(skb, 48 << 2);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 48);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 0);
++
++	skb = cake_test_download(test, 46);
++	skb->redirected = 0;
++	cake_test_set_dsfield(skb, 48 << 2);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 48);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 0);
++
++	skb = cake_test_skb(test, false, IPPROTO_TCP, 2, 40000, 0);
++	skb->redirected = 1;
++	skb->from_ingress = 1;
++	cake_test_set_dsfield(skb, 48 << 2);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 0);
++	skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	skb->redirected = 1;
++	skb->from_ingress = 1;
++	cake_test_set_dsfield(skb, 48 << 2);
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_dsfield(skb), 0);
++}
++
++/* ARP has no DSCP, and stays in the network control class */
++static void cake_test_wash_arp(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, false, 0, 2, 40000, 0);
++
++	cake_test_dscp_restore_set(test, true);
++	skb->protocol = htons(ETH_P_ARP);
++	skb->redirected = 1;
++	skb->from_ingress = 1;
++	KUNIT_EXPECT_EQ(test, cake_wash_diffserv(skb), 0x38);
++}
++#endif
++
+ /* The watchdog wakes no earlier than the shaper's next packet and at most
+  * the slack after it: an hrtimer set for that range
+  */
+@@ -2176,6 +2401,15 @@
+ }
+ 
+ static struct kunit_case cake_test_cases[] = {
++	KUNIT_CASE(cake_test_diffserv_write),
++	KUNIT_CASE(cake_test_diffserv_no_wash),
++	KUNIT_CASE(cake_test_diffserv_csum_complete),
++#if IS_ENABLED(CONFIG_NF_CONNTRACK) && defined(CONFIG_NET_REDIRECT)
++	KUNIT_CASE(cake_test_wash_restores),
++	KUNIT_CASE(cake_test_wash_restores_original_dir),
++	KUNIT_CASE(cake_test_wash_plain),
++	KUNIT_CASE(cake_test_wash_arp),
++#endif
+ 	KUNIT_CASE(cake_test_hash_matches_eager),
+ 	KUNIT_CASE(cake_test_hash_reallocates_idle_flow),
+ 	KUNIT_CASE(cake_test_hash_flow_override),
