@@ -47,6 +47,36 @@ export type Change =
   | { op: 'order'; config: string; sections: string[] };
 
 /**
+ * Set, or unset (undefined), options of one named section: adds the section
+ * if it's missing, and deletes it when nothing would be left in it.
+ */
+export function sectionChanges(config: string, sections: Section[], name: string, options: Record<string, string | undefined>): Change[] {
+  const s = sections.find((x) => x['.name'] === name);
+  const values: Record<string, string> = {};
+  const unset: string[] = [];
+  for (const [option, value] of Object.entries(options)) {
+    if (value === undefined) {
+      if (s?.[option] !== undefined) unset.push(option);
+    } else if (str(s, option) !== value) {
+      values[option] = value;
+    }
+  }
+  const changes: Change[] = [];
+  if (Object.keys(values).length > 0) {
+    changes.push(s === undefined ? { op: 'add', config, type: name, name, values } : { op: 'set', config, section: name, values });
+  }
+  if (unset.length > 0) {
+    const kept = Object.keys(s ?? {}).filter((k) => !k.startsWith('.') && !unset.includes(k));
+    changes.push(
+      kept.length === 0 && Object.keys(values).length === 0
+        ? { op: 'delete', config, section: name }
+        : { op: 'unset', config, section: name, options: unset },
+    );
+  }
+  return changes;
+}
+
+/**
  * Stage changes after dropping everything this session already has staged.
  * rpcd applies all of a session's staged changes, and a rollback stages
  * again what it undid, so a save after one (the firewall's check failing)

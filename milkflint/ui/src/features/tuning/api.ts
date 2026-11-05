@@ -25,8 +25,8 @@ const groPortSchema = z.object({
 export type GroPort = z.output<typeof groPortSchema>;
 
 const statusSchema = z.object({
-  /** each radio's best-effort AQL limits, in µs */
-  radios: z.array(z.object({ phy: z.string(), low: z.number(), high: z.number() })),
+  /** each radio's best-effort AQL limits and the total that holds devices to the low one, in µs (an older router has no total) */
+  radios: z.array(z.object({ phy: z.string(), low: z.number(), high: z.number(), threshold: z.number().nullable().default(null) })),
   steering: z.object({
     cpus: z.number(),
     /** where the Ethernet receive (NAPI) threads may run */
@@ -56,12 +56,16 @@ const statusSchema = z.object({
       rx_delay: z.number().nullable(),
       /** sch_cake's ecn_fail_count: 0 always marks */
       cake_ecn: z.number().nullable(),
+      /** sch_cake's l4s_ramp: where L4S traffic starts to be marked, in percent of its target; 0 not at all */
+      cake_l4s: z.number().nullable().default(null),
       /** whether sch_cake is loaded: Smart Queue has run since boot */
       cake_loaded: z.boolean().default(false),
       /** the Wi-Fi driver's sends of a data frame */
       wifi_retries: z.number().nullable(),
+      /** whether the Wi-Fi driver aggregates the voice queue; null without the setting, or on an older router */
+      wifi_vo_aggr: z.boolean().nullable().default(null),
     })
-    .default({ rx_delay: null, cake_ecn: null, cake_loaded: false, wifi_retries: null }),
+    .default({ rx_delay: null, cake_ecn: null, cake_l4s: null, cake_loaded: false, wifi_retries: null, wifi_vo_aggr: null }),
 });
 export type TuningStatus = z.output<typeof statusSchema>;
 

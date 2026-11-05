@@ -2,7 +2,6 @@ import { ActivityIcon, GlobeIcon, LoaderCircleIcon, RadarIcon, SettingsIcon } fr
 import { type ReactElement, type ReactNode, useCallback, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
-import { ThroughputChart } from '@/components/charts/throughput-chart';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
@@ -20,9 +19,11 @@ import { cn } from '@/lib/utils';
 import { type Live, useLive, WINDOW_SECONDS } from './live';
 import { Button } from '@/components/ui/button';
 import { usePoll } from '@/hooks/use-poll';
-import { type Bucket, type DnsTarget, getHistory, type History, type Route, type Sample, type Stat } from './api';
+import { type Bucket, type DnsTarget, getHistory, type History, type Route, type Sample } from './api';
+import { type ChartLine, csvName, historyLine, type LineSpec, linesToCsv, liveLine } from './chart-data';
 import { type DnsLine, dnsLines, providerName } from './dns-lines';
-import { type Probe, type ProbeSummary, rating, summarize, summarizeDnsServer, summarizeRoute } from './score';
+import { LatencyChart } from './latency-chart';
+import { type Probe, type ProbeSummary, rating, summarize, summarizeDnsServer } from './score';
 import { ScoreRing } from './score-ring';
 
 const pingTargets = [
@@ -86,7 +87,6 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
   );
 }
 
-const ROUTE_EVERY = 30;
 const routeColors = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)'];
 // the DNS servers asked now: blue, amber, then paler ones (the probe asks
 // four at most); servers asked earlier in the span, and the line from before
@@ -107,11 +107,12 @@ function dnsRowLabel(d: DnsTarget): string {
 }
 
 // The charts' time span: the last hour from the live samples, or the
-// probe's minute history merged into `step`-second buckets.
+// probe's minute history merged into `step`-second buckets. `csvStep` is
+// the CSV's: finer than the chart where the router can read it quickly.
 const spans = [
-  { key: '1h', label: '1 hour', seconds: 3600, step: undefined, spanLabel: '1 h' },
-  { key: '24h', label: '24 hours', seconds: 86400, step: 120, spanLabel: '24 h' },
-  { key: '7d', label: '7 days', seconds: 7 * 86400, step: 900, spanLabel: '7 d' },
+  { key: '1h', label: '1 hour', seconds: 3600, step: undefined, csvStep: undefined, spanLabel: '1 h' },
+  { key: '24h', label: '24 hours', seconds: 86400, step: 120, csvStep: 60, spanLabel: '24 h' },
+  { key: '7d', label: '7 days', seconds: 7 * 86400, step: 900, csvStep: 900, spanLabel: '7 d' },
 ] as const;
 type Span = (typeof spans)[number];
 
@@ -137,100 +138,108 @@ function SpanPicker({ span, onChange }: { span: Span; onChange: (s: Span) => voi
   );
 }
 
-/** One value per bucket of the history (its typical), undefined where nothing was recorded or answered. */
-function historySeries(history: History, pick: (b: Bucket) => Stat | undefined): (number | undefined)[] {
-  const out: (number | undefined)[] = Array.from({ length: Math.round((history.now - history.start) / history.step) }, () => undefined);
-  for (const b of history.buckets) {
-    const v = pick(b)?.[0];
-    if (b.i < out.length && v !== null && v !== undefined) out[b.i] = v;
-  }
-  return out;
+/** What the lines are read from. */
+type Source = { samples: readonly Sample[]; history?: undefined } | { samples?: undefined; history: History };
+
+const toLines = (specs: readonly LineSpec[], source: Source): ChartLine[] =>
+  specs.map((spec) => (source.history === undefined ? liveLine(spec, source.samples) : historyLine(spec, source.history)));
+
+/** The latency chart's lines: internet, each DNS server, the gateway (unless it has never answered). */
+function latencyLines(source: Source, dnsOrder: readonly string[], gatewayAnswers: boolean | null | undefined): ChartLine[] {
+  const dns =
+    source.history === undefined
+      ? dnsLines(
+          source.samples,
+          (s) => s.dns_servers,
+          (s) => s.dns,
+          dnsOrder,
+        )
+      : dnsLines(
+          source.history.buckets,
+          (b) => (b.dns_servers === undefined ? undefined : Object.fromEntries(Object.entries(b.dns_servers).map(([k, v]) => [k, v?.[0] ?? null]))),
+          (b) => b.dns?.[0],
+          dnsOrder,
+        );
+  const dnsSpec = (l: DnsLine): LineSpec => ({
+    key: `dns:${l.key}`,
+    label: l.key === '' ? l.label : `DNS · ${l.label}`,
+    color: dnsColor(l, dnsOrder),
+    // the line from before the probe asked each server reads the single value
+    sample: (s) => (l.key === '' ? (s.dns_servers === undefined ? s.dns : undefined) : s.dns_servers?.[l.key]),
+    bucket: (b: Bucket) => (l.key === '' ? (b.dns_servers === undefined ? b.dns : undefined) : b.dns_servers?.[l.key]),
+  });
+  const lines = toLines(
+    [
+      { key: 'internet', label: 'Internet', color: 'var(--chart-1)', sample: (s) => s.internet, bucket: (b) => b.internet },
+      ...dns.map(dnsSpec),
+      {
+        key: 'gateway',
+        label: 'Gateway',
+        color: 'var(--chart-3)',
+        countLoss: gatewayAnswers !== false,
+        sample: (s) => s.gateway,
+        bucket: (b) => b.gateway,
+      },
+    ],
+    source,
+  );
+  return lines.filter((l) => l.key !== 'gateway' || l.points.some((p) => p.v !== undefined));
 }
+
+const routeLines = (routes: readonly Route[], source: Source): ChartLine[] =>
+  toLines(
+    routes.map((r, i) => ({
+      key: r.key,
+      label: r.label,
+      detail: r.host,
+      color: routeColors[i % routeColors.length] ?? 'var(--chart-1)',
+      // a sample between the route rounds has none: not asked
+      sample: (s) => (s.routes === undefined ? undefined : (s.routes[r.key] ?? null)),
+      bucket: (b) => b.routes?.[r.key],
+    })),
+    source,
+  );
 
 /** What the charts show for the chosen span. */
 interface ChartData {
-  slots: number;
-  routeSlots: number;
+  start: number;
+  end: number;
   spanLabel: string;
   /** The Latency card's description: how often a point is. */
   description: string;
-  /** Values for a probe (live samples or history buckets). */
-  probe: (key: Probe) => (number | undefined)[];
-  /** A line per DNS server. */
-  dns: DnsLine[];
-  route: (key: string) => (number | undefined)[];
-  /** Epoch seconds of a slot of each chart, for hovering. */
-  timeOf: (slot: number) => number | undefined;
-  routeTimeOf: (slot: number) => number | undefined;
+  source?: Source | undefined;
   /** Shown instead of the charts, e.g. while history loads. */
   note?: string | undefined;
 }
 
-/** The time of a slot when `rounds` are drawn right-aligned in `slots`. */
-const roundTime =
-  (rounds: readonly Sample[], slots: number) =>
-  (slot: number): number | undefined =>
-    rounds[slot - (slots - rounds.length)]?.t;
-
-function liveChart(samples: readonly Sample[], interval: number, dnsOrder: readonly string[]): ChartData {
-  const rounds = samples.filter((s) => s.routes !== undefined);
-  const slots = Math.round(3600 / interval);
-  const routeSlots = Math.round(3600 / ROUTE_EVERY);
+function liveChart(samples: readonly Sample[], interval: number, now: number): ChartData {
   return {
-    slots,
-    routeSlots,
+    start: now - 3600,
+    end: now,
     spanLabel: '1 h',
-    description: `Every ${String(interval)} s; gaps are probes with no answer`,
-    probe: (key) => samples.map((s) => s[key] ?? undefined),
-    dns: dnsLines(
-      samples,
-      (s) => s.dns_servers,
-      (s) => s.dns,
-      dnsOrder,
-    ),
-    route: (key) => rounds.map((s) => s.routes?.[key] ?? undefined),
-    timeOf: roundTime(samples, slots),
-    routeTimeOf: roundTime(rounds, routeSlots),
+    description: `Measured every ${String(interval)} s; each point is one measurement`,
+    source: { samples },
   };
 }
 
-function historyChart(span: Span, history: History | undefined, loading: boolean, dnsOrder: readonly string[]): ChartData {
-  const empty = (): (number | undefined)[] => [];
-  const description = `Typical per ${String((span.step ?? 60) / 60)} min over the last ${span.label}; gaps: no answer or not recorded`;
+function historyChart(span: Span, history: History | undefined, loading: boolean, now: number, interval: number): ChartData {
+  const step = (span.step ?? 60) / 60;
+  const description = `Measured every ${String(interval)} s. Each point covers ${String(step)} min: the line is the typical time, the shading reaches the slowest.`;
   if (history === undefined) {
-    const slots = Math.round(span.seconds / (span.step ?? 60));
     return {
-      slots,
-      routeSlots: slots,
+      start: now - span.seconds,
+      end: now,
       spanLabel: span.spanLabel,
       description,
-      probe: empty,
-      dns: [],
-      route: empty,
-      timeOf: () => undefined,
-      routeTimeOf: () => undefined,
       note: loading ? 'Loading history…' : 'History unavailable.',
     };
   }
-  const slots = Math.round((history.now - history.start) / history.step);
-  const timeOf = (slot: number): number => history.start + slot * history.step;
-  const bySlot: (Bucket | undefined)[] = Array.from({ length: slots }, () => undefined);
-  for (const b of history.buckets) if (b.i < slots) bySlot[b.i] = b;
   return {
-    slots,
-    routeSlots: slots,
+    start: history.start,
+    end: history.now,
     spanLabel: span.spanLabel,
     description,
-    probe: (key) => historySeries(history, (b) => b[key]),
-    dns: dnsLines(
-      bySlot,
-      (b) => (b?.dns_servers === undefined ? undefined : Object.fromEntries(Object.entries(b.dns_servers).map(([k, v]) => [k, v?.[0] ?? null]))),
-      (b) => b?.dns?.[0],
-      dnsOrder,
-    ),
-    route: (key) => historySeries(history, (b) => b.routes?.[key]),
-    timeOf,
-    routeTimeOf: timeOf,
+    source: { history },
     note:
       history.days === 0
         ? 'History is off (milkflint.netquality.history_days).'
@@ -244,56 +253,46 @@ function ChartNote({ children }: { children: ReactNode }): ReactElement {
   return <div className="flex h-52 items-center justify-center text-sm text-muted-foreground">{children}</div>;
 }
 
+/** The chart's axis labels: whole numbers. */
+const axisMs = (v: number): string => `${formatNumber(v)} ms`;
+
 /** The UK, Europe and US servers: whether a slowdown is the line or a route abroad. */
 function Routes({
   routes,
-  recent,
   chart,
   picker,
+  csv,
 }: {
   routes: readonly Route[];
-  recent: readonly Sample[];
   chart: ChartData;
   picker: ReactNode;
+  csv: () => Promise<{ name: string; text: string }>;
 }): ReactElement {
-  const color = (i: number): string => routeColors[i % routeColors.length] ?? 'var(--chart-1)';
   return (
     <Card>
       <CardHeading
         icon={GlobeIcon}
         title="Routes"
-        description={`A server each in the UK, Europe and the US, pinged every ${String(ROUTE_EVERY)} s. Not part of the score.`}
-        action={picker}
+        description="A server each in the UK, Europe and the US, pinged once a minute. Not part of the score."
+        action={<div className="hidden sm:block">{picker}</div>}
       />
       <CardContent>
-        <div className="divide-y">
-          {routes.map((r) => (
-            <ProbeBar key={r.key} label={r.label} target={r.host} scaleMs={200} summary={summarizeRoute(recent, r.key)} />
-          ))}
-        </div>
-        <p className="pt-2 pb-4 text-xs text-muted-foreground">
+        <div className="pb-3 sm:hidden">{picker}</div>
+        <p className="pb-3 text-xs text-muted-foreground">
           If all three get slower together, it&apos;s your line; if only the far ones do, it&apos;s the route there.
         </p>
-        <div className="mb-3 flex flex-wrap gap-5 text-xs text-muted-foreground">
-          {routes.map((r, i) => (
-            <span key={r.key} className="flex items-center gap-1.5">
-              <span className="size-2 rounded-full" style={{ background: color(i) }} />
-              {r.label}
-            </span>
-          ))}
-        </div>
-        {chart.note !== undefined ? (
+        {chart.note !== undefined || chart.source === undefined ? (
           <ChartNote>{chart.note}</ChartNote>
         ) : (
-          <ThroughputChart
+          <LatencyChart
             label="Route latency"
-            slots={chart.routeSlots}
+            lines={routeLines(routes, chart.source)}
+            start={chart.start}
+            end={chart.end}
             spanLabel={chart.spanLabel}
-            format={(v) => `${formatNumber(v)} ms`}
+            format={axisMs}
             hoverFormat={ms}
-            timeOf={chart.routeTimeOf}
-            minMax={50}
-            series={routes.map((r, i) => ({ label: r.label, color: color(i), values: chart.route(r.key) }))}
+            csv={csv}
           />
         )}
       </CardContent>
@@ -317,13 +316,24 @@ function Results({ live }: { live: Live }): ReactElement {
   );
   const dnsTargets = targets?.dns_servers ?? [];
   const dnsOrder = dnsTargets.map((d) => d.key);
-  const chart = span.step === undefined ? liveChart(samples, interval, dnsOrder) : historyChart(span, history.data, history.loading, dnsOrder);
-  // the latency chart's lines: internet, each DNS server, the gateway
-  const lines = [
-    { label: 'Internet', color: 'var(--chart-1)', values: chart.probe('internet') },
-    ...chart.dns.map((l) => ({ label: l.key === '' ? l.label : `DNS · ${l.label}`, color: dnsColor(l, dnsOrder), values: l.values })),
-    { label: 'Gateway', color: 'var(--chart-3)', values: chart.probe('gateway') },
-  ];
+  const chart =
+    span.step === undefined ? liveChart(samples, interval, status.now) : historyChart(span, history.data, history.loading, status.now, interval);
+  const routes = targets?.routes ?? [];
+  const gatewayAnswers = status.gateway_answers;
+  // the CSV's data: as charted for the hour and the 7 days, by the minute for the 24 hours
+  const csvSource = async (): Promise<Source> => {
+    if (span.step === undefined) return { samples };
+    if (span.csvStep === span.step && history.data !== undefined) return { history: history.data };
+    return { history: await getHistory(span.seconds, span.csvStep) };
+  };
+  const latencyCsv = async (): Promise<{ name: string; text: string }> => ({
+    name: csvName('latency', span.key, status.now),
+    text: linesToCsv(latencyLines(await csvSource(), dnsOrder, gatewayAnswers)),
+  });
+  const routesCsv = async (): Promise<{ name: string; text: string }> => ({
+    name: csvName('routes', span.key, status.now),
+    text: linesToCsv(routeLines(routes, await csvSource())),
+  });
   const picker = <SpanPicker span={span} onChange={setSpan} />;
 
   if (samples.length === 0) {
@@ -424,36 +434,27 @@ function Results({ live }: { live: Live }): ReactElement {
       </div>
 
       <Card>
-        <CardHeading icon={ActivityIcon} title="Latency" description={chart.description} action={picker} />
+        <CardHeading icon={ActivityIcon} title="Latency" description={chart.description} action={<div className="hidden sm:block">{picker}</div>} />
         <CardContent>
-          <div className="mb-3 flex flex-wrap gap-5 text-xs text-muted-foreground">
-            {lines.map((l) => (
-              <span key={l.label} className="flex items-center gap-1.5">
-                <span className="size-2 rounded-full" style={{ background: l.color }} />
-                {l.label}
-              </span>
-            ))}
-          </div>
-          {chart.note !== undefined ? (
+          <div className="pb-3 sm:hidden">{picker}</div>
+          {chart.note !== undefined || chart.source === undefined ? (
             <ChartNote>{chart.note}</ChartNote>
           ) : (
-            <ThroughputChart
+            <LatencyChart
               label="Latency"
-              slots={chart.slots}
+              lines={latencyLines(chart.source, dnsOrder, gatewayAnswers)}
+              start={chart.start}
+              end={chart.end}
               spanLabel={chart.spanLabel}
-              format={(v) => `${formatNumber(v)} ms`}
+              format={axisMs}
               hoverFormat={ms}
-              timeOf={chart.timeOf}
-              minMax={50}
-              series={lines}
+              csv={latencyCsv}
             />
           )}
         </CardContent>
       </Card>
 
-      {targets?.routes !== undefined && targets.routes.length > 0 && (
-        <Routes routes={targets.routes} recent={recent} chart={chart} picker={picker} />
-      )}
+      {routes.length > 0 && <Routes routes={routes} chart={chart} picker={picker} csv={routesCsv} />}
     </div>
   );
 }

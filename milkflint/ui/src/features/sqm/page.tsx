@@ -19,12 +19,13 @@ import { useLoad } from '@/hooks/use-load';
 import { type NetworkLive, queueKey, useNetworkLive } from '@/hooks/use-network-live';
 import { getDevices, getInterfaces } from '@/lib/api/network';
 import type { CakeQdisc, CakeTin } from '@/lib/api/stats';
-import { bool, type Change, getConfig, type Section, str } from '@/lib/api/uci';
+import { bool, type Change, getConfig, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { formatBitrate, formatNumber } from '@/lib/format';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
+import { type SqmDscpOption, sqmDscpOptions } from './dscp';
 import { GSO, optValue, takesWhole, type Whole, wholeSetting, withOpts, words } from './gso';
 
 // Link-layer presets: how much each packet grows on the wire, so CAKE's
@@ -98,6 +99,8 @@ interface SqmForm {
   uploadMemory: UploadMemory | 'custom';
   perDevice: boolean;
   multiQueue: boolean;
+  /** Downloads get back the DSCP their connection sends with (milkflint.cake.dscp_restore) */
+  restoreDscp: boolean;
   offloadOff: boolean;
 }
 
@@ -109,6 +112,9 @@ interface SqmData {
   installed: boolean;
   iqdiscOpts: string | undefined;
   eqdiscOpts: string | undefined;
+  milkflint: Section[];
+  /** sqm's options for DSCP on the download, as set */
+  squash: Record<SqmDscpOption, string | undefined>;
   /** sqm's tcMPU, unset when a preset doesn't use one */
   mpu: string | undefined;
   /** Performance Tuning's choice of whether CAKE takes GRO packets whole */
@@ -175,6 +181,7 @@ async function loadSqm(): Promise<SqmData> {
     perDevice: words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost'),
     // on unless turned off: MilkFlint's default (uci-defaults sets use_mq once)
     multiQueue: queue === undefined || bool(queue, 'use_mq'),
+    restoreDscp: str(milkflint?.find((s) => s['.name'] === 'cake'), 'dscp_restore') === '1',
     offloadOff: false,
   };
   return {
@@ -194,6 +201,8 @@ async function loadSqm(): Promise<SqmData> {
     eqdiscOpts: str(queue, 'eqdisc_opts'),
     mpu: str(queue, 'tcMPU'),
     whole: wholeSetting(str(milkflint?.find((s) => s['.name'] === 'gro'), 'whole')),
+    milkflint: milkflint ?? [],
+    squash: { squash_dscp: str(queue, 'squash_dscp'), squash_ingress: str(queue, 'squash_ingress') },
   };
 }
 
@@ -256,16 +265,20 @@ function toChanges(f: SqmForm, data: SqmData): Change[] {
   }
   // LuCI shows these options only in its advanced mode
   if (unset.length < 2) Object.assign(values, { qdisc_advanced: '1', qdisc_really_really_advanced: '1' });
+  const dscp = sqmDscpOptions(f.restoreDscp, f.prioritise, data.form.restoreDscp);
+  Object.assign(values, dscp.set);
   const changes: Change[] =
     f.section === undefined
       ? [{ op: 'add', config: 'sqm', type: 'queue', name: 'wan', values }]
       : [{ op: 'set', config: 'sqm', section: f.section, values }];
   const wasSet = unset.filter((key) => (key === 'iqdisc_opts' ? data.iqdiscOpts : data.eqdiscOpts) !== undefined);
+  wasSet.push(...dscp.unset.filter((key) => data.squash[key] !== undefined));
   // a preset without an mpu: sqm's default (none)
   if (preset !== undefined && preset.mpu === undefined && data.mpu !== undefined) wasSet.push('tcMPU');
   if (wasSet.length > 0 && f.section !== undefined) {
     changes.push({ op: 'unset', config: 'sqm', section: f.section, options: wasSet });
   }
+  changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', { dscp_restore: f.restoreDscp ? '1' : undefined }));
   // hardware offloading only: CAKE still shapes software-offloaded packets
   if (f.offloadOff && data.offloading !== undefined) {
     changes.push({
@@ -732,6 +745,28 @@ export function SqmPage(): ReactElement {
                       checked={form.perDevice}
                       onCheckedChange={(v) => {
                         set('perDevice', v);
+                      }}
+                    />
+                  </Field>
+                  <Field
+                    id="restoreDscp"
+                    label="Keep devices’ priorities on downloads"
+                    hint={
+                      <>
+                        Devices mark what they send as calls, video or background transfers (DSCP), but the marks don’t survive the
+                        way back from the internet. This puts each connection’s mark back on its downloads, so Wi-Fi sends a
+                        call’s ahead of other traffic and a backup’s behind it
+                        {form.prioritise ? ', and Prioritise by traffic type applies to downloads as well' : ''}.
+                        {!form.enabled && <span className="mt-1 block">Needs Smart Queue on.</span>}
+                      </>
+                    }
+                  >
+                    <Switch
+                      id="restoreDscp"
+                      checked={form.restoreDscp}
+                      disabled={!form.enabled}
+                      onCheckedChange={(v) => {
+                        set('restoreDscp', v);
                       }}
                     />
                   </Field>

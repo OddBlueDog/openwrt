@@ -1,7 +1,7 @@
 // Hovering (or tapping) a chart: a guide line at the nearest point, a dot on
 // each series and a small card with the time and the values there. Laid
 // over the chart's plot area, in the same 0..slots-1 coordinates.
-import { type PointerEvent, type ReactElement, useRef, useState } from 'react';
+import { Fragment, type PointerEvent, type ReactElement, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
 
 export interface HoverSeries {
@@ -9,6 +9,10 @@ export interface HoverSeries {
   color: string;
   /** As drawn: oldest first, right-aligned to the last slot. */
   values: readonly (number | undefined)[];
+  /** Beside a slot's value (or instead of it where there is none), e.g. "up to 40 ms" or "lost". */
+  notes?: readonly (string | undefined)[];
+  /** A second value at a slot, marked with a hollow dot above the first: e.g. the slowest behind a typical value. */
+  upper?: readonly (number | undefined)[];
 }
 
 /** "14:30:05" within minutes, "14:30" within a day, "Tue 14:30" beyond. */
@@ -52,11 +56,12 @@ export function ChartHover({
       ? []
       : series.map((s) => {
           const i = slot - (slots - s.values.length);
-          return { s, v: i >= 0 ? s.values[i] : undefined };
+          return { s, v: i >= 0 ? s.values[i] : undefined, note: i >= 0 ? s.notes?.[i] : undefined, upper: i >= 0 ? s.upper?.[i] : undefined };
         });
-  const shown = slot !== undefined && rows.some((r) => r.v !== undefined);
+  const shown = slot !== undefined && rows.some((r) => r.v !== undefined || r.note !== undefined);
   const x = slot === undefined || slots <= 1 ? 100 : (slot / (slots - 1)) * 100;
   const t = slot === undefined ? undefined : timeOf?.(slot);
+  const yPct = (v: number): number => 100 - (max > 0 ? Math.min(v / max, 1) : 0) * 100;
   // the step and span from the right, where the data is (it's right-aligned)
   const tEnd = timeOf?.(slots - 1);
   const tPrev = timeOf?.(slots - 2);
@@ -77,13 +82,26 @@ export function ChartHover({
         <>
           <div className="pointer-events-none absolute inset-y-0 w-px bg-foreground/30" style={{ left: `${String(x)}%` }} />
           {rows.map(
-            ({ s, v }) =>
+            ({ s, v, upper }) =>
               v !== undefined && (
-                <span
-                  key={s.label}
-                  className="pointer-events-none absolute size-2 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-background"
-                  style={{ left: `${String(x)}%`, top: `${String(100 - (max > 0 ? Math.min(v / max, 1) : 0) * 100)}%`, background: s.color }}
-                />
+                <Fragment key={s.label}>
+                  {upper !== undefined && (
+                    <>
+                      <span
+                        className="pointer-events-none absolute w-0.5 -translate-x-1/2 opacity-50"
+                        style={{ left: `${String(x)}%`, top: `${String(yPct(upper))}%`, height: `${String(yPct(v) - yPct(upper))}%`, background: s.color }}
+                      />
+                      <span
+                        className="pointer-events-none absolute size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 bg-background"
+                        style={{ left: `${String(x)}%`, top: `${String(yPct(upper))}%`, borderColor: s.color }}
+                      />
+                    </>
+                  )}
+                  <span
+                    className="pointer-events-none absolute size-2 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-background"
+                    style={{ left: `${String(x)}%`, top: `${String(yPct(v))}%`, background: s.color }}
+                  />
+                </Fragment>
               ),
           )}
           <div
@@ -98,11 +116,14 @@ export function ChartHover({
                 {formatTime(t, tEnd !== undefined && tPrev !== undefined ? tEnd - tPrev : 60, t0 !== undefined && tEnd !== undefined ? tEnd - t0 : 0)}
               </span>
             )}
-            {rows.map(({ s, v }) => (
+            {rows.map(({ s, v, note }) => (
               <span key={s.label} className="flex items-center gap-2">
                 <span className="size-2 shrink-0 rounded-full" style={{ background: s.color }} />
                 <span className="text-muted-foreground">{s.label}</span>
-                <span className="ml-auto pl-3 font-medium tabular">{v === undefined ? '—' : format(v)}</span>
+                <span className="ml-auto pl-3 font-medium tabular">
+                  {v === undefined ? (note ?? '—') : format(v)}
+                  {v !== undefined && note !== undefined && <span className="pl-1.5 font-normal text-muted-foreground">{note}</span>}
+                </span>
               </span>
             ))}
           </div>

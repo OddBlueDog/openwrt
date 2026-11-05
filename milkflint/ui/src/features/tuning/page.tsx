@@ -19,25 +19,36 @@ import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { type NetworkLive, useNetworkLive } from '@/hooks/use-network-live';
 import { usePoll } from '@/hooks/use-poll';
-import { bool, type Change, getConfig, type Section, str } from '@/lib/api/uci';
+import { bool, type Change, getConfig, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { formatNumber, formatPercent } from '@/lib/format';
 import { href } from '@/lib/router';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
-import { GSO, takesWhole, type Whole, wholeSetting, wholeValue, withOpts, words } from '../sqm/gso';
+import { cakeTargetMs, GSO, takesWhole, type Whole, wholeSetting, wholeValue, withOpts, words } from '../sqm/gso';
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
 import { type GroPort, getTuningStatus, type TuningStatus } from './api';
 import {
+  AQL_OWN_TOTAL,
+  type AqlTotal,
+  aqlAutoTotal,
+  aqlTotalError,
+  aqlTotalOf,
+  aqlTotalValue,
   ecnDropChoices,
   ecnDropLabel,
   ecnNow,
+  l4sChoices,
+  l4sLabel,
+  l4sNow,
   type Knobs,
   knobDefaults,
   knobOptions,
   knobSectionsChanged,
   readKnobs,
   retriesLabel,
+  voAggrChoices,
+  voAggrLabel,
   retryChoices,
   rxDelayChoices,
   rxDelayLabel,
@@ -46,6 +57,8 @@ import {
 // The settings (router side: features/tuning/init puts them into effect):
 // - milkflint.wifi.aql_be: the Wi-Fi queue's best-effort limits, "<low>
 //   <high>" in µs or "off" (mac80211's own); unset is 2500/5000;
+// - milkflint.wifi.aql_threshold: the radio's total that holds devices to
+//   their low limit; unset follows the high limit (knobs.ts);
 // - milkflint.steering.layout: "openwrt" for OpenWrt's packet steering
 //   instead of MilkFlint's; milkflint.steering.rss "0" for MilkFlint's RPS
 //   layout instead of RSS; network.globals.packet_steering "0" turns
@@ -59,7 +72,7 @@ import {
 //   Automatic is plain GRO up to 16 KB when the download CAKE takes GRO
 //   packets whole, fraglist GRO otherwise;
 // - the latency settings in ./knobs.ts: milkflint.steering.wifi_all,
-//   .rings_rt and .rx_delay, milkflint.cake.ecn_drop, milkflint.wifi.retries;
+//   .rings_rt and .rx_delay, milkflint.cake.ecn_drop and .l4s, milkflint.wifi.retries;
 // - firewall's defaults flow_offloading: software flow offloading, as the
 //   Firewall page sets it ("1" in the image). Turning it off turns hardware
 //   offloading (flow_offloading_hw) off too, as that needs it.
@@ -77,6 +90,9 @@ interface TuningForm extends Knobs {
   /** the custom AQL limits, µs */
   aqlLow: string;
   aqlHigh: string;
+  /** the radio's total that holds devices to their low limit, and the custom one in µs */
+  aqlTotal: AqlTotal;
+  aqlTotalCustom: string;
   steering: Steering;
   /** switch Smart Queue's multi-queue CAKE with the steering */
   followQueue: boolean;
@@ -97,8 +113,8 @@ interface TuningData {
   packetSteering: string | undefined;
   /** the firewall's defaults section, and whether hardware flow offloading is on */
   firewall: { section: string; hardware: boolean } | undefined;
-  /** Smart Queue's WAN queue section: multi-queue, download speed (kbit/s), CAKE's download options */
-  sqm: { section: string; multiQueue: boolean; download: number; iqdiscOpts: string | undefined } | undefined;
+  /** Smart Queue's WAN queue section: multi-queue, download speed (kbit/s), CAKE's download options, the delay it aims for */
+  sqm: { section: string; multiQueue: boolean; download: number; iqdiscOpts: string | undefined; targetMs: number | null } | undefined;
 }
 
 const defaults: TuningForm = {
@@ -106,6 +122,8 @@ const defaults: TuningForm = {
   aql: 'default',
   aqlLow: '2500',
   aqlHigh: '5000',
+  aqlTotal: 'auto',
+  aqlTotalCustom: '',
   steering: 'rss',
   followQueue: true,
   gro: 'auto',
@@ -178,6 +196,7 @@ async function loadTuning(): Promise<TuningData> {
       aql: aqlBe === 'off' ? 'off' : custom === null ? 'default' : 'custom',
       aqlLow: custom?.[1] ?? defaults.aqlLow,
       aqlHigh: custom?.[2] ?? defaults.aqlHigh,
+      ...aqlTotalOf(str(section('wifi'), 'aql_threshold')),
       steering:
         packetSteering === '0' ? 'off' : str(steering, 'layout') === 'openwrt' ? 'openwrt' : str(steering, 'rss') === '0' ? 'rps' : 'rss',
       followQueue: true,
@@ -200,6 +219,11 @@ async function loadTuning(): Promise<TuningData> {
             multiQueue: bool(queue, 'use_mq'),
             download: Number(str(queue, 'download') ?? '0'),
             iqdiscOpts: str(queue, 'iqdisc_opts'),
+            // a single figure only if both directions aim for the same
+            targetMs:
+              cakeTargetMs(str(queue, 'iqdisc_opts')) === cakeTargetMs(str(queue, 'eqdisc_opts'))
+                ? cakeTargetMs(str(queue, 'iqdisc_opts'))
+                : null,
           },
   };
 }
@@ -233,6 +257,7 @@ function meaning(f: TuningForm, data: TuningData | undefined): string {
   const queue = data === undefined ? undefined : queueSwitch(f, data);
   return JSON.stringify([
     f.aql === 'custom' ? `${f.aqlLow} ${f.aqlHigh}` : f.aql,
+    f.aqlTotal === 'custom' ? f.aqlTotalCustom : f.aqlTotal,
     f.steering,
     queue === undefined ? null : f.followQueue,
     f.gro,
@@ -244,50 +269,29 @@ function meaning(f: TuningForm, data: TuningData | undefined): string {
     f.ringsRt,
     f.rxDelay,
     f.ecnDrop,
+    f.l4s,
     f.retries,
+    f.voAggr,
   ]);
 }
 
-type Errors = Partial<Record<'aqlLow' | 'aqlHigh', string>>;
+type Errors = Partial<Record<'aqlLow' | 'aqlHigh' | 'aqlTotal', string>>;
+
+/** The high limit the form asks for, µs: NaN while a custom one is being typed */
+function aqlHighOf(f: TuningForm): number {
+  return f.aql === 'off' ? 12_000 : f.aql === 'custom' ? Number(f.aqlHigh) : Number(defaults.aqlHigh);
+}
 
 function validate(f: TuningForm): Errors {
   const e: Errors = {};
+  const totalError = aqlTotalError(f.aqlTotal, f.aqlTotalCustom, aqlHighOf(f));
+  if (totalError !== undefined) e.aqlTotal = totalError;
   if (f.aql !== 'custom') return e;
   const ok = (v: string): boolean => /^\d{1,6}$/.test(v) && Number(v) >= 500 && Number(v) <= 50_000;
   if (!ok(f.aqlLow)) e.aqlLow = 'Whole microseconds, 500 to 50,000.';
   if (!ok(f.aqlHigh)) e.aqlHigh = 'Whole microseconds, 500 to 50,000.';
   else if (e.aqlLow === undefined && Number(f.aqlHigh) < Number(f.aqlLow)) e.aqlHigh = 'At least the low limit.';
   return e;
-}
-
-/**
- * Set, or unset (undefined), options of one named section: adds the section
- * if it's missing, and deletes it when nothing would be left in it.
- */
-function sectionChanges(config: string, sections: Section[], name: string, options: Record<string, string | undefined>): Change[] {
-  const s = sections.find((x) => x['.name'] === name);
-  const values: Record<string, string> = {};
-  const unset: string[] = [];
-  for (const [option, value] of Object.entries(options)) {
-    if (value === undefined) {
-      if (s?.[option] !== undefined) unset.push(option);
-    } else if (str(s, option) !== value) {
-      values[option] = value;
-    }
-  }
-  const changes: Change[] = [];
-  if (Object.keys(values).length > 0) {
-    changes.push(s === undefined ? { op: 'add', config, type: name, name, values } : { op: 'set', config, section: name, values });
-  }
-  if (unset.length > 0) {
-    const kept = Object.keys(s ?? {}).filter((k) => !k.startsWith('.') && !unset.includes(k));
-    changes.push(
-      kept.length === 0 && Object.keys(values).length === 0
-        ? { op: 'delete', config, section: name }
-        : { op: 'unset', config, section: name, options: unset },
-    );
-  }
-  return changes;
 }
 
 // Only what changed is written, so Restore defaults leaves alone what's
@@ -297,8 +301,9 @@ function toChanges(f: TuningForm, data: TuningData): Change[] {
   const changes: Change[] = [];
   const knobs = knobOptions(f);
   const knobsChanged = knobSectionsChanged(f, was);
-  if (aqlValue(f) !== aqlValue(was) || knobsChanged.has('wifi')) {
-    changes.push(...sectionChanges('milkflint', data.milkflint, 'wifi', { aql_be: aqlValue(f), ...knobs.wifi }));
+  const total = aqlTotalValue(f.aqlTotal, f.aqlTotalCustom);
+  if (aqlValue(f) !== aqlValue(was) || total !== aqlTotalValue(was.aqlTotal, was.aqlTotalCustom) || knobsChanged.has('wifi')) {
+    changes.push(...sectionChanges('milkflint', data.milkflint, 'wifi', { aql_be: aqlValue(f), aql_threshold: total, ...knobs.wifi }));
   }
   if (f.steering !== was.steering || knobsChanged.has('steering')) {
     changes.push(
@@ -368,6 +373,20 @@ function aqlLabel(f: TuningForm): string {
       return '5,000 / 12,000 µs (mac80211’s own)';
     case 'custom':
       return `${formatNumber(Number(f.aqlLow))} / ${formatNumber(Number(f.aqlHigh))} µs`;
+  }
+}
+
+/** The radio's total for the form: "Automatic: 6,000 µs" */
+function aqlTotalLabel(f: TuningForm): string {
+  switch (f.aqlTotal) {
+    case 'auto': {
+      const high = aqlHighOf(f);
+      return Number.isNaN(high) ? 'Automatic: 1.2 times the high limit' : `Automatic: ${formatNumber(aqlAutoTotal(high, f.aql === 'off'))} µs`;
+    }
+    case 'own':
+      return `${formatNumber(AQL_OWN_TOTAL)} µs (mac80211’s own)`;
+    case 'custom':
+      return `${formatNumber(Number(f.aqlTotalCustom))} µs`;
   }
 }
 
@@ -787,10 +806,13 @@ function InterruptCard({
 function EcnCard({
   form,
   status,
+  targetMs,
   set,
 }: {
   form: TuningForm;
   status: TuningStatus | undefined;
+  /** the queue delay Smart Queue aims for, ms; null if it isn't known */
+  targetMs: number | null;
   set: <K extends keyof TuningForm>(key: K, value: TuningForm[K]) => void;
 }): ReactElement {
   return (
@@ -798,13 +820,13 @@ function EcnCard({
       <CardHeading
         icon={GaugeIcon}
         title="Smart Queue: ECN"
-        description="How Smart Queue (CAKE) treats downloads that ask to be slowed by marks (ECN) rather than drops."
+        description="How Smart Queue (CAKE) treats traffic that asks to be slowed by marks (ECN) rather than drops."
       />
       <CardContent className="divide-y">
         <Field
           id="ecnDrop"
           label="Drop from downloads that ignore the marks"
-          hint="Some servers answer Smart Queue’s marks and keep sending as fast as before, and their queue grows until Smart Queue drops from them instead, as from a download without ECN; then they slow down. Sooner keeps that queue short; the times are at the Standard latency target, half that at Low (Smart Queue page). L4S traffic is always marked."
+          hint="Some servers answer Smart Queue’s marks and keep sending as fast as before, and their queue grows until Smart Queue drops from them instead, as from a download without ECN; then they slow down. Sooner keeps that queue short; the times are at the Standard latency target, half that at Low (Smart Queue page). L4S traffic has its own setting below."
         >
           <Select
             value={form.ecnDrop === '' ? 'default' : form.ecnDrop}
@@ -825,6 +847,31 @@ function EcnCard({
           </Select>
         </Field>
         {status !== undefined && <InfoRow label="In use now">{ecnNow(status.knobs.cake_ecn, status.knobs.cake_loaded)}</InfoRow>}
+        <Field
+          id="l4s"
+          label="Mark L4S traffic by how long it waited"
+          hint="Some apps and servers (Apple’s, for one) use L4S, a kind of ECN that slows down a little for each mark and needs many of them. Smart Queue marks their packets by how long each waited, more of them the longer, from your Latency target up. Sooner keeps their queue shorter at more of their speed. Off, they get only the few marks other ECN traffic gets and hold a longer queue. Other traffic isn’t affected, and the change takes effect at once."
+        >
+          <Select
+            value={form.l4s === '' ? 'default' : form.l4s}
+            onValueChange={(v) => {
+              set('l4s', v === 'default' ? '' : v);
+            }}
+          >
+            <SelectTrigger id="l4s">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {[...l4sChoices, ...(l4sChoices.includes(form.l4s) ? [] : [form.l4s])].map((v) => (
+                <SelectItem key={v === '' ? 'default' : v} value={v === '' ? 'default' : v}>
+                  {l4sLabel(v, targetMs)}
+                  {v === '' ? ' (default)' : v === '0' ? ' (as CAKE upstream)' : v === '60' ? ': shorter queue, less speed' : v === '200' ? ': more speed, longer queue' : ''}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        {status !== undefined && <InfoRow label="L4S in use now">{l4sNow(status.knobs.cake_l4s, status.knobs.cake_loaded, targetMs)}</InfoRow>}
       </CardContent>
     </Card>
   );
@@ -843,8 +890,13 @@ function AqlCard({
 }): ReactElement {
   const radios = status?.radios ?? [];
   const first = radios[0];
-  const same = first !== undefined && radios.every((r) => r.low === first.low && r.high === first.high);
+  const same = first !== undefined && radios.every((r) => r.low === first.low && r.high === first.high && r.threshold === first.threshold);
+  // the limits a radio has now, with the total on an image that says
+  const inUse = (r: { low: number; high: number; threshold: number | null }): string =>
+    `${formatNumber(r.low)} / ${formatNumber(r.high)} µs${r.threshold === null ? '' : `, ${formatNumber(r.threshold)} µs in all`}`;
+  const high = aqlHighOf(form);
   const retriesNow = status?.knobs.wifi_retries ?? null;
+  const voAggrNow = status?.knobs.wifi_vo_aggr ?? null;
   return (
     <Card>
       <CardHeading
@@ -876,7 +928,7 @@ function AqlCard({
         </Field>
         {form.aql === 'custom' && (
           <>
-            <Field id="aqlLow" label="Low limit" hint="µs per device, while the radio has 24 ms or more waiting in all." error={errors.aqlLow}>
+            <Field id="aqlLow" label="Low limit" hint="µs per device, while the radio has more than its total below waiting: usually two or more busy devices." error={errors.aqlLow}>
               <Input
                 id="aqlLow"
                 inputMode="numeric"
@@ -888,7 +940,7 @@ function AqlCard({
                 }}
               />
             </Field>
-            <Field id="aqlHigh" label="High limit" hint="µs per device, the rest of the time: with one busy device, always." error={errors.aqlHigh}>
+            <Field id="aqlHigh" label="High limit" hint="µs per device, the rest of the time: with one busy device, nearly always." error={errors.aqlHigh}>
               <Input
                 id="aqlHigh"
                 inputMode="numeric"
@@ -901,6 +953,52 @@ function AqlCard({
               />
             </Field>
           </>
+        )}
+        <Field
+          id="aqlTotal"
+          label="Radio’s total"
+          hint="Once this much airtime is waiting for all devices together, each is held to its low limit, so several busy devices share this total rather than each keeping the high limit waiting. Smaller keeps latency down when the Wi-Fi is full, at a little speed. It never holds back a device on its own, and every radio takes it at once."
+          error={errors.aqlTotal}
+        >
+          <Select
+            value={form.aqlTotal}
+            onValueChange={(v) => {
+              set('aqlTotal', v as AqlTotal);
+            }}
+          >
+            <SelectTrigger id="aqlTotal">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">
+                {Number.isNaN(high)
+                  ? 'Automatic: 1.2 times the high limit (default)'
+                  : form.aql === 'off'
+                    ? `${formatNumber(aqlAutoTotal(high, true))} µs (default with mac80211’s limits)`
+                    : `${formatNumber(aqlAutoTotal(high, false))} µs, 1.2 times the high limit (default)`}
+              </SelectItem>
+              {(form.aql !== 'off' || form.aqlTotal === 'own') && <SelectItem value="own">{formatNumber(AQL_OWN_TOTAL)} µs (mac80211’s own)</SelectItem>}
+              <SelectItem value="custom">Custom</SelectItem>
+            </SelectContent>
+          </Select>
+        </Field>
+        {form.aqlTotal === 'custom' && (
+          <Field
+            id="aqlTotalCustom"
+            label="Custom total"
+            hint={`µs, from the high limit${Number.isNaN(high) ? '' : ` (${formatNumber(high)})`} to 50,000.`}
+          >
+            <Input
+              id="aqlTotalCustom"
+              inputMode="numeric"
+              className="w-28 font-mono"
+              value={form.aqlTotalCustom}
+              aria-invalid={errors.aqlTotal !== undefined}
+              onChange={(e) => {
+                set('aqlTotalCustom', e.target.value.trim());
+              }}
+            />
+          </Field>
         )}
         <Field
           id="retries"
@@ -926,15 +1024,39 @@ function AqlCard({
           </Select>
         </Field>
         {retriesNow !== null && <InfoRow label="Sends in use now">{retriesLabel(retriesNow)}</InfoRow>}
+        <Field
+          id="voAggr"
+          label="Voice queue aggregation"
+          hint="Sends traffic marked as voice in groups of frames, as everything else is sent. Without it, a device that has just joined and gets nothing else can stay at the lowest rate, and even a modest flow then takes the air from everyone. Stock OpenWrt leaves it off: turn it off if a device starts dropping out during calls."
+        >
+          <Select
+            value={form.voAggr === '' ? 'on' : form.voAggr}
+            onValueChange={(v) => {
+              set('voAggr', v === 'on' ? '' : v);
+            }}
+          >
+            <SelectTrigger id="voAggr">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {voAggrChoices.map((v) => (
+                <SelectItem key={v === '' ? 'on' : v} value={v === '' ? 'on' : v}>
+                  {voAggrLabel(v)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+        {voAggrNow !== null && <InfoRow label="Voice queue aggregation in use now">{voAggrNow ? 'On' : 'Off'}</InfoRow>}
         {status !== undefined &&
           (same || first === undefined ? (
             <InfoRow label={radios.length > 1 ? `Queue limit in use now, ${String(radios.length)} radios` : 'Queue limit in use now'}>
-              {first === undefined ? 'no radios' : `${formatNumber(first.low)} / ${formatNumber(first.high)} µs`}
+              {first === undefined ? 'no radios' : inUse(first)}
             </InfoRow>
           ) : (
             radios.map((r) => (
               <InfoRow key={r.phy} label={`Queue limit in use now, ${r.phy}`}>
-                {formatNumber(r.low)} / {formatNumber(r.high)} µs
+                {inUse(r)}
               </InfoRow>
             ))
           ))}
@@ -1084,7 +1206,7 @@ export function TuningPage(): ReactElement {
             <GroCard form={form} data={data} port={status.data?.gro[0]} set={set} />
             <OffloadCard form={form} data={data} set={set} />
             <InterruptCard form={form} status={status.data} set={set} />
-            <EcnCard form={form} status={status.data} set={set} />
+            <EcnCard form={form} status={status.data} targetMs={data.sqm?.targetMs ?? null} set={set} />
             <AqlCard form={form} errors={errors} status={status.data} set={set} />
             <WaitsCard status={status.data} live={live.data} />
           </div>
@@ -1113,14 +1235,29 @@ export function TuningPage(): ReactElement {
             <ul className="flex flex-col gap-2 text-sm">
               <RestoreItem label="Wi-Fi queue" to={aqlLabel(defaults)} from={data.form.aql === 'default' ? undefined : aqlLabel(data.form)} />
               <RestoreItem
+                label="Wi-Fi radio’s total"
+                to={aqlTotalLabel(defaults)}
+                from={aqlTotalValue(data.form.aqlTotal, data.form.aqlTotalCustom) === undefined && data.form.aql === 'default' ? undefined : aqlTotalLabel(data.form)}
+              />
+              <RestoreItem
                 label="Wi-Fi sends per frame"
                 to={retriesLabel(defaults.retries)}
                 from={data.form.retries === defaults.retries ? undefined : retriesLabel(data.form.retries)}
               />
               <RestoreItem
+                label="Voice queue aggregation"
+                to={voAggrLabel(defaults.voAggr)}
+                from={data.form.voAggr === defaults.voAggr ? undefined : voAggrLabel(data.form.voAggr)}
+              />
+              <RestoreItem
                 label="Packet steering"
                 to={steeringOptions[defaults.steering].label}
                 from={data.form.steering === defaults.steering ? undefined : steeringOptions[data.form.steering].label}
+              />
+              <RestoreItem
+                label="Smart Queue marks L4S traffic"
+                to={l4sLabel(defaults.l4s, data.sqm?.targetMs ?? null)}
+                from={data.form.l4s === defaults.l4s ? undefined : l4sLabel(data.form.l4s, data.sqm?.targetMs ?? null)}
               />
               <RestoreItem label="Wi-Fi threads on every CPU" to="On" from={data.form.wifiAll ? undefined : 'Off'} />
               <RestoreItem label="Internet receive threads first" to="On" from={data.form.ringsRt ? undefined : 'Off'} />

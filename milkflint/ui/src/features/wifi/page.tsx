@@ -16,9 +16,24 @@ import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
-import { bool, type Change, getConfig, str } from '@/lib/api/uci';
+import { bool, type Change, getConfig, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { isGuestIface } from '../wifi-guest/guest';
 import { BeamformingCard } from './beamforming';
+import { qosMapChoice, qosMapHint, qosMapValue } from './qos-map';
+import {
+  SPR_MODE_LABELS,
+  SPR_THRESHOLDS,
+  type SprMode,
+  type SprSetting,
+  sprDriverMode,
+  sprHint,
+  sprModes,
+  sprNow,
+  sprOf,
+  sprOption,
+  sprRadioOptions,
+  sprThresholdLabel,
+} from './spatial-reuse';
 import { blockOf, describeBlock } from './channels';
 import { CountryField } from './country';
 import { WifiLive } from './live';
@@ -31,11 +46,13 @@ import {
   getDfsFrequencies,
   getFrequencies,
   getRadar,
+  getSpatialReuse,
   getRegulatedCountries,
   getRegulatory,
   getTxPowers,
   getWirelessStatus,
   type RegRule,
+  type SpatialReuse,
 } from '@/lib/api/wireless';
 
 const noFaster = 'It’s no faster: the router’s Wi-Fi chip encrypts with every one of these ciphers in hardware.';
@@ -191,6 +208,10 @@ interface RadioForm {
    * mu_beamformee, which the MT7915 driver takes as MU-MIMO allowed too.
    */
   muMimo: boolean;
+  /** Spatial reuse: sending while another network is heard only weakly */
+  spr: SprSetting;
+  /** qos_map_set as set; '' is the image's default */
+  qosMap: string;
 }
 
 interface RadioOptions {
@@ -201,10 +222,13 @@ interface RadioOptions {
   dfs: number[];
   /** How long each of those channels' radar check takes, ms by MHz (the kernel's; 60 s if it doesn't say). */
   cacMs: Record<number, number>;
+  /** Spatial reuse on the radio now */
+  spr: SpatialReuse | undefined;
 }
 
 interface WifiData {
   forms: RadioForm[];
+  milkflint: Section[];
   options: Record<string, RadioOptions>;
   /** Every radio section, used or not: the country goes on all of them. */
   radios: string[];
@@ -314,7 +338,12 @@ function bandLabel(band: string): string {
 }
 
 async function loadWifi(): Promise<WifiData> {
-  const [sections, status] = await Promise.all([getConfig('wireless'), getWirelessStatus()]);
+  const [sections, status, milkflint] = await Promise.all([
+    getConfig('wireless'),
+    getWirelessStatus(),
+    getConfig('milkflint').catch((): Section[] => []),
+  ]);
+  const wifiSection = milkflint.find((s) => s['.name'] === 'wifi');
   const radios = sections.filter((s) => s['.type'] === 'wifi-device');
   // the guest network's access points have a page of their own (Guest Wi-Fi)
   const ifaces = sections.filter((s) => s['.type'] === 'wifi-iface' && !isGuestIface(s));
@@ -351,6 +380,12 @@ async function loadWifi(): Promise<WifiData> {
       randomBssid: str(iface, 'macaddr') === 'random',
       beamforming: str(r, 'su_beamformer') !== '0' && str(r, 'he_su_beamformer') !== '0',
       muMimo: str(r, 'mu_beamformer') !== '0' && str(r, 'he_mu_beamformer') !== '0',
+      spr: sprOf(
+        str(r, 'he_spr_sr_control'),
+        str(r, 'he_spr_non_srg_obss_pd_max_offset'),
+        str(wifiSection, sprOption(str(r, 'band') ?? '2g')),
+      ),
+      qosMap: str(iface, 'qos_map_set') ?? '',
     };
   });
 
@@ -361,14 +396,15 @@ async function loadWifi(): Promise<WifiData> {
       // a Wi-Fi interface, or the radio's phy while its network is off (a fresh install)
       const device = status[f.radio]?.interfaces?.find((i) => i.ifname !== undefined)?.ifname ?? status[f.radio]?.iwinfo?.phy;
       if (device === undefined) {
-        options[f.radio] = { channels: [], txpowers: [], htmodes, dfs: [], cacMs: {} };
+        options[f.radio] = { channels: [], txpowers: [], htmodes, dfs: [], cacMs: {}, spr: undefined };
         return;
       }
-      const [channels, txpowers, dfs, radar] = await Promise.all([
+      const [channels, txpowers, dfs, radar, spr] = await Promise.all([
         getFrequencies(device).catch(() => []),
         getTxPowers(device).catch(() => []),
         getDfsFrequencies(device).catch((): number[] => []),
         f.band === '5g' ? getRadar(device).catch(() => undefined) : undefined,
+        getSpatialReuse(device).catch(() => undefined),
       ]);
       options[f.radio] = {
         // all of them: which may be used goes by the country's rules (see usable)
@@ -377,6 +413,7 @@ async function loadWifi(): Promise<WifiData> {
         htmodes,
         dfs,
         cacMs: Object.fromEntries((radar?.channels ?? []).flatMap((c) => (c.cac_ms === undefined ? [] : [[c.mhz, c.cac_ms]]))),
+        spr,
       };
     }),
   );
@@ -395,6 +432,7 @@ async function loadWifi(): Promise<WifiData> {
   const only = codes.size === 1 ? [...codes][0] : undefined;
   return {
     forms,
+    milkflint,
     options,
     radios: radios.map((r) => r['.name']),
     country: only === undefined || only === '00' ? '' : only,
@@ -453,6 +491,13 @@ function changesFor(f: RadioForm, before: RadioForm): Change[] {
         : { op: 'set', config: 'wireless', section: f.radio, values: { mu_beamformer: '0', he_mu_beamformer: '0', mu_beamformee: '0' } },
     );
   }
+  if (JSON.stringify(sprRadioOptions(f.spr)) !== JSON.stringify(sprRadioOptions(before.spr))) {
+    const options = sprRadioOptions(f.spr);
+    const values = Object.fromEntries(Object.entries(options).filter((e): e is [string, string] => e[1] !== undefined));
+    const unset = Object.keys(options).filter((k) => options[k] === undefined);
+    if (Object.keys(values).length > 0) changes.push({ op: 'set', config: 'wireless', section: f.radio, values });
+    if (unset.length > 0) changes.push({ op: 'unset', config: 'wireless', section: f.radio, options: unset });
+  }
   if (f.iface !== undefined) {
     changes.push({
       op: 'set',
@@ -468,6 +513,13 @@ function changesFor(f: RadioForm, before: RadioForm): Change[] {
     });
     if (f.encryption === 'none' && before.key !== '') {
       changes.push({ op: 'unset', config: 'wireless', section: f.iface, options: ['key'] });
+    }
+    if (f.qosMap !== before.qosMap) {
+      changes.push(
+        f.qosMap === ''
+          ? { op: 'unset', config: 'wireless', section: f.iface, options: ['qos_map_set'] }
+          : { op: 'set', config: 'wireless', section: f.iface, values: { qos_map_set: f.qosMap } },
+      );
     }
     // only when switched: a fixed address set elsewhere stays as it is
     if (f.randomBssid !== before.randomBssid) {
@@ -906,6 +958,82 @@ function RadioCard({
                 </Field>
               </>
             )}
+            {['HE', 'EHT'].includes(form.modePrefix) && (
+              <>
+                <Field
+                  id={id('spr')}
+                  label="Spatial reuse"
+                  hint={`Sends while a neighbouring network is heard only weakly, instead of waiting for it. It can add speed in a crowded area, and cost retries if a device can’t hear past the neighbour. ${sprHint(form.spr.mode)} ${sprNow(options?.spr)}`}
+                >
+                  <Select
+                    value={form.spr.mode}
+                    onValueChange={(v) => {
+                      set('spr', { ...form.spr, mode: v as SprMode });
+                    }}
+                  >
+                    <SelectTrigger id={id('spr')}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {sprModes((options?.spr?.mode ?? null) !== null).map((m) => (
+                        <SelectItem key={m} value={m}>
+                          {SPR_MODE_LABELS[m]}
+                        </SelectItem>
+                      ))}
+                      {!sprModes((options?.spr?.mode ?? null) !== null).includes(form.spr.mode as SprMode) && (
+                        <SelectItem value={form.spr.mode}>
+                          {form.spr.mode === 'custom' ? 'Custom (set elsewhere)' : `${SPR_MODE_LABELS[form.spr.mode]} (this driver can’t)`}
+                        </SelectItem>
+                      )}
+                    </SelectContent>
+                  </Select>
+                </Field>
+                {(form.spr.mode === 'devices' || form.spr.mode === 'fixed') && (
+                  <Field
+                    id={id('sprThreshold')}
+                    label="Ignore neighbours weaker than"
+                    hint="A neighbour heard below this doesn’t hold back sending. Higher reuses more of the air, with more risk of retries."
+                  >
+                    <Select
+                      value={String(form.spr.threshold)}
+                      onValueChange={(v) => {
+                        set('spr', { ...form.spr, threshold: Number(v) });
+                      }}
+                    >
+                      <SelectTrigger id={id('sprThreshold')}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {[...SPR_THRESHOLDS, ...((SPR_THRESHOLDS as readonly number[]).includes(form.spr.threshold) ? [] : [form.spr.threshold])].map((t) => (
+                          <SelectItem key={t} value={String(t)}>
+                            {sprThresholdLabel(t)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+              </>
+            )}
+            {form.iface !== undefined && (
+              <Field id={id('qosMap')} label="Priority of marked traffic" hint={qosMapHint(qosMapChoice(form.qosMap))}>
+                <Select
+                  value={qosMapChoice(form.qosMap)}
+                  onValueChange={(v) => {
+                    set('qosMap', v === 'custom' ? form.qosMap : (qosMapValue(v as 'edge' | 'openwrt') ?? ''));
+                  }}
+                >
+                  <SelectTrigger id={id('qosMap')}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="edge">For a home network (RFC 8325)</SelectItem>
+                    <SelectItem value="openwrt">OpenWrt’s own</SelectItem>
+                    {qosMapChoice(form.qosMap) === 'custom' && <SelectItem value="custom">Custom (set elsewhere)</SelectItem>}
+                  </SelectContent>
+                </Select>
+              </Field>
+            )}
           </div>
         </div>
       </CardContent>
@@ -966,6 +1094,14 @@ export function WifiPage(): ReactElement {
       const before = data.forms[i];
       return before === undefined || JSON.stringify(f) === JSON.stringify(before) ? [] : changesFor(f, before);
     });
+    changes.push(
+      ...sectionChanges(
+        'milkflint',
+        data.milkflint,
+        'wifi',
+        Object.fromEntries(forms.map((f) => [sprOption(f.band), sprDriverMode(f.spr)])),
+      ),
+    );
     if (countryDirty && country !== '') {
       for (const radio of data.radios) changes.push({ op: 'set', config: 'wireless', section: radio, values: { country } });
     }

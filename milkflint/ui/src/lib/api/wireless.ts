@@ -265,6 +265,23 @@ const beamforming = z.object({
 });
 export type Beamforming = z.output<typeof beamforming>;
 
+const spatialReuse = z.object({
+  /** an access point of this radio is up (otherwise control and offset are null) */
+  running: z.boolean(),
+  /** the driver's mode; null with a driver that has no such setting */
+  mode: z.enum(['auto', 'fixed', 'off']).nullable(),
+  /** he_spr_sr_control, as hostapd sends it in its beacons */
+  control: z.number().nullable(),
+  /** he_spr_non_srg_obss_pd_max_offset: from -82 dBm */
+  offset: z.number().nullable(),
+});
+export type SpatialReuse = z.output<typeof spatialReuse>;
+
+/** Spatial reuse on a radio now; by interface or phy. */
+export function getSpatialReuse(device: string): Promise<SpatialReuse> {
+  return call('milkflint.wifi', 'spatial_reuse', { device }, spatialReuse);
+}
+
 /** The beamforming a radio's access points run with (hostapd's config for it); by interface or phy. */
 export function getBeamforming(device: string): Promise<Beamforming> {
   return call('milkflint.wifi', 'beamforming', { device }, beamforming);

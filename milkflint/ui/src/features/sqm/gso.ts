@@ -41,6 +41,30 @@ export function optValue(opts: string | undefined, keyword: string): string | un
   return i < 0 ? undefined : (w[i + 1] ?? '');
 }
 
+/** CAKE's named rtt presets, in ms */
+const RTT_PRESETS: Record<string, number> = {
+  datacentre: 0.1,
+  lan: 1,
+  metro: 10,
+  regional: 30,
+  internet: 100,
+  oceanic: 300,
+  satellite: 1000,
+  interplanetary: 3_600_000,
+};
+
+/** The queue delay CAKE aims for at these options, in ms: a twentieth of its rtt (default 100 ms); null if it can't be told */
+export function cakeTargetMs(opts: string | undefined): number | null {
+  const value = optValue(opts, 'rtt');
+  if (value === undefined) {
+    const preset = words(opts).find((w) => w in RTT_PRESETS);
+    return (preset === undefined ? 100 : (RTT_PRESETS[preset] ?? 100)) / 20;
+  }
+  const m = /^(\d+(?:\.\d+)?)(us|ms|s)$/.exec(value);
+  if (m === null) return null;
+  return (Number(m[1]) * { us: 0.001, ms: 1, s: 1000 }[m[2] as 'us' | 'ms' | 's']) / 20;
+}
+
 /** opts with the managed keywords replaced by the wanted ones; others (set in LuCI) are kept */
 export function withOpts(current: string | undefined, managed: string[], wanted: string[]): string {
   const kept: string[] = [];

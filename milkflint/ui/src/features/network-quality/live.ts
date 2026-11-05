@@ -18,7 +18,9 @@ export function useLive(intervalMs: number): ReturnType<typeof usePoll<Live>> {
     const last = samples.current[samples.current.length - 1]?.t ?? 0;
     const status = await getStatus(last);
     const cutoff = status.now - 3600;
-    samples.current = [...samples.current, ...status.samples].filter((s) => s.t > cutoff);
+    // only what's newer than what's held now: another poll may have got there first
+    const held = samples.current[samples.current.length - 1]?.t ?? 0;
+    samples.current = [...samples.current, ...status.samples.filter((s) => s.t > held)].filter((s) => s.t > cutoff);
     return { status, samples: samples.current };
   }, intervalMs);
 }

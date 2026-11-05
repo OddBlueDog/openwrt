@@ -40,11 +40,6 @@ export function summarizeDnsServer(samples: readonly Sample[], key: string): Pro
   return summarizeValues(samples.flatMap((s) => (s.dns_servers === undefined || !(key in s.dns_servers) ? [] : [s.dns_servers[key] ?? null])));
 }
 
-/** A route's server over the rounds that pinged it; not part of the score. */
-export function summarizeRoute(samples: readonly Sample[], key: string): ProbeSummary {
-  return summarizeValues(samples.flatMap((s) => (s.routes === undefined ? [] : [s.routes[key] ?? null])));
-}
-
 function summarizeValues(values: readonly (number | null)[]): ProbeSummary {
   const answered = values.filter((v): v is number => v !== null).sort((a, b) => a - b);
   return {
