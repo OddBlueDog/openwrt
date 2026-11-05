@@ -1,0 +1,879 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 20:41:55 +0000
+Subject: [PATCH] wifi: mt76: mt7915: spatial reuse mode per radio
+
+The firmware's spatial reuse switches are per band, but sr_scene_detect is
+one module parameter for every radio, and takes effect only when a BSS next
+starts.
+
+A debugfs file per radio, spatial_reuse: auto (the firmware's scene
+detection, as before, and still following sr_scene_detect), fixed (the
+thresholds the BSS advertises) or off. A write takes effect at once on
+what's running, without restarting Wi-Fi, under the wiphy lock through
+wiphy_locked_debugfs_write(), as removing the file waits for a writer. If
+the firmware refuses, the writer gets the error, the mode stays asked for,
+and the same write tries again.
+
+Each way between the modes works, which took more than the switch:
+- a fixed threshold turns the firmware's own adjustment off (SPR_ENABLE_DPD)
+  and off turns spatial reuse off (SPR_ENABLE), and with scene detection
+  nothing turned either back on: going back to auto does now, once;
+- the switches are the band's and the settings a BSS's, so an interface whose
+  BSS doesn't use spatial reuse no longer switches off what another set up
+  on the band (spr_vifs);
+- a firmware restart loses the settings and mac80211 doesn't send
+  BSS_CHANGED_HE_OBSS_PD for it: reconfig_complete applies them again.
+
+KUnit: each mode's firmware commands, the ways between them, a refusal at
+each step, the same-band case, the debugfs names and the restart.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/debugfs.c         |  46 +++++++
+ mt7915/main.c            |  82 ++++++++++++
+ mt7915/mcu.c             |  35 ++++-
+ mt7915/mt7915.h          |  18 +++
+ mt7915/tests/main-test.c | 239 +++++++++++++++++++++++++++++++++
+ mt7915/tests/mcu-test.c  | 276 +++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 691 insertions(+), 5 deletions(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index cc83634c..d362622b 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1369,6 +1369,50 @@ mt7915_rf_regval_set(void *data, u64 val)
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7915_rf_regval_get,
+ 			 mt7915_rf_regval_set, "0x%08llx\n");
+ 
++static ssize_t
++mt7915_spatial_reuse_read(struct file *file, char __user *userbuf,
++			  size_t count, loff_t *ppos)
++{
++	struct mt7915_phy *phy = file->private_data;
++	char buf[8];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf), "%s\n", mt7915_spr_mode_name(phy));
++
++	return simple_read_from_buffer(userbuf, count, ppos, buf, len);
++}
++
++static ssize_t
++mt7915_spatial_reuse_handler(struct wiphy *wiphy, struct file *file, char *buf,
++			     size_t count, void *data)
++{
++	int ret = mt7915_spr_set_mode(data, buf);
++
++	return ret ? ret : count;
++}
++
++/* auto, fixed or off: see enum mt7915_spr_mode. In the wiphy lock's own way
++ * for debugfs: removing the file waits for a writer, under that lock.
++ */
++static ssize_t
++mt7915_spatial_reuse_write(struct file *file, const char __user *userbuf,
++			   size_t count, loff_t *ppos)
++{
++	struct mt7915_phy *phy = file->private_data;
++	char buf[8];
++
++	return wiphy_locked_debugfs_write(phy->mt76->hw->wiphy, file, buf,
++					  sizeof(buf), userbuf, count,
++					  mt7915_spatial_reuse_handler, phy);
++}
++
++static const struct file_operations mt7915_spatial_reuse_fops = {
++	.open = simple_open,
++	.read = mt7915_spatial_reuse_read,
++	.write = mt7915_spatial_reuse_write,
++	.llseek = default_llseek,
++};
++
+ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+@@ -1403,6 +1447,8 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "twt_stats", dir,
+ 				    mt7915_twt_stats);
+ 	debugfs_create_file("rf_regval", 0600, dir, dev, &fops_rf_regval);
++	debugfs_create_file("spatial_reuse", 0600, dir, phy,
++			    &mt7915_spatial_reuse_fops);
+ 	debugfs_create_u32("rx_event_frags", 0400, dir, &dev->rx_event_frags);
+ 	if (!is_mt7915(&dev->mt76))
+ 		debugfs_create_file("vow_atf", 0600, dir, dev, &fops_vow_atf);
+diff --git a/mt7915/main.c b/mt7915/main.c
+index f9b285bf..7177c519 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ /* Copyright (C) 2020 MediaTek Inc. */
+ 
++#include <kunit/static_stub.h>
+ #include <linux/etherdevice.h>
+ #include <linux/platform_device.h>
+ #include <linux/pci.h>
+@@ -338,6 +339,7 @@ static void mt7915_remove_interface(struct ieee80211_hw *hw,
+ 	mutex_lock(&dev->mt76.mutex);
+ 	dev->mt76.vif_mask &= ~BIT_ULL(mvif->mt76.idx);
+ 	phy->omac_mask &= ~BIT_ULL(mvif->mt76.omac_idx);
++	phy->spr_vifs &= ~BIT_ULL(mvif->mt76.idx);
+ 	mt76_wcid_mask_clear(dev->mt76.wcid_mask, mvif->sta.wcid.idx);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -1974,12 +1976,92 @@ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
+ }
+ #endif
+ 
++static const char * const mt7915_spr_mode_names[] = {
++	[MT7915_SPR_AUTO] = "auto",
++	[MT7915_SPR_FIXED] = "fixed",
++	[MT7915_SPR_OFF] = "off",
++};
++
++const char *mt7915_spr_mode_name(const struct mt7915_phy *phy)
++{
++	return mt7915_spr_mode_names[phy->spr_mode];
++}
++
++struct mt7915_spr_apply_data {
++	struct mt7915_phy *phy;
++	int err;	/* the first firmware error */
++};
++
++static void mt7915_spr_apply_iter(void *_data, u8 *mac, struct ieee80211_vif *vif)
++{
++	struct mt7915_spr_apply_data *data = _data;
++	int ret;
++
++	if (!vif->bss_conf.he_support)
++		return;
++
++	ret = mt7915_mcu_add_obss_spr(data->phy, vif, &vif->bss_conf.he_obss_pd);
++	if (ret && !data->err)
++		data->err = ret;
++}
++
++/* What mac80211's BSS_CHANGED_HE_OBSS_PD does when a BSS starts, for the
++ * ones already running. Under the wiphy lock.
++ */
++static int mt7915_spr_apply(struct mt7915_phy *phy)
++{
++	struct mt7915_spr_apply_data data = { .phy = phy };
++	struct mt7915_dev *dev = phy->dev;
++
++	KUNIT_STATIC_STUB_REDIRECT(mt7915_spr_apply, phy);
++
++	mutex_lock(&dev->mt76.mutex);
++	ieee80211_iterate_active_interfaces_mtx(phy->mt76->hw,
++						IEEE80211_IFACE_ITER_NORMAL,
++						mt7915_spr_apply_iter, &data);
++	mutex_unlock(&dev->mt76.mutex);
++
++	if (data.err)
++		dev_warn(dev->mt76.dev, "spatial reuse %s not applied: %d\n",
++			 mt7915_spr_mode_name(phy), data.err);
++
++	return data.err;
++}
++
++/* A radio's spatial reuse mode, by name, at once. Under the wiphy lock. If the
++ * firmware refuses it, the mode stays asked for, for what starts later, the
++ * writer hears why, and writing it again tries again.
++ */
++int mt7915_spr_set_mode(struct mt7915_phy *phy, const char *name)
++{
++	int mode = sysfs_match_string(mt7915_spr_mode_names, name);
++	int ret;
++
++	if (mode < 0)
++		return mode;
++
++	if (mode == phy->spr_mode && !phy->spr_unapplied)
++		return 0;
++
++	phy->spr_mode = mode;
++	ret = mt7915_spr_apply(phy);
++	phy->spr_unapplied = !!ret;
++
++	return ret;
++}
++
+ static void
+ mt7915_reconfig_complete(struct ieee80211_hw *hw,
+ 			 enum ieee80211_reconfig_type reconfig_type)
+ {
+ 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
+ 
++	/* the firmware restarted without its spatial reuse settings, and
++	 * mac80211 doesn't send BSS_CHANGED_HE_OBSS_PD for a restart
++	 */
++	if (reconfig_type == IEEE80211_RECONFIG_TYPE_RESTART)
++		phy->spr_unapplied = !!mt7915_spr_apply(phy);
++
+ 	ieee80211_wake_queues(hw);
+ 	ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
+ 				     MT7915_WATCHDOG_TIME);
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 4d75d3a6..dfa34b67 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -4247,6 +4247,7 @@ mt7915_mcu_set_obss_spr_pd(struct mt7915_phy *phy,
+ 	ret = mt7915_mcu_enable_obss_spr(phy, SPR_ENABLE_DPD, false);
+ 	if (ret)
+ 		return ret;
++	phy->spr_dpd_off = true;
+ 
+ 	if (he_obss_pd->sr_ctrl &
+ 	    IEEE80211_HE_SPR_NON_SRG_OBSS_PD_SR_DISALLOWED)
+@@ -4349,23 +4350,47 @@ mt7915_mcu_set_obss_spr_bitmap(struct mt7915_phy *phy,
+ int mt7915_mcu_add_obss_spr(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 			    struct ieee80211_he_obss_pd *he_obss_pd)
+ {
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	bool detect = phy->spr_mode == MT7915_SPR_AUTO && sr_scene_detect;
++	bool enable = he_obss_pd->enable && phy->spr_mode != MT7915_SPR_OFF;
+ 	int ret;
+ 
++	/* The firmware's switches are the band's: an interface whose BSS
++	 * doesn't use spatial reuse leaves alone what another's set up.
++	 */
++	if (he_obss_pd->enable)
++		phy->spr_vifs |= BIT_ULL(mvif->mt76.idx);
++	else
++		phy->spr_vifs &= ~BIT_ULL(mvif->mt76.idx);
++	if (!he_obss_pd->enable && phy->spr_vifs)
++		return 0;
++
+ 	/* enable firmware scene detection algorithms */
+-	ret = mt7915_mcu_enable_obss_spr(phy, SPR_ENABLE_SD, sr_scene_detect);
++	ret = mt7915_mcu_enable_obss_spr(phy, SPR_ENABLE_SD, detect);
+ 	if (ret)
+ 		return ret;
+ 
+-	/* firmware dynamically adjusts PD threshold so skip manual control */
+-	if (sr_scene_detect && !he_obss_pd->enable)
++	/* a fixed threshold turned firmware's own adjustment off */
++	if (detect && phy->spr_dpd_off) {
++		ret = mt7915_mcu_enable_obss_spr(phy, SPR_ENABLE_DPD, true);
++		if (ret)
++			return ret;
++		phy->spr_dpd_off = false;
++	}
++
++	/* firmware dynamically adjusts PD threshold so skip manual control,
++	 * unless the driver turned spatial reuse off: only it can undo that
++	 */
++	if (detect && !enable && !phy->spr_forced_off)
+ 		return 0;
+ 
+ 	/* enable spatial reuse */
+-	ret = mt7915_mcu_enable_obss_spr(phy, SPR_ENABLE, he_obss_pd->enable);
++	ret = mt7915_mcu_enable_obss_spr(phy, SPR_ENABLE, enable || detect);
+ 	if (ret)
+ 		return ret;
++	phy->spr_forced_off = !enable && !detect;
+ 
+-	if (sr_scene_detect || !he_obss_pd->enable)
++	if (detect || !enable)
+ 		return 0;
+ 
+ 	ret = mt7915_mcu_enable_obss_spr(phy, SPR_ENABLE_TX, true);
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 1842ac60..06a8d026 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -221,10 +221,26 @@ struct mt7915_hif {
+ 	u32 index;
+ };
+ 
++/* What a radio does about other networks' transmissions it could talk over
++ * (OBSS PD spatial reuse), each radio's debugfs file spatial_reuse. The
++ * BSS's own beacons, what its devices may do, come from hostapd.
++ */
++enum mt7915_spr_mode {
++	MT7915_SPR_AUTO,	/* firmware's scene detection (sr_scene_detect) */
++	MT7915_SPR_FIXED,	/* the thresholds the BSS advertises */
++	MT7915_SPR_OFF,		/* none */
++};
++
+ struct mt7915_phy {
+ 	struct mt76_phy *mt76;
+ 	struct mt7915_dev *dev;
+ 
++	u8 spr_mode;		/* enum mt7915_spr_mode */
++	bool spr_dpd_off;	/* a fixed threshold turned firmware's adjustment off */
++	bool spr_forced_off;	/* the driver turned the band's spatial reuse off */
++	bool spr_unapplied;	/* the firmware refused the mode: a write tries again */
++	u64 spr_vifs;		/* the interfaces whose BSS uses it, by mvif idx */
++
+ 	struct ieee80211_sband_iftype_data iftype[NUM_NL80211_BANDS][NUM_NL80211_IFTYPES];
+ 
+ 	struct ieee80211_vif *monitor_vif;
+@@ -601,6 +617,8 @@ int mt7915_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			  int enable, u32 changed);
+ int mt7915_mcu_set_protection(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 			      u8 ht_mode, bool use_cts_prot);
++const char *mt7915_spr_mode_name(const struct mt7915_phy *phy);
++int mt7915_spr_set_mode(struct mt7915_phy *phy, const char *name);
+ int mt7915_mcu_add_obss_spr(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 			    struct ieee80211_he_obss_pd *he_obss_pd);
+ int mt7915_mcu_add_rate_ctrl(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index cf01bfc2..80bf8fa0 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -509,12 +509,243 @@ static void mt7915_main_test_reconfig_complete(struct kunit *test)
+ 	ieee80211_stop_queues(hw);
+ 	KUNIT_ASSERT_TRUE(test, ieee80211_queue_stopped(hw, 0));
+ 
++	wiphy_lock(hw->wiphy);
+ 	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
++	wiphy_unlock(hw->wiphy);
+ 	KUNIT_EXPECT_FALSE(test, ieee80211_queue_stopped(hw, 0));
+ 	KUNIT_EXPECT_FALSE(test, ieee80211_queue_stopped(hw, 3));
+ 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dev->mphy.mac_work));
+ }
+ 
++/* --- spatial reuse --------------------------------------------------------- */
++
++static int mt7915_main_test_spr_applied;
++static int mt7915_main_test_spr_apply_ret;
++
++static int mt7915_main_test_spr_apply_stub(struct mt7915_phy *phy)
++{
++	mt7915_main_test_spr_applied++;
++	return mt7915_main_test_spr_apply_ret;
++}
++
++/* A mode is one of three names, as echo writes them, per radio: anything else
++ * leaves it as it was. With no interface up the firmware isn't told.
++ */
++static void mt7915_main_test_spr_set_mode(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_phy *phy2 = mt7915_hw_phy(mt7915_main_test_hw2(dev));
++
++	KUNIT_EXPECT_STREQ(test, mt7915_spr_mode_name(phy), "auto");
++
++	wiphy_lock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off\n"), 0);
++	KUNIT_EXPECT_EQ(test, phy->spr_mode, MT7915_SPR_OFF);
++	KUNIT_EXPECT_STREQ(test, mt7915_spr_mode_name(phy), "off");
++
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "on"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, ""), -EINVAL);
++	KUNIT_EXPECT_EQ(test, phy->spr_mode, MT7915_SPR_OFF);
++
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "fixed"), 0);
++	KUNIT_EXPECT_STREQ(test, mt7915_spr_mode_name(phy), "fixed");
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "auto\n"), 0);
++	KUNIT_EXPECT_EQ(test, phy->spr_mode, MT7915_SPR_AUTO);
++
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off"), 0);
++	wiphy_unlock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, phy2->spr_mode, MT7915_SPR_AUTO);
++
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(SET_SPR)), 0);
++}
++
++/* A new mode goes to the firmware at once, as another mode's writes would
++ * otherwise wait for Wi-Fi to restart; the same mode again sends nothing.
++ */
++static void mt7915_main_test_spr_set_mode_applies(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++
++	mt7915_main_test_spr_applied = 0;
++	mt7915_main_test_spr_apply_ret = 0;
++	kunit_activate_static_stub(test, mt7915_spr_apply,
++				   mt7915_main_test_spr_apply_stub);
++
++	wiphy_lock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 1);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 1);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "nonsense"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 1);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "auto"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 2);
++	wiphy_unlock(hw->wiphy);
++}
++
++/* Applying a mode is what mac80211 asks for when a BSS starts, for each HE
++ * BSS of the radio with what it advertises; a BSS without HE has no spatial
++ * reuse to set.
++ */
++static void mt7915_main_test_spr_apply_iter(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_spr_apply_data data = { .phy = phy };
++	struct ieee80211_vif *vif;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	mt7915_main_test_clear(fake);
++	phy->spr_mode = MT7915_SPR_OFF;
++
++	mt7915_spr_apply_iter(&data, vif->addr, vif);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(SET_SPR)), 0);
++
++	vif->bss_conf.he_support = true;
++	vif->bss_conf.he_obss_pd.enable = true;
++	mt7915_spr_apply_iter(&data, vif->addr, vif);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(SET_SPR)), 2);
++	KUNIT_EXPECT_EQ(test, data.err, 0);
++}
++
++/* A firmware error on one BSS is kept, the first of them, and the next BSS
++ * still gets its turn.
++ */
++static void mt7915_main_test_spr_apply_iter_error(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_spr_apply_data data = { .phy = phy };
++	struct ieee80211_vif *one, *two;
++
++	one = mt7915_main_test_ap(test, hw, 1);
++	two = mt7915_main_test_ap(test, hw, 2);
++	one->bss_conf.he_support = true;
++	two->bss_conf.he_support = true;
++	one->bss_conf.he_obss_pd.enable = true;
++	two->bss_conf.he_obss_pd.enable = true;
++	mt7915_main_test_clear(fake);
++	phy->spr_mode = MT7915_SPR_OFF;
++
++	mt7915_main_test_fail_at(fake, 1, -EIO);
++	mt7915_spr_apply_iter(&data, one->addr, one);
++	KUNIT_EXPECT_EQ(test, data.err, -EIO);
++
++	mt7915_main_test_fail_at(fake, 1, 0);
++	mt7915_spr_apply_iter(&data, two->addr, two);
++	KUNIT_EXPECT_EQ(test, data.err, -EIO);
++	KUNIT_EXPECT_GE(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(SET_SPR)), 3);
++}
++
++/* A mode the firmware refused stays asked for, the writer hears the error, and
++ * the same write, which otherwise sends nothing, tries again.
++ */
++static void mt7915_main_test_spr_set_mode_refused(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++
++	mt7915_main_test_spr_applied = 0;
++	mt7915_main_test_spr_apply_ret = -EIO;
++	kunit_activate_static_stub(test, mt7915_spr_apply,
++				   mt7915_main_test_spr_apply_stub);
++
++	wiphy_lock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off"), -EIO);
++	KUNIT_EXPECT_EQ(test, phy->spr_mode, MT7915_SPR_OFF);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 1);
++
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off"), -EIO);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 2);
++
++	mt7915_main_test_spr_apply_ret = 0;
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 3);
++
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(phy, "off"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 3);
++	wiphy_unlock(hw->wiphy);
++}
++
++/* An interface going away no longer counts as using spatial reuse on its band. */
++static void mt7915_main_test_spr_remove_interface(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct ieee80211_vif *vif;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	vif->bss_conf.he_obss_pd.enable = true;
++	mt7915_bss_info_changed(hw, vif, &vif->bss_conf,
++				BSS_CHANGED_HE_OBSS_PD);
++	KUNIT_EXPECT_NE(test, phy->spr_vifs, 0ULL);
++
++	mt7915_remove_interface(hw, vif);
++	KUNIT_EXPECT_EQ(test, phy->spr_vifs, 0ULL);
++}
++
++/* A BSS started on a radio set to off stays off: the mode isn't only for
++ * what's already running.
++ */
++static void mt7915_main_test_spr_bss_start_off(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++
++	mt7915_hw_phy(hw)->spr_mode = MT7915_SPR_OFF;
++	vif = mt7915_main_test_ap(test, hw, 1);
++	vif->bss_conf.he_obss_pd.enable = true;
++	mt7915_main_test_clear(fake);
++
++	mt7915_bss_info_changed(hw, vif, &vif->bss_conf,
++				BSS_CHANGED_HE_OBSS_PD);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(SET_SPR)), 2);
++}
++
++/* A firmware restart loses spatial reuse's settings and mac80211 doesn't send
++ * BSS_CHANGED_HE_OBSS_PD for it, so the driver has to; only for a restart.
++ */
++static void mt7915_main_test_spr_after_restart(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++
++	mt7915_main_test_spr_applied = 0;
++	mt7915_main_test_spr_apply_ret = 0;
++	kunit_activate_static_stub(test, mt7915_spr_apply,
++				   mt7915_main_test_spr_apply_stub);
++
++	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_SUSPEND);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 0);
++	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 1);
++	KUNIT_EXPECT_FALSE(test, mt7915_hw_phy(hw)->spr_unapplied);
++
++	/* refused after a restart: the next write of the same mode tries again */
++	mt7915_main_test_spr_apply_ret = -EIO;
++	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
++	KUNIT_EXPECT_TRUE(test, mt7915_hw_phy(hw)->spr_unapplied);
++	mt7915_main_test_spr_apply_ret = 0;
++	wiphy_lock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(mt7915_hw_phy(hw), "auto"), 0);
++	wiphy_unlock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 3);
++	KUNIT_EXPECT_FALSE(test, mt7915_hw_phy(hw)->spr_unapplied);
++}
++
+ /* --- interfaces -------------------------------------------------------------- */
+ 
+ /* Own MAC (BSSID) slots: an AP takes hw BSSID 0, then the extended ones;
+@@ -3474,6 +3705,14 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_start_stop_dbdc),
+ 	KUNIT_CASE(mt7915_main_test_start_errors),
+ 	KUNIT_CASE(mt7915_main_test_reconfig_complete),
++	KUNIT_CASE(mt7915_main_test_spr_set_mode),
++	KUNIT_CASE(mt7915_main_test_spr_set_mode_applies),
++	KUNIT_CASE(mt7915_main_test_spr_apply_iter),
++	KUNIT_CASE(mt7915_main_test_spr_apply_iter_error),
++	KUNIT_CASE(mt7915_main_test_spr_set_mode_refused),
++	KUNIT_CASE(mt7915_main_test_spr_remove_interface),
++	KUNIT_CASE(mt7915_main_test_spr_bss_start_off),
++	KUNIT_CASE(mt7915_main_test_spr_after_restart),
+ 	KUNIT_CASE(mt7915_main_test_omac_idx),
+ 	KUNIT_CASE(mt7915_main_test_add_ap),
+ 	KUNIT_CASE(mt7915_main_test_add_second_ap),
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 04153e72..054c7308 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -1296,6 +1296,274 @@ static void mt7915_test_obss_spr_errors(struct kunit *test)
+ 	}
+ }
+ 
++/* Off: no scene detection and no spatial reuse, whatever the BSS allows and
++ * whatever the module parameter says.
++ */
++static void mt7915_test_obss_spr_mode_off(struct kunit *test)
++{
++	struct ieee80211_he_obss_pd pd = {
++		.enable = true,
++		.sr_ctrl = IEEE80211_HE_SPR_NON_SRG_OFFSET_PRESENT,
++		.non_srg_max_offset = 10,
++	};
++	struct mt7915_test_ctx c;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_scene_detect(test, true);
++	c.phy->mt76->band_idx = 1;
++	c.phy->spr_mode = MT7915_SPR_OFF;
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 2);
++	mt7915_test_expect_spr(test, c.fake, 0, SPR_ENABLE_SD, 0, 1);
++	mt7915_test_expect_spr(test, c.fake, 1, SPR_ENABLE, 0, 1);
++}
++
++/* Fixed: the threshold the BSS advertises, with scene detection off although
++ * the module parameter has it on for the radios on auto.
++ */
++static void mt7915_test_obss_spr_mode_fixed(struct kunit *test)
++{
++	struct ieee80211_he_obss_pd pd = {
++		.enable = true,
++		.sr_ctrl = IEEE80211_HE_SPR_NON_SRG_OFFSET_PRESENT,
++		.non_srg_max_offset = 10,
++	};
++	struct mt7915_test_spr_pd *req;
++	struct mt7915_test_ctx c;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_scene_detect(test, true);
++	c.phy->mt76->band_idx = 1;
++	c.phy->spr_mode = MT7915_SPR_FIXED;
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	/* no HE-SIG-A message: the BSS doesn't allow SR value 15 */
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 6);
++	mt7915_test_expect_spr(test, c.fake, 0, SPR_ENABLE_SD, 0, 1);
++	mt7915_test_expect_spr(test, c.fake, 1, SPR_ENABLE, 1, 1);
++	mt7915_test_expect_spr(test, c.fake, 2, SPR_ENABLE_TX, 1, 1);
++	mt7915_test_expect_spr(test, c.fake, 3, SPR_ENABLE_DPD, 0, 1);
++	req = mt7915_test_payload(mt76_test_msg(c.fake, 4),
++				  struct mt7915_test_spr_pd);
++	KUNIT_ASSERT_NOT_NULL(test, req);
++	KUNIT_EXPECT_EQ(test, req->pd_th_non_srg, 82 - 10);
++}
++
++/* The default mode sends what the driver always has: the module parameter
++ * still decides, for an A/B without the debugfs file.
++ */
++static void mt7915_test_obss_spr_mode_auto_follows_param(struct kunit *test)
++{
++	struct ieee80211_he_obss_pd pd = { .enable = true };
++	struct mt7915_test_ctx c;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	c.phy->mt76->band_idx = 1;
++	KUNIT_EXPECT_EQ(test, c.phy->spr_mode, MT7915_SPR_AUTO);
++
++	mt7915_test_scene_detect(test, true);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 2);
++	mt7915_test_expect_spr(test, c.fake, 0, SPR_ENABLE_SD, 1, 1);
++	mt7915_test_expect_spr(test, c.fake, 1, SPR_ENABLE, 1, 1);
++
++	sr_scene_detect = false;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	mt7915_test_expect_spr(test, c.fake, 2, SPR_ENABLE_SD, 0, 1);
++	mt7915_test_expect_spr(test, c.fake, 3, SPR_ENABLE, 1, 1);
++	mt7915_test_expect_spr(test, c.fake, 4, SPR_ENABLE_TX, 1, 1);
++}
++
++/* A fixed threshold turns firmware's own adjustment off, and nothing else
++ * turns it back on: going back to auto has to, once, or scene detection
++ * would be left unable to move the threshold. Off in between changes nothing.
++ */
++static void mt7915_test_obss_spr_fixed_then_auto(struct kunit *test)
++{
++	struct ieee80211_he_obss_pd pd = {
++		.enable = true,
++		.sr_ctrl = IEEE80211_HE_SPR_NON_SRG_OFFSET_PRESENT,
++		.non_srg_max_offset = 10,
++	};
++	struct mt7915_test_ctx c;
++	unsigned int sent;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_scene_detect(test, true);
++	c.phy->mt76->band_idx = 1;
++
++	c.phy->spr_mode = MT7915_SPR_FIXED;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++
++	c.phy->spr_mode = MT7915_SPR_OFF;
++	sent = c.fake->n_msgs;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_EXPECT_EQ(test, c.fake->n_msgs - sent, 2);
++
++	c.phy->spr_mode = MT7915_SPR_AUTO;
++	sent = c.fake->n_msgs;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 3);
++	mt7915_test_expect_spr(test, c.fake, sent, SPR_ENABLE_SD, 1, 1);
++	mt7915_test_expect_spr(test, c.fake, sent + 1, SPR_ENABLE_DPD, 1, 1);
++	mt7915_test_expect_spr(test, c.fake, sent + 2, SPR_ENABLE, 1, 1);
++
++	sent = c.fake->n_msgs;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 2);
++	mt7915_test_expect_spr(test, c.fake, sent, SPR_ENABLE_SD, 1, 1);
++	mt7915_test_expect_spr(test, c.fake, sent + 1, SPR_ENABLE, 1, 1);
++}
++
++/* Firmware refusing to take its adjustment back is tried again next time. */
++static void mt7915_test_obss_spr_auto_dpd_retried(struct kunit *test)
++{
++	struct ieee80211_he_obss_pd pd = {
++		.enable = true,
++		.sr_ctrl = IEEE80211_HE_SPR_NON_SRG_OFFSET_PRESENT,
++	};
++	struct mt7915_test_ctx c;
++	unsigned int sent;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_scene_detect(test, true);
++	c.phy->mt76->band_idx = 1;
++
++	c.phy->spr_mode = MT7915_SPR_FIXED;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++
++	c.phy->spr_mode = MT7915_SPR_AUTO;
++	/* the second message from here: SD goes through, DPD fails */
++	mt7915_test_fail_at(test, c.dev, 1, -EIO);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), -EIO);
++
++	sent = c.fake->n_msgs;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 3);
++	mt7915_test_expect_spr(test, c.fake, sent + 1, SPR_ENABLE_DPD, 1, 1);
++}
++
++/* Off, or a fixed threshold on a BSS without spatial reuse, turns the band's
++ * switch off, and with scene detection nothing else turns it back on: going
++ * back to auto has to, once, or the radio stays without it until the firmware
++ * restarts.
++ */
++static void mt7915_test_obss_spr_back_to_auto_disabled_bss(struct kunit *test)
++{
++	static const u8 modes[] = { MT7915_SPR_OFF, MT7915_SPR_FIXED };
++	struct ieee80211_he_obss_pd pd = {};
++	struct mt7915_test_ctx c;
++	unsigned int sent;
++	int i;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_scene_detect(test, true);
++	c.phy->mt76->band_idx = 1;
++
++	/* never touched: auto sends what it always has */
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs, 1);
++
++	for (i = 0; i < ARRAY_SIZE(modes); i++) {
++		c.phy->spr_mode = modes[i];
++		sent = c.fake->n_msgs;
++		KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++		KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 2);
++		mt7915_test_expect_spr(test, c.fake, sent, SPR_ENABLE_SD, 0, 1);
++		mt7915_test_expect_spr(test, c.fake, sent + 1, SPR_ENABLE, 0, 1);
++
++		c.phy->spr_mode = MT7915_SPR_AUTO;
++		sent = c.fake->n_msgs;
++		KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++		KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 2);
++		mt7915_test_expect_spr(test, c.fake, sent, SPR_ENABLE_SD, 1, 1);
++		mt7915_test_expect_spr(test, c.fake, sent + 1, SPR_ENABLE, 1, 1);
++
++		/* once */
++		sent = c.fake->n_msgs;
++		KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++		KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 1);
++		mt7915_test_expect_spr(test, c.fake, sent, SPR_ENABLE_SD, 1, 1);
++	}
++}
++
++/* Firmware refusing to turn it back on is tried again next time. */
++static void mt7915_test_obss_spr_back_to_auto_retried(struct kunit *test)
++{
++	struct ieee80211_he_obss_pd pd = {};
++	struct mt7915_test_ctx c;
++	unsigned int sent;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_scene_detect(test, true);
++	c.phy->mt76->band_idx = 1;
++
++	c.phy->spr_mode = MT7915_SPR_OFF;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++
++	c.phy->spr_mode = MT7915_SPR_AUTO;
++	mt7915_test_fail_at(test, c.dev, 1, -EIO);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), -EIO);
++
++	sent = c.fake->n_msgs;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &pd), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 2);
++	mt7915_test_expect_spr(test, c.fake, sent + 1, SPR_ENABLE, 1, 1);
++}
++
++/* The firmware's switches are the band's, the settings a BSS's: an interface
++ * whose BSS doesn't use spatial reuse (a station, a mesh) leaves alone what an
++ * AP on the same radio set up, in any mode and whichever comes first. With no
++ * interface using it, the band's switches follow the last one asked as before.
++ */
++static void mt7915_test_obss_spr_other_vif_on_band(struct kunit *test)
++{
++	static const u8 modes[] = { MT7915_SPR_FIXED, MT7915_SPR_OFF, MT7915_SPR_AUTO };
++	struct ieee80211_he_obss_pd ap = {
++		.enable = true,
++		.sr_ctrl = IEEE80211_HE_SPR_NON_SRG_OFFSET_PRESENT,
++		.non_srg_max_offset = 10,
++	};
++	struct ieee80211_he_obss_pd none = {};
++	struct ieee80211_vif *sta;
++	struct mt7915_test_ctx c;
++	unsigned int sent;
++	int i;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	mt7915_test_scene_detect(test, true);
++	c.phy->mt76->band_idx = 1;
++	sta = mt7915_test_vif(test, c.phy, NL80211_IFTYPE_STATION, HW_BSSID_1);
++	((struct mt7915_vif *)sta->drv_priv)->mt76.idx = 1;
++	c.mvif->mt76.idx = 0;
++
++	for (i = 0; i < ARRAY_SIZE(modes); i++) {
++		c.phy->spr_mode = modes[i];
++
++		/* the AP, then the station */
++		KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &ap), 0);
++		sent = c.fake->n_msgs;
++		KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, sta, &none), 0);
++		KUNIT_EXPECT_EQ_MSG(test, c.fake->n_msgs, sent, "mode %d", modes[i]);
++	}
++
++	/* the same interface changing its mind still counts */
++	c.phy->spr_mode = MT7915_SPR_FIXED;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &ap), 0);
++	ap.enable = false;
++	sent = c.fake->n_msgs;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, c.vif, &ap), 0);
++	KUNIT_ASSERT_EQ(test, c.fake->n_msgs - sent, 2);
++	mt7915_test_expect_spr(test, c.fake, sent, SPR_ENABLE_SD, 0, 1);
++	mt7915_test_expect_spr(test, c.fake, sent + 1, SPR_ENABLE, 0, 1);
++
++	/* nothing left using it: the station's turn */
++	sent = c.fake->n_msgs;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_obss_spr(c.phy, sta, &none), 0);
++	KUNIT_EXPECT_EQ(test, c.fake->n_msgs - sent, 2);
++}
++
+ /* --- BSS info ------------------------------------------------------------- */
+ 
+ /* RF_CH: primary and center channels and the width (both segments for
+@@ -4455,6 +4723,14 @@ static struct kunit_case mt7915_mcu_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_obss_spr_pd),
+ 	KUNIT_CASE(mt7915_test_obss_spr_siga),
+ 	KUNIT_CASE(mt7915_test_obss_spr_errors),
++	KUNIT_CASE(mt7915_test_obss_spr_mode_off),
++	KUNIT_CASE(mt7915_test_obss_spr_mode_fixed),
++	KUNIT_CASE(mt7915_test_obss_spr_mode_auto_follows_param),
++	KUNIT_CASE(mt7915_test_obss_spr_fixed_then_auto),
++	KUNIT_CASE(mt7915_test_obss_spr_auto_dpd_retried),
++	KUNIT_CASE(mt7915_test_obss_spr_back_to_auto_disabled_bss),
++	KUNIT_CASE(mt7915_test_obss_spr_back_to_auto_retried),
++	KUNIT_CASE(mt7915_test_obss_spr_other_vif_on_band),
+ 	{}
+ };
+ 
