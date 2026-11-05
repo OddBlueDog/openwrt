@@ -1,0 +1,470 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 5 Nov 2026 14:30:00 +0000
+Subject: [PATCH] net/sched: sch_cake: an L4S ramp for ECT(1) packets
+
+L4S senders (ECT(1)) cut their rate a little for each CE mark, in
+proportion to the share of their packets marked. COBALT marks only after
+a whole interval over target and then at 1/sqrt(count), far too rarely
+for them: such a sender holds a queue of several targets, more than a
+classic one on the same link, however well it would respond.
+
+CAKE gives each flow its own queue, so a flow's ECT(1) packets can be
+marked by their own wait at once, with no effect on other flows: never
+up to the target (l4s_ramp percent of it, module parameter, default 100,
+0: off), always from twice that, by a linear ramp between them.
+
+It starts at the target, not at the millisecond or so usual for L4S.
+Packets reach a router in bursts, a Wi-Fi client's aggregates or a
+sender's window, and the end of a burst waits some milliseconds however
+empty the queue was: a shallower ramp marks those, and the sender slows
+down with no queue to show for it, far below the rate. On the same
+grounds the ramp starts no lower than twice the time the packet takes at
+its flow's fair share of the rate (its size at the rate, times the bulk
+flows, which COBALT's own test only counts in ingress mode), so slow
+links, GSO batches and many flows aren't marked for their own wait, and
+a flow's last packet isn't marked.
+
+A sender that ignores even this is dropped by COBALT, as 760-14 does
+for ECT(0), once its queue is twice the ramp's end for a full-size
+packet. Without the ramp ECT(1) is only marked, as before.
+
+KUnit: the ramp's ends and proportion over IPv6 and IPv4, its following
+the target and the parameter, only ECT(1), a flow's last packet, off, a
+slow link, many flows, GSO batches; the drops and where their bar moves.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -482,9 +482,10 @@
+  * strikes, and a flow that slows down for its marks has had over a dozen by
+  * then and left the queue, ECN or not. A sender that ignores them grows its
+  * queue all that while, and again on each new connection: at a count of 256,
+- * for three seconds. ECT(1) (L4S) is never dropped this way, nor is a GSO
+- * batch of more than COBALT_ECN_MAX_SEGS packets (it is marked). 0: always
+- * mark, as upstream.
++ * for three seconds. ECT(1) (L4S) is dropped this way only under the L4S
++ * ramp below, and from a longer queue; a GSO batch of more than
++ * COBALT_ECN_MAX_SEGS packets never is (it is marked). 0: always mark, as
++ * upstream.
+  */
+ static unsigned int ecn_fail_count __read_mostly = 8;
+ module_param(ecn_fail_count, uint, 0644);
+@@ -492,7 +493,41 @@
+ 
+ #define COBALT_ECN_STRIKES	8
+ #define COBALT_ECN_MAX_SEGS	4
++
++/* L4S senders (ECT(1)) cut their rate a little for each CE mark, in proportion
++ * to the share of their packets marked. COBALT's marks come only after a whole
++ * interval over target, and then at 1/sqrt(count): far too few for such a
++ * sender, which holds a queue of several targets. CAKE gives each flow its own
++ * queue, so its ECT(1) packets can be marked by their own wait at once, with no
++ * effect on any other flow: never up to l4s_ramp percent of the target, always
++ * from twice that, by a linear ramp between them. It leaves COBALT's state alone.
++ *
++ * It starts at the target and not at the millisecond or so usual for L4S, as
++ * packets reach a router in bursts (a Wi-Fi client's aggregates, a sender's
++ * window) and the end of a burst waits some milliseconds however empty the
++ * queue was: a shallower ramp marks those, and the sender slows down with no
++ * queue to show for it.
++ *
++ * Part of a packet's wait isn't a queue its sender can do anything about: the
++ * ramp starts no lower than twice the time the packet itself takes at its
++ * flow's fair share of the rate (its size at the rate, times the bulk flows),
++ * and a flow's last packet isn't marked. Otherwise a slow link, a GSO batch or
++ * many flows would mark every packet, however little the flow sent.
++ *
++ * A sender that ignores even this is dropped by COBALT once its queue is
++ * twice the ramp's end for a full-size packet (see ecn_fail_count). 0: no ramp
++ * and no such drops: COBALT only marks ECT(1), as upstream.
++ */
++static unsigned int l4s_ramp __read_mostly = 100;
++module_param(l4s_ramp, uint, 0644);
++MODULE_PARM_DESC(l4s_ramp, "Where marking ECT(1) packets CE starts, in percent of CAKE's target (0: no L4S ramp)");
+ 
++/* where the ramp starts for a packet that takes @own at its flow's share */
++static u64 cake_l4s_start(u64 target, u32 ramp, u64 own)
++{
++	return max_t(u64, div_u64(target * ramp, 100), 2 * own);
++}
++
+ static u8 cobalt_ecn(struct sk_buff *skb)
+ {
+ 	switch (skb_protocol(skb, true)) {
+@@ -604,7 +639,8 @@
+ 			       struct cobalt_params *p,
+ 			       ktime_t now,
+ 			       struct sk_buff *skb,
+-			       u32 bulk_flows)
++			       u32 bulk_flows,
++			       u32 all_bulk_flows)
+ {
+ 	bool next_due, over_target, drop = false;
+ 	ktime_t schedule;
+@@ -649,10 +685,19 @@
+ 
+ 	if (next_due && vars->dropping) {
+ 		u32 fail = READ_ONCE(ecn_fail_count);
++		u32 ramp = READ_ONCE(l4s_ramp);
+ 		u8 ecn = fail ? cobalt_ecn(skb) : INET_ECN_NOT_ECT;
++		u64 ignored = 2 * p->target;
++		bool ect = ecn == INET_ECN_ECT_0;
+ 
+-		if (ecn == INET_ECN_ECT_0 && !vars->ecn_ignored) {
+-			if (vars->count >= fail && sojourn > 2 * p->target) {
++		if (ecn == INET_ECN_ECT_1 && ramp) {
++			ect = true;
++			ignored = 4 * cake_l4s_start(p->target, ramp, p->mtu_time *
++						     max_t(u32, all_bulk_flows, 1));
++		}
++
++		if (ect && !vars->ecn_ignored) {
++			if (vars->count >= fail && sojourn > ignored) {
+ 				if (++vars->ecn_strikes >= COBALT_ECN_STRIKES) {
+ 					vars->ecn_ignored = true;
+ 					cobalt_set_count(vars, fail);
+@@ -662,7 +707,7 @@
+ 			}
+ 		}
+ 
+-		if (vars->ecn_ignored && ecn == INET_ECN_ECT_0 &&
++		if (vars->ecn_ignored && ect &&
+ 		    skb_shinfo(skb)->gso_segs <= COBALT_ECN_MAX_SEGS) {
+ 			/* the flow ignores marks: drop, as without ECN */
+ 			vars->ecn_marked = false;
+@@ -2671,7 +2716,35 @@
+ 	for (tin = 0; tin < q->tin_cnt; tin++)
+ 		cake_mq_retire_tin(q, &q->tins[tin], now);
+ }
++
++/* The L4S ramp (l4s_ramp) for @skb, leaving its flow. @last: no packet of the
++ * flow is left behind it.
++ */
++static bool cake_l4s_mark(const struct cake_tin_data *b, struct sk_buff *skb,
++			  ktime_t now, bool last)
++{
++	u32 ramp = READ_ONCE(l4s_ramp);
++	u64 sojourn, start, own;
+ 
++	if (!ramp || last)
++		return false;
++	sojourn = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
++	start = div_u64(b->cparams.target * ramp, 100);
++	if (sojourn <= start || cobalt_ecn(skb) != INET_ECN_ECT_1)
++		return false;
++
++	own = (get_cobalt_cb(skb)->adjusted_len * b->tin_rate_ns) >> b->tin_rate_shft;
++	own *= max_t(u32, b->bulk_flow_count, 1);
++	start = cake_l4s_start(b->cparams.target, ramp, own);
++	if (sojourn <= start)
++		return false;
++	/* always marked at twice the start: from here, it's as long again */
++	if (sojourn - start < start &&
++	    reciprocal_scale(get_random_u32(), min_t(u64, start, U32_MAX)) >= sojourn - start)
++		return false;
++	return INET_ECN_set_ce(skb);
++}
++
+ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ {
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+@@ -2857,7 +2930,8 @@
+ 		if (!cobalt_should_drop(&flow->cvars, &b->cparams, now, skb,
+ 					(b->bulk_flow_count *
+ 					 !!(q->config->rate_flags &
+-					    CAKE_FLAG_INGRESS))) ||
++					    CAKE_FLAG_INGRESS)),
++					b->bulk_flow_count) ||
+ 		    !flow->head)
+ 			break;
+ 
+@@ -2877,6 +2951,8 @@
+ 			goto retry;
+ 	}
+ 
++	if (cake_l4s_mark(b, skb, now, !flow->head))
++		flow->cvars.ecn_marked = true;
+ 	b->tin_ecn_mark += !!flow->cvars.ecn_marked;
+ 	qdisc_bstats_update(sch, skb);
+ 	if (q->config->is_shared)
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+ /* KUnit tests for sch_cake's flow hashing, DRR quanta, COBALT's drops for
+- * flows that ignore ECN marks, and cake_mq's count of active sub-cakes,
++ * flows that ignore ECN marks, the L4S ramp, and cake_mq's count of active sub-cakes,
+  * share of the rate and host loads. Built into
+  * sch_cake.ko (#included at the end of sch_cake.c) when
+  * CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs when it loads.
+@@ -1701,6 +1701,7 @@
+ 	struct cobalt_params p;
+ 	ktime_t now;
+ 	u32 marks, drops;
++	u32 bulk_flows;
+ };
+ 
+ static void cake_test_ecn_init(struct cake_test_ecn *e)
+@@ -1710,6 +1711,7 @@
+ 	e->p.interval = 50 * NSEC_PER_MSEC;
+ 	e->p.mtu_time = 12 * NSEC_PER_USEC;	/* 1514 bytes at ~1 Gbit/s */
+ 	e->now = CAKE_TEST_NOW;
++	e->bulk_flows = 1;
+ }
+ 
+ static void cake_test_ecn_set(struct sk_buff *skb, u8 ecn)
+@@ -1734,7 +1736,7 @@
+ 		e->now = e->v.count ? max(ktime_add_ns(e->now, 1), e->v.drop_next) :
+ 				      ktime_add_ns(e->now, NSEC_PER_MSEC);
+ 		cobalt_set_enqueue_time(skb, ktime_sub_ns(e->now, sojourn));
+-		drop = cobalt_should_drop(&e->v, &e->p, e->now, skb, 1);
++		drop = cobalt_should_drop(&e->v, &e->p, e->now, skb, 1, e->bulk_flows);
+ 		if (drop || e->v.ecn_marked)
+ 			signals++;
+ 		drops += drop;
+@@ -1815,15 +1817,227 @@
+ static void cake_test_ecn_l4s_marked(struct kunit *test)
+ {
+ 	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	u32 ramp = READ_ONCE(l4s_ramp);
+ 	struct cake_test_ecn e;
+ 
++	WRITE_ONCE(l4s_ramp, 0);
+ 	cake_test_ecn_init(&e);
+-	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 20 * NSEC_PER_MSEC,
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 200 * NSEC_PER_MSEC,
+ 						4 * READ_ONCE(ecn_fail_count)), 0);
+ 	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
+ 	KUNIT_EXPECT_EQ(test, e.marks, 4 * READ_ONCE(ecn_fail_count));
++	WRITE_ONCE(l4s_ramp, ramp);
++}
++
++/* Under the ramp, ECT(1) that stays over twice the ramp's end (here 2.5 to 5 ms,
++ * so 10 ms) is dropped as ECT(0) would be, and a queue up to it is only marked
++ */
++static void cake_test_ecn_l4s_ignored(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_UDP, 2, 40000, 0);
++	u32 fail = READ_ONCE(ecn_fail_count);
++	struct cake_test_ecn e;
++
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 10 * NSEC_PER_MSEC,
++						4 * fail + 4 * COBALT_ECN_STRIKES), 0);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 11 * NSEC_PER_MSEC,
++						fail + COBALT_ECN_STRIKES - 2), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 11 * NSEC_PER_MSEC, 50), 50);
++	KUNIT_EXPECT_TRUE(test, e.v.ecn_ignored);
++	/* dropped as it came, not marked */
++	KUNIT_EXPECT_EQ(test, ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK, INET_ECN_ECT_1);
++}
++
++/* That bar moves with the ramp, and with the bulk flows: 300 of them at 12 us a
++ * packet start the ramp at 7.2 ms, so a wait of 20 ms is still no sign of
++ * ignored marks, nor is one of 15 ms when the ramp starts at twice the target
++ */
++static void cake_test_ecn_l4s_ignored_moves(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_UDP, 2, 40000, 0);
++	u32 fail = READ_ONCE(ecn_fail_count), ramp = READ_ONCE(l4s_ramp);
++	struct cake_test_ecn e;
++
++	cake_test_ecn_init(&e);
++	e.bulk_flows = 300;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 20 * NSEC_PER_MSEC,
++						4 * fail + 4 * COBALT_ECN_STRIKES), 0);
++	cake_test_ecn_init(&e);
++	e.bulk_flows = 300;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 29 * NSEC_PER_MSEC,
++						fail + COBALT_ECN_STRIKES - 2), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 29 * NSEC_PER_MSEC, 1), 1);
++
++	WRITE_ONCE(l4s_ramp, 200);
++	cake_test_ecn_init(&e);
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_1, 15 * NSEC_PER_MSEC,
++						4 * fail + 4 * COBALT_ECN_STRIKES), 0);
++	WRITE_ONCE(l4s_ramp, ramp);
++}
++
++/* How often of @n tries the ramp marks a packet of @len adjusted bytes and the
++ * ECN codepoint @ecn that waited @sojourn_us, each try's packet reset first;
++ * each mark must leave CE.
++ */
++static u32 cake_test_l4s_marks(struct kunit *test, struct cake_tin_data *b, struct sk_buff *skb,
++			       u8 ecn, u32 len, u64 sojourn_us, bool last, u32 n)
++{
++	ktime_t now = CAKE_TEST_NOW;
++	u32 i, marks = 0;
++
++	get_cobalt_cb(skb)->adjusted_len = len;
++	cobalt_set_enqueue_time(skb, ktime_sub_ns(now, sojourn_us * NSEC_PER_USEC));
++	for (i = 0; i < n; i++) {
++		bool marked;
++
++		cake_test_ecn_set(skb, ecn);
++		marked = cake_l4s_mark(b, skb, now, last);
++		KUNIT_EXPECT_EQ(test, cobalt_ecn(skb), marked ? INET_ECN_CE : ecn);
++		marks += marked;
++	}
++	return marks;
++}
++
++static struct cake_tin_data *cake_test_l4s_tin(struct kunit *test, u64 mbit, u16 bulk, u64 target_ms)
++{
++	struct cake_tin_data *b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	cake_set_rate(b, mbit * 1000000 / 8, 1514, target_ms * NSEC_PER_MSEC, 20 * target_ms * NSEC_PER_MSEC);
++	b->bulk_flow_count = bulk;
++	return b;
++}
++
++/* On a fast link with one flow: nothing to the target (5 ms), everything from
++ * twice it, and in proportion between them, IPv6 and IPv4 (a mark keeps its
++ * checksum)
++ */
++static void cake_test_l4s_ramp(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct sk_buff *skb4 = cake_test_skb(test, false, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 850, 1, 5);
++	u32 marks;
++
++	KUNIT_ASSERT_EQ(test, READ_ONCE(l4s_ramp), 100);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 4500, false, 1000), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 5000, false, 1000), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 10000, false, 1000), 1000);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 50000, false, 1000), 1000);
++	/* 1000 tries at p: within six standard deviations (false once in 10^8 runs) */
++	marks = cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 7500, false, 1000);
++	KUNIT_EXPECT_GE(test, marks, 500 - 95);
++	KUNIT_EXPECT_LE(test, marks, 500 + 95);
++	marks = cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 6250, false, 1000);
++	KUNIT_EXPECT_GE(test, marks, 250 - 82);
++	KUNIT_EXPECT_LE(test, marks, 250 + 82);
++
++	ip_send_check(ip_hdr(skb4));
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb4, INET_ECN_ECT_1, 1514, 20000, false, 1), 1);
++	KUNIT_EXPECT_EQ(test, ip_fast_csum((u8 *)ip_hdr(skb4), ip_hdr(skb4)->ihl), 0);
+ }
+ 
++/* It follows the target (Smart Queue's latency target), and l4s_ramp's percent */
++static void cake_test_l4s_follows_target(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 850, 1, 2);
++	u32 ramp = READ_ONCE(l4s_ramp);
++
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 2000, false, 100), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 4000, false, 100), 100);
++
++	b = cake_test_l4s_tin(test, 850, 1, 5);
++	WRITE_ONCE(l4s_ramp, 40);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 2000, false, 100), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 4000, false, 100), 100);
++	WRITE_ONCE(l4s_ramp, ramp);
++}
++
++/* Only ECT(1): classic ECN keeps COBALT's marks, the rest none, however long it
++ * waited
++ */
++static void cake_test_l4s_only_ect1(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 850, 1, 5);
++
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_NOT_ECT, 1514, 50000, false, 100), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_0, 1514, 50000, false, 100), 0);
++	cake_test_ecn_set(skb, INET_ECN_CE);
++	KUNIT_EXPECT_FALSE(test, cake_l4s_mark(b, skb, CAKE_TEST_NOW, false));
++}
++
++/* A flow's last packet has no queue behind it to mark */
++static void cake_test_l4s_last(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 850, 1, 5);
++
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 50000, true, 100), 0);
++}
++
++/* Off: nothing is marked */
++static void cake_test_l4s_off(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 850, 1, 5);
++	u32 ramp = READ_ONCE(l4s_ramp);
++
++	WRITE_ONCE(l4s_ramp, 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 50000, false, 100), 0);
++	WRITE_ONCE(l4s_ramp, ramp);
++}
++
++/* 3 Mbit/s: a full-size packet takes about 4 ms, so the ramp is about 8 to 16 ms
++ * for it, and two packets' wait isn't marked; a small packet takes little, and
++ * has the plain ramp from the target, here 1.5 packet times
++ */
++static void cake_test_l4s_slow_link(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 3, 1, 5);
++
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 7900, false, 100), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 16300, false, 100), 100);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 100, 5900, false, 100), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 100, 12200, false, 100), 100);
++}
++
++/* 170 Mbit/s and 60 bulk flows: a full-size packet at its flow's share takes
++ * about 4.3 ms, so the ramp is about 8.6 to 17.2 ms for it; a lone flow's, or
++ * one with no bulk flow yet, is the target's
++ */
++static void cake_test_l4s_many_flows(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 170, 60, 5);
++
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 8400, false, 100), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 17400, false, 100), 100);
++	b->bulk_flow_count = 1;
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 10100, false, 100), 100);
++	b->bulk_flow_count = 0;
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 10100, false, 100), 100);
++}
++
++/* A GSO batch's own time counts whole: 16 KB at 800 Mbit/s with 32 bulk flows is
++ * about 5.1 ms at the flow's share; a single packet's isn't
++ */
++static void cake_test_l4s_gso(struct kunit *test)
++{
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	struct cake_tin_data *b = cake_test_l4s_tin(test, 800, 32, 5);
++
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 16000, 10000, false, 100), 0);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 16000, 21000, false, 100), 100);
++	KUNIT_EXPECT_EQ(test, cake_test_l4s_marks(test, b, skb, INET_ECN_ECT_1, 1514, 10100, false, 100), 100);
++}
++
+ /* A flow whose queue stays within twice the target is marked whatever its
+  * count: CoDel-like flows that answer the marks never get that far.
+  */
+@@ -1977,6 +2191,16 @@
+ 	KUNIT_CASE(cake_test_ecn_ignored_switches),
+ 	KUNIT_CASE(cake_test_ecn_ignored_ipv4),
+ 	KUNIT_CASE(cake_test_ecn_l4s_marked),
++	KUNIT_CASE(cake_test_ecn_l4s_ignored),
++	KUNIT_CASE(cake_test_ecn_l4s_ignored_moves),
++	KUNIT_CASE(cake_test_l4s_ramp),
++	KUNIT_CASE(cake_test_l4s_follows_target),
++	KUNIT_CASE(cake_test_l4s_only_ect1),
++	KUNIT_CASE(cake_test_l4s_last),
++	KUNIT_CASE(cake_test_l4s_off),
++	KUNIT_CASE(cake_test_l4s_slow_link),
++	KUNIT_CASE(cake_test_l4s_many_flows),
++	KUNIT_CASE(cake_test_l4s_gso),
+ 	KUNIT_CASE(cake_test_ecn_near_target_marked),
+ 	KUNIT_CASE(cake_test_ecn_strikes_reset),
+ 	KUNIT_CASE(cake_test_ecn_not_ect_dropped),
