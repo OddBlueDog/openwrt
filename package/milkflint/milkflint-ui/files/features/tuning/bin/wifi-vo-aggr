@@ -1,0 +1,31 @@
+#!/bin/sh
+# Whether the Wi-Fi driver aggregates the voice queue (mt76-connac-lib's
+# vo_aggr, TIDs 6 and 7), from milkflint.wifi.vo_aggr: "0" no, as stock OpenWrt's
+# mt76; anything else (unset too) yes.
+#
+# Without aggregation, a device that has just joined and gets nothing else can
+# stay at the lowest rate while its frames go out one at a time, and even a
+# modest flow then takes the air from everyone.
+#
+# The driver takes it for the next frames. A session already running stays
+# until something stops it, so turning it off stops them, and a device's next
+# voice frames go out alone. milkflint-tuning runs this at boot and when a
+# setting changes, the ieee80211 hotplug (30-milkflint-aql) as a radio appears.
+#
+#   wifi-vo-aggr
+
+P=/sys/module/mt76_connac_lib/parameters/vo_aggr
+
+[ -w "$P" ] || exit 0
+on=1
+[ "$(uci -q get milkflint.wifi.vo_aggr)" = 0 ] && on=0
+echo "$on" > "$P"
+
+if [ "$on" = 0 ]; then
+	for f in /sys/kernel/debug/ieee80211/*/netdev:*/stations/*/agg_status; do
+		[ -w "$f" ] || continue
+		echo "tx stop 6" 2> /dev/null > "$f"
+		echo "tx stop 7" 2> /dev/null > "$f"
+	done
+fi
+exit 0

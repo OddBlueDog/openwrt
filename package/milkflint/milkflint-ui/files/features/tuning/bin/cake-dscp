@@ -1,0 +1,27 @@
+#!/bin/sh
+# Whether downloads get back the DSCP their connection sends with, from
+# milkflint.cake.dscp_restore: "1" yes, anything else (unset too) no.
+#
+# ISPs clear the DSCP of what comes in or set their own, and Smart Queue's
+# download CAKE washes it. With this on, conntrack keeps the DSCP each
+# direction of a connection last left the router with (nf_conntrack's
+# dscp_learn), and where CAKE washes what came in, it writes that instead
+# (sch_cake's dscp_restore), ECN bits kept. CAKE's diffserv tins and Wi-Fi's
+# access categories then go by what the LAN device asked for. It needs CAKE's
+# wash: sqm's squash_dscp, on unless LuCI turned it off. Both take effect at
+# once, for connections already open too.
+#
+# This puts downloads on Wi-Fi's voice queue, too: whether the driver aggregates
+# that queue is wifi-vo-aggr's.
+#
+# milkflint-tuning runs this at boot and when the setting changes, the iface
+# hotplug 12-milkflint-cake-ecn after sqm, which may be what loads sch_cake.
+#
+#   cake-dscp
+
+on=0
+[ "$(uci -q get milkflint.cake.dscp_restore)" = 1 ] && on=1
+for p in /sys/module/nf_conntrack/parameters/dscp_learn /sys/module/sch_cake/parameters/dscp_restore; do
+	[ -w "$p" ] && echo "$on" > "$p"
+done
+exit 0

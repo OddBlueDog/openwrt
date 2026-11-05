@@ -1,8 +1,10 @@
-# MilkFlint: Smart Queue's ECN setting (milkflint.cake.ecn_drop) for
-# sch_cake, after sqm has set up an interface's queues (11-sqm), so a
-# sch_cake loaded only then gets it too. Installed as
+# MilkFlint: Smart Queue's ECN setting (milkflint.cake.ecn_drop), and whether
+# downloads get back their connection's DSCP (milkflint.cake.dscp_restore),
+# for sch_cake, after sqm has set up an interface's queues (11-sqm), so a
+# sch_cake loaded only then gets them too. Installed as
 # /etc/hotplug.d/iface/12-milkflint-cake-ecn; hotplug-call sources it, so it
 # returns rather than exits.
 
 [ "$ACTION" = ifup ] || return 0
 /usr/libexec/milkflint/cake-ecn
+/usr/libexec/milkflint/cake-dscp

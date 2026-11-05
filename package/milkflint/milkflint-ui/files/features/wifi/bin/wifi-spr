@@ -1,0 +1,35 @@
+#!/bin/sh
+# What each radio's Wi-Fi driver does about spatial reuse (802.11ax OBSS PD:
+# sending while a neighbour is heard only weakly), from
+# milkflint.wifi.spr_<band> (2g, 5g, 6g): "fixed" the threshold the network
+# advertises (wireless' he_spr_non_srg_obss_pd_max_offset), "off" none,
+# unset or anything else "auto", the firmware's own scene detection. What
+# the network's devices may do is hostapd's (he_spr_sr_control), from the same
+# page. The driver takes it at once, for what's running too, without
+# restarting Wi-Fi, and keeps it for what starts later.
+#
+# Writes it to the radios named, or to every radio there is; a driver without
+# the file (not mt7915's) is left alone. milkflint-tuning runs this when a
+# setting changes, the ieee80211 hotplug for each radio that appears.
+#
+#   wifi-spr [phy...]
+
+[ $# -gt 0 ] || set -- $(ls /sys/kernel/debug/ieee80211 2> /dev/null)
+for phy; do
+	f=/sys/kernel/debug/ieee80211/$phy/mt76/spatial_reuse
+	[ -w "$f" ] || continue
+	case "$(iw phy "$phy" info 2> /dev/null)" in
+	*"Band 4:"*) band=6g ;;
+	*"Band 2:"*) band=5g ;;
+	*"Band 1:"*) band=2g ;;
+	*) continue ;;
+	esac
+	mode=$(uci -q get "milkflint.wifi.spr_$band")
+	case "$mode" in
+	fixed | off) ;;
+	*) mode=auto ;;
+	esac
+	# the driver refuses it when the firmware does: writing it again retries
+	echo "$mode" 2> /dev/null > "$f" || logger -t milkflint-wifi "$phy: the Wi-Fi driver didn't take spatial reuse $mode"
+done
+exit 0

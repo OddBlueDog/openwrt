@@ -81,6 +81,27 @@ function phy_of(dev) {
 	return match(phy, /^[A-Za-z0-9_.-]+$/) ? phy : null;
 }
 
+// Spatial reuse on a phy now: the driver's mode (auto, fixed, off; null with a
+// driver that has no such setting), and from hostapd's config, while an access
+// point of this phy is up, what its beacons tell devices: he_spr_sr_control (1:
+// no parametrized reuse, 2: no reuse by threshold, 4: this offset is given),
+// and the offset from -82 dBm (null: none).
+function spatial_reuse(phy) {
+	const running = length(filter(lsdir('/var/run/hostapd') ?? [], (s) => index(s, `${phy}-`) == 0)) > 0;
+	const conf = running ? (readfile(`/var/run/hostapd-${phy}.conf`) ?? '') : '';
+	const num = (name) => {
+		const m = match(conf, regexp(`(^|\n)${name}=([0-9]+)`));
+		return m ? +m[2] : null;
+	};
+	const mode = trim(readfile(`/sys/kernel/debug/ieee80211/${phy}/mt76/spatial_reuse`) ?? '');
+	return {
+		running,
+		mode: length(mode) ? mode : null,
+		control: num('he_spr_sr_control'),
+		offset: num('he_spr_non_srg_obss_pd_max_offset')
+	};
+}
+
 // hostapd's config for a phy (/var/run/hostapd-<phy>.conf, which wifi-scripts
 // write with only what the radio supports and the settings allow; files of
 // earlier phys stay behind after a driver reload, so only while an access
@@ -243,6 +264,17 @@ return {
 					return { error: 'invalid device' };
 				const phy = phy_of(dev);
 				return phy == null ? { running: false, vht: null, he: null } : beamforming(phy);
+			}
+		},
+		// spatial reuse on the radio now (by phy or interface)
+		spatial_reuse: {
+			args: { device: 'device' },
+			call: function(req) {
+				const dev = req.args.device;
+				if (type(dev) != 'string' || !match(dev, /^[A-Za-z0-9_.-]+$/))
+					return { error: 'invalid device' };
+				const phy = phy_of(dev);
+				return phy == null ? { running: false, mode: null, control: null, offset: null } : spatial_reuse(phy);
 			}
 		}
 	}

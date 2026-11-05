@@ -1,20 +1,44 @@
 #!/bin/sh
-# When Smart Queue (CAKE) drops from an ECN download that keeps ignoring its
+# How Smart Queue (CAKE) marks ECN traffic.
+#
+# When it drops from an ECN download that keeps ignoring its
 # ECN marks, as it drops from a download without ECN, from
 # milkflint.cake.ecn_drop: after that many ignored marks, 8 to 65535; "0"
 # never, it always marks, as upstream CAKE; unset (or anything else) 8.
 # Some servers answer the marks and keep their speed, and their queue grows
 # until then; dropped, they slow down, at a little speed to them. A count
 # of n takes about 2 * rtt * sqrt(n) of marking: 8, about 0.6 s at CAKE's
-# default rtt of 100 ms. L4S traffic is always marked. sch_cake (its
-# ecn_fail_count, 760-14; 8 by default since 760-15) takes it at once.
-# milkflint-tuning runs this at boot and when the setting changes; sch_cake
-# keeps it while it stays loaded.
+# default rtt of 100 ms. sch_cake (its ecn_fail_count, 760-14; 8 by default
+# since 760-15) takes it at once.
+#
+# Where L4S traffic (ECT(1)) starts to be marked by how long each packet has
+# waited, from milkflint.cake.l4s: in percent of Smart Queue's target, 20 to
+# 400, every packet being marked from twice that; "0" not at all, it gets only
+# classic CAKE's few marks and holds a longer queue; unset (or anything else)
+# 100. sch_cake (its l4s_ramp, 760-16) takes it at once.
+#
+# milkflint-tuning runs this at boot and when a setting changes; sch_cake
+# keeps them while it stays loaded.
 #
 #   cake-ecn
 
 P=/sys/module/sch_cake/parameters/ecn_fail_count
+RAMP=/sys/module/sch_cake/parameters/l4s_ramp
 DEFAULT=8
+
+if [ -w "$RAMP" ]; then
+	v=$(uci -q get milkflint.cake.l4s)
+	case "$v" in
+		'' | *[!0-9]* | ???????*) n=100 ;;
+		*)
+			# no leading zeros: sch_cake would read them as octal
+			n=${v#"${v%%[!0]*}"}
+			n=${n:-0}
+			[ "$n" = 0 ] || { [ "$n" -ge 20 ] && [ "$n" -le 400 ]; } || n=100
+			;;
+	esac
+	echo "$n" > "$RAMP"
+fi
 
 # sch_cake not loaded yet (Smart Queue off), or without the parameter
 [ -w "$P" ] || exit 0

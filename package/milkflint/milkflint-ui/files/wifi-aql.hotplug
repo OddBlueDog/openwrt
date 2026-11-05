@@ -11,7 +11,9 @@
 # Queue's shaper), that queue fills, and every packet to the client, a
 # speed test's latency probes too, waits behind it. Lower limits (2500/5000)
 # keep that wait shorter. What doesn't fit stays in mac80211's own queues,
-# where fq_codel sends sparse flows first.
+# where fq_codel sends sparse flows first. So that several busy devices don't
+# each keep the high limit waiting, the radio's total that holds them to the
+# low limit comes down with it: 1.2 times the high limit.
 #
 # milkflint.wifi.aql_be (the Performance Tuning page): "<low> <high>" in us,
 # or "off" for mac80211's 5000 12000. /usr/libexec/milkflint/wifi-aql
@@ -30,4 +32,5 @@
 	done
 	/usr/libexec/milkflint/wifi-aql "$phy"
 	/usr/libexec/milkflint/wifi-retries
+	/usr/libexec/milkflint/wifi-vo-aggr
 ) > /dev/null 2>&1 &

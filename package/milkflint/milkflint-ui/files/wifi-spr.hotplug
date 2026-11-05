@@ -1,0 +1,21 @@
+# MilkFlint: a radio's spatial reuse setting (milkflint.wifi.spr_<band>, the
+# Radios & SSIDs page) for the Wi-Fi driver, on every radio as it appears: at
+# boot, or when the driver loads again. Nothing to do with none set: the
+# driver starts on auto. Installed as
+# /etc/hotplug.d/ieee80211/33-milkflint-spr; hotplug-call sources it, so it
+# returns rather than exits.
+
+[ "$ACTION" = add ] || return 0
+[ -n "$(uci -q get milkflint.wifi.spr_2g)$(uci -q get milkflint.wifi.spr_5g)$(uci -q get milkflint.wifi.spr_6g)" ] || return 0
+
+(
+	phy=${DEVICENAME:-${DEVPATH##*/}}
+	f=/sys/kernel/debug/ieee80211/$phy/mt76/spatial_reuse
+	# the driver adds its debugfs files after the radio is registered
+	i=0
+	while [ ! -w "$f" ] && [ $i -lt 20 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	/usr/libexec/milkflint/wifi-spr "$phy"
+) > /dev/null 2>&1 &

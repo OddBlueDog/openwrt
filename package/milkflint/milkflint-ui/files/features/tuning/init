@@ -2,6 +2,8 @@
 # MilkFlint performance tuning (ui feature "tuning"): puts the Performance
 # Tuning page's settings into effect on the running router, without taking
 # Wi-Fi or the network down.
+# - milkflint.wifi.aql_threshold: the radio's total that holds devices to
+#   their low limit, in µs (the same script as aql_be);
 # - milkflint.wifi.aql_be: the Wi-Fi driver queue's best-effort limits,
 #   which /usr/libexec/milkflint/wifi-aql writes to every radio (the
 #   ieee80211 hotplug does the same for each radio as it appears);
@@ -19,6 +21,17 @@
 #   from an ECN download that ignores them, "0" never (it always marks)
 #   (/usr/libexec/milkflint/cake-ecn; the iface hotplug 12-milkflint-cake-ecn
 #   runs it after sqm too);
+# - milkflint.cake.l4s: where L4S traffic starts to be marked by how long each
+#   packet has waited, in percent of Smart Queue's target, "0" not at all (the
+#   same script);
+# - milkflint.cake.dscp_restore: downloads get back the DSCP their connection
+#   sends with (/usr/libexec/milkflint/cake-dscp; the same iface hotplug too);
+# - milkflint.wifi.vo_aggr: whether the Wi-Fi driver aggregates the voice queue,
+#   on by default (/usr/libexec/milkflint/wifi-vo-aggr;
+#   the ieee80211 hotplug runs it for each radio too);
+# - milkflint.wifi.spr_<band>: what each radio's driver does about spatial
+#   reuse (/usr/libexec/milkflint/wifi-spr; the ieee80211 hotplug runs it for
+#   each radio too);
 # - milkflint.wifi.retries: how often the Wi-Fi driver sends a data frame
 #   before it gives up (/usr/libexec/milkflint/wifi-retries; the ieee80211
 #   hotplug runs it for each radio too);
@@ -52,10 +65,13 @@ reload_if_enabled() {
 
 apply() {
 	mkdir -p "$RUN"
-	put aql "$(uci -q get milkflint.wifi.aql_be)" /usr/libexec/milkflint/wifi-aql
+	put aql "$(uci -q get milkflint.wifi.aql_be) $(uci -q get milkflint.wifi.aql_threshold)" /usr/libexec/milkflint/wifi-aql
 	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss) $(uci -q get milkflint.steering.wifi_all) $(uci -q get milkflint.steering.rings_rt)" reload_if_enabled packet_steering
 	put rx_delay "$(uci -q get milkflint.steering.rx_delay)" /usr/libexec/milkflint/rx-delay
-	put cake_ecn "$(uci -q get milkflint.cake.ecn_drop)" /usr/libexec/milkflint/cake-ecn
+	put cake_ecn "$(uci -q get milkflint.cake.ecn_drop) $(uci -q get milkflint.cake.l4s)" /usr/libexec/milkflint/cake-ecn
+	put cake_dscp "$(uci -q get milkflint.cake.dscp_restore)" /usr/libexec/milkflint/cake-dscp
+	put vo_aggr "$(uci -q get milkflint.wifi.vo_aggr)" /usr/libexec/milkflint/wifi-vo-aggr
+	put spr "$(uci -q get milkflint.wifi.spr_2g) $(uci -q get milkflint.wifi.spr_5g) $(uci -q get milkflint.wifi.spr_6g)" /usr/libexec/milkflint/wifi-spr
 	put retries "$(uci -q get milkflint.wifi.retries)" /usr/libexec/milkflint/wifi-retries
 	# what the GRO settings resolve to: sqm and firewall changes count too
 	put gro "$(/usr/libexec/milkflint/gro show)" /usr/libexec/milkflint/gro

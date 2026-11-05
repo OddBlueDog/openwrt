@@ -81,7 +81,15 @@ function add_all(set, cpus) {
 			push(set, c);
 }
 
-// Each radio's best-effort (BE) limits, in us
+// a module parameter's number; null where the image doesn't have it (or
+// sch_cake isn't loaded)
+function param(path) {
+	const v = trim(readfile(path) ?? '');
+	return match(v, /^[0-9]+$/) ? +v : null;
+}
+
+// Each radio's best-effort (BE) limits, and the total that holds devices to
+// the low one, in us
 function radios() {
 	const out = [];
 	const phys = sort(filter(lsdir('/sys/kernel/debug/ieee80211') ?? [], (p) => match(p, /^phy[0-9]+$/)),
@@ -89,7 +97,7 @@ function radios() {
 	for (let phy in phys) {
 		const m = match(readfile(`/sys/kernel/debug/ieee80211/${phy}/aql_txq_limit`) ?? '', /\nBE[ \t]+([0-9]+)[ \t]+([0-9]+)/);
 		if (m)
-			push(out, { phy, low: +m[1], high: +m[2] });
+			push(out, { phy, low: +m[1], high: +m[2], threshold: param(`/sys/kernel/debug/ieee80211/${phy}/aql_threshold`) });
 	}
 	return out;
 }
@@ -165,11 +173,10 @@ function tick_rate() {
 	return null;
 }
 
-// a module parameter's number; null where the image doesn't have it (or
-// sch_cake isn't loaded)
-function param(path) {
+// a module parameter that's on or off; null where the image doesn't have it
+function flag(path) {
 	const v = trim(readfile(path) ?? '');
-	return match(v, /^[0-9]+$/) ? +v : null;
+	return (v == 'Y' || v == '1') ? true : ((v == 'N' || v == '0') ? false : null);
 }
 
 // the drivers' latency settings as they are now: the Ethernet's longest RX
@@ -181,8 +188,10 @@ function knobs() {
 	return {
 		rx_delay: param('/sys/module/mtk_eth/parameters/rx_dim_max_us'),
 		cake_ecn: param('/sys/module/sch_cake/parameters/ecn_fail_count'),
+		cake_l4s: param('/sys/module/sch_cake/parameters/l4s_ramp'),
 		cake_loaded: access('/sys/module/sch_cake') == true,
 		wifi_retries: param('/sys/module/mt76_connac_lib/parameters/data_tx_count'),
+		wifi_vo_aggr: flag('/sys/module/mt76_connac_lib/parameters/vo_aggr'),
 	};
 }
 

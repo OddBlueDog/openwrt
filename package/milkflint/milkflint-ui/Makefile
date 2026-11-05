@@ -43,6 +43,7 @@ define Package/milkflint-ui/install
 	$(INSTALL_CONF) ./files/flowtable.sysctl $(1)/etc/sysctl.d/20-milkflint-flowtable.conf
 	$(INSTALL_DATA) ./files/wifi-aql.hotplug $(1)/etc/hotplug.d/ieee80211/30-milkflint-aql
 	$(INSTALL_DATA) ./files/wifi-muru.hotplug $(1)/etc/hotplug.d/ieee80211/32-milkflint-muru
+	$(INSTALL_DATA) ./files/wifi-spr.hotplug $(1)/etc/hotplug.d/ieee80211/33-milkflint-spr
 	$(INSTALL_DATA) ./files/cake-ecn.hotplug $(1)/etc/hotplug.d/iface/12-milkflint-cake-ecn
 	$(INSTALL_DATA) ./files/milkflint.html $(1)/www/milkflint.html
 	$(INSTALL_DATA) ./files/acl.json $(1)/usr/share/rpcd/acl.d/milkflint-ui.json

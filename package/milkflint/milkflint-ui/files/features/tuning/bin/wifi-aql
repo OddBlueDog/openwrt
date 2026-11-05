@@ -2,6 +2,14 @@
 # The Wi-Fi driver queue's limits for best-effort traffic (mac80211's AQL,
 # access category 2), from milkflint.wifi.aql_be: "<low> <high>" in us,
 # "off" for mac80211's own 5000 12000, unset for MilkFlint's 2500 5000.
+# With them, the radio's total at which a device is held to its low limit
+# (aql_threshold), from milkflint.wifi.aql_threshold: in us, from the high
+# limit to 50000 (a lower one would limit a lone device); unset or anything
+# else, 1.2 times the high limit, or mac80211's own 24000 with "off". A lone
+# device still gets its high limit with a little else going on, and two or
+# more busy ones share about that total rather than each having the high
+# limit waiting, which only a radio's many devices would ever take to
+# mac80211's 24000.
 # Writes them to the radios named,
 # or to every radio there is. mac80211 takes them at once, for the devices
 # already connected too, so Wi-Fi isn't restarted. The ieee80211 hotplug
@@ -13,18 +21,33 @@
 DEFAULT="2500 5000"
 
 limits=$(uci -q get milkflint.wifi.aql_be)
+threshold=
 case "$limits" in
 '') limits=$DEFAULT ;;
-off) limits="5000 12000" ;;
+off) limits="5000 12000" threshold=24000 ;;
 esac
 if ! echo "$limits" | grep -qxE '[0-9]{1,6} [0-9]{1,6}'; then
 	logger -t milkflint-tuning "milkflint.wifi.aql_be isn't \"<low> <high>\" or off: using $DEFAULT"
 	limits=$DEFAULT
+fi
+# awk, as the limits and the total may have leading zeros
+[ -n "$threshold" ] || threshold=$(echo "$limits" | awk '{ print int($2 * 6 / 5) }')
+total=$(uci -q get milkflint.wifi.aql_threshold)
+if [ -n "$total" ]; then
+	high=$(echo "$limits" | awk '{ print $2 + 0 }')
+	n=$(echo "$total" | grep -xE '[0-9]{1,6}' | awk '{ print $1 + 0 }')
+	if [ -n "$n" ] && [ "$n" -ge "$high" ] && [ "$n" -le 50000 ]; then
+		threshold=$n
+	else
+		logger -t milkflint-tuning "milkflint.wifi.aql_threshold isn't $high to 50000 us: using $threshold"
+	fi
 fi
 
 [ $# -gt 0 ] || set -- $(ls /sys/kernel/debug/ieee80211 2> /dev/null)
 for phy; do
 	f=/sys/kernel/debug/ieee80211/$phy/aql_txq_limit
 	[ -w "$f" ] && echo "2 $limits" > "$f"
+	f=/sys/kernel/debug/ieee80211/$phy/aql_threshold
+	[ -w "$f" ] && echo "$threshold" > "$f"
 done
 exit 0
