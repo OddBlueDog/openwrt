@@ -2,7 +2,7 @@
 import * as ubus from "ubus";
 import * as uloop from "uloop";
 import { is_equal } from "./utils.uc";
-import { access } from "fs";
+import { access, writefile } from "fs";
 
 const NOTIFY_CMD_UP = 0;
 const NOTIFY_CMD_SET_DATA = 1;
@@ -60,7 +60,9 @@ function handle_link(dev, data, up)
 		wireless_ap: ap,
 	};
 
-	if (ap && config.multicast_to_unicast != null)
+	// Set or not: netifd's default for an access point's bridge port is on, with
+	// hairpin, and on its own mac80211 relays a client's multicast as well.
+	if (ap)
 		dev_data.multicast_to_unicast = config.multicast_to_unicast ? 1 : 0;
 
 	if (data.type == "vif" && config.mode == "ap") {
@@ -68,8 +70,18 @@ function handle_link(dev, data, up)
 		dev_data.wireless_isolate = !!config.isolate;
 	}
 
-	if (up)
+	if (up) {
 		netifd.device_set(dev, dev_data);
+		// netifd writes these when a port joins the bridge, and a network
+		// reloaded in place stays in it: ap_isolate from the new config with
+		// the old hairpin would cut its clients off from each other.
+		if (ap && access(`/sys/class/net/${dev}/brport`)) {
+			let to_unicast = dev_data.multicast_to_unicast == 1;
+			let hairpin = (to_unicast || !!config.proxy_arp) && !config.isolate;
+			writefile(`/sys/class/net/${dev}/brport/multicast_to_unicast`, to_unicast ? '1' : '0');
+			writefile(`/sys/class/net/${dev}/brport/hairpin_mode`, hairpin ? '1' : '0');
+		}
+	}
 
 	for (let net in config.network)
 		netifd.interface_handle_link({
