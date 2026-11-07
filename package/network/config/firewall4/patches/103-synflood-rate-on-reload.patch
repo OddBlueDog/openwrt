@@ -1,0 +1,29 @@
+From: MilkFlint <milkflint@localhost>
+Date: Sat, 7 Nov 2026 15:00:00 +0000
+Subject: [PATCH] firewall4: a reload's SYN flood rate reaches every address
+
+Each address in the SYN flood sets has its own limit, made at the rate in
+force when the address was first seen. A reload flushes the table's rules
+but not its sets' elements, so a lowered rate didn't reach an address the
+set already had: it kept the old rate until it had been quiet for a minute,
+and a flood from it never is. Empty the sets on every load, in the same
+transaction as the new rules; addresses come back at the new rate on their
+next SYN.
+
+Signed-off-by: MilkFlint <milkflint@localhost>
+---
+--- a/root/usr/share/firewall4/templates/ruleset.uc
++++ b/root/usr/share/firewall4/templates/ruleset.uc
+@@ -483,7 +483,12 @@
+ {% fw4.includes('chain-append', 'mangle_forward') %}
+ 	}
+ {% fw4.includes('table-append') %}
+ }
++{% if (fw4.default_option("synflood_protect") && fw4.default_option("synflood_rate")): %}
++
++flush set inet fw4 syn_flood_v4
++flush set inet fw4 syn_flood_v6
++{% endif %}
+ {% if (bridge_offload): %}
+ 
+ table bridge fw4
