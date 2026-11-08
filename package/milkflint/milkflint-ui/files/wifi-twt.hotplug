@@ -1,0 +1,20 @@
+# MilkFlint: a radio's Target Wake Time limits (milkflint.wifi.twt_<band>_*, the
+# Radios & SSIDs page) for the Wi-Fi driver, on every radio as it appears: at
+# boot, or when the driver loads again. Nothing to do with none set: the driver
+# starts on the defaults. Installed as /etc/hotplug.d/ieee80211/34-milkflint-twt;
+# hotplug-call sources it, so it returns rather than exits.
+
+[ "$ACTION" = add ] || return 0
+uci -q show milkflint.wifi | grep -q '\.twt_' || return 0
+
+(
+	phy=${DEVICENAME:-${DEVPATH##*/}}
+	f=/sys/kernel/debug/ieee80211/$phy/mt76/twt_policy
+	# the driver adds its debugfs files after the radio is registered
+	i=0
+	while [ ! -w "$f" ] && [ $i -lt 20 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	/usr/libexec/milkflint/wifi-twt "$phy"
+) > /dev/null 2>&1 &

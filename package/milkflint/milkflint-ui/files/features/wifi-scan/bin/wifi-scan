@@ -123,7 +123,7 @@ function parse_ies(list) {
 			break;
 		case 11:
 			if (length(d) >= 3)
-				ie.load = { stations: u16le(d, 0), utilization: u8(d, 2) / 255 };
+				ie.load = { stations: u16le(d, 0), utilization: u8(d, 2) / 255.0 };
 			break;
 		case 45:
 			ie.ht_cap = true;

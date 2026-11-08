@@ -1,0 +1,1 @@
+import{d as e}from"./uci-BCod-5uD.js";function t(t){let n=e(t,`zonename`),r=e(t,`timezone`);return n!==void 0&&n!==`UTC`||r!==void 0&&r!==`GMT0`}function n(e){return e.length===0||e.some(e=>e.name===`UTC`)?[...e]:[{name:`UTC`,tz:`UTC0`},...e]}export{t as n,n as t};

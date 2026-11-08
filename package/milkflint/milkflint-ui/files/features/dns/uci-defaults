@@ -5,6 +5,18 @@ uci -q get milkflint.dns > /dev/null || uci -q set milkflint.dns=dns
 [ -n "$(uci -q get milkflint.dns.mode)" ] || uci -q set milkflint.dns.mode='auto'
 # before 0.4 the DNS page used https-dns-proxy, with a plain on/off
 uci -q delete milkflint.dns.encrypted
+# Devices ask for a site's HTTPS record alongside its address, and dnsmasq
+# only caches them when told to, so each one went out to the DNS server. Once,
+# marked in /etc/config/milkflint, as turning it off on the DNS page should
+# last over upgrades, which run this again.
+if [ -z "$(uci -q get milkflint.defaults.cache_https)" ]; then
+	uci -q get milkflint.defaults > /dev/null || uci -q set milkflint.defaults=defaults
+	uci -q set milkflint.defaults.cache_https='1'
+	uci -q get dhcp.@dnsmasq[0].cache_rr | grep -qiw https || {
+		uci -q add_list dhcp.@dnsmasq[0].cache_rr='HTTPS'
+		uci -q commit dhcp
+	}
+fi
 uci -q commit milkflint
 /etc/init.d/milkflint-dns enable
 exit 0

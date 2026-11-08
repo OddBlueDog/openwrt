@@ -32,6 +32,9 @@
 # - milkflint.wifi.spr_<band>: what each radio's driver does about spatial
 #   reuse (/usr/libexec/milkflint/wifi-spr; the ieee80211 hotplug runs it for
 #   each radio too);
+# - milkflint.wifi.twt_<band>_*: what each radio's driver agrees to of devices'
+#   Target Wake Time requests (/usr/libexec/milkflint/wifi-twt; the ieee80211
+#   hotplug runs it for each radio too);
 # - milkflint.wifi.retries: how often the Wi-Fi driver sends a data frame
 #   before it gives up (/usr/libexec/milkflint/wifi-retries; the ieee80211
 #   hotplug runs it for each radio too);
@@ -72,6 +75,7 @@ apply() {
 	put cake_dscp "$(uci -q get milkflint.cake.dscp_restore)" /usr/libexec/milkflint/cake-dscp
 	put vo_aggr "$(uci -q get milkflint.wifi.vo_aggr)" /usr/libexec/milkflint/wifi-vo-aggr
 	put spr "$(uci -q get milkflint.wifi.spr_2g) $(uci -q get milkflint.wifi.spr_5g) $(uci -q get milkflint.wifi.spr_6g)" /usr/libexec/milkflint/wifi-spr
+	put twt "$(uci -q show milkflint.wifi | grep '\.twt_')" /usr/libexec/milkflint/wifi-twt
 	put retries "$(uci -q get milkflint.wifi.retries)" /usr/libexec/milkflint/wifi-retries
 	# what the GRO settings resolve to: sqm and firewall changes count too
 	put gro "$(/usr/libexec/milkflint/gro show)" /usr/libexec/milkflint/gro

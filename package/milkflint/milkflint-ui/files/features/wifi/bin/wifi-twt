@@ -1,0 +1,53 @@
+#!/bin/sh
+# What each radio's Wi-Fi driver agrees to of devices' Target Wake Time requests,
+# from milkflint.wifi.twt_<band>_<name> (band 2g, 5g, 6g), unset for the default:
+#   max_interval  longest sleep between wake periods, ms; 0 no limit (60000)
+#   min_interval  shortest, ms (0)
+#   min_wake      least time awake in a wake period, in 256 us (64, the least)
+#   flows         agreements on the radio (16, the most)
+#   sta_flows     agreements per device (8, the most)
+#   trigger       trigger-enabled agreements: allow, never (allow)
+# Only new requests go by it, at once: agreements devices have stay. Whether a
+# radio offers TWT at all is hostapd's (wireless' he_twt_responder), from the
+# same page. A driver without the file (not mt7915's) is left alone.
+# milkflint-tuning runs this when a setting changes, the ieee80211 hotplug for
+# each radio that appears.
+#
+#   wifi-twt [phy...]
+
+number() { # option, default, most
+	v=$(uci -q get "milkflint.wifi.twt_${band}_$1")
+	case "$v" in
+	'' | *[!0-9]*) v=$2 ;;
+	esac
+	[ "${#v}" -le 7 ] && [ "$v" -le "$3" ] || v=$2
+	echo "$v"
+}
+
+put() {
+	echo "$1 $2" 2> /dev/null >> "$f" || logger -t milkflint-wifi "$phy: the Wi-Fi driver didn't take TWT's $1 $2"
+}
+
+[ $# -gt 0 ] || set -- $(ls /sys/kernel/debug/ieee80211 2> /dev/null)
+for phy; do
+	f=/sys/kernel/debug/ieee80211/$phy/mt76/twt_policy
+	[ -w "$f" ] || continue
+	case "$(iw phy "$phy" info 2> /dev/null)" in
+	*"Band 4:"*) band=6g ;;
+	*"Band 2:"*) band=5g ;;
+	*"Band 1:"*) band=2g ;;
+	*) continue ;;
+	esac
+	trigger=$(uci -q get "milkflint.wifi.twt_${band}_trigger")
+	[ "$trigger" = never ] || trigger=allow
+	# the driver checks the shortest against the longest: from no limits, in
+	# an order that can't be refused for what was there before
+	put min_interval_ms 0
+	put max_interval_ms "$(number max_interval 60000 3600000)"
+	put min_interval_ms "$(number min_interval 0 3600000)"
+	put min_wake_dur "$(number min_wake 64 255)"
+	put max_flows "$(number flows 16 16)"
+	put max_sta_flows "$(number sta_flows 8 8)"
+	put trigger "$trigger"
+done
+exit 0

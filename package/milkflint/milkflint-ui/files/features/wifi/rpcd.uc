@@ -4,7 +4,7 @@
 // beamforming its access points run with.
 'use strict';
 
-import { lsdir, popen, readfile } from 'fs';
+import { lsdir, open, popen, readfile } from 'fs';
 import { cursor } from 'uci';
 
 // Linux's regulatory database (wireless-regdb, the rules the kernel
@@ -100,6 +100,54 @@ function spatial_reuse(phy) {
 		control: num('he_spr_sr_control'),
 		offset: num('he_spr_non_srg_obss_pd_max_offset')
 	};
+}
+
+// Target Wake Time on a radio now: the driver's limits, how requests have gone,
+// the agreements it has (the driver's debugfs, with a mutex that the Wi-Fi
+// driver holds through a restart: don't poll this fast), and which connected
+// devices say they can ask (mac80211's copy of their capabilities: no firmware
+// involved). supported is false with a driver that has none of this.
+function twt(phy) {
+	const running = length(filter(lsdir('/var/run/hostapd') ?? [], (s) => index(s, `${phy}-`) == 0)) > 0;
+	const conf = running ? (readfile(`/var/run/hostapd-${phy}.conf`) ?? '') : '';
+	const base = `/sys/kernel/debug/ieee80211/${phy}`;
+	const offered = running && !!match(conf, /(^|\n)ieee80211ax=1/) && !match(conf, /(^|\n)he_twt_responder=0/);
+	const policy_text = readfile(`${base}/mt76/twt_policy`);
+	const capable = [];
+	let stations = 0;
+	for (let dir in lsdir(base) ?? []) {
+		if (index(dir, 'netdev:') != 0)
+			continue;
+		for (let mac in lsdir(`${base}/${dir}/stations`) ?? []) {
+			stations++;
+			if (index(readfile(`${base}/${dir}/stations/${mac}/he_capa`) ?? '', 'TWT-REQ') >= 0)
+				push(capable, mac);
+		}
+	}
+	if (policy_text == null)
+		return { running, offered, supported: false, policy: null, counters: null, agreements: [], capable, stations };
+
+	const policy = {};
+	for (let line in split(policy_text, '\n')) {
+		const m = match(line, /^([a-z_]+) ([a-z0-9]+)$/);
+		if (m)
+			policy[m[1]] = m[1] == 'trigger' ? m[2] : +m[2];
+	}
+	let counters = null;
+	const agreements = [];
+	for (let line in split(readfile(`${base}/mt76/twt_status`) ?? '', '\n')) {
+		const fields = {};
+		for (let kv in split(line, ' ')) {
+			const m = match(kv, /^([a-z_]+)=(.+)$/);
+			if (m)
+				fields[m[1]] = m[1] == 'sta' ? m[2] : +m[2];
+		}
+		if (index(line, 'counters ') == 0)
+			counters = fields;
+		else if (index(line, 'flow ') == 0)
+			push(agreements, fields);
+	}
+	return { running, offered, supported: true, policy, counters, agreements, capable, stations };
 }
 
 // hostapd's config for a phy (/var/run/hostapd-<phy>.conf, which wifi-scripts
@@ -275,6 +323,41 @@ return {
 					return { error: 'invalid device' };
 				const phy = phy_of(dev);
 				return phy == null ? { running: false, mode: null, control: null, offset: null } : spatial_reuse(phy);
+			}
+		},
+		// Target Wake Time on the radio now (by phy or interface)
+		twt: {
+			args: { device: 'device' },
+			call: function(req) {
+				const dev = req.args.device;
+				if (type(dev) != 'string' || !match(dev, /^[A-Za-z0-9_.-]+$/))
+					return { error: 'invalid device' };
+				const phy = phy_of(dev);
+				return phy == null
+					? { running: false, offered: false, supported: false, policy: null, counters: null, agreements: [], capable: [], stations: 0 }
+					: twt(phy);
+			}
+		},
+		// ends a device's agreements and tells it: one flow, or all of them
+		twt_end: {
+			args: { device: 'device', mac: 'mac', flow: 'flow' },
+			call: function(req) {
+				const dev = req.args.device, mac = req.args.mac, flow = req.args.flow;
+				if (type(dev) != 'string' || !match(dev, /^[A-Za-z0-9_.-]+$/))
+					return { error: 'invalid device' };
+				if (type(mac) != 'string' || !match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+					return { error: 'invalid address' };
+				if (flow != 'all' && !(type(flow) == 'string' && match(flow, /^[0-7]$/)))
+					return { error: 'invalid flow' };
+				const phy = phy_of(dev);
+				if (phy == null)
+					return { error: 'no such radio' };
+				const f = open(`/sys/kernel/debug/ieee80211/${phy}/mt76/twt_teardown`, 'w');
+				if (!f)
+					return { error: 'this driver has no such thing' };
+				const ok = f.write(`${mac} ${flow}\n`);
+				f.close();
+				return ok == null ? { error: 'no such agreement' } : { ok: true };
 			}
 		}
 	}
