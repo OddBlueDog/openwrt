@@ -536,9 +536,17 @@ export function editSection(type: string, section: Section | undefined, values: 
   return changes;
 }
 
+/** The whole config's order with `section` moved to where `target` is (after it when moving down). */
+export function moveTo(current: readonly string[], section: string, target: string): Change {
+  const order = current.filter((s) => s !== section);
+  const down = current.indexOf(section) < current.indexOf(target);
+  order.splice(order.indexOf(target) + (down ? 1 : 0), 0, section);
+  return { op: 'order', config: 'firewall', sections: order };
+}
+
 // SYN flood protection's rate: new TCP connections each address may open to
 // the router itself a second (our fw4 counts every source address on its
-// own: source/patches/0053), with twice that at once, fw4's own ratio.
+// own), with twice that at once, fw4's own ratio.
 // Connections through the router aren't counted.
 /** fw4's rate when synflood_rate is unset (25/second, 50 at once). */
 export const SYN_RATE_FW4 = 25;

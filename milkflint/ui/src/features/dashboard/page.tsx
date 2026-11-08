@@ -2,6 +2,7 @@ import {
   ActivityIcon,
   ArrowDownIcon,
   ArrowUpIcon,
+  ClockIcon,
   CpuIcon,
   GlobeIcon,
   MemoryStickIcon,
@@ -14,11 +15,14 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
+import { useLoad } from '@/hooks/use-load';
 import { ipv4 } from '@/lib/api/network';
 import { firmwareName } from '@/lib/api/system';
+import { getConfig } from '@/lib/api/uci';
 import { useRouterMode } from '@/lib/router-mode';
 import { formatBitrate, formatBytes, formatDuration, formatPercent } from '@/lib/format';
 import { errorMessage } from '@/lib/utils';
+import { zoneChosen } from '../time/zone';
 import { ClientsCard } from './clients-card';
 import { QualityCard } from './quality-card';
 import { RadiosCard } from './radios-card';
@@ -157,6 +161,26 @@ function StatCards({ d }: { d: Dashboard }): ReactElement {
   );
 }
 
+const loadSystem = async (): Promise<boolean> => zoneChosen((await getConfig('system')).find((s) => s['.type'] === 'system'));
+
+/** Shown until a time zone is picked, on the Name & Time page or in LuCI. */
+function SetupNote(): ReactElement | null {
+  const { data: chosen } = useLoad(loadSystem);
+  if (chosen !== false) return null;
+  return (
+    <Alert variant="info">
+      <ClockIcon />
+      <AlertTitle>Name your router and choose its time zone</AlertTitle>
+      <AlertDescription>
+        Schedules and logs follow the router&apos;s clock, which is on UTC until you choose.
+        <Button size="sm" variant="outline" className="mt-2" asChild>
+          <a href="#/time">Go to Name &amp; Time</a>
+        </Button>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
 function Loading(): ReactElement {
   return (
     <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -199,6 +223,7 @@ export function DashboardPage(): ReactElement {
         <Loading />
       ) : (
         <div className="flex flex-col gap-4">
+          <SetupNote />
           <StatCards d={data} />
           <div className="grid gap-4 xl:grid-cols-3">
             <TrafficCard d={data} className="xl:col-span-2" />

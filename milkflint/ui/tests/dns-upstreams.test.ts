@@ -10,6 +10,7 @@ import {
   dnssecWarning,
   filterWarning,
   keepHoursOf,
+  staleHoursOf,
   matchingServer,
   plainServers,
   protoNote,
@@ -106,6 +107,9 @@ test('instant answers’ keep time reads dnsproxy’s duration as hours, else it
   assert.equal(keepHoursOf('90m'), '12');
   assert.equal(keepHoursOf('0h'), '12');
   assert.equal(keepHoursOf('1d'), '12');
+  assert.equal(staleHoursOf('86400'), '24');
+  assert.equal(staleHoursOf('3600'), '1');
+  for (const other of [undefined, '0', '100', 'x']) assert.equal(staleHoursOf(other), '12', other);
 });
 
 test('only CleanBrowsing’s servers don’t check DNSSEC', () => {

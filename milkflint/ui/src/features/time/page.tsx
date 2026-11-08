@@ -17,10 +17,12 @@ import { usePoll } from '@/hooks/use-poll';
 import { getInfo, getTimezones, getUnixtime, setLocaltime } from '@/lib/api/system';
 import { bool, type Change, getConfig, list, str } from '@/lib/api/uci';
 import { errorMessage } from '@/lib/utils';
+import { withUtc, zoneChosen } from './zone';
 
 interface TimeForm {
   section: string;
   hostname: string;
+  /** '' until a time zone is picked (./zone.ts): the router stays on UTC */
   zonename: string;
   ntp: boolean;
   servers: string;
@@ -40,11 +42,11 @@ async function loadTime(): Promise<TimeData> {
     form: {
       section: s?.['.name'] ?? 'system',
       hostname: str(s, 'hostname') ?? 'MilkFlint',
-      zonename: str(s, 'zonename') ?? 'UTC',
+      zonename: zoneChosen(s) ? (str(s, 'zonename') ?? 'UTC') : '',
       ntp: ntp === undefined ? false : bool(ntp, 'enabled', true),
       servers: list(ntp, 'server').join('\n'),
     },
-    zones,
+    zones: withUtc(zones),
     ntpSection: ntp?.['.name'],
   };
 }
@@ -147,10 +149,9 @@ export function TimePage(): ReactElement {
   const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data?.form);
 
   const toChanges = (f: TimeForm): Change[] => {
-    const tz = data?.zones.find((z) => z.name === f.zonename)?.tz ?? 'UTC0';
-    const changes: Change[] = [
-      { op: 'set', config: 'system', section: f.section, values: { hostname: f.hostname, zonename: f.zonename, timezone: tz } },
-    ];
+    // the zone only when it changed: its rule comes from the list, which may not have loaded
+    const zone = f.zonename === data?.form.zonename ? {} : { zonename: f.zonename, timezone: data?.zones.find((z) => z.name === f.zonename)?.tz ?? 'UTC0' };
+    const changes: Change[] = [{ op: 'set', config: 'system', section: f.section, values: { hostname: f.hostname, ...zone } }];
     const ntp = { enabled: f.ntp ? '1' : '0', server: serversOf(f.servers) };
     changes.push(
       data?.ntpSection === undefined
@@ -187,7 +188,8 @@ export function TimePage(): ReactElement {
                 <Field id="zonename" label="Time zone" hint="Search by city or region, or by an abbreviation like GMT or CET.">
                   <SearchSelect
                     id="zonename"
-                    options={(data.zones.length > 0 ? data.zones : [{ name: form.zonename, tz: '' }]).map((z) => ({
+                    placeholder="Choose a time zone"
+                    options={(data.zones.length > 0 || form.zonename === '' ? data.zones : [{ name: form.zonename, tz: '' }]).map((z) => ({
                       value: z.name,
                       label: z.name.replaceAll('_', ' '),
                       // the zone's abbreviations from its POSIX rule ("GMT0BST,…" → GMT BST)

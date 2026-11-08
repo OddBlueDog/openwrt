@@ -19,11 +19,10 @@ import {
 import { type DragEvent, type KeyboardEvent, type ReactElement, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import type { Change } from '@/lib/api/uci';
 import { cn } from '@/lib/utils';
 import type { Counters, FirewallData } from './api';
 import { type Actions, hitsText } from './forms';
-import { builtInRules, enabledChange, type FirewallConfig, managedBy, portsText, type Rule, scheduleText, zoneTitle } from './model';
+import { builtInRules, enabledChange, type FirewallConfig, managedBy, moveTo, portsText, type Rule, scheduleText, zoneTitle } from './model';
 import { GroupHeader, HeadRow, HeaderButton, Path, PowerButton, RouterPill, RowButton, VerdictBadge, Who } from './table-parts';
 
 interface Chain {
@@ -99,14 +98,6 @@ function why(r: Rule): string | undefined {
   const managed = managedBy[r.section];
   if (managed !== undefined) return `Made by the ${managed.title} page.`;
   return r.name === undefined ? undefined : builtInRules[r.name];
-}
-
-/** The order with `section` moved to where `target` is (after it when moving down). */
-function moveTo(data: FirewallData, section: string, target: string): Change {
-  const order = data.cfg.order.filter((s) => s !== section);
-  const down = data.cfg.order.indexOf(section) < data.cfg.order.indexOf(target);
-  order.splice(order.indexOf(target) + (down ? 1 : 0), 0, section);
-  return { op: 'order', config: 'firewall', sections: order };
 }
 
 function RowActions({ r, actions }: { r: Rule; actions: Actions }): ReactElement {
@@ -196,7 +187,7 @@ export function RulesTable({ data, counters, actions }: { data: FirewallData; co
     const to = e.key === 'ArrowUp' ? up : e.key === 'ArrowDown' ? down : undefined;
     if (to === undefined || actions.applying) return;
     e.preventDefault();
-    actions.apply([moveTo(data, r.section, to.section)]);
+    actions.apply([moveTo(data.cfg.order, r.section, to.section)]);
   };
   const dropProps = (
     chain: Chain,
@@ -211,7 +202,7 @@ export function RulesTable({ data, counters, actions }: { data: FirewallData; co
       e.preventDefault();
       const from = e.dataTransfer.getData('text/plain');
       setOver(undefined);
-      if (dragging === chain.key && from !== '' && from !== r.section) actions.apply([moveTo(data, from, r.section)]);
+      if (dragging === chain.key && from !== '' && from !== r.section) actions.apply([moveTo(data.cfg.order, from, r.section)]);
     },
   });
 
@@ -372,7 +363,7 @@ export function RulesTable({ data, counters, actions }: { data: FirewallData; co
                           aria-label={`Move ${title} up`}
                           disabled={up === undefined || actions.applying}
                           onClick={() => {
-                            if (up !== undefined) actions.apply([moveTo(data, r.section, up.section)]);
+                            if (up !== undefined) actions.apply([moveTo(data.cfg.order, r.section, up.section)]);
                           }}
                         >
                           <ArrowUpIcon />
@@ -384,7 +375,7 @@ export function RulesTable({ data, counters, actions }: { data: FirewallData; co
                           aria-label={`Move ${title} down`}
                           disabled={down === undefined || actions.applying}
                           onClick={() => {
-                            if (down !== undefined) actions.apply([moveTo(data, r.section, down.section)]);
+                            if (down !== undefined) actions.apply([moveTo(data.cfg.order, r.section, down.section)]);
                           }}
                         >
                           <ArrowDownIcon />

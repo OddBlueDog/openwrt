@@ -1,5 +1,5 @@
-import { ActivityIcon, ArrowDownIcon, ArrowUpIcon, CpuIcon, GaugeIcon, TriangleAlertIcon } from 'lucide-react';
-import { type ReactElement, useCallback, useState } from 'react';
+import { ActivityIcon, ArrowDownIcon, ArrowUpIcon, CpuIcon, GaugeIcon, InfoIcon, TriangleAlertIcon } from 'lucide-react';
+import { type ReactElement, useCallback, useEffect, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
 import { CpuLanes } from '@/components/cpu-lanes';
@@ -25,6 +25,7 @@ import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
+import { ACK_FILTER, ACK_FILTER_RATIO, type AckFilter, ackFilterOf, suggestsAckFilter } from './ack-filter';
 import { type SqmDscpOption, sqmDscpOptions } from './dscp';
 import { GSO, optValue, takesWhole, type Whole, wholeSetting, withOpts, words } from './gso';
 
@@ -97,6 +98,7 @@ interface SqmForm {
   link: LinkPreset | 'custom';
   latency: LatencyTarget | 'custom';
   uploadMemory: UploadMemory | 'custom';
+  ackFilter: AckFilter;
   perDevice: boolean;
   multiQueue: boolean;
   /** Downloads get back the DSCP their connection sends with (milkflint.cake.dscp_restore) */
@@ -178,6 +180,7 @@ async function loadSqm(): Promise<SqmData> {
     link: presetOf(queue),
     latency: latencyOf(str(queue, 'iqdisc_opts'), str(queue, 'eqdisc_opts')),
     uploadMemory: uploadMemoryOf(str(queue, 'eqdisc_opts'), Number(str(queue, 'upload') ?? '0')),
+    ackFilter: ackFilterOf(words(str(queue, 'eqdisc_opts'))),
     perDevice: words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost'),
     // on unless turned off: MilkFlint's default (uci-defaults sets use_mq once)
     multiQueue: queue === undefined || bool(queue, 'use_mq'),
@@ -246,6 +249,7 @@ function toChanges(f: SqmForm, data: SqmData): Change[] {
   }
   const memory = { managed: f.uploadMemory === 'custom' ? [] : ['memlimit'], wanted: [] as string[] };
   if (f.uploadMemory === 'low') memory.wanted.push('memlimit', String(lowMemlimit(upload)));
+  const ackFilter = f.ackFilter === 'custom' ? [] : ACK_FILTER;
   const opts = {
     iqdisc_opts: withOpts(
       data.iqdiscOpts,
@@ -254,8 +258,8 @@ function toChanges(f: SqmForm, data: SqmData): Change[] {
     ),
     eqdisc_opts: withOpts(
       data.eqdiscOpts,
-      [...FAIR_EGRESS, ...both.managed, ...memory.managed],
-      [...(f.perDevice ? FAIR_EGRESS : []), ...both.wanted, ...memory.wanted],
+      [...FAIR_EGRESS, ...both.managed, ...memory.managed, ...ackFilter],
+      [...(f.perDevice ? FAIR_EGRESS : []), ...both.wanted, ...memory.wanted, ...(f.ackFilter === 'on' ? ['ack-filter'] : [])],
     ),
   };
   const unset: string[] = [];
@@ -552,6 +556,17 @@ export function SqmPage(): ReactElement {
   // fast path still goes through the qdiscs, and MilkFlint's kernel keeps CAKE's per-device fairness
   // with it.
   const offloadOn = data?.offloading?.hardware === true;
+  // the suggestion's button: picks out the setting for a moment
+  const [showAckFilter, setShowAckFilter] = useState(false);
+  useEffect(() => {
+    if (!showAckFilter) return undefined;
+    const t = window.setTimeout(() => {
+      setShowAckFilter(false);
+    }, 2000);
+    return () => {
+      window.clearTimeout(t);
+    };
+  }, [showAckFilter]);
 
   return (
     <>
@@ -641,6 +656,31 @@ export function SqmPage(): ReactElement {
                       }}
                     />
                   </Field>
+                  {form.enabled && form.ackFilter === 'off' && suggestsAckFilter(form.downloadMbit, form.uploadMbit) && (
+                    <div className="py-3">
+                      <Alert variant="info">
+                        <InfoIcon />
+                        <AlertTitle>Try the upload ACK filter</AlertTitle>
+                        <AlertDescription>
+                          Your download is over {ACK_FILTER_RATIO} times your upload, so the acknowledgements downloads send back can fill the upload and
+                          hold them back.
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="mt-2"
+                            onClick={() => {
+                              const select = document.getElementById('ackFilter');
+                              select?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                              select?.focus({ preventScroll: true });
+                              setShowAckFilter(true);
+                            }}
+                          >
+                            Show the upload ACK filter
+                          </Button>
+                        </AlertDescription>
+                      </Alert>
+                    </div>
+                  )}
                   <Field
                     id="mode"
                     label="Mode"
@@ -732,6 +772,28 @@ export function SqmPage(): ReactElement {
                         <SelectItem value="auto">Automatic</SelectItem>
                         <SelectItem value="low">Low</SelectItem>
                         {form.uploadMemory === 'custom' && <SelectItem value="custom">Custom (set in LuCI)</SelectItem>}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <Field
+                    id="ackFilter"
+                    label="Upload ACK filter"
+                    className={cn('rounded-md transition-colors duration-500', showAckFilter && 'bg-info/15')}
+                    hint={`Drops acknowledgements a newer one has replaced, so they take less of the upload and downloads keep their speed. Helps when your download is over ${String(ACK_FILTER_RATIO)} times your upload (CAKE's ack-filter).`}
+                  >
+                    <Select
+                      value={form.ackFilter}
+                      onValueChange={(v) => {
+                        set('ackFilter', v as AckFilter);
+                      }}
+                    >
+                      <SelectTrigger id="ackFilter">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="off">Off</SelectItem>
+                        <SelectItem value="on">On</SelectItem>
+                        {form.ackFilter === 'custom' && <SelectItem value="custom">Aggressive (set in LuCI)</SelectItem>}
                       </SelectContent>
                     </Select>
                   </Field>

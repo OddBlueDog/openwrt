@@ -32,40 +32,48 @@ import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
-import { ipToInt, prefixLength } from '@/lib/api/network';
-import { bool, type Change, getConfig, list, type Section, str } from '@/lib/api/uci';
+import { prefixLength } from '@/lib/api/network';
+import { bool, getConfig, list, type Section, str } from '@/lib/api/uci';
 import { Choice, Segmented } from '../firewall/parts';
 import { SERVER } from '../remote-access/sections';
 import { type GuestId, isGuestNetwork } from '../wifi-guest/guest';
 import { getDnsStatus } from './api';
-import { type DeviceDns, deviceDnsChanges, homeDhcp, loops, readDeviceDns, validateDeviceDns } from './device-dns';
-import { addIntercept, INTERCEPT_SECTIONS, type InterceptZone, interceptOn, interceptSection } from './intercept';
-import { isProviderId, type Proto, protoLabels, protoOf, type ProviderId, providers } from './providers';
+import { CacheCard } from './cache-card';
+import { homeDhcp, loops, readDeviceDns } from './device-dns';
+import { INTERCEPT_SECTIONS, interceptOn, interceptSection } from './intercept';
+import {
+  backupPick,
+  backupUseOf,
+  cacheRrTypes,
+  DEFAULT_CACHE_SIZE,
+  type DnsData,
+  type DnsForm,
+  isHttpsRr,
+  mainPick,
+  type Mode,
+  plan,
+  toChanges,
+  validate,
+} from './model';
+import { isProviderId, type Proto, protoLabels, type ProviderId, providers } from './providers';
 import {
   backupDnssecWarning,
-  type BackupUse,
-  DEFAULT_KEEP_HOURS,
   describe,
   dnssecWarning,
   filterWarning,
-  KEEP_HOURS,
   keepHoursOf,
   matchingServer,
   type Pair,
-  plainServers,
   protoNote,
-  type ProxyServers,
-  proxyServers,
   type ServerPick,
   serverHint,
   serverOf,
   serversOf,
   shortName,
+  staleHoursOf,
   suggestBackup,
   TIMEOUT_S,
 } from './upstreams';
-
-type Mode = 'auto' | 'static' | 'encrypted';
 
 // How lookups are sent: the page's first choice. 'static' is plain DNS
 // (the stock firmware's name for it, kept in milkflint.dns.mode).
@@ -105,62 +113,6 @@ const pairs: Record<Pair, { label: string; hint: (mode: Mode) => string }> = {
   },
 };
 
-/** Where dnsproxy listens for dnsmasq (the stock firmware's port). */
-const PROXY = '127.0.0.1#5453';
-
-/** dnsproxy's cache size when instant answers are on, in bytes (its default, 64 KB, holds only a few hundred names). */
-const CACHE_BYTES = '4194304';
-
-interface DnsRecord {
-  key: string;
-  section: string | undefined;
-  name: string;
-  ip: string;
-}
-
-interface DnsForm {
-  mode: Mode;
-  provider: ProviderId | 'custom';
-  server: string;
-  proto: Proto;
-  custom: string;
-  /** One server, or two and how they're used (milkflint.dns.backup 'none', else backup_use). */
-  pair: Pair;
-  /** The second server: from another provider, or custom; a suggestion while there's one server. */
-  backup: ProviderId | 'custom';
-  backupServer: string;
-  backupCustom: string;
-  /** dnsproxy's optimistic cache: expired names answered at once and refreshed behind. */
-  quick: boolean;
-  /** how long after expiring an answer may still be given out, in hours (optimistic_max_age) */
-  keepHours: string;
-  intercept: boolean;
-  rebind: boolean;
-  domain: string;
-  records: DnsRecord[];
-  /** The DNS server the home network's devices are told to use. */
-  devices: DeviceDns;
-}
-
-interface DnsData {
-  form: DnsForm;
-  dnsmasq: string | undefined;
-  servers: string[];
-  managed: string[];
-  hasMilkflintDns: boolean;
-  hasProxyCache: boolean;
-  /** The intercept redirects there are (any zone's), and whether each is on. */
-  intercepts: { section: string; enabled: boolean }[];
-  /** Where the switch catches devices: the home network and each guest network's zone. */
-  interceptZones: InterceptZone[];
-  proxyInstalled: boolean;
-  proxyEnabled: boolean;
-  /** The home network's DHCP section, where the devices' DNS server is set. */
-  lanDhcp: Section | undefined;
-  routerIp: string;
-  prefix: number;
-}
-
 let nextKey = 0;
 
 function protosOf(provider: ProviderId | 'custom'): readonly Proto[] {
@@ -189,6 +141,8 @@ async function loadDns(): Promise<DnsData> {
   // with one server, the second slot starts on a good partner for the first
   const suggestion = suggestBackup({ provider, server: str(rf, 'server') ?? '', custom: '' });
   const cache = proxy.find((s) => s['.name'] === 'cache');
+  const cacheRr = cacheRrTypes(list(dnsmasq, 'cache_rr'));
+  const stale = str(dnsmasq, 'use_stale_cache');
   return {
     form: {
       mode: mode === 'static' || mode === 'encrypted' ? mode : 'auto',
@@ -200,8 +154,13 @@ async function loadDns(): Promise<DnsData> {
       backup: hasBackup ? backup : suggestion.provider,
       backupServer: hasBackup ? (str(rf, 'backup_server') ?? '') : suggestion.server,
       backupCustom: str(rf, 'backup_custom') ?? '',
-      quick: bool(cache, 'enabled') && bool(cache, 'cache_optimistic'),
-      keepHours: keepHoursOf(str(cache, 'optimistic_max_age')),
+      cacheOn: str(dnsmasq, 'cachesize') !== '0',
+      // off is a size of 0: turning it back on starts from the default
+      cacheSize: (str(dnsmasq, 'cachesize') ?? '0') === '0' ? DEFAULT_CACHE_SIZE : (str(dnsmasq, 'cachesize') ?? DEFAULT_CACHE_SIZE),
+      cacheHttps: cacheRr.some(isHttpsRr),
+      // dnsproxy reuses expired answers for encrypted DNS, dnsmasq for the others
+      quick: mode === 'encrypted' ? bool(cache, 'enabled') && bool(cache, 'cache_optimistic') : stale !== undefined,
+      keepHours: mode === 'encrypted' ? keepHoursOf(str(cache, 'optimistic_max_age')) : staleHoursOf(stale),
       intercept: interceptOn(firewall),
       rebind: bool(dnsmasq, 'rebind_protection', true),
       domain: str(dnsmasq, 'domain') ?? 'lan',
@@ -212,9 +171,11 @@ async function loadDns(): Promise<DnsData> {
     },
     dnsmasq: dnsmasq?.['.name'],
     servers: list(dnsmasq, 'server'),
+    cacheRr,
     managed: list(rf, 'managed'),
     hasMilkflintDns: rf !== undefined,
     hasProxyCache: cache !== undefined,
+    hasStaleCache: stale !== undefined,
     intercepts: firewall
       .filter((s) => s['.type'] === 'redirect' && INTERCEPT_SECTIONS.includes(s['.name']))
       .map((s) => ({ section: s['.name'], enabled: bool(s, 'enabled', true) })),
@@ -233,176 +194,6 @@ async function loadDns(): Promise<DnsData> {
     routerIp: ipaddr?.split('/')[0] ?? '192.168.1.1',
     prefix: ipaddr?.includes('/') === true ? Number(ipaddr.split('/')[1]) : prefixLength(str(lan, 'netmask')),
   };
-}
-
-const mainPick = (f: DnsForm): ServerPick => ({ provider: f.provider, server: f.server, custom: f.custom });
-
-const backupPick = (f: DnsForm): ServerPick | undefined =>
-  f.pair === 'one' ? undefined : { provider: f.backup, server: f.backupServer, custom: f.backupCustom };
-
-const backupUseOf = (pair: Pair): BackupUse => (pair === 'fallback' ? 'fallback' : 'parallel');
-
-const isIpv6 = (v: string): boolean => /^[0-9a-f:]+$/i.test(v) && v.includes(':');
-const splitList = (v: string): string[] => v.split(/[\s,]+/).filter((s) => s !== '');
-const isEncryptedUrl = (v: string): boolean => protoOf(v.trim()) !== undefined && !/\s/.test(v.trim());
-const isAddressList = (v: string): boolean => {
-  const ips = splitList(v);
-  return ips.length > 0 && ips.every((ip) => ipToInt(ip) !== undefined || isIpv6(ip));
-};
-
-/** What dnsmasq forwards to (plain: the servers; encrypted: dnsproxy), and what dnsproxy uses. */
-function plan(f: DnsForm): { dnsmasq: string[]; proxy: ProxyServers | undefined } {
-  if (f.mode === 'static') return { dnsmasq: plainServers(mainPick(f), backupPick(f)), proxy: undefined };
-  if (f.mode === 'encrypted') return { dnsmasq: [PROXY], proxy: proxyServers(mainPick(f), f.proto, backupPick(f), backupUseOf(f.pair)) };
-  return { dnsmasq: [], proxy: undefined };
-}
-
-const NAME = /^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
-
-type FormErrors = Partial<Record<'custom' | 'backup' | 'backupCustom' | 'domain' | 'ownIpv4' | 'ownIpv6', string>>;
-
-const ADDRESS_LIST = 'One or more IP addresses, separated by commas.';
-const ENCRYPTED_URL = 'An address starting https://, tls://, quic:// or sdns://.';
-
-function validate(f: DnsForm, data: DnsData): { form: FormErrors; records: Record<string, string> } {
-  const own = validateDeviceDns(f.devices, data.routerIp, data.prefix);
-  const form: FormErrors = { ...(own.ipv4 === undefined ? {} : { ownIpv4: own.ipv4 }), ...(own.ipv6 === undefined ? {} : { ownIpv6: own.ipv6 }) };
-  const records: Record<string, string> = {};
-  if (f.mode !== 'auto') {
-    const ok = f.mode === 'static' ? isAddressList : isEncryptedUrl;
-    const message = f.mode === 'static' ? ADDRESS_LIST : ENCRYPTED_URL;
-    if (f.provider === 'custom' && !ok(f.custom)) form.custom = message;
-    if (f.pair !== 'one') {
-      if (f.backup === 'custom' && !ok(f.backupCustom)) form.backupCustom = message;
-      if (f.backup !== 'custom' && f.backup === f.provider) {
-        form.backup = 'Pick another provider: an outage usually takes all of one provider’s servers down together.';
-      }
-    }
-  }
-  if (!/^[A-Za-z0-9-]{1,63}$/.test(f.domain)) form.domain = 'One word: letters, digits and hyphens.';
-  for (const r of f.records) {
-    if (!NAME.test(r.name)) records[r.key] = 'Enter a host name, e.g. nas or printer.home.';
-    else if (ipToInt(r.ip) === undefined) records[r.key] = 'Enter an IPv4 address.';
-  }
-  return { form, records };
-}
-
-function toChanges(f: DnsForm, data: DnsData): Change[] {
-  const changes: Change[] = [];
-  const p = plan(f);
-  const rf = {
-    mode: f.mode,
-    provider: f.provider,
-    server: serverOf(mainPick(f))?.name ?? '',
-    proto: f.proto,
-    custom: f.custom.trim(),
-    backup: f.pair === 'one' ? 'none' : f.backup,
-    backup_server: f.backup === 'custom' ? '' : (serverOf({ provider: f.backup, server: f.backupServer, custom: '' })?.name ?? ''),
-    backup_custom: f.backupCustom.trim(),
-    backup_use: backupUseOf(f.pair),
-    // the dnsmasq servers this page added, so it can take them out again
-    // (an empty list can't be set: rpcd rejects it, so it's unset below)
-    ...(p.dnsmasq.length > 0 ? { managed: p.dnsmasq } : {}),
-  };
-  changes.push(
-    data.hasMilkflintDns
-      ? { op: 'set', config: 'milkflint', section: 'dns', values: rf }
-      : { op: 'add', config: 'milkflint', type: 'dns', name: 'dns', values: rf },
-  );
-  if (p.dnsmasq.length === 0) changes.push({ op: 'unset', config: 'milkflint', section: 'dns', options: ['managed'] });
-
-  if (data.dnsmasq !== undefined) {
-    const others = data.servers.filter((s) => !data.managed.includes(s));
-    const servers = [...others, ...p.dnsmasq];
-    // plain DNS with two servers: dnsmasq asks them all at once (allservers)
-    // or strictly in order, the backup's last (strictorder)
-    const two = f.mode === 'static' && f.pair !== 'one';
-    const hadTwo = data.form.mode === 'static' && data.form.pair !== 'one';
-    changes.push({
-      op: 'set',
-      config: 'dhcp',
-      section: data.dnsmasq,
-      values: {
-        rebind_protection: f.rebind ? '1' : '0',
-        domain: f.domain,
-        local: `/${f.domain}/`,
-        ...(servers.length > 0 ? { server: servers } : {}),
-        ...(f.mode === 'auto' ? {} : { noresolv: '1' }),
-        ...(two ? (f.pair === 'parallel' ? { allservers: '1' } : { strictorder: '1' }) : {}),
-      },
-    });
-    const unset = [
-      ...(servers.length === 0 ? ['server'] : []),
-      ...(f.mode === 'auto' && data.form.mode !== 'auto' ? ['noresolv'] : []),
-      ...(two ? [f.pair === 'parallel' ? 'strictorder' : 'allservers'] : hadTwo ? ['allservers', 'strictorder'] : []),
-    ];
-    if (unset.length > 0) changes.push({ op: 'unset', config: 'dhcp', section: data.dnsmasq, options: unset });
-  }
-
-  if (data.proxyInstalled) {
-    const proxy = p.proxy;
-    if (proxy !== undefined && proxy.upstream.length > 0) {
-      changes.push({
-        op: 'set',
-        config: 'dnsproxy',
-        section: 'global',
-        values: {
-          enabled: '1',
-          listen_addr: ['127.0.0.1'],
-          listen_port: ['5453'],
-          // dnsproxy's default is 10 s: a connection the server dropped held lookups that long
-          timeout: `${String(TIMEOUT_S)}s`,
-          ...(proxy.mode === undefined ? {} : { upstream_mode: proxy.mode }),
-        },
-      });
-      if (proxy.mode === undefined) changes.push({ op: 'unset', config: 'dnsproxy', section: 'global', options: ['upstream_mode'] });
-      changes.push({
-        op: 'set',
-        config: 'dnsproxy',
-        section: 'servers',
-        values: { upstream: proxy.upstream, bootstrap: proxy.bootstrap, ...(proxy.fallback.length > 0 ? { fallback: proxy.fallback } : {}) },
-      });
-      // a fallback only when the backup is set to be one (any other, say from LuCI, would send lookups elsewhere)
-      if (proxy.fallback.length === 0) changes.push({ op: 'unset', config: 'dnsproxy', section: 'servers', options: ['fallback'] });
-      const cache = {
-        enabled: f.quick ? '1' : '0',
-        cache_optimistic: f.quick ? '1' : '0',
-        ...(f.quick ? { size: CACHE_BYTES, optimistic_max_age: `${f.keepHours}h` } : {}),
-      };
-      changes.push(
-        data.hasProxyCache
-          ? { op: 'set', config: 'dnsproxy', section: 'cache', values: cache }
-          : { op: 'add', config: 'dnsproxy', type: 'dnsproxy', name: 'cache', values: cache },
-      );
-    } else if (data.proxyEnabled) {
-      changes.push({ op: 'set', config: 'dnsproxy', section: 'global', values: { enabled: '0' } });
-    }
-  }
-
-  if (data.lanDhcp !== undefined) changes.push(...deviceDnsChanges(data.lanDhcp['.name'], data.lanDhcp, f.devices));
-
-  // one redirect per zone: the home network's and each guest network's; none
-  // while devices use another server, whose own lookups it would catch too
-  const wanted = f.intercept && !f.devices.own ? data.interceptZones : [];
-  for (const zone of wanted) {
-    const s = data.intercepts.find((x) => x.section === interceptSection(zone));
-    if (s === undefined) changes.push(addIntercept(zone));
-    else if (!s.enabled) changes.push({ op: 'set', config: 'firewall', section: s.section, values: { enabled: '1' } });
-  }
-  // turned off, or its guest network is gone
-  const keep = new Set(wanted.map(interceptSection));
-  for (const s of data.intercepts) if (!keep.has(s.section)) changes.push({ op: 'delete', config: 'firewall', section: s.section });
-
-  const kept = new Set(f.records.flatMap((r) => (r.section === undefined ? [] : [r.section])));
-  for (const r of data.form.records) if (r.section !== undefined && !kept.has(r.section)) changes.push({ op: 'delete', config: 'dhcp', section: r.section });
-  for (const r of f.records) {
-    changes.push(
-      r.section === undefined
-        ? { op: 'add', config: 'dhcp', type: 'domain', values: { name: r.name, ip: r.ip } }
-        : { op: 'set', config: 'dhcp', section: r.section, values: { name: r.name, ip: r.ip } },
-    );
-  }
-  return changes;
 }
 
 // ---- the servers section --------------------------------------------------
@@ -741,7 +532,7 @@ export function DnsPage(): ReactElement {
                         {filter !== undefined && <WarningBox title="They don’t filter the same">{filter}</WarningBox>}
                         {dnssec !== undefined && <WarningBox title="Doesn’t check DNSSEC">{dnssec}</WarningBox>}
                         {backupDnssec !== undefined && <WarningBox title="The second server doesn’t check DNSSEC">{backupDnssec}</WarningBox>}
-                        {sends.length > 0 && Object.keys(errors.form).every((k) => k === 'domain' || k.startsWith('own')) && (
+                        {sends.length > 0 && Object.keys(errors.form).every((k) => k === 'domain' || k === 'cacheSize' || k.startsWith('own')) && (
                           <p className="text-xs text-muted-foreground">
                             Sends to <span className="font-mono break-all text-foreground">{sends.join(', ')}</span>
                           </p>
@@ -751,52 +542,7 @@ export function DnsPage(): ReactElement {
                   </CardContent>
                 </Card>
 
-                {form.mode === 'encrypted' && (
-                  <Card className="xl:col-span-2">
-                    <CardHeading icon={ZapIcon} title="Speed" description="Answers from the router’s memory, so devices wait less." />
-                    <CardContent className="divide-y">
-                      <Field
-                        id="dns-quick"
-                        label="Instant answers"
-                        hint="The router remembers each answer for as long as the site allows, often only a few minutes. With this on, it keeps using an answer after that, straight away instead of making the device wait, and fetches a fresh one in the background. Rarely, a site that has just changed its address won't load on the first try; reloading fixes it."
-                      >
-                        <Switch
-                          id="dns-quick"
-                          checked={form.quick}
-                          onCheckedChange={(v) => {
-                            set('quick', v);
-                          }}
-                        />
-                      </Field>
-                      {form.quick && (
-                        <Field
-                          id="dns-keep"
-                          label="Use old answers for up to"
-                          hint="Sites your devices keep using are refreshed long before this. It's for ones they come back to later: after this long, the old answer is dropped and the next visit waits for a fresh one as usual."
-                        >
-                          <Select
-                            value={form.keepHours}
-                            onValueChange={(v) => {
-                              set('keepHours', v);
-                            }}
-                          >
-                            <SelectTrigger id="dns-keep">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {KEEP_HOURS.map((h) => (
-                                <SelectItem key={h} value={h}>
-                                  {h === '1' ? '1 hour' : h === '24' ? '1 day' : h === '48' ? '2 days' : `${h} hours`}
-                                  {h === DEFAULT_KEEP_HOURS ? ' (default)' : ''}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </Field>
-                      )}
-                    </CardContent>
-                  </Card>
-                )}
+                <CacheCard form={form} set={set} sizeError={errors.form.cacheSize} />
 
                 <Card className="xl:col-span-2">
                   <CardHeading

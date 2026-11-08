@@ -25,6 +25,7 @@ import { getHostHints, getLeases, getNeighbors, hintName, inSubnet, ipToInt, isR
 import { type Change, getConfig, list, type Section, str } from '@/lib/api/uci';
 import { bandOf, getAccessPoints } from '@/lib/api/wireless';
 import { formatBitrate, formatDuration } from '@/lib/format';
+import { editChanges, reservedIp } from './model';
 
 interface Device {
   mac: string;
@@ -125,10 +126,10 @@ function EditDialog({
   onSave: (changes: Change[]) => void;
 }): ReactElement {
   const [name, setName] = useState(device.name ?? '');
-  const [reserve, setReserve] = useState(device.reservation !== undefined);
+  const [reserve, setReserve] = useState(reservedIp(device.reservation) !== undefined);
   const [ip, setIp] = useState(device.ip ?? '');
 
-  const takenBy = data.devices.find((d) => d.mac !== device.mac && d.reservation !== undefined && d.ip === ip);
+  const takenBy = data.devices.find((d) => d.mac !== device.mac && reservedIp(d.reservation) === ip);
   const ipError = !reserve
     ? undefined
     : !inSubnet(ip, data.routerIp, data.prefix)
@@ -141,24 +142,7 @@ function EditDialog({
   const nameError = name !== '' && !/^[A-Za-z0-9-]{1,63}$/.test(name) ? 'Letters, digits and hyphens only (it becomes the device’s local name).' : undefined;
 
   const save = (): void => {
-    const section = device.reservation?.['.name'];
-    if (!reserve && name === '') {
-      onSave(section === undefined ? [] : [{ op: 'delete', config: 'dhcp', section }]);
-    } else if (section === undefined) {
-      onSave([
-        {
-          op: 'add',
-          config: 'dhcp',
-          type: 'host',
-          values: { mac: device.mac, dns: '1', ...(name === '' ? {} : { name }), ...(reserve ? { ip } : {}) },
-        },
-      ]);
-    } else {
-      const changes: Change[] = [{ op: 'set', config: 'dhcp', section, values: { ...(name === '' ? {} : { name }), ...(reserve ? { ip } : {}) } }];
-      const unset = [...(name === '' ? ['name'] : []), ...(reserve ? [] : ['ip'])];
-      if (unset.length > 0) changes.push({ op: 'unset', config: 'dhcp', section, options: unset });
-      onSave(changes);
-    }
+    onSave(editChanges(device.reservation?.['.name'], device.mac, name, reserve, ip));
   };
 
   return (
@@ -299,7 +283,7 @@ export function ClientsPage(): ReactElement {
                           <div className="min-w-0">
                             <div className="flex items-center gap-2 font-medium">
                               {d.name ?? 'Unnamed device'}
-                              {d.reservation !== undefined && str(d.reservation, 'ip') !== undefined && (
+                              {reservedIp(d.reservation) !== undefined && (
                                 <Badge variant="secondary" className="gap-1 font-normal">
                                   <PinIcon /> reserved
                                 </Badge>

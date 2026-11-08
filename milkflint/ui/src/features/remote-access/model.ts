@@ -179,7 +179,7 @@ export function reachOf(wan: Wan): Reach {
   const ip = wan.ipv4 === undefined ? undefined : ipToInt(wan.ipv4);
   if (ip === undefined) return 'none';
   if (isPrivate(ip)) return 'private';
-  if (Math.floor(ip / 2 ** 22) === (100 * 256 + 64) / 4) return 'shared';
+  if (Math.floor(ip / 2 ** 22) === (100 * 256 + 64) / 64) return 'shared';
   return 'public';
 }
 

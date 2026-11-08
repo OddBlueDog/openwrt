@@ -282,6 +282,66 @@ export function getSpatialReuse(device: string): Promise<SpatialReuse> {
   return call('milkflint.wifi', 'spatial_reuse', { device }, spatialReuse);
 }
 
+const twtStatus = z.object({
+  /** an access point of this radio is up */
+  running: z.boolean(),
+  /** and offers TWT: Wi-Fi 6 and he_twt_responder not off */
+  offered: z.boolean(),
+  /** the driver has limits and agreements to show */
+  supported: z.boolean(),
+  policy: z
+    .object({
+      min_interval_ms: z.number(),
+      max_interval_ms: z.number(),
+      min_wake_dur: z.number(),
+      max_flows: z.number(),
+      max_sta_flows: z.number(),
+      trigger: z.string(),
+    })
+    .nullable(),
+  /** requests since the radio started */
+  counters: z
+    .object({
+      accepted: z.number(),
+      repeated: z.number(),
+      replaced: z.number(),
+      alternate: z.number(),
+      dictate: z.number(),
+      rejected: z.number(),
+      teardown_rx: z.number(),
+      teardown_tx: z.number(),
+      lost: z.number(),
+    })
+    .nullable(),
+  agreements: z.array(
+    z.object({
+      sta: z.string(),
+      id: z.number(),
+      interval_us: z.number(),
+      wake_us: z.number(),
+      trigger: z.number(),
+      announced: z.number(),
+      protection: z.number(),
+      tsf: z.number(),
+      age_s: z.number(),
+    }),
+  ),
+  /** connected devices whose capabilities say they can ask */
+  capable: z.array(z.string()),
+  stations: z.number(),
+});
+export type TwtStatus = z.output<typeof twtStatus>;
+
+/** Target Wake Time on a radio now; by interface or phy. */
+export function getTwt(device: string): Promise<TwtStatus> {
+  return call('milkflint.wifi', 'twt', { device }, twtStatus);
+}
+
+/** Ends a device's agreement and tells it. */
+export function endTwt(device: string, mac: string, flow: string): Promise<unknown> {
+  return call('milkflint.wifi', 'twt_end', { device, mac, flow }, z.object({ ok: z.literal(true) }));
+}
+
 /** The beamforming a radio's access points run with (hostapd's config for it); by interface or phy. */
 export function getBeamforming(device: string): Promise<Beamforming> {
   return call('milkflint.wifi', 'beamforming', { device }, beamforming);

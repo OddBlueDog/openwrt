@@ -1,8 +1,8 @@
 // Encrypted DNS with a main server and, optionally, a backup from another
 // provider: what dnsproxy gets (its upstreams, fallback, bootstrap and mode)
 // and what to warn about when the two don't filter the same sites or one
-// doesn't check DNSSEC; and how long instant answers (dnsproxy's optimistic
-// cache) keep old answers.
+// doesn't check DNSSEC; and how long expired answers are reused (dnsproxy's optimistic
+// cache).
 // No imports from the app, so the tests (ui/tests) load it as it is.
 
 import { type Block, blockLabels, type DnsServer, type Proto, protoLabels, protoOf, type ProviderId, providers, urlFor } from './providers.ts';
@@ -211,7 +211,7 @@ export function backupDnssecWarning(backup: ServerPick, use: BackupUse): string 
     : `${serverLabel(backup)} doesn’t check DNSSEC: while the main server isn’t answering, a forged answer wouldn’t be caught.`;
 }
 
-/** How long instant answers may give out an answer after it expires, in hours: the choices, and dnsproxy's default. */
+/** How long an answer may still be given out after it expires, in hours: the choices, and dnsproxy's default. */
 export const KEEP_HOURS = ['1', '6', '12', '24', '48'] as const;
 export const DEFAULT_KEEP_HOURS = '12';
 
@@ -222,4 +222,10 @@ export function keepHoursOf(duration: string | undefined): string {
   const n = Number(m[1]);
   const hours = m[2] === 'h' ? n : n % 60 === 0 ? n / 60 : 0;
   return hours > 0 ? String(hours) : DEFAULT_KEEP_HOURS;
+}
+
+/** dnsmasq's use_stale_cache (seconds) in the same whole hours; the default for anything else, such as 0, which LuCI could set for "for ever". */
+export function staleHoursOf(seconds: string | undefined): string {
+  const hours = Number(seconds) / 3600;
+  return keepHoursOf(Number.isInteger(hours) ? `${String(hours)}h` : undefined);
 }

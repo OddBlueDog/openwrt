@@ -282,3 +282,59 @@ test('wifi-spr: a driver without the file is left alone', () => {
   run('wifi-spr', { 'milkflint.wifi.spr_5g': 'off' }, ['phy1'], wifiBin);
   assert.throws(() => readFileSync(join(root, 'ieee80211', 'phy1', 'mt76', 'spatial_reuse')));
 });
+
+function twtFile(phy: string): string {
+  const dir = join(root, 'ieee80211', phy, 'mt76');
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'twt_policy');
+}
+
+function twt(settings: Record<string, string>, phy = 'phy1'): string[] {
+  rmSync(twtFile(phy), { force: true });
+  writeFileSync(twtFile(phy), '');
+  run('wifi-twt', settings, [phy], wifiBin);
+  return readFileSync(twtFile(phy), 'utf8').trim().split('\n');
+}
+
+const TWT_DEFAULTS = ['min_interval_ms 0', 'max_interval_ms 60000', 'min_interval_ms 0', 'min_wake_dur 64', 'max_flows 16', 'max_sta_flows 8', 'trigger allow'];
+
+test('wifi-twt: nothing set writes the driver’s defaults, so that clearing a setting takes', () => {
+  assert.deepEqual(twt({}), TWT_DEFAULTS);
+});
+
+test('wifi-twt: the radio’s band’s settings, the shortest cleared first as the driver checks it against the longest', () => {
+  assert.deepEqual(
+    twt({
+      'milkflint.wifi.twt_5g_max_interval': '5000',
+      'milkflint.wifi.twt_5g_min_interval': '100',
+      'milkflint.wifi.twt_5g_min_wake': '128',
+      'milkflint.wifi.twt_5g_flows': '4',
+      'milkflint.wifi.twt_5g_sta_flows': '2',
+      'milkflint.wifi.twt_5g_trigger': 'never',
+      'milkflint.wifi.twt_2g_max_interval': '100',
+    }),
+    ['min_interval_ms 0', 'max_interval_ms 5000', 'min_interval_ms 100', 'min_wake_dur 128', 'max_flows 4', 'max_sta_flows 2', 'trigger never'],
+  );
+  assert.equal(twt({ 'milkflint.wifi.twt_2g_max_interval': '100' }, 'phy0')[1], 'max_interval_ms 100');
+});
+
+test('wifi-twt: what the driver couldn’t take isn’t written', () => {
+  assert.deepEqual(
+    twt({
+      'milkflint.wifi.twt_5g_max_interval': '1; reboot',
+      'milkflint.wifi.twt_5g_min_interval': '99999999999',
+      'milkflint.wifi.twt_5g_min_wake': '256',
+      'milkflint.wifi.twt_5g_flows': '17',
+      'milkflint.wifi.twt_5g_sta_flows': '9',
+      'milkflint.wifi.twt_5g_trigger': 'sometimes; reboot',
+    }),
+    TWT_DEFAULTS,
+  );
+});
+
+test('wifi-twt: a driver without the file is left alone', () => {
+  rmSync(join(root, 'ieee80211', 'phy1'), { recursive: true, force: true });
+  mkdirSync(join(root, 'ieee80211', 'phy1'));
+  run('wifi-twt', { 'milkflint.wifi.twt_5g_flows': '4' }, ['phy1'], wifiBin);
+  assert.throws(() => readFileSync(join(root, 'ieee80211', 'phy1', 'mt76', 'twt_policy')));
+});

@@ -21,6 +21,31 @@ import { isGuestIface } from '../wifi-guest/guest';
 import { BeamformingCard } from './beamforming';
 import { qosMapChoice, qosMapHint, qosMapValue } from './qos-map';
 import {
+  TWT_FLOWS,
+  TWT_MIN_WAKES,
+  TWT_PRESET_LABELS,
+  TWT_PRESETS,
+  TWT_STA_FLOWS,
+  TWT_TRIGGER_LABELS,
+  type TwtPreset,
+  type TwtSetting,
+  type TwtTrigger,
+  twtChoices,
+  twtDriverOptions,
+  twtIntervalLabel,
+  twtMaxChoices,
+  twtMinChoices,
+  twtOf,
+  twtOption,
+  twtPresetHint,
+  twtRadioOptions,
+  twtRestarts,
+  twtTriggerHint,
+  twtWakeLabel,
+  twtWithPreset,
+} from './twt';
+import { TwtCard } from './twt-card';
+import {
   SPR_MODE_LABELS,
   SPR_THRESHOLDS,
   type SprMode,
@@ -47,6 +72,7 @@ import {
   getFrequencies,
   getRadar,
   getSpatialReuse,
+  getTwt,
   getRegulatedCountries,
   getRegulatory,
   getTxPowers,
@@ -212,6 +238,10 @@ interface RadioForm {
   spr: SprSetting;
   /** qos_map_set as set; '' is the image's default */
   qosMap: string;
+  /** Target Wake Time: whether the radio offers it, and the limits of what it agrees to */
+  twt: TwtSetting;
+  /** multicast_to_unicast: mac80211 sends multicast to each device on its own */
+  multicastToUnicast: boolean;
 }
 
 interface RadioOptions {
@@ -224,6 +254,8 @@ interface RadioOptions {
   cacMs: Record<number, number>;
   /** Spatial reuse on the radio now */
   spr: SpatialReuse | undefined;
+  /** The Wi-Fi driver has TWT limits (only a radio's own switch otherwise) */
+  twtLimits: boolean;
 }
 
 interface WifiData {
@@ -333,6 +365,12 @@ function radarCheckSeconds(f: RadioForm, o: RadioOptions | undefined): number {
   return needs.length === 0 ? 0 : Math.max(...needs.map(cac));
 }
 
+/** Whether saving this restarts the radio: everything does but TWT's limits, which go to the driver at once. */
+function restartsRadio(f: RadioForm, before: RadioForm | undefined): boolean {
+  const config = (r: RadioForm | undefined): string => JSON.stringify(r === undefined ? r : { ...r, twt: r.twt.on });
+  return config(f) !== config(before);
+}
+
 function bandLabel(band: string): string {
   return band === '2g' ? '2.4 GHz' : band === '5g' ? '5 GHz' : band === '6g' ? '6 GHz' : band;
 }
@@ -386,6 +424,8 @@ async function loadWifi(): Promise<WifiData> {
         str(wifiSection, sprOption(str(r, 'band') ?? '2g')),
       ),
       qosMap: str(iface, 'qos_map_set') ?? '',
+      twt: twtOf(str(r, 'he_twt_responder'), (name) => str(wifiSection, twtOption(str(r, 'band') ?? '2g', name))),
+      multicastToUnicast: bool(iface, 'multicast_to_unicast'),
     };
   });
 
@@ -396,15 +436,16 @@ async function loadWifi(): Promise<WifiData> {
       // a Wi-Fi interface, or the radio's phy while its network is off (a fresh install)
       const device = status[f.radio]?.interfaces?.find((i) => i.ifname !== undefined)?.ifname ?? status[f.radio]?.iwinfo?.phy;
       if (device === undefined) {
-        options[f.radio] = { channels: [], txpowers: [], htmodes, dfs: [], cacMs: {}, spr: undefined };
+        options[f.radio] = { channels: [], txpowers: [], htmodes, dfs: [], cacMs: {}, spr: undefined, twtLimits: false };
         return;
       }
-      const [channels, txpowers, dfs, radar, spr] = await Promise.all([
+      const [channels, txpowers, dfs, radar, spr, twt] = await Promise.all([
         getFrequencies(device).catch(() => []),
         getTxPowers(device).catch(() => []),
         getDfsFrequencies(device).catch((): number[] => []),
         f.band === '5g' ? getRadar(device).catch(() => undefined) : undefined,
         getSpatialReuse(device).catch(() => undefined),
+        getTwt(device).catch(() => undefined),
       ]);
       options[f.radio] = {
         // all of them: which may be used goes by the country's rules (see usable)
@@ -414,6 +455,7 @@ async function loadWifi(): Promise<WifiData> {
         dfs,
         cacMs: Object.fromEntries((radar?.channels ?? []).flatMap((c) => (c.cac_ms === undefined ? [] : [[c.mhz, c.cac_ms]]))),
         spr,
+        twtLimits: twt?.supported === true,
       };
     }),
   );
@@ -498,6 +540,13 @@ function changesFor(f: RadioForm, before: RadioForm): Change[] {
     if (Object.keys(values).length > 0) changes.push({ op: 'set', config: 'wireless', section: f.radio, values });
     if (unset.length > 0) changes.push({ op: 'unset', config: 'wireless', section: f.radio, options: unset });
   }
+  if (twtRestarts(f.twt, before.twt)) {
+    changes.push(
+      twtRadioOptions(f.twt).he_twt_responder === undefined
+        ? { op: 'unset', config: 'wireless', section: f.radio, options: ['he_twt_responder'] }
+        : { op: 'set', config: 'wireless', section: f.radio, values: { he_twt_responder: '0' } },
+    );
+  }
   if (f.iface !== undefined) {
     changes.push({
       op: 'set',
@@ -513,6 +562,13 @@ function changesFor(f: RadioForm, before: RadioForm): Change[] {
     });
     if (f.encryption === 'none' && before.key !== '') {
       changes.push({ op: 'unset', config: 'wireless', section: f.iface, options: ['key'] });
+    }
+    if (f.multicastToUnicast !== before.multicastToUnicast) {
+      changes.push(
+        f.multicastToUnicast
+          ? { op: 'set', config: 'wireless', section: f.iface, values: { multicast_to_unicast: '1' } }
+          : { op: 'unset', config: 'wireless', section: f.iface, options: ['multicast_to_unicast'] },
+      );
     }
     if (f.qosMap !== before.qosMap) {
       changes.push(
@@ -1013,7 +1069,178 @@ function RadioCard({
                     </Select>
                   </Field>
                 )}
+                <Field
+                  id={id('twt')}
+                  label="Target Wake Time"
+                  hint="Lets Wi-Fi 6 devices that ask agree a schedule and sleep between wake times, saving battery. Turning it off or on restarts this band’s network."
+                >
+                  <Switch
+                    id={id('twt')}
+                    checked={form.twt.on}
+                    onCheckedChange={(v) => {
+                      set('twt', { ...form.twt, on: v });
+                    }}
+                  />
+                </Field>
+                {form.twt.on && options?.twtLimits === true && (
+                  <Field id={id('twtPreset')} label="Sleep schedules" hint={twtPresetHint(form.twt.preset)}>
+                    <Select
+                      value={form.twt.preset}
+                      onValueChange={(v) => {
+                        set('twt', twtWithPreset(form.twt, v as TwtPreset | 'custom'));
+                      }}
+                    >
+                      <SelectTrigger id={id('twtPreset')}>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {[...(Object.keys(TWT_PRESETS) as TwtPreset[]), 'custom' as const].map((p) => (
+                          <SelectItem key={p} value={p}>
+                            {TWT_PRESET_LABELS[p]}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                )}
+                {form.twt.on && options?.twtLimits === true && form.twt.preset === 'custom' && (
+                  <>
+                    <Field
+                      id={id('twtMax')}
+                      label="Longest sleep"
+                      hint="A device asking for longer is offered this. Anything sent to a device waits up to this long, and one that sleeps for minutes can be dropped for not answering."
+                    >
+                      <Select
+                        value={String(form.twt.maxIntervalMs)}
+                        onValueChange={(v) => {
+                          set('twt', { ...form.twt, maxIntervalMs: Number(v) });
+                        }}
+                      >
+                        <SelectTrigger id={id('twtMax')}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {twtMaxChoices(form.twt).map((ms) => (
+                            <SelectItem key={ms} value={String(ms)}>
+                              {twtIntervalLabel(ms)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                    <Field id={id('twtMin')} label="Shortest sleep" hint="A device asking for less is offered this. Keeps very frequent wake-ups off the air.">
+                      <Select
+                        value={String(form.twt.minIntervalMs)}
+                        onValueChange={(v) => {
+                          set('twt', { ...form.twt, minIntervalMs: Number(v) });
+                        }}
+                      >
+                        <SelectTrigger id={id('twtMin')}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {twtMinChoices(form.twt).map((ms) => (
+                            <SelectItem key={ms} value={String(ms)}>
+                              {twtIntervalLabel(ms)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                    <Field id={id('twtWake')} label="Least time awake" hint="How long a device has to stay awake at each wake time. The radio can’t do less than the shortest here.">
+                      <Select
+                        value={String(form.twt.minWake)}
+                        onValueChange={(v) => {
+                          set('twt', { ...form.twt, minWake: Number(v) });
+                        }}
+                      >
+                        <SelectTrigger id={id('twtWake')}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {twtChoices(TWT_MIN_WAKES, form.twt.minWake).map((u) => (
+                            <SelectItem key={u} value={String(u)}>
+                              {twtWakeLabel(u)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                    <Field id={id('twtFlows')} label="Schedules on this band" hint="More than this are turned down.">
+                      <Select
+                        value={String(form.twt.flows)}
+                        onValueChange={(v) => {
+                          set('twt', { ...form.twt, flows: Number(v) });
+                        }}
+                      >
+                        <SelectTrigger id={id('twtFlows')}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {twtChoices(TWT_FLOWS, form.twt.flows).map((n) => (
+                            <SelectItem key={n} value={String(n)}>
+                              {String(n)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                    <Field id={id('twtStaFlows')} label="Schedules per device" hint="More than this are turned down.">
+                      <Select
+                        value={String(form.twt.staFlows)}
+                        onValueChange={(v) => {
+                          set('twt', { ...form.twt, staFlows: Number(v) });
+                        }}
+                      >
+                        <SelectTrigger id={id('twtStaFlows')}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {twtChoices(TWT_STA_FLOWS, form.twt.staFlows).map((n) => (
+                            <SelectItem key={n} value={String(n)}>
+                              {String(n)}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                    <Field id={id('twtTrigger')} label="Trigger-enabled schedules" hint={twtTriggerHint(form.twt.trigger)}>
+                      <Select
+                        value={form.twt.trigger}
+                        onValueChange={(v) => {
+                          set('twt', { ...form.twt, trigger: v as TwtTrigger });
+                        }}
+                      >
+                        <SelectTrigger id={id('twtTrigger')}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {(Object.keys(TWT_TRIGGER_LABELS) as TwtTrigger[]).map((t) => (
+                            <SelectItem key={t} value={t}>
+                              {TWT_TRIGGER_LABELS[t]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                  </>
+                )}
               </>
+            )}
+            {form.iface !== undefined && (
+              <Field
+                id={id('multicast')}
+                label="Send multicast to each device"
+                hint="Sends group traffic as a copy to each device, at its own speed, instead of one slow copy for all. Much less air for multicast video; for the small announcements most homes have, a little more, and it wakes sleeping devices more often."
+              >
+                <Switch
+                  id={id('multicast')}
+                  checked={form.multicastToUnicast}
+                  onCheckedChange={(v) => {
+                    set('multicastToUnicast', v);
+                  }}
+                />
+              </Field>
             )}
             {form.iface !== undefined && (
               <Field id={id('qosMap')} label="Priority of marked traffic" hint={qosMapHint(qosMapChoice(form.qosMap))}>
@@ -1099,7 +1326,7 @@ export function WifiPage(): ReactElement {
         'milkflint',
         data.milkflint,
         'wifi',
-        Object.fromEntries(forms.map((f) => [sprOption(f.band), sprDriverMode(f.spr)])),
+        Object.fromEntries(forms.flatMap((f) => [[sprOption(f.band), sprDriverMode(f.spr)], ...Object.entries(twtDriverOptions(f.band, f.twt))])),
       ),
     );
     if (countryDirty && country !== '') {
@@ -1109,7 +1336,7 @@ export function WifiPage(): ReactElement {
     // say so, as devices on it are gone for that long.
     const radarS = Math.max(
       0,
-      ...forms.map((f, i) => (countryDirty || JSON.stringify(f) !== JSON.stringify(data.forms[i]) ? radarCheckSeconds(f, data.options[f.radio]) : 0)),
+      ...forms.map((f, i) => (countryDirty || restartsRadio(f, data.forms[i]) ? radarCheckSeconds(f, data.options[f.radio]) : 0)),
     );
     void apply(
       changes,
@@ -1169,6 +1396,7 @@ export function WifiPage(): ReactElement {
             ))}
             <RadarCard className="2xl:col-span-2" />
             <BeamformingCard className="2xl:col-span-2" />
+            <TwtCard className="2xl:col-span-2" />
           </div>
         )}
       </div>
