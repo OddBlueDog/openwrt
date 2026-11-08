@@ -1,0 +1,25 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 16:00:00 +0000
+Subject: [PATCH] Blacklist the remaining emSign roots
+
+Mozilla's root list no longer has "emSign Root CA - C1" and
+"emSign ECC Root CA - C3". It limits "emSign Root CA - G1" to TLS
+certificates issued up to a date, which a PEM bundle can't express.
+---
+ mozilla/blacklist.txt | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/mozilla/blacklist.txt
++++ b/mozilla/blacklist.txt
+@@ -7,5 +7,11 @@
+ "emSign ECC Root CA - G3"
+ # Blacklist "Comodo AAA Services root" (cf. #1151413)
+ "Comodo AAA Services root"
++# Blacklist the roots that Mozilla's list no longer has
++"emSign Root CA - C1"
++"emSign ECC Root CA - C3"
++# Mozilla and Chrome limit this one to certificates issued up to a date,
++# which a PEM bundle can't express
++"emSign Root CA - G1"
+ 
+ # Expired CAs
