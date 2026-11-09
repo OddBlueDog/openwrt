@@ -1,0 +1,103 @@
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 9 Nov 2026 21:30:00 +0000
+Subject: [PATCH] net/sched: sch_cake: a flow that ignores CE marks loses its GSO packets too
+
+760-14 drops the ECT(0) packets of a flow that ignores CAKE's marks, but
+not a GSO packet of more than COBALT_ECN_MAX_SEGS (4) segments: that one
+was still marked. A CAKE that takes GRO packets whole (no-split-gso) gets
+its fastest flows in the largest GRO packets. Such a flow was marked for
+ever and never slowed down, while a flow without ECN in the same state had
+the same packets dropped. Switching the flow to drops also restarts its
+count at ecn_fail_count, so it was then marked less often than before.
+
+Drop them whole, whatever their size, as for a flow without ECN.
+
+KUnit: a flow that arrives in GSO packets is marked until it has shown
+that it ignores the marks, then dropped, at 44, 12 and 2 segments alike.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -483,16 +483,15 @@ static void cobalt_vars_init(struct cobalt_vars *vars)
+  * then and left the queue, ECN or not. A sender that ignores them grows its
+  * queue all that while, and again on each new connection: at a count of 256,
+  * for three seconds. ECT(1) (L4S) is dropped this way only under the L4S
+- * ramp below, and from a longer queue; a GSO batch of more than
+- * COBALT_ECN_MAX_SEGS packets never is (it is marked). 0: always mark, as
+- * upstream.
++ * ramp below, and from a longer queue. A GSO packet is dropped whole,
++ * whatever its size, as one from a flow without ECN is: the fastest flows
++ * arrive in the largest GRO packets. 0: always mark, as upstream.
+  */
+ static unsigned int ecn_fail_count __read_mostly = 8;
+ module_param(ecn_fail_count, uint, 0644);
+ MODULE_PARM_DESC(ecn_fail_count, "COBALT count at which a flow that ignores ECN marks is dropped instead (0: always mark)");
+ 
+ #define COBALT_ECN_STRIKES	8
+-#define COBALT_ECN_MAX_SEGS	4
+ 
+ /* L4S senders (ECT(1)) cut their rate a little for each CE mark, in proportion
+  * to the share of their packets marked. COBALT's marks come only after a whole
+@@ -707,8 +706,7 @@ static bool cobalt_should_drop(struct cobalt_vars *var
+ 			}
+ 		}
+ 
+-		if (vars->ecn_ignored && ect &&
+-		    skb_shinfo(skb)->gso_segs <= COBALT_ECN_MAX_SEGS) {
++		if (vars->ecn_ignored && ect) {
+ 			/* the flow ignores marks: drop, as without ECN */
+ 			vars->ecn_marked = false;
+ 			drop = true;
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -2334,24 +2334,31 @@ static void cake_test_ecn_off(struct kunit *test)
+ 	WRITE_ONCE(ecn_fail_count, fail);
+ }
+ 
+-/* A GSO batch of more than COBALT_ECN_MAX_SEGS packets is marked, not
+- * dropped whole, even in a flow that ignores marks
++/* A flow that arrives in GSO packets is marked like any other until it has
++ * shown it ignores the marks, and from then on its packets are dropped
++ * whole, the largest GRO packet as a small one: as a flow without ECN
+  */
+-static void cake_test_ecn_gso_marked(struct kunit *test)
++static void cake_test_ecn_gso_dropped(struct kunit *test)
+ {
+ 	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
+ 	struct cake_test_ecn e;
+ 	u32 fail = READ_ONCE(ecn_fail_count);
+ 
+ 	cake_test_ecn_init(&e);
+-	cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, fail + COBALT_ECN_STRIKES);
+-	KUNIT_ASSERT_TRUE(test, e.v.ecn_ignored);
+-	skb_shinfo(skb)->gso_segs = COBALT_ECN_MAX_SEGS + 1;
+-	e.marks = 0;
+-	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 10), 0);
+-	KUNIT_EXPECT_EQ(test, e.marks, 10);
+-	skb_shinfo(skb)->gso_segs = COBALT_ECN_MAX_SEGS;
++	skb_shinfo(skb)->gso_segs = 44;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC,
++						fail + COBALT_ECN_STRIKES - 2), 0);
++	KUNIT_EXPECT_FALSE(test, e.v.ecn_ignored);
++	KUNIT_EXPECT_EQ(test, e.marks, fail + COBALT_ECN_STRIKES - 2);
++
++	e.marks = 0;
+ 	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 10), 10);
++	KUNIT_EXPECT_TRUE(test, e.v.ecn_ignored);
++	skb_shinfo(skb)->gso_segs = 12;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 10), 10);
++	skb_shinfo(skb)->gso_segs = 2;
++	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 10), 10);
++	KUNIT_EXPECT_EQ(test, e.marks, 0);
+ 	skb_shinfo(skb)->gso_segs = 0;
+ }
+ 
+@@ -2439,7 +2446,7 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_ecn_strikes_reset),
+ 	KUNIT_CASE(cake_test_ecn_not_ect_dropped),
+ 	KUNIT_CASE(cake_test_ecn_off),
+-	KUNIT_CASE(cake_test_ecn_gso_marked),
++	KUNIT_CASE(cake_test_ecn_gso_dropped),
+ 	KUNIT_CASE(cake_test_ecn_decays_back),
+ 	KUNIT_CASE(cake_test_mq_marks_its_queue),
+ 	KUNIT_CASE(cake_test_mq_count_back_from_idle),
