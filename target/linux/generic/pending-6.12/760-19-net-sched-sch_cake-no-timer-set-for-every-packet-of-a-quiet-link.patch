@@ -1,0 +1,351 @@
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 9 Nov 2026 21:40:00 +0000
+Subject: [PATCH] net/sched: sch_cake: no timer set for every packet of a quiet link
+
+A CAKE below its rate runs out of packets after almost every one, and set
+its watchdog each time, twice with cake_mq:
+
+- With the queue empty and a flow still decaying, cake_dequeue() set the
+  watchdog for a target later. Woken with nothing queued, cake_dequeue()
+  returns before it looks at a flow, so the wakeup did nothing: the flows'
+  state decays when the next packet comes, as before. It's gone.
+
+- cake_mq_drained() set the watchdog for when the sub-cake would count as
+  idle, to retire its bulk rotation then. That time moves with each packet,
+  so the timer was started again for each. It now has a timer of its own,
+  as the shaper's watchdog is set again for every packet held back. It's
+  set for up to as long again after the sub-cake would be idle, and left
+  alone while it still falls in that range: once in an idle time's worth
+  of traffic, and it goes off only when the packets have stopped. An idle
+  sub-cake's flows leave the host loads up to that much later.
+
+KUnit: the idle watchdog's range (left alone, set again when it would go
+off too soon or too late), and packets through cake_enqueue() and
+cake_dequeue() that leave an empty queue with decaying flows set no
+watchdog.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -299,6 +299,8 @@ struct cake_sched_data {
+ 	u32		mq_packets;
+ 	/* when the shaper last held packets back */
+ 	u64		mq_held_at;
++	/* wakes a sub-cake gone idle, to retire its rotation: cake_mq_drained() */
++	struct qdisc_watchdog mq_watchdog;
+ 
+ 	/* Cold, so last: plain cake's own config (cake_mq's sub-queues share
+ 	 * their parent's) and the 16 KB heap only used when the buffer limit
+@@ -2729,14 +2731,33 @@ static void cake_mq_retire_tin(struct cake_sched_data 
+ 			break;
+ 		cake_flow_emptied(q, b, flow, now);
+ 	}
++}
++
++/* cake_mq: look at a sub-cake out of packets again once it's idle, at some
++ * time from @idle_at to @idle after it. A sub-cake below its share runs out
++ * of packets after almost every one, and @idle_at moves with each: a timer
++ * already set in that range stays as it is. So it's set once in @idle of
++ * traffic, not for every packet, and goes off only when the packets have
++ * stopped. It's a timer of its own, as the shaper's watchdog is set again
++ * for every packet held back.
++ */
++static void cake_mq_watch_idle(struct cake_sched_data *q, u64 idle_at, u64 idle)
++{
++	struct hrtimer *timer = &q->mq_watchdog.timer;
++
++	if (hrtimer_is_queued(timer) &&
++	    (u64)hrtimer_get_expires_tv64(timer) - idle_at <= idle)
++		return;
++	qdisc_watchdog_schedule_ns(&q->mq_watchdog, idle_at + idle);
+ }
+ 
+ /* cake_mq: a sub-cake out of packets. A flow between bursts stays in the
+  * bulk rotation, as in one CAKE: a lone TCP flow empties its sub-cake
+  * often. Once it has sent nothing for a while (cake_mq_idle_after()), the
+  * sub-cake is idle and might not dequeue again for a long time: it retires
+- * its rotation then (the watchdog wakes it), so its flows leave the host
+- * loads the busy sub-cakes share out by.
++ * its rotation then, or up to as long again later (cake_mq_watch_idle()
++ * wakes it), so its flows leave the host loads the busy sub-cakes share out
++ * by.
+  *
+  * The new flows go at once, as the next dequeue would find each of them
+  * in one CAKE with other traffic queued: a sparse flow alone on its
+@@ -2746,7 +2767,8 @@ static void cake_mq_drained(struct cake_sched_data *q,
+  */
+ static void cake_mq_drained(struct cake_sched_data *q, ktime_t now)
+ {
+-	u64 idle_at = q->last_active + (q->mq_idle ?: CAKE_MQ_TAU);
++	u64 idle = q->mq_idle ?: CAKE_MQ_TAU;
++	u64 idle_at = q->last_active + idle;
+ 	bool bulk = false;
+ 	u16 tin;
+ 
+@@ -2763,7 +2785,7 @@ static void cake_mq_drained(struct cake_sched_data *q,
+ 	if (!bulk)
+ 		return;
+ 	if (ktime_to_ns(now) < idle_at) {
+-		qdisc_watchdog_schedule_ns(&q->watchdog, idle_at);
++		cake_mq_watch_idle(q, idle_at, idle);
+ 		return;
+ 	}
+ 	for (tin = 0; tin < q->tin_cnt; tin++)
+@@ -3032,21 +3054,11 @@ retry:
+ 		if (q->config->is_shared)
+ 			q->mq_held_at = ktime_to_ns(now);
+ 		cake_watchdog(q, cake_mq_wake_by(q, next, now));
+-	} else if (!sch->q.qlen) {
+-		int i;
+-
+-		for (i = 0; i < q->tin_cnt; i++) {
+-			if (q->tins[i].decaying_flow_count) {
+-				ktime_t next = \
+-					ktime_add_ns(now,
+-						     q->tins[i].cparams.target);
+-
+-				qdisc_watchdog_schedule_ns(&q->watchdog,
+-							   ktime_to_ns(next));
+-				break;
+-			}
+-		}
+ 	}
++	/* No watchdog for the decaying flows of a queue that's now empty:
++	 * woken with nothing queued, cake_dequeue() returns before it looks
++	 * at a flow. Their state decays when the next packet comes.
++	 */
+ 
+ 	if (q->overflow_timeout)
+ 		q->overflow_timeout--;
+@@ -3605,6 +3617,7 @@ static void cake_destroy(struct Qdisc *sch)
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+ 
+ 	qdisc_watchdog_cancel(&q->watchdog);
++	qdisc_watchdog_cancel(&q->mq_watchdog);
+ 	tcf_block_put(q->block);
+ 	kvfree(q->tins);
+ }
+@@ -3640,6 +3653,7 @@ static int cake_init(struct Qdisc *sch, struct nlattr 
+ 	qd->config = q;
+ 
+ 	qdisc_watchdog_init(&qd->watchdog, sch);
++	qdisc_watchdog_init(&qd->mq_watchdog, sch);
+ 
+ 	if (opt) {
+ 		err = cake_change(sch, opt, extack);
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1325,14 +1325,18 @@ static void cake_test_mq_retire_on_idle(struct kunit *
+ }
+ 
+ /* A sub-cake out of packets keeps its bulk rotation while it sent within
+- * CAKE_MQ_TAU, its watchdog set for when that runs out, and retires it then
++ * its idle time, its idle watchdog set for up to as long again after that
++ * runs out. While the packets keep coming, a watchdog that still falls in
++ * that range is left alone; one that would go off too soon or too late is
++ * set again. Idle, the sub-cake retires the rotation.
+  */
+ static void cake_test_mq_drained(struct kunit *test)
+ {
+ 	struct cake_test_mq *mq = cake_test_mq_alloc(test);
+ 	struct cake_sched_data *q = cake_test_mq_q(mq, 2);
++	struct hrtimer *timer = &q->mq_watchdog.timer;
+ 	/* the real clock: the watchdog is a real timer, cancelled before it fires */
+-	u64 now = ktime_get_ns() + NSEC_PER_SEC;
++	u64 now = ktime_get_ns() + NSEC_PER_SEC, ms = NSEC_PER_MSEC;
+ 	struct cake_tin_data *b;
+ 	int i;
+ 
+@@ -1347,26 +1351,50 @@ static void cake_test_mq_drained(struct kunit *test)
+ 	INIT_LIST_HEAD(&b->decaying_flows);
+ 	cake_mq_set_host_tables(q, mq->cfg->mq_hosts);
+ 	qdisc_watchdog_init(&q->watchdog, mq->sch[2]);
++	qdisc_watchdog_init(&q->mq_watchdog, mq->sch[2]);
+ 	for (i = 0; i < 3; i++)
+ 		cake_test_bulk_flow(test, b, CAKE_FLOW_TRIPLE, 5, 40000 + i);
+ 
+-	/* between bursts: kept, and the watchdog will look again */
+-	q->last_active = now - CAKE_MQ_TAU / 2;
+-	cake_mq_drained(q, now);
+-	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 3);
+-	KUNIT_EXPECT_TRUE(test, hrtimer_is_queued(&q->watchdog.timer));
+-	KUNIT_EXPECT_EQ(test, ktime_to_ns(hrtimer_get_softexpires(&q->watchdog.timer)),
+-			now + CAKE_MQ_TAU / 2);
+-	qdisc_watchdog_cancel(&q->watchdog);
++	/* between bursts: kept, and the idle watchdog will look again; the
++	 * shaper's is the shaper's
++	 */
++	q->mq_idle = 8 * ms;
++	q->last_active = now;
++	cake_mq_drained(q, now + ms);
++	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 3);
++	KUNIT_EXPECT_TRUE(test, hrtimer_is_queued(timer));
++	KUNIT_EXPECT_EQ(test, hrtimer_get_expires_tv64(timer), now + 16 * ms);
++	KUNIT_EXPECT_FALSE(test, hrtimer_is_queued(&q->watchdog.timer));
+ 
+-	/* idle for CAKE_MQ_TAU: retired */
+-	cake_mq_drained(q, now + CAKE_MQ_TAU / 2);
++	/* more packets, idle later: the watchdog still falls in time */
++	q->last_active = now + 4 * ms;
++	cake_mq_drained(q, now + 5 * ms);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_expires_tv64(timer), now + 16 * ms);
++	q->last_active = now + 8 * ms;
++	cake_mq_drained(q, now + 8 * ms);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_expires_tv64(timer), now + 16 * ms);
++
++	/* it would go off before the sub-cake is idle: set again */
++	q->last_active = now + 9 * ms;
++	cake_mq_drained(q, now + 9 * ms);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_expires_tv64(timer), now + 25 * ms);
++
++	/* faster packets, a shorter idle time: it would go off too late */
++	q->mq_idle = 2 * ms;
++	q->last_active = now + 10 * ms;
++	cake_mq_drained(q, now + 10 * ms);
++	KUNIT_EXPECT_EQ(test, hrtimer_get_expires_tv64(timer), now + 14 * ms);
++	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 3);
++	qdisc_watchdog_cancel(&q->mq_watchdog);
++
++	/* idle: retired */
++	cake_mq_drained(q, now + 12 * ms);
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&b->old_flows));
+ 	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 0);
+ 	KUNIT_EXPECT_EQ(test, b->mq_weight, 0);
+ 	for (i = 0; i < 2 * CAKE_QUEUES; i++)
+ 		KUNIT_ASSERT_EQ(test, atomic_read(&mq->cfg->mq_hosts[i]), 0);
+-	KUNIT_EXPECT_FALSE(test, hrtimer_is_queued(&q->watchdog.timer));
++	KUNIT_EXPECT_FALSE(test, hrtimer_is_queued(timer));
+ }
+ 
+ /* A packet from LAN host @host, port @sport, into tin @b as a new flow,
+@@ -1413,7 +1441,7 @@ static void cake_test_mq_drained_sparse(struct kunit *
+ 	INIT_LIST_HEAD(&b->old_flows);
+ 	INIT_LIST_HEAD(&b->decaying_flows);
+ 	cake_mq_set_host_tables(q, mq->cfg->mq_hosts);
+-	qdisc_watchdog_init(&q->watchdog, mq->sch[1]);
++	qdisc_watchdog_init(&q->mq_watchdog, mq->sch[1]);
+ 
+ 	bulk = cake_test_bulk_flow(test, b, CAKE_FLOW_DUAL_SRC, 5, 40000);
+ 	sparse = cake_test_sparse_flow(test, b, CAKE_FLOW_DUAL_SRC, 5, 41000, 100);
+@@ -1432,18 +1460,110 @@ static void cake_test_mq_drained_sparse(struct kunit *
+ 	/* the bulk flow stays, and its host counts it alone */
+ 	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 1);
+ 	KUNIT_EXPECT_EQ(test, cake_host_load(b, bulk, CAKE_FLOW_DUAL_SRC), 1);
+-	KUNIT_EXPECT_TRUE(test, hrtimer_is_queued(&q->watchdog.timer));
+-	qdisc_watchdog_cancel(&q->watchdog);
++	KUNIT_EXPECT_TRUE(test, hrtimer_is_queued(&q->mq_watchdog.timer));
++	qdisc_watchdog_cancel(&q->mq_watchdog);
+ 
+ 	/* nothing new: nothing changes */
+ 	cake_mq_drained(q, now);
+ 	KUNIT_EXPECT_EQ(test, b->bulk_flow_count, 1);
+ 	KUNIT_EXPECT_EQ(test, b->decaying_flow_count, 1);
+-	qdisc_watchdog_cancel(&q->watchdog);
++	qdisc_watchdog_cancel(&q->mq_watchdog);
+ 	for (i = 0; i < CAKE_QUEUES; i++)
+ 		KUNIT_ASSERT_LE(test, atomic_read(&mq->cfg->mq_hosts[i]), 1);
+ }
+ 
++static void cake_test_cancel_watchdogs(void *data)
++{
++	struct cake_sched_data *q = data;
++
++	qdisc_watchdog_cancel(&q->watchdog);
++	qdisc_watchdog_cancel(&q->mq_watchdog);
++}
++
++/* Sub-cake @i of @mq, ready for cake_enqueue() and cake_dequeue(): one
++ * tin, a queue per flow, no shaper, its watchdogs cancelled with the test
++ */
++static struct cake_sched_data *cake_test_mq_live(struct kunit *test,
++						 struct cake_test_mq *mq, int i)
++{
++	struct cake_sched_data *q = cake_test_mq_q(mq, i);
++	struct cake_tin_data *b;
++
++	mq->cfg->flow_mode = CAKE_FLOW_FLOWS;
++	mq->cfg->tin_mode = CAKE_DIFFSERV_BESTEFFORT;
++	q->tins = cake_test_alloc(test, CAKE_MAX_TINS * sizeof(*q->tins));
++	q->tin_cnt = 1;
++	q->buffer_limit = ~0;
++	b = &q->tins[0];
++	INIT_LIST_HEAD(&b->new_flows);
++	INIT_LIST_HEAD(&b->old_flows);
++	INIT_LIST_HEAD(&b->decaying_flows);
++	cake_set_rate(b, 0, 1514, 5 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
++	cake_set_bulk_quantum(mq->cfg, b, 0);
++	b->tin_quantum = 65535;
++	qdisc_watchdog_init(&q->watchdog, mq->sch[i]);
++	qdisc_watchdog_init(&q->mq_watchdog, mq->sch[i]);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_cancel_watchdogs, q));
++	return q;
++}
++
++/* @skb through @sch: in, and out again as the only packet queued. Called
++ * with bottom halves off, where a KUnit check can't report a failure: says
++ * whether it went through.
++ */
++static bool cake_test_through(struct Qdisc *sch, struct sk_buff *skb)
++{
++	struct sk_buff *to_free = NULL;
++
++	qdisc_skb_cb(skb)->pkt_len = skb->len;
++	return cake_enqueue(skb, sch, &to_free) == NET_XMIT_SUCCESS &&
++	       cake_dequeue(sch) == skb && !to_free && !sch->q.qlen;
++}
++
++/* A queue that runs empty sets no watchdog for its decaying flows: woken
++ * with nothing queued, cake_dequeue() returns before it looks at a flow, so
++ * the wakeup did nothing but cost a timer for every packet of a quiet link
++ */
++static void cake_test_empty_no_watchdog(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_mq_live(test, mq, 1);
++	struct sk_buff *one = cake_test_skb(test, false, IPPROTO_UDP, 5, 41000, 0);
++	struct sk_buff *two = cake_test_skb(test, false, IPPROTO_UDP, 6, 41000, 0);
++	struct cake_tin_data *b = &q->tins[0];
++	struct Qdisc *sch = mq->sch[1];
++	bool through[2], empty[2], shaper[2], idle;
++	u32 decaying[3];
++
++	/* as the stack calls a qdisc; the checks wait until it's over */
++	rcu_read_lock_bh();
++	through[0] = cake_test_through(sch, one);
++	/* out of packets: its flow waits with the decaying ones */
++	empty[0] = !cake_dequeue(sch);
++	decaying[0] = b->decaying_flow_count;
++	/* another flow's packet leaves the queue empty with that one decaying */
++	through[1] = cake_test_through(sch, two);
++	decaying[1] = b->decaying_flow_count;
++	shaper[0] = hrtimer_is_queued(&q->watchdog.timer);
++	empty[1] = !cake_dequeue(sch);
++	decaying[2] = b->decaying_flow_count;
++	shaper[1] = hrtimer_is_queued(&q->watchdog.timer);
++	idle = hrtimer_is_queued(&q->mq_watchdog.timer);
++	rcu_read_unlock_bh();
++
++	KUNIT_EXPECT_TRUE(test, through[0]);
++	KUNIT_EXPECT_TRUE(test, empty[0]);
++	KUNIT_EXPECT_EQ(test, decaying[0], 1);
++	KUNIT_EXPECT_TRUE(test, through[1]);
++	KUNIT_EXPECT_EQ(test, decaying[1], 1);
++	KUNIT_EXPECT_FALSE(test, shaper[0]);
++	KUNIT_EXPECT_TRUE(test, empty[1]);
++	KUNIT_EXPECT_EQ(test, decaying[2], 2);
++	KUNIT_EXPECT_FALSE(test, shaper[1]);
++	/* no bulk flow to retire: no idle watchdog either */
++	KUNIT_EXPECT_FALSE(test, idle);
++}
++
+ /* Any mix of flows going bulk and empty in four sub-cakes, hosts spread
+  * over them: the table always holds what they count, and each tin's
+  * weight is its flows'
+@@ -2469,6 +2589,7 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_mq_retire_on_idle),
+ 	KUNIT_CASE(cake_test_mq_drained),
+ 	KUNIT_CASE(cake_test_mq_drained_sparse),
++	KUNIT_CASE(cake_test_empty_no_watchdog),
+ 	KUNIT_CASE(cake_test_mq_host_table_matches),
+ 	{}
+ };
