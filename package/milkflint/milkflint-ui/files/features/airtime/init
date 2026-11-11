@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# MilkFlint airtime fairness (ui feature "airtime"): the service that gives
+# devices with a poor Wi-Fi link a smaller share of the air, per band from
+# milkflint.wifi.airtime_2g / _5g / _6g ("1" on). It reads the setting
+# itself every second, so a change needs no restart; with every band off it
+# sets nothing, and only measures while the Wi-Fi page is open.
+
+START=96
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/bin/ucode /usr/libexec/milkflint/airtime
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+}

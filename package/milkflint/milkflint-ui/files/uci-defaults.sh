@@ -161,6 +161,36 @@ if [ -z "$(uci -q get milkflint.defaults.synflood)" ]; then
 	UCI
 fi
 
+# Multi-queue CAKE goes with the download speed: from 500 Mbit/s, and one
+# CAKE below that. Each of cake_mq's queues holds its packets to its own
+# share of the speed, so a packet waits behind another for longer than in
+# one CAKE, the more the slower the line, and one CPU shapes a slower line
+# easily. The web interface keeps use_mq in step with the speed it saves,
+# unless it's chosen there (milkflint.cake.multi_queue). A queue with
+# cake_mq off was a choice and stays off; the web interface's queue is the
+# first. Not a guest network's or the VPN's shaper. Once, like cake_mq.
+if [ -z "$(uci -q get milkflint.defaults.cake_mq_auto)" ]; then
+	first=1
+	for queue in $(uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p"); do
+		case "$(uci -q get "sqm.$queue.interface")" in br-guest* | wg_out) continue ;; esac
+		if [ "$(uci -q get "sqm.$queue.use_mq")" != 1 ]; then
+			[ -z "$first" ] || uci -q batch <<-UCI
+				set milkflint.cake=cake
+				set milkflint.cake.multi_queue='0'
+			UCI
+		elif ! [ "$(uci -q get "sqm.$queue.download")" -ge 500000 ] 2> /dev/null; then
+			uci set "sqm.$queue.use_mq=0"
+		fi
+		first=
+	done
+	uci -q commit sqm
+	uci -q batch <<-UCI
+		set milkflint.defaults=defaults
+		set milkflint.defaults.cake_mq_auto='1'
+		commit milkflint
+	UCI
+fi
+
 # Download shaping of 500 Mbit/s and more uses CAKE's no-split-gso: CAKE
 # takes GRO packets whole instead of splitting each one (64 KB is ~1 ms at
 # 500 Mbit/s), which saves CPU at those speeds. The web interface keeps it in
@@ -201,6 +231,55 @@ if [ -z "$(uci -q get milkflint.defaults.wifi_be)" ]; then
 	uci -q batch <<-UCI
 		set milkflint.defaults=defaults
 		set milkflint.defaults.wifi_be='1'
+		commit milkflint
+	UCI
+fi
+
+# Wi-Fi 6: the router's radio can schedule a device's uplink, and a device
+# that was just scheduled has to hold back its own access to the air for a
+# while. The access point says how much and for how long (its MU EDCA
+# parameters), and OpenWrt's say: a backoff from up to 511 slots instead of
+# 15, for two seconds after each scheduled send. That costs nothing while
+# the router keeps scheduling the device. When the router is busy sending
+# (a slow device's long frames, say) it stops, and the device can hardly
+# get a turn by itself: its packets, a download's ACKs among them, stall
+# for a good part of a second. With the timer at its shortest (8 ms) a
+# device is back on its normal access almost at once. On every radio, for
+# each traffic class without a timer of its own; once, after the Wi-Fi
+# config exists, like wifi_dtim.
+if [ -z "$(uci -q get milkflint.defaults.wifi_mu_edca)" ]; then
+	found=
+	for radio in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)=wifi-device$/\1/p"); do
+		found=1
+		for ac in be bk vi vo; do
+			[ -n "$(uci -q get "wireless.$radio.he_mu_edca_ac_${ac}_timer")" ] && continue
+			uci set "wireless.$radio.he_mu_edca_ac_${ac}_timer=1"
+		done
+	done
+	if [ -n "$found" ]; then
+		uci -q commit wireless
+		uci -q batch <<-UCI
+			set milkflint.defaults=defaults
+			set milkflint.defaults.wifi_mu_edca='1'
+			commit milkflint
+		UCI
+	fi
+fi
+
+# Airtime fairness (features/airtime) on every band, once: a device with a
+# poor link gets a smaller share of the air while others want it, worked out
+# as it goes at the balanced strength (a share in proportion to its useful
+# rate). A band whose shares were already chosen keeps them; after this,
+# switching a band off or back to goals set by hand stays as chosen.
+if [ -z "$(uci -q get milkflint.defaults.airtime)" ]; then
+	uci -q get milkflint.wifi > /dev/null || uci set milkflint.wifi=wifi
+	for band in 2g 5g 6g; do
+		uci set "milkflint.wifi.airtime_$band=1"
+		[ -n "$(uci -q get "milkflint.wifi.airtime_${band}_auto")" ] || uci set "milkflint.wifi.airtime_${band}_auto=balanced"
+	done
+	uci -q batch <<-UCI
+		set milkflint.defaults=defaults
+		set milkflint.defaults.airtime='1'
 		commit milkflint
 	UCI
 fi

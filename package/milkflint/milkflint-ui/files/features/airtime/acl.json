@@ -1,0 +1,8 @@
+{
+	"milkflint-airtime": {
+		"description": "MilkFlint web interface: airtime fairness",
+		"read": {
+			"ubus": { "milkflint.airtime": [ "status" ] }
+		}
+	}
+}

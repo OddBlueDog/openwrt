@@ -1,0 +1,602 @@
+#!/usr/bin/ucode
+// MilkFlint's airtime fairness (ui feature "airtime"): once a second, looks
+// at every Wi-Fi device's link and sets how much of the air it may take
+// while others want it (airtime-policy.uc says how). What it sets is the
+// kernel's own:
+//   - the device's airtime weight (nl80211), which mac80211's airtime
+//     scheduler shares the air by;
+//   - for a weak or lost device, its AQL limits for best effort and
+//     background (debugfs), so that only a frame or two of it wait in the
+//     radio;
+//   - and, with a driver that has them (the MilkFlint mt76's per-device
+//     tx_tries and tx_pace files), how many times its frames are sent before
+//     they're given up on, and the part of the time its ordinary traffic may
+//     be sent for while a device that isn't paced has traffic waiting.
+// On per band, from milkflint.wifi.airtime_2g / _5g / _6g: "1" on, anything
+// else (unset too) off. The rates that part the classes and each class's
+// airtime goal can be set there per band too (airtime_<band>_full, _pace,
+// _weak, _goal_slow, _goal_weak, _goal_lost; airtime-policy.uc has the
+// defaults), and whether the shares are worked out as it goes instead of the
+// goals (airtime_<band>_auto: gentle, balanced or strict, where the driver
+// can pace); like the switch they are read every second. Off, a band's devices keep the kernel's defaults,
+// which is the router's own airtime fairness: an equal share of the air for
+// every busy device. Nothing is saved anywhere: a device that joins again
+// starts with a full share, and when a band is switched off or this stops,
+// every device it changed gets the defaults back.
+//
+// It also writes what it sees and does to /tmp/milkflint/airtime.json for
+// the web interface: per radio how busy the channel is and, per device, its
+// rate, its share of the air, its class, its weight and how much of the
+// second it was held back, with a minute of history. With every band off it only measures while someone is looking
+// (the rpcd plugin touches airtime.watch at each request), and how busy the
+// channel is it reads only then: that's for the page alone, and each reading
+// asks the radio.
+//
+//   airtime                the service (procd runs it)
+//   airtime once FILE      a test: the passes in FILE ({ bands: { "5g": true },
+//                          settings: { "airtime_5g_pace": "50" } (optional),
+//                          steps: [{ t, aps: [{ dev, phy, freq, iface, stations }] }] }),
+//                          nothing read from or set on the router, the last
+//                          state printed
+'use strict';
+
+import { readfile, writefile, rename, mkdir, open, stat } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+import * as uloop from 'uloop';
+import * as nl80211 from 'nl80211';
+import { decide, auto_pace, attempts_delta, band_of, settings_of, WEIGHT_FULL } from './airtime-policy.uc';
+
+const DEBUGFS = '/sys/kernel/debug/ieee80211';
+const STATE_DIR = '/tmp/milkflint';
+const STATE = STATE_DIR + '/airtime.json';
+const WATCH = STATE_DIR + '/airtime.watch';
+const HISTORY = 60;		// seconds of history kept for the page
+const WATCH_FOR = 20;	// seconds a look at the page keeps the measuring going
+
+// the ACs in the order mac80211's per-station aql file numbers them
+const ACS = [ 'VO', 'VI', 'BE', 'BK' ];
+// the ones the policy narrows: voice and video keep the radio's limits
+const NARROWED = [ 'BE', 'BK' ];
+
+let stations = {};	// "dev mac": { prev figures, policy state, what's applied }
+let radios = {};	// phy: { history, air: hostapd's channel time }
+
+// the bands the policy is on for: { '5g': true }. `s`: milkflint.wifi
+function bands_on(s) {
+	const out = {};
+	for (let b in [ '2g', '5g', '6g' ])
+		if (s[`airtime_${b}`] == '1')
+			out[b] = true;
+	return out;
+}
+
+// The access points hostapd runs: [{ dev, phy, freq, channel, ssid }]
+function access_points(conn) {
+	const out = [];
+	for (let obj in conn.list() ?? []) {
+		const dev = match(obj, /^hostapd\.(.+)$/)?.[1];
+		const phy = dev ? trim(readfile(`/sys/class/net/${dev}/phy80211/name`) ?? '') : '';
+		if (phy == '')
+			continue;
+		const st = conn.call(obj, 'get_status') ?? {};
+		push(out, { dev, phy, freq: st.freq ?? 0, channel: st.channel, ssid: st.ssid });
+	}
+	return out;
+}
+
+// phy -> its wifi-device section ("radio1"), from netifd
+function radio_names(conn) {
+	const out = {};
+	for (let name, r in conn.call('network.wireless', 'status') ?? {})
+		for (let i in r?.interfaces ?? []) {
+			const phy = i.ifname ? trim(readfile(`/sys/class/net/${i.ifname}/phy80211/name`) ?? '') : '';
+			if (phy != '')
+				out[phy] = name;
+		}
+	return out;
+}
+
+// The radio's counters for the channel it's on, in ms since it started:
+// { time, busy, tx, noise } (how long it has been there, how long the channel
+// was busy, how long the radio itself sent; tx null where the driver doesn't
+// say; and the noise it measures there, dBm), or null with a driver that
+// keeps none. hostapd's status has the
+// first two as well, but only reads them every few seconds, which is too
+// coarse beside the devices' figures: a download's last seconds showed as
+// somebody else's for a while after it.
+function survey_of(dev, freq) {
+	const res = nl80211.request(nl80211.const.NL80211_CMD_GET_SURVEY, nl80211.const.NLM_F_DUMP, { dev });
+	for (let r in (type(res) == 'array') ? res : []) {
+		const i = r.survey_info ?? {};
+		if (i.frequency == freq && i.time != null && i.busy != null)
+			return { time: i.time, busy: i.busy, tx: i.time_tx, noise: i.noise };
+	}
+	return null;
+}
+
+// nl80211's channel widths in MHz (enum nl80211_chan_width; the others are
+// narrower than a Wi-Fi network's)
+const WIDTH_MHZ = { '0': 20, '1': 20, '2': 40, '3': 80, '4': 80, '5': 160, '13': 320 };
+
+function channel_of(mhz) {
+	if (mhz == 2484)
+		return 14;
+	return int(((mhz < 2484) ? mhz - 2407 : (mhz < 5950) ? mhz - 5000 : mhz - 5950) / 5);
+}
+
+// The 20 MHz channels a radio's channel takes up, lowest first, and its
+// width in MHz: { width, channels }. `info`: what nl80211 says of one of its
+// interfaces ({ channel_width, center_freq1 }); `freq`: the primary channel's.
+function block_of(info, freq) {
+	const width = WIDTH_MHZ[`${info?.channel_width}`] ?? 20;
+	const center = (width > 20 && info?.center_freq1) ? info.center_freq1 : freq;
+	const channels = [];
+	for (let f = center - width / 2 + 10; f <= center + width / 2 - 10; f += 20)
+		push(channels, channel_of(f));
+	return { width, channels };
+}
+
+function iface_of(dev) {
+	const i = nl80211.request(nl80211.const.NL80211_CMD_GET_INTERFACE, 0, { dev });
+	return (type(i) == 'object') ? i : null;
+}
+
+// A rate as nl80211 gives it, in the shape iwinfo's station list has (which
+// the page's other lists read): { rate (kbit/s), mhz, mcs, nss } and which of
+// ht, vht, he, eht it is; null without one.
+function phy_of(r) {
+	const rate = (r?.bitrate32 ?? r?.bitrate ?? 0) * 100;
+	if (!rate)
+		return null;
+	const out = { rate, mhz: r.width_320 ? 320 : (r.width_160 || r.width_80p80) ? 160 : r.width_80 ? 80 : r.width_40 ? 40 : 20 };
+	if (r.eht_mcs != null) {
+		out.eht = true; out.mcs = r.eht_mcs; out.nss = r.eht_nss;
+	}
+	else if (r.he_mcs != null) {
+		out.he = true; out.mcs = r.he_mcs; out.nss = r.he_nss;
+	}
+	else if (r.vht_mcs != null) {
+		out.vht = true; out.mcs = r.vht_mcs; out.nss = r.vht_nss;
+	}
+	else if (r.mcs != null) {
+		// 802.11n numbers its rates 0-31: eight to a stream
+		out.ht = true; out.mcs = r.mcs; out.nss = int(r.mcs / 8) + 1;
+	}
+	return out;
+}
+
+function station_dump(dev) {
+	const res = nl80211.request(nl80211.const.NL80211_CMD_GET_STATION, nl80211.const.NLM_F_DUMP, { dev });
+	const mbit = (r) => (r?.bitrate32 ?? r?.bitrate ?? 0) / 10.0;
+	return map(type(res) == 'array' ? res : [], (r) => {
+		const i = r.sta_info ?? {};
+		return {
+			mac: lc(r.mac), signal: i.signal_avg ?? i.signal, rate: mbit(i.tx_bitrate), rx_rate: mbit(i.rx_bitrate),
+			tx_packets: i.tx_packets ?? 0, tx_retries: i.tx_retries ?? 0, tx_failed: i.tx_failed ?? 0,
+			tx_bytes: i.tx_bytes64 ?? i.tx_bytes ?? 0, rx_bytes: i.rx_bytes64 ?? i.rx_bytes ?? 0,
+			// its link, for the page: the two rates as nl80211 has them, each
+			// antenna's signal (dBm, averaged) and how long it's been connected (s)
+			tx_bitrate: i.tx_bitrate, rx_bitrate: i.rx_bitrate,
+			chains: i.chain_signal_avg ?? i.chain_signal, connected: i.connected_time,
+			// null: this driver doesn't share the air by weight (no airtime fairness)
+			air_tx: i.tx_duration ?? 0, air_rx: i.rx_duration ?? 0, weight: i.airtime_weight
+		};
+	});
+}
+
+// the driver's per-frame counters of a device (the MilkFlint mt76's
+// tx_attempts file), or null with another driver
+function attempts_of(phy, dev, mac) {
+	const s = readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/tx_attempts`);
+	if (!s)
+		return null;
+	const r = {};
+	for (let m in match(s, /([0-9a-z+-]+) ([0-9]+)/g))
+		r[m[1]] = int(m[2]);
+	return r;
+}
+
+// how long a device has dozed so far, in ms (the MilkFlint mt76's ps file:
+// the firmware's power-save reports), or null with another driver
+function dozed_of(phy, dev, mac) {
+	const m = match(readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/ps`) ?? '', /dozing_ms ([0-9]+)/);
+	return m ? int(m[1]) : null;
+}
+
+// whether a device has best effort or background traffic waiting in
+// mac80211's queues for it (the station's aqm file: a line a TID, its AC
+// and backlog-bytes, backlog-packets, ...; ACs 2 and 3 are those two)
+function backlog_of(phy, dev, mac) {
+	for (let m in match(readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/aqm`) ?? '', /\n[0-9]+ ([0-9]+) [0-9]+ ([0-9]+)/g))
+		if ((m[1] == '2' || m[1] == '3') && m[2] != '0')
+			return true;
+	return false;
+}
+
+// the radio's own AQL limits per AC: { BE: [low, high], ... }
+function aql_defaults(phy) {
+	const out = {};
+	for (let m in match(readfile(`${DEBUGFS}/${phy}/aql_txq_limit`) ?? '', /(VO|VI|BE|BK)[ \t]+([0-9]+)[ \t]+([0-9]+)/g))
+		out[m[1]] = [ int(m[2]), int(m[3]) ];
+	return out;
+}
+
+function set_weight(dev, mac, weight) {
+	nl80211.request(nl80211.const.NL80211_CMD_SET_STATION, 0, { dev, mac, airtime_weight: weight });
+}
+
+// a device's AQL limits for the narrowed ACs: `limits` [low, high], or null
+// for the radio's own. The file takes one "limit <ac> <low> <high>" a write.
+// false where the kernel has no such file (no AQL for this driver).
+function set_aql(phy, dev, mac, limits) {
+	const defaults = aql_defaults(phy);
+	let done = false;
+	for (let ac in NARROWED) {
+		const l = limits ?? defaults[ac];
+		const f = l ? open(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/aql`, 'w') : null;
+		if (!f)
+			continue;
+		f.write(`limit ${index(ACS, ac)} ${l[0]} ${l[1]}\n`);
+		f.close();
+		done = true;
+	}
+	return done;
+}
+
+// how many times a device's frames are sent, 0 for the driver's own; false
+// where the driver has no such setting
+function set_tries(phy, dev, mac, n) {
+	const f = open(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/tx_tries`, 'w');
+	if (!f)
+		return false;
+	f.write(`${n}\n`);
+	f.close();
+	return true;
+}
+
+// the part of the time a device's ordinary traffic may be sent for while
+// others wait, in thousandths, 0 for no pacing; false where the driver has
+// no such setting
+function set_pace(phy, dev, mac, share) {
+	const f = open(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/tx_pace`, 'w');
+	if (!f)
+		return false;
+	f.write(`${share}\n`);
+	f.close();
+	return true;
+}
+
+// what the driver says of a device's pacing: { share, held } (the share it
+// has, and for how many us its traffic has been held back so far), or null
+// where the driver has no pacing
+function pace_of(phy, dev, mac) {
+	const m = match(readfile(`${DEBUGFS}/${phy}/netdev:${dev}/stations/${mac}/tx_pace`) ?? '', /^([0-9]+) [0-9]+ [0-9]+ ([0-9]+)/);
+	return m ? { share: int(m[1]), held: int(m[2]) } : null;
+}
+
+// Give back what the policy changed on a device (it may have left already).
+function release(key) {
+	const st = stations[key];
+	if (st?.applied_weight != null && st.applied_weight != WEIGHT_FULL)
+		set_weight(st.dev, st.mac, WEIGHT_FULL);
+	if (st?.applied_aql != null)
+		set_aql(st.phy, st.dev, st.mac, null);
+	if (st?.applied_tries)
+		set_tries(st.phy, st.dev, st.mac, 0);
+	if (st?.applied_pace)
+		set_pace(st.phy, st.dev, st.mac, 0);
+	delete stations[key];
+}
+
+function release_all() {
+	for (let key in keys(stations))
+		release(key);
+}
+
+function names() {
+	const out = {};
+	for (let line in split(readfile('/tmp/dhcp.leases') ?? '', '\n')) {
+		const f = split(line, ' ');
+		if (length(f) >= 4 && f[3] != '*')
+			out[lc(f[1])] = f[3];
+	}
+	cursor().foreach('dhcp', 'host', (h) => {
+		if (!h.name)
+			return;
+		for (let mac in (type(h.mac) == 'array') ? h.mac : split(h.mac ?? '', ' '))
+			out[lc(mac)] = h.name;
+	});
+	return out;
+}
+
+// One second: every radio's devices measured, judged and, where the band is
+// on, set. `now` in seconds with a fraction; `dry` sets nothing and reads
+// nothing (a test); `watched`: the page is being looked at, so how busy the
+// channel is gets read too; `wifi`: milkflint.wifi, for each band's settings.
+// Returns the state the page reads.
+function pass(aps, radio_of, on_bands, known, now, dry, watched, wifi) {
+	const seen = {};
+	const out = { t: int(now), radios: [] };
+	const by_phy = {};
+	for (let ap in aps)
+		push(by_phy[ap.phy] ??= [], ap);
+
+	for (let phy, list in by_phy) {
+		const band = band_of(list[0].freq);
+		const on = !!on_bands[band];
+		const cfg = settings_of(wifi, band);
+		const r = (radios[phy] ??= { history: [], air: null });
+		// `weights`: the driver shares the air by weight, so the policy has
+		// something to set (false once a device is seen without one)
+		// `pacing`: the driver can pace a device (asked of each device below)
+		// `rates` and `goals`: the band's settings as the policy uses them
+		const row = {
+			phy, radio: radio_of[phy] ?? null, band, channel: list[0].channel ?? null, on, weights: true, pacing: false,
+			rates: { full: cfg.full, pace: cfg.pace, weak: cfg.weak },
+			goals: { slow: cfg.goal_slow, weak: cfg.goal_weak, lost: cfg.goal_lost },
+			devices: []
+		};
+
+		// every channel the radio takes up, for the page (asked of the radio
+		// while the page is looked at)
+		const info = !watched ? null : ('iface' in list[0]) ? list[0].iface : dry ? null : iface_of(list[0].dev);
+		const block = (info && list[0].freq) ? block_of(info, list[0].freq) : null;
+		row.width = block?.width ?? null;
+		row.channels = block?.channels ?? [];
+
+		// how busy the channel was since the last pass, and how much of that
+		// was the radio itself sending: the same second the devices' figures
+		// below are of. null until there are two readings a pass apart.
+		const air = !watched ? null : ('survey' in list[0]) ? list[0].survey : dry ? null : survey_of(list[0].dev, list[0].freq);
+		let busy = null, sent = null;
+		if (air && r.air && air.time > r.air.time && now - r.air.t < 3) {
+			const span = 1.0 * (air.time - r.air.time);
+			busy = min(1.0, max(0.0, (air.busy - r.air.busy) / span));
+			if (air.tx != null && r.air.tx != null)
+				sent = min(busy, max(0.0, (air.tx - r.air.tx) / span));
+		}
+		r.air = air ? { ...air, t: now } : null;
+		row.busy = busy;
+		// the noise the radio measures on its channel, dBm (null where it doesn't say)
+		row.noise = air?.noise ?? null;
+
+		// each device's second, measured and judged; with the auto shares on,
+		// what it may have depends on the others, so nothing is set until
+		// every device has been looked at
+		const auto = on && cfg.strength != null;
+		const entries = [];
+		for (let ap in list) {
+			for (let s in ap.stations ?? station_dump(ap.dev)) {
+				const key = ap.dev + ' ' + s.mac;
+				const att = ('attempts' in s) ? s.attempts : attempts_of(phy, ap.dev, s.mac);
+				const dozed = ('dozed' in s) ? s.dozed : dozed_of(phy, ap.dev, s.mac);
+				const paced = ('pace' in s) ? s.pace : dry ? null : pace_of(phy, ap.dev, s.mac);
+				const st = (stations[key] ??= { dev: ap.dev, phy, mac: s.mac, policy: null, applied_weight: null, applied_aql: null, applied_tries: 0, applied_pace: 0 });
+				seen[key] = true;
+				const p = st.prev;
+				const secs = p ? now - p.t : 0;
+				// joined again (its counters started over): start afresh
+				const fresh = !p || secs <= 0 || s.tx_packets < p.s.tx_packets || s.air_tx < p.s.air_tx;
+				let fig = { rate: s.rate, sends: 0, delivered: 0, failed: 0 };
+				let air_tx = 0, air_rx = 0, tx_mbit = 0, rx_mbit = 0, asleep = 0, held = 0;
+				if (!fresh) {
+					if (dozed != null && p.dozed != null && dozed >= p.dozed)
+						asleep = min(1.0, (dozed - p.dozed) / (secs * 1000.0));
+					if (paced && p.paced && paced.held >= p.paced.held)
+						held = min(1.0, (paced.held - p.paced.held) / (secs * 1e6));
+					const d = att ? attempts_delta(p.att, att) : null;
+					if (d)
+						fig = { rate: s.rate, ...d };
+					else {
+						// without the driver's counters: packets and retries
+						const pk = s.tx_packets - p.s.tx_packets, re = max(0, s.tx_retries - p.s.tx_retries);
+						const fl = max(0, s.tx_failed - p.s.tx_failed);
+						fig = { rate: s.rate, sends: pk + re, delivered: max(0, pk - fl), failed: fl };
+					}
+					air_tx = min(1.0, max(0, s.air_tx - p.s.air_tx) / (secs * 1e6));
+					air_rx = min(1.0, max(0, s.air_rx - p.s.air_rx) / (secs * 1e6));
+					tx_mbit = max(0, s.tx_bytes - p.s.tx_bytes) * 8 / (secs * 1e6);
+					rx_mbit = max(0, s.rx_bytes - p.s.rx_bytes) * 8 / (secs * 1e6);
+				}
+				else
+					st.policy = null;
+				st.prev = { t: now, s, att, dozed, paced };
+				st.policy = decide(st.policy, { ...fig, asleep }, band, cfg);
+				// pacing needs no weights, only a driver that has it
+				if (paced)
+					row.pacing = true;
+				// traffic waiting for it is only asked for where the auto shares need it
+				const backlog = !auto ? 0 : ('backlog' in s) ? s.backlog : dry ? 0 : backlog_of(phy, ap.dev, s.mac);
+				push(entries, { ap, s, st, paced, held, backlog, air: air_tx + air_rx, air_tx, air_rx, tx_mbit, rx_mbit, asleep });
+			}
+		}
+
+		// the auto shares, where the driver can pace; otherwise nothing of
+		// them is kept
+		const shared = auto && row.pacing;
+		row.auto = cfg.auto;
+		row.competing = null;
+		if (shared)
+			row.competing = auto_pace(map(entries, (e) => ({ st: e.st.policy, air: e.air, air_tx: e.air_tx, backlog: e.backlog, held: e.held })), cfg).competing;
+		else
+			for (let e in entries) {
+				e.st.policy.aim = 0;
+				e.st.policy.trim = 1.0;
+			}
+
+		for (let e in entries) {
+			const ap = e.ap, s = e.s, st = e.st, paced = e.paced;
+			// a driver without airtime weights: the policy can only watch
+			const can = s.weight != null;
+			if (!can)
+				row.weights = false;
+			const want_weight = (on && can) ? st.policy.weight : WEIGHT_FULL;
+			let want_aql = (on && can) ? st.policy.aql : null;
+			let want_tries = (on && can) ? st.policy.tries : 0;
+			let want_pace = (on && paced) ? st.policy.pace : 0;
+			if (!dry) {
+				// off, only what this service set is put back
+				if (can && s.weight != want_weight && (on || st.applied_weight != null))
+					set_weight(ap.dev, s.mac, want_weight);
+				// where the kernel has no such setting: nothing set, and the page isn't told otherwise
+				if (sprintf('%J', want_aql) != sprintf('%J', st.applied_aql) && !set_aql(phy, ap.dev, s.mac, want_aql))
+					want_aql = null;
+				if (want_tries != st.applied_tries && !set_tries(phy, ap.dev, s.mac, want_tries))
+					want_tries = 0;
+				// against what the driver has, not what was last written (a
+				// device that joined again has none); off, only what this
+				// service set is put back
+				if (paced && want_pace != paced.share && (on || st.applied_pace) &&
+				    !set_pace(phy, ap.dev, s.mac, want_pace))
+					want_pace = 0;
+			}
+			st.applied_weight = (on && can) ? want_weight : null;
+			st.applied_aql = want_aql;
+			st.applied_tries = want_tries;
+			st.applied_pace = want_pace;
+
+			push(row.devices, {
+				mac: s.mac, name: known[s.mac] ?? null, dev: ap.dev, ssid: ap.ssid ?? null, signal: s.signal ?? null,
+				rate: s.rate, rx_rate: s.rx_rate, delivery: st.policy.delivery, useful: st.policy.useful,
+				// the weight the kernel has for it now (a change shows a second later)
+				class: st.policy.class, reason: st.policy.reason, weight: dry ? want_weight : (s.weight ?? WEIGHT_FULL),
+				narrowed: want_aql != null, tries: want_tries,
+				// `paced`: the policy would pace it; `pace`: the part of
+				// the time it has, in thousandths (0: not paced); `held`:
+				// the part of the last second its traffic was held back
+				paced: st.policy.paced, pace: want_pace, held: e.held,
+				// with the auto shares: its share of the air, in thousandths
+				// (0: none), and the factor its pacing is trimmed by
+				aim: (want_pace > 0) ? st.policy.aim : 0, trim: (want_pace > 0) ? st.policy.trim : 1.0,
+				air_tx: e.air_tx, air_rx: e.air_rx, tx_mbit: e.tx_mbit, rx_mbit: e.rx_mbit, asleep: e.asleep,
+				// its link in detail: how the router sends to it and it to
+				// the router, each antenna's signal, seconds connected
+				tx_phy: phy_of(s.tx_bitrate), rx_phy: phy_of(s.rx_bitrate),
+				chains: s.chains ?? null, connected: s.connected ?? null
+			});
+		}
+
+		// a minute of history: each second's air by class, for the page's strip
+		const by_class = { full: 0, slow: 0, weak: 0, lost: 0 };
+		let heard = 0, ours = 0;
+		for (let d in row.devices) {
+			by_class[d.class] += d.air_tx + d.air_rx;
+			heard += d.air_rx;
+			ours += d.air_tx + d.air_rx;
+		}
+		// the busy time that was neither the radio sending nor its devices:
+		// other networks and noise. Where the radio doesn't say how long it
+		// sent, the devices' own figures for that.
+		row.other = (busy == null) ? null : max(0.0, busy - ((sent != null) ? sent + heard : ours));
+		// with what other networks and noise took of that second, where the
+		// channel was read (null otherwise: only while the page is looked at)
+		push(r.history, { t: int(now), ...by_class, other: row.other });
+		while (length(r.history) > HISTORY)
+			shift(r.history);
+		row.history = r.history;
+		push(out.radios, row);
+	}
+
+	// devices that left: nothing to give back, the kernel forgot them
+	for (let key in keys(stations))
+		if (!seen[key])
+			delete stations[key];
+	for (let phy in keys(radios))
+		if (!by_phy[phy])
+			delete radios[phy];
+	return out;
+}
+
+function save(state) {
+	mkdir(STATE_DIR);
+	writefile(STATE + '.tmp', sprintf('%J\n', state));
+	rename(STATE + '.tmp', STATE);
+}
+
+function now_s() {
+	const c = clock();
+	return c[0] + c[1] / 1e9;
+}
+
+// ---- main ------------------------------------------------------------------
+
+if (ARGV[0] == 'once') {
+	const input = json(readfile(ARGV[1]));
+	let state = null;
+	for (let step in input.steps)
+		state = pass(step.aps, input.radio_of ?? {}, input.bands ?? {}, input.names ?? {}, step.t, true, true, input.settings ?? null);
+	print(sprintf('%.J\n', state));
+	exit(0);
+}
+
+uloop.init();
+
+// What an earlier run of this service left set, if it ended without putting
+// it back (killed, or an error): its last state says which devices it had
+// changed, and they're taken over, so the first pass corrects or releases
+// them like any other.
+function adopt() {
+	let old = null;
+	try {
+		old = json(readfile(STATE) ?? 'null');
+	}
+	catch (e) {
+		old = null;
+	}
+	for (let r in old?.radios ?? [])
+		for (let d in r?.devices ?? [])
+			if (d?.dev && d?.mac && (d.weight != WEIGHT_FULL || d.narrowed || d.tries || d.pace))
+				stations[d.dev + ' ' + d.mac] = {
+					dev: d.dev, phy: r.phy, mac: d.mac, policy: null,
+					applied_weight: d.weight, applied_aql: d.narrowed ? [ 0, 0 ] : null, applied_tries: d.tries ?? 0,
+					applied_pace: d.pace ?? 0
+				};
+}
+adopt();
+
+// names and the radios' sections change rarely: read every half minute
+let known = {}, radio_of = {}, cached = 0;
+
+let idle = false;
+function tick() {
+	const wifi = cursor().get_all('milkflint', 'wifi') ?? {};
+	const on = bands_on(wifi);
+	const watched = (stat(WATCH)?.mtime ?? 0) > time() - WATCH_FOR;
+	if (!length(on) && !watched) {
+		// nothing to set and nobody looking: no measuring either
+		if (!idle) {
+			release_all();
+			radios = {};
+			save({ t: time(), idle: true, radios: [] });
+			idle = true;
+		}
+		uloop.timer(2000, tick);
+		return;
+	}
+	idle = false;
+	const conn = connect(null, 5);
+	if (conn) {
+		if (time() - cached >= 30) {
+			known = names();
+			radio_of = radio_names(conn);
+			cached = time();
+		}
+		save(pass(access_points(conn), radio_of, on, known, now_s(), false, watched, wifi));
+		conn.disconnect();
+	}
+	uloop.timer(1000, tick);
+}
+
+// procd stops this with TERM: every device back on the kernel's defaults
+const bye = () => {
+	release_all();
+	save({ t: time(), idle: true, radios: [] });
+	uloop.end();
+};
+uloop.signal('TERM', bye);
+uloop.signal('INT', bye);
+
+uloop.timer(100, tick);
+uloop.run();
+exit(0);
