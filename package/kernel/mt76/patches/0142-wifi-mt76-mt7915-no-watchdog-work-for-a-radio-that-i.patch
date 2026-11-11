@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:35 +0000
+Subject: [PATCH] wifi: mt76: mt7915: no watchdog work for a radio that isn't
+ running
+
+mt7915_mac_work() re-arms itself each time, and mt7915_stop() cancels
+it. An L1 recovery and reconfig_complete() queue it for both radios,
+though, and a radio with no interface up was never started, so it is
+never stopped either. From the first recovery on, the work ran for that
+radio for good: a channel query to the firmware twice a second under the
+device mutex, the MIB counters and the noise floor read from a radio
+that isn't on, and nothing to cancel it when the driver is unloaded.
+
+It returns without re-arming when its radio isn't running.
+
+mt7915_test_mac_work.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 12 ++++++++++++
+ mt7915/tests/mac-test.c | 18 +++++++++++++++++-
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 7f210368..fea311ec 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2231,6 +2231,18 @@ void mt7915_mac_work(struct work_struct *work)
+ 
+ 	mutex_lock(&mphy->dev->mutex);
+ 
++	/*
++	 * An L1 recovery and a restart queue this for both radios, a stopped
++	 * one too (mt7915_stop() cancels it, but a radio with no interface
++	 * was never started). It has nothing to watch there, and re-arming
++	 * itself would query the firmware for it twice a second from then on,
++	 * with nothing left to cancel it when the driver is unloaded.
++	 */
++	if (!test_bit(MT76_STATE_RUNNING, &mphy->state)) {
++		mutex_unlock(&mphy->dev->mutex);
++		return;
++	}
++
+ 	/*
+ 	 * Each firmware query holds the mutex for a round trip, so they're
+ 	 * spaced out: the channel's airtime every 500 ms (its counters are
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index d44b6268..39bf6e94 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -5355,7 +5355,7 @@ static void mt7915_test_muru_reply(struct mt76_test_fake *fake,
+ 
+ /* The watchdog work, every 100 ms: the noise floor each time; every 5th
+  * time the channel survey, the MIB counters and the rx-stuck checks; every
+- * 100th (when enabled) the MU stats. It always re-arms itself.
++ * 100th (when enabled) the MU stats. It re-arms itself while its radio runs.
+  */
+ static void mt7915_test_mac_work(struct kunit *test)
+ {
+@@ -5427,6 +5427,22 @@ static void mt7915_test_mac_work(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
+ 			MCU_EXT_CMD(MURU_CTRL)), 1);
+ 	KUNIT_EXPECT_EQ(test, dev->phy.muru_work_count, 0);
++
++	/* A stopped radio (or one never started: an L1 recovery and a restart
++	 * queue the work for both) has nothing to watch: no query, and the work
++	 * doesn't keep itself going.
++	 */
++	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++	for (i = 0; i < 5; i++)
++		mt7915_mac_work(&dev->mphy.mac_work.work);
++	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dev->mphy.mac_work));
++	KUNIT_EXPECT_EQ(test, dev->mphy.mac_work_count, 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(GET_MIB_INFO)), 20);
++	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
++	/* nothing is left to run after the test, whatever it found */
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++	set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+ }
+ 
+ /* A complete SER (L1) recovery: DMA stopped and reset, tokens reclaimed,

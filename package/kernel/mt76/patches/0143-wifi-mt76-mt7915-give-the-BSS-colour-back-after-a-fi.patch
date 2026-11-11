@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:36 +0000
+Subject: [PATCH] wifi: mt76: mt7915: give the BSS colour back after a firmware
+ restart
+
+The firmware learns a BSS's colour from BSS_INFO_BSS_COLOR, which is
+sent on BSS_CHANGED_HE_BSS_COLOR. mac80211 raises that when a BSS starts
+with a colour and when the colour changes, not in ieee80211_reconfig():
+the same gap as BSS_CHANGED_HE_OBSS_PD, which reconfig_complete()
+already fills. After a full reset the restarted firmware so ran the BSS
+without its colour, while the beacon went on announcing it, until the
+interface was next restarted.
+
+reconfig_complete() sends it again for a restart, to each HE BSS that
+has a colour, before the spatial reuse settings.
+
+mt7915_main_test_bss_color_after_restart.
+mt7915_main_test_spr_after_restart holds the wiphy lock around
+reconfig_complete() now, as mac80211 does: it walks the interfaces.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mt7915/main.c            | 35 +++++++++++++++++++++++---
+ mt7915/tests/main-test.c | 54 +++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 85 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 43677972..89b6bc5d 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -2080,17 +2080,46 @@ static void mt7915_twt_lost_iter(void *data, struct ieee80211_sta *sta)
+ 	}
+ }
+ 
++/* The restarted firmware has no BSS colour either: mac80211 sends
++ * BSS_CHANGED_HE_BSS_COLOR when a BSS starts with one and when its colour
++ * changes, not for a restart, while the beacon goes on announcing the colour.
++ */
++static void mt7915_bss_color_restore_iter(void *data, u8 *mac,
++					  struct ieee80211_vif *vif)
++{
++	struct ieee80211_hw *hw = data;
++
++	if (vif->bss_conf.he_support && vif->bss_conf.he_bss_color.enabled)
++		mt7915_update_bss_color(hw, vif, &vif->bss_conf.he_bss_color);
++}
++
++/* Under the wiphy lock. */
++static void mt7915_bss_color_restore(struct mt7915_phy *phy)
++{
++	struct mt7915_dev *dev = phy->dev;
++
++	mutex_lock(&dev->mt76.mutex);
++	ieee80211_iterate_active_interfaces_mtx(phy->mt76->hw,
++						IEEE80211_IFACE_ITER_NORMAL,
++						mt7915_bss_color_restore_iter,
++						phy->mt76->hw);
++	mutex_unlock(&dev->mt76.mutex);
++}
++
+ static void
+ mt7915_reconfig_complete(struct ieee80211_hw *hw,
+ 			 enum ieee80211_reconfig_type reconfig_type)
+ {
+ 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
+ 
+-	/* the firmware restarted without its spatial reuse settings, and
+-	 * mac80211 doesn't send BSS_CHANGED_HE_OBSS_PD for a restart
++	/* the firmware restarted without its BSS colour and spatial reuse
++	 * settings, and mac80211 sends neither BSS_CHANGED_HE_BSS_COLOR nor
++	 * BSS_CHANGED_HE_OBSS_PD for a restart
+ 	 */
+-	if (reconfig_type == IEEE80211_RECONFIG_TYPE_RESTART)
++	if (reconfig_type == IEEE80211_RECONFIG_TYPE_RESTART) {
++		mt7915_bss_color_restore(phy);
+ 		phy->spr_unapplied = !!mt7915_spr_apply(phy);
++	}
+ 
+ 	ieee80211_wake_queues(hw);
+ 
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 3849ef1a..a3cb91b8 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -728,6 +728,10 @@ static void mt7915_main_test_spr_after_restart(struct kunit *test)
+ 	kunit_activate_static_stub(test, mt7915_spr_apply,
+ 				   mt7915_main_test_spr_apply_stub);
+ 
++	/* as mac80211 calls it: the restart walks the interfaces for their
++	 * BSS colour too
++	 */
++	wiphy_lock(hw->wiphy);
+ 	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_SUSPEND);
+ 	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 0);
+ 	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
+@@ -739,13 +743,60 @@ static void mt7915_main_test_spr_after_restart(struct kunit *test)
+ 	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
+ 	KUNIT_EXPECT_TRUE(test, mt7915_hw_phy(hw)->spr_unapplied);
+ 	mt7915_main_test_spr_apply_ret = 0;
+-	wiphy_lock(hw->wiphy);
+ 	KUNIT_EXPECT_EQ(test, mt7915_spr_set_mode(mt7915_hw_phy(hw), "auto"), 0);
+ 	wiphy_unlock(hw->wiphy);
+ 	KUNIT_EXPECT_EQ(test, mt7915_main_test_spr_applied, 3);
+ 	KUNIT_EXPECT_FALSE(test, mt7915_hw_phy(hw)->spr_unapplied);
+ }
+ 
++/* A firmware restart loses the BSS colour as well, and mac80211 sends
++ * BSS_CHANGED_HE_BSS_COLOR only when a BSS starts with a colour or changes it:
++ * the driver gives the colour back to each HE BSS that has one, as it does at
++ * its start (so not for an extended BSSID, which shares the main BSS's).
++ */
++static void mt7915_main_test_bss_color_after_restart(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *ap, *ap2;
++	struct bss_info_color *color;
++
++	ap = mt7915_main_test_ap(test, hw, 1);
++	ap2 = mt7915_main_test_ap(test, hw, 2);
++	ap->bss_conf.he_support = true;
++	ap->bss_conf.he_bss_color.color = 37;
++	ap->bss_conf.he_bss_color.enabled = true;
++	ap2->bss_conf.he_support = true;
++	ap2->bss_conf.he_bss_color.color = 37;
++	ap2->bss_conf.he_bss_color.enabled = true;
++	mt7915_main_test_clear(fake);
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7915_bss_color_restore_iter(hw, ap->addr, ap);
++	mutex_unlock(&dev->mt76.mutex);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 1);
++	color = mt7915_main_test_tlv(mt76_test_msg(fake, 0),
++				     BSS_INFO_BSS_COLOR);
++	KUNIT_ASSERT_NOT_NULL(test, color);
++	KUNIT_EXPECT_EQ(test, color->color, 37);
++	KUNIT_EXPECT_EQ(test, color->disable, 0);
++
++	/* the extended BSSID; a BSS without HE; one without a colour: nothing
++	 * was sent at their start either
++	 */
++	mt7915_main_test_clear(fake);
++	mutex_lock(&dev->mt76.mutex);
++	mt7915_bss_color_restore_iter(hw, ap2->addr, ap2);
++	ap->bss_conf.he_support = false;
++	mt7915_bss_color_restore_iter(hw, ap->addr, ap);
++	ap->bss_conf.he_support = true;
++	ap->bss_conf.he_bss_color.enabled = false;
++	mt7915_bss_color_restore_iter(hw, ap->addr, ap);
++	mutex_unlock(&dev->mt76.mutex);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++}
++
+ /* --- interfaces -------------------------------------------------------------- */
+ 
+ /* Own MAC (BSSID) slots: an AP takes hw BSSID 0, then the extended ones;
+@@ -3758,6 +3809,7 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_spr_remove_interface),
+ 	KUNIT_CASE(mt7915_main_test_spr_bss_start_off),
+ 	KUNIT_CASE(mt7915_main_test_spr_after_restart),
++	KUNIT_CASE(mt7915_main_test_bss_color_after_restart),
+ 	KUNIT_CASE(mt7915_main_test_omac_idx),
+ 	KUNIT_CASE(mt7915_main_test_add_ap),
+ 	KUNIT_CASE(mt7915_main_test_add_second_ap),

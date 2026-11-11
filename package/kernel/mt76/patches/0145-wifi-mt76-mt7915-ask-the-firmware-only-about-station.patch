@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:36 +0000
+Subject: [PATCH] wifi: mt76: mt7915: ask the firmware only about stations it
+ has
+
+mt7915_sta_statistics() asked the firmware for the rx rate of whatever
+station mac80211 named. mac80211 also asks about one the firmware
+doesn't have: for the last statistics of every removal, after the
+station was disconnected; for one not associated yet; and after a full
+reset for one not re-added yet, whose index may be another station's by
+then. That was a round trip under the device mutex for nothing, or for
+another station's rate.
+
+Ask only for an associated station (wcid.sta). The tx rate and the
+counters the driver keeps are reported as before.
+
+mt7915_main_test_sta_statistics.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mt7915/main.c            | 10 +++++++++-
+ mt7915/tests/main-test.c | 12 ++++++++++++
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 89b6bc5d..722d2ead 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1291,7 +1291,15 @@ static void mt7915_sta_statistics(struct ieee80211_hw *hw,
+ 	 */
+ 	mutex_lock(&phy->dev->mt76.mutex);
+ 
+-	if (!mt7915_mcu_get_rx_rate(phy, vif, sta, &rxrate)) {
++	/*
++	 * Only for a station the firmware has. mac80211 asks once more after
++	 * the station was disconnected (the last statistics of a removal), and
++	 * can ask before it is associated or, after a full reset, before it is
++	 * re-added, when its index may be another station's: a round trip for
++	 * nothing, or for someone else's rate.
++	 */
++	if (msta->wcid.sta &&
++	    !mt7915_mcu_get_rx_rate(phy, vif, sta, &rxrate)) {
+ 		sinfo->rxrate = rxrate;
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
+ 	}
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index a3cb91b8..c72ca90f 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -3038,6 +3038,18 @@ static void mt7915_main_test_sta_statistics(struct kunit *test)
+ 	msta->wcid.rate.legacy = 540;
+ 	mt7915_main_test_clear(fake);
+ 
++	/* Not associated (not yet, or disconnected for its removal, or dropped
++	 * by a full reset until it's re-added): the firmware has no such
++	 * station to ask about. The driver's own numbers are still reported.
++	 */
++	mt7915_sta_statistics(hw, vif, sta, &sinfo);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++	KUNIT_EXPECT_FALSE(test, sinfo.filled &
++			   BIT_ULL(NL80211_STA_INFO_RX_BITRATE));
++	KUNIT_EXPECT_EQ(test, sinfo.tx_failed, 3);
++	memset(&sinfo, 0, sizeof(sinfo));
++	msta->wcid.sta = 1;
++
+ 	/* the firmware sends no rate back: no rx rate */
+ 	mt7915_sta_statistics(hw, vif, sta, &sinfo);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_msg(fake, 0)->cmd,

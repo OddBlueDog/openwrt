@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:36 +0000
+Subject: [PATCH] wifi: mt76: no throughput trigger for an LED the device tree
+ leaves out
+
+mt76_led_init() registers an LED for every driver that can drive one,
+with mac80211's throughput trigger as its default, whether or not the
+board has an LED on the chip's pin. Only a device tree "led" node with
+status disabled stopped it.
+
+While an LED has that trigger, mac80211 adds every frame's length to the
+trigger's tx_bytes in the xmit path and to its rx_bytes in the rx path,
+two adjacent words written from different CPUs, and a timer sets the
+blink rate once a second, which for mt7915 is a handful of register
+writes per radio, in timer context and whether or not a reset is under
+way. On a board with no such LED that is all for nothing.
+
+A device that the device tree describes without an "led" node has none
+wired: its LED is still registered, and can be given any trigger by
+hand, but gets no default trigger. A device with no device tree node at
+all (a plain PCIe card) keeps the default, as does one with an "led"
+node.
+
+mt76_test_register_led_dt_none.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mac80211.c        | 17 +++++++++++++++--
+ tests/core-test.c | 31 +++++++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 2 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index d32c1703..1d388450 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -198,6 +198,9 @@ static int mt76_led_init(struct mt76_phy *phy)
+ 	struct mt76_dev *dev = phy->dev;
+ 	struct ieee80211_hw *hw = phy->hw;
+ 	struct device_node *np = dev->dev->of_node;
++	/* a device the device tree doesn't describe at all: as it always was */
++	bool wired = !np;
++	const char *trigger;
+ 
+ 	if (!phy->leds.cdev.brightness_set && !phy->leds.cdev.blink_set)
+ 		return 0;
+@@ -221,6 +224,7 @@ static int mt76_led_init(struct mt76_phy *phy)
+ 				of_property_read_bool(np, "led-active-low");
+ 		}
+ 
++		wired = true;
+ 		of_node_put(np);
+ 	}
+ 
+@@ -228,11 +232,20 @@ static int mt76_led_init(struct mt76_phy *phy)
+ 		 wiphy_name(hw->wiphy));
+ 
+ 	phy->leds.cdev.name = phy->leds.name;
+-	phy->leds.cdev.default_trigger =
+-		ieee80211_create_tpt_led_trigger(hw,
++	trigger = ieee80211_create_tpt_led_trigger(hw,
+ 					IEEE80211_TPT_LEDTRIG_FL_RADIO,
+ 					mt76_tpt_blink,
+ 					ARRAY_SIZE(mt76_tpt_blink));
++	/*
++	 * A board whose device tree describes the device, but no LED on it,
++	 * has none wired to the chip. The LED stays, to be given a trigger by
++	 * hand, but not the throughput trigger by default: while an LED has
++	 * it, mac80211 adds every frame's bytes to two adjacent counters, one
++	 * from the tx path and one from the rx path, and once a second sets
++	 * the blink rate through the chip's registers, for nothing to see.
++	 */
++	if (wired)
++		phy->leds.cdev.default_trigger = trigger;
+ 
+ 	dev_info(dev->dev,
+ 		"registering led '%s'\n", phy->leds.name);
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 176a4efc..0084b714 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -1543,6 +1543,36 @@ static void mt76_test_register_led_dt_disabled(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_led, 0);
+ }
+ 
++/* A device tree that describes the device but no LED on it (the GL-MT6000's):
++ * none is wired to the chip. The LED is still registered, to be given a
++ * trigger by hand, but mac80211's throughput trigger isn't its default, so
++ * nothing counts every frame's bytes or sets a blink rate each second for it.
++ */
++static void mt76_test_register_led_dt_none(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct led_classdev *cdev = &dev->phy.leds.cdev;
++	struct mt76_test_dt *dt;
++
++	if (IS_ENABLED(CONFIG_OF_DYNAMIC))
++		kunit_skip(test, "needs a kernel without CONFIG_OF_DYNAMIC");
++	dt = kunit_kzalloc(test, sizeof(*dt), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dt);
++	dt->np.name = "wifi";
++	dt->np.full_name = "wifi@18000000";
++	dev->dev->of_node = &dt->np;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_test_dt_detach, dev->dev), 0);
++
++	cdev->brightness_set = mt76_test_led_set;
++	mt76_hwt_register(test, dev);
++
++	KUNIT_EXPECT_NOT_NULL(test, cdev->dev);
++	KUNIT_EXPECT_NULL(test, cdev->default_trigger);
++	KUNIT_EXPECT_NULL(test, cdev->trigger);
++	KUNIT_EXPECT_EQ(test, dev->phy.leds.pin, 0);
++}
++
+ static void mt76_test_free_ext_phy(void *data)
+ {
+ 	struct mt76_phy *phy = data;
+@@ -1664,6 +1694,7 @@ static struct kunit_case mt76_core_init_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_register_led),
+ 	KUNIT_CASE(mt76_test_register_led_dt),
+ 	KUNIT_CASE(mt76_test_register_led_dt_disabled),
++	KUNIT_CASE(mt76_test_register_led_dt_none),
+ 	KUNIT_CASE(mt76_test_register_ext_phy),
+ 	KUNIT_CASE(mt76_test_register_shared_phy),
+ 	{}

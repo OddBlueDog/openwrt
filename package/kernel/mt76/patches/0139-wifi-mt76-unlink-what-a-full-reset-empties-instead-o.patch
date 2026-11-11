@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:35 +0000
+Subject: [PATCH] wifi: mt76: unlink what a full reset empties instead of
+ re-initialising it
+
+mt76_reset_device() cleans up every published wcid, then re-initialised
+the heads of the poll list, the status list and each phy's tx list. A
+station whose removal began just before the reset is unpublished already
+(mt76_sta_pre_rcu_remove()), so the walk over the published wcids misses
+it, and the rest of its removal waits for the device mutex the reset
+holds. If it was on the poll list, or on the tx list with a frame
+queued, it kept its links into the old list. When its removal went on
+after the reset, list_del_init() wrote those stale neighbours back: the
+stations linked since the reset were cut out of the list while their own
+nodes still looked linked, so mt76_wcid_add_poll() and mt76_tx() never
+added them again. They were no longer polled for airtime and rates, or
+their management frames stayed queued.
+
+The lists are now emptied entry by entry under their locks. A head that
+was never initialised (a phy not registered yet) has no entries.
+
+mt76_test_reset_device_unpublished: with the heads only re-initialised,
+the kernel's list checks report the corruption.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mac80211.c        | 25 +++++++++++++++++---
+ tests/core-test.c | 60 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 82 insertions(+), 3 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index 8d31d3ee..4f75e018 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -834,12 +834,31 @@ void mt76_free_device(struct mt76_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(mt76_free_device);
+ 
++/*
++ * Empty a list for a full reset by unlinking its entries, not only by
++ * re-initialising its head. An entry the reset doesn't reach otherwise (a
++ * station mt76_sta_pre_rcu_remove() unpublished just before it, whose
++ * removal waits for the mutex) would keep its pointers into the list, and its
++ * own unlink after the reset would write them back into the head: the stations
++ * linked since are dropped from the list while their nodes still say they are
++ * on it, so they are never added again. A head never initialised (a phy not
++ * registered yet) has no entries.
++ */
++static void mt76_reset_list(struct list_head *head, spinlock_t *lock)
++{
++	spin_lock_bh(lock);
++	while (head->next && !list_empty(head))
++		list_del_init(head->next);
++	INIT_LIST_HEAD(head);
++	spin_unlock_bh(lock);
++}
++
+ static void mt76_reset_phy(struct mt76_phy *phy)
+ {
+ 	if (!phy)
+ 		return;
+ 
+-	INIT_LIST_HEAD(&phy->tx_list);
++	mt76_reset_list(&phy->tx_list, &phy->tx_lock);
+ 	phy->num_sta = 0;
+ 	phy->chanctx = NULL;
+ 	mt76_roc_complete(phy);
+@@ -880,8 +899,8 @@ void mt76_reset_device(struct mt76_dev *dev)
+ 	}
+ 	rcu_read_unlock();
+ 
+-	INIT_LIST_HEAD(&dev->wcid_list);
+-	INIT_LIST_HEAD(&dev->sta_poll_list);
++	mt76_reset_list(&dev->wcid_list, &dev->status_lock);
++	mt76_reset_list(&dev->sta_poll_list, &dev->sta_poll_lock);
+ 	dev->vif_mask = 0;
+ 	memset(dev->wcid_mask, 0, sizeof(dev->wcid_mask));
+ 
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 7cde4b9d..b000eb80 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -3371,6 +3371,65 @@ static void mt76_test_reset_device_tx_status(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&dev->wcid_list));
+ }
+ 
++/* A station whose removal began just before a full reset is unpublished
++ * already (mt76_sta_pre_rcu_remove()), so the reset's walk over the published
++ * wcids misses it, and the rest of its removal waits for the reset to finish.
++ * It may still be on the poll list and, with frames queued, on its phy's tx
++ * list. The reset takes it off both: with only the heads re-initialised, its
++ * own unlink afterwards writes its stale pointers into them, and a station
++ * linked since the reset is gone from the lists though its nodes say it is on
++ * them (so it's never polled or scheduled again).
++ */
++static void mt76_test_reset_device_unpublished(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct mt76_wcid *gone, *back;
++
++	gone = kunit_kzalloc(test, sizeof(*gone), GFP_KERNEL);
++	back = kunit_kzalloc(test, sizeof(*back), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, gone);
++	KUNIT_ASSERT_NOT_NULL(test, back);
++
++	mt76_wcid_init(gone, MT_BAND0);
++	gone->idx = 3;
++	gone->sta = 1;
++	mt76_wcid_add_poll(dev, gone);
++	skb_queue_tail(&gone->tx_pending, mt76_test_skb(test, 32));
++	list_add_tail(&gone->tx_list, &dev->phy.tx_list);
++	/* unpublished: dev->wcid[3] stays NULL */
++
++	mt76_reset_device(dev);
++
++	KUNIT_EXPECT_TRUE(test, list_empty(&gone->poll_list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&gone->tx_list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->sta_poll_list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->phy.tx_list));
++
++	/* mac80211 re-adds another station, which is polled and has a frame */
++	mt76_wcid_init(back, MT_BAND0);
++	back->idx = 4;
++	back->sta = 1;
++	rcu_assign_pointer(dev->wcid[4], back);
++	mt76_wcid_add_poll(dev, back);
++	list_add_tail(&back->tx_list, &dev->phy.tx_list);
++
++	/* the removal goes on where it waited */
++	mt76_wcid_cleanup(dev, gone);
++
++	KUNIT_EXPECT_EQ(test, atomic_read(&mt76_test_nfreed), 1);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->sta_poll_list), 1);
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&dev->sta_poll_list,
++						   struct mt76_wcid, poll_list),
++			    back);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->phy.tx_list), 1);
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&dev->phy.tx_list,
++						   struct mt76_wcid, tx_list),
++			    back);
++
++	rcu_assign_pointer(dev->wcid[4], NULL);
++	mt76_wcid_cleanup(dev, back);
++}
++
+ static struct {
+ 	int n;
+ 	struct ieee80211_hw *hw;
+@@ -3568,6 +3627,7 @@ static struct kunit_case mt76_core_sta_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_wcid_add_poll),
+ 	KUNIT_CASE(mt76_test_reset_device),
+ 	KUNIT_CASE(mt76_test_reset_device_hw_ps),
++	KUNIT_CASE(mt76_test_reset_device_unpublished),
+ 	KUNIT_CASE(mt76_test_reset_device_tx_status),
+ 	KUNIT_CASE(mt76_test_sta_readd_after_reset),
+ 	KUNIT_CASE(mt76_test_wcid_key_setup),

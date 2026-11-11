@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:36 +0000
+Subject: [PATCH] wifi: mt76: mt7915: a repeated TWT demand whose time was
+ already past
+
+A demanded target wake time counts as the agreement the station already
+has when it is on the agreement's phase. mt7915_mac_twt_param_equal()
+took the remainder of their difference, as a u64. A demanded time that
+was past already has its agreement start whole intervals later, so the
+same demand again names the earlier time: the difference wraps, and its
+remainder is 0 only for an interval that is a power of two. For any
+other interval the repeated request was taken as new terms, and the
+agreement torn down and set up again instead of answered once more.
+
+Compare each time's own phase.
+
+mt7915_test_twt_repeat_past_demand.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 15 ++++++++++----
+ mt7915/tests/mac-test.c | 45 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index fea311ec..837e2329 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2586,12 +2586,19 @@ mt7915_mac_twt_param_equal(struct mt7915_twt_flow *f,
+ 	struct ieee80211_twt_params *twt_agrt = (void *)twt->params;
+ 	u16 type = le16_to_cpu(twt_agrt->req_type);
+ 	u8 exp = FIELD_GET(IEEE80211_TWT_REQTYPE_WAKE_INT_EXP, type);
+-	u64 rem;
++	u64 phase, rem;
+ 
+-	/* a demanded time is part of the terms, as a phase of the interval */
++	/*
++	 * A demanded time is part of the terms, as a phase of the interval.
++	 * Each time's own phase, not their difference's: the demanded one is
++	 * the earlier whenever it was past already and the agreement started
++	 * whole intervals later, and that difference wraps as a u64, to a
++	 * remainder of its own unless the interval is a power of two.
++	 */
+ 	if (cmd == TWT_SETUP_CMD_DEMAND) {
+-		div64_u64_rem(le64_to_cpu(twt_agrt->twt) - f->tsf, interval, &rem);
+-		if (rem)
++		div64_u64_rem(le64_to_cpu(twt_agrt->twt), interval, &rem);
++		div64_u64_rem(f->tsf, interval, &phase);
++		if (rem != phase)
+ 			return false;
+ 	}
+ 
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 39bf6e94..5a41ad80 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -3617,6 +3617,50 @@ static void mt7915_test_twt_repeat(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->twt.n_agrt, 1);
+ }
+ 
++/* A demanded time that was past already: the agreement starts whole intervals
++ * later, so the same demand again names an earlier time than the agreement's.
++ * It is still the agreement it has, for an interval that isn't a power of two
++ * as well (1000 << 10 us): nothing changes in the firmware.
++ */
++static void mt7915_test_twt_repeat_past_demand(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *a = mt7915_test_sta(test, dev, 9, mvif);
++	struct ieee80211_twt_setup *twt;
++	unsigned int n;
++
++	mt7915_test_tsf(dev, 5000000);
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_DEMAND, 10, 1000, 64, 0);
++	mt7915_test_twt_params(twt)->twt = cpu_to_le64(1000000);
++	mt7915_mac_add_twt_setup(dev->mt76.hw, mt7915_test_to_sta(a), twt);
++	KUNIT_ASSERT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ACCEPT);
++	/* four intervals of 1024000 us on: the first the device can still make */
++	KUNIT_ASSERT_EQ(test, a->twt.flow[0].tsf, 1000000 + 4 * 1024000);
++
++	n = fake->n_msgs;
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_DEMAND, 10, 1000, 64, 0);
++	mt7915_test_twt_params(twt)->twt = cpu_to_le64(1000000);
++	mt7915_mac_add_twt_setup(dev->mt76.hw, mt7915_test_to_sta(a), twt);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ACCEPT);
++	KUNIT_EXPECT_EQ(test, le64_to_cpu(mt7915_test_twt_params(twt)->twt),
++			1000000 + 4 * 1024000);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, n);
++	KUNIT_EXPECT_EQ(test, dev->phy.twt_counters.repeated, 1);
++	KUNIT_EXPECT_EQ(test, dev->phy.twt_counters.replaced, 0);
++	KUNIT_EXPECT_EQ(test, dev->twt.n_agrt, 1);
++
++	/* another phase of that interval is still new terms */
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_DEMAND, 10, 1000, 64, 0);
++	mt7915_test_twt_params(twt)->twt = cpu_to_le64(1000000 + 500);
++	mt7915_mac_add_twt_setup(dev->mt76.hw, mt7915_test_to_sta(a), twt);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ACCEPT);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, n + 2);
++	KUNIT_EXPECT_EQ(test, dev->phy.twt_counters.replaced, 1);
++}
++
+ /* Any of these terms changed on the flow it has replaces the agreement: the old
+  * one goes from the firmware first, so that it doesn't run beside the new one.
+  */
+@@ -5738,6 +5782,7 @@ static struct kunit_case mt7915_mac_twt_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_twt_reject),
+ 	KUNIT_CASE(mt7915_test_twt_flow_id),
+ 	KUNIT_CASE(mt7915_test_twt_repeat),
++	KUNIT_CASE(mt7915_test_twt_repeat_past_demand),
+ 	KUNIT_CASE(mt7915_test_twt_replace),
+ 	KUNIT_CASE(mt7915_test_twt_tu),
+ 	KUNIT_CASE(mt7915_test_twt_policy),

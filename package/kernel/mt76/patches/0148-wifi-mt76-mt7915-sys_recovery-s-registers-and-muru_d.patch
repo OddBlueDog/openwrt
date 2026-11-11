@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:36 +0000
+Subject: [PATCH] wifi: mt76: mt7915: sys_recovery's registers and muru_debug
+ under the mutex
+
+Reading debugfs sys_recovery reads the firmware's SER words from the WF
+subsystem without the device mutex, so a read can land while a full
+reset has the subsystem powered down and is bringing it back, which is
+also when someone is most likely to look at them. Writing muru_debug
+sent its firmware command without the mutex as well, beside a firmware
+reload if a full reset was running. Both take the mutex.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mt7915/debugfs.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 54d69405..86f24ddf 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -147,7 +147,12 @@ mt7915_sys_recovery_get(struct file *file, char __user *user_buf,
+ 	desc += scnprintf(buff + desc, bufsz - desc,
+ 			  "8: trigger firmware crash\n");
+ 
+-	/* SER statistics */
++	/*
++	 * SER statistics. Read under the mutex: a full reset holds it while
++	 * the WF subsystem is powered down and brought back, and these are its
++	 * registers.
++	 */
++	mutex_lock(&dev->mt76.mutex);
+ 	desc += scnprintf(buff + desc, bufsz - desc,
+ 			  "\nlet's dump firmware SER statistics...\n");
+ 	desc += scnprintf(buff + desc, bufsz - desc,
+@@ -180,6 +185,7 @@ mt7915_sys_recovery_get(struct file *file, char __user *user_buf,
+ 	desc += scnprintf(buff + desc, bufsz - desc,
+ 			  "::E  R , SER_LMAC_WISR7_B1 = 0x%08x\n",
+ 			  mt76_rr(dev, MT_SWDEF_LAMC_WISR7_BN1_STATS));
++	mutex_unlock(&dev->mt76.mutex);
+ 	desc += scnprintf(buff + desc, bufsz - desc,
+ 			  "\nSYS_RESET_COUNT: WM %d, WA %d\n",
+ 			  dev->recovery.wm_reset_count,
+@@ -258,8 +264,11 @@ mt7915_muru_debug_set(void *data, u64 val)
+ {
+ 	struct mt7915_dev *dev = data;
+ 
++	/* a firmware command: not while a full reset restarts the firmware */
++	mutex_lock(&dev->mt76.mutex);
+ 	dev->muru_debug = val;
+ 	mt7915_mcu_muru_debug_set(dev, dev->muru_debug);
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return 0;
+ }

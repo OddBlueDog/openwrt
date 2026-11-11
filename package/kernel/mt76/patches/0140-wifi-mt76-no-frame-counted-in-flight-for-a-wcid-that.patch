@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:35 +0000
+Subject: [PATCH] wifi: mt76: no frame counted in flight for a wcid that's
+ being published
+
+wcid->non_aql_packets counts a station's frames in the hardware that
+mac80211's airtime accounting doesn't cover (management frames, null
+frames). It goes up when such a frame is queued and down when its
+completion finds the wcid by its index.
+
+A full reset can leave it one too high. mt7915_mac_restart() clears
+MT76_RESET and lets the tx worker run again before mt76_reset_device()
+unpublishes the stations, so a management frame that waited in a
+station's tx_pending through the firmware's hang can be sent in between
+and counted, and its completion then finds no wcid. The station, and
+its counter, outlive the reset, and nothing ever set the counter back.
+
+With frames held for dozing stations (MT_DRV_HW_PS_BUFFERING),
+mt76_tx_ps_busy() takes a count above zero as a frame in flight: such a
+station would get no frame at all while it dozes, so no TIM bit either,
+until it happens to wake by itself, for as long as it stays associated.
+At 16 its txqs are never served.
+
+mt76_wcid_init() sets the count to zero: nothing is in flight for a wcid
+about to be published, the first time or after a reset.
+
+mt76_test_sta_readd_after_reset.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mac80211.c        | 10 ++++++++++
+ tests/core-test.c |  6 ++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index 4f75e018..c5ea4894 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1846,6 +1846,16 @@ void mt76_wcid_init(struct mt76_wcid *wcid, u8 band_idx)
+ {
+ 	wcid->hw_key_idx = -1;
+ 	wcid->phy_idx = band_idx;
++	/*
++	 * Nothing is in flight for a wcid about to be published. For a station
++	 * mac80211 re-adds after a full reset this isn't 0 by itself: the tx
++	 * worker runs again before the reset unpublishes the stations, and a
++	 * management frame it sent one from tx_pending in between was counted,
++	 * while its completion found no wcid to count it off. One left over
++	 * would keep the station from ever getting a frame while it dozes
++	 * (mt76_tx_ps_busy()), for as long as it stays associated.
++	 */
++	atomic_set(&wcid->non_aql_packets, 0);
+ 
+ 	INIT_LIST_HEAD(&wcid->tx_list);
+ 	skb_queue_head_init(&wcid->tx_pending);
+diff --git a/tests/core-test.c b/tests/core-test.c
+index b000eb80..ce06cfc4 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -3481,6 +3481,10 @@ static void mt76_test_sta_readd_after_reset(struct kunit *test)
+ 	mt76_reset_device(dev);
+ 	KUNIT_EXPECT_NULL(test, rcu_access_pointer(dev->wcid[9]));
+ 	KUNIT_EXPECT_EQ(test, mt76_test_sched.n, 0);
++	/* A management frame the tx worker sent it between the restart and the
++	 * reset of the stations: counted, and its completion found no wcid.
++	 */
++	atomic_set(&wcid->non_aql_packets, 1);
+ 
+ 	/* mac80211's restart work re-adds it */
+ 	runs = atomic_read(&mt76_test_worker_runs);
+@@ -3488,6 +3492,8 @@ static void mt76_test_sta_readd_after_reset(struct kunit *test)
+ 					     IEEE80211_STA_NOTEXIST,
+ 					     IEEE80211_STA_NONE), 0);
+ 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(dev->wcid[9]), wcid);
++	/* nothing of its is in flight: not held back for that frame for good */
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets), 0);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_sched.n, 2);
+ 	KUNIT_EXPECT_PTR_EQ(test, mt76_test_sched.txq[0], sta->txq[0]);
+ 	KUNIT_EXPECT_PTR_EQ(test, mt76_test_sched.txq[1], sta->txq[1]);

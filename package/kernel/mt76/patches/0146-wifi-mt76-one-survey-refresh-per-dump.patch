@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:36 +0000
+Subject: [PATCH] wifi: mt76: one survey refresh per dump
+
+mt76_get_survey() refreshes the channel counters when asked for the
+first channel of a band: mt76_get_survey_sband() turns the index into
+one within the band, and 0 is its first channel. The index just past the
+last channel also comes out as 0, with no band. A survey dump ends by
+asking for that index, so each dump refreshed the survey twice: for
+mt7915 a second firmware query under the device mutex and a second
+noise reading, for an answer of -ENOENT. With several radios on one hw
+it also refreshed the radio before the one asked about.
+
+Refresh only for a channel that exists.
+
+mt76_test_get_survey.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mac80211.c        | 8 +++++++-
+ tests/core-test.c | 3 ++-
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index c5ea4894..d32c1703 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1232,7 +1232,13 @@ int mt76_get_survey(struct ieee80211_hw *hw, int idx,
+ 
+ 		sband = mt76_get_survey_sband(phy, &idx);
+ 
+-		if (idx == 0 && phy->dev->drv->update_survey)
++		/*
++		 * The first channel of one of this phy's bands, not the index
++		 * past its last one, which also comes out as 0 here: a dump
++		 * ends by asking for that one, and would query the firmware
++		 * a second time for nothing.
++		 */
++		if (sband && idx == 0 && phy->dev->drv->update_survey)
+ 			mt76_update_survey(phy);
+ 
+ 		if (sband || !hw->wiphy->n_radio)
+diff --git a/tests/core-test.c b/tests/core-test.c
+index ce06cfc4..176a4efc 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -1936,9 +1936,10 @@ static void mt76_test_get_survey(struct kunit *test)
+ 	KUNIT_EXPECT_PTR_EQ(test, survey.channel,
+ 			    &phy->sband_5g.sband.channels[0]);
+ 
+-	/* past the last channel */
++	/* past the last channel, where every dump ends: no refresh for that */
+ 	KUNIT_EXPECT_EQ(test, mt76_get_survey(dev->hw, 14 + 28, &survey),
+ 			-ENOENT);
++	KUNIT_EXPECT_EQ(test, mt76_test_drv.n_update_survey, 2);
+ 
+ 	/* several radios on one hw: the count goes on into the next phy of
+ 	 * that hw (band 2 here; band 1 is on another hw)

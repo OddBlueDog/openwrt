@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:35 +0000
+Subject: [PATCH] wifi: mt76: mt7915: release the held stations after an L1
+ recovery
+
+The firmware reports a station's power save state only when it changes,
+and the driver holds back the frames of a station reported dozing. An L1
+recovery stops NAPI and then resets the rx rings with the events still
+in them (mt7915_dma_reset()): an event saying that a station woke can be
+lost. That station would stay held, at one frame in flight per AC, while
+it is awake, until it next dozes and wakes, and a station kept awake by
+its traffic doesn't.
+
+A full reset already forgets the holds (mt76_reset_device()). An L1
+recovery now releases them too, once the rings are reset: a station that
+does doze then has its frames buffered by the firmware, as without the
+hold, until its next event.
+
+mt7915_test_reset_work_ser.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 21 +++++++++++++++++++++
+ mt7915/tests/mac-test.c |  8 +++++++-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index e4978b2e..7f210368 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1553,6 +1553,26 @@ static void mt7915_mac_sta_rc_reset(struct mt7915_dev *dev)
+ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ }
+ 
++/* An L1 recovery resets the rx rings with whatever events were still in them,
++ * a station's wake-up among them maybe, and the firmware reports only changes.
++ * A station held since then would stay at one frame in flight for as long as it
++ * stays awake. None is held after it: for one that does doze, the firmware
++ * buffers as it does without the hold, until its next event.
++ */
++static void mt7915_mac_ps_release(struct mt7915_dev *dev)
++{
++	int i;
++
++	rcu_read_lock();
++	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid); i++) {
++		struct mt76_wcid *wcid = rcu_dereference(dev->mt76.wcid[i]);
++
++		if (wcid && test_bit(MT_WCID_FLAG_PS, &wcid->flags))
++			mt76_sta_ps_transition(&dev->mt76, wcid, false);
++	}
++	rcu_read_unlock();
++}
++
+ static void
+ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ {
+@@ -1711,6 +1731,7 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 	mt7915_dma_reset(dev, false);
+ 
+ 	mt7915_mac_reset_tokens(dev);
++	mt7915_mac_ps_release(dev);
+ 
+ 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+ 	if (!mt7915_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE))
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index bcde245d..d44b6268 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -5432,15 +5432,19 @@ static void mt7915_test_mac_work(struct kunit *test)
+ /* A complete SER (L1) recovery: DMA stopped and reset, tokens reclaimed,
+  * each handshake step reported, DMA and interrupts back on, the reset
+  * flags cleared, NAPI and the queues running again, beacons refreshed and
+- * both bands' watchdogs re-armed.
++ * both bands' watchdogs re-armed. A station held as dozing isn't any more: the
++ * event that it woke may have been in the rx rings the recovery reset.
+  */
+ static void mt7915_test_reset_work_ser(struct kunit *test)
+ {
+ 	struct mt7915_test_env *env = mt7915_test_hw_env(test);
+ 	struct mt7915_dev *dev = env->dev;
+ 	struct mt7915_phy *phy1 = mt7915_test_band1(test, env);
++	struct mt7915_sta *held = mt7915_test_sta(test, dev, 9, NULL);
++	struct mt7915_sta *awake = mt7915_test_sta(test, dev, 10, NULL);
+ 	struct sk_buff *skb;
+ 
++	set_bit(MT_WCID_FLAG_PS, &held->wcid.flags);
+ 	mt7915_test_rings(test, dev);
+ 	mt7915_test_token(test, dev, 0, &skb);
+ 	cancel_delayed_work_sync(&dev->mphy.mac_work);
+@@ -5477,6 +5481,8 @@ static void mt7915_test_reset_work_ser(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, mt7915_test_napi_enabled(
+ 			  &dev->mt76.napi[MT_RXQ_MAIN]));
+ 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &held->wcid.flags));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &awake->wcid.flags));
+ 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dev->mphy.mac_work));
+ 	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&phy1->mt76->mac_work));
+ 	cancel_delayed_work_sync(&phy1->mt76->mac_work);

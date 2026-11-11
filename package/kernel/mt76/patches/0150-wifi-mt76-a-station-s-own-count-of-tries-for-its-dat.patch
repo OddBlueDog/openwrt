@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:14:29 +0000
+Subject: [PATCH] wifi: mt76: a station's own count of tries for its data
+ frames
+
+How many times the hardware sends a data frame to one station before it
+gives up on it: wcid->tx_tries, 0 for the module's data_tx_count, set
+through the station's debugfs file tx_tries. For user space that judges
+links: fewer tries for a station whose frames mostly fail, so that they
+cost the other stations less air.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ mt76.h                  |  6 ++++++
+ mt76_connac_mac.c       |  6 ++++--
+ mt7915/debugfs.c        | 48 +++++++++++++++++++++++++++++++++++++++++
+ tests/connac-mac-test.c | 44 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 102 insertions(+), 2 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index 539dbfc2..45389146 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -424,6 +424,12 @@ struct mt76_wcid {
+ 	u32 tx_info;
+ 	bool sw_iv;
+ 
++	/* times a data frame to this station is sent before the hardware
++	 * gives up on it, 1-31; 0: the module's data_tx_count. For a station
++	 * whose link is poor: its frames then cost the others less air.
++	 */
++	u8 tx_tries;
++
+ 	struct list_head tx_list;
+ 	struct sk_buff_head tx_pending;
+ 	struct sk_buff_head tx_offchannel;
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index cdecfd39..b612abb8 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -504,7 +504,8 @@ mt76_connac2_mac_write_txwi_80211(struct mt76_dev *dev, __le32 *txwi,
+ /* How many times the hardware sends a data frame before it gives up on it.
+  * With the air busy, a frame can take most of its 15 tries, holding up the
+  * station's later frames; fewer tries give up sooner and leave the loss to
+- * TCP. Management frames, beacons and frames to the PS queue keep 15.
++ * TCP. Management frames, beacons and frames to the PS queue keep 15. A
++ * station can have a count of its own (wcid->tx_tries).
+  */
+ static unsigned int data_tx_count = 15;
+ module_param(data_tx_count, uint, 0644);
+@@ -555,7 +556,8 @@ void mt76_connac2_mac_write_txwi(struct mt76_dev *dev, __le32 *txwi,
+ 			mt76_connac_lmac_mapping(skb_get_queue_mapping(skb));
+ 		if (is_8023 ||
+ 		    ieee80211_is_data(((struct ieee80211_hdr *)skb->data)->frame_control))
+-			tx_count = clamp_val(READ_ONCE(data_tx_count), 1, 31);
++			tx_count = clamp_val(READ_ONCE(wcid->tx_tries) ?:
++					     READ_ONCE(data_tx_count), 1, 31);
+ 
+ 		/* mt7915 WA only counts WED path */
+ 		if (is_mt7915(dev) && mtk_wed_device_active(&dev->mmio.wed))
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 86f24ddf..6eb752cd 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1884,10 +1884,58 @@ mt7915_sta_tx_attempts_show(struct seq_file *s, void *data)
+ 
+ DEFINE_SHOW_ATTRIBUTE(mt7915_sta_tx_attempts);
+ 
++/* How many times a data frame to this station is sent before the hardware
++ * gives up on it, 1-31; 0 (the default) is the module's data_tx_count. The
++ * next frames built take it. For user space that judges links (MilkFlint's
++ * airtime service): fewer tries for a station whose frames mostly fail.
++ */
++static ssize_t
++mt7915_sta_tx_tries_read(struct file *file, char __user *ubuf, size_t count,
++			 loff_t *ppos)
++{
++	struct ieee80211_sta *sta = file->private_data;
++	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	char buf[8];
++	int n;
++
++	n = scnprintf(buf, sizeof(buf), "%u\n", READ_ONCE(msta->wcid.tx_tries));
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, n);
++}
++
++static ssize_t
++mt7915_sta_tx_tries_write(struct file *file, const char __user *ubuf,
++			  size_t count, loff_t *ppos)
++{
++	struct ieee80211_sta *sta = file->private_data;
++	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	u8 val;
++	int ret;
++
++	ret = kstrtou8_from_user(ubuf, count, 0, &val);
++	if (ret)
++		return ret;
++	if (val > 31)
++		return -EINVAL;
++
++	WRITE_ONCE(msta->wcid.tx_tries, val);
++
++	return count;
++}
++
++static const struct file_operations fops_sta_tx_tries = {
++	.read = mt7915_sta_tx_tries_read,
++	.write = mt7915_sta_tx_tries_write,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
+ void mt7915_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta, struct dentry *dir)
+ {
+ 	debugfs_create_file("fixed_rate", 0600, dir, sta, &fops_fixed_rate);
++	debugfs_create_file("tx_tries", 0600, dir, sta, &fops_sta_tx_tries);
+ 	debugfs_create_file("hw-queues", 0400, dir, sta, &mt7915_queues_fops);
+ 	debugfs_create_file("ps", 0400, dir, sta, &mt7915_sta_ps_fops);
+ 	debugfs_create_file("tx_attempts", 0400, dir, sta,
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 1453b25a..4b9f9652 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -606,6 +606,49 @@ static void mt76_connac_test_txwi_data_tx_count(struct kunit *test)
+ 	WRITE_ONCE(data_tx_count, old);
+ }
+ 
++/* A station's own count (wcid->tx_tries) goes before the module's, clamped
++ * the same way; 0 is the module's again, and the PS queue keeps 15.
++ */
++static void mt76_connac_test_txwi_sta_tx_tries(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_connac_test_dev(test);
++	struct ieee80211_sta *sta = mt76_connac_test_sta(test, 9);
++	struct ieee80211_sta *other = mt76_connac_test_sta(test, 10);
++	struct mt76_wcid *wcid = mt76_connac_test_wcid(sta);
++	unsigned int old = READ_ONCE(data_tx_count);
++	static const struct { u8 set; unsigned int want; } c[] = {
++		{ 2, 2 }, { 1, 1 }, { 6, 6 }, { 31, 31 }, { 40, 31 }, { 0, 9 },
++	};
++	struct sk_buff *skb;
++	__le32 txwi[16];
++	int i;
++
++	skb = mt76_connac_test_frame(test, MT76_CONNAC_TEST_QOS_DATA,
++				     mt76_connac_test_peer, 60);
++	skb_set_queue_mapping(skb, IEEE80211_AC_BE);
++	WRITE_ONCE(data_tx_count, 9);
++	for (i = 0; i < ARRAY_SIZE(c); i++) {
++		WRITE_ONCE(wcid->tx_tries, c[i].set);
++		mt76_connac2_mac_write_txwi(dev, txwi, skb, wcid, NULL, 7,
++					    MT_TXQ_BE, 0);
++		KUNIT_EXPECT_EQ_MSG(test, FIELD_GET(MT_TXD3_REM_TX_COUNT,
++						    mt76_connac_test_dw(txwi, 3)),
++				    c[i].want, "tx_tries %u", c[i].set);
++	}
++	/* another station isn't touched by it */
++	WRITE_ONCE(wcid->tx_tries, 2);
++	mt76_connac2_mac_write_txwi(dev, txwi, skb, mt76_connac_test_wcid(other),
++				    NULL, 7, MT_TXQ_BE, 0);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TXD3_REM_TX_COUNT,
++					mt76_connac_test_dw(txwi, 3)), 9);
++	/* nor the PS queue's frames */
++	mt76_connac2_mac_write_txwi(dev, txwi, skb, wcid, NULL, 7, MT_TXQ_PSD, 0);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TXD3_REM_TX_COUNT,
++					mt76_connac_test_dw(txwi, 3)), 15);
++	WRITE_ONCE(wcid->tx_tries, 0);
++	WRITE_ONCE(data_tx_count, old);
++}
++
+ /* A frame whose tx status we want: reported to the host, never in an
+  * A-MSDU; no-ack and power management queue variants.
+  */
+@@ -2726,6 +2769,7 @@ static struct kunit_case mt76_connac_mac_test_cases[] = {
+ 	KUNIT_CASE(mt76_connac_test_txwi_data),
+ 	KUNIT_CASE(mt76_connac_test_txwi_status),
+ 	KUNIT_CASE(mt76_connac_test_txwi_data_tx_count),
++	KUNIT_CASE(mt76_connac_test_txwi_sta_tx_tries),
+ 	KUNIT_CASE(mt76_connac_test_txwi_mgmt),
+ 	KUNIT_CASE(mt76_connac_test_txwi_band1),
+ 	KUNIT_CASE(mt76_connac_test_txwi_beacon),

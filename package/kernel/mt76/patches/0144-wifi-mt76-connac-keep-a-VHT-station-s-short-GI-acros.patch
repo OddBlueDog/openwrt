@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 20:46:36 +0000
+Subject: [PATCH] wifi: mt76: connac: keep a VHT station's short GI across tx
+ statuses
+
+A tx status reports the rate without its guard interval. For HT the
+short GI flag is carried over from the station's rate, as the station
+poll last read it from the WTBL, and for HE the GI is. For VHT the flags
+were set to RATE_INFO_FLAGS_VHT_MCS alone, so every status of a VHT
+station turned its rate to long GI until the next poll: the rate
+reported for it flipped between the two, and the airtime mac80211
+estimates from it for AQL was too long in between.
+
+mt76_connac_test_txs_modes.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ mt76_connac_mac.c       | 7 +++++++
+ tests/connac-mac-test.c | 5 +++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index d0d0f2da..cdecfd39 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -731,6 +731,13 @@ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 			return false;
+ 
+ 		rate.flags = RATE_INFO_FLAGS_VHT_MCS;
++		/*
++		 * The status has no guard interval: as for HT and HE, it stays
++		 * what the station poll last read, or every status would turn
++		 * a VHT station's rate to long GI until the next poll.
++		 */
++		if (wcid->rate.flags & RATE_INFO_FLAGS_SHORT_GI)
++			rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+ 		break;
+ 	case MT_PHY_TYPE_HE_SU:
+ 	case MT_PHY_TYPE_HE_EXT_SU:
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 854c55e5..1453b25a 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -1269,6 +1269,11 @@ static void mt76_connac_test_txs_modes(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, wcid->rate.bw, RATE_INFO_BW_160);
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bw[3], 1);
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_nss[2], 1);
++	/* its short GI, once the station poll has read it, stays as for HT */
++	wcid->rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
++	KUNIT_ASSERT_TRUE(test, mt76_connac2_mac_fill_txs(dev, wcid, txs));
++	KUNIT_EXPECT_EQ(test, wcid->rate.flags,
++			RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_SHORT_GI);
+ 	KUNIT_EXPECT_FALSE(test, mt76_connac2_mac_fill_txs(dev, wcid,
+ 		(__le32[8]){ mt76_connac_test_txs(MT_PHY_TYPE_VHT, 10, 1, 0,
+ 						  0) }));
