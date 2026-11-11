@@ -1,4 +1,4 @@
-import { ActivityIcon, ArrowDownIcon, ArrowUpIcon, CpuIcon, GaugeIcon, InfoIcon, TriangleAlertIcon } from 'lucide-react';
+import { ActivityIcon, ArrowDownIcon, ArrowUpIcon, CpuIcon, GaugeIcon, InfoIcon, SlidersHorizontalIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, useCallback, useEffect, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
@@ -14,149 +14,34 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { type NetworkLive, queueKey, useNetworkLive } from '@/hooks/use-network-live';
 import { getDevices, getInterfaces } from '@/lib/api/network';
 import type { CakeQdisc, CakeTin } from '@/lib/api/stats';
-import { bool, type Change, getConfig, type Section, sectionChanges, str } from '@/lib/api/uci';
+import { getConfig } from '@/lib/api/uci';
 import { formatBitrate, formatNumber } from '@/lib/format';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
-import { ACK_FILTER, ACK_FILTER_RATIO, type AckFilter, ackFilterOf, suggestsAckFilter } from './ack-filter';
-import { type SqmDscpOption, sqmDscpOptions } from './dscp';
-import { GSO, optValue, takesWhole, type Whole, wholeSetting, withOpts, words } from './gso';
-import { MULTI_QUEUE_KBIT, type MultiQueue, multiQueueOf, multiQueueValue, usesMultiQueue } from './multi-queue';
-
-// Link-layer presets: how much each packet grows on the wire, so CAKE's
-// shaping matches what the line really carries. mpu (sqm's tcMPU) is the
-// smallest frame the line sends, as in CAKE's own ethernet and docsis
-// keywords; ATM's cells already set ADSL's. VDSL2 adds CAKE's ptm keyword
-// (sqm has no option for it) for its 64/65 encoding.
-interface LinkPresetDef {
-  label: string;
-  linklayer: string;
-  overhead: string;
-  mpu?: string;
-  ptm?: boolean;
-}
-const linkPresets = {
-  none: { label: 'No compensation', linklayer: 'none', overhead: '0' },
-  ethernet: { label: 'Fibre / Ethernet', linklayer: 'ethernet', overhead: '44', mpu: '84' },
-  docsis: { label: 'Cable (DOCSIS)', linklayer: 'ethernet', overhead: '18', mpu: '64' },
-  vdsl: { label: 'VDSL2 (PTM)', linklayer: 'ethernet', overhead: '34', mpu: '68', ptm: true },
-  adsl: { label: 'ADSL (ATM)', linklayer: 'atm', overhead: '44' },
-} satisfies Record<string, LinkPresetDef>;
-type LinkPreset = keyof typeof linkPresets;
-
-// CAKE's rtt, the round trip it tunes for: its queues aim for a twentieth
-// of it, and it marks or drops sooner when it's shorter. Senders that slow
-// down for that keep shorter queues, for some speed; small flows go first
-// either way. Other values (LuCI) show as Custom. Set in both directions'
-// opts.
-const latencyTargets = {
-  standard: { label: 'Standard (100 ms)', rtt: undefined },
-  low: { label: 'Low (50 ms)', rtt: '50ms' },
-} as const;
-type LatencyTarget = keyof typeof latencyTargets;
-// rtt, and CAKE's named rtt presets
-const RTT = ['rtt', 'datacentre', 'lan', 'metro', 'regional', 'internet', 'oceanic', 'satellite', 'interplanetary'];
-
-/** a direction's rtt setting: "50ms" for rtt 50ms, a preset's name, or undefined for CAKE's default */
-function rttOf(opts: string | undefined): string | undefined {
-  return optValue(opts, 'rtt') ?? words(opts).find((w) => RTT.includes(w));
-}
-
-// The upload queue's memory limit (CAKE's memlimit in eqdisc_opts). CAKE's
-// own is four round trips at the upload rate, at least 4 MiB: a fast
-// device starting an upload can fill that before CAKE drops anything.
-// Low allows one 100 ms round trip of the rate, at least 1 MiB, so the
-// burst is cut sooner; the drops land on the flow that overshot.
-type UploadMemory = 'auto' | 'low';
-const LOW_MEMLIMIT_FLOOR = 1 << 20;
-
-/** Low's memlimit in bytes for an upload speed in kbit/s */
-function lowMemlimit(uploadKbit: number): number {
-  return Math.max(Math.round((uploadKbit * 1000) / 8 / 10), LOW_MEMLIMIT_FLOOR);
-}
-
-// CAKE keywords this page manages in SQM's extra options for each direction
-// (iqdisc_opts, eqdisc_opts); any others, set in LuCI, are kept.
-const FAIR_INGRESS = ['nat', 'dual-dsthost', 'ingress'];
-const FAIR_EGRESS = ['nat', 'dual-srchost'];
-// Whether CAKE takes GRO packets whole (no-split-gso) goes with the speed,
-// unless Performance Tuning sets it (milkflint.gro.whole): ./gso.ts.
-
-interface SqmForm {
-  section: string | undefined;
-  enabled: boolean;
-  device: string;
-  downloadMbit: string;
-  uploadMbit: string;
-  prioritise: boolean;
-  link: LinkPreset | 'custom';
-  latency: LatencyTarget | 'custom';
-  uploadMemory: UploadMemory | 'custom';
-  ackFilter: AckFilter;
-  perDevice: boolean;
-  /** multi-queue CAKE for the download: with the speed, or always, or never (./multi-queue.ts) */
-  multiQueue: MultiQueue;
-  /** Downloads get back the DSCP their connection sends with (milkflint.cake.dscp_restore) */
-  restoreDscp: boolean;
-  offloadOff: boolean;
-}
-
-interface SqmData {
-  form: SqmForm;
-  devices: string[];
-  wanDevice: string | undefined;
-  offloading: { section: string; software: boolean; hardware: boolean } | undefined;
-  installed: boolean;
-  iqdiscOpts: string | undefined;
-  eqdiscOpts: string | undefined;
-  milkflint: Section[];
-  /** sqm's options for DSCP on the download, as set */
-  squash: Record<SqmDscpOption, string | undefined>;
-  /** sqm's tcMPU, unset when a preset doesn't use one */
-  mpu: string | undefined;
-  /** Performance Tuning's choice of whether CAKE takes GRO packets whole */
-  whole: Whole;
-}
-
-function presetOf(queue: Section | undefined): LinkPreset | 'custom' {
-  const linklayer = str(queue, 'linklayer') ?? 'none';
-  const overhead = str(queue, 'overhead') ?? '0';
-  const mpu = str(queue, 'tcMPU');
-  const iq = words(str(queue, 'iqdisc_opts'));
-  const eq = words(str(queue, 'eqdisc_opts'));
-  const ptm = iq.includes('ptm') && eq.includes('ptm');
-  if (ptm !== (iq.includes('ptm') || eq.includes('ptm'))) return 'custom';
-  for (const [key, p] of Object.entries(linkPresets) as [LinkPreset, LinkPresetDef][]) {
-    if (p.linklayer !== linklayer) continue;
-    if (p.linklayer === 'none') return ptm ? 'custom' : key;
-    if (p.overhead !== overhead) continue;
-    // the presets used to set only these two: a section without mpu and
-    // ptm still counts as its preset, and saving adds them
-    if (mpu === undefined && !ptm) return key;
-    if ((mpu ?? '0') === (p.mpu ?? '0') && ptm === (p.ptm === true)) return key;
-  }
-  return 'custom';
-}
-
-function latencyOf(iqdiscOpts: string | undefined, eqdiscOpts: string | undefined): LatencyTarget | 'custom' {
-  const rtt = rttOf(iqdiscOpts);
-  if (rtt !== rttOf(eqdiscOpts)) return 'custom';
-  const found = Object.entries(latencyTargets).find(([, t]) => t.rtt === rtt);
-  return found === undefined ? 'custom' : (found[0] as LatencyTarget);
-}
-
-function uploadMemoryOf(eqdiscOpts: string | undefined, uploadKbit: number): UploadMemory | 'custom' {
-  const limit = optValue(eqdiscOpts, 'memlimit');
-  if (limit === undefined) return 'auto';
-  return limit === String(lowMemlimit(uploadKbit)) ? 'low' : 'custom';
-}
+import { ACK_FILTER_RATIO, type AckFilter, suggestsAckFilter } from './ack-filter';
+import { advancedData } from './advanced';
+import { AdvancedSheet } from './advanced-sheet';
+import {
+  type LatencyTarget,
+  type LinkPreset,
+  latencyTargets,
+  linkPresets,
+  type SqmData,
+  type SqmForm,
+  sqmData,
+  toChanges,
+  type UploadMemory,
+  validate,
+} from './model';
+import { MULTI_QUEUE_KBIT, type MultiQueue, usesMultiQueue } from './multi-queue';
 
 async function loadSqm(): Promise<SqmData> {
   const [sqm, firewall, interfaces, devices, milkflint] = await Promise.all([
@@ -167,143 +52,7 @@ async function loadSqm(): Promise<SqmData> {
     getConfig('milkflint').catch(() => undefined),
   ]);
   const wan = interfaces.find((i) => i.interface === 'wan');
-  const wanDevice = wan?.l3_device ?? wan?.device;
-  // the internet port's queue: Guest Wi-Fi's speed limit is one too
-  const queue = sqm?.find((s) => s['.type'] === 'queue' && !isGuestShaper(str(s, 'interface')) && !isVpnShaper(str(s, 'interface')));
-  const defaults = firewall.find((s) => s['.type'] === 'defaults');
-  const cake = milkflint?.find((s) => s['.name'] === 'cake');
-
-  const form: SqmForm = {
-    section: queue?.['.name'],
-    enabled: bool(queue, 'enabled'),
-    device: str(queue, 'interface') ?? wanDevice ?? 'eth1',
-    downloadMbit: String(Number(str(queue, 'download') ?? '0') / 1000),
-    uploadMbit: String(Number(str(queue, 'upload') ?? '0') / 1000),
-    prioritise: str(queue, 'script') === 'layer_cake.qos',
-    link: presetOf(queue),
-    latency: latencyOf(str(queue, 'iqdisc_opts'), str(queue, 'eqdisc_opts')),
-    uploadMemory: uploadMemoryOf(str(queue, 'eqdisc_opts'), Number(str(queue, 'upload') ?? '0')),
-    ackFilter: ackFilterOf(words(str(queue, 'eqdisc_opts'))),
-    perDevice: words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost'),
-    multiQueue: multiQueueOf(
-      str(cake, 'multi_queue'),
-      queue === undefined ? undefined : bool(queue, 'use_mq'),
-      Number(str(queue, 'download') ?? '0'),
-    ),
-    restoreDscp: str(cake, 'dscp_restore') === '1',
-    offloadOff: false,
-  };
-  return {
-    form,
-    devices: Object.keys(devices).filter((d) => d !== 'lo' && !d.startsWith('ifb') && !d.startsWith('br-') && !d.startsWith('phy')),
-    wanDevice,
-    offloading:
-      defaults === undefined
-        ? undefined
-        : {
-            section: defaults['.name'],
-            software: bool(defaults, 'flow_offloading'),
-            hardware: bool(defaults, 'flow_offloading_hw'),
-          },
-    installed: sqm !== undefined,
-    iqdiscOpts: str(queue, 'iqdisc_opts'),
-    eqdiscOpts: str(queue, 'eqdisc_opts'),
-    mpu: str(queue, 'tcMPU'),
-    whole: wholeSetting(str(milkflint?.find((s) => s['.name'] === 'gro'), 'whole')),
-    milkflint: milkflint ?? [],
-    squash: { squash_dscp: str(queue, 'squash_dscp'), squash_ingress: str(queue, 'squash_ingress') },
-  };
-}
-
-function validate(f: SqmForm): Partial<Record<'downloadMbit' | 'uploadMbit', string>> {
-  const e: Partial<Record<'downloadMbit' | 'uploadMbit', string>> = {};
-  if (!f.enabled) return e;
-  for (const key of ['downloadMbit', 'uploadMbit'] as const) {
-    const v = Number(f[key]);
-    if (!Number.isFinite(v) || v <= 0) e[key] = 'Enter your line speed in Mbit/s, e.g. 450.';
-    else if (v > 10_000) e[key] = 'That’s more than 10 Gbit/s.';
-  }
-  return e;
-}
-
-function toChanges(f: SqmForm, data: SqmData): Change[] {
-  const preset: LinkPresetDef | undefined = f.link === 'custom' ? undefined : linkPresets[f.link];
-  const download = Math.round(Number(f.downloadMbit) * 1000);
-  const upload = Math.round(Number(f.uploadMbit) * 1000);
-  const values: Record<string, string> = {
-    enabled: f.enabled ? '1' : '0',
-    interface: f.device,
-    download: String(download),
-    upload: String(upload),
-    qdisc: 'cake',
-    script: f.prioritise ? 'layer_cake.qos' : 'piece_of_cake.qos',
-    use_mq: usesMultiQueue(download, f.multiQueue) ? '1' : '0',
-    ...(preset === undefined ? {} : { linklayer: preset.linklayer, overhead: preset.overhead }),
-    // LuCI keeps tcMPU only in its advanced link-layer mode
-    ...(preset?.mpu === undefined ? {} : { tcMPU: preset.mpu, linklayer_advanced: '1' }),
-  };
-  // the keywords this page sets in both directions' opts; Custom keeps LuCI's
-  const both = { managed: [] as string[], wanted: [] as string[] };
-  if (preset !== undefined) {
-    both.managed.push('ptm');
-    if (preset.ptm === true) both.wanted.push('ptm');
-  }
-  if (f.latency !== 'custom') {
-    both.managed.push(...RTT);
-    const rtt = latencyTargets[f.latency].rtt;
-    if (rtt !== undefined) both.wanted.push('rtt', rtt);
-  }
-  const memory = { managed: f.uploadMemory === 'custom' ? [] : ['memlimit'], wanted: [] as string[] };
-  if (f.uploadMemory === 'low') memory.wanted.push('memlimit', String(lowMemlimit(upload)));
-  const ackFilter = f.ackFilter === 'custom' ? [] : ACK_FILTER;
-  const opts = {
-    iqdisc_opts: withOpts(
-      data.iqdiscOpts,
-      [...FAIR_INGRESS, ...GSO, ...both.managed],
-      [...(f.perDevice ? FAIR_INGRESS : []), ...(takesWhole(download, data.whole) ? ['no-split-gso'] : []), ...both.wanted],
-    ),
-    eqdisc_opts: withOpts(
-      data.eqdiscOpts,
-      [...FAIR_EGRESS, ...both.managed, ...memory.managed, ...ackFilter],
-      [...(f.perDevice ? FAIR_EGRESS : []), ...both.wanted, ...memory.wanted, ...(f.ackFilter === 'on' ? ['ack-filter'] : [])],
-    ),
-  };
-  const unset: string[] = [];
-  for (const [key, value] of Object.entries(opts)) {
-    if (value !== '') values[key] = value;
-    else unset.push(key);
-  }
-  // LuCI shows these options only in its advanced mode
-  if (unset.length < 2) Object.assign(values, { qdisc_advanced: '1', qdisc_really_really_advanced: '1' });
-  const dscp = sqmDscpOptions(f.restoreDscp, f.prioritise, data.form.restoreDscp);
-  Object.assign(values, dscp.set);
-  const changes: Change[] =
-    f.section === undefined
-      ? [{ op: 'add', config: 'sqm', type: 'queue', name: 'wan', values }]
-      : [{ op: 'set', config: 'sqm', section: f.section, values }];
-  const wasSet = unset.filter((key) => (key === 'iqdisc_opts' ? data.iqdiscOpts : data.eqdiscOpts) !== undefined);
-  wasSet.push(...dscp.unset.filter((key) => data.squash[key] !== undefined));
-  // a preset without an mpu: sqm's default (none)
-  if (preset !== undefined && preset.mpu === undefined && data.mpu !== undefined) wasSet.push('tcMPU');
-  if (wasSet.length > 0 && f.section !== undefined) {
-    changes.push({ op: 'unset', config: 'sqm', section: f.section, options: wasSet });
-  }
-  changes.push(
-    ...sectionChanges('milkflint', data.milkflint, 'cake', {
-      dscp_restore: f.restoreDscp ? '1' : undefined,
-      multi_queue: multiQueueValue(f.multiQueue),
-    }),
-  );
-  // hardware offloading only: CAKE still shapes software-offloaded packets
-  if (f.offloadOff && data.offloading !== undefined) {
-    changes.push({
-      op: 'set',
-      config: 'firewall',
-      section: data.offloading.section,
-      values: { flow_offloading_hw: '0' },
-    });
-  }
-  return changes;
+  return sqmData({ sqm, firewall, milkflint, wanDevice: wan?.l3_device ?? wan?.device, devices: Object.keys(devices) });
 }
 
 const tinNames: Record<string, string[]> = {
@@ -544,6 +293,32 @@ function Processors({ live }: { live: { data: Live | undefined; error: unknown }
   );
 }
 
+// The header's way into the advanced sheet; why it can't open, when it can't
+function AdvancedButton({ why, onClick }: { why: string | undefined; onClick: () => void }): ReactElement {
+  // aria-disabled rather than disabled: a disabled button gets no pointer events, so no tooltip
+  const button = (
+    <Button
+      variant="outline"
+      size="sm"
+      aria-disabled={why !== undefined}
+      className={cn(why !== undefined && 'cursor-not-allowed opacity-50')}
+      onClick={() => {
+        if (why === undefined) onClick();
+      }}
+    >
+      <SlidersHorizontalIcon />
+      Advanced
+    </Button>
+  );
+  if (why === undefined) return button;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent>{why}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 export function SqmPage(): ReactElement {
   const { data, error, loading, reload } = useLoad(loadSqm);
   const [edit, setEdit] = useState<SqmForm>();
@@ -552,6 +327,7 @@ export function SqmPage(): ReactElement {
     reload();
   }, [reload]);
   const { state, apply } = useApply(onApplied);
+  const [advanced, setAdvanced] = useState(false);
   const live = useLive();
   const form = edit ?? data?.form;
   const errors = form === undefined ? {} : validate(form);
@@ -587,7 +363,37 @@ export function SqmPage(): ReactElement {
       <PageHeader
         title="Smart Queue"
         description="Keeps latency low when the line is busy: SQM with CAKE shapes traffic just below your line speed, so queues build on the router, where CAKE keeps them short and fair."
+        actions={
+          <AdvancedButton
+            why={
+              data === undefined
+                ? 'Loading…'
+                : data.queue === undefined
+                  ? 'Turn Smart Queue on and save first.'
+                  : dirty
+                    ? 'Save or revert the changes on this page first.'
+                    : state.phase === 'applying'
+                      ? 'Saving…'
+                      : undefined
+            }
+            onClick={() => {
+              setAdvanced(true);
+            }}
+          />
+        }
       />
+      {advanced && data?.queue !== undefined && (
+        <AdvancedSheet
+          data={advancedData(data.queue, data.milkflint)}
+          onClose={() => {
+            setAdvanced(false);
+          }}
+          onSave={(changes) => {
+            setAdvanced(false);
+            void apply(changes);
+          }}
+        />
+      )}
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
         {error !== undefined && data === undefined ? (
@@ -736,7 +542,7 @@ export function SqmPage(): ReactElement {
                             {p.linklayer !== 'none' && ` · ${p.overhead} bytes`}
                           </SelectItem>
                         ))}
-                        {form.link === 'custom' && <SelectItem value="custom">Custom (set in LuCI)</SelectItem>}
+                        {form.link === 'custom' && <SelectItem value="custom">Custom: see Advanced</SelectItem>}
                       </SelectContent>
                     </Select>
                   </Field>
@@ -760,7 +566,7 @@ export function SqmPage(): ReactElement {
                             {t.label}
                           </SelectItem>
                         ))}
-                        {form.latency === 'custom' && <SelectItem value="custom">Custom (set in LuCI)</SelectItem>}
+                        {form.latency === 'custom' && <SelectItem value="custom">Custom: see Advanced</SelectItem>}
                       </SelectContent>
                     </Select>
                   </Field>
@@ -785,7 +591,7 @@ export function SqmPage(): ReactElement {
                       <SelectContent>
                         <SelectItem value="auto">Automatic</SelectItem>
                         <SelectItem value="low">Low</SelectItem>
-                        {form.uploadMemory === 'custom' && <SelectItem value="custom">Custom (set in LuCI)</SelectItem>}
+                        {form.uploadMemory === 'custom' && <SelectItem value="custom">Custom: see Advanced</SelectItem>}
                       </SelectContent>
                     </Select>
                   </Field>
@@ -807,7 +613,7 @@ export function SqmPage(): ReactElement {
                       <SelectContent>
                         <SelectItem value="off">Off</SelectItem>
                         <SelectItem value="on">On</SelectItem>
-                        {form.ackFilter === 'custom' && <SelectItem value="custom">Aggressive (set in LuCI)</SelectItem>}
+                        {form.ackFilter === 'custom' && <SelectItem value="custom">Aggressive: see Advanced</SelectItem>}
                       </SelectContent>
                     </Select>
                   </Field>

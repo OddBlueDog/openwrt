@@ -24,7 +24,7 @@ import { formatNumber, formatPercent } from '@/lib/format';
 import { href } from '@/lib/router';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
-import { cakeTargetMs, GSO, takesWhole, type Whole, wholeSetting, wholeValue, withOpts, words } from '../sqm/gso';
+import { cakeTargetMs, GSO, takesWhole, type Whole, wholeOf, wholeValue, withOpts, words } from '../sqm/gso';
 import { multiQueueValue, usesMultiQueue } from '../sqm/multi-queue';
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
@@ -206,7 +206,8 @@ async function loadTuning(): Promise<TuningData> {
       gro: groMode === 'fraglist' || groMode === 'plain' || groMode === 'off' ? groMode : 'auto',
       udpFwd: udpFwd === '1' ? 'on' : udpFwd === '0' ? 'off' : 'auto',
       groMax: /^\d{4,5}$/.test(groMax) ? groMax : '',
-      whole: wholeSetting(str(gro, 'whole')),
+      // what the queue does, when LuCI changed it (../sqm/gso.ts)
+      whole: wholeOf(str(gro, 'whole'), queue === undefined ? null : str(queue, 'iqdisc_opts'), Number(str(queue, 'download') ?? '0')),
       offload: bool(fwDefaults, 'flow_offloading'),
       ...readKnobs((name, option) => str(section(name), option)),
     },

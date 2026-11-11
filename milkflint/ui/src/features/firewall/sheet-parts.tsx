@@ -1,5 +1,6 @@
-// What the Firewall page's side sheets share: labels that name the UCI
-// option a field sets, and the section as the file will hold it.
+// What the side sheets share (the Firewall page's, Smart Queue's advanced
+// one): labels that name the UCI option a field sets, and the section as
+// the file will hold it.
 import { CheckIcon, CopyIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -21,13 +22,14 @@ export function FieldLabel({ htmlFor, label, opt }: { htmlFor?: string; label: s
 
 const quote = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
 
-/** The section as /etc/config/firewall will hold it once the changes are applied. */
-function previewLines(type: string, original: Section | undefined, changes: readonly Change[]): string[] {
+/** The section as /etc/config/<config> will hold it once the changes are applied. */
+function previewLines(config: string, type: string, original: Section | undefined, changes: readonly Change[]): string[] {
   const merged = new Map<string, string | string[]>();
   for (const [k, v] of Object.entries(original ?? {})) if (!k.startsWith('.') && v !== undefined && typeof v !== 'boolean' && typeof v !== 'number') merged.set(k, v);
   // only this section's: a sheet's changes can touch others (a zone's forwardings)
   const name = original?.['.name'];
   for (const c of changes) {
+    if (c.config !== config) continue;
     if (c.op === 'add' && name === undefined && c.type === type) for (const [k, v] of Object.entries(c.values)) merged.set(k, v);
     else if (c.op === 'set' && c.section === name) for (const [k, v] of Object.entries(c.values)) merged.set(k, v);
     else if (c.op === 'unset' && c.section === name) for (const k of c.options) merged.delete(k);
@@ -56,13 +58,23 @@ function copyText(text: string): void {
 }
 
 /** The section a sheet edits, as it will be in the file once saved, with a copy button. */
-export function UciPreview({ type, original, changes }: { type: string; original: Section | undefined; changes: readonly Change[] }): ReactElement {
+export function UciPreview({
+  config = 'firewall',
+  type,
+  original,
+  changes,
+}: {
+  config?: string;
+  type: string;
+  original: Section | undefined;
+  changes: readonly Change[];
+}): ReactElement {
   const [copied, setCopied] = useState(false);
-  const lines = previewLines(type, original, changes);
+  const lines = previewLines(config, type, original, changes);
   return (
     <div className="overflow-hidden rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-3 py-1.5">
-        <span className="font-mono text-xs text-muted-foreground">/etc/config/firewall</span>
+        <span className="font-mono text-xs text-muted-foreground">/etc/config/{config}</span>
         <Button
           variant="ghost"
           size="icon"

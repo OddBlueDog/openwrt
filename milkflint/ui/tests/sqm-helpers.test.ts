@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { delayMs, directionsOf, summarize } from '../src/features/sqm/cake.ts';
-import { cakeTargetMs, GSO, optValue, takesWhole, wholeSetting, wholeValue, withOpts } from '../src/features/sqm/gso.ts';
+import { cakeTargetMs, GSO, optValue, takesWhole, wholeOf, wholeSetting, wholeValue, withOpts } from '../src/features/sqm/gso.ts';
 import { MULTI_QUEUE_KBIT, multiQueueOf, multiQueueSetting, multiQueueValue, usesMultiQueue } from '../src/features/sqm/multi-queue.ts';
 import type { CakeQdisc } from '../src/lib/api/stats.ts';
 
@@ -67,7 +67,7 @@ test('multi-queue CAKE goes with the download speed, unless chosen', () => {
   assert.equal(usesMultiQueue(MULTI_QUEUE_KBIT - 1, 'auto'), false);
   assert.equal(usesMultiQueue(MULTI_QUEUE_KBIT, 'auto'), true);
   assert.equal(usesMultiQueue(20_000, 'on'), true);
-  assert.equal(usesMultiQueue(900_000, 'off'), false);
+  assert.equal(usesMultiQueue(800_000, 'off'), false);
   for (const c of ['auto', 'on', 'off'] as const) assert.equal(multiQueueSetting(multiQueueValue(c)), c);
   assert.equal(multiQueueSetting(undefined), 'auto');
   assert.equal(multiQueueSetting('yes'), 'auto');
@@ -76,7 +76,7 @@ test('multi-queue CAKE goes with the download speed, unless chosen', () => {
 test('the multi-queue choice shown is what the queue does', () => {
   // no queue yet: the setting
   assert.equal(multiQueueOf(undefined, undefined, 0), 'auto');
-  assert.equal(multiQueueOf('0', undefined, 900_000), 'off');
+  assert.equal(multiQueueOf('0', undefined, 800_000), 'off');
   // use_mq as the setting gives at this speed: the setting
   assert.equal(multiQueueOf(undefined, true, 750_000), 'auto');
   assert.equal(multiQueueOf(undefined, false, 85_000), 'auto');
@@ -135,4 +135,16 @@ test('one direction’s figures: added over queues, delays from the busiest tin 
   assert.equal(s.flows, 14);
   assert.equal(delayMs(undefined), '—');
   assert.equal(delayMs(1500), '1.5 ms');
+});
+
+test('the GRO choice to show: the setting, or what the queue does when LuCI changed it', () => {
+  assert.equal(wholeOf(undefined, 'nat no-split-gso', 800_000), 'auto');
+  assert.equal(wholeOf(undefined, 'nat', 300_000), 'auto');
+  // taken out, or put in, by hand
+  assert.equal(wholeOf(undefined, 'nat', 800_000), 'off');
+  assert.equal(wholeOf(undefined, 'no-split-gso', 300_000), 'on');
+  assert.equal(wholeOf('1', 'nat', 300_000), 'off');
+  assert.equal(wholeOf('0', 'nat', 800_000), 'off');
+  // no queue: the setting
+  assert.equal(wholeOf('1', null, 0), 'on');
 });

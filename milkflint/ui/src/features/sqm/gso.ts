@@ -29,6 +29,20 @@ export function takesWhole(downloadKbit: number, whole: Whole): boolean {
   return whole === 'auto' ? downloadKbit >= NO_SPLIT_GSO_KBIT : whole === 'on';
 }
 
+/**
+ * The choice to show for a queue: the setting, unless the download's opts
+ * don't do what it gives at this speed (no-split-gso added or taken out in
+ * LuCI, say), which then shows as it is, as multi-queue does. A speed change
+ * leaves such a queue as it is. iqdiscOpts null: no queue.
+ */
+export function wholeOf(setting: string | undefined, iqdiscOpts: string | undefined | null, downloadKbit: number): Whole {
+  const choice = wholeSetting(setting);
+  if (iqdiscOpts === null) return choice;
+  const whole = words(iqdiscOpts).includes('no-split-gso');
+  if (takesWhole(downloadKbit, choice) === whole) return choice;
+  return whole ? 'on' : 'off';
+}
+
 export const words = (opts: string | undefined): string[] => (opts ?? '').split(/\s+/).filter((w) => w !== '');
 
 /** CAKE keywords followed by a value (rtt 50ms): a managed one goes with its value */
