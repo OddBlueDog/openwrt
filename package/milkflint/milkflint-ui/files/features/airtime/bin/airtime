@@ -491,7 +491,13 @@ function pass(aps, radio_of, on_bands, known, now, dry, watched, wifi) {
 		row.other = (busy == null) ? null : max(0.0, busy - ((sent != null) ? sent + heard : ours));
 		// with what other networks and noise took of that second, where the
 		// channel was read (null otherwise: only while the page is looked at)
-		push(r.history, { t: int(now), ...by_class, other: row.other });
+		// (a second already there, from a pass that came early, is replaced)
+		const sec = { t: int(now), ...by_class, other: row.other };
+		const n = length(r.history);
+		if (n && r.history[n - 1].t == sec.t)
+			r.history[n - 1] = sec;
+		else
+			push(r.history, sec);
 		while (length(r.history) > HISTORY)
 			shift(r.history);
 		row.history = r.history;
@@ -517,6 +523,15 @@ function save(state) {
 function now_s() {
 	const c = clock();
 	return c[0] + c[1] / 1e9;
+}
+
+// ms to just after the next whole second by the clock: the passes are a
+// second apart by the clock, each in a second of its own, rather than a
+// second after the last one ended, which drifted and skipped a second of
+// the history now and then
+function to_next_second() {
+	const c = clock();
+	return 1000 - int(c[1] / 1e6) + 20;
 }
 
 // ---- main ------------------------------------------------------------------
@@ -585,7 +600,7 @@ function tick() {
 		save(pass(access_points(conn), radio_of, on, known, now_s(), false, watched, wifi));
 		conn.disconnect();
 	}
-	uloop.timer(1000, tick);
+	uloop.timer(to_next_second(), tick);
 }
 
 // procd stops this with TERM: every device back on the kernel's defaults
