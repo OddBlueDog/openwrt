@@ -510,13 +510,40 @@ export function airtimeSecondTotal(s: AirtimeSecond): number {
   return AIRTIME_CLASSES.reduce((n, cls) => n + Math.max(0, s[cls]), 0);
 }
 
+/** A column of the strip: the second it stands for (the router's epoch second its figures end at), and them if it was measured */
+export interface AirtimeColumn<S> {
+  t: number;
+  second: S | undefined;
+}
+
 /**
- * The strip's columns, oldest first: the last `slots` seconds, with empty
- * columns in front while there are fewer, so the newest is always the last.
+ * The strip's columns, oldest first: the `slots` seconds up to the newest one
+ * measured, each second's figures placed by their own time (`t`), so a second
+ * the router didn't measure is an empty column where it was, rather than every
+ * older second moving up one. Before the history starts, empty columns too.
  */
-export function airtimeColumns<S>(history: readonly S[], slots: number): (S | undefined)[] {
-  const recent = slots > 0 ? history.slice(-slots) : [];
-  return [...Array.from({ length: slots - recent.length }, () => undefined), ...recent];
+export function airtimeColumns<S extends { t: number }>(history: readonly S[], slots: number): AirtimeColumn<S>[] {
+  const last = history.at(-1);
+  if (last === undefined || slots <= 0) return Array.from({ length: Math.max(0, slots) }, (_, i) => ({ t: i - slots + 1, second: undefined }));
+  const end = Math.round(last.t);
+  const out: AirtimeColumn<S>[] = Array.from({ length: slots }, (_, i) => ({ t: end - slots + 1 + i, second: undefined }));
+  for (const s of history) {
+    const i = Math.round(s.t) - (end - slots + 1);
+    if (i >= 0 && i < slots) {
+      const column = out[i];
+      if (column !== undefined) column.second = s;
+    }
+  }
+  return out;
+}
+
+/**
+ * How many whole seconds ago a column's second ended, by the router's clock
+ * when it answered (`now`, epoch seconds). Where the reply has no clock (0),
+ * the column's place from the newest instead.
+ */
+export function airtimeColumnAgo(t: number, now: number, newest: number): number {
+  return Math.max(0, Math.round(now > 0 ? now - t : newest - t));
 }
 
 /**

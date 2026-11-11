@@ -23,6 +23,7 @@ import {
   airtimeChainsWords,
   airtimeChannelsLabel,
   airtimeClassHint,
+  airtimeColumnAgo,
   airtimeColumns,
   airtimeDoing,
   AIRTIME_AUTO_LABELS,
@@ -401,13 +402,19 @@ function StripMarks({ side }: { side: 'left' | 'right' }): ReactElement {
  * The last minute, a column a second: how much of the air the band's devices
  * took, split by class, with what other networks and noise took on top. Full
  * height is all of the air, with marks at each quarter on both sides; the
- * column under the pointer shows that second in full, like the bar above.
+ * column under the pointer shows that second in full, like the bar above,
+ * and how long ago it was by the router's clock (`now`). Each second is
+ * placed by its own time, so one the router didn't measure is a gap.
  */
-function LastMinute({ band, history }: { band: string; history: AirtimeRadio['history'] }): ReactElement {
+function LastMinute({ band, history, now }: { band: string; history: AirtimeRadio['history']; now: number }): ReactElement {
   const [pointed, setPointed] = useState<number>();
   const columns = airtimeColumns(history, SECONDS);
-  const peak = Math.max(0, ...history.slice(-SECONDS).map(airtimeSecondTotal));
-  const second = pointed === undefined ? undefined : columns[pointed];
+  const newest = columns.at(-1)?.t ?? 0;
+  const peak = Math.max(0, ...columns.map((c) => (c.second === undefined ? 0 : airtimeSecondTotal(c.second))));
+  const column = pointed === undefined ? undefined : columns[pointed];
+  const second = column?.second;
+  // a gap within the history: the router didn't measure that second
+  const gap = column !== undefined && second === undefined && history.length > 0 && column.t > Math.round(history[0]?.t ?? Infinity);
   const parts = second === undefined ? [] : airtimeSecondParts(second);
   // How far along the strip the pointed column is, in percent. The breakdown
   // sits above it and is shifted left by as much of its own width, so it
@@ -430,10 +437,10 @@ function LastMinute({ band, history }: { band: string; history: AirtimeRadio['hi
             {AIRTIME_STRIP_MARKS.filter((mark) => mark < 1).map((mark) => (
               <div key={mark} aria-hidden className="pointer-events-none absolute inset-x-0 border-t border-foreground/10" style={{ bottom: `${String(mark * 100)}%` }} />
             ))}
-            {columns.map((s, i) => (
+            {columns.map(({ second: s }, i) => (
               <div
                 key={i}
-                className={cn('relative flex h-full min-w-0 flex-1 flex-col-reverse', pointed === i && s !== undefined && 'bg-foreground/10')}
+                className={cn('relative flex h-full min-w-0 flex-1 flex-col-reverse', pointed === i && (s !== undefined || gap) && 'bg-foreground/10')}
                 onPointerEnter={() => {
                   setPointed(i);
                 }}
@@ -449,13 +456,14 @@ function LastMinute({ band, history }: { band: string; history: AirtimeRadio['hi
               </div>
             ))}
           </div>
-          {second !== undefined && pointed !== undefined && (
+          {column !== undefined && (second !== undefined || gap) && (
             <div
               className="pointer-events-none absolute bottom-full z-10 mb-1.5 rounded-md border bg-popover px-2.5 py-1.5 text-xs whitespace-nowrap text-popover-foreground shadow-md"
               style={{ left: `${String(along)}%`, transform: `translateX(-${String(along)}%)` }}
             >
-              <p className="font-medium">{airtimeAgo(SECONDS - 1 - pointed)}</p>
-              <ul className="mt-1 flex flex-col gap-0.5">
+              <p className="font-medium">{airtimeAgo(airtimeColumnAgo(column.t, now, newest))}</p>
+              {gap && <p className="text-muted-foreground">Not measured</p>}
+              <ul className="mt-1 flex flex-col gap-0.5 empty:hidden">
                 {parts.map((part) => (
                   <li key={part.key} className="flex items-center gap-1.5">
                     <span
@@ -483,7 +491,7 @@ function LastMinute({ band, history }: { band: string; history: AirtimeRadio['hi
   );
 }
 
-function RadioPanel({ radio }: { radio: AirtimeRadio }): ReactElement {
+function RadioPanel({ radio, now }: { radio: AirtimeRadio; now: number }): ReactElement {
   // the device under the pointer, in the bar or the list: picked out in both
   const [pointed, setActive] = useState<string>();
   const [all, setAll] = useState(false);
@@ -578,7 +586,7 @@ function RadioPanel({ radio }: { radio: AirtimeRadio }): ReactElement {
         </div>
       )}
 
-      {radio.devices.length > 0 && radio.history.length > 0 && <LastMinute band={band} history={radio.history} />}
+      {radio.devices.length > 0 && radio.history.length > 0 && <LastMinute band={band} history={radio.history} now={now} />}
     </div>
   );
 }
@@ -610,7 +618,7 @@ export function AirtimeCard({ className }: { className?: string }): ReactElement
         ) : (
           <div className={cn('grid gap-4', radios.length > 1 && '@min-[80rem]:grid-cols-2')}>
             {radios.map((r) => (
-              <RadioPanel key={r.phy} radio={r} />
+              <RadioPanel key={r.phy} radio={r} now={data.now} />
             ))}
           </div>
         )}

@@ -26,6 +26,7 @@ import {
   airtimeChainsWords,
   airtimeChannelsLabel,
   airtimeClassHint,
+  airtimeColumnAgo,
   airtimeColumns,
   airtimeDoing,
   airtimeHeldWords,
@@ -341,12 +342,54 @@ test('airtime: sorting leaves the router’s list as it was', () => {
   );
 });
 
-test('airtime: the last minute’s columns end at the newest second', () => {
-  assert.deepEqual(airtimeColumns([1, 2, 3], 5), [undefined, undefined, 1, 2, 3]);
-  assert.deepEqual(airtimeColumns([1, 2, 3], 3), [1, 2, 3]);
-  assert.deepEqual(airtimeColumns([1, 2, 3, 4, 5], 3), [3, 4, 5]);
-  assert.deepEqual(airtimeColumns([], 2), [undefined, undefined]);
-  assert.deepEqual(airtimeColumns([1, 2], 0), []);
+test('airtime: the last minute’s columns end at the newest second, each second where its time puts it', () => {
+  const at = (...ts: number[]) => ts.map((t) => ({ t }));
+  const placed = (history: { t: number }[], slots: number) => airtimeColumns(history, slots).map((c) => [c.t, c.second?.t]);
+  assert.deepEqual(placed(at(101, 102, 103), 5), [
+    [99, undefined],
+    [100, undefined],
+    [101, 101],
+    [102, 102],
+    [103, 103],
+  ]);
+  assert.deepEqual(placed(at(101, 102, 103), 3), [
+    [101, 101],
+    [102, 102],
+    [103, 103],
+  ]);
+  assert.deepEqual(placed(at(101, 102, 103, 104, 105), 3), [
+    [103, 103],
+    [104, 104],
+    [105, 105],
+  ]);
+  // a second the router didn't measure is a gap where it was, not a shift of the older ones
+  assert.deepEqual(placed(at(100, 101, 103, 104), 5), [
+    [100, 100],
+    [101, 101],
+    [102, undefined],
+    [103, 103],
+    [104, 104],
+  ]);
+  // so a minute with one second missing ends a second earlier than its 60 entries would say
+  const minute = at(...Array.from({ length: 61 }, (_, i) => 1000 + i).filter((t) => t !== 1030));
+  const columns = airtimeColumns(minute, 60);
+  assert.equal(columns[0]?.t, 1001);
+  assert.equal(columns.filter((c) => c.second === undefined).length, 1);
+  assert.equal(airtimeColumns<{ t: number }>([], 2).length, 2);
+  assert.ok(airtimeColumns<{ t: number }>([], 2).every((c) => c.second === undefined));
+  assert.deepEqual(airtimeColumns(at(1, 2), 0), []);
+});
+
+test('airtime: how long ago a column was, by the router’s clock', () => {
+  // the reply's clock against the column's second
+  assert.equal(airtimeColumnAgo(1000, 1000, 1000), 0);
+  assert.equal(airtimeColumnAgo(1000, 1002, 1000), 2);
+  assert.equal(airtimeColumnAgo(941, 1002, 1000), 61);
+  // without a clock in the reply, counted from the newest column
+  assert.equal(airtimeColumnAgo(990, 0, 1000), 10);
+  // never in the future
+  assert.equal(airtimeColumnAgo(1003, 1000, 1003), 0);
+  assert.equal(airtimeAgo(airtimeColumnAgo(1000, 1001, 1000)), '1 s ago');
 });
 
 test('airtime: a second’s total and its breakdown, on a scale that is always all of the air', () => {
