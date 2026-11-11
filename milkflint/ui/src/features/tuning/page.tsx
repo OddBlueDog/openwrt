@@ -25,6 +25,7 @@ import { href } from '@/lib/router';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
 import { cakeTargetMs, GSO, takesWhole, type Whole, wholeSetting, wholeValue, withOpts, words } from '../sqm/gso';
+import { multiQueueValue, usesMultiQueue } from '../sqm/multi-queue';
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
 import { type GroPort, getTuningStatus, type TuningStatus } from './api';
@@ -78,7 +79,9 @@ import {
 //   offloading (flow_offloading_hw) off too, as that needs it.
 // Unset everywhere is what the image does: Restore defaults unsets them.
 // Moving to or from RSS can also switch Smart Queue's multi-queue CAKE
-// (sqm's use_mq), which only spreads over CPUs when RSS does.
+// (sqm's use_mq), which only spreads over CPUs when RSS does: to RSS it
+// goes back to following the download speed (milkflint.cake.multi_queue
+// unset, ../sqm/multi-queue.ts), away from it off ("0").
 
 type Aql = 'default' | 'off' | 'custom';
 type Steering = 'rss' | 'rps' | 'openwrt' | 'off';
@@ -245,10 +248,14 @@ function aqlValue(f: TuningForm): string | undefined {
   }
 }
 
-/** Smart Queue's multi-queue setting the new steering asks for, when it should change */
+/**
+ * Smart Queue's multi-queue setting the new steering asks for, when it should
+ * change: on with RSS where the download speed asks for it (../sqm/multi-queue.ts),
+ * off without RSS.
+ */
 function queueSwitch(f: TuningForm, data: TuningData): boolean | undefined {
   if (data.sqm === undefined || f.steering === data.form.steering) return undefined;
-  const want = f.steering === 'rss';
+  const want = f.steering === 'rss' && (data.sqm.multiQueue || usesMultiQueue(data.sqm.download, 'auto'));
   return want === data.sqm.multiQueue ? undefined : want;
 }
 
@@ -314,8 +321,17 @@ function toChanges(f: TuningForm, data: TuningData): Change[] {
       }),
     );
   }
-  if (knobsChanged.has('cake')) {
-    changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', knobs.cake));
+  // Smart Queue's multi-queue CAKE goes with the steering: back to following
+  // the speed with RSS, off without it (the Smart Queue page's setting)
+  const queue = queueSwitch(f, data);
+  const follow = queue !== undefined && f.followQueue && data.sqm !== undefined;
+  if (knobsChanged.has('cake') || follow) {
+    changes.push(
+      ...sectionChanges('milkflint', data.milkflint, 'cake', {
+        ...(knobsChanged.has('cake') ? knobs.cake : {}),
+        ...(follow ? { multi_queue: multiQueueValue(queue ? 'auto' : 'off') } : {}),
+      }),
+    );
   }
   if (f.steering !== was.steering) {
     // on or off is OpenWrt's own option: "0" is off, unset (its default) on
@@ -328,8 +344,7 @@ function toChanges(f: TuningForm, data: TuningData): Change[] {
     } else if (data.packetSteering === '0' && data.globals !== undefined) {
       changes.push({ op: 'unset', config: 'network', section: data.globals, options: ['packet_steering'] });
     }
-    const queue = queueSwitch(f, data);
-    if (queue !== undefined && f.followQueue && data.sqm !== undefined) {
+    if (follow && data.sqm !== undefined) {
       changes.push({ op: 'set', config: 'sqm', section: data.sqm.section, values: { use_mq: queue ? '1' : '0' } });
     }
   }

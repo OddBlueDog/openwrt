@@ -347,6 +347,122 @@ export function getBeamforming(device: string): Promise<Beamforming> {
   return call('milkflint.wifi', 'beamforming', { device }, beamforming);
 }
 
+// What the policy itself decides is always there; what the service measures
+// besides, for the page, has a default, so a service that says less still reads.
+const airtimeDevice = z.object({
+  mac: z.string(),
+  /** from its lease or its reservation; null: not known */
+  name: z.string().nullable().default(null),
+  /** the access point's interface it's on, and that network's name */
+  dev: z.string().default(''),
+  ssid: z.string().nullable().default(null),
+  /** dBm */
+  signal: z.number().nullable().default(null),
+  /** Mbit/s the router sends to it at (0: not known yet), and it sends at */
+  rate: z.number(),
+  rx_rate: z.number().default(0),
+  /** share of the router's transmissions to it that got a frame through, 0..1 */
+  delivery: z.number(),
+  /** Mbit/s: rate x delivery, what the policy judges its link by */
+  useful: z.number(),
+  class: z.enum(['full', 'slow', 'weak', 'lost']),
+  /** "slow link", "weak link", "not answering"; null with a full share */
+  reason: z.string().nullable().default(null),
+  /** airtime weight, 32..256: 256 is a full share, which every device has where the policy is off */
+  weight: z.number(),
+  /** its queue allowance in the radio is narrowed */
+  narrowed: z.boolean().default(false),
+  /** times each of its frames is sent before it's given up on; 0: the driver's own (also where the driver takes no number per device) */
+  tries: z.number().default(0),
+  /** the policy would pace it: its link is slow enough to be held back while a device with a good link is waiting */
+  paced: z.boolean().default(false),
+  /** the part of the time its ordinary traffic is sent for while others wait, in thousandths; 0: not paced (the policy is off, or the driver can't) */
+  pace: z.number().default(0),
+  /** share of the last second its traffic was held back, 0..1 */
+  held: z.number().default(0),
+  /** with the band's shares worked out as it goes (auto): its share of the air, in thousandths (0: none), and the factor its pacing is trimmed by so that what it takes, measured, is that share */
+  aim: z.number().default(0),
+  trim: z.number().default(1),
+  /** share of the last second the router spent sending to it, and it spent sending, 0..1 */
+  air_tx: z.number().default(0),
+  air_rx: z.number().default(0),
+  /** Mbit/s of traffic to it and from it in the last second */
+  tx_mbit: z.number().default(0),
+  rx_mbit: z.number().default(0),
+  /** share of the last second it spent in power save, 0..1 */
+  asleep: z.number().default(0),
+  /** its link in detail: how the router sends to it and it to the router; null: not known */
+  tx_phy: rate.nullable().default(null),
+  rx_phy: rate.nullable().default(null),
+  /** each antenna's signal, dBm (averaged); null where the radio doesn't say */
+  chains: z.array(z.number()).nullable().default(null),
+  /** seconds since it connected */
+  connected: z.number().nullable().default(null),
+});
+
+const airtimeRadio = z.object({
+  phy: z.string(),
+  /** its wifi-device section ("radio1") */
+  radio: z.string().nullable().default(null),
+  band: z.enum(['2g', '5g', '6g']),
+  channel: z.union([z.number(), z.string()]).nullable().default(null),
+  /** the channel's width in MHz, and every 20 MHz channel it takes up, lowest first; null and none until known */
+  width: z.number().nullable().default(null),
+  channels: z.array(z.number()).default([]),
+  /** the policy is applied on this band; otherwise the service only watches */
+  on: z.boolean(),
+  /** the radio's driver shares the air by weight, so the policy has something to set */
+  weights: z.boolean().default(true),
+  /** the radio's driver can hold a device back by time (pacing) */
+  pacing: z.boolean().default(false),
+  /** how the shares of the devices held back are set: a strength's name (auto), or null for the goals set by hand */
+  auto: z.string().nullable().default(null),
+  /** with auto applied: how many devices that aren't held back wanted the air in the last second (0: none, which counts as one); null otherwise */
+  competing: z.number().nullable().default(null),
+  /** share of the time the channel was busy, every network's use and noise counted, 0..1; null until known */
+  busy: z.number().nullable().default(null),
+  /** the part of `busy` that was other networks and noise, by the radio's own count, 0..1; null where it doesn't say */
+  other: z.number().nullable().default(null),
+  /** the noise the radio measures on its channel, dBm; null until known (it's read while this is asked for) */
+  noise: z.number().nullable().default(null),
+  devices: z.array(airtimeDevice).default([]),
+  /**
+   * up to a minute, a second each: the share of that second's air the devices of each class took, 0..1, and what
+   * other networks and noise took (null for a second the channel wasn't read in: it's only read while this is asked for)
+   */
+  history: z
+    .array(
+      z.object({
+        t: z.number(),
+        full: z.number().default(0),
+        slow: z.number().default(0),
+        weak: z.number().default(0),
+        lost: z.number().default(0),
+        other: z.number().nullable().default(null),
+      }),
+    )
+    .default([]),
+});
+
+const airtimeStatus = z.object({
+  /** false: the service isn't running, or has only just been asked to measure */
+  running: z.boolean(),
+  /** the router's clock, epoch seconds */
+  now: z.number().default(0),
+  radios: z.array(airtimeRadio).default([]),
+});
+export type AirtimeStatus = z.output<typeof airtimeStatus>;
+export type AirtimeRadio = AirtimeStatus['radios'][number];
+export type AirtimeDevice = AirtimeRadio['devices'][number];
+
+/**
+ * What the airtime fairness service sees and does on each band now. Asking
+ * also keeps it measuring on the bands whose policy is off.
+ */
+export function getAirtime(): Promise<AirtimeStatus> {
+  return call('milkflint.airtime', 'status', {}, airtimeStatus);
+}
+
 const surveyEntry = z
   .object({
     mhz: z.number(),

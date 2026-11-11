@@ -18,7 +18,11 @@ import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
 import { bool, type Change, getConfig, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { isGuestIface } from '../wifi-guest/guest';
+import { type AirtimeBandKey, type AirtimeBands, airtimeBandsErrors, airtimeBandsOf, airtimeBandValues, airtimeOf, airtimeOption, airtimeValue } from './airtime';
+import { AirtimeBandsTable } from './airtime-bands';
+import { AirtimeCard } from './airtime-card';
 import { BeamformingCard } from './beamforming';
+import { HOLD_BACK_LABELS, HOLD_BACK_OPTIONS, type HoldBack, holdBackChoices, holdBackHint, holdBackOf, holdBackValues } from './hold-back';
 import { qosMapChoice, qosMapHint, qosMapValue } from './qos-map';
 import {
   TWT_FLOWS,
@@ -240,6 +244,12 @@ interface RadioForm {
   qosMap: string;
   /** Target Wake Time: whether the radio offers it, and the limits of what it agrees to */
   twt: TwtSetting;
+  /** Wi-Fi 6: how long a device the router scheduled holds back before it sends on its own again (the MU EDCA timers) */
+  holdBack: HoldBack;
+  /** Airtime fairness: devices with a poor link get a smaller share of the air (the airtime service's policy for the band) */
+  airtime: boolean;
+  /** The policy's settings for the band, as typed: the rates that part the link classes and each paced class's airtime goal */
+  airtimeBands: AirtimeBands;
   /** multicast_to_unicast: mac80211 sends multicast to each device on its own */
   multicastToUnicast: boolean;
 }
@@ -365,9 +375,13 @@ function radarCheckSeconds(f: RadioForm, o: RadioOptions | undefined): number {
   return needs.length === 0 ? 0 : Math.max(...needs.map(cac));
 }
 
-/** Whether saving this restarts the radio: everything does but TWT's limits, which go to the driver at once. */
+/**
+ * Whether saving this restarts the radio: everything does but TWT's limits, which go to the driver at once, and
+ * airtime fairness and its settings, which its service reads for itself.
+ */
 function restartsRadio(f: RadioForm, before: RadioForm | undefined): boolean {
-  const config = (r: RadioForm | undefined): string => JSON.stringify(r === undefined ? r : { ...r, twt: r.twt.on });
+  const config = (r: RadioForm | undefined): string =>
+    JSON.stringify(r === undefined ? r : { ...r, twt: r.twt.on, airtime: undefined, airtimeBands: undefined });
   return config(f) !== config(before);
 }
 
@@ -425,6 +439,9 @@ async function loadWifi(): Promise<WifiData> {
       ),
       qosMap: str(iface, 'qos_map_set') ?? '',
       twt: twtOf(str(r, 'he_twt_responder'), (name) => str(wifiSection, twtOption(str(r, 'band') ?? '2g', name))),
+      holdBack: holdBackOf(HOLD_BACK_OPTIONS.map((o) => str(r, o))),
+      airtime: airtimeOf(str(wifiSection, airtimeOption(str(r, 'band') ?? '2g'))),
+      airtimeBands: airtimeBandsOf((o) => str(wifiSection, o), str(r, 'band') ?? '2g'),
       multicastToUnicast: bool(iface, 'multicast_to_unicast'),
     };
   });
@@ -482,12 +499,14 @@ async function loadWifi(): Promise<WifiData> {
   };
 }
 
-function validate(f: RadioForm): Partial<Record<'ssid' | 'key', string>> {
-  const errors: Partial<Record<'ssid' | 'key', string>> = {};
+function validate(f: RadioForm): Partial<Record<'ssid' | 'key' | AirtimeBandKey, string>> {
+  const errors: Partial<Record<'ssid' | 'key' | AirtimeBandKey, string>> = {};
   const bytes = new TextEncoder().encode(f.ssid).length;
   if (f.iface !== undefined && (bytes < 1 || bytes > 32)) errors.ssid = 'Use 1 to 32 characters.';
   const keyBad = f.iface === undefined ? undefined : keyError(f.encryption, f.key);
   if (keyBad !== undefined) errors.key = keyBad;
+  // the policy's settings only show, and are only saved, with the policy on
+  if (f.airtime) Object.assign(errors, airtimeBandsErrors(f.airtimeBands));
   return errors;
 }
 
@@ -537,6 +556,14 @@ function changesFor(f: RadioForm, before: RadioForm): Change[] {
     const options = sprRadioOptions(f.spr);
     const values = Object.fromEntries(Object.entries(options).filter((e): e is [string, string] => e[1] !== undefined));
     const unset = Object.keys(options).filter((k) => options[k] === undefined);
+    if (Object.keys(values).length > 0) changes.push({ op: 'set', config: 'wireless', section: f.radio, values });
+    if (unset.length > 0) changes.push({ op: 'unset', config: 'wireless', section: f.radio, options: unset });
+  }
+  // only when chosen: periods set elsewhere stay as they are
+  const holdBack = f.holdBack === before.holdBack ? undefined : holdBackValues(f.holdBack);
+  if (holdBack !== undefined) {
+    const values = Object.fromEntries(Object.entries(holdBack).filter((e): e is [string, string] => e[1] !== undefined));
+    const unset = Object.keys(holdBack).filter((k) => holdBack[k] === undefined);
     if (Object.keys(values).length > 0) changes.push({ op: 'set', config: 'wireless', section: f.radio, values });
     if (unset.length > 0) changes.push({ op: 'unset', config: 'wireless', section: f.radio, options: unset });
   }
@@ -1069,6 +1096,25 @@ function RadioCard({
                     </Select>
                   </Field>
                 )}
+                <Field id={id('holdBack')} label="Hold-back after a scheduled turn" hint={holdBackHint(form.holdBack)}>
+                  <Select
+                    value={form.holdBack}
+                    onValueChange={(v) => {
+                      set('holdBack', v as HoldBack);
+                    }}
+                  >
+                    <SelectTrigger id={id('holdBack')}>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {holdBackChoices(form.holdBack).map((h) => (
+                        <SelectItem key={h} value={h}>
+                          {HOLD_BACK_LABELS[h]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
                 <Field
                   id={id('twt')}
                   label="Target Wake Time"
@@ -1227,6 +1273,30 @@ function RadioCard({
                 )}
               </>
             )}
+            <Field
+              id={id('airtime')}
+              label="Airtime fairness"
+              hint="Devices with a poor link get a smaller share of the air, and the slowest are held back while a device with a good link is waiting. Off, every busy device gets an equal share, however slow its link."
+            >
+              <Switch
+                id={id('airtime')}
+                checked={form.airtime}
+                onCheckedChange={(v) => {
+                  set('airtime', v);
+                }}
+              />
+            </Field>
+            {form.airtime && (
+              <AirtimeBandsTable
+                idPrefix={id('airtime')}
+                band={form.band}
+                value={form.airtimeBands}
+                errors={errors}
+                onChange={(v) => {
+                  set('airtimeBands', v);
+                }}
+              />
+            )}
             {form.iface !== undefined && (
               <Field
                 id={id('multicast')}
@@ -1326,7 +1396,15 @@ export function WifiPage(): ReactElement {
         'milkflint',
         data.milkflint,
         'wifi',
-        Object.fromEntries(forms.flatMap((f) => [[sprOption(f.band), sprDriverMode(f.spr)], ...Object.entries(twtDriverOptions(f.band, f.twt))])),
+        Object.fromEntries(
+          forms.flatMap((f) => [
+            [sprOption(f.band), sprDriverMode(f.spr)],
+            ...Object.entries(twtDriverOptions(f.band, f.twt)),
+            [airtimeOption(f.band), airtimeValue(f.airtime)],
+            // off, the band's settings are left as they are
+            ...(f.airtime ? Object.entries(airtimeBandValues(f.band, f.airtimeBands)) : []),
+          ]),
+        ),
       ),
     );
     if (countryDirty && country !== '') {
@@ -1397,6 +1475,7 @@ export function WifiPage(): ReactElement {
             <RadarCard className="2xl:col-span-2" />
             <BeamformingCard className="2xl:col-span-2" />
             <TwtCard className="2xl:col-span-2" />
+            <AirtimeCard className="2xl:col-span-2" />
           </div>
         )}
       </div>

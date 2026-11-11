@@ -28,6 +28,7 @@ import { isGuestShaper } from '../wifi-guest/guest';
 import { ACK_FILTER, ACK_FILTER_RATIO, type AckFilter, ackFilterOf, suggestsAckFilter } from './ack-filter';
 import { type SqmDscpOption, sqmDscpOptions } from './dscp';
 import { GSO, optValue, takesWhole, type Whole, wholeSetting, withOpts, words } from './gso';
+import { MULTI_QUEUE_KBIT, type MultiQueue, multiQueueOf, multiQueueValue, usesMultiQueue } from './multi-queue';
 
 // Link-layer presets: how much each packet grows on the wire, so CAKE's
 // shaping matches what the line really carries. mpu (sqm's tcMPU) is the
@@ -100,7 +101,8 @@ interface SqmForm {
   uploadMemory: UploadMemory | 'custom';
   ackFilter: AckFilter;
   perDevice: boolean;
-  multiQueue: boolean;
+  /** multi-queue CAKE for the download: with the speed, or always, or never (./multi-queue.ts) */
+  multiQueue: MultiQueue;
   /** Downloads get back the DSCP their connection sends with (milkflint.cake.dscp_restore) */
   restoreDscp: boolean;
   offloadOff: boolean;
@@ -169,6 +171,7 @@ async function loadSqm(): Promise<SqmData> {
   // the internet port's queue: Guest Wi-Fi's speed limit is one too
   const queue = sqm?.find((s) => s['.type'] === 'queue' && !isGuestShaper(str(s, 'interface')) && !isVpnShaper(str(s, 'interface')));
   const defaults = firewall.find((s) => s['.type'] === 'defaults');
+  const cake = milkflint?.find((s) => s['.name'] === 'cake');
 
   const form: SqmForm = {
     section: queue?.['.name'],
@@ -182,9 +185,12 @@ async function loadSqm(): Promise<SqmData> {
     uploadMemory: uploadMemoryOf(str(queue, 'eqdisc_opts'), Number(str(queue, 'upload') ?? '0')),
     ackFilter: ackFilterOf(words(str(queue, 'eqdisc_opts'))),
     perDevice: words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost'),
-    // on unless turned off: MilkFlint's default (uci-defaults sets use_mq once)
-    multiQueue: queue === undefined || bool(queue, 'use_mq'),
-    restoreDscp: str(milkflint?.find((s) => s['.name'] === 'cake'), 'dscp_restore') === '1',
+    multiQueue: multiQueueOf(
+      str(cake, 'multi_queue'),
+      queue === undefined ? undefined : bool(queue, 'use_mq'),
+      Number(str(queue, 'download') ?? '0'),
+    ),
+    restoreDscp: str(cake, 'dscp_restore') === '1',
     offloadOff: false,
   };
   return {
@@ -231,7 +237,7 @@ function toChanges(f: SqmForm, data: SqmData): Change[] {
     upload: String(upload),
     qdisc: 'cake',
     script: f.prioritise ? 'layer_cake.qos' : 'piece_of_cake.qos',
-    use_mq: f.multiQueue ? '1' : '0',
+    use_mq: usesMultiQueue(download, f.multiQueue) ? '1' : '0',
     ...(preset === undefined ? {} : { linklayer: preset.linklayer, overhead: preset.overhead }),
     // LuCI keeps tcMPU only in its advanced link-layer mode
     ...(preset?.mpu === undefined ? {} : { tcMPU: preset.mpu, linklayer_advanced: '1' }),
@@ -282,7 +288,12 @@ function toChanges(f: SqmForm, data: SqmData): Change[] {
   if (wasSet.length > 0 && f.section !== undefined) {
     changes.push({ op: 'unset', config: 'sqm', section: f.section, options: wasSet });
   }
-  changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', { dscp_restore: f.restoreDscp ? '1' : undefined }));
+  changes.push(
+    ...sectionChanges('milkflint', data.milkflint, 'cake', {
+      dscp_restore: f.restoreDscp ? '1' : undefined,
+      multi_queue: multiQueueValue(f.multiQueue),
+    }),
+  );
   // hardware offloading only: CAKE still shapes software-offloaded packets
   if (f.offloadOff && data.offloading !== undefined) {
     changes.push({
@@ -552,6 +563,9 @@ export function SqmPage(): ReactElement {
     });
   };
   const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data?.form);
+  // the download speed being edited, and whether it gets multi-queue CAKE
+  const downloadKbit = Math.round(Number(form?.downloadMbit ?? '0') * 1000);
+  const multiQueueOn = form !== undefined && usesMultiQueue(downloadKbit, form.multiQueue);
   // Hardware offloading forwards connections in the Ethernet's PPE, past CAKE. Software offloading's
   // fast path still goes through the qdiscs, and MilkFlint's kernel keeps CAKE's per-device fairness
   // with it.
@@ -839,8 +853,11 @@ export function SqmPage(): ReactElement {
                       <>
                         Splits CAKE into one queue per network-card queue, sharing your speeds by what each needs, so more than one CPU can
                         shape at once (cake_mq). With RSS (Performance Tuning), each receive ring feeds its own download queue on its own
-                        CPU. Upload stays one CAKE on the Flint 2: its Ethernet sends everything on one queue.
-                        {live.data !== undefined && live.data.net.rss?.spreading !== true && form.multiQueue && (
+                        CPU. Each queue holds its packets to its own share of the speed, so a packet can wait a little longer than in one
+                        CAKE, and more so on a slower line, which one CPU shapes easily: Automatic uses it from{' '}
+                        {MULTI_QUEUE_KBIT / 1000} Mbit/s of download. Upload stays one CAKE on the Flint 2: its Ethernet sends everything on
+                        one queue.
+                        {live.data !== undefined && live.data.net.rss?.spreading !== true && multiQueueOn && (
                           <span className="mt-1 block text-warning">
                             RSS isn’t spreading downloads now, so they all use one queue
                             {live.data.net.rps.length > 0 ? `, and packet steering spreads the rest over ${cpuText(live.data.net.rps)}` : ''}.
@@ -849,13 +866,21 @@ export function SqmPage(): ReactElement {
                       </>
                     }
                   >
-                    <Switch
-                      id="multiQueue"
-                      checked={form.multiQueue}
-                      onCheckedChange={(v) => {
-                        set('multiQueue', v);
+                    <Select
+                      value={form.multiQueue}
+                      onValueChange={(v) => {
+                        set('multiQueue', v as MultiQueue);
                       }}
-                    />
+                    >
+                      <SelectTrigger id="multiQueue">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="auto">Automatic: {usesMultiQueue(downloadKbit, 'auto') ? 'on' : 'off'} at this speed</SelectItem>
+                        <SelectItem value="on">On</SelectItem>
+                        <SelectItem value="off">Off</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </Field>
                   <Field id="device" label="Interface" hint="Where to shape: your internet (WAN) port.">
                     <Select

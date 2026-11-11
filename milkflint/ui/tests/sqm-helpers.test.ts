@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { delayMs, directionsOf, summarize } from '../src/features/sqm/cake.ts';
 import { cakeTargetMs, GSO, optValue, takesWhole, wholeSetting, wholeValue, withOpts } from '../src/features/sqm/gso.ts';
+import { MULTI_QUEUE_KBIT, multiQueueOf, multiQueueSetting, multiQueueValue, usesMultiQueue } from '../src/features/sqm/multi-queue.ts';
 import type { CakeQdisc } from '../src/lib/api/stats.ts';
 
 test('a managed keyword is replaced, the rest stay in order', () => {
@@ -60,6 +61,32 @@ test('taking GRO packets whole', () => {
   assert.equal(takesWhole(1_000_000, 'off'), false);
   for (const w of ['auto', 'on', 'off'] as const) assert.equal(wholeSetting(wholeValue(w)), w);
   assert.equal(wholeSetting('2'), 'auto');
+});
+
+test('multi-queue CAKE goes with the download speed, unless chosen', () => {
+  assert.equal(usesMultiQueue(MULTI_QUEUE_KBIT - 1, 'auto'), false);
+  assert.equal(usesMultiQueue(MULTI_QUEUE_KBIT, 'auto'), true);
+  assert.equal(usesMultiQueue(20_000, 'on'), true);
+  assert.equal(usesMultiQueue(900_000, 'off'), false);
+  for (const c of ['auto', 'on', 'off'] as const) assert.equal(multiQueueSetting(multiQueueValue(c)), c);
+  assert.equal(multiQueueSetting(undefined), 'auto');
+  assert.equal(multiQueueSetting('yes'), 'auto');
+});
+
+test('the multi-queue choice shown is what the queue does', () => {
+  // no queue yet: the setting
+  assert.equal(multiQueueOf(undefined, undefined, 0), 'auto');
+  assert.equal(multiQueueOf('0', undefined, 900_000), 'off');
+  // use_mq as the setting gives at this speed: the setting
+  assert.equal(multiQueueOf(undefined, true, 750_000), 'auto');
+  assert.equal(multiQueueOf(undefined, false, 85_000), 'auto');
+  assert.equal(multiQueueOf('1', true, 85_000), 'on');
+  assert.equal(multiQueueOf('0', false, 750_000), 'off');
+  // use_mq set elsewhere (LuCI) to something else: shown as it is, and saved so
+  assert.equal(multiQueueOf(undefined, false, 750_000), 'off');
+  assert.equal(multiQueueOf(undefined, true, 85_000), 'on');
+  assert.equal(multiQueueOf('1', false, 750_000), 'off');
+  assert.equal(multiQueueOf('0', true, 85_000), 'on');
 });
 
 const cake = (dev: string, over: Partial<CakeQdisc> = {}): CakeQdisc => ({ kind: 'cake', dev, ...over });
