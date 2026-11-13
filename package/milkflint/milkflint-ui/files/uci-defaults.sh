@@ -214,6 +214,70 @@ if [ -z "$(uci -q get milkflint.defaults.sqm_gso)" ]; then
 	UCI
 fi
 
+# A guest network's speed limit is shared out per device (dual-srchost on
+# the way in, dual-dsthost on the way out), so CAKE has to see each guest's
+# own address. sqm adds nat to both directions, which looks a packet's
+# connection up and takes its addresses on the internet side: on the guest
+# bridge that's the router's WAN address for every guest, so they counted
+# as one device and the share went per connection. nonat keeps their own;
+# the Guest Wi-Fi page writes it for the queues it sets up. A direction
+# whose options already say nat or nonat stays as chosen. Once, like
+# cake_mq.
+if [ -z "$(uci -q get milkflint.defaults.guest_nonat)" ]; then
+	for queue in $(uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p"); do
+		case "$(uci -q get "sqm.$queue.interface")" in br-guest*) ;; *) continue ;; esac
+		for key in iqdisc_opts eqdisc_opts; do
+			opts=$(uci -q get "sqm.$queue.$key")
+			case " $opts " in *" nat "* | *" nonat "*) continue ;; esac
+			uci set "sqm.$queue.$key=${opts:+$opts }nonat"
+			uci set "sqm.$queue.qdisc_advanced=1"
+			uci set "sqm.$queue.qdisc_really_really_advanced=1"
+		done
+	done
+	uci -q commit sqm
+	uci -q batch <<-UCI
+		set milkflint.defaults=defaults
+		set milkflint.defaults.guest_nonat='1'
+		commit milkflint
+	UCI
+fi
+
+# sqm ships its queue counting no link overhead (linklayer 'none'): CAKE
+# takes each packet for its IP length plus 14 bytes, short of what the line
+# carries, the most on small packets (a download's ACKs on a slow upload),
+# so a queue builds up in the modem instead. A queue still as sqm ships it
+# gets the Smart Queue page's Fibre / Ethernet preset (44 bytes a packet,
+# 84 at least): counting too much costs a little speed, too little costs
+# latency. As sqm ships it means off, no link layer but none, and none of
+# the options a link layer sets; a queue that's on runs as someone set it
+# up, no compensation included (a link whose overhead is counted
+# elsewhere), and stays so. Not a guest network's or the VPN's, which have
+# no modem under them. Once, like cake_mq.
+if [ -z "$(uci -q get milkflint.defaults.sqm_link)" ]; then
+	for queue in $(uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p"); do
+		case "$(uci -q get "sqm.$queue.interface")" in br-guest* | wg_out) continue ;; esac
+		[ "$(uci -q get "sqm.$queue.enabled")" = 1 ] && continue
+		case "$(uci -q get "sqm.$queue.linklayer")" in '' | none) ;; *) continue ;; esac
+		set_link=1
+		for key in overhead tcMPU tcMTU tcTSIZE linklayer_advanced linklayer_adaptation_mechanism; do
+			[ -z "$(uci -q get "sqm.$queue.$key")" ] || set_link=
+		done
+		[ -n "$set_link" ] || continue
+		uci -q batch <<-UCI
+			set sqm.$queue.linklayer='ethernet'
+			set sqm.$queue.overhead='44'
+			set sqm.$queue.tcMPU='84'
+			set sqm.$queue.linklayer_advanced='1'
+		UCI
+	done
+	uci -q commit sqm
+	uci -q batch <<-UCI
+		set milkflint.defaults=defaults
+		set milkflint.defaults.sqm_link='1'
+		commit milkflint
+	UCI
+fi
+
 # 5 GHz Wi-Fi: under a big download the router fills the air with long
 # transmissions, and a client's own packets (its TCP ACKs, a speed test's
 # latency probes) wait for a turn, which can be most of the latency a

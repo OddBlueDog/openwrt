@@ -458,7 +458,9 @@ function pass(aps, radio_of, on_bands, known, now, dry, watched, wifi) {
 
 			push(row.devices, {
 				mac: s.mac, name: known[s.mac] ?? null, dev: ap.dev, ssid: ap.ssid ?? null, signal: s.signal ?? null,
-				rate: s.rate, rx_rate: s.rx_rate, delivery: st.policy.delivery, useful: st.policy.useful,
+				// `rate`: the one its link is judged by (the policy's; its
+				// rate right now is in tx_phy)
+				rate: st.policy.rate || s.rate, rx_rate: s.rx_rate, delivery: st.policy.delivery, useful: st.policy.useful,
 				// the weight the kernel has for it now (a change shows a second later)
 				class: st.policy.class, reason: st.policy.reason, weight: dry ? want_weight : (s.weight ?? WEIGHT_FULL),
 				narrowed: want_aql != null, tries: want_tries,

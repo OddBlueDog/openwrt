@@ -1,0 +1,142 @@
+From 5572ae1496ec95bdee91a2c9b381919fe40821af Mon Sep 17 00:00:00 2001
+From: Yuen Su <zypulsecore@gmail.com>
+Date: Mon, 19 Oct 2026 21:52:28 +0800
+Subject: [PATCH] sqm: propagate shaping startup failures
+
+Return preparation and shaping-function failures to start-sqm, and only
+publish state and success after startup succeeds. Keep ingress and
+egress functions optional, preserving the existing warning when a
+script supplies only one direction.
+
+Retain failures from attempted starts across multiple interfaces in the
+OpenWrt and Linux runners while continuing other interfaces. Skipped
+sections are not failures.
+
+Signed-off-by: Yuen Su <zypulsecore@gmail.com>
+---
+ platform/linux/sqm-bin |  6 ++++--
+ src/functions.sh       | 14 +++++++++++---
+ src/run-openwrt.sh     |  4 +++-
+ src/start-sqm          | 12 ++++++++++--
+ 4 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/platform/linux/sqm-bin b/platform/linux/sqm-bin
+index 9423766..4afd8f1 100644
+--- a/platform/linux/sqm-bin
++++ b/platform/linux/sqm-bin
+@@ -31,6 +31,7 @@ if [ "$ACTION" = "stop" -a -z "$RUN_IFACE" ]; then
+     exit 0
+ fi
+ 
++SQM_EXIT_STATUS=0
+ if [ -n "$RUN_IFACE" ]; then
+     if [ ! -f /etc/sqm/${RUN_IFACE}.iface.conf ]; then
+         echo "No config file found for iface $RUN_IFACE." >&2
+@@ -39,14 +40,14 @@ if [ -n "$RUN_IFACE" ]; then
+     IFACE=$RUN_IFACE
+     . /etc/sqm/${RUN_IFACE}.iface.conf
+     [ -f ${SQM_STATE_DIR}/$IFACE.state ] && ( . ${SQM_LIB_DIR}/stop-sqm )
+-    [ "$ACTION" = "stop" ] || ( . ${SQM_LIB_DIR}/start-sqm )
++    [ "$ACTION" = "stop" ] || ( . ${SQM_LIB_DIR}/start-sqm ) || SQM_EXIT_STATUS=$?
+ else
+     echo "Starting SQM on all configured interfaces." >&2
+     for f in /etc/sqm/*.iface.conf; do
+         if [ -f "$f" ]; then
+             IFACE=$(basename $f .iface.conf)
+             [ -f ${SQM_STATE_DIR}/$IFACE.state ] && ( . $f; . ${SQM_LIB_DIR}/stop-sqm )
+-            [ "$ACTION" = "stop" ] || ( . $f; . ${SQM_LIB_DIR}/start-sqm )
++            [ "$ACTION" = "stop" ] || ( . $f; . ${SQM_LIB_DIR}/start-sqm ) || SQM_EXIT_STATUS=$?
+         else
+             echo >&2
+             echo "Error: No valid interface configuration found." >&2
+@@ -58,3 +59,4 @@ else
+         fi
+     done
+ fi
++exit "$SQM_EXIT_STATUS"
+diff --git a/src/functions.sh b/src/functions.sh
+index 43d5d5c..ca47c9f 100644
+--- a/src/functions.sh
++++ b/src/functions.sh
+@@ -437,7 +437,7 @@ sqm_start_default() {
+ 
+     if fn_exists sqm_prepare_script ; then
+ 	sqm_debug "sqm_start_default: starting sqm_prepare_script"
+-        sqm_prepare_script
++        sqm_prepare_script || return 1
+     else
+ 	sqm_debug "sqm_start_default: no sqm_prepare_script function found, proceeding without."
+     fi
+@@ -451,7 +451,11 @@ sqm_start_default() {
+     if [ "${UPLINK}" -ne 0 ];
+     then
+ 	CUR_DIRECTION="egress"
+-	fn_exists egress && egress || sqm_warn "sqm_start_default: ${SCRIPT} lacks an egress() function"
++        if fn_exists egress; then
++            egress || return 1
++        else
++            sqm_warn "sqm_start_default: ${SCRIPT} lacks an egress() function"
++        fi
+         #egress
+         sqm_debug "sqm_start_default: egress shaping activated"
+     else
+@@ -462,7 +466,11 @@ sqm_start_default() {
+     then
+ 	CUR_DIRECTION="ingress"
+ 	verify_qdisc ingress "ingress" || return 1
+-	fn_exists ingress && ingress || sqm_warn "sqm_start_default: ${SCRIPT} lacks an ingress() function"
++        if fn_exists ingress; then
++            ingress || return 1
++        else
++            sqm_warn "sqm_start_default: ${SCRIPT} lacks an ingress() function"
++        fi
+         #ingress
+         sqm_debug "sqm_start_default: ingress shaping activated"
+     else
+diff --git a/src/run-openwrt.sh b/src/run-openwrt.sh
+index d735a2f..026d1c8 100644
+--- a/src/run-openwrt.sh
++++ b/src/run-openwrt.sh
+@@ -81,7 +81,7 @@ start_sqm_section() {
+     export SQM_VERBOSITY_MAX=${SQM_VERBOSITY_MAX:-$(config_get "$section" verbosity)}
+     export SQM_VERBOSITY_MIN
+ 
+-    "${SQM_LIB_DIR}/start-sqm"
++    "${SQM_LIB_DIR}/start-sqm" || SQM_EXIT_STATUS=$?
+ }
+ 
+ release_lock() {
+@@ -132,6 +132,8 @@ if [ "$ACTION" = "stop" ]; then
+         stop_statefile "${SQM_STATE_DIR}/${RUN_IFACE}.state"
+     fi
+ else
++    SQM_EXIT_STATUS=0
+     config_load sqm
+     config_foreach start_sqm_section
++    exit "$SQM_EXIT_STATUS"
+ fi
+diff --git a/src/start-sqm b/src/start-sqm
+index 50f8c92..7f99727 100755
+--- a/src/start-sqm
++++ b/src/start-sqm
+@@ -60,10 +60,18 @@ sqm_log "Starting SQM script: ${SCRIPT} on ${IFACE}, in: ${DOWNLINK} Kbps, out:
+ 
+ if fn_exists sqm_start ; then
+     sqm_debug "Using script specific sqm_start function overriding the generic sqm_start_default."
+-    sqm_start && write_state_file ${STATE_FILE} && sqm_log "${SCRIPT} was started on ${IFACE} successfully"
++    sqm_start
+ else
+     sqm_debug "Using generic sqm_start_default function."
+-    sqm_start_default && write_state_file ${STATE_FILE} && sqm_log "${SCRIPT} was started on ${IFACE} successfully"
++    sqm_start_default
+ fi
+ 
++ret=$?
++if [ "$ret" -ne 0 ]; then
++    sqm_error "${SCRIPT} failed to start on ${IFACE} (exit ${ret})"
++    exit "$ret"
++fi
++write_state_file "${STATE_FILE}" || exit 1
++sqm_log "${SCRIPT} was started on ${IFACE} successfully"
++
+ exit 0

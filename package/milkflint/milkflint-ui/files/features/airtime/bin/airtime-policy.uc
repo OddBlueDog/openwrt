@@ -29,6 +29,18 @@
 //          sent only twice, until one is answered. (Frames sent to a phone as it dozes off
 //          fail too; that's its power save, not its link, and doesn't count.)
 //
+// A phone can also stop listening without saying so (asleep, with the router
+// still taking it for awake): for some seconds nothing sent to it is
+// answered, and the first frame it does answer goes out at the low rate
+// the radio had fallen back to. None of that says its link is slow. So a
+// second in which nothing got through leaves the delivery share alone
+// (that's "lost", above), and a lower rate is only believed once a number
+// of frames went through at it in each of two seconds close together; a
+// higher one at once. (One such second is also what a phone gets that the
+// router's driver held while it was silent: everything that waited for it,
+// at once.) A link that really is slow shows it as soon as it carries
+// traffic.
+//
 // A share only matters while devices compete for the air: alone, a weak
 // device still gets all of it.
 //
@@ -169,6 +181,11 @@ export const TRIES_LOST = 2;
 const KEEP = 0.6;
 // a second counts for the delivery share with at least this many frames sent
 const MIN_SENDS = 4;
+// a lower rate is believed from seconds with at least this many frames
+// through (a link that takes any air to speak of has many more), two of
+// them no more than LOW_WITHIN seconds apart
+const MIN_FRAMES = 8;
+const LOW_WITHIN = 3;
 // a step down in class needs this many seconds in a row, a step up this many
 const DOWN_AFTER = 2;
 const UP_AFTER = 3;
@@ -227,20 +244,44 @@ export function decide(prev, s, band, cfg) {
 	const was = prev?.class;
 	const st = {
 		delivery: prev?.delivery ?? 1.0,
-		rate: (s.rate > 0) ? s.rate : (prev?.rate ?? 0),
+		rate: prev?.rate ?? 0,
+		low: prev?.low ?? 0,
 		class: prev?.class ?? 'full',
 		streak: prev?.streak ?? 0,
 		want: prev?.want ?? 'full',
 		failed_run: prev?.failed_run ?? 0
 	};
 
+	// the rate its link is judged by: the one the router sends to it at, but
+	// a lower one than before only once frames have gone through at it in
+	// two seconds close together (after a silence the first frames go out
+	// at whatever the radio had fallen back to, one or many at once)
+	if (s.rate > 0 && (st.rate <= 0 || s.rate >= st.rate)) {
+		st.rate = s.rate;
+		st.low = 0;
+	}
+	else if (s.rate > 0 && s.delivered >= MIN_FRAMES) {
+		if (st.low > 0) {
+			st.rate = s.rate;
+			st.low = 0;
+		}
+		else
+			st.low = LOW_WITHIN;
+	}
+	else if (st.low > 0)
+		st.low--;
+
 	// the share of its transmissions that got a frame through. In a second it
 	// partly slept, the frames given up on were sent at a device that wasn't
-	// listening: they say nothing of its link and are left out
+	// listening: they say nothing of its link and are left out. Nor does a
+	// second in which nothing got through at all: that's a device not
+	// answering (below), not a share
 	const slept = (s.asleep ?? 0) > 0;
 	const sends = slept ? max(s.delivered, s.sends - s.failed * FAILED_SENDS) : s.sends;
-	if (sends >= MIN_SENDS && (!slept || s.delivered > 0)) {
-		const now = min(1.0, max(0.0, s.delivered / sends));
+	if (sends >= MIN_SENDS && s.delivered > 0) {
+		// (as a fraction whatever the counts' type: two whole numbers
+		// would divide to 0 or 1)
+		const now = min(1.0, max(0.0, 1.0 * s.delivered / sends));
 		st.delivery = KEEP * st.delivery + (1 - KEEP) * now;
 	}
 	// frames given up on with none through: counted until one gets through,

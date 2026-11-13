@@ -20,11 +20,11 @@
 # max_size only applies to plain GRO: fraglist GRO always groups up to 64 KB.
 #
 # The port is the one Smart Queue shapes for the internet (not a guest
-# network's), or the wan interface's device without Smart Queue, followed
-# down to its hardware port (eth1 under a VLAN). A port that stops being it
-# gets OpenWrt's defaults back. Everything is ethtool -K and ip link set:
-# nothing goes down. milkflint-tuning runs this when the settings, sqm or
-# the firewall change.
+# network's or the VPN's), or the wan interface's device without Smart
+# Queue, followed down to its hardware port (eth1 under a VLAN). A port that
+# stops being it gets OpenWrt's defaults back. Everything is ethtool -K and
+# ip link set: nothing goes down. milkflint-tuning runs this when the
+# settings, sqm or the firewall change.
 #
 #   gro          put the settings into effect
 #   gro show     print what they resolve to, one line per port:
@@ -56,8 +56,10 @@ has_hw() {
 	[ -e "/sys/class/net/$1/device" ] || [ -n "$(ls -d /sys/class/net/$1/lower_* 2> /dev/null)" ]
 }
 
-is_guest() {
-	case "$1" in br-guest* | ifb4br-guest*) return 0 ;; esac
+# <device>: a guest network's or the VPN's queue, not the internet port's:
+# its download options say nothing about how the port should group
+not_internet() {
+	case "$1" in br-guest* | ifb4br-guest* | wg_out | ifb4wg_out) return 0 ;; esac
 	return 1
 }
 
@@ -67,7 +69,7 @@ find_queue() {
 	config_get iface "$1" interface
 	config_get enabled "$1" enabled 0
 	config_get opts "$1" iqdisc_opts
-	[ -n "$iface" ] && [ "$enabled" = 1 ] && ! is_guest "$iface" && [ -z "$queue_dev" ] || return 0
+	[ -n "$iface" ] && [ "$enabled" = 1 ] && ! not_internet "$iface" && [ -z "$queue_dev" ] || return 0
 	queue_dev=$iface
 	case " $opts " in *" no-split-gso "*) whole=1 ;; esac
 }

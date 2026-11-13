@@ -1,0 +1,61 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] verify_qdisc: remember a qdisc that worked
+
+A start checks the same qdiscs every time (cake twice, ingress, cake_mq for
+each direction), and each check makes and deletes a throwaway ifb: about
+half of the commands a start runs, while downloads go unshaped. A qdisc
+that worked is remembered under the state dir (a tmpfs, so until a
+reboot) and not checked again. Should one stop working, say its module was
+removed, the real qdisc add fails and so does the start (patch 101).
+
+available_qdiscs stays as it is: LuCI offers what's in it, and these
+include ingress and cake_mq, which aren't choices there.
+
+diff --git a/src/functions.sh b/src/functions.sh
+index 0cc6791..402108d 100644
+--- a/src/functions.sh
++++ b/src/functions.sh
+@@ -321,6 +321,13 @@ get_ifb_for_if() {
+ #
+ # note the ingress qdisc is different in that it requires tc qdisc replace dev
+ # tmp_ifb ingress instead of "root ingress"
++#
++# A qdisc that worked is remembered in $SQM_VERIFIED_QDISCS until a reboot:
++# a start checks three to five and each check is a throwaway ifb, about half
++# of the commands a start runs, while downloads go unshaped. Should one stop
++# working (its module removed), the real qdisc add fails and so does the
++# start.
++SQM_VERIFIED_QDISCS=${SQM_VERIFIED_QDISCS-${SQM_STATE_DIR:+${SQM_STATE_DIR}/verified_qdiscs}}
+ verify_qdisc() {
+     local qdisc
+     local supported
+@@ -332,8 +339,6 @@ verify_qdisc() {
+     local randnum
+     qdisc=$1
+     supported="$2"
+-    randnum=$(tr -cd 0-9a-f < /dev/urandom 2>/dev/null | head -c 5)
+-    ifb=SQM_IFB_$randnum
+     root_string="root" # this works for most qdiscs
+     args=""
+     IFB_MTU=1514
+@@ -345,6 +350,12 @@ verify_qdisc() {
+         done
+         [ "$found" -eq "1" ] || return 1
+     fi
++    if [ -n "$SQM_VERIFIED_QDISCS" ] && [ -f "$SQM_VERIFIED_QDISCS/$qdisc" ]; then
++        sqm_debug "QDISC $qdisc is useable (it was before)."
++        return 0
++    fi
++    randnum=$(tr -cd 0-9a-f < /dev/urandom 2>/dev/null | head -c 5)
++    ifb=SQM_IFB_$randnum
+     if [ "$qdisc" = "cake_mq" ]; then
+         # cake_mq only works on a device with several transmit queues; the
+         # ifb create_ifb makes has one unless USE_MQ is on, which is for the
+@@ -370,6 +381,7 @@ verify_qdisc() {
+     res=$?
+     if [ "$res" = "0" ] ; then
+         sqm_debug "QDISC $qdisc is useable."
++        [ -n "$SQM_VERIFIED_QDISCS" ] && mkdir -p "$SQM_VERIFIED_QDISCS" && touch "$SQM_VERIFIED_QDISCS/$qdisc"
+     else
+         sqm_error "QDISC $qdisc is NOT useable."
+     fi

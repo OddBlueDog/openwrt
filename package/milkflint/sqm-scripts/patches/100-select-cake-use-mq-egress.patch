@@ -21,10 +21,10 @@ index eb7cb07..aff6fb7 100644
  [ -z "$ZERO_DSCP_INGRESS" ] && ZERO_DSCP_INGRESS="${ZERO_DSCP:-${SQUASH_DSCP:-1}}"
  [ -z "$IGNORE_DSCP_INGRESS" ] && IGNORE_DSCP_INGRESS="${IGNORE_DSCP:-${SQUASH_INGRESS:-1}}"
 diff --git a/src/functions.sh b/src/functions.sh
-index 43d5d5c..201ecfb 100644
+index ca47c9f..52c3b95 100644
 --- a/src/functions.sh
 +++ b/src/functions.sh
-@@ -885,12 +885,18 @@ select_cake() {
+@@ -893,12 +893,18 @@ select_cake() {
      local interface
      local num_queues
      local qdisc
@@ -45,7 +45,7 @@ index 43d5d5c..201ecfb 100644
      fi
  
 diff --git a/src/run-openwrt.sh b/src/run-openwrt.sh
-index d735a2f..50f14a5 100644
+index 026d1c8..3980221 100644
 --- a/src/run-openwrt.sh
 +++ b/src/run-openwrt.sh
 @@ -67,6 +67,7 @@ start_sqm_section() {

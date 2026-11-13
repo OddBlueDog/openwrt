@@ -1,0 +1,282 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] sqm: a start that fails leaves nothing running
+
+The scripts' ingress() went on after a failed qdisc add: the ifb was
+brought up and the redirect added, so downloads passed through an ifb
+with no shaper, and ingress() returned the redirect's status. An unknown
+word in iqdisc_opts does that, and so does autorate-ingress with cake_mq,
+which the kernel refuses. Each script's egress() and ingress() now return
+failure when a qdisc add (or bringing the ifb up) fails, before the
+redirect.
+
+start-sqm writes no state file for a failed start, so no stop would take
+down what it did set up (an upload CAKE with the old settings, the ingress
+qdisc, the ifb). It takes all of it down itself, then fails.
+
+diff --git a/src/layer_cake.qos b/src/layer_cake.qos
+index 112043b..baf4701 100644
+--- a/src/layer_cake.qos
++++ b/src/layer_cake.qos
+@@ -33,7 +33,7 @@ ingress() {
+     qdisc=$(select_cake $DEV)
+ 
+     SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+-    $TC qdisc add dev $IFACE handle ffff: ingress
++    $TC qdisc add dev $IFACE handle ffff: ingress || return 1
+ 
+     SILENT=1 $TC qdisc del dev $DEV root
+ 
+@@ -41,9 +41,9 @@ ingress() {
+     [ "$ZERO_DSCP_INGRESS" -eq "1" ] && INGRESS_CAKE_OPTS="$INGRESS_CAKE_OPTS wash"
+ 
+     $TC qdisc add dev $DEV root $( get_stab_string ) $qdisc \
+-        bandwidth ${DOWNLINK}kbit $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}
++        bandwidth ${DOWNLINK}kbit $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS} || return 1
+ 
+-    $IP link set dev $DEV up
++    $IP link set dev $DEV up || return 1
+ 
+     # redirect all IP packets arriving in $IFACE to ifb0
+ 
+diff --git a/src/piece_of_cake.qos b/src/piece_of_cake.qos
+index 4148d47..94801d7 100644
+--- a/src/piece_of_cake.qos
++++ b/src/piece_of_cake.qos
+@@ -37,15 +37,15 @@ ingress() {
+     qdisc=$(select_cake $DEV)
+ 
+     SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+-    $TC qdisc add dev $IFACE handle ffff: ingress
++    $TC qdisc add dev $IFACE handle ffff: ingress || return 1
+     SILENT=1 $TC qdisc del dev $DEV root
+ 
+     [ "$ZERO_DSCP_INGRESS" -eq "1" ] && INGRESS_CAKE_OPTS="$INGRESS_CAKE_OPTS wash"
+ 
+     $TC qdisc add dev $DEV root $( get_stab_string ) $qdisc \
+-        bandwidth ${DOWNLINK}kbit $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}
++        bandwidth ${DOWNLINK}kbit $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS} || return 1
+ 
+-    $IP link set dev $DEV up
++    $IP link set dev $DEV up || return 1
+ 
+     # redirect all IP packets arriving in $IFACE to ifb0
+ 
+diff --git a/src/simple.qos b/src/simple.qos
+index 1cba99f..9cd2418 100644
+--- a/src/simple.qos
++++ b/src/simple.qos
+@@ -121,7 +121,7 @@ nft_setup() {
+ 
+ cake_egress()
+ {
+-    $TC qdisc add dev $IFACE root `get_stab_string` $QDISC bandwidth ${CEIL}kbit `get_cake_lla_string` ${EQDISC_OPTS}
++    $TC qdisc add dev $IFACE root `get_stab_string` $QDISC bandwidth ${CEIL}kbit `get_cake_lla_string` ${EQDISC_OPTS} || return 1
+ }
+ 
+ egress() {
+@@ -141,18 +141,18 @@ egress() {
+         cake*) cake_egress; return;;
+     esac
+ 
+-    $TC qdisc add dev $IFACE root handle 1: `get_stab_string` htb default 12
++    $TC qdisc add dev $IFACE root handle 1: `get_stab_string` htb default 12 || return 1
+     $TC class add dev $IFACE parent 1: classid 1:1 htb $LQ rate ${CEIL}kbit ceil ${CEIL}kbit $BURST `get_htb_adsll_string`
+     $TC class add dev $IFACE parent 1:1 classid 1:11 htb $LQ rate 128kbit ceil ${PRIO_RATE}kbit prio 1 `get_htb_adsll_string`
+     $TC class add dev $IFACE parent 1:1 classid 1:12 htb $LQ rate ${BE_RATE}kbit ceil ${BE_CEIL}kbit $BURST prio 2 `get_htb_adsll_string`
+     $TC class add dev $IFACE parent 1:1 classid 1:13 htb $LQ rate ${BK_RATE}kbit ceil ${BE_CEIL}kbit $BURST prio 3 `get_htb_adsll_string`
+ 
+     $TC qdisc add dev $IFACE parent 1:11 handle 110: $QDISC \
+-        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_quantum 300` `get_flows ${PRIO_RATE}` ${EQDISC_OPTS}
++        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_quantum 300` `get_flows ${PRIO_RATE}` ${EQDISC_OPTS} || return 1
+     $TC qdisc add dev $IFACE parent 1:12 handle 120: $QDISC \
+-        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_quantum 300` `get_flows ${BE_RATE}` ${EQDISC_OPTS}
++        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_quantum 300` `get_flows ${BE_RATE}` ${EQDISC_OPTS} || return 1
+     $TC qdisc add dev $IFACE parent 1:13 handle 130: $QDISC \
+-        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_quantum 300` `get_flows ${BK_RATE}` ${EQDISC_OPTS}
++        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_quantum 300` `get_flows ${BK_RATE}` ${EQDISC_OPTS} || return 1
+ 
+     # Need a catchall rule
+ 
+@@ -191,9 +191,9 @@ cake_ingress()
+     CAKEARGS=
+     [ "$IGNORE_DSCP_INGRESS" = "1" ] && CAKEARGS="$CAKEARGS besteffort"
+     $TC qdisc add dev $DEV root `get_stab_string` $QDISC bandwidth ${DOWNLINK}kbit \
+-        $CAKEARGS `get_cake_lla_string` ${IQDISC_OPTS}
++        $CAKEARGS `get_cake_lla_string` ${IQDISC_OPTS} || return 1
+ 
+-    $IP link set dev $DEV up
++    $IP link set dev $DEV up || return 1
+ 
+     # redirect all IP packets arriving in $IFACE to $DEV
+ 
+@@ -213,7 +213,7 @@ ingress() {
+     BURST="`get_htb_burst $IFACE $CEIL ${ISHAPER_BURST_DUR_US}`"
+ 
+     SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+-    $TC qdisc add dev $IFACE handle ffff: ingress
++    $TC qdisc add dev $IFACE handle ffff: ingress || return 1
+ 
+     SILENT=1 $TC qdisc del dev $DEV root
+ 
+@@ -223,30 +223,30 @@ ingress() {
+ 
+     if [ "$IGNORE_DSCP_INGRESS" = "1" ]; then
+         sqm_debug "Do not perform DSCP based filtering on ingress. (1-tier classification)"
+-        $TC qdisc add dev $DEV root handle 1: `get_stab_string` htb default 10
++        $TC qdisc add dev $DEV root handle 1: `get_stab_string` htb default 10 || return 1
+         $TC class add dev $DEV parent 1: classid 1:1 htb $LQ rate ${DOWNLINK}kbit ceil ${DOWNLINK}kbit $BURST `get_htb_adsll_string`
+         $TC class add dev $DEV parent 1:1 classid 1:10 htb $LQ rate ${DOWNLINK}kbit ceil ${DOWNLINK}kbit $BURST prio 0 `get_htb_adsll_string`
+         $TC qdisc add dev $DEV parent 1:10 handle 110: $QDISC \
+-            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_flows ${DOWNLINK}` ${IQDISC_OPTS}
++            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_flows ${DOWNLINK}` ${IQDISC_OPTS} || return 1
+     else
+         sqm_debug "Perform DSCP based filtering on ingress. (3-tier classification)"
+-        $TC qdisc add dev $DEV root handle 1: `get_stab_string` htb default 12
++        $TC qdisc add dev $DEV root handle 1: `get_stab_string` htb default 12 || return 1
+         $TC class add dev $DEV parent 1: classid 1:1 htb $LQ rate ${CEIL}kbit ceil ${CEIL}kbit $BURST `get_htb_adsll_string`
+         $TC class add dev $DEV parent 1:1 classid 1:11 htb $LQ rate 32kbit ceil ${PRIO_RATE}kbit prio 1 `get_htb_adsll_string`
+         $TC class add dev $DEV parent 1:1 classid 1:12 htb $LQ rate ${BE_RATE}kbit ceil ${BE_CEIL}kbit $BURST prio 2 `get_htb_adsll_string`
+         $TC class add dev $DEV parent 1:1 classid 1:13 htb $LQ rate ${BK_RATE}kbit ceil ${BE_CEIL}kbit $BURST prio 3 `get_htb_adsll_string`
+ 
+         $TC qdisc add dev $DEV parent 1:11 handle 110: $QDISC \
+-            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_quantum 500` `get_flows ${PRIO_RATE}` ${IQDISC_OPTS}
++            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_quantum 500` `get_flows ${PRIO_RATE}` ${IQDISC_OPTS} || return 1
+         $TC qdisc add dev $DEV parent 1:12 handle 120: $QDISC \
+-            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_quantum 1500` `get_flows ${BE_RATE}` ${IQDISC_OPTS}
++            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_quantum 1500` `get_flows ${BE_RATE}` ${IQDISC_OPTS} || return 1
+         $TC qdisc add dev $DEV parent 1:13 handle 130: $QDISC \
+-            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_quantum 300` `get_flows ${BK_RATE}` ${IQDISC_OPTS}
++            `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_quantum 300` `get_flows ${BK_RATE}` ${IQDISC_OPTS} || return 1
+ 
+         diffserv $DEV
+     fi
+ 
+-    $IP link set dev $DEV up
++    $IP link set dev $DEV up || return 1
+ 
+     # redirect all IP packets arriving in $IFACE to $DEV
+ 
+diff --git a/src/simplest.qos b/src/simplest.qos
+index 80fe208..94f4458 100644
+--- a/src/simplest.qos
++++ b/src/simplest.qos
+@@ -28,7 +28,7 @@
+ 
+ cake_egress()
+ {
+-    $TC qdisc add dev $IFACE root `get_stab_string` cake bandwidth ${UPLINK}kbit besteffort `get_cake_lla_string` ${EQDISC_OPTS}
++    $TC qdisc add dev $IFACE root `get_stab_string` cake bandwidth ${UPLINK}kbit besteffort `get_cake_lla_string` ${EQDISC_OPTS} || return 1
+ }
+ 
+ egress() {
+@@ -42,18 +42,18 @@ egress() {
+         cake*) cake_egress; return ;;
+     esac
+ 
+-    $TC qdisc add dev $IFACE root handle 1: `get_stab_string` htb default 10
++    $TC qdisc add dev $IFACE root handle 1: `get_stab_string` htb default 10 || return 1
+     $TC class add dev $IFACE parent 1: classid 1:1 htb $LQ rate ${UPLINK}kbit ceil ${UPLINK}kbit $BURST `get_htb_adsll_string`
+     $TC class add dev $IFACE parent 1:1 classid 1:10 htb $LQ rate ${UPLINK}kbit ceil ${UPLINK}kbit $BURST prio 0 `get_htb_adsll_string`
+     $TC qdisc add dev $IFACE parent 1:10 handle 110: $QDISC \
+-        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_flows ${UPLINK}` ${EQDISC_OPTS}
++        `get_limit ${ELIMIT}` `get_target "${ETARGET}" ${UPLINK}` `get_ecn ${EECN}` `get_flows ${UPLINK}` ${EQDISC_OPTS} || return 1
+ 
+ }
+ 
+ cake_ingress()
+ {
+-    $TC qdisc add dev $DEV root `get_stab_string` cake bandwidth ${DOWNLINK}kbit besteffort `get_cake_lla_string` ${IQDISC_OPTS}
+-    $IP link set dev $DEV up
++    $TC qdisc add dev $DEV root `get_stab_string` cake bandwidth ${DOWNLINK}kbit besteffort `get_cake_lla_string` ${IQDISC_OPTS} || return 1
++    $IP link set dev $DEV up || return 1
+ 
+     # redirect all IP packets arriving in $IFACE to $DEV
+ 
+@@ -64,7 +64,7 @@ cake_ingress()
+ ingress() {
+     sqm_debug "ingress"
+     SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+-    $TC qdisc add dev $IFACE handle ffff: ingress
++    $TC qdisc add dev $IFACE handle ffff: ingress || return 1
+ 
+     LQ="quantum `get_htb_quantum $IFACE ${DOWNLINK} ${ISHAPER_QUANTUM_DUR_US}`"
+     BURST="`get_htb_burst $IFACE ${DOWNLINK} ${ISHAPER_BURST_DUR_US}`"
+@@ -75,7 +75,7 @@ ingress() {
+         cake*) cake_ingress; return ;;
+     esac
+ 
+-    $TC qdisc add dev $DEV root handle 1: `get_stab_string` htb default 10
++    $TC qdisc add dev $DEV root handle 1: `get_stab_string` htb default 10 || return 1
+     $TC class add dev $DEV parent 1: classid 1:1 htb $LQ rate ${DOWNLINK}kbit ceil ${DOWNLINK}kbit $BURST `get_htb_adsll_string`
+     $TC class add dev $DEV parent 1:1 classid 1:10 htb $LQ rate ${DOWNLINK}kbit ceil ${DOWNLINK}kbit $BURST prio 0 `get_htb_adsll_string`
+ 
+@@ -85,9 +85,9 @@ ingress() {
+     # Most high rate flows are REALLY close. This stomps on those harder, but hurts on high rate long distance
+     #$TC qdisc add dev $DEV parent 1:10 handle 110: $QDISC limit $LIMIT $ECN interval 20ms target 3ms `get_flows ${DOWNLINK}`
+     $TC qdisc add dev $DEV parent 1:10 handle 110: $QDISC \
+-        `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_flows ${DOWNLINK}` ${IQDISC_OPTS}
++        `get_limit ${ILIMIT}` `get_target "${ITARGET}" ${DOWNLINK}` `get_ecn ${IECN}` `get_flows ${DOWNLINK}` ${IQDISC_OPTS} || return 1
+ 
+-    $IP link set dev $DEV up
++    $IP link set dev $DEV up || return 1
+ 
+     # redirect all IP packets arriving in $IFACE to ifb0
+ 
+diff --git a/src/simplest_tbf.qos b/src/simplest_tbf.qos
+index 3f7a1c3..0f9d3d9 100644
+--- a/src/simplest_tbf.qos
++++ b/src/simplest_tbf.qos
+@@ -38,17 +38,17 @@ egress() {
+     SILENT=1 $TC qdisc del dev $IFACE root
+ 
+     $TC qdisc add dev $IFACE root handle 1: $(get_stab_string) tbf \
+-        rate ${UPLINK}kbit burst $BURST latency 300ms $(get_htb_adsll_string)
++        rate ${UPLINK}kbit burst $BURST latency 300ms $(get_htb_adsll_string) || return 1
+     $TC qdisc add dev $IFACE parent 1: handle 110: $QDISC \
+         $(get_limit ${ELIMIT}) $(get_target "${ETARGET}" ${UPLINK}) \
+-        $(get_ecn ${EECN}) $(get_flows ${UPLINK}) ${EQDISC_OPTS}
++        $(get_ecn ${EECN}) $(get_flows ${UPLINK}) ${EQDISC_OPTS} || return 1
+ 
+ }
+ 
+ ingress() {
+     sqm_debug "ingress"
+     SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+-    $TC qdisc add dev $IFACE handle ffff: ingress
++    $TC qdisc add dev $IFACE handle ffff: ingress || return 1
+ 
+     MTU=$(get_mtu $IFACE)
+     BURST="$(get_burst ${MTU:-1514} ${DOWNLINK} ${ISHAPER_BURST_DUR_US})"
+@@ -57,12 +57,12 @@ ingress() {
+     SILENT=1 $TC qdisc del dev $DEV root
+ 
+     $TC qdisc add dev $DEV root handle 1: $(get_stab_string) tbf \
+-        rate ${DOWNLINK}kbit burst $BURST latency 300ms $(get_htb_adsll_string)
++        rate ${DOWNLINK}kbit burst $BURST latency 300ms $(get_htb_adsll_string) || return 1
+     $TC qdisc add dev $DEV parent 1: handle 110: $QDISC \
+         $(get_limit ${ILIMIT}) $(get_target "${ITARGET}" ${DOWNLINK}) \
+-        $(get_ecn ${IECN}) $(get_flows ${DOWNLINK}) ${IQDISC_OPTS}
++        $(get_ecn ${IECN}) $(get_flows ${DOWNLINK}) ${IQDISC_OPTS} || return 1
+ 
+-    $IP link set dev $DEV up
++    $IP link set dev $DEV up || return 1
+ 
+     # redirect all IP packets arriving in $IFACE to ifb0
+ 
+diff --git a/src/start-sqm b/src/start-sqm
+index 7f99727..4ee5263 100755
+--- a/src/start-sqm
++++ b/src/start-sqm
+@@ -69,6 +69,12 @@ fi
+ ret=$?
+ if [ "$ret" -ne 0 ]; then
+     sqm_error "${SCRIPT} failed to start on ${IFACE} (exit ${ret})"
++    # Take down what it set up: with no state file, no stop would, and
++    # downloads mustn't be redirected to an ifb that doesn't shape them.
++    CUR_IFB=${DEV:-$(ifb_name ${IFACE})}
++    SILENT=1 $TC qdisc del dev ${IFACE} ingress
++    SILENT=1 $TC qdisc del dev ${IFACE} root
++    sqm_cleanup 1
+     exit "$ret"
+ fi
+ write_state_file "${STATE_FILE}" || exit 1

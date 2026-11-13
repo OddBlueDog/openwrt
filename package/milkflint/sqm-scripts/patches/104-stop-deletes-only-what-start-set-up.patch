@@ -1,0 +1,67 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] sqm: a stop deletes only what the start set up
+
+run.sh passes stop-sqm the state file's interface and script but not its
+speeds, so stop-sqm had defaults.sh's: DOWNLINK was never 0, and every
+stop deleted the ingress qdisc, also of a queue without a download. A
+queue without an upload had no root qdisc to delete either, and on a
+device that's gone (pppoe-wan after a disconnect) both deletes fail. Each
+failed delete logged two ERROR lines for nothing.
+
+The stop gets the speeds the queue was started with, deletes a direction's
+qdisc only when that direction was shaped, and skips the device's qdiscs
+when the device is gone, and the ifb when it is.
+
+diff --git a/src/functions.sh b/src/functions.sh
+index 402108d..b2b1cac 100644
+--- a/src/functions.sh
++++ b/src/functions.sh
+@@ -510,6 +510,7 @@ sqm_cleanup()
+     nft_cleanup
+ 
+     [ -n "$CUR_IFB" ] || return 0
++    [ -d "/sys/class/net/${CUR_IFB}" ] || return 0
+ 
+     SILENT=$silent $IP link delete dev ${CUR_IFB} type ifb
+     sqm_debug "${0}: ${CUR_IFB} interface deleted"
+@@ -517,8 +518,13 @@ sqm_cleanup()
+ 
+ 
+ sqm_stop() {
+-    [ "${DOWNLINK}" -ne 0 ] && $TC qdisc del dev $IFACE ingress
+-    $TC qdisc del dev $IFACE root
++    # Only what the start set up (a direction set to 0 has no qdisc to
++    # delete), and nothing on a device that's gone (its qdiscs went with it):
++    # a delete that fails logs two errors for nothing.
++    if [ -d "/sys/class/net/${IFACE}" ]; then
++        [ "${DOWNLINK}" -ne 0 ] && $TC qdisc del dev $IFACE ingress
++        [ "${UPLINK}" -ne 0 ] && $TC qdisc del dev $IFACE root
++    fi
+ 
+     sqm_cleanup
+ }
+diff --git a/src/run-openwrt.sh b/src/run-openwrt.sh
+index 3980221..34da62a 100644
+--- a/src/run-openwrt.sh
++++ b/src/run-openwrt.sh
+@@ -32,6 +32,7 @@ stop_statefile() {
+     # there.
+     [ -f "$f" ] && ( . "$f";
+                      IFACE=$IFACE SCRIPT=$SCRIPT SQM_DEBUG=$SQM_DEBUG \
++                          UPLINK=$UPLINK DOWNLINK=$DOWNLINK \
+                           SQM_DEBUG_LOG=$SQM_DEBUG_LOG CLEANUP=$CLEANUP \
+                           SQM_VERBOSITY_MAX=$SQM_VERBOSITY_MAX \
+                           SQM_VERBOSITY_MIN=$SQM_VERBOSITY_MIN \
+diff --git a/src/stop-sqm b/src/stop-sqm
+index 135b5f3..87f8d09 100755
+--- a/src/stop-sqm
++++ b/src/stop-sqm
+@@ -37,7 +37,7 @@ fi
+ sqm_trace; sqm_trace "$(date): Stopping." # Add some space and a date stamp to verbose log output and log files to separate runs
+ 
+ # make sure to only delete the ifb associated with the current interface
+-CUR_IFB=$( get_ifb_associated_with_if ${IFACE} )
++[ -d "/sys/class/net/${IFACE}" ] && CUR_IFB=$( get_ifb_associated_with_if ${IFACE} )
+ [ -z "$CUR_IFB" ] && CUR_IFB=$( ifb_name ${IFACE} )
+ 
+ if [ ! -f "${SQM_LIB_DIR}/$SCRIPT" ]; then

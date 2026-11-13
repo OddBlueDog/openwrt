@@ -1,0 +1,1 @@
+function e(){return typeof location>`u`?void 0:location.protocol}function t(t,n=e()){return`${n===`https:`?`https`:`http`}://${t}/`}export{t};

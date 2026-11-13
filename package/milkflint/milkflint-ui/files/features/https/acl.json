@@ -1,0 +1,13 @@
+{
+	"milkflint-https": {
+		"description": "MilkFlint web interface: HTTPS",
+		"read": {
+			"ubus": { "milkflint.https": [ "status" ] },
+			"uci": [ "uhttpd" ]
+		},
+		"write": {
+			"ubus": { "milkflint.https": [ "renew" ] },
+			"uci": [ "uhttpd" ]
+		}
+	}
+}

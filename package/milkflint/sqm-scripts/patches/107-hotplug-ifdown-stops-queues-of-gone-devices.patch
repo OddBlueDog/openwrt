@@ -1,0 +1,51 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] sqm-hotplug: on ifdown, stop the queues whose device is gone
+
+netifd sets DEVICE only for ifup and ifupdate, so the hotplug's check for
+it ended every ifdown before its stop: an ifdown never stopped anything. A
+queue on a device that goes with its interface (pppoe-wan, a tunnel) kept
+its ifb, with its CAKE, and its state file until the next ifup, or for
+good if the interface stayed down.
+
+On ifdown the hotplug stops each running queue whose device no longer
+exists. A queue on a device that's still there keeps running, as it did:
+the ifdown can be another interface's on the same device (wan6 on wan's
+eth1), and qdiscs stay on a device that goes down. If the device is still
+there at the ifdown and goes after, the next ifup's reload finds its
+qdiscs gone and starts it again.
+
+diff --git a/platform/openwrt/sqm-hotplug b/platform/openwrt/sqm-hotplug
+index 5b35071..8aa0084 100755
+--- a/platform/openwrt/sqm-hotplug
++++ b/platform/openwrt/sqm-hotplug
+@@ -2,6 +2,20 @@
+ 
+ . /lib/functions.sh
+ 
++# netifd names no device on ifdown. A queue whose device went with the
++# interface (pppoe-wan, a tunnel) is stopped, so its ifb and state file
++# don't stay behind; one on a device that's still there (eth1, which wan6
++# shares with wan) keeps running.
++if [ "$ACTION" = ifdown ]; then
++    . /etc/sqm/sqm.conf
++    for f in ${SQM_STATE_DIR}/*.state; do
++        dev=${f##*/}
++        dev=${dev%.state}
++        [ -f "$f" ] && [ ! -d "/sys/class/net/$dev" ] && /usr/lib/sqm/run.sh stop "$dev"
++    done
++    exit 0
++fi
++
+ [ -n "$DEVICE" ] || exit 0
+ 
+ list_ports() {
+@@ -34,9 +48,3 @@ reload_sqm() {
+ }
+ 
+ [ "$ACTION" = ifup ] && /etc/init.d/sqm enabled && reload_sqm
+-
+-if [ "$ACTION" = ifdown ]; then
+-    for dev in $ALL_DEVICES; do
+-        /usr/lib/sqm/run.sh stop $dev
+-    done
+-fi

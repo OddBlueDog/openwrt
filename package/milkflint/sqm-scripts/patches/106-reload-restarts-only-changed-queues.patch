@@ -1,0 +1,196 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] run-openwrt: reload restarts only the queues that changed
+
+Every ifup on a queue's device stopped and started the queue, and every
+change to the sqm config restarted all of them: wan6 coming up restarted
+the queue wan6 shares with wan, and a guest network's new speed limit
+restarted the internet queue. Each restart leaves downloads unshaped for a
+moment, drops what's queued and forgets every flow.
+
+run.sh reload [iface] stops a running queue only when its section changed,
+was removed or turned off, or its qdiscs aren't what its start left, then
+starts what isn't running. The init script's reload and the ifup hotplug
+use it. A queue is left running only while both of these are what they
+were at its start, kept in its state file:
+
+- a checksum of every option of its section, the scripts a start runs and
+  sqm.conf, and its device's MTU and transmit queues;
+- a checksum of what runs: the download's redirect, the kind, handle and
+  parent of each qdisc on the device and its ifb (a replaced qdisc has a
+  new handle), both devices' indexes (a device made again has a new one)
+  and whether the ifb is up.
+
+A state file without them (an older version's) counts as changed. The
+reload trigger no longer goes through rc.common's stop, which dropped it
+until the start was done, so a second save soon after the first was
+missed.
+
+diff --git a/platform/openwrt/sqm-hotplug b/platform/openwrt/sqm-hotplug
+index 636c914..5b35071 100755
+--- a/platform/openwrt/sqm-hotplug
++++ b/platform/openwrt/sqm-hotplug
+@@ -25,14 +25,15 @@ ports_for_device() {
+ 
+ ALL_DEVICES=$(echo $DEVICE $(uci -q get network.$INTERFACE.ifname) $(ports_for_device $(uci -q get network.$INTERFACE.device)) | tr ' ' '\n' | sort -u)
+ 
+-restart_sqm() {
++# a queue that runs as set is left alone (run.sh reload): every interface
++# on the device comes up (wan6 on wan's), and a restart drops the queue
++reload_sqm() {
+     for dev in $ALL_DEVICES; do
+-        /usr/lib/sqm/run.sh stop $dev
+-        /usr/lib/sqm/run.sh start $dev
++        /usr/lib/sqm/run.sh reload $dev
+     done
+ }
+ 
+-[ "$ACTION" = ifup ] && /etc/init.d/sqm enabled && restart_sqm
++[ "$ACTION" = ifup ] && /etc/init.d/sqm enabled && reload_sqm
+ 
+ if [ "$ACTION" = ifdown ]; then
+     for dev in $ALL_DEVICES; do
+diff --git a/platform/openwrt/sqm-init b/platform/openwrt/sqm-init
+index 3badb62..2bc872a 100755
+--- a/platform/openwrt/sqm-init
++++ b/platform/openwrt/sqm-init
+@@ -8,10 +8,13 @@ service_triggers()
+ 	procd_add_reload_trigger "sqm"
+ }
+ 
++# Restarts only the queues whose settings changed (run.sh reload). A stop
++# and a start restarted every queue, and rc.common's stop drops this
++# service's reload trigger until the start is done: a second save meanwhile
++# wasn't applied.
+ reload_service()
+ {
+-	stop "$@"
+-	start "$@"
++	/usr/lib/sqm/run.sh reload "$@"
+ }
+ 
+ start_service()
+diff --git a/src/run-openwrt.sh b/src/run-openwrt.sh
+index 42538a2..7a4de80 100644
+--- a/src/run-openwrt.sh
++++ b/src/run-openwrt.sh
+@@ -39,8 +39,72 @@ stop_statefile() {
+                           OUTPUT_TARGET=$OUTPUT_TARGET ${SQM_LIB_DIR}/stop-sqm )
+ }
+ 
++# Every option of each section as config_load reads it, for
++# section_inputs: whatever a start takes from a section is among them.
++config_cb() { SQM_SECTION="$2"; }
++option_cb() { [ -z "$SQM_SECTION" ] || append "SQM_OPTIONS_$SQM_SECTION" "$1=$2" "$N"; }
++list_cb() { [ -z "$SQM_SECTION" ] || append "SQM_OPTIONS_$SQM_SECTION" "$1+=$2" "$N"; }
++
++# A checksum of what a start of <section> depends on: the section's options,
++# the scripts a start runs (a new version of them counts), and its device's
++# MTU and transmit queues. A reload leaves a queue running only while this
++# is what it was started with.
++section_inputs() {
++    local section iface script
++    section="$1"
++    iface=$(config_get "$section" interface)
++    script=$(config_get "$section" script)
++    {
++        echo "$section"
++        eval "echo \"\$SQM_OPTIONS_$section\""
++        cat /etc/sqm/sqm.conf "$0" "${SQM_LIB_DIR}/functions.sh" "${SQM_LIB_DIR}/defaults.sh" \
++            "${SQM_LIB_DIR}/start-sqm" "${SQM_LIB_DIR}/${script}"
++        cat "/sys/class/net/${iface}/mtu"
++        ls "/sys/class/net/${iface}/queues"
++    } 2>/dev/null | md5sum | cut -d' ' -f1
++}
++
++# A checksum of what runs on <iface> now, as the kernel has it: the
++# download's redirect, the kind, handle and parent of each qdisc on the
++# device and on its ifb (one replaced or made again has a new handle), both
++# devices' indexes (a device made again has a new one) and whether the ifb
++# is up. A reload leaves a queue running only while this is what its start
++# left.
++sqm_qdiscs() {
++    local iface ifb
++    iface="$1"
++    ifb=$(tc filter show dev "$iface" parent ffff: 2>/dev/null | sed -n 's/.*Redirect to device \([^ )]*\).*/\1/p')
++    {
++        echo "redirect $ifb"
++        ifb=${ifb:-$(ifb_name "$iface")}
++        echo "$iface $(cat "/sys/class/net/${iface}/ifindex" 2>/dev/null)"
++        tc qdisc show dev "$iface" 2>/dev/null | cut -d' ' -f2-5
++        echo "$ifb $(cat "/sys/class/net/${ifb}/ifindex" 2>/dev/null)" \
++            "$(( $(cat "/sys/class/net/${ifb}/flags" 2>/dev/null || echo 0) & 1 ))"
++        tc qdisc show dev "$ifb" 2>/dev/null | cut -d' ' -f2-5
++    } | md5sum | cut -d' ' -f1
++}
++
++# config_foreach callback: the first section that's on for the interface $2
++# (the one a start runs) in SQM_FOUND
++find_section() {
++    [ -z "$SQM_FOUND" ] && [ "$(config_get "$1" interface)" = "$2" ] &&
++        [ "$(config_get "$1" enabled)" -eq 1 ] 2>/dev/null && SQM_FOUND="$1"
++    return 0
++}
++
++# <state file> <iface>: the queue it records runs as its section asks now
++# and as its start left it
++running_as_set() {
++    SQM_FOUND=
++    config_foreach find_section "" "$2"
++    [ -n "$SQM_FOUND" ] &&
++        [ "$(sed -n 's/^SQM_INPUTS="\(.*\)"$/\1/p' "$1")" = "$(section_inputs "$SQM_FOUND")" ] &&
++        [ "$(sed -n 's/^SQM_QDISCS="\(.*\)"$/\1/p' "$1")" = "$(sqm_qdiscs "$2")" ]
++}
++
+ start_sqm_section() {
+-    local section
++    local section inputs
+     section="$1"
+     export IFACE=$(config_get "$section" interface)
+ 
+@@ -83,7 +147,16 @@ start_sqm_section() {
+     export SQM_VERBOSITY_MAX=${SQM_VERBOSITY_MAX:-$(config_get "$section" verbosity)}
+     export SQM_VERBOSITY_MIN
+ 
+-    "${SQM_LIB_DIR}/start-sqm" || SQM_EXIT_STATUS=$?
++    inputs=$(section_inputs "$section")
++    if "${SQM_LIB_DIR}/start-sqm"; then
++        # what a reload compares
++        [ -f "${SQM_STATE_DIR}/${IFACE}.state" ] && {
++            echo "SQM_INPUTS=\"$inputs\""
++            echo "SQM_QDISCS=\"$(sqm_qdiscs "$IFACE")\""
++        } >> "${SQM_STATE_DIR}/${IFACE}.state"
++    else
++        SQM_EXIT_STATUS=$?
++    fi
+ }
+ 
+ # One run at a time. The lock is flock's on fd 9 (start-sqm and stop-sqm
+@@ -121,6 +194,28 @@ if [ "$ACTION" = "stop" ]; then
+     else
+         stop_statefile "${SQM_STATE_DIR}/${RUN_IFACE}.state"
+     fi
++elif [ "$ACTION" = "reload" ]; then
++    # A stop and a start of the queues whose section changed, was removed or
++    # turned off, or whose qdiscs aren't as their start left them (the device
++    # was made again), then a start of those not running. A queue that runs
++    # as set is left alone: a restart leaves downloads unshaped for a moment,
++    # drops what's queued and forgets every flow, and an ifup on its device
++    # (wan6 on wan's) or a save of another section used to cause one.
++    SQM_EXIT_STATUS=0
++    config_load sqm
++    for f in ${SQM_STATE_DIR}/*.state; do
++        [ -f "$f" ] || continue
++        iface=${f##*/}
++        iface=${iface%.state}
++        [ -z "$RUN_IFACE" -o "$RUN_IFACE" = "$iface" ] || continue
++        if running_as_set "$f" "$iface"; then
++            sqm_log "SQM on ${iface} runs as set: left running"
++        else
++            stop_statefile "$f"
++        fi
++    done
++    config_foreach start_sqm_section
++    exit "$SQM_EXIT_STATUS"
+ else
+     SQM_EXIT_STATUS=0
+     config_load sqm

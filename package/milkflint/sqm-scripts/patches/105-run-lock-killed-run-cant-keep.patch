@@ -1,0 +1,70 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] run-openwrt: a run lock that a killed run can't leave behind
+
+The run lock was a directory with the holder's PID in it, removed by an
+exit trap. A run that was killed (SIGKILL, or the shell dying) left it, and
+every later start and stop waited 10 s and gave up, until a reboot or
+someone removed it by hand. It is flock's now, on a file next to it: the
+kernel lets go of it when the process holding it ends, however it ends.
+The 10 s wait for a run that's still going stays.
+
+diff --git a/src/run-openwrt.sh b/src/run-openwrt.sh
+index 34da62a..42538a2 100644
+--- a/src/run-openwrt.sh
++++ b/src/run-openwrt.sh
+@@ -14,7 +14,7 @@
+ 
+ ACTION="${1:-start}"
+ RUN_IFACE="$2"
+-LOCKDIR="${SQM_STATE_DIR}/sqm-run.lock"
++LOCKFILE="${SQM_STATE_DIR}/run.lock"
+ 
+ CLEANUP=0
+ if [ "$ACTION" = "cleanup" ]; then
+@@ -86,31 +86,20 @@ start_sqm_section() {
+     "${SQM_LIB_DIR}/start-sqm" || SQM_EXIT_STATUS=$?
+ }
+ 
+-release_lock() {
+-    PID=$(cat "$LOCKDIR/pid")
+-    if [ "$PID" -ne "$$" ]; then
+-        sqm_error "Trying to release lock with wrong PID $PID != $$"
+-        return 1
+-    fi
+-
+-    rm -rf "$LOCKDIR"
+-    return 0
+-}
+-
++# One run at a time. The lock is flock's on fd 9 (start-sqm and stop-sqm
++# inherit it): the kernel lets go of it when the run ends, however it ends.
++# A lock directory, as this was, stayed taken after a run that was killed,
++# and every later start or stop gave up until a reboot.
+ take_lock() {
+-
+-    if mkdir "$LOCKDIR" 2>/dev/null; then
++    if flock -n 9; then
+         sqm_trace "Acquired run lock"
+-        echo $$ > "$LOCKDIR/pid"
+-
+-        trap release_lock 0
+         return 0
+     fi
+-    PID=$(cat "$LOCKDIR/pid")
+-    sqm_warn "Unable to get run lock - already held by $PID"
++    sqm_warn "Unable to get run lock - another run holds it"
+     return 1
+ }
+ 
++exec 9> "$LOCKFILE"
+ MAX_TRIES=10
+ tries=$MAX_TRIES
+ while ! take_lock; do
+@@ -119,7 +108,6 @@ while ! take_lock; do
+     if [ "$tries" -eq 0 ]; then
+         sqm_error "Giving up on getting lock after $MAX_TRIES attempts"
+         sqm_error "This is a bug; please report it at https://github.com/tohojo/sqm-scripts/issues"
+-        sqm_error "Then, to re-enable sqm-scripts, manually remove $LOCKDIR"
+         exit 1
+     fi
+ done
