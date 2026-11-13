@@ -1,0 +1,489 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 13 Nov 2026 18:30:00 +0000
+Subject: [PATCH] net/sched: sch_cake: the ACK filter reads a flow's queue only when it holds an ACK
+
+cake_ack_filter() runs for every packet that joins a flow with the ACK
+flag set, which on a TCP upload is every data packet, and reads the
+headers of the packets queued ahead of it, looking for pure ACKs the new
+one makes redundant. An upload's flow holds none: each of its packets read
+its whole queue for nothing, the more the longer the queue, so most when
+the upload is busiest.
+
+Each flow now counts its queued pure ACKs (the ACK flag alone, ECE and CWR
+aside, and no data: what the filter asks of a packet before it compares it
+with the new one), in a byte struct cake_flow had spare, and the filter
+reads the queue only when there's one. A packet leaves the count as it
+leaves the queue: dequeued, dropped from the head when the queue
+overflows, or dropped by the filter. The count stops at 255: an ACK queued
+beyond that may be kept where the filter could have dropped it.
+
+KUnit: the count through an upload's data, a download's ACKs, FINs and
+data with the ACK flag, and packets leaving; past 255 and back to 0;
+through cake_enqueue(), cake_dequeue() and a reset; and at random in both
+modes, IPv4 and IPv6, with what the filter tells apart (more acknowledged
+or less, SACK, timestamps, ECE, another connection in the flow): the count
+always what's queued, and the read skipped only where upstream's filter,
+run on the same queue, drops nothing.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -139,6 +139,7 @@ struct cake_flow {
+ 	u16		  srchost; /* index into cake_host table */
+ 	u16		  dsthost;
+ 	u8		  set;
++	u8		  pure_acks; /* queued, for the ACK filter: cake_ack_filter() */
+ 	u16		  mq_weight; /* cake_mq: its part of the tin's mq_weight */
+ }; /* please try to keep this structure <= 64 bytes */
+ 
+@@ -328,6 +329,7 @@ enum {
+ struct cobalt_skb_cb {
+ 	ktime_t enqueue_time;
+ 	u32     adjusted_len;
++	bool	pure_ack;	/* counted in its flow's pure_acks */
+ };
+ 
+ static u64 us_to_ns(u64 us)
+@@ -1273,12 +1275,14 @@ static struct sk_buff *dequeue_head(struct cake_flow *flow)
+ 	if (skb) {
+ 		flow->head = skb->next;
+ 		skb_mark_not_on_list(skb);
++		if (get_cobalt_cb(skb)->pure_ack)
++			flow->pure_acks--;
+ 	}
+ 
+ 	return skb;
+ }
+ 
+-/* add skb to flow queue (tail add) */
++/* add skb to flow queue (tail add); the ACK filter counts it if it's a pure ACK */
+ 
+ static void flow_queue_add(struct cake_flow *flow, struct sk_buff *skb)
+ {
+@@ -1288,6 +1292,7 @@ static void flow_queue_add(struct cake_flow *flow, struct sk_buff *skb)
+ 		flow->tail->next = skb;
+ 	flow->tail = skb;
+ 	skb->next = NULL;
++	get_cobalt_cb(skb)->pure_ack = false;
+ }
+ 
+ static struct iphdr *cake_get_iphdr(const struct sk_buff *skb,
+@@ -1565,8 +1570,8 @@ static bool cake_tcph_may_drop(const struct tcphdr *tcph,
+ 	return true;
+ }
+ 
+-static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
+-				       struct cake_flow *flow)
++static struct sk_buff *__cake_ack_filter(struct cake_sched_data *q,
++					 struct cake_flow *flow)
+ {
+ 	bool aggressive = q->config->ack_filter == CAKE_ACK_AGGRESSIVE;
+ 	struct sk_buff *elig_ack = NULL, *elig_ack_prev = NULL;
+@@ -1716,10 +1721,62 @@ found:
+ 		flow->head = elig_ack->next;
+ 
+ 	skb_mark_not_on_list(elig_ack);
++	if (get_cobalt_cb(elig_ack)->pure_ack)
++		flow->pure_acks--;
+ 
+ 	return elig_ack;
+ }
+ 
++/* A pure ACK, one a later ACK could make redundant: only the ACK flag
++ * (ECE and CWR aside) and no data, what __cake_ack_filter() asks of each
++ * packet it may drop before it compares it with the new one. @iph and @tcph
++ * are @skb's, from cake_get_iphdr() and cake_get_tcphdr().
++ */
++static bool cake_pure_ack(const struct sk_buff *skb, const struct iphdr *iph,
++			  const struct tcphdr *tcph)
++{
++	int seglen;
++
++	if ((tcp_flag_word(tcph) & cpu_to_be32(0x0F3F0000)) != TCP_FLAG_ACK)
++		return false;
++	if (iph->version == 4)
++		seglen = iph_totlen(skb, iph) - 4 * iph->ihl;
++	else
++		seglen = ipv6_payload_len(skb, (const struct ipv6hdr *)iph);
++	return seglen == __tcp_hdrlen(tcph);
++}
++
++/* Drop a queued ACK that the one just added at @flow's tail makes redundant.
++ * Upstream's filter reads the headers of every packet queued ahead of it,
++ * and any packet with the ACK flag starts that: all of an upload's data
++ * packets, each reading the whole of its flow's queue while that's longest.
++ * The flow counts its queued pure ACKs, the only packets the filter may
++ * drop, so that read happens only when there's one. It counts up to
++ * U8_MAX: an ACK queued beyond that may be passed over and kept, as one is
++ * that no later ACK makes redundant.
++ */
++static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
++				       struct cake_flow *flow)
++{
++	struct sk_buff *skb = flow->tail;
++	unsigned char _tcph[64];
++	const struct tcphdr *tcph;
++	const struct iphdr *iph;
++	struct ipv6hdr _iph;
++	u8 queued = flow->pure_acks;
++
++	tcph = cake_get_tcphdr(skb, _tcph, sizeof(_tcph));
++	iph = cake_get_iphdr(skb, &_iph);
++	if (!tcph || !iph)
++		return NULL;
++
++	if (cake_pure_ack(skb, iph, tcph) && flow->pure_acks < U8_MAX) {
++		get_cobalt_cb(skb)->pure_ack = true;
++		flow->pure_acks++;
++	}
++	return queued ? __cake_ack_filter(q, flow) : NULL;
++}
++
+ static u64 cake_ewma(u64 avg, u64 sample, u32 shift)
+ {
+ 	avg -= avg >> shift;
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -3107,6 +3107,331 @@ static void cake_test_overhead_tunnel(struct kunit *test)
+ 			segs * (outer + plain_seg - ETH_HLEN + 38));
+ }
+ 
++/* The ACK filter's tests: one connection's packets (192.168.1.5:41000 to
++ * 1.1.1.1:443) in one CAKE flow queue, with another connection's (port
++ * 41001) sharing it as a hash collision would
++ */
++struct cake_test_tcp {
++	__be32	flags;		/* TCP_FLAG_* */
++	u32	ack;
++	u16	data;		/* payload bytes */
++	u32	tsval;		/* a timestamp option when non-zero */
++	u32	sack;		/* a SACK block of one segment from here when non-zero */
++	bool	v6;
++	bool	other;		/* the other connection's */
++};
++
++static struct sk_buff *cake_test_tcp_skb(struct kunit *test, const struct cake_test_tcp *t)
++{
++	const unsigned int l3 = t->v6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
++	unsigned int opts = (t->tsval ? 12 : 0) + (t->sack ? 12 : 0);
++	unsigned int len = ETH_HLEN + l3 + sizeof(struct tcphdr) + opts + t->data;
++	struct sk_buff *skb = alloc_skb(len, GFP_KERNEL);
++	struct tcphdr *th;
++	u8 *o;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	skb->dev = init_net.loopback_dev;
++	skb_put_zero(skb, len);
++	skb_reset_mac_header(skb);
++	skb_set_network_header(skb, ETH_HLEN);
++	skb_set_transport_header(skb, ETH_HLEN + l3);
++	if (t->v6) {
++		struct ipv6hdr *ip6 = ipv6_hdr(skb);
++
++		skb->protocol = htons(ETH_P_IPV6);
++		ip6->version = 6;
++		ip6->nexthdr = IPPROTO_TCP;
++		ip6->payload_len = htons(len - ETH_HLEN - l3);
++		ip6->saddr.s6_addr32[0] = htonl(0x20010db8);
++		ip6->saddr.s6_addr[15] = 5;
++		ip6->daddr.s6_addr32[0] = htonl(0x20010db8);
++		ip6->daddr.s6_addr[15] = 1;
++	} else {
++		struct iphdr *ip = ip_hdr(skb);
++
++		skb->protocol = htons(ETH_P_IP);
++		ip->version = 4;
++		ip->ihl = 5;
++		ip->protocol = IPPROTO_TCP;
++		ip->tot_len = htons(len - ETH_HLEN);
++		ip->saddr = htonl(0xc0a80105);
++		ip->daddr = htonl(0x01010101);
++	}
++	th = tcp_hdr(skb);
++	th->source = htons(t->other ? 41001 : 41000);
++	th->dest = htons(443);
++	th->ack_seq = htonl(t->ack);
++	th->doff = (sizeof(*th) + opts) / 4;
++	tcp_flag_word(th) |= t->flags;
++	o = (u8 *)(th + 1);
++	if (t->tsval) {
++		*o++ = TCPOPT_NOP;
++		*o++ = TCPOPT_NOP;
++		*o++ = TCPOPT_TIMESTAMP;
++		*o++ = TCPOLEN_TIMESTAMP;
++		put_unaligned_be32(t->tsval, o);
++		put_unaligned_be32(t->tsval, o + 4);
++		o += 8;
++	}
++	if (t->sack) {
++		*o++ = TCPOPT_NOP;
++		*o++ = TCPOPT_NOP;
++		*o++ = TCPOPT_SACK;
++		*o++ = TCPOLEN_SACK_BASE + TCPOLEN_SACK_PERBLOCK;
++		put_unaligned_be32(t->sack, o);
++		put_unaligned_be32(t->sack + 1400, o + 4);
++	}
++	qdisc_skb_cb(skb)->pkt_len = skb->len;
++	return skb;
++}
++
++/* the flow's queued packets counted as pure ACKs, read off the packets */
++static u32 cake_test_flagged(const struct cake_flow *flow)
++{
++	const struct sk_buff *skb;
++	u32 n = 0;
++
++	for (skb = flow->head; skb; skb = skb->next)
++		n += get_cobalt_cb(skb)->pure_ack;
++	return n;
++}
++
++static void cake_test_drain_flow(void *flow)
++{
++	struct sk_buff *skb;
++
++	while ((skb = dequeue_head(flow)))
++		kfree_skb(skb);
++}
++
++/* A flow queue and a CAKE config for the ACK filter, in @mode */
++static struct cake_flow *cake_test_ack_flow(struct kunit *test, struct cake_sched_data *q,
++					    u8 mode)
++{
++	struct cake_flow *flow = cake_test_alloc(test, sizeof(*flow));
++
++	q->config = cake_test_alloc(test, sizeof(*q->config));
++	q->config->ack_filter = mode;
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_drain_flow, flow));
++	return flow;
++}
++
++/* @t at @flow's tail, through the ACK filter as cake_enqueue() runs it: what
++ * the filter dropped, freed, or NULL
++ */
++static bool cake_test_ack_in(struct kunit *test, struct cake_sched_data *q,
++			     struct cake_flow *flow, const struct cake_test_tcp *t)
++{
++	struct sk_buff *ack;
++
++	flow_queue_add(flow, cake_test_tcp_skb(test, t));
++	ack = cake_ack_filter(q, flow);
++	kfree_skb(ack);
++	return ack;
++}
++
++/* An upload's data packets all carry the ACK flag: none counts, so none
++ * starts a read of the queue; pure ACKs count as they come and go, and the
++ * filter drops the same ones as upstream's
++ */
++static void cake_test_ack_filter_counts(struct kunit *test)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	struct cake_flow *flow = cake_test_ack_flow(test, q, CAKE_ACK_FILTER);
++	struct cake_test_tcp t = { .flags = TCP_FLAG_ACK };
++	int i;
++
++	for (i = 0; i < 20; i++) {
++		t.data = 1400;
++		t.ack = 1000;
++		KUNIT_EXPECT_FALSE(test, cake_test_ack_in(test, q, flow, &t));
++	}
++	KUNIT_EXPECT_EQ(test, flow->pure_acks, 0);
++
++	/* a download's ACKs on the same connection, each acknowledging more:
++	 * from the third, the oldest of the two before it goes
++	 */
++	t.data = 0;
++	for (i = 1; i <= 5; i++) {
++		t.ack = 1000 + i * 2800;
++		KUNIT_EXPECT_EQ_MSG(test, cake_test_ack_in(test, q, flow, &t), i >= 3, "ACK %d", i);
++		KUNIT_EXPECT_EQ(test, flow->pure_acks, min(i, 2));
++		KUNIT_EXPECT_EQ(test, flow->pure_acks, cake_test_flagged(flow));
++	}
++	/* SYN, FIN and RST aren't pure ACKs; data with the ACK isn't either */
++	t.flags = TCP_FLAG_ACK | TCP_FLAG_FIN;
++	cake_test_ack_in(test, q, flow, &t);
++	t.flags = TCP_FLAG_ACK;
++	t.data = 1;
++	cake_test_ack_in(test, q, flow, &t);
++	KUNIT_EXPECT_EQ(test, flow->pure_acks, 2);
++
++	/* sent: each leaves the count as it leaves the queue */
++	for (i = 0; i < 20; i++)
++		kfree_skb(dequeue_head(flow));
++	KUNIT_EXPECT_EQ(test, flow->pure_acks, 2);
++	kfree_skb(dequeue_head(flow));
++	KUNIT_EXPECT_EQ(test, flow->pure_acks, 1);
++	cake_test_drain_flow(flow);
++	KUNIT_EXPECT_EQ(test, flow->pure_acks, 0);
++}
++
++/* More pure ACKs than the count holds, none of which the filter may drop
++ * (each acknowledges less than the one before): it stops at U8_MAX and
++ * comes back to 0 as they leave, never below
++ */
++static void cake_test_ack_filter_saturates(struct kunit *test)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	struct cake_flow *flow = cake_test_ack_flow(test, q, CAKE_ACK_FILTER);
++	struct cake_test_tcp t = { .flags = TCP_FLAG_ACK };
++	int i;
++
++	for (i = 0; i < 300; i++) {
++		t.ack = 1000000 - i;
++		KUNIT_ASSERT_FALSE(test, cake_test_ack_in(test, q, flow, &t));
++	}
++	KUNIT_EXPECT_EQ(test, flow->pure_acks, U8_MAX);
++	KUNIT_EXPECT_EQ(test, cake_test_flagged(flow), U8_MAX);
++	for (i = 0; i < 300; i++) {
++		kfree_skb(dequeue_head(flow));
++		KUNIT_ASSERT_EQ(test, flow->pure_acks, cake_test_flagged(flow));
++	}
++	KUNIT_EXPECT_EQ(test, flow->pure_acks, 0);
++}
++
++/* At random, in both modes: phases of an upload's data with a few ACKs,
++ * and of a download's ACKs, which do and don't make the ones before them
++ * redundant (more acknowledged, the same, less; SACK; timestamps; ECE),
++ * with FINs, the other connection's packets, IPv6, and packets leaving from
++ * the head. The count is always what's queued, and whenever the filter
++ * skips its read of the queue, upstream's, run on the same queue, finds
++ * nothing to drop either.
++ */
++static void cake_test_ack_filter_matches(struct kunit *test)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	struct cake_flow *flow = cake_test_ack_flow(test, q, CAKE_ACK_FILTER);
++	u32 ack = 100000, drops = 0, skips = 0, qlen = 0;
++	struct rnd_state rnd;
++	int round;
++
++	prandom_seed_state(&rnd, 7626);
++	for (round = 0; round < 8000; round++) {
++		bool upload = (round / 250) % 2;
++		u32 r = prandom_u32_state(&rnd), n;
++		struct cake_test_tcp t = {
++			.flags = TCP_FLAG_ACK,
++			.v6 = (round / 2000) % 2,
++			.other = r % 11 == 0,
++		};
++		struct sk_buff *dropped;
++		bool skipped;
++
++		if (round == 4000)
++			q->config->ack_filter = CAKE_ACK_AGGRESSIVE;
++		if (upload && (r >> 4) % 10)
++			t.data = 1400;
++		else switch ((r >> 8) % 10) {
++		case 0:
++			t.data = 1 + (r >> 12) % 1400;
++			break;
++		case 1:
++			t.flags |= TCP_FLAG_FIN;
++			break;
++		case 2:
++			t.flags |= TCP_FLAG_ECE;
++			break;
++		case 3:
++			t.sack = ack + 1400 * (1 + (r >> 12) % 4);
++			break;
++		case 4:
++			t.tsval = 1000 + round - (r >> 12) % 3;
++			break;
++		default:
++			break;
++		}
++		/* mostly more acknowledged, sometimes the same or less */
++		switch ((r >> 16) % 8) {
++		case 0:
++			ack -= 1400;
++			break;
++		case 1:
++			break;
++		default:
++			ack += 1400;
++		}
++		t.ack = ack;
++
++		flow_queue_add(flow, cake_test_tcp_skb(test, &t));
++		qlen++;
++		skipped = !flow->pure_acks;
++		dropped = cake_ack_filter(q, flow);
++		if (dropped) {
++			drops++;
++			qlen--;
++			kfree_skb(dropped);
++		} else if (skipped && qlen > 1) {
++			skips++;
++			dropped = __cake_ack_filter(q, flow);
++			KUNIT_ASSERT_NULL_MSG(test, dropped, "round %d: skipped a read that drops", round);
++		}
++		KUNIT_ASSERT_EQ_MSG(test, flow->pure_acks, cake_test_flagged(flow), "round %d", round);
++		/* sent from the head: none to two a round, at most 64 queued */
++		for (n = (r >> 20) % 3; qlen && (n || qlen > 64); n -= !!n, qlen--)
++			kfree_skb(dequeue_head(flow));
++		KUNIT_ASSERT_EQ_MSG(test, flow->pure_acks, cake_test_flagged(flow), "round %d", round);
++	}
++	KUNIT_EXPECT_GT(test, drops, 200);
++	KUNIT_EXPECT_GT(test, skips, 200);
++}
++
++/* Through cake_enqueue() and cake_dequeue(), and a reset with ACKs queued:
++ * each flow's count back to 0
++ */
++static void cake_test_ack_filter_live(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 0, CAKE_DIFFSERV_BESTEFFORT);
++	struct cake_test_tcp t = { .flags = TCP_FLAG_ACK };
++	struct Qdisc *sch = mq->sch[0];
++	struct sk_buff *skb[40];
++	u32 sent = 0, left;
++	int i, pass;
++
++	q->config->ack_filter = CAKE_ACK_FILTER;
++	for (pass = 0; pass < 2; pass++) {
++		for (i = 0; i < 40; i++) {
++			t.ack += 1400;
++			t.other = i % 3 == 0;
++			t.data = i % 5 == 0 ? 1400 : 0;
++			skb[i] = cake_test_tcp_skb(test, &t);
++		}
++		rcu_read_lock_bh();
++		for (i = 0; i < 40; i++)
++			cake_test_enqueue(sch, skb[i]);
++		left = sch->q.qlen;
++		/* the first pass sent, the second reset with its packets queued */
++		if (!pass) {
++			struct sk_buff *out;
++
++			while ((out = cake_dequeue(sch))) {
++				sent++;
++				kfree_skb(out);
++			}
++		} else {
++			cake_reset(sch);
++		}
++		rcu_read_unlock_bh();
++		KUNIT_EXPECT_LT(test, left, 40);
++		KUNIT_EXPECT_EQ(test, sch->q.qlen, 0);
++		for (i = 0; i < CAKE_QUEUES; i++)
++			KUNIT_ASSERT_EQ_MSG(test, q->tins[0].flows[i].pure_acks, 0, "flow %d", i);
++	}
++	KUNIT_EXPECT_GT(test, sent, 0);
++}
++
+ static int cake_test_init(struct kunit *test)
+ {
+ 	int i;
+@@ -3197,6 +3522,10 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_change_vs_autorate),
+ 	KUNIT_CASE(cake_test_clear_tin_parent),
+ 	KUNIT_CASE(cake_test_overhead_tunnel),
++	KUNIT_CASE(cake_test_ack_filter_counts),
++	KUNIT_CASE(cake_test_ack_filter_saturates),
++	KUNIT_CASE(cake_test_ack_filter_matches),
++	KUNIT_CASE(cake_test_ack_filter_live),
+ 	{}
+ };
+ 
