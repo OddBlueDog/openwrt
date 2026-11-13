@@ -1,0 +1,825 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:26:15 +0000
+Subject: [PATCH] wifi: mt76: tests: phones whose doze notice goes missing, and
+ the hold
+
+The power-save simulation gets phones that doze without the firmware
+learning of it, the driver's own probes, and the report of each frame's
+end as the tx-free event gives it. The hold of a station that stopped
+answering is tested step by step (when it starts and when not, what
+waits, the probes, each way out) and against the same run without it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ tests/ps-sim-test.c | 551 ++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 538 insertions(+), 13 deletions(-)
+
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index a4b643ef..46d949e9 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -71,10 +71,15 @@ MODULE_INFO(import_ns, "EXPORTED_FOR_KUNIT_TESTING");
+ #define PSIM_MAX_STA		6
+ #define PSIM_NDESC		256
+ #define PSIM_MAX_FRAMES		(1 << 16)
++/* of those, kept for the driver's own probes once the traffic has used the rest */
++#define PSIM_PROBE_ROOM		4096
+ #define PSIM_BEACON		20	/* steps between beacons (DTIM 1) */
+ #define PSIM_STALL		60	/* steps an awake backlog may sit */
+ #define PSIM_BACKLOG		256	/* frames a station may have queued */
+ #define PSIM_POLL_WINDOW	600	/* steps hostapd waits for a poll's ACK (3 s) */
++#define PSIM_STEP_MS		5
++/* the silent hold's clock (jiffies) at step 0: anything but 0 */
++#define PSIM_SILENT_T0		100000UL
+ 
+ enum psim_kind {
+ 	PSIM_LAPTOP,
+@@ -105,6 +110,7 @@ struct psim_frame {
+ 	u8 gen;		/* the station's association it was for */
+ 	bool ps;	/* queued to the hardware while the driver held the sta */
+ 	bool poll;	/* hostapd's inactivity poll (a QoS null), not data */
++	bool silent;	/* the driver's own probe of a station held for its silence */
+ 	bool altx_dozing; /* sent on ALTX, at once: was the station asleep */
+ 	u32 seq;
+ 	u32 step;	/* when it was queued in mac80211 */
+@@ -128,6 +134,7 @@ struct psim_sta {
+ 	bool dozing;		/* the truth, as the firmware knows it */
+ 	bool fw_awake;		/* after a full reset the firmware has it awake */
+ 	bool polling;		/* sensor: fetching with PS-Poll */
++	bool mute;		/* asleep, its doze notice lost: awake to the firmware */
+ 	u32 wake_until;		/* scanner: back on channel; phone: idle */
+ 	unsigned int idle;
+ 
+@@ -148,6 +155,7 @@ struct psim_sta {
+ 	/* for the report */
+ 	unsigned long queued, acked, failed, dropped, polls, wakes;
+ 	unsigned long probes, probes_acked, probes_missed;
++	unsigned long mutes, mute_lost, silent_probes;
+ 	unsigned long latency_sum, latency_max;
+ };
+ 
+@@ -165,6 +173,8 @@ struct psim_cfg {
+ 	unsigned int resets;		/* per mille per step: a full reset */
+ 	unsigned int queue_fail;	/* per mille of data frames tx_queue_skb fails */
+ 	bool one_hash;			/* every frame hashes alike: fq collisions */
++	bool silent;			/* the driver holds a sta that stopped answering */
++	unsigned int mute;		/* per mille of a phone's doze notices lost */
+ 	enum psim_kind kinds[PSIM_MAX_STA];
+ 	int n_sta;
+ };
+@@ -214,6 +224,8 @@ struct psim {
+ 	char note[8][160];
+ 	unsigned int n_notes;
+ 	unsigned int n_vanished, n_order, n_stall, n_tim, n_ps_burst;
++	/* data handed to the hardware for a station held for its silence */
++	unsigned int n_silent_fed;
+ 	/* more than one frame while held, after a former station's frames
+ 	 * completed on this one's wcid and released its airtime
+ 	 */
+@@ -342,6 +354,8 @@ static u32 psim_skb_id(struct sk_buff *skb)
+ 	return skb->mark - 1;
+ }
+ 
++static void psim_skb_destructor(struct sk_buff *skb);
++
+ /* The hardware ring: the driver's frame goes into the firmware's buffer
+  * for its station and AC (DMA moves it there; psim_dma() frees the ring).
+  */
+@@ -356,6 +370,44 @@ static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 	struct psim_sta *ps;
+ 	int idx, ac, pos;
+ 
++	if (!skb->mark) {
++		/*
++		 * Not the simulation's frame: the driver's probe of a station
++		 * it holds for its silence (mt76_tx_silent_probe()). A poll
++		 * like hostapd's from here on, but nobody waits for it.
++		 */
++		int i;
++
++		for (i = 0; i < s->cfg->n_sta; i++)
++			if (s->sta[i].present && psim_wcid(&s->sta[i]) == wcid)
++				break;
++		if (i == s->cfg->n_sta || s->n_frames >= PSIM_MAX_FRAMES) {
++			/* no record left for it: as a tx_queue_skb failure */
++			struct ieee80211_tx_status status = {
++				.sta = sta,
++				.skb = skb,
++				.info = IEEE80211_SKB_CB(skb),
++			};
++
++			spin_lock_bh(&s->dev->rx_lock);
++			ieee80211_tx_status_ext(phy->hw, &status);
++			spin_unlock_bh(&s->dev->rx_lock);
++			return -ENOMEM;
++		}
++		id = s->n_frames++;
++		f = &s->frames[id];
++		f->state = PF_QUEUED;
++		f->sta = i;
++		f->tid = 7;
++		f->gen = s->sta[i].gen;
++		f->step = s->step;
++		f->poll = true;
++		f->silent = true;
++		s->sta[i].silent_probes++;
++		skb->mark = id + 1;
++		skb->destructor = psim_skb_destructor;
++	}
++
+ 	KUNIT_ASSERT_LT(test, id, s->n_frames);
+ 	f = &s->frames[id];
+ 	KUNIT_ASSERT_EQ_MSG(test, f->state, PF_QUEUED,
+@@ -365,6 +417,11 @@ static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 	KUNIT_ASSERT_PTR_EQ(test, wcid, psim_wcid(ps));
+ 	KUNIT_ASSERT_LT(test, (int)q->queued, q->ndesc);
+ 
++	if (test_bit(MT_WCID_FLAG_SILENT, &wcid->flags) && !f->poll &&
++	    !s->n_silent_fed++)
++		psim_note(s, "step %u: %s got a frame (tid %u seq %u) while held for its silence\n",
++			  s->step, psim_kind_name[ps->kind], f->tid, f->seq);
++
+ 	ac = psim_tid_to_ac[f->tid];
+ 	if (s->cfg->queue_fail && !f->poll &&
+ 	    psim_chance(s, s->cfg->queue_fail)) {
+@@ -566,6 +623,8 @@ static void psim_free(void *data)
+ 	if (s->ndev)
+ 		free_netdev(s->ndev);
+ 	psim_ctx = NULL;
++	silent_hold = true;
++	mt76_tx_silent_test_now = 0;
+ }
+ 
+ static struct ieee80211_channel psim_chan = {
+@@ -609,6 +668,11 @@ static struct psim *psim_init(struct kunit *test, const struct psim_cfg *cfg)
+ 				  GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, s->frames);
+ 	psim_ctx = s;
++	/* the hold of stations that stopped answering: off unless the case
++	 * asks for it, and on the simulation's clock, not the kernel's
++	 */
++	silent_hold = cfg->silent;
++	mt76_tx_silent_test_now = PSIM_SILENT_T0;
+ 
+ 	dev = mt76_test_dev(test, sizeof(*dev), &psim_hw_ops, &psim_drv);
+ 	s->dev = dev;
+@@ -641,6 +705,7 @@ static struct psim *psim_init(struct kunit *test, const struct psim_cfg *cfg)
+ 	mt76_worker_disable(&dev->tx_worker);
+ 
+ 	/* what mt76_phy_init() and mt7915 set that matters on the tx side */
++	phy->chandef.chan = &psim_chan;
+ 	hw->queues = IEEE80211_NUM_ACS;
+ 	hw->txq_data_size = sizeof(struct mt76_txq);
+ 	hw->sta_data_size = sizeof(struct mt76_wcid);
+@@ -752,6 +817,7 @@ static int psim_sta_join(struct psim *s, int i)
+ 	ps->idx = ((struct mt76_wcid *)si->sta.drv_priv)->idx;
+ 	ps->dozing = false;
+ 	ps->polling = false;
++	ps->mute = false;
+ 	ps->idle = 0;
+ 	ps->stall = 0;
+ 	ps->backlog = 0;
+@@ -852,6 +918,17 @@ static void psim_complete(struct psim *s, u16 idx, struct sk_buff *skb,
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 
++	struct mt76_wcid *wcid;
++
++	/* mt7915_mac_tx_free(): the frame's count and status, for the station
++	 * the event names
++	 */
++	rcu_read_lock();
++	wcid = __mt76_wcid_ptr(s->dev, idx);
++	if (wcid && wcid->sta)
++		mt76_tx_result(s->dev, wcid, acked);
++	rcu_read_unlock();
++
+ 	/* the status mt7915's tx-free event gives */
+ 	memset(&info->status, 0, sizeof(info->status));
+ 	info->status.rates[0].idx = -1;
+@@ -907,7 +984,7 @@ static void psim_send_probe(struct psim *s, struct psim_sta *ps)
+ 	struct sk_buff *skb;
+ 	u32 id;
+ 
+-	if (s->n_frames >= PSIM_MAX_FRAMES)
++	if (s->n_frames >= PSIM_MAX_FRAMES - PSIM_PROBE_ROOM)
+ 		return;
+ 	id = s->n_frames++;
+ 	f = &s->frames[id];
+@@ -969,7 +1046,8 @@ static unsigned int psim_air(struct psim *s, struct psim_sta *ps,
+ 			if (f->ps)
+ 				ps->ps_out[ac]--;
+ 			f->state = PF_ACKED;
+-			psim_probe_done(s, ps, f, true);
++			if (!f->silent)
++				psim_probe_done(s, ps, f, true);
+ 			n++;
+ 			ps->progress = true;
+ 			psim_complete(s, wcid->idx, skb, true);
+@@ -1019,15 +1097,20 @@ static unsigned int psim_air_lost(struct psim *s, struct psim_sta *ps,
+ 		if (f->ps)
+ 			ps->ps_out[ac]--;
+ 		f->state = PF_FAILED;
+-		if (f->poll) {
++		if (f->silent) {
++			/* the driver's own: the station didn't answer */
++		} else if (f->poll) {
+ 			/* not the driver's: the firmware lost track */
+ 			ps->probes_missed++;
+ 			s->reset_probes_lost++;
+ 		} else {
+ 			ps->backlog--;
++			if (ps->mute)
++				ps->mute_lost++;
+ 		}
+ 		ps->failed++;
+-		s->reset_lost++;
++		if (!f->silent)
++			s->reset_lost++;
+ 		ps->progress = true;
+ 		n++;
+ 		psim_complete(s, wcid->idx, skb, false);
+@@ -1143,12 +1226,44 @@ static void psim_tx_free_done(struct psim *s)
+ 	mt76_worker_schedule(&s->dev->tx_worker);
+ }
+ 
++/* mt76_check_sta(): a frame from the station reached the driver */
++static void psim_heard(struct psim *s, struct psim_sta *ps)
++{
++	mt76_tx_heard(s->dev, psim_wcid(ps));
++}
++
++/* A phone dozes and its notice never arrives (its closing null frame after
++ * a keepalive its chip sent): the firmware goes on having it awake, and
++ * reports nothing.
++ */
++static void psim_mute(struct psim *s, struct psim_sta *ps)
++{
++	ps->dozing = true;
++	ps->fw_awake = true;
++	ps->mute = true;
++	ps->mutes++;
++}
++
++/* ... and it has something to send again: frames from it, and no report
++ * either, as the firmware had it awake all along
++ */
++static void psim_unmute(struct psim *s, struct psim_sta *ps)
++{
++	ps->dozing = false;
++	ps->fw_awake = false;
++	ps->mute = false;
++	ps->wakes++;
++	psim_heard(s, ps);
++}
++
+ /* What a station does this step, by kind. */
+ static void psim_behave(struct psim *s, struct psim_sta *ps, bool beacon)
+ {
+ 	bool tim = psim_fw_pending(ps);
+ 
+ 	if (s->quiesce) {
++		if (ps->mute)
++			psim_unmute(s, ps);
+ 		psim_set_dozing(s, ps, false);
+ 		ps->polling = false;
+ 		return;
+@@ -1158,12 +1273,20 @@ static void psim_behave(struct psim *s, struct psim_sta *ps, bool beacon)
+ 	case PSIM_LAPTOP:
+ 		break;
+ 	case PSIM_PHONE:
+-		if (!ps->dozing) {
++		if (ps->mute) {
++			/* no TIM bit to wake for: only what it sends itself */
++			if (psim_chance(s, 3))
++				psim_unmute(s, ps);
++		} else if (!ps->dozing) {
+ 			/* asleep after a few idle steps */
+ 			if (ps->progress)
+ 				ps->idle = 0;
+-			else if (++ps->idle > psim_range(s, 3, 15))
+-				psim_set_dozing(s, ps, true);
++			else if (++ps->idle > psim_range(s, 3, 15)) {
++				if (s->cfg->mute && psim_chance(s, s->cfg->mute))
++					psim_mute(s, ps);
++				else
++					psim_set_dozing(s, ps, true);
++			}
+ 		} else if ((beacon && tim) || psim_chance(s, 3)) {
+ 			/* its TIM bit, or an app sends */
+ 			psim_set_dozing(s, ps, false);
+@@ -1244,7 +1367,7 @@ static void psim_transmit(struct psim *s)
+ 
+ 			KUNIT_ASSERT_NOT_NULL(s->test, skb);
+ 			f->state = acked ? PF_ACKED : PF_FAILED;
+-			if (here)
++			if (here && !f->silent)
+ 				psim_probe_done(s, ps, f, acked);
+ 			psim_complete(s, here ? ps->idx : 0, skb, acked);
+ 		}
+@@ -1291,7 +1414,7 @@ static void psim_enqueue(struct psim *s, struct psim_sta *ps, u8 tid)
+ 	u8 ac = psim_tid_to_ac[tid];
+ 	u32 id;
+ 
+-	if (s->n_frames >= PSIM_MAX_FRAMES)
++	if (s->n_frames >= PSIM_MAX_FRAMES - PSIM_PROBE_ROOM)
+ 		return;
+ 	id = s->n_frames++;
+ 	f = &s->frames[id];
+@@ -1493,6 +1616,8 @@ static void psim_step(struct psim *s)
+ 	int i, k;
+ 
+ 	s->step++;
++	mt76_tx_silent_test_now = PSIM_SILENT_T0 +
++				  msecs_to_jiffies(s->step * PSIM_STEP_MS);
+ 	if (!s->quiesce)
+ 		psim_traffic(s);
+ 	/* hostapd's inactivity timer: about every 500 steps per station */
+@@ -1545,6 +1670,9 @@ static void psim_step(struct psim *s)
+ 			psim_sta_leave(s, i);
+ 	}
+ 
++	/* mt76_tx_silent_work(): the held stations' probes that are due */
++	mt76_tx_silent_poll(s->dev);
++
+ 	while (psim_worker(s))
+ 		;
+ 	psim_check(s);
+@@ -1580,6 +1708,10 @@ static void psim_report(struct psim *s)
+ 			kunit_info(s->test, "%-8s hostapd polls %lu, ACKed in time %lu, missed %lu\n",
+ 				   psim_kind_name[ps->kind], ps->probes,
+ 				   ps->probes_acked, ps->probes_missed);
++		if (ps->mutes || ps->silent_probes)
++			kunit_info(s->test, "%-8s asleep unannounced %lu times, %lu frames lost to that; the driver's probes %lu\n",
++				   psim_kind_name[ps->kind], ps->mutes,
++				   ps->mute_lost, ps->silent_probes);
+ 	}
+ 	if (s->queue_fails)
+ 		kunit_info(s->test, "tx_queue_skb failures %lu\n", s->queue_fails);
+@@ -1594,7 +1726,14 @@ static void psim_report(struct psim *s)
+ 			   s->cfg->one_hash ? s->n_order : 0);
+ }
+ 
+-static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
++/* a run's sums over its stations, for comparing runs */
++struct psim_totals {
++	unsigned long queued, mutes, mute_lost, silent_probes, silent_holds;
++};
++
++static struct psim *psim_run_totals(struct kunit *test,
++				    const struct psim_cfg *cfg,
++				    struct psim_totals *tot)
+ {
+ 	struct psim *s;
+ 	unsigned int n;
+@@ -1632,7 +1771,11 @@ static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
+ 	if (cfg->lost_events)
+ 		for (i = 0; i < cfg->n_sta; i++)
+ 			if (s->sta[i].present)
+-				psim_event(s, &s->sta[i], s->sta[i].dozing);
++				/* what the firmware has: awake, for a phone
++				 * whose doze notice it never got
++				 */
++				psim_event(s, &s->sta[i], s->sta[i].dozing &&
++							  !s->sta[i].mute);
+ 	for (n = 0; n < 2000 && psim_busy(s); n++)
+ 		psim_step(s);
+ 	for (n = 0; n < 10; n++)
+@@ -1659,6 +1802,8 @@ static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
+ 			    "more than one frame per AC while held");
+ 	KUNIT_EXPECT_EQ_MSG(test, s->n_probe_missed, 0,
+ 			    "hostapd polls missed: stations disassociated");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_silent_fed, 0,
++			    "frames handed to the hardware for a station held for its silence");
+ 	KUNIT_EXPECT_FALSE_MSG(test, psim_busy(s), "still busy after %u steps",
+ 			       n);
+ 
+@@ -1674,6 +1819,10 @@ static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
+ 		KUNIT_EXPECT_FALSE_MSG(test,
+ 				       test_bit(MT_WCID_FLAG_PS, &wcid->flags),
+ 				       "%s still held", psim_kind_name[ps->kind]);
++		KUNIT_EXPECT_FALSE_MSG(test,
++				       test_bit(MT_WCID_FLAG_SILENT, &wcid->flags),
++				       "%s still held for its silence",
++				       psim_kind_name[ps->kind]);
+ 		KUNIT_EXPECT_EQ_MSG(test,
+ 				    atomic_read(&wcid->non_aql_packets), 0,
+ 				    "%s non-AQL", psim_kind_name[ps->kind]);
+@@ -1707,6 +1856,30 @@ static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
+ 		break;
+ 	}
+ 	skb_queue_purge(&psim_skbs);
++
++	/* no station left to probe once the work has looked */
++	mt76_tx_silent_poll(s->dev);
++	KUNIT_EXPECT_TRUE(test, bitmap_empty(s->dev->silent_wait, MT76_N_WCIDS));
++
++	if (tot) {
++		memset(tot, 0, sizeof(*tot));
++		for (i = 0; i < cfg->n_sta; i++) {
++			struct psim_sta *ps = &s->sta[i];
++
++			tot->queued += ps->queued;
++			tot->mutes += ps->mutes;
++			tot->mute_lost += ps->mute_lost;
++			tot->silent_probes += ps->silent_probes;
++			if (ps->present)
++				tot->silent_holds += psim_wcid(ps)->silent_holds;
++		}
++	}
++	return s;
++}
++
++static void psim_run(struct kunit *test, const struct psim_cfg *cfg)
++{
++	psim_run_totals(test, cfg, NULL);
+ }
+ 
+ /* the five kinds of client, the laptop first */
+@@ -1757,12 +1930,32 @@ static const struct psim_cfg psim_cases[] = {
+ 	/* as stock mt76: every event says awake, nothing is held */
+ 	{ .seed = 7, .steps = 20000, .ps_sync = false, .event_delay = 3,
+ 	  .offchannel = true, .leave = 2, PSIM_ALL_KINDS },
++	/* phones whose doze notice goes missing one time in five, with the
++	 * hold of stations that stopped answering: alone, then with the
++	 * rest (scans, leavers, lost and late events, resets)
++	 */
++	{ .seed = 15, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .mute = 200, .silent = true, PSIM_ALL_KINDS },
++	{ .seed = 16, .steps = 20000, .ps_sync = true, .event_delay = 4,
++	  .mute = 200, .silent = true, .offchannel = true, .leave = 2,
++	  .late_free = 300, .lost_events = 5, PSIM_ALL_KINDS },
++	{ .seed = 17, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .mute = 200, .silent = true, .resets = 2, .midburst = 200,
++	  PSIM_ALL_KINDS },
++	/* the hold with no such phone about: frames that fail by chance
++	 * mustn't stall anyone
++	 */
++	{ .seed = 18, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .silent = true, .offchannel = true, PSIM_ALL_KINDS },
++	/* and those phones without the hold, as before */
++	{ .seed = 15, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	  .mute = 200, PSIM_ALL_KINDS },
+ };
+ 
+ static void psim_case_desc(const struct psim_cfg *cfg, char *desc)
+ {
+ 	snprintf(desc, KUNIT_PARAM_DESC_SIZE,
+-		 "seed %u ps_sync %d delay %u%s%s%s%s%s%s%s%s%s", cfg->seed, cfg->ps_sync,
++		 "seed %u ps_sync %d delay %u%s%s%s%s%s%s%s%s%s%s%s", cfg->seed, cfg->ps_sync,
+ 		 cfg->event_delay, cfg->offchannel ? " scans" : "",
+ 		 cfg->leave ? " leavers" : "",
+ 		 cfg->lost_events ? " lost-events" : "",
+@@ -1771,7 +1964,9 @@ static void psim_case_desc(const struct psim_cfg *cfg, char *desc)
+ 		 cfg->late_free ? " late-frees" : "",
+ 		 cfg->probes ? " polls" : "",
+ 		 cfg->resets ? " resets" : "",
+-		 cfg->queue_fail ? " queue-fails" : "");
++		 cfg->queue_fail ? " queue-fails" : "",
++		 cfg->mute ? " unannounced-dozes" : "",
++		 cfg->silent ? " silent-hold" : "");
+ }
+ 
+ KUNIT_ARRAY_PARAM(psim, psim_cases, psim_case_desc);
+@@ -2064,10 +2259,340 @@ static void mt76_psim_test_pace(struct kunit *test)
+ 	dev->pace_timer_set = true;
+ }
+ 
++/* --- a station that stops answering (mt76_tx_silent_*() in tx.c) --- */
++
++/* 5 ms with none of the simulation's own traffic or dozing: the firmware's
++ * events, the air, the probes' work, the tx worker
++ */
++static void psim_silent_tick(struct psim *s)
++{
++	s->step++;
++	mt76_tx_silent_test_now = PSIM_SILENT_T0 +
++				  msecs_to_jiffies(s->step * PSIM_STEP_MS);
++	psim_deliver_events(s);
++	psim_transmit(s);
++	mt76_tx_silent_poll(s->dev);
++	while (psim_worker(s))
++		;
++}
++
++static void psim_silent_ticks(struct psim *s, unsigned int n)
++{
++	while (n--)
++		psim_silent_tick(s);
++}
++
++/* frames of a station waiting in mac80211's queues */
++static unsigned long psim_queued(struct psim_sta *ps)
++{
++	unsigned long n = 0;
++	int tid;
++
++	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++)
++		n += psim_txq_depth(ps, tid);
++	return n;
++}
++
++/* a frame for the station, handed to the hardware if the driver lets it */
++static void psim_silent_send(struct psim *s, struct psim_sta *ps, int n)
++{
++	while (n--)
++		psim_enqueue(s, ps, 0);
++	while (psim_worker(s))
++		;
++}
++
++/* The hold of a station that stops answering, step by step: when it starts
++ * and when it doesn't, what waits, the probes, and each way out.
++ */
++static void mt76_psim_test_silent(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 21, .ps_sync = true, .silent = true,
++		.kinds = { PSIM_PHONE, PSIM_LAPTOP }, .n_sta = 2,
++	};
++	struct psim_sta *phone, *laptop;
++	struct mt76_wcid *wcid, *lw;
++	unsigned long done, probes;
++	struct mt76_dev *dev;
++	struct psim *s;
++	int i, ac;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	dev = s->dev;
++	phone = &s->sta[0];
++	laptop = &s->sta[1];
++	wcid = psim_wcid(phone);
++	lw = psim_wcid(laptop);
++
++	/* answering: frames go, nothing is held, however long it was quiet */
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, phone, 8);
++	psim_silent_ticks(s, 4);
++	KUNIT_EXPECT_EQ(test, phone->acked + phone->failed, 8);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++
++	/* A frame that fails just after another was acked (heard within
++	 * MT76_SILENT_IDLE_MS): chance, not silence. Not held.
++	 */
++	psim_silent_send(s, phone, 1);
++	KUNIT_ASSERT_TRUE(test, psim_fw_pending(phone));
++	psim_air_lost(s, phone, 1);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_EQ(test, wcid->silent_holds, 0);
++	psim_silent_ticks(s, 2);
++
++	/* It dozes, and its notice never arrives. Quiet for a while, then a
++	 * frame for it: handed over as for any awake station, and lost.
++	 */
++	psim_mute(s, phone);
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, phone, 1);
++	KUNIT_ASSERT_TRUE(test, psim_fw_pending(phone));
++	done = phone->failed;
++	psim_silent_tick(s);
++	KUNIT_EXPECT_EQ(test, phone->failed, done + 1);
++	/* that was the sign: held from here on */
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, test_bit(wcid->idx, dev->silent_wait));
++	KUNIT_EXPECT_EQ(test, wcid->silent_holds, 1);
++
++	/* what comes for it now waits in its queues: none of it reaches the
++	 * hardware, for two seconds of silence
++	 */
++	done = phone->acked + phone->failed - phone->silent_probes;
++	psim_silent_send(s, phone, 20);
++	KUNIT_EXPECT_EQ(test, psim_queued(phone), 20);
++	for (i = 0; i < 400; i++) {
++		psim_silent_tick(s);
++		if (i == 200)
++			psim_silent_send(s, phone, 5);
++	}
++	KUNIT_EXPECT_EQ(test, psim_queued(phone), 25);
++	KUNIT_EXPECT_EQ(test, s->n_silent_fed, 0);
++	KUNIT_EXPECT_EQ(test, phone->mute_lost, 1);
++	/* probed meanwhile, at growing gaps: after 20, 60, 140, 300, 620 and
++	 * 1260 ms, none answered
++	 */
++	KUNIT_EXPECT_GE(test, phone->silent_probes, 5);
++	KUNIT_EXPECT_LE(test, phone->silent_probes, 7);
++	KUNIT_EXPECT_EQ(test, wcid->silent_probes, phone->silent_probes);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	/* the laptop beside it isn't touched */
++	psim_silent_send(s, laptop, 10);
++	psim_silent_ticks(s, 3);
++	KUNIT_EXPECT_EQ(test, laptop->acked + laptop->failed, 10);
++	KUNIT_EXPECT_EQ(test, lw->silent_holds, 0);
++
++	/* it has something to send: heard, released, and all 25 go out, in
++	 * the order they came
++	 */
++	probes = phone->silent_probes;
++	psim_unmute(s, phone);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	while (psim_worker(s))
++		;
++	psim_silent_ticks(s, 20);
++	KUNIT_EXPECT_EQ(test, psim_queued(phone), 0);
++	KUNIT_EXPECT_EQ(test, phone->backlog, 0);
++	KUNIT_EXPECT_EQ(test, s->n_order, 0);
++	KUNIT_EXPECT_EQ(test, phone->mute_lost, 1);
++	KUNIT_EXPECT_EQ(test, phone->silent_probes, probes);
++	KUNIT_EXPECT_GE(test, wcid->silent_ms, 1900);
++	KUNIT_EXPECT_LE(test, wcid->silent_ms, 2200);
++	kunit_info(test, "silent for 2 s with 26 frames for it: %lu lost, 25 delivered once it was heard, %lu probes\n",
++		   phone->mute_lost, phone->silent_probes);
++
++	/* Held again, and this time the firmware reports it dozing (its next
++	 * notice did arrive): the report ends the hold, and power save takes
++	 * over, a frame per AC at a time.
++	 */
++	psim_mute(s, phone);
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, phone, 1);
++	psim_silent_tick(s);
++	KUNIT_ASSERT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	psim_silent_send(s, phone, 6);
++	phone->mute = false;
++	phone->fw_awake = false;
++	mt76_sta_ps_transition(dev, wcid, true);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	while (psim_worker(s))
++		;
++	KUNIT_EXPECT_EQ(test, psim_queued(phone), 5);
++	KUNIT_EXPECT_EQ(test, phone->fw_len[IEEE80211_AC_BE], 1);
++	psim_set_dozing(s, phone, false);
++	psim_silent_ticks(s, 20);
++	KUNIT_EXPECT_EQ(test, phone->backlog, 0);
++	KUNIT_EXPECT_EQ(test, wcid->silent_holds, 2);
++
++	/* A station that listens but had nothing to say, and one frame to
++	 * it failed (a moment's interference): held, probed 20 ms later, and
++	 * the probe's ACK releases it. What waited goes after 30 ms or so.
++	 */
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, laptop, 1);
++	psim_air_lost(s, laptop, 1);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &lw->flags));
++	psim_silent_send(s, laptop, 12);
++	KUNIT_EXPECT_EQ(test, psim_queued(laptop), 12);
++	psim_silent_ticks(s, 8);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &lw->flags));
++	KUNIT_EXPECT_EQ(test, psim_queued(laptop), 0);
++	KUNIT_EXPECT_EQ(test, laptop->backlog, 0);
++	KUNIT_EXPECT_EQ(test, lw->silent_holds, 1);
++	KUNIT_EXPECT_EQ(test, laptop->silent_probes, 1);
++	KUNIT_EXPECT_LE(test, lw->silent_ms, 45);
++
++	/* just heard from (an ACK a moment ago), then three frames in a row
++	 * come back failed: that is silence too, and it is held at once
++	 */
++	psim_silent_send(s, laptop, 4);
++	psim_silent_ticks(s, 2);
++	KUNIT_ASSERT_EQ(test, laptop->backlog, 0);
++	psim_silent_send(s, laptop, 3);
++	psim_air_lost(s, laptop, 2);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &lw->flags));
++	psim_air_lost(s, laptop, 1);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &lw->flags));
++	psim_silent_ticks(s, 8);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &lw->flags));
++	KUNIT_EXPECT_EQ(test, lw->silent_holds, 2);
++
++	/* while the radio is away on another channel frames fail for that:
++	 * not a station's silence
++	 */
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, laptop, 1);
++	dev->phy.offchannel = true;
++	psim_air_lost(s, laptop, 1);
++	dev->phy.offchannel = false;
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &lw->flags));
++	psim_silent_ticks(s, 2);
++
++	/* nor is a dozing station's lost frame (the firmware's to buffer) */
++	psim_silent_ticks(s, 40);
++	psim_set_dozing(s, phone, true);
++	psim_silent_tick(s);
++	KUNIT_ASSERT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	mt76_tx_result(dev, wcid, false);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	psim_set_dozing(s, phone, false);
++	psim_silent_ticks(s, 2);
++
++	/* switched off, as stock: nothing is held, and what is held then
++	 * goes at the work's next look
++	 */
++	psim_mute(s, phone);
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, phone, 1);
++	psim_silent_tick(s);
++	KUNIT_ASSERT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	psim_silent_send(s, phone, 3);
++	KUNIT_EXPECT_EQ(test, psim_queued(phone), 3);
++	silent_hold = false;
++	psim_silent_tick(s);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_EQ(test, psim_queued(phone), 0);
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, phone, 1);
++	psim_silent_tick(s);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	silent_hold = true;
++	psim_unmute(s, phone);
++	psim_silent_ticks(s, 5);
++
++	/* It leaves while held (its frames go with it) and joins again: a
++	 * new station, not held, not probed.
++	 */
++	psim_mute(s, phone);
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, phone, 1);
++	psim_silent_tick(s);
++	KUNIT_ASSERT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	psim_silent_send(s, phone, 4);
++	psim_sta_leave(s, 0);
++	wcid = psim_wcid(phone);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	probes = phone->silent_probes;
++	psim_silent_ticks(s, 300);
++	KUNIT_EXPECT_EQ(test, phone->silent_probes, probes);
++	KUNIT_EXPECT_TRUE(test, bitmap_empty(dev->silent_wait, MT76_N_WCIDS));
++	psim_silent_send(s, phone, 6);
++	psim_silent_ticks(s, 5);
++	KUNIT_EXPECT_EQ(test, phone->backlog, 0);
++
++	/* nothing left anywhere */
++	psim_print_notes(s);
++	KUNIT_EXPECT_EQ(test, s->n_vanished, 0);
++	KUNIT_EXPECT_EQ(test, s->n_order, 0);
++	KUNIT_EXPECT_EQ(test, s->n_silent_fed, 0);
++	KUNIT_EXPECT_FALSE(test, psim_busy(s));
++	for (i = 0; i < cfg.n_sta; i++) {
++		struct psim_sta *ps = &s->sta[i];
++
++		KUNIT_EXPECT_EQ(test,
++				atomic_read(&psim_wcid(ps)->non_aql_packets), 0);
++		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++)
++			KUNIT_EXPECT_EQ(test,
++				atomic_read(&ps->si->airtime[ac].aql_tx_pending), 0);
++	}
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&psim_skbs));
++	skb_queue_purge(&psim_skbs);
++}
++
++/* The same hours of the same clients, phones' doze notices going missing one
++ * time in five, without the hold and then with it: what those phones lose.
++ * (Two cases: a test has one device.)
++ */
++static struct psim_cfg psim_saves_cfg = {
++	.seed = 31, .steps = 20000, .ps_sync = true, .event_delay = 3,
++	.mute = 200, PSIM_ALL_KINDS,
++};
++
++static struct psim_totals psim_saves_off;
++
++static void mt76_psim_test_silent_off(struct kunit *test)
++{
++	psim_saves_cfg.silent = false;
++	psim_run_totals(test, &psim_saves_cfg, &psim_saves_off);
++	kunit_info(test, "without the hold: %lu unannounced dozes, %lu frames lost to them (%lu queued in all)\n",
++		   psim_saves_off.mutes, psim_saves_off.mute_lost,
++		   psim_saves_off.queued);
++	KUNIT_EXPECT_GT(test, psim_saves_off.mutes, 20);
++	KUNIT_EXPECT_GT(test, psim_saves_off.mute_lost,
++			psim_saves_off.mutes * 20);
++}
++
++static void mt76_psim_test_silent_on(struct kunit *test)
++{
++	struct psim_totals *off = &psim_saves_off, on;
++
++	if (!off->mutes)
++		kunit_skip(test, "needs mt76_psim_test_silent_off's run before it");
++
++	psim_saves_cfg.silent = true;
++	psim_run_totals(test, &psim_saves_cfg, &on);
++	kunit_info(test, "with the hold: %lu unannounced dozes, %lu frames lost (without it %lu for %lu), held %lu times, %lu probes\n",
++		   on.mutes, on.mute_lost, off->mute_lost, off->mutes,
++		   on.silent_holds, on.silent_probes);
++	KUNIT_ASSERT_GT(test, on.mutes, 20);
++	/* per silence: what was in the hardware when the first frame came
++	 * back, not what came for the phone until it spoke again
++	 */
++	KUNIT_EXPECT_LT(test, on.mute_lost * off->mutes * 3,
++			off->mute_lost * on.mutes);
++}
++
+ static struct kunit_case mt76_psim_test_cases[] = {
+ 	KUNIT_CASE_PARAM(mt76_psim_test_run, psim_gen_params),
+ 	KUNIT_CASE_PARAM(mt76_psim_test_run, psim_seed_params),
+ 	KUNIT_CASE(mt76_psim_test_pace),
++	KUNIT_CASE(mt76_psim_test_silent),
++	KUNIT_CASE(mt76_psim_test_silent_off),
++	KUNIT_CASE(mt76_psim_test_silent_on),
+ 	{}
+ };
+ 

@@ -1,0 +1,591 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 00:26:15 +0000
+Subject: [PATCH] wifi: mt76: hold a station that stops answering while awake
+ to the firmware
+
+A phone asleep sends its keepalives from its Wi-Fi chip, between a null
+frame that says it is awake and one that says it dozes again. When the
+last one doesn't arrive, the firmware has the phone awake for as long as
+it stays silent, and every frame handed to the hardware for it in that
+time is lost: sent in vain, or given back without having been sent. No
+power-save report comes.
+
+Once a frame to a station of an AP interface comes back failed and
+nothing has been heard from the station for a while (no frame, no ACK,
+no power-save report), or a few frames in a row come back failed, hold
+it as a dozing station is held, with nothing handed to the hardware: its
+frames wait in its queues. The next frame received from it, the next
+power-save report or an ACK releases it. A null frame sent at growing
+intervals is the probe that finds a station which does listen and only
+had nothing to say.
+
+silent_hold (module parameter, on by default) switches it off. The
+station's debugfs ps file shows the holds, their time and the probes.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ mac80211.c       |  18 +++
+ mt76.h           |  32 +++++
+ mt7915/debugfs.c |  20 +++-
+ mt7915/mac.c     |   8 ++
+ tx.c             | 306 +++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 382 insertions(+), 2 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index c709b30e..8e161d85 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -719,6 +719,7 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
+ 	mutex_init(&dev->mcu.mutex);
+ 	dev->tx_worker.fn = mt76_tx_worker;
+ 	mt76_tx_pace_init(dev);
++	mt76_tx_silent_init(dev);
+ 
+ 	hw->wiphy->flags |= WIPHY_FLAG_IBSS_RSN;
+ 	hw->wiphy->interface_modes =
+@@ -834,6 +835,7 @@ void mt76_unregister_device(struct mt76_dev *dev)
+ 	ieee80211_unregister_hw(hw);
+ 	/* its stations are gone: nothing arms the pacing timer again */
+ 	mt76_tx_pace_stop(dev);
++	mt76_tx_silent_stop(dev);
+ }
+ EXPORT_SYMBOL_GPL(mt76_unregister_device);
+ 
+@@ -841,6 +843,7 @@ void mt76_free_device(struct mt76_dev *dev)
+ {
+ 	mt76_record_dev_gone(dev);
+ 	mt76_tx_pace_stop(dev);
++	mt76_tx_silent_stop(dev);
+ 	mt76_worker_teardown(&dev->tx_worker);
+ 	if (dev->wq) {
+ 		destroy_workqueue(dev->wq);
+@@ -909,6 +912,10 @@ void mt76_reset_device(struct mt76_dev *dev)
+ 		 */
+ 		if (dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING)
+ 			clear_bit(MT_WCID_FLAG_PS, &wcid->flags);
++		/* nor held for its silence: its frames in flight were the
++		 * reset's to free, and it is added again as new
++		 */
++		clear_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
+ 		/* for mt76_sta_add(), when mac80211 re-adds the station */
+ 		set_bit(MT_WCID_FLAG_RESET, &wcid->flags);
+ 		rcu_assign_pointer(dev->wcid[i], NULL);
+@@ -1600,6 +1607,11 @@ mt76_check_sta(struct mt76_dev *dev, struct sk_buff *skb)
+ 
+ 	wcid->inactive_count = 0;
+ 
++	/* heard: what was held for its silence goes (mt76_tx_result()) */
++	WRITE_ONCE(wcid->heard, mt76_tx_silent_now());
++	if (unlikely(test_bit(MT_WCID_FLAG_SILENT, &wcid->flags)))
++		mt76_tx_silent_release(dev, wcid);
++
+ 	if (status->flag & RX_FLAG_8023)
+ 		return;
+ 
+@@ -1879,6 +1891,9 @@ void mt76_wcid_init(struct mt76_wcid *wcid, u8 band_idx)
+ 	 * (mt76_tx_ps_busy()), for as long as it stays associated.
+ 	 */
+ 	atomic_set(&wcid->non_aql_packets, 0);
++	/* it has just been heard from: it is being added */
++	wcid->heard = mt76_tx_silent_now();
++	clear_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
+ 
+ 	INIT_LIST_HEAD(&wcid->tx_list);
+ 	skb_queue_head_init(&wcid->tx_pending);
+@@ -1898,6 +1913,9 @@ void mt76_wcid_cleanup(struct mt76_dev *dev, struct mt76_wcid *wcid)
+ 	struct sk_buff_head list;
+ 	struct sk_buff *skb;
+ 
++	/* no longer a station to probe (mt76_tx_silent_poll()) */
++	clear_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++
+ 	mt76_tx_status_lock(dev, &list);
+ 	mt76_tx_status_skb_get(dev, wcid, -1, &list);
+ 	idr_destroy(&wcid->pktid);
+diff --git a/mt76.h b/mt76.h
+index 45df8036..c5c2d1fa 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -379,6 +379,7 @@ enum mt76_wcid_flags {
+ 	MT_WCID_FLAG_HDR_TRANS,
+ 	MT_WCID_FLAG_TDLS_PEER,
+ 	MT_WCID_FLAG_RESET,	/* unpublished by a full reset */
++	MT_WCID_FLAG_SILENT,	/* held: it stopped answering (mt76_tx_silent_*()) */
+ };
+ 
+ #define MT76_N_WCIDS 1088
+@@ -444,6 +445,19 @@ struct mt76_wcid {
+ 	u32 pace_holds;		/* times it was held */
+ 	u64 pace_held;		/* us it was held in all */
+ 
++	/* A station that stopped answering while the hardware has it awake
++	 * (mt76_tx_silent_*() in tx.c): held, as a dozing one is, until it
++	 * is heard again. Times in jiffies.
++	 */
++	unsigned long heard;		/* its last frame, ACK or PS report */
++	unsigned long silent_since;
++	unsigned long silent_probe;	/* when the next probe goes */
++	u8 silent_probes_sent;		/* in this hold */
++	u8 silent_fails;		/* frames given up on since the last ACK */
++	u32 silent_holds;		/* times it was held */
++	u32 silent_probes;		/* probes sent in all */
++	u64 silent_ms;			/* time held in all, ended holds */
++
+ 	struct list_head tx_list;
+ 	struct sk_buff_head tx_pending;
+ 	struct sk_buff_head tx_offchannel;
+@@ -1026,6 +1040,11 @@ struct mt76_dev {
+ 	bool pace_timer_set;
+ 	unsigned long pace_wait[BITS_TO_LONGS(MT76_N_WCIDS)];
+ 
++	/* the stations held for not answering, and the work that probes them */
++	struct delayed_work silent_work;
++	bool silent_work_set;
++	unsigned long silent_wait[BITS_TO_LONGS(MT76_N_WCIDS)];
++
+ 	spinlock_t token_lock;
+ 	struct idr token;
+ 	u16 wed_token_count;
+@@ -1604,6 +1623,19 @@ void mt76_txq_schedule_pending(struct mt76_phy *phy);
+ void mt76_tx_worker_run(struct mt76_dev *dev);
+ void mt76_tx_pace_init(struct mt76_dev *dev);
+ void mt76_tx_pace_stop(struct mt76_dev *dev);
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++/* the tests set the clock (mt76_tx_silent_test_now) */
++unsigned long mt76_tx_silent_now(void);
++#else
++static inline unsigned long mt76_tx_silent_now(void)
++{
++	return jiffies;
++}
++#endif
++void mt76_tx_silent_init(struct mt76_dev *dev);
++void mt76_tx_silent_stop(struct mt76_dev *dev);
++void mt76_tx_silent_release(struct mt76_dev *dev, struct mt76_wcid *wcid);
++void mt76_tx_result(struct mt76_dev *dev, struct mt76_wcid *wcid, bool acked);
+ void mt76_tx_worker(struct mt76_worker *w);
+ void mt76_release_buffered_frames(struct ieee80211_hw *hw,
+ 				  struct ieee80211_sta *sta,
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 411faabb..f300c4b1 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1843,20 +1843,36 @@ DEFINE_SHOW_ATTRIBUTE(mt7915_queues);
+ 
+ /* The station's power save as the firmware reports it (PS sync events),
+  * since it was added: dozing now and for how long, how often it dozed, its
+- * dozing time in all (the current doze included) and its longest doze.
++ * dozing time in all (the current doze included) and its longest doze. And
++ * what the firmware doesn't report: whether the driver holds the station
++ * now because it stopped answering while awake to the firmware
++ * (mt76_tx_result()), how often it has, for how long in all (this hold
++ * included) and how many probes it sent meanwhile.
+  */
+ static int
+ mt7915_sta_ps_show(struct seq_file *s, void *data)
+ {
+ 	struct ieee80211_sta *sta = s->private;
++	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	struct mt76_wcid *wcid = &msta->wcid;
+ 	struct mt7915_sta_ps_stats st;
++	bool silent = test_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++	u64 silent_ms = READ_ONCE(wcid->silent_ms);
++
++	if (silent)
++		silent_ms += jiffies_to_msecs(mt76_tx_silent_now() -
++					      READ_ONCE(wcid->silent_since));
+ 
+-	mt7915_sta_ps_stats((struct mt7915_sta *)sta->drv_priv, &st);
++	mt7915_sta_ps_stats(msta, &st);
+ 	seq_printf(s, "dozing %d\n", st.dozing);
+ 	seq_printf(s, "since_ms %u\n", st.since_ms);
+ 	seq_printf(s, "dozes %u\n", st.dozes);
+ 	seq_printf(s, "dozing_ms %llu\n", st.dozing_ms);
+ 	seq_printf(s, "longest_ms %u\n", st.longest_ms);
++	seq_printf(s, "silent %d\n", silent);
++	seq_printf(s, "silent_holds %u\n", READ_ONCE(wcid->silent_holds));
++	seq_printf(s, "silent_ms %llu\n", silent_ms);
++	seq_printf(s, "silent_probes %u\n", READ_ONCE(wcid->silent_probes));
+ 
+ 	return 0;
+ }
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 837e2329..50dc7713 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -943,21 +943,29 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 
+ 		if (!mtk_wed_device_active(&mdev->mmio.wed) && wcid) {
+ 			u32 tx_retries = 0, tx_failed = 0, count = 0;
++			bool mpdu = false;
+ 
+ 			/* count: transmissions; stat: non-zero if never acked */
+ 			if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3)) {
+ 				count = FIELD_GET(MT_TX_FREE_COUNT_V3, info);
+ 				tx_retries = count ? count - 1 : 0;
+ 				tx_failed = !!FIELD_GET(MT_TX_FREE_STAT_V3, info);
++				mpdu = true;
+ 			} else if (!v3 && (info & MT_TX_FREE_MPDU_HEADER)) {
+ 				count = FIELD_GET(MT_TX_FREE_COUNT, info);
+ 				tx_retries = count ? count - 1 : 0;
+ 				tx_failed = !!FIELD_GET(MT_TX_FREE_STAT, info);
++				mpdu = true;
+ 			}
+ 			wcid->stats.tx_retries += tx_retries;
+ 			wcid->stats.tx_failed += tx_failed;
+ 			if (count)
+ 				wcid->stats.tx_attempts[min_t(u32, fls(count - 1), 4)]++;
++			/* acked: the station answers; given up on: it may have
++			 * stopped listening (mt76_tx_result())
++			 */
++			if (mpdu && wcid->sta)
++				mt76_tx_result(mdev, wcid, !tx_failed);
+ 		}
+ 
+ 		if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3))
+diff --git a/tx.c b/tx.c
+index 4545b775..34dce473 100644
+--- a/tx.c
++++ b/tx.c
+@@ -657,6 +657,293 @@ void mt76_tx_pace_stop(struct mt76_dev *dev)
+ 		hrtimer_cancel(&dev->pace_timer);
+ }
+ 
++/*
++ * A station that stops answering while the hardware has it awake.
++ *
++ * A phone asleep sends its keepalives from its Wi-Fi chip: a null frame to
++ * say it's awake, the keepalive, a null frame to say it dozes again. Now
++ * and then the last one never arrives. The firmware then has the phone
++ * awake for as long as it stays silent (seconds, until it next has
++ * something to send), and every frame handed to the hardware for it in
++ * that time is lost: the first is sent its full count of times with no
++ * ACK, later ones can come back without having been sent at all (count 0,
++ * failed). The firmware reports no power-save change.
++ *
++ * So the driver does what the firmware doesn't: once a frame to a station
++ * comes back failed and nothing has been heard from that station for
++ * MT76_SILENT_IDLE_MS (no frame, no ACK, no power-save report), or
++ * MT76_SILENT_FAILS frames in a row come back failed however recently it
++ * was heard, the station is held as a dozing one is, with nothing at all
++ * handed to the hardware. Its frames wait in its queues. It is released by
++ * the next frame received from it, the next power-save report about it, or
++ * an ACK:
++ * of a frame that was in flight, or of a probe, a null frame the driver
++ * sends it at growing intervals for the case that it does listen and just
++ * had nothing to say (a failed frame can also be a moment's interference).
++ * The frame that found it silent, and what was in the hardware by then, is
++ * lost as before; what waits here is delayed instead, by no more than the
++ * station's silence.
++ *
++ * Only for a station of an AP interface, and with PS buffering in the
++ * hardware (where the firmware, not mac80211, tracks power save).
++ */
++static bool silent_hold = true;
++module_param(silent_hold, bool, 0644);
++MODULE_PARM_DESC(silent_hold, "Hold back a station's frames once it stops answering while the firmware has it awake, until it is heard again (default on; off: hand them to the hardware, as stock mt76 does)");
++
++#define MT76_SILENT_IDLE_MS	100	/* nothing heard for this long */
++#define MT76_SILENT_FAILS	3	/* or this many frames failed in a row */
++#define MT76_SILENT_PROBE_MS	20	/* the first probe; doubles each time */
++#define MT76_SILENT_PROBE_MAX_MS 1000	/* the longest gap between probes */
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++static unsigned long mt76_tx_silent_test_now;	/* the tests' clock, when set */
++
++unsigned long mt76_tx_silent_now(void)
++{
++	return mt76_tx_silent_test_now ?: jiffies;
++}
++EXPORT_SYMBOL_GPL(mt76_tx_silent_now);
++#endif
++
++/* the interface a station is on, by way of its queues */
++static struct ieee80211_vif *mt76_sta_vif(struct ieee80211_sta *sta)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(sta->txq); i++)
++		if (sta->txq[i])
++			return sta->txq[i]->vif;
++
++	return NULL;
++}
++
++static void mt76_tx_silent_arm(struct mt76_dev *dev, unsigned long delay)
++{
++	if (!dev->silent_work_set)
++		return;
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++	/* the tests run the work's function themselves */
++	if (mt76_tx_silent_test_now)
++		return;
++#endif
++	if (!delayed_work_pending(&dev->silent_work) ||
++	    time_before(jiffies + delay, dev->silent_work.timer.expires))
++		mod_delayed_work(dev->wq, &dev->silent_work, delay);
++}
++
++/* The station is heard again, or isn't to be held any more: its queues go
++ * back on mac80211's list.
++ */
++void mt76_tx_silent_release(struct mt76_dev *dev, struct mt76_wcid *wcid)
++{
++	struct ieee80211_sta *sta;
++	struct ieee80211_hw *hw;
++	int i;
++
++	if (!test_and_clear_bit(MT_WCID_FLAG_SILENT, &wcid->flags))
++		return;
++
++	wcid->silent_ms += jiffies_to_msecs(mt76_tx_silent_now() -
++					    wcid->silent_since);
++
++	sta = wcid_to_sta(wcid);
++	if (!sta)
++		return;
++
++	hw = mt76_phy_hw(dev, wcid->phy_idx);
++	for (i = 0; i < ARRAY_SIZE(sta->txq); i++)
++		if (sta->txq[i])
++			ieee80211_schedule_txq(hw, sta->txq[i]);
++	mt76_worker_schedule(&dev->tx_worker);
++}
++EXPORT_SYMBOL_GPL(mt76_tx_silent_release);
++
++/* something came from the station: a frame, an ACK, a power-save report */
++static void mt76_tx_heard(struct mt76_dev *dev, struct mt76_wcid *wcid)
++{
++	WRITE_ONCE(wcid->heard, mt76_tx_silent_now());
++	if (unlikely(test_bit(MT_WCID_FLAG_SILENT, &wcid->flags)))
++		mt76_tx_silent_release(dev, wcid);
++}
++
++/* How a frame the hardware was handed for a station ended, from its tx-free
++ * report: acked, or given up on (sent in vain, or not sent at all).
++ */
++void mt76_tx_result(struct mt76_dev *dev, struct mt76_wcid *wcid, bool acked)
++{
++	unsigned long now = mt76_tx_silent_now();
++	struct ieee80211_sta *sta;
++	struct ieee80211_vif *vif;
++	struct mt76_phy *phy;
++
++	if (acked) {
++		wcid->silent_fails = 0;
++		mt76_tx_heard(dev, wcid);
++		return;
++	}
++
++	if (!READ_ONCE(silent_hold) ||
++	    !(dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING))
++		return;
++
++	/* held already; or dozing, as far as the firmware says: its frames
++	 * are the firmware's to buffer
++	 */
++	if (test_bit(MT_WCID_FLAG_SILENT, &wcid->flags) ||
++	    test_bit(MT_WCID_FLAG_PS, &wcid->flags))
++		return;
++
++	if (wcid->silent_fails < U8_MAX)
++		wcid->silent_fails++;
++	if (wcid->silent_fails < MT76_SILENT_FAILS &&
++	    time_before(now, READ_ONCE(wcid->heard) +
++			     msecs_to_jiffies(MT76_SILENT_IDLE_MS)))
++		return;
++
++	/* frames fail for other reasons while the radio is away or resets */
++	phy = mt76_dev_phy(dev, wcid->phy_idx);
++	if (!phy || test_bit(MT76_RESET, &phy->state) || phy->offchannel)
++		return;
++
++	sta = wcid_to_sta(wcid);
++	vif = sta ? mt76_sta_vif(sta) : NULL;
++	if (!vif || vif->type != NL80211_IFTYPE_AP)
++		return;
++
++	wcid->silent_since = now;
++	wcid->silent_fails = 0;
++	wcid->silent_probes_sent = 0;
++	wcid->silent_probe = now + msecs_to_jiffies(MT76_SILENT_PROBE_MS);
++	wcid->silent_holds++;
++	set_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++	set_bit(wcid->idx, dev->silent_wait);
++	mt76_tx_silent_arm(dev, msecs_to_jiffies(MT76_SILENT_PROBE_MS));
++}
++EXPORT_SYMBOL_GPL(mt76_tx_result);
++
++/* A null frame for a held station, as hostapd's inactivity poll is one:
++ * its tx-free report says whether the station answers (mt76_tx_result()).
++ * It isn't a frame anything waits for, so losing it costs nothing.
++ */
++static void mt76_tx_silent_probe(struct mt76_dev *dev, struct mt76_wcid *wcid)
++{
++	struct ieee80211_sta *sta = wcid_to_sta(wcid);
++	struct mt76_phy *phy = mt76_dev_phy(dev, wcid->phy_idx);
++	struct ieee80211_tx_info *info;
++	struct ieee80211_qos_hdr *hdr;
++	struct ieee80211_vif *vif;
++	struct sk_buff *skb;
++	bool qos;
++	int len;
++
++	vif = sta ? mt76_sta_vif(sta) : NULL;
++	if (!vif || !phy || !phy->chandef.chan)
++		return;
++
++	qos = sta->wme;
++	len = qos ? sizeof(*hdr) : sizeof(struct ieee80211_hdr_3addr);
++	skb = dev_alloc_skb(phy->hw->extra_tx_headroom + len);
++	if (!skb)
++		return;
++
++	skb_reserve(skb, phy->hw->extra_tx_headroom);
++	hdr = skb_put_zero(skb, len);
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 (qos ? IEEE80211_STYPE_QOS_NULLFUNC :
++						IEEE80211_STYPE_NULLFUNC) |
++					 IEEE80211_FCTL_FROMDS);
++	memcpy(hdr->addr1, sta->addr, ETH_ALEN);
++	memcpy(hdr->addr2, vif->addr, ETH_ALEN);
++	memcpy(hdr->addr3, vif->addr, ETH_ALEN);
++	if (qos)
++		hdr->qos_ctrl = cpu_to_le16(7);
++	skb->priority = 7;
++	skb_set_queue_mapping(skb, IEEE80211_AC_VO);
++
++	info = IEEE80211_SKB_CB(skb);
++	memset(info, 0, sizeof(*info));
++	info->band = phy->chandef.chan->band;
++	info->hw_queue = vif->hw_queue[IEEE80211_AC_VO];
++	info->control.vif = vif;
++
++	wcid->silent_probes++;
++	mt76_tx(phy, sta, wcid, skb);
++}
++
++/* The held stations' probes whose time has come. Returns the jiffies until
++ * the next one is due, 0 with no station held.
++ */
++static unsigned long mt76_tx_silent_poll(struct mt76_dev *dev)
++{
++	unsigned long now = mt76_tx_silent_now(), next = 0;
++	bool any = false;
++	unsigned int idx;
++
++	rcu_read_lock();
++	for_each_set_bit(idx, dev->silent_wait, MT76_N_WCIDS) {
++		struct mt76_wcid *wcid = __mt76_wcid_ptr(dev, idx);
++		struct mt76_phy *phy;
++		unsigned int ms;
++
++		if (!wcid || !test_bit(MT_WCID_FLAG_SILENT, &wcid->flags)) {
++			clear_bit(idx, dev->silent_wait);
++			continue;
++		}
++
++		if (!READ_ONCE(silent_hold)) {
++			mt76_tx_silent_release(dev, wcid);
++			clear_bit(idx, dev->silent_wait);
++			continue;
++		}
++
++		phy = mt76_dev_phy(dev, wcid->phy_idx);
++		if (!time_before(now, wcid->silent_probe) && phy &&
++		    !test_bit(MT76_RESET, &phy->state) && !phy->offchannel) {
++			mt76_tx_silent_probe(dev, wcid);
++			ms = MT76_SILENT_PROBE_MS <<
++			     min_t(unsigned int, wcid->silent_probes_sent + 1, 6);
++			ms = min_t(unsigned int, ms, MT76_SILENT_PROBE_MAX_MS);
++			wcid->silent_probe = now + msecs_to_jiffies(ms);
++			if (wcid->silent_probes_sent < U8_MAX)
++				wcid->silent_probes_sent++;
++		} else if (!time_before(now, wcid->silent_probe)) {
++			/* the radio is away: look again shortly */
++			wcid->silent_probe = now +
++				msecs_to_jiffies(MT76_SILENT_PROBE_MS);
++		}
++
++		if (!any || time_before(wcid->silent_probe, now + next))
++			next = max_t(long, wcid->silent_probe - now, 1);
++		any = true;
++	}
++	rcu_read_unlock();
++
++	return any ? next : 0;
++}
++
++static void mt76_tx_silent_work(struct work_struct *work)
++{
++	struct mt76_dev *dev = container_of(work, struct mt76_dev,
++					    silent_work.work);
++	unsigned long next = mt76_tx_silent_poll(dev);
++
++	if (next)
++		queue_delayed_work(dev->wq, &dev->silent_work, next);
++}
++
++void mt76_tx_silent_init(struct mt76_dev *dev)
++{
++	INIT_DELAYED_WORK(&dev->silent_work, mt76_tx_silent_work);
++	dev->silent_work_set = true;
++}
++
++void mt76_tx_silent_stop(struct mt76_dev *dev)
++{
++	if (dev->silent_work_set)
++		cancel_delayed_work_sync(&dev->silent_work);
++}
++
+ static struct sk_buff *
+ mt76_txq_dequeue(struct mt76_phy *phy, struct mt76_txq *mtxq)
+ {
+@@ -825,6 +1112,10 @@ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
+ 	u64 now = 0;
+ 	int idx;
+ 
++	/* it stopped answering: nothing goes to the hardware */
++	if (test_bit(MT_WCID_FLAG_SILENT, &wcid->flags))
++		return 0;
++
+ 	if (test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
+ 		if (!(dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING))
+ 			return 0;
+@@ -875,6 +1166,10 @@ mt76_txq_send_burst(struct mt76_phy *phy, struct mt76_queue *q,
+ 		if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+ 			break;
+ 
++		/* or stopped answering (a tx-free report, likewise) */
++		if (test_bit(MT_WCID_FLAG_SILENT, &wcid->flags))
++			break;
++
+ 		/* a paced station that owes enough: the rest waits its time */
+ 		if (pace && mt76_tx_pace_qid(qid) &&
+ 		    wcid->pace_tokens <= -MT76_PACE_BURST_US)
+@@ -961,6 +1256,14 @@ mt76_txq_schedule_list(struct mt76_phy *phy, enum mt76_txq_id qid)
+ 
+ 		q = phy->q_tx[qid];
+ 
++		/*
++		 * A station that stopped answering: the hardware would only
++		 * give its frames back. Not returned to the list:
++		 * mt76_tx_silent_release() schedules its queues again.
++		 */
++		if (test_bit(MT_WCID_FLAG_SILENT, &wcid->flags))
++			continue;
++
+ 		if (test_bit(MT_WCID_FLAG_PS, &wcid->flags)) {
+ 			if (!(dev->drv->drv_flags & MT_DRV_HW_PS_BUFFERING))
+ 				continue;
+@@ -1272,6 +1575,9 @@ void mt76_sta_ps_transition(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 	struct ieee80211_hw *hw;
+ 	int i;
+ 
++	/* the firmware heard from it: no longer held for its silence */
++	mt76_tx_heard(dev, wcid);
++
+ 	if (ps) {
+ 		set_bit(MT_WCID_FLAG_PS, &wcid->flags);
+ 		mt76_worker_schedule(&dev->tx_worker);

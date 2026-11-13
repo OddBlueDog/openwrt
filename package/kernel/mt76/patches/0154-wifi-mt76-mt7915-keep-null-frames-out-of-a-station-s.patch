@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 09:09:04 +0000
+Subject: [PATCH] wifi: mt76: mt7915: keep null frames out of a station's tx
+ statistics
+
+The tx-free event's count and status of each frame went into the station's
+retry, failure and attempt counters whatever the frame was. A null frame
+the AP sends a station isn't the station's data: hostapd's inactivity
+poll, and now the driver's probe of a station that stopped answering,
+which goes unanswered for as long as the station is silent and would
+count as a failed frame each time.
+
+The count and status now wait for the frame's first MSDU, which shows
+what the frame was, and a null frame's stay out of the statistics. The
+driver still hears of every frame's end (mt76_tx_result()).
+
+KUnit: mt7915-mac-tx.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 93 +++++++++++++++++++++++++++++++----------
+ mt7915/tests/mac-test.c | 78 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 148 insertions(+), 23 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 50dc7713..92c9fc77 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -888,6 +888,40 @@ mt7915_mac_tx_free_done(struct mt7915_dev *dev,
+ 	}
+ }
+ 
++/* A frame's count and status from the tx-free event, once its first MSDU
++ * shows which frame it was (@skb; NULL for a token nobody knows): into the
++ * station's statistics, unless it is a null frame. Those are hostapd's
++ * inactivity poll and the driver's probe of a station that stopped
++ * answering: not the station's data, and the probe goes unanswered for as
++ * long as the station is silent. Either way mt76_tx_result() hears of it.
++ */
++static void
++mt7915_mac_tx_free_mpdu(struct mt76_dev *mdev, struct mt76_wcid *wcid,
++			struct sk_buff *skb, u32 count, bool failed)
++{
++	bool null = false;
++
++	if (skb && skb->len >= sizeof(struct ieee80211_hdr_3addr) &&
++	    !(IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)) {
++		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++		null = ieee80211_is_any_nullfunc(hdr->frame_control);
++	}
++
++	if (!null) {
++		wcid->stats.tx_retries += count ? count - 1 : 0;
++		wcid->stats.tx_failed += failed;
++		if (count)
++			wcid->stats.tx_attempts[min_t(u32, fls(count - 1), 4)]++;
++	}
++
++	/* acked: the station answers; given up on: it may have stopped
++	 * listening
++	 */
++	if (wcid->sta)
++		mt76_tx_result(mdev, wcid, !failed);
++}
++
+ static void
+ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ {
+@@ -903,6 +937,12 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 	u16 total, count = 0;
+ 	__le32 *cur_info;
+ 	u32 txd;
++	/* an MPDU header's station, count and status, until the MSDU after it
++	 * says which frame they are of
++	 */
++	struct mt76_wcid *mpdu_wcid = NULL;
++	bool mpdu_failed = false;
++	u32 mpdu_count = 0;
+ 
+ 	if (WARN_ON_ONCE(len < sizeof(*free)))
+ 		return;
+@@ -930,6 +970,13 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 			struct mt7915_sta *msta;
+ 			u16 idx;
+ 
++			/* a header no MSDU followed */
++			if (mpdu_wcid) {
++				mt7915_mac_tx_free_mpdu(mdev, mpdu_wcid, NULL,
++							mpdu_count, mpdu_failed);
++				mpdu_wcid = NULL;
++			}
++
+ 			idx = FIELD_GET(MT_TX_FREE_WLAN_ID, info);
+ 			wcid = mt76_wcid_ptr(dev, idx);
+ 			sta = wcid_to_sta(wcid);
+@@ -941,31 +988,21 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 			continue;
+ 		}
+ 
+-		if (!mtk_wed_device_active(&mdev->mmio.wed) && wcid) {
+-			u32 tx_retries = 0, tx_failed = 0, count = 0;
+-			bool mpdu = false;
+-
++		if (!mtk_wed_device_active(&mdev->mmio.wed) && wcid &&
++		    (info & (v3 ? MT_TX_FREE_MPDU_HEADER_V3 :
++				  MT_TX_FREE_MPDU_HEADER))) {
++			if (mpdu_wcid)
++				mt7915_mac_tx_free_mpdu(mdev, mpdu_wcid, NULL,
++							mpdu_count, mpdu_failed);
+ 			/* count: transmissions; stat: non-zero if never acked */
+-			if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3)) {
+-				count = FIELD_GET(MT_TX_FREE_COUNT_V3, info);
+-				tx_retries = count ? count - 1 : 0;
+-				tx_failed = !!FIELD_GET(MT_TX_FREE_STAT_V3, info);
+-				mpdu = true;
+-			} else if (!v3 && (info & MT_TX_FREE_MPDU_HEADER)) {
+-				count = FIELD_GET(MT_TX_FREE_COUNT, info);
+-				tx_retries = count ? count - 1 : 0;
+-				tx_failed = !!FIELD_GET(MT_TX_FREE_STAT, info);
+-				mpdu = true;
++			if (v3) {
++				mpdu_count = FIELD_GET(MT_TX_FREE_COUNT_V3, info);
++				mpdu_failed = !!FIELD_GET(MT_TX_FREE_STAT_V3, info);
++			} else {
++				mpdu_count = FIELD_GET(MT_TX_FREE_COUNT, info);
++				mpdu_failed = !!FIELD_GET(MT_TX_FREE_STAT, info);
+ 			}
+-			wcid->stats.tx_retries += tx_retries;
+-			wcid->stats.tx_failed += tx_failed;
+-			if (count)
+-				wcid->stats.tx_attempts[min_t(u32, fls(count - 1), 4)]++;
+-			/* acked: the station answers; given up on: it may have
+-			 * stopped listening (mt76_tx_result())
+-			 */
+-			if (mpdu && wcid->sta)
+-				mt76_tx_result(mdev, wcid, !tx_failed);
++			mpdu_wcid = wcid;
+ 		}
+ 
+ 		if (v3 && (info & MT_TX_FREE_MPDU_HEADER_V3))
+@@ -982,6 +1019,12 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 			}
+ 			count++;
+ 			txwi = mt76_token_release(mdev, msdu, &wake);
++			if (mpdu_wcid) {
++				mt7915_mac_tx_free_mpdu(mdev, mpdu_wcid,
++							txwi ? txwi->skb : NULL,
++							mpdu_count, mpdu_failed);
++				mpdu_wcid = NULL;
++			}
+ 			if (!txwi)
+ 				continue;
+ 
+@@ -989,6 +1032,10 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 		}
+ 	}
+ 
++	if (mpdu_wcid)
++		mt7915_mac_tx_free_mpdu(mdev, mpdu_wcid, NULL, mpdu_count,
++					mpdu_failed);
++
+ 	mt7915_mac_tx_free_done(dev, &free_list, wake);
+ }
+ 
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 5a41ad80..5a445656 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -2733,6 +2733,83 @@ static void mt7915_test_tx_free_attempts(struct kunit *test)
+ 				    "bucket %d", i);
+ }
+ 
++/* A null frame's end is not the station's data: hostapd's inactivity poll,
++ * or the driver's probe of a station that stopped answering, which fails
++ * for as long as the station is silent. Its count and status stay out of
++ * the station's statistics; the data frame's in the same event go in. The
++ * driver still hears of each (mt76_tx_result()): an acked one is the
++ * station answering.
++ */
++static void mt7915_test_tx_free_null(struct kunit *test)
++{
++	static const u8 qos_null[] = {
++		0xc8, 0x02, 0x00, 0x00,			/* QoS null, from the AP */
++		0x00, 0x00, 0x11, 0x22, 0x33, 0x44,
++		0x02, 0x11, 0x22, 0x33, 0x44, 0x01,
++		0x02, 0x11, 0x22, 0x33, 0x44, 0x01,
++		0x00, 0x00, 0x07, 0x00,
++	};
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *msta = mt7915_test_sta(test, dev, 9, mvif);
++	unsigned long before = jiffies - HZ;
++	struct sk_buff *skb[3];
++	int id[3], i;
++	u32 info[7];
++	__le32 *ev;
++
++	mt7915_test_band1(test, env);
++	for (i = 0; i < 2; i++) {
++		u8 *txwi = mt7915_test_txwi(test, dev);
++		struct mt76_txwi_cache *t = mt7915_test_txwi_cache(dev, txwi);
++
++		((__le32 *)txwi)[1] = cpu_to_le32(FIELD_PREP(MT_TXD1_WLAN_IDX, 9));
++		t->skb = mt7915_test_tx_skb(test, qos_null, sizeof(qos_null));
++		skb[i] = skb_get(t->skb);
++		id[i] = mt76_token_consume(&dev->mt76, &t);
++		KUNIT_ASSERT_GE(test, id[i], 0);
++	}
++	id[2] = mt7915_test_token(test, dev, 9, &skb[2]);
++	msta->wcid.heard = before;
++
++	info[0] = MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 9);
++	/* a null frame sent 15 times and given up on */
++	info[1] = MT_TX_FREE_MPDU_HEADER_V3 |
++		  FIELD_PREP(MT_TX_FREE_COUNT_V3, 15) |
++		  FIELD_PREP(MT_TX_FREE_STAT_V3, 1);
++	info[2] = id[0] | (MT_TX_FREE_MSDU_ID_V3 << 15);
++	/* a data frame sent twice and given up on */
++	info[3] = MT_TX_FREE_MPDU_HEADER_V3 |
++		  FIELD_PREP(MT_TX_FREE_COUNT_V3, 2) |
++		  FIELD_PREP(MT_TX_FREE_STAT_V3, 1);
++	info[4] = id[2] | (MT_TX_FREE_MSDU_ID_V3 << 15);
++	/* a null frame acked at the first go */
++	info[5] = MT_TX_FREE_MPDU_HEADER_V3 |
++		  FIELD_PREP(MT_TX_FREE_COUNT_V3, 1) |
++		  FIELD_PREP(MT_TX_FREE_STAT_V3, 0);
++	info[6] = id[1] | (MT_TX_FREE_MSDU_ID_V3 << 15);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 3,
++			       FIELD_PREP(MT_TX_FREE_VER, 4), info, 7);
++
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 9 * 4));
++	for (i = 0; i < 3; i++) {
++		KUNIT_EXPECT_NULL(test, idr_find(&dev->mt76.token, id[i]));
++		KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb[i]));
++		kfree_skb(skb[i]);
++	}
++	/* only the data frame: sent twice, never acked */
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 1);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_retries, 1);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_attempts[1], 1);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_attempts[0] +
++			      msta->wcid.stats.tx_attempts[2] +
++			      msta->wcid.stats.tx_attempts[3] +
++			      msta->wcid.stats.tx_attempts[4], 0);
++	/* the acked null frame: the station was heard */
++	KUNIT_EXPECT_TRUE(test, time_after(msta->wcid.heard, before));
++}
++
+ /* Words before any wcid pair, for an entry that's no station, or for
+  * unknown tokens are skipped; the rest of the event is still handled.
+  */
+@@ -5756,6 +5833,7 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_tx_free_v3),
+ 	KUNIT_CASE(mt7915_test_tx_free_v3_odd),
+ 	KUNIT_CASE(mt7915_test_tx_free_attempts),
++	KUNIT_CASE(mt7915_test_tx_free_null),
+ 	KUNIT_CASE(mt7915_test_tx_free_unknown),
+ 	KUNIT_CASE(mt7915_test_tx_free_v0),
+ 	KUNIT_CASE(mt7915_test_tx_free_still_full),
