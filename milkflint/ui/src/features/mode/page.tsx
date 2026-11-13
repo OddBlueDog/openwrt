@@ -40,6 +40,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { refreshRouterMode, type RouterMode } from '@/lib/router-mode';
+import { routerUrl } from '@/lib/router-url';
 import { cn, errorMessage } from '@/lib/utils';
 import { Choice, SwitchRow } from '../firewall/parts';
 import { type Addressing, bridgeOffloadChange, getModeStatus, type LastSwitch, type ModeStatus, switchMode } from './api';
@@ -416,7 +417,7 @@ function ToRouter({ status, busy, onSwitch }: { status: ModeStatus; busy: boolea
       <CardContent className="flex flex-col gap-4">
         <ul className="divide-y">
           <ChangeItem icon={NetworkIcon}>
-            {handmade ? 'Its own network' : 'Its own network again'}, at <span className="font-mono">http://{address}/</span>, with
+            {handmade ? 'Its own network' : 'Its own network again'}, at <span className="font-mono">{routerUrl(address)}</span>, with
             its DHCP server{handmade ? ', its firewall and IPv6 settings, turned on if they were off' : ''}.
           </ChangeItem>
           <ChangeItem icon={CableIcon}>
@@ -637,7 +638,7 @@ export function ModePage(): ReactElement {
           seconds,
           at: Date.now(),
           routerAt: at,
-          url: address === undefined ? undefined : `http://${address}/`,
+          url: address === undefined ? undefined : routerUrl(address),
         });
       },
       (err: unknown) => {
@@ -707,10 +708,10 @@ export function ModePage(): ReactElement {
               {pending?.target === 'ap'
                 ? `This page loses its connection. MilkFlint then answers ${
                     pending.form !== undefined && apAddress(pending.form) !== undefined
-                      ? `at http://${apAddress(pending.form) ?? ''}/`
+                      ? `at ${routerUrl(apAddress(pending.form) ?? '')}`
                       : 'at the address your main router gives it (look for MilkFlint in its list of devices)'
                   }, once your device has reconnected. If it can’t reach your main router within two minutes, it goes back to router mode by itself.`
-                : `This page loses its connection. MilkFlint then answers at http://${status?.router_address ?? '192.168.1.1'}/ on its own Wi-Fi and LAN ports. If its LAN doesn’t come up, it goes back to access point mode by itself.`}
+                : `This page loses its connection. MilkFlint then answers at ${routerUrl(status?.router_address ?? '192.168.1.1')} on its own Wi-Fi and LAN ports. If its LAN doesn’t come up, it goes back to access point mode by itself.`}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

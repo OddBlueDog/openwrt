@@ -14,21 +14,64 @@ import { type MultiQueue, multiQueueOf, multiQueueValue, usesMultiQueue } from '
 // smallest frame the line sends, as in CAKE's own ethernet and docsis
 // keywords; ATM's cells already set ADSL's. VDSL2 adds CAKE's ptm keyword
 // (sqm has no option for it) for its 64/65 encoding.
+//
+// CAKE counts a packet from where its device's payload starts: on the
+// internet port that's the IP packet, under PPPoE with the session's 8-byte
+// header in front, and on the session's own device (pppoe-wan) the IP packet
+// alone. Fibre / Ethernet's and DOCSIS's figures are an Ethernet frame's, so
+// on the session's device they add its header (pppoe); VDSL2's (PPPoE and a
+// VLAN over PTM) and ADSL's (the most any ATM encapsulation adds) include it.
 export interface LinkPresetDef {
   label: string;
   linklayer: string;
   overhead: string;
+  /** the overhead on a PPPoE session's own device, where it differs */
+  pppoe?: string;
   mpu?: string;
   ptm?: boolean;
 }
 export const linkPresets = {
   none: { label: 'No compensation', linklayer: 'none', overhead: '0' },
-  ethernet: { label: 'Fibre / Ethernet', linklayer: 'ethernet', overhead: '44', mpu: '84' },
-  docsis: { label: 'Cable (DOCSIS)', linklayer: 'ethernet', overhead: '18', mpu: '64' },
+  ethernet: { label: 'Fibre / Ethernet', linklayer: 'ethernet', overhead: '44', pppoe: '52', mpu: '84' },
+  docsis: { label: 'Cable (DOCSIS)', linklayer: 'ethernet', overhead: '18', pppoe: '26', mpu: '64' },
   vdsl: { label: 'VDSL2 (PTM)', linklayer: 'ethernet', overhead: '34', mpu: '68', ptm: true },
   adsl: { label: 'ADSL (ATM)', linklayer: 'atm', overhead: '44' },
 } satisfies Record<string, LinkPresetDef>;
 export type LinkPreset = keyof typeof linkPresets;
+
+/** netifd's device for a PPPoE interface's session: pppoe-wan for wan */
+export function pppoeDevice(iface: string): string {
+  return `pppoe-${iface}`;
+}
+
+/** A PPPoE session's own device, where CAKE sees the IP packets inside it. */
+export function isPppoeDevice(device: string | undefined): boolean {
+  return device?.startsWith('pppoe-') === true;
+}
+
+/** A preset's overhead for a queue on this device. */
+export function presetOverhead(p: LinkPresetDef, device: string): string {
+  return isPppoeDevice(device) ? (p.pppoe ?? p.overhead) : p.overhead;
+}
+
+// sqm's linklayer_adaptation_mechanism: unset, default and cake are CAKE's
+// own compensation (exact per packet, GRO packets too); tc_stab is tc's size
+// table, and htb_private gives CAKE none at all.
+const CAKE_LLAM = [undefined, 'default', 'cake'];
+
+/**
+ * How a queue's link options differ from a preset's, where choosing the
+ * preset again puts them right: no mpu or ptm (an older version of this page
+ * wrote neither), the overhead for the other kind of device (a PPPoE
+ * session's own, or not), or another mechanism than CAKE's own.
+ */
+export type LinkGap = 'mpu' | 'ptm' | 'overhead' | 'mechanism';
+
+export interface LinkMatch {
+  link: LinkPreset | 'custom';
+  /** custom, but a preset's except for these */
+  near: { preset: LinkPreset; gaps: LinkGap[] } | undefined;
+}
 
 // CAKE's rtt, the round trip it tunes for: its queues aim for a twentieth
 // of it, and it marks or drops sooner when it's shorter. Senders that slow
@@ -62,7 +105,10 @@ export function lowMemlimit(uploadKbit: number): number {
 }
 
 // CAKE keywords this page manages in SQM's extra options for each direction
-// (iqdisc_opts, eqdisc_opts); any others, set in LuCI, are kept.
+// (iqdisc_opts, eqdisc_opts); any others, set in LuCI, are kept. Fair share
+// per device on writes its recipe, and off takes the whole of it out again:
+// left behind, the download's ingress mode would go on charging its drops to
+// the shaper with no per-device fairness to show for it.
 const FAIR_INGRESS = ['nat', 'dual-dsthost', 'ingress'];
 const FAIR_EGRESS = ['nat', 'dual-srchost'];
 // Whether CAKE takes GRO packets whole (no-split-gso) goes with the speed,
@@ -90,7 +136,12 @@ export interface SqmForm {
 export interface SqmData {
   form: SqmForm;
   devices: string[];
+  /** the internet connection's device: with PPPoE, its session's */
   wanDevice: string | undefined;
+  /** with a PPPoE internet connection, its session's device (pppoe-wan): the queue goes there */
+  pppoe: string | undefined;
+  /** the queue's link options are custom, but a preset's except for these */
+  linkNear: LinkMatch['near'];
   offloading: { section: string; software: boolean; hardware: boolean } | undefined;
   installed: boolean;
   /** the internet port's queue as uci has it: the advanced sheet's */
@@ -108,24 +159,39 @@ export interface SqmData {
   whole: Whole;
 }
 
-function presetOf(queue: Section | undefined): LinkPreset | 'custom' {
+/** The preset a queue on this device has, or the one it's near. */
+export function presetOf(queue: Section | undefined, device: string): LinkMatch {
+  const custom: LinkMatch = { link: 'custom', near: undefined };
   const linklayer = str(queue, 'linklayer') ?? 'none';
   const overhead = str(queue, 'overhead') ?? '0';
-  const mpu = str(queue, 'tcMPU');
+  const mpu = str(queue, 'tcMPU') ?? '0';
   const iq = words(str(queue, 'iqdisc_opts'));
   const eq = words(str(queue, 'eqdisc_opts'));
   const ptm = iq.includes('ptm') && eq.includes('ptm');
-  if (ptm !== (iq.includes('ptm') || eq.includes('ptm'))) return 'custom';
+  if (ptm !== (iq.includes('ptm') || eq.includes('ptm'))) return custom;
+  const cakeOwn = CAKE_LLAM.includes(str(queue, 'linklayer_adaptation_mechanism'));
+  let near: LinkMatch['near'];
   for (const [key, p] of Object.entries(linkPresets) as [LinkPreset, LinkPresetDef][]) {
     if (p.linklayer !== linklayer) continue;
-    if (p.linklayer === 'none') return ptm ? 'custom' : key;
-    if (p.overhead !== overhead) continue;
-    // the presets used to set only these two: a section without mpu and
-    // ptm still counts as its preset (choosing a preset writes them)
-    if (mpu === undefined && !ptm) return key;
-    if ((mpu ?? '0') === (p.mpu ?? '0') && ptm === (p.ptm === true)) return key;
+    if (p.linklayer === 'none') return ptm ? custom : { link: key, near: undefined };
+    const gaps: LinkGap[] = [];
+    if (overhead !== presetOverhead(p, device)) {
+      if (overhead !== p.overhead && overhead !== p.pppoe) continue;
+      gaps.push('overhead');
+    }
+    if (mpu !== (p.mpu ?? '0')) {
+      if (str(queue, 'tcMPU') !== undefined) continue;
+      gaps.push('mpu');
+    }
+    if (ptm !== (p.ptm === true)) {
+      if (ptm) continue;
+      gaps.push('ptm');
+    }
+    if (!cakeOwn) gaps.push('mechanism');
+    if (gaps.length === 0) return { link: key, near: undefined };
+    near ??= { preset: key, gaps };
   }
-  return 'custom';
+  return { ...custom, near };
 }
 
 function latencyOf(iqdiscOpts: string | undefined, eqdiscOpts: string | undefined): LatencyTarget | 'custom' {
@@ -146,25 +212,39 @@ export interface SqmSources {
   sqm: Section[] | undefined;
   firewall: Section[];
   milkflint: Section[] | undefined;
+  /** wan's device as netifd has it: its session's while a PPPoE one is up, else its port */
   wanDevice: string | undefined;
+  /** wan's protocol */
+  wanProto: string | undefined;
   devices: string[];
 }
 
+/** The internet's queue in sqm's config: Guest Wi-Fi's speed limits and the VPN's queue are queues too. */
+export function internetQueue(sqm: readonly Section[] | undefined): Section | undefined {
+  return sqm?.find((s) => s['.type'] === 'queue' && !isGuestShaper(str(s, 'interface')) && !isVpnShaper(str(s, 'interface')));
+}
+
 /** The page's data from the router's configs. */
-export function sqmData({ sqm, firewall, milkflint, wanDevice, devices }: SqmSources): SqmData {
-  // the internet port's queue: Guest Wi-Fi's speed limit is one too
-  const queue = sqm?.find((s) => s['.type'] === 'queue' && !isGuestShaper(str(s, 'interface')) && !isVpnShaper(str(s, 'interface')));
+export function sqmData({ sqm, firewall, milkflint, wanDevice, wanProto, devices }: SqmSources): SqmData {
+  const queue = internetQueue(sqm);
   const defaults = firewall.find((s) => s['.type'] === 'defaults');
   const cake = milkflint?.find((s) => s['.name'] === 'cake');
+  // PPPoE's session device is there only while it's connected
+  const pppoe = wanProto !== 'pppoe' ? undefined : isPppoeDevice(wanDevice) ? wanDevice : pppoeDevice('wan');
+  const wan = pppoe ?? wanDevice;
+  const device = str(queue, 'interface') ?? wan ?? 'eth1';
+  const link = presetOf(queue, device);
 
   const form: SqmForm = {
     section: queue?.['.name'],
     enabled: bool(queue, 'enabled'),
-    device: str(queue, 'interface') ?? wanDevice ?? 'eth1',
+    device,
     downloadMbit: String(Number(str(queue, 'download') ?? '0') / 1000),
     uploadMbit: String(Number(str(queue, 'upload') ?? '0') / 1000),
     prioritise: str(queue, 'script') === 'layer_cake.qos',
-    link: presetOf(queue),
+    // a new queue: Fibre / Ethernet, which counts a little too much on most
+    // lines rather than far too little on all of them
+    link: queue === undefined ? 'ethernet' : link.link,
     latency: latencyOf(str(queue, 'iqdisc_opts'), str(queue, 'eqdisc_opts')),
     uploadMemory: uploadMemoryOf(str(queue, 'eqdisc_opts'), Number(str(queue, 'upload') ?? '0')),
     ackFilter: ackFilterOf(words(str(queue, 'eqdisc_opts'))),
@@ -179,8 +259,13 @@ export function sqmData({ sqm, firewall, milkflint, wanDevice, devices }: SqmSou
   };
   return {
     form,
-    devices: devices.filter((d) => d !== 'lo' && !d.startsWith('ifb') && !d.startsWith('br-') && !d.startsWith('phy')),
-    wanDevice,
+    // not the VPN's tunnel nor a guest network's: a queue there is theirs
+    devices: devices.filter(
+      (d) => d !== 'lo' && !d.startsWith('ifb') && !d.startsWith('br-') && !d.startsWith('phy') && !isVpnShaper(d) && !isGuestShaper(d),
+    ),
+    wanDevice: wan,
+    pppoe,
+    linkNear: link.near,
     offloading:
       defaults === undefined
         ? undefined
@@ -205,18 +290,29 @@ export function sqmData({ sqm, firewall, milkflint, wanDevice, devices }: SqmSou
   };
 }
 
-export function validate(f: SqmForm): Partial<Record<'downloadMbit' | 'uploadMbit', string>> {
-  const e: Partial<Record<'downloadMbit' | 'uploadMbit', string>> = {};
-  if (!f.enabled) return e;
+const kbit = (mbit: string): number => Math.round(Number(mbit) * 1000);
+
+export type SqmErrors = Partial<Record<'downloadMbit' | 'uploadMbit' | 'multiQueue', string>>;
+
+export function validate(f: SqmForm, data: SqmData): SqmErrors {
+  const e: SqmErrors = {};
   for (const key of ['downloadMbit', 'uploadMbit'] as const) {
+    // with Smart Queue off, a speed is checked when it's written: a new
+    // queue's, or one that changed. sqm takes 0 or a word for "don't shape",
+    // and the automatic choices go with the speed.
+    if (!f.enabled && f.section !== undefined && kbit(f[key]) === kbit(data.form[key])) continue;
     const v = Number(f[key]);
     if (!Number.isFinite(v) || v <= 0) e[key] = 'Enter your line speed in Mbit/s, e.g. 450.';
+    else if (kbit(f[key]) < 1) e[key] = 'Too slow to shape: at least 0.001 Mbit/s.';
     else if (v > 10_000) e[key] = 'That’s more than 10 Gbit/s.';
+  }
+  // the kernel refuses a multi-queue CAKE that estimates the line's speed,
+  // and the download then goes unshaped
+  if (f.enabled && usesMultiQueue(kbit(f.downloadMbit), f.multiQueue) && words(data.iqdiscOpts).includes('autorate-ingress')) {
+    e.multiQueue = 'Multi-queue CAKE can’t estimate the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
   }
   return e;
 }
-
-const kbit = (mbit: string): number => Math.round(Number(mbit) * 1000);
 
 /** CAKE keywords a save replaces in one direction's opts, and what it puts in their place */
 interface OptsEdit {
@@ -253,6 +349,10 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
   }
   const multiQueue = usesMultiQueue(download, f.multiQueue);
   if (changed('multiQueue') || multiQueue !== usesMultiQueue(wasDownload, f.multiQueue)) values['use_mq'] = multiQueue ? '1' : '0';
+  // the upload stays one CAKE, as the hint says (./multi-queue.ts): first
+  // boot set use_mq_egress on the queues it found, and where it's unset
+  // the upload follows use_mq
+  if (isNew) values['use_mq_egress'] = '0';
 
   const iq: OptsEdit = { managed: [], wanted: [] };
   const eq: OptsEdit = { managed: [], wanted: [] };
@@ -266,12 +366,17 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
   const preset: LinkPresetDef | undefined = f.link === 'custom' ? undefined : linkPresets[f.link];
   if (changed('link') && preset !== undefined) {
     values['linklayer'] = preset.linklayer;
-    values['overhead'] = preset.overhead;
+    values['overhead'] = presetOverhead(preset, f.device);
     // LuCI keeps tcMPU only in its advanced link-layer mode
     if (preset.mpu !== undefined) Object.assign(values, { tcMPU: preset.mpu, linklayer_advanced: '1' });
     // a preset without an mpu: sqm's default (none)
     else if (data.mpu !== undefined) unset.push('tcMPU');
+    // CAKE's own compensation, where LuCI chose tc's size table or HTB's
+    if (!CAKE_LLAM.includes(str(data.queue, 'linklayer_adaptation_mechanism'))) unset.push('linklayer_adaptation_mechanism');
     both(['ptm'], preset.ptm === true ? ['ptm'] : []);
+  } else if (changed('device') && preset !== undefined && presetOverhead(preset, f.device) !== presetOverhead(preset, was.device)) {
+    // onto or off a PPPoE session's own device: the preset's figure there
+    values['overhead'] = presetOverhead(preset, f.device);
   }
   if (changed('latency') && f.latency !== 'custom') {
     const rtt = latencyTargets[f.latency].rtt;
@@ -321,6 +426,8 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
   if (changed('restoreDscp') || (f.restoreDscp && changed('prioritise'))) {
     const dscp = sqmDscpOptions(f.restoreDscp, f.prioritise, was.restoreDscp);
     Object.assign(values, dscp.set);
+    // LuCI keeps these only in its advanced mode: without it, its next save drops them
+    if (Object.keys(dscp.set).length > 0 && str(data.queue, 'qdisc_advanced') !== '1') values['qdisc_advanced'] = '1';
     unset.push(...dscp.unset.filter((key) => data.squash[key] !== undefined));
   }
 
@@ -348,4 +455,18 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
     });
   }
   return changes;
+}
+
+/**
+ * The internet's queue moved to another device, as the Internet page does
+ * when the connection goes to or from PPPoE: its interface, and the overhead
+ * a link preset has there. Custom link options stay as they are.
+ */
+export function queueMove(queue: Section, device: string): Record<string, string> {
+  const values: Record<string, string> = { interface: device };
+  const { link } = presetOf(queue, str(queue, 'interface') ?? device);
+  if (link === 'custom') return values;
+  const overhead = presetOverhead(linkPresets[link], device);
+  if (overhead !== (str(queue, 'overhead') ?? '0')) values['overhead'] = overhead;
+  return values;
 }

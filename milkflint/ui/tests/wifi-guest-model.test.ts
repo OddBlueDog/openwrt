@@ -3,9 +3,10 @@
 // on the router (bridge, DHCP, zone, access points, speed limit, DNS intercept).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { cakeEffect } from '../src/features/sqm/advanced.ts';
 import { ADDRESSES, bandCreds, blankNet, freeAddress, type GuestData, newForm, type NetData, type NetForm, overlaps, removal, toChanges, validate } from '../src/features/wifi-guest/model.ts';
 import { ipToInt } from '../src/lib/api/network.ts';
-import type { Change } from '../src/lib/api/uci.ts';
+import type { Change, Section } from '../src/lib/api/uci.ts';
 import { applied, nameOf, section } from './uci-fixture.ts';
 
 const range = (ip: string, prefix: number, name = 'Other'): { ip: number; prefix: number; name: string } => ({ ip: ipToInt(ip) ?? 0, prefix, name });
@@ -256,8 +257,33 @@ test('the speed limit: its own queue, each way as its devices see it', () => {
   // egress on the bridge is what they download
   assert.equal(queue.values['upload'], '50000');
   assert.equal(queue.values['download'], '10500');
-  assert.equal(queue.values['iqdisc_opts'], 'dual-srchost');
-  assert.equal(queue.values['eqdisc_opts'], 'dual-dsthost');
+  assert.equal(queue.values['iqdisc_opts'], 'nonat dual-srchost');
+  assert.equal(queue.values['eqdisc_opts'], 'nonat dual-dsthost');
+});
+
+test('the speed limit is fair per guest: CAKE’s NAT lookup, which sqm gives it, is off', () => {
+  // on the guest bridge, the lookup turns every guest into the router's internet
+  // address: one host on the way up, and per connection on the way down
+  const f = form({ downMbit: '50', upMbit: '10' });
+  const queue = toChanges(f, blankNet(f, data()), data()).find((c) => c.op === 'add' && c.config === 'sqm');
+  assert.ok(queue?.op === 'add');
+  // as sqm-scripts gives CAKE each direction: its own words first, the queue's after; CAKE takes the last of each kind
+  const effect = (key: string): ReturnType<typeof cakeEffect> => cakeEffect(['diffserv3', 'nat', 'besteffort', ...String(queue.values[key]).split(' ')]);
+  assert.equal(effect('iqdisc_opts').nat, 'nonat');
+  assert.equal(effect('eqdisc_opts').nat, 'nonat');
+  assert.equal(effect('iqdisc_opts').isolation, 'dual-srchost');
+  assert.equal(effect('eqdisc_opts').isolation, 'dual-dsthost');
+});
+
+test('a speed limit set up before keeps its own options: only its speeds and switch are written', () => {
+  const limited = form({ downMbit: '50', upMbit: '10' });
+  const net = existing(limited);
+  assert.ok(net.shaper !== null && net.shaper !== undefined);
+  const shaper: Section = { ...net.shaper };
+  Object.assign(shaper, { iqdisc_opts: 'dual-srchost', eqdisc_opts: 'dual-dsthost conservative' });
+  const luci = { ...net, shaper };
+  const changes = toChanges(form({ downMbit: '80', upMbit: '10' }), luci, data()).filter((c) => c.config === 'sqm');
+  assert.deepEqual(changes, [{ op: 'set', config: 'sqm', section: 'guest', values: { enabled: '1', upload: '80000', download: '10000' } }]);
 });
 
 test('one way only: the other is left alone', () => {

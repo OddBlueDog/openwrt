@@ -241,8 +241,10 @@ const MARK = /^(?:0x[0-9a-f]{1,8}|\d{1,10})$/i;
 const int = (v: string, min: number, max: number): boolean => /^-?\d+$/.test(v) && Number(v) >= min && Number(v) <= max;
 
 /** errors by field: "down.rtt", "overhead", ... */
-export function validateAdvanced(f: AdvancedForm): AdvancedErrors {
+export function validateAdvanced(f: AdvancedForm, data: AdvancedData): AdvancedErrors {
   const e: AdvancedErrors = {};
+  // the kernel refuses it with multi-queue CAKE, and the download then goes unshaped
+  if (f.down.autorate && data.useMq) e['down.autorate'] = 'Not with multi-queue CAKE, which can’t: turn Multi-queue off on the page first.';
   for (const dir of ['down', 'up'] as const) {
     const d = f[dir];
     if (d.rtt !== '' && !(RTT_PRESETS as readonly string[]).includes(d.rtt) && !TIME.test(d.rtt)) e[`${dir}.rtt`] = 'A time such as 50ms, 1s or 500us.';
@@ -284,6 +286,8 @@ export function advancedChanges(f: AdvancedForm, data: AdvancedData): Change[] {
   if (!data.dscpRestore) {
     if (f.squashDscp !== was.squashDscp) values['squash_dscp'] = f.squashDscp ? '1' : '0';
     if (f.squashIngress !== was.squashIngress) values['squash_ingress'] = f.squashIngress ? '1' : '0';
+    // LuCI keeps these only in its advanced mode: without it, its next save drops them
+    if (('squash_dscp' in values || 'squash_ingress' in values) && str(data.queue, 'qdisc_advanced') !== '1') values['qdisc_advanced'] = '1';
   }
   put('linklayer', f.linklayer, was.linklayer);
   put('overhead', f.overhead, was.overhead);

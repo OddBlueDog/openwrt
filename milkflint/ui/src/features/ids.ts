@@ -23,6 +23,7 @@ export const featureIds = [
   'upnp',
   'system-overview',
   'admin-password',
+  'https',
   'upgrade',
   'time',
   'schedules',

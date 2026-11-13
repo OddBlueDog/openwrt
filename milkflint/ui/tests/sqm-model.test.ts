@@ -2,7 +2,8 @@
 // keywords and options set in LuCI stay unless their own setting changed.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { type SqmData, type SqmForm, sqmData, toChanges } from '../src/features/sqm/model.ts';
+import { advancedData, cakeArgs } from '../src/features/sqm/advanced.ts';
+import { internetQueue, type SqmData, type SqmForm, sqmData, toChanges, validate } from '../src/features/sqm/model.ts';
 import type { Change, Section } from '../src/lib/api/uci.ts';
 import { applied, section } from './uci-fixture.ts';
 
@@ -19,7 +20,7 @@ const queue = (values: Record<string, string> = {}): Section =>
   });
 
 const load = (sqm: Section[] | undefined, milkflint: Section[] = []): SqmData =>
-  sqmData({ sqm, firewall: [section('defaults', 'cfg01')], milkflint, wanDevice: 'eth1', devices: ['eth0', 'eth1', 'lo', 'br-lan'] });
+  sqmData({ sqm, firewall: [section('defaults', 'cfg01')], milkflint, wanDevice: 'eth1', wanProto: 'dhcp', devices: ['eth0', 'eth1', 'lo', 'br-lan'] });
 
 const save = (data: SqmData, over: Partial<SqmForm>): Change[] => toChanges({ ...data.form, ...over }, data);
 
@@ -40,7 +41,7 @@ test('a new speed leaves no-split-gso out when it was taken out in LuCI', () => 
 
 test('a speed change writes only the speed', () => {
   // keywords and options the page reads but these settings didn't change: one-sided
-  // fairness, simple.qos, use_mq on below 500 Mbit/s, an old preset without its mpu
+  // fairness, simple.qos, use_mq on below 500 Mbit/s, an old preset without its mpu (custom, near it)
   const sqm = [
     queue({
       download: '300000',
@@ -53,7 +54,8 @@ test('a speed change writes only the speed', () => {
     }),
   ];
   const data = load(sqm);
-  assert.equal(data.form.link, 'ethernet');
+  assert.equal(data.form.link, 'custom');
+  assert.deepEqual(data.linkNear, { preset: 'ethernet', gaps: ['mpu'] });
   assert.equal(data.form.multiQueue, 'on');
   assert.equal(data.form.perDevice, false);
   const changes = save(data, { downloadMbit: '400', uploadMbit: '40' });
@@ -206,6 +208,7 @@ test('a new queue gets everything, and loads back as saved', () => {
     qdisc: 'cake',
     script: 'piece_of_cake.qos',
     use_mq: '1',
+    use_mq_egress: '0',
     linklayer: 'ethernet',
     overhead: '44',
     tcMPU: '84',
@@ -224,4 +227,185 @@ test('a save loads back as the form that made it', () => {
   const data = load(sqm);
   const form: SqmForm = { ...data.form, downloadMbit: '450', uploadMbit: '45', latency: 'low', uploadMemory: 'low', ackFilter: 'on', link: 'docsis' };
   assert.deepEqual(load([after(data, sqm, toChanges(form, data))]).form, form);
+});
+
+/**
+ * The section as LuCI's SQM page leaves it when it saves: an option whose
+ * dependencies aren't met goes (luci-app-sqm's depends, LuCI's form.js
+ * removes an inactive option that isn't retained).
+ */
+function luciSave(s: Section): Section {
+  const gates: Record<string, (x: Section) => boolean> = {
+    squash_dscp: (x) => x['qdisc_advanced'] === '1',
+    squash_ingress: (x) => x['qdisc_advanced'] === '1',
+    qdisc_really_really_advanced: (x) => x['qdisc_advanced'] === '1',
+    iqdisc_opts: (x) => x['qdisc_really_really_advanced'] === '1',
+    eqdisc_opts: (x) => x['qdisc_really_really_advanced'] === '1',
+    linklayer_advanced: (x) => x['linklayer'] === 'ethernet' || x['linklayer'] === 'atm',
+    tcMPU: (x) => x['linklayer_advanced'] === '1',
+    linklayer_adaptation_mechanism: (x) => x['linklayer_advanced'] === '1',
+  };
+  let out = { ...s };
+  for (;;) {
+    const drop = Object.keys(gates).filter((o) => o in out && gates[o]?.(out) === false);
+    if (drop.length === 0) return out;
+    out = Object.fromEntries(Object.entries(out).filter(([k]) => !drop.includes(k))) as Section;
+  }
+}
+
+test('with Smart Queue off, a speed is checked when it’s written', () => {
+  // off with LuCI's 0 (don't shape): left as it is, nothing to check
+  const zero = load([queue({ enabled: '0', download: '0', upload: '0' })]);
+  assert.deepEqual(validate(zero.form, zero), {});
+  assert.deepEqual(validate({ ...zero.form, prioritise: true }, zero), {});
+  // typed while off: an empty or mistyped speed would be written as 0 or NaN, flipping
+  // the automatic choices that go with it; it was let through before
+  const off = load([queue({ enabled: '0' })]);
+  assert.deepEqual(validate(off.form, off), {});
+  for (const typed of ['', 'abc', '0', '-5', '1e999']) {
+    assert.notEqual(validate({ ...off.form, downloadMbit: typed }, off).downloadMbit, undefined, typed);
+    assert.notEqual(validate({ ...off.form, uploadMbit: typed }, off).uploadMbit, undefined, typed);
+  }
+  assert.deepEqual(validate({ ...off.form, downloadMbit: '640', uploadMbit: '50' }, off), {});
+  // a new queue writes both speeds, on or off
+  const none = load([]);
+  assert.notEqual(validate(none.form, none).downloadMbit, undefined);
+  assert.deepEqual(validate({ ...none.form, downloadMbit: '80', uploadMbit: '20' }, none), {});
+});
+
+test('a speed under 1 kbit/s is refused: written as 0, it would mean don’t shape', () => {
+  const data = load([queue()]);
+  assert.match(validate({ ...data.form, downloadMbit: '0.0004' }, data).downloadMbit ?? '', /at least 0\.001/);
+  assert.match(validate({ ...data.form, enabled: false, uploadMbit: '0.0004' }, data).uploadMbit ?? '', /at least 0\.001/);
+  assert.deepEqual(validate({ ...data.form, downloadMbit: '0.001', uploadMbit: '0.001' }, data), {});
+  assert.notEqual(validate({ ...data.form, downloadMbit: '10001' }, data).downloadMbit, undefined);
+});
+
+test('multi-queue CAKE can’t estimate the speed: the kernel refuses it and downloads go unshaped', () => {
+  const sqm = [queue({ download: '800000', iqdisc_opts: 'nat autorate-ingress' })];
+  const data = load(sqm);
+  assert.equal(data.form.multiQueue, 'auto');
+  assert.notEqual(validate(data.form, data).multiQueue, undefined);
+  // either one off
+  assert.deepEqual(validate({ ...data.form, multiQueue: 'off' }, data), {});
+  assert.deepEqual(validate({ ...data.form, downloadMbit: '300' }, data), {}, 'one CAKE below 500 Mbit/s');
+  assert.notEqual(validate({ ...data.form, downloadMbit: '300', multiQueue: 'on' }, data).multiQueue, undefined);
+  // not while it's off
+  assert.deepEqual(validate({ ...data.form, enabled: false }, data), {});
+  // without autorate, nothing to say
+  const plain = load([queue({ download: '800000', iqdisc_opts: 'nat' })]);
+  assert.deepEqual(validate(plain.form, plain), {});
+});
+
+test('a new queue’s upload stays one CAKE; an existing queue’s choice isn’t touched', () => {
+  const data = load([]);
+  const sqm = applied({ sqm: [] }, toChanges({ ...data.form, enabled: true, downloadMbit: '800', uploadMbit: '100' }, data))['sqm'] ?? [];
+  const q = sqm[0];
+  assert.ok(q !== undefined);
+  assert.equal(q['use_mq'], '1');
+  assert.equal(q['use_mq_egress'], '0');
+  // as sqm-scripts gets it: multi-queue down, one CAKE up (without use_mq_egress the upload followed use_mq)
+  const adv = advancedData(q, []);
+  assert.equal(cakeArgs(adv.form, adv, 'down')[0], 'cake_mq');
+  assert.equal(cakeArgs(adv.form, adv, 'up')[0], 'cake');
+  const unset = { ...q };
+  Reflect.deleteProperty(unset, 'use_mq_egress');
+  const was = advancedData(unset, []);
+  assert.equal(cakeArgs(was.form, was, 'up')[0], 'cake_mq');
+  // a queue that's there: nothing about it, whatever the speed does
+  for (const values of [{}, { use_mq_egress: '1' }]) {
+    const existing = load([queue({ download: '300000', use_mq: '0', ...values })]);
+    for (const c of save(existing, { downloadMbit: '900', multiQueue: 'auto' })) {
+      assert.ok(!(c.op === 'set' && 'use_mq_egress' in c.values));
+    }
+  }
+});
+
+test('Fair share per device off takes out what on put in, and on puts it in once', () => {
+  // the download's ingress mode goes with it: left behind, it would charge drops to the shaper for nothing
+  const sqm = [queue({ iqdisc_opts: 'nat dual-dsthost ingress no-split-gso', eqdisc_opts: 'nat dual-srchost ack-filter' })];
+  const data = load(sqm);
+  assert.equal(data.form.perDevice, true);
+  const off = after(data, sqm, save(data, { perDevice: false }));
+  assert.equal(off['iqdisc_opts'], 'no-split-gso');
+  assert.equal(off['eqdisc_opts'], 'ack-filter');
+  assert.equal(load([off]).form.perDevice, false);
+  // and back on: the recipe once, other words kept
+  const back = load([off]);
+  const on = after(back, [off], save(back, { perDevice: true }));
+  assert.equal(on['iqdisc_opts'], 'no-split-gso nat dual-dsthost ingress');
+  assert.equal(on['eqdisc_opts'], 'ack-filter nat dual-srchost');
+  // one direction's isolation set in LuCI: on completes it, off takes the recipe out, the rest stays
+  const oneSided = [queue({ iqdisc_opts: 'dual-dsthost', eqdisc_opts: 'triple-isolate' })];
+  const one = load(oneSided);
+  assert.equal(one.form.perDevice, false);
+  const both = after(one, oneSided, save(one, { perDevice: true }));
+  assert.equal(both['eqdisc_opts'], 'triple-isolate nat dual-srchost');
+  const none = after(load([both]), [both], save(load([both]), { perDevice: false }));
+  assert.equal(none['iqdisc_opts'], undefined);
+  assert.equal(none['eqdisc_opts'], 'triple-isolate');
+});
+
+test('Keep devices’ priorities writes its sqm options with LuCI’s advanced mode, so a save in LuCI keeps them', () => {
+  const sqm = [queue({ script: 'layer_cake.qos' })];
+  const data = load(sqm);
+  const on = after(data, sqm, save(data, { restoreDscp: true }));
+  assert.equal(on['squash_ingress'], '0');
+  assert.equal(on['qdisc_advanced'], '1');
+  // LuCI drops squash_ingress without it: downloads would lose their tins, the switch still on
+  assert.equal(luciSave(on)['squash_ingress'], '0');
+  const without = { ...on };
+  Reflect.deleteProperty(without, 'qdisc_advanced');
+  assert.equal(luciSave(without)['squash_ingress'], undefined);
+  // already in advanced mode: not written again
+  const adv = [queue({ script: 'layer_cake.qos', qdisc_advanced: '1' })];
+  const a = load(adv);
+  assert.deepEqual(
+    save(a, { restoreDscp: true }).filter((c) => c.config === 'sqm'),
+    [{ op: 'set', config: 'sqm', section: 'wan', values: { squash_ingress: '0' } }],
+  );
+  // what's only unset needs no advanced mode
+  const restoring = [queue({ squash_ingress: '0', squash_dscp: '0' })];
+  const r = load(restoring, [section('cake', 'cake', { dscp_restore: '1' })]);
+  assert.deepEqual(
+    save(r, { restoreDscp: false }).filter((c) => c.config === 'sqm'),
+    [{ op: 'unset', config: 'sqm', section: 'wan', options: ['squash_ingress'] }],
+  );
+});
+
+test('what the page saves survives a save in LuCI', () => {
+  const data = load([]);
+  const form: SqmForm = {
+    ...data.form,
+    enabled: true,
+    downloadMbit: '80',
+    uploadMbit: '20',
+    prioritise: true,
+    link: 'vdsl',
+    latency: 'low',
+    uploadMemory: 'low',
+    ackFilter: 'on',
+    perDevice: true,
+    restoreDscp: true,
+  };
+  const out = applied({ sqm: [], milkflint: [] }, toChanges(form, data));
+  const q = out['sqm']?.[0];
+  assert.ok(q !== undefined);
+  assert.deepEqual(luciSave(q), q);
+  assert.deepEqual({ ...load([luciSave(q)], out['milkflint']).form, section: undefined }, form);
+});
+
+test('the Interface choices leave out the VPN’s tunnel and the guest networks’ devices', () => {
+  const data = sqmData({
+    sqm: [queue()],
+    firewall: [],
+    milkflint: [],
+    wanDevice: 'eth1',
+    wanProto: 'dhcp',
+    devices: ['eth0', 'eth1', 'eth1.911', 'lo', 'br-lan', 'br-guest', 'ifb4br-guest', 'br-guest2', 'wg_out', 'ifb4wg_out', 'ifb4eth1', 'phy1-ap0', 'pppoe-wan', 'wwan0'],
+  });
+  assert.deepEqual(data.devices, ['eth0', 'eth1', 'eth1.911', 'pppoe-wan', 'wwan0']);
+  // the reason: a queue there is the VPN's or a guest network's, and the page loses its own
+  assert.equal(internetQueue([queue({ interface: 'wg_out' })]), undefined);
+  assert.equal(internetQueue([queue({ interface: 'br-guest' })]), undefined);
 });

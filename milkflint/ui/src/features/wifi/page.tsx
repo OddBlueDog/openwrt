@@ -1301,7 +1301,7 @@ function RadioCard({
               <Field
                 id={id('multicast')}
                 label="Send multicast to each device"
-                hint="Sends group traffic as a copy to each device, at its own speed, instead of one slow copy for all. Much less air for multicast video; for the small announcements most homes have, a little more, and it wakes sleeping devices more often."
+                hint="On: each device gets its own copy of group traffic (multicast), sent at that device’s speed. Off: one copy for all devices, sent at the slowest speed. On saves a lot of airtime for multicast video, such as IPTV. For the small announcements most homes have, on costs a little more airtime and wakes sleeping devices more often."
               >
                 <Switch
                   id={id('multicast')}

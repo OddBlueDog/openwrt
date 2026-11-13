@@ -120,8 +120,9 @@ test('link options: tcMPU and the stab ones with LuCI’s advanced mode, cleared
 
 test('DSCP options: written when changed, left to Keep devices’ priorities when that’s on', () => {
   const data = advancedData(queue({ script: 'layer_cake.qos' }), []);
+  // with LuCI's advanced mode, which its next save would drop them without
   assert.deepEqual(save(data, (f) => ({ ...f, squashIngress: false })), [
-    { op: 'set', config: 'sqm', section: 'wan', values: { squash_ingress: '0' } },
+    { op: 'set', config: 'sqm', section: 'wan', values: { squash_ingress: '0', qdisc_advanced: '1' } },
   ]);
   const restoring = advancedData(queue({ script: 'layer_cake.qos', squash_ingress: '0' }), [section('cake', 'cake', { dscp_restore: '1' })]);
   assert.equal(restoring.dscpRestore, true);
@@ -136,7 +137,7 @@ test('upload multi-queue: like the download is unset', () => {
 
 test('what can’t be saved', () => {
   const data = advancedData(queue(), []);
-  const errors = (over: (f: AdvancedForm) => AdvancedForm): string[] => Object.keys(validateAdvanced(over(data.form)));
+  const errors = (over: (f: AdvancedForm) => AdvancedForm): string[] => Object.keys(validateAdvanced(over(data.form), data));
   assert.deepEqual(errors((f) => f), []);
   assert.deepEqual(errors((f) => ({ ...f, down: { ...f.down, rtt: 'fast' } })), ['down.rtt']);
   assert.deepEqual(errors((f) => ({ ...f, down: { ...f.down, rtt: '0.5ms' } })), []);
@@ -146,9 +147,9 @@ test('what can’t be saved', () => {
   assert.deepEqual(errors((f) => ({ ...f, overhead: '300' })), ['overhead']);
   assert.deepEqual(errors((f) => ({ ...f, overhead: '-4' })), []);
   // Other options: not a keyword with its own setting, nor sqm's, nor a value missing
-  assert.equal(validateAdvanced({ ...data.form, up: { ...data.form.up, extra: 'diffserv4' } })['up.extra'], 'diffserv4 has its own setting above.');
-  assert.equal(validateAdvanced({ ...data.form, up: { ...data.form.up, extra: 'bandwidth 10mbit' } })['up.extra'], 'sqm sets bandwidth itself.');
-  assert.equal(validateAdvanced({ ...data.form, up: { ...data.form.up, extra: 'conservative mpu' } })['up.extra'], 'mpu needs a value after it.');
+  assert.equal(validateAdvanced({ ...data.form, up: { ...data.form.up, extra: 'diffserv4' } }, data)['up.extra'], 'diffserv4 has its own setting above.');
+  assert.equal(validateAdvanced({ ...data.form, up: { ...data.form.up, extra: 'bandwidth 10mbit' } }, data)['up.extra'], 'sqm sets bandwidth itself.');
+  assert.equal(validateAdvanced({ ...data.form, up: { ...data.form.up, extra: 'conservative mpu' } }, data)['up.extra'], 'mpu needs a value after it.');
   assert.deepEqual(errors((f) => ({ ...f, up: { ...f.up, extra: 'conservative mpu 64' } })), []);
 });
 
@@ -179,7 +180,8 @@ test('what sqm gives CAKE, and what CAKE makes of it', () => {
 });
 
 test('a save loads back as the sheet that made it', () => {
-  const data = advancedData(queue({ iqdisc_opts: 'nat dual-dsthost ingress', eqdisc_opts: 'nat dual-srchost' }), []);
+  // one CAKE on the download: it estimates the speed
+  const data = advancedData(queue({ use_mq: '0', iqdisc_opts: 'nat dual-dsthost ingress', eqdisc_opts: 'nat dual-srchost' }), []);
   const form: AdvancedForm = {
     ...data.form,
     down: { ...data.form.down, diffserv: 'diffserv4', rtt: 'metro', autorate: true, extra: 'conservative' },
@@ -192,6 +194,7 @@ test('a save loads back as the sheet that made it', () => {
     tsize: '128',
     verbosity: '8',
   };
+  assert.deepEqual(validateAdvanced(form, data), {});
   const out = after(data, advancedChanges(form, data));
   const back = advancedData(out.queue, out.milkflint).form;
   assert.deepEqual(back, { ...form, down: { ...form.down, gso: 'no-split-gso' } });
@@ -202,4 +205,29 @@ test('LuCI’s advanced modes are written only when they aren’t on', () => {
   assert.deepEqual(save(data, (f) => ({ ...f, up: { ...f.up, ackFilter: 'ack-filter' } })), [
     { op: 'set', config: 'sqm', section: 'wan', values: { eqdisc_opts: 'nat ack-filter' } },
   ]);
+});
+
+test('estimating the line’s speed is refused with multi-queue CAKE, which the kernel won’t start with it', () => {
+  const mq = advancedData(queue({ use_mq: '1' }), []);
+  const on = (data: AdvancedData): AdvancedForm => ({ ...data.form, down: { ...data.form.down, autorate: true } });
+  assert.deepEqual(Object.keys(validateAdvanced(on(mq), mq)), ['down.autorate']);
+  // one CAKE: fine
+  const one = advancedData(queue({ use_mq: '0' }), []);
+  assert.deepEqual(validateAdvanced(on(one), one), {});
+  // already on with multi-queue (LuCI): turning it off is what's allowed
+  const luci = advancedData(queue({ use_mq: '1', iqdisc_opts: 'nat autorate-ingress' }), []);
+  assert.equal(luci.form.down.autorate, true);
+  assert.notDeepEqual(validateAdvanced(luci.form, luci), {});
+  const off = { ...luci.form, down: { ...luci.form.down, autorate: false } };
+  assert.deepEqual(validateAdvanced(off, luci), {});
+  assert.equal(after(luci, advancedChanges(off, luci)).queue['iqdisc_opts'], 'nat');
+});
+
+test('DSCP options from the sheet keep LuCI’s advanced mode on, and don’t write it when it is', () => {
+  const plain = advancedData(queue(), []);
+  const washOff = after(plain, save(plain, (f) => ({ ...f, squashDscp: false })));
+  assert.equal(washOff.queue['squash_dscp'], '0');
+  assert.equal(washOff.queue['qdisc_advanced'], '1');
+  const adv = advancedData(queue({ qdisc_advanced: '1' }), []);
+  assert.deepEqual(save(adv, (f) => ({ ...f, squashDscp: false })), [{ op: 'set', config: 'sqm', section: 'wan', values: { squash_dscp: '0' } }]);
 });

@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { aqlAutoTotal, aqlTotalOf, L4S_DEFAULT, readKnobs } from '../src/features/tuning/knobs.ts';
+import { functionsSh, uciExport } from './openwrt-shell.ts';
 
 const scripts = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/tuning/bin/', import.meta.url));
 const root = mkdtempSync(join(tmpdir(), 'tuning-scripts-'));
@@ -337,4 +338,40 @@ test('wifi-twt: a driver without the file is left alone', () => {
   mkdirSync(join(root, 'ieee80211', 'phy1'));
   run('wifi-twt', { 'milkflint.wifi.twt_5g_flows': '4' }, ['phy1'], wifiBin);
   assert.throws(() => readFileSync(join(root, 'ieee80211', 'phy1', 'mt76', 'twt_policy')));
+});
+
+/** gro show, against a pretend /etc/config/sqm (each section a queue) and a wan on eth1 */
+function groShow(queues: Record<string, Record<string, string>>): string {
+  const r = join(root, 'gro');
+  rmSync(r, { recursive: true, force: true });
+  for (const d of ['etc/config', 'lib/functions', 'sys/class/net/eth1/device', 'sys/class/net/br-guest', 'sys/class/net/wg_out', 'var/run'])
+    mkdirSync(join(r, d), { recursive: true });
+  writeFileSync(join(r, 'etc/config/sqm'), uciExport('sqm', 'queue', queues));
+  writeFileSync(join(r, 'lib/functions.sh'), functionsSh(join(r, 'etc/config')));
+  writeFileSync(join(r, 'lib/functions/network.sh'), 'network_get_physdev() { eval "$1=eth1"; }\n');
+  const text = readFileSync(join(scripts, 'gro'), 'utf8')
+    .replaceAll('. /lib/functions.sh', `. ${join(r, 'lib/functions.sh')}`)
+    .replaceAll('. /lib/functions/network.sh', `. ${join(r, 'lib/functions/network.sh')}`)
+    .replaceAll('/sys/class/net', join(r, 'sys/class/net'))
+    .replaceAll('/var/run/milkflint-tuning', join(r, 'var/run'));
+  writeFileSync(join(r, 'gro'), text);
+  return execFileSync('dash', [join(r, 'gro'), 'show'], { env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin` }, encoding: 'utf8' }).trim();
+}
+
+const NO_QUEUE = 'dev=eth1 mode=fraglist auto=fraglist udp=0 max=65536 whole=0 offload=0';
+const WHOLE = 'dev=eth1 mode=plain auto=plain udp=1 max=16384 whole=1 offload=0';
+const wanQueue = { enabled: '1', interface: 'eth1', download: '650000', iqdisc_opts: 'no-split-gso' };
+const vpnQueue = { enabled: '1', interface: 'wg_out', download: '70000', iqdisc_opts: 'dual-dsthost nat' };
+const guestQueue = { enabled: '1', interface: 'br-guest', download: '30000', iqdisc_opts: 'dual-srchost' };
+
+test('gro: the internet queue’s download options decide, whatever comes before it', () => {
+  assert.equal(groShow({}), NO_QUEUE);
+  assert.equal(groShow({ wan: wanQueue }), WHOLE);
+  assert.equal(groShow({ guest: guestQueue, vpn: vpnQueue, wan: wanQueue }), WHOLE);
+});
+
+test('gro: with the internet queue off, a guest network’s or the VPN’s options don’t count', () => {
+  const off = { ...wanQueue, enabled: '0' };
+  assert.equal(groShow({ wan: off, vpn: { ...vpnQueue, iqdisc_opts: 'no-split-gso' } }), NO_QUEUE);
+  assert.equal(groShow({ wan: off, guest: { ...guestQueue, iqdisc_opts: 'no-split-gso' } }), NO_QUEUE);
 });

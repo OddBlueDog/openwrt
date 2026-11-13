@@ -8,6 +8,7 @@ import { feature as dataStatistics } from './data-statistics/feature';
 import { feature as dns } from './dns/feature';
 import { feature as firewall } from './firewall/feature';
 import { groups } from './groups';
+import { feature as https } from './https/feature';
 import type { FeatureId } from './ids';
 import { feature as internet } from './internet/feature';
 import { feature as ipv6 } from './ipv6/feature';
@@ -55,6 +56,7 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   upnp,
   'system-overview': systemOverview,
   'admin-password': adminPassword,
+  https,
   upgrade,
   time,
   schedules,

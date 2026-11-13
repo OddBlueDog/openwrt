@@ -1,7 +1,9 @@
 // The Internet page's settings and the UCI changes that make them: the WAN
-// interface, the provider's VLAN as an 802.1q device, and wan6 under PPPoE.
+// interface, the provider's VLAN as an 802.1q device, wan6 under PPPoE, and
+// Smart Queue's queue, which goes where PPPoE's packets can be read.
 import { ipToInt } from '@/lib/api/network';
 import { type Change, type Section, str } from '@/lib/api/uci';
+import { isPppoeDevice, pppoeDevice, queueMove } from '../sqm/model';
 import { type ClientIdMode, fromStored, toStored } from './client-id';
 
 export interface InternetForm {
@@ -25,6 +27,8 @@ export interface InternetForm {
   vlanSection: string | undefined;
   clientIdMode: ClientIdMode;
   clientId: string;
+  /** Smart Queue's queue for the internet, as sqm has it (../sqm/model.ts); undefined: none, or no sqm */
+  sqmQueue: Section | undefined;
 }
 
 /**
@@ -140,5 +144,23 @@ export function toChanges(f: InternetForm, before: InternetForm): Change[] {
   } else if (f.ipv6) {
     changes.push({ op: 'add', config: 'network', type: 'interface', name: 'wan6', values: { device: '@wan', proto: 'dhcpv6' } });
   }
+
+  const queue = before.sqmQueue;
+  const to = sqmQueueTo(f, before);
+  if (queue !== undefined && to !== undefined) changes.push({ op: 'set', config: 'sqm', section: queue['.name'], values: queueMove(queue, to) });
   return changes;
+}
+
+/**
+ * Where Smart Queue's queue goes with these changes; undefined: it stays.
+ * It goes with PPPoE: onto the session's own device, where CAKE reads the
+ * packets inside it (on the port it sees only PPPoE frames), and back onto
+ * the port without it. A queue on any other device stays.
+ */
+export function sqmQueueTo(f: InternetForm, before: InternetForm): string | undefined {
+  if (before.sqmQueue === undefined || (f.proto === 'pppoe') === (before.proto === 'pppoe')) return undefined;
+  const on = str(before.sqmQueue, 'interface');
+  if (f.proto !== 'pppoe') return isPppoeDevice(on) ? f.port : undefined;
+  const wasDevice = before.vlan === '' ? before.port : `${before.port}.${before.vlan}`;
+  return on === before.port || on === wasDevice ? pppoeDevice('wan') : undefined;
 }

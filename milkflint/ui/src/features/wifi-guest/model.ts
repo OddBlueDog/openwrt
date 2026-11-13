@@ -374,9 +374,11 @@ export function toChanges(f: NetForm, net: NetData, d: GuestData): Change[] {
                 linklayer: 'none',
                 qdisc_advanced: '1',
                 qdisc_really_really_advanced: '1',
-                // fair per device: by where it comes from on the way in, where it goes on the way out
-                iqdisc_opts: 'dual-srchost',
-                eqdisc_opts: 'dual-dsthost',
+                // fair per device: by where it comes from on the way in, where it goes on the way out.
+                // nonat: sqm gives CAKE nat, which on this side of the router's NAT would
+                // see every guest as the router's own internet address
+                iqdisc_opts: 'nonat dual-srchost',
+                eqdisc_opts: 'nonat dual-dsthost',
               },
             }
           : // one set up in LuCI keeps its own settings

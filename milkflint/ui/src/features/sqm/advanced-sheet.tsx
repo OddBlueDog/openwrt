@@ -28,7 +28,7 @@ import {
   validateAdvanced,
 } from './advanced';
 import { cakeTargetMs, NO_SPLIT_GSO_KBIT, takesWhole } from './gso';
-import { linkPresets } from './model';
+import { linkPresets, presetOverhead } from './model';
 
 type TabId = Direction | 'line' | 'queue';
 const tabs: { id: TabId; label: string; icon: LucideIcon }[] = [
@@ -188,6 +188,7 @@ function SwitchField({
   hint,
   checked,
   changed,
+  error,
   disabled = false,
   onChange,
 }: {
@@ -197,6 +198,7 @@ function SwitchField({
   hint?: ReactNode;
   checked: boolean;
   changed: boolean;
+  error?: string | undefined;
   disabled?: boolean;
   onChange: (on: boolean) => void;
 }): ReactElement {
@@ -208,6 +210,7 @@ function SwitchField({
           <Opt>{opt}</Opt>
           <Changed on={changed} />
         </div>
+        {error !== undefined && <p className="text-xs text-destructive">{error}</p>}
         {hint !== undefined && <p className="text-xs text-muted-foreground">{hint}</p>}
       </div>
       <Switch id={id} className="mt-0.5" checked={checked} disabled={disabled} onCheckedChange={onChange} />
@@ -503,7 +506,10 @@ function DirectionTab({
               opt="autorate-ingress"
               checked={d.autorate}
               changed={ch('autorate')}
-              hint="CAKE measures how fast downloads arrive and shapes to that instead of the speed you set: for lines whose speed changes, such as 4G or 5G."
+              error={errors['down.autorate']}
+              // multi-queue CAKE can't: one set in LuCI can still be turned off
+              disabled={data.useMq && !d.autorate}
+              hint={`CAKE measures how fast downloads arrive and shapes to that instead of the speed you set: for lines whose speed changes, such as 4G or 5G.${data.useMq ? ' Not with multi-queue CAKE, which the download uses now (Multi-queue, on the page).' : ''}`}
               onChange={(v) => {
                 setDir(dir, 'autorate', v);
               }}
@@ -641,8 +647,10 @@ function LineTab({
                 setF((x) => ({
                   ...x,
                   linklayer: p.linklayer,
-                  overhead: p.overhead,
+                  overhead: presetOverhead(p, data.device),
                   mpu: 'mpu' in p ? p.mpu : '',
+                  // the presets are CAKE's own compensation
+                  llam: ['', 'default', 'cake'].includes(x.llam) ? x.llam : '',
                   down: { ...x.down, ptm: 'ptm' in p },
                   up: { ...x.up, ptm: 'ptm' in p },
                 }));
@@ -893,7 +901,7 @@ export function AdvancedSheet({
   const setDir = <K extends keyof DirectionForm>(dir: Direction, key: K, value: DirectionForm[K]): void => {
     setF((x) => ({ ...x, [dir]: { ...x[dir], [key]: value } }));
   };
-  const errors = validateAdvanced(f);
+  const errors = validateAdvanced(f, data);
   const wrong = new Set(Object.keys(errors).map(tabOf));
   const changes = advancedChanges(f, data);
   const options = changes.reduce((n, c) => n + (c.op === 'set' || c.op === 'add' ? Object.keys(c.values).length : c.op === 'unset' ? c.options.length : 1), 0);

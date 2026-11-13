@@ -3,9 +3,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { fromStored, hexToText, textToHex, toStored } from '../src/features/internet/client-id.ts';
-import { type InternetForm, toChanges, validate, wanPort } from '../src/features/internet/model.ts';
-import type { Change } from '../src/lib/api/uci.ts';
-import { section } from './uci-fixture.ts';
+import { type InternetForm, sqmQueueTo, toChanges, validate, wanPort } from '../src/features/internet/model.ts';
+import { sqmData } from '../src/features/sqm/model.ts';
+import type { Change, Section } from '../src/lib/api/uci.ts';
+import { applied, section } from './uci-fixture.ts';
 
 const form = (over: Partial<InternetForm> = {}): InternetForm => ({
   proto: 'dhcp',
@@ -23,6 +24,7 @@ const form = (over: Partial<InternetForm> = {}): InternetForm => ({
   vlanSection: undefined,
   clientIdMode: 'text',
   clientId: '',
+  sqmQueue: undefined,
   ...over,
 });
 
@@ -37,6 +39,11 @@ const wanUnset = (changes: readonly Change[]): string[] => {
   return c.options;
 };
 const wan6 = (changes: readonly Change[]): Change | undefined => changes.find((c) => c.op === 'set' && c.section === 'wan6');
+const sqmChanges = (changes: readonly Change[]): Change[] => changes.filter((c) => c.config === 'sqm');
+
+/** Smart Queue's queue as sqm-scripts ships it (section eth1), with Fibre / Ethernet */
+const fibreQueue = (values: Record<string, string> = {}): Section =>
+  section('queue', 'eth1', { enabled: '1', interface: 'eth1', download: '80000', upload: '20000', linklayer: 'ethernet', overhead: '44', tcMPU: '84', linklayer_advanced: '1', ...values });
 
 test('client ID: text goes out as hex and reads back as text', () => {
   const sky = 'username@skydsl|password';
@@ -191,4 +198,69 @@ test('its checks', () => {
   assert.notEqual(validate(form({ clientIdMode: 'hex', clientId: 'xyz' })).clientId, undefined);
   assert.notEqual(validate(form({ clientId: 'x'.repeat(256) })).clientId, undefined);
   assert.equal(validate(form({ proto: 'pppoe', username: 'u', clientIdMode: 'hex', clientId: 'xyz' })).clientId, undefined, 'only DHCP sends one');
+});
+
+test('to PPPoE: Smart Queue moves onto the session, with Fibre / Ethernet’s overhead there', () => {
+  const q = fibreQueue();
+  const changes = toChanges(form({ proto: 'pppoe', username: 'u', sqmQueue: q }), form({ sqmQueue: q }));
+  assert.deepEqual(sqmChanges(changes), [{ op: 'set', config: 'sqm', section: 'eth1', values: { interface: 'pppoe-wan', overhead: '52' } }]);
+  // the Smart Queue page then has it as Fibre / Ethernet, on the session, with nothing to warn about
+  const sqm = applied({ sqm: [q] }, sqmChanges(changes))['sqm'] ?? [];
+  const data = sqmData({ sqm, firewall: [], milkflint: [], wanDevice: 'pppoe-wan', wanProto: 'pppoe', devices: [] });
+  assert.equal(data.form.device, 'pppoe-wan');
+  assert.equal(data.form.device, data.pppoe);
+  assert.equal(data.form.link, 'ethernet');
+});
+
+test('from PPPoE: back onto the port, with the port’s overhead, under a VLAN too', () => {
+  const q = fibreQueue({ interface: 'pppoe-wan', overhead: '52' });
+  const before = form({ proto: 'pppoe', username: 'u', wan6Device: '@wan', sqmQueue: q });
+  assert.deepEqual(sqmChanges(toChanges(form({ wan6Device: '@wan', sqmQueue: q }), before)), [
+    { op: 'set', config: 'sqm', section: 'eth1', values: { interface: 'eth1', overhead: '44' } },
+  ]);
+  const vlan = form({ proto: 'pppoe', username: 'u', vlan: '911', vlanSection: 'wan_vlan', wan6Device: '@wan', sqmQueue: q });
+  assert.deepEqual(sqmChanges(toChanges({ ...vlan, proto: 'dhcp' }, vlan)), [
+    { op: 'set', config: 'sqm', section: 'eth1', values: { interface: 'eth1', overhead: '44' } },
+  ]);
+});
+
+test('to PPPoE from a VLAN: a queue on the port or on the VLAN goes to the session', () => {
+  for (const on of ['eth1', 'eth1.911']) {
+    const q = fibreQueue({ interface: on });
+    const before = form({ vlan: '911', vlanSection: 'wan_vlan', wan6Device: 'eth1.911', sqmQueue: q });
+    assert.deepEqual(sqmChanges(toChanges({ ...before, proto: 'pppoe', username: 'u' }, before)), [
+      { op: 'set', config: 'sqm', section: 'eth1', values: { interface: 'pppoe-wan', overhead: '52' } },
+    ]);
+  }
+});
+
+test('Smart Queue stays where it is otherwise', () => {
+  const q = fibreQueue();
+  // no PPPoE either side
+  assert.deepEqual(sqmChanges(toChanges(form({ proto: 'static', ipaddr: '203.0.113.2', gateway: '203.0.113.1', staticDns: '1.1.1.1', sqmQueue: q }), form({ sqmQueue: q }))), []);
+  assert.deepEqual(sqmChanges(toChanges(form({ vlan: '911', sqmQueue: q }), form({ sqmQueue: q }))), []);
+  // PPPoE all along
+  const p = form({ proto: 'pppoe', username: 'u', wan6Device: '@wan', sqmQueue: fibreQueue({ interface: 'pppoe-wan', overhead: '52' }) });
+  assert.deepEqual(sqmChanges(toChanges({ ...p, username: 'v' }, p)), []);
+  // a queue put on another device
+  const elsewhere = fibreQueue({ interface: 'lan4' });
+  assert.deepEqual(sqmChanges(toChanges(form({ proto: 'pppoe', username: 'u', sqmQueue: elsewhere }), form({ sqmQueue: elsewhere }))), []);
+  // no queue, or no sqm
+  assert.deepEqual(sqmChanges(toChanges(form({ proto: 'pppoe', username: 'u' }), form())), []);
+});
+
+test('custom link options move as they are', () => {
+  const q = fibreQueue({ overhead: '40', tcMPU: '64' });
+  assert.deepEqual(sqmChanges(toChanges(form({ proto: 'pppoe', username: 'u', sqmQueue: q }), form({ sqmQueue: q }))), [
+    { op: 'set', config: 'sqm', section: 'eth1', values: { interface: 'pppoe-wan' } },
+  ]);
+});
+
+test('where the page says Smart Queue goes, as its changes move it', () => {
+  const q = fibreQueue();
+  assert.equal(sqmQueueTo(form({ proto: 'pppoe', sqmQueue: q }), form({ sqmQueue: q })), 'pppoe-wan');
+  const p = fibreQueue({ interface: 'pppoe-wan', overhead: '52' });
+  assert.equal(sqmQueueTo(form({ sqmQueue: p }), form({ proto: 'pppoe', sqmQueue: p })), 'eth1');
+  assert.equal(sqmQueueTo(form({ proto: 'static', sqmQueue: q }), form({ sqmQueue: q })), undefined);
+  assert.equal(sqmQueueTo(form({ proto: 'pppoe' }), form()), undefined, 'no queue');
 });

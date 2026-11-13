@@ -31,10 +31,14 @@ import { advancedData } from './advanced';
 import { AdvancedSheet } from './advanced-sheet';
 import {
   type LatencyTarget,
+  type LinkGap,
   type LinkPreset,
+  isPppoeDevice,
   latencyTargets,
   linkPresets,
+  presetOverhead,
   type SqmData,
+  type SqmErrors,
   type SqmForm,
   sqmData,
   toChanges,
@@ -42,6 +46,7 @@ import {
   validate,
 } from './model';
 import { MULTI_QUEUE_KBIT, type MultiQueue, usesMultiQueue } from './multi-queue';
+import { shapingProblems } from './running';
 
 async function loadSqm(): Promise<SqmData> {
   const [sqm, firewall, interfaces, devices, milkflint] = await Promise.all([
@@ -52,7 +57,41 @@ async function loadSqm(): Promise<SqmData> {
     getConfig('milkflint').catch(() => undefined),
   ]);
   const wan = interfaces.find((i) => i.interface === 'wan');
-  return sqmData({ sqm, firewall, milkflint, wanDevice: wan?.l3_device ?? wan?.device, devices: Object.keys(devices) });
+  return sqmData({ sqm, firewall, milkflint, wanDevice: wan?.l3_device ?? wan?.device, wanProto: wan?.proto, devices: Object.keys(devices) });
+}
+
+/** What the Connection type's choice has instead, when it's near a preset (./model.ts), for a queue on this device */
+function gapText(gap: LinkGap, device: string): string {
+  switch (gap) {
+    case 'mpu':
+      return 'no smallest packet size';
+    case 'ptm':
+      return 'no PTM';
+    case 'overhead':
+      return isPppoeDevice(device) ? 'the internet port’s overhead, short on a PPPoE session' : 'a PPPoE session’s overhead';
+    case 'mechanism':
+      return 'tc’s size table instead of CAKE’s own (in LuCI)';
+  }
+}
+
+/** a problem once it has lasted this long: a save restarts Smart Queue, which takes a few seconds */
+const SETTLE_MS = 10_000;
+
+/** value once it has stayed the same for ms; undefined until then */
+function useLasting(value: string | undefined, ms: number): string | undefined {
+  const [lasting, setLasting] = useState<string>();
+  useEffect(() => {
+    const t = window.setTimeout(
+      () => {
+        setLasting(value);
+      },
+      value === undefined ? 0 : ms,
+    );
+    return () => {
+      window.clearTimeout(t);
+    };
+  }, [value, ms]);
+  return value === lasting ? value : undefined;
 }
 
 const tinNames: Record<string, string[]> = {
@@ -235,7 +274,7 @@ function useLive(): { data: Live | undefined; error: unknown } {
   return { data: { directions, net: data }, error };
 }
 
-function LiveStatus({ live }: { live: { data: Live | undefined; error: unknown } }): ReactElement {
+function LiveStatus({ live, problems }: { live: { data: Live | undefined; error: unknown }; problems: string[] }): ReactElement {
   const { data, error } = live;
   const directions = data?.directions ?? [];
   return (
@@ -245,14 +284,36 @@ function LiveStatus({ live }: { live: { data: Live | undefined; error: unknown }
         title="Live"
         description="CAKE's own statistics, every 2 s"
         action={
-          <Badge variant={directions.length > 0 ? 'success' : 'secondary'}>{directions.length > 0 ? 'Shaping' : 'Not running'}</Badge>
+          problems.length > 0 ? (
+            <Badge variant="destructive">Not as saved</Badge>
+          ) : (
+            <Badge variant={directions.length > 0 ? 'success' : 'secondary'}>{directions.length > 0 ? 'Shaping' : 'Not running'}</Badge>
+          )
         }
       />
       <CardContent className="flex flex-col gap-3">
         {error !== undefined && data === undefined && (
           <p className="text-sm text-muted-foreground">Statistics aren&apos;t available on this router.</p>
         )}
-        {directions.length === 0 && data !== undefined && (
+        {problems.length > 0 && (
+          <Alert variant="destructive">
+            <TriangleAlertIcon />
+            <AlertTitle>Smart Queue isn&apos;t running as saved</AlertTitle>
+            <AlertDescription>
+              {problems.map((p) => (
+                <span key={p}>{p}</span>
+              ))}
+              <span>
+                sqm-scripts may have failed to start CAKE with these settings: the{' '}
+                <a href="#/logs" className="font-medium text-foreground underline underline-offset-2">
+                  Logs
+                </a>{' '}
+                have its messages.
+              </span>
+            </AlertDescription>
+          </Alert>
+        )}
+        {directions.length === 0 && data !== undefined && problems.length === 0 && (
           <p className="text-sm text-muted-foreground">
             No CAKE queue is installed. Turn Smart Queue on and save to start shaping.
           </p>
@@ -330,7 +391,10 @@ export function SqmPage(): ReactElement {
   const [advanced, setAdvanced] = useState(false);
   const live = useLive();
   const form = edit ?? data?.form;
-  const errors = form === undefined ? {} : validate(form);
+  const errors: SqmErrors = form === undefined || data === undefined ? {} : validate(form, data);
+  // what tc runs against what's saved, once it has lasted past a restart
+  const running = live.data === undefined || data === undefined ? [] : shapingProblems(data.queue, live.data.net.qdiscs);
+  const problems = useLasting(running.length === 0 ? undefined : running.join('\n'), SETTLE_MS)?.split('\n') ?? [];
   // Functional update: several edits in one render can't overwrite each other.
   const set = <K extends keyof SqmForm>(key: K, value: SqmForm[K]): void => {
     setEdit((current) => {
@@ -430,6 +494,27 @@ export function SqmPage(): ReactElement {
                 </AlertDescription>
               </Alert>
             )}
+            {form.enabled && data.pppoe !== undefined && form.device !== data.pppoe && (
+              <Alert variant="warning">
+                <TriangleAlertIcon />
+                <AlertTitle>Smart Queue shapes the port under PPPoE</AlertTitle>
+                <AlertDescription>
+                  Your internet connection is PPPoE, but Smart Queue shapes {form.device}, where CAKE sees only PPPoE frames and can&apos;t
+                  read the packets inside them: Fair share per device, ECN marks, the upload ACK filter and priorities don&apos;t work there.
+                  The session&apos;s own device, {data.pppoe}, carries the same traffic as plain IP packets.
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="mt-2"
+                    onClick={() => {
+                      if (data.pppoe !== undefined) set('device', data.pppoe);
+                    }}
+                  >
+                    Shape {data.pppoe} instead
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            )}
             <div className="grid items-start gap-4 xl:grid-cols-[1fr_28rem]">
               <Card>
                 <CardHeader className="items-center">
@@ -505,9 +590,11 @@ export function SqmPage(): ReactElement {
                     id="mode"
                     label="Mode"
                     hint={
-                      form.prioritise
-                        ? 'Calls and games go ahead of downloads and backups (CAKE diffserv tins).'
-                        : 'One fair queue for everything. Best for most homes.'
+                      !form.prioritise
+                        ? 'One fair queue for everything. Best for most homes.'
+                        : form.restoreDscp || data.squash.squash_ingress === '0'
+                          ? 'Calls and games go ahead of downloads and backups, both ways (CAKE diffserv tins).'
+                          : 'Calls and games go ahead of other uploads (CAKE diffserv tins). Downloads arrive with your provider’s marks, which mean nothing here: they get tins with Keep devices’ priorities on downloads.'
                     }
                   >
                     <Select
@@ -525,7 +612,28 @@ export function SqmPage(): ReactElement {
                       </SelectContent>
                     </Select>
                   </Field>
-                  <Field id="link" label="Connection type" hint="So shaping accounts for each packet's overhead on your line.">
+                  <Field
+                    id="link"
+                    label="Connection type"
+                    hint={
+                      <>
+                        So shaping accounts for each packet&apos;s overhead on your line.
+                        {form.link === 'none' && (
+                          <span className="mt-1 block text-warning">
+                            No compensation counts every packet as smaller than the line carries it, small ones such as acknowledgements
+                            most of all, so the queue builds up in your modem instead. Choose your connection type: Fibre / Ethernet if
+                            you&apos;re not sure.
+                          </span>
+                        )}
+                        {form.link === 'custom' && data.form.link === 'custom' && data.linkNear !== undefined && (
+                          <span className="mt-1 block text-warning">
+                            {linkPresets[data.linkNear.preset].label} with {data.linkNear.gaps.map((g) => gapText(g, data.form.device)).join(', ')}: choose{' '}
+                            {linkPresets[data.linkNear.preset].label} again to set it as this page does.
+                          </span>
+                        )}
+                      </>
+                    }
+                  >
                     <Select
                       value={form.link}
                       onValueChange={(v) => {
@@ -538,11 +646,14 @@ export function SqmPage(): ReactElement {
                       <SelectContent>
                         {Object.entries(linkPresets).map(([key, p]) => (
                           <SelectItem key={key} value={key}>
-                            {p.label}
-                            {p.linklayer !== 'none' && ` · ${p.overhead} bytes`}
+                            {p.linklayer === 'none' ? `${p.label} (not recommended)` : `${p.label} · ${presetOverhead(p, form.device)} bytes`}
                           </SelectItem>
                         ))}
-                        {form.link === 'custom' && <SelectItem value="custom">Custom: see Advanced</SelectItem>}
+                        {form.link === 'custom' && (
+                          <SelectItem value="custom">
+                            {data.linkNear === undefined ? 'Custom: see Advanced' : `Custom: near ${linkPresets[data.linkNear.preset].label}`}
+                          </SelectItem>
+                        )}
                       </SelectContent>
                     </Select>
                   </Field>
@@ -639,6 +750,12 @@ export function SqmPage(): ReactElement {
                         way back from the internet. This puts each connection’s mark back on its downloads, so Wi-Fi sends a
                         call’s ahead of other traffic and a backup’s behind it
                         {form.prioritise ? ', and Prioritise by traffic type applies to downloads as well' : ''}.
+                        {!form.restoreDscp && data.squash.squash_dscp === '0' && (
+                          <span className="mt-1 block">
+                            Downloads keep your provider&apos;s marks now (set in LuCI). This needs CAKE to clear them, so they&apos;re
+                            cleared, and stay so if you turn it off again.
+                          </span>
+                        )}
                         {!form.enabled && <span className="mt-1 block">Needs Smart Queue on.</span>}
                       </>
                     }
@@ -655,6 +772,7 @@ export function SqmPage(): ReactElement {
                   <Field
                     id="multiQueue"
                     label="Multi-queue"
+                    error={errors.multiQueue}
                     hint={
                       <>
                         Splits CAKE into one queue per network-card queue, sharing your speeds by what each needs, so more than one CPU can
@@ -688,7 +806,15 @@ export function SqmPage(): ReactElement {
                       </SelectContent>
                     </Select>
                   </Field>
-                  <Field id="device" label="Interface" hint="Where to shape: your internet (WAN) port.">
+                  <Field
+                    id="device"
+                    label="Interface"
+                    hint={
+                      data.pppoe === undefined
+                        ? 'Where to shape: your internet (WAN) port.'
+                        : `Where to shape: with PPPoE, the session’s own device (${data.pppoe}), where CAKE reads the packets inside it.`
+                    }
+                  >
                     <Select
                       value={form.device}
                       onValueChange={(v) => {
@@ -699,7 +825,8 @@ export function SqmPage(): ReactElement {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
-                        {[...new Set([form.device, ...data.devices])].map((d) => (
+                        {/* the WAN's device even while a PPPoE session's is down */}
+                        {[...new Set([form.device, ...(data.wanDevice === undefined ? [] : [data.wanDevice]), ...data.devices])].map((d) => (
                           <SelectItem key={d} value={d}>
                             {d}
                             {d === data.wanDevice && ' (WAN)'}
@@ -711,7 +838,7 @@ export function SqmPage(): ReactElement {
                 </CardContent>
               </Card>
               <div className="flex flex-col gap-4">
-                <LiveStatus live={live} />
+                <LiveStatus live={live} problems={problems} />
                 <Processors live={live} />
               </div>
             </div>

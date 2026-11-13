@@ -24,6 +24,7 @@ import { useLoad } from '@/hooks/use-load';
 import { intToIp, ipToInt, prefixLength } from '@/lib/api/network';
 import { bool, type Change, getConfig, str } from '@/lib/api/uci';
 import { href } from '@/lib/router';
+import { routerUrl } from '@/lib/router-url';
 
 const prefixes = ['24', '23', '22', '16'] as const;
 const leaseTimes = [
@@ -202,7 +203,7 @@ export function LanPage(): ReactElement {
                       <TriangleAlertIcon />
                       <AlertTitle>This moves the router</AlertTitle>
                       <AlertDescription>
-                        Afterwards it answers at http://{form.ipaddr}/, and devices need to reconnect.
+                        Afterwards it answers at {routerUrl(form.ipaddr)}, and devices need to reconnect.
                       </AlertDescription>
                     </Alert>
                   </div>
@@ -324,7 +325,7 @@ export function LanPage(): ReactElement {
               onClick={() => {
                 setConfirmMove(false);
                 if (form !== undefined && data !== undefined) {
-                  void applyAndMove(toChanges(form, data), `http://${form.ipaddr}/`);
+                  void applyAndMove(toChanges(form, data), routerUrl(form.ipaddr));
                 }
               }}
             >

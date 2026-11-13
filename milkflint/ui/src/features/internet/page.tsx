@@ -18,11 +18,12 @@ import { getInterfaces, ipv4 } from '@/lib/api/network';
 import { bool, getConfig, list, str } from '@/lib/api/uci';
 import { formatDuration } from '@/lib/format';
 import { cn } from '@/lib/utils';
+import { internetQueue } from '../sqm/model';
 import { type ClientIdMode, hexToText, textToHex } from './client-id';
-import { clientIdForm, type InternetForm, toChanges, validate, wanPort } from './model';
+import { clientIdForm, type InternetForm, sqmQueueTo, toChanges, validate, wanPort } from './model';
 
 async function loadInternet(): Promise<InternetForm> {
-  const sections = await getConfig('network');
+  const [sections, sqm] = await Promise.all([getConfig('network'), getConfig('sqm').catch(() => undefined)]);
   const wan = sections.find((s) => s['.name'] === 'wan');
   const wan6 = sections.find((s) => s['.name'] === 'wan6');
   const dns = list(wan, 'dns');
@@ -40,6 +41,7 @@ async function loadInternet(): Promise<InternetForm> {
     wan6Device: str(wan6, 'device') ?? device,
     ...wanPort(sections, device),
     ...clientIdForm(str(wan, 'clientid') ?? ''),
+    sqmQueue: internetQueue(sqm),
   };
 }
 
@@ -122,6 +124,8 @@ export function InternetPage(): ReactElement {
   const { state, apply } = useApply(onApplied);
   const form = edit ?? data;
   const errors = form === undefined ? {} : validate(form);
+  // Smart Queue's queue going to or from PPPoE's session with the change
+  const queueTo = form === undefined || data === undefined ? undefined : sqmQueueTo(form, data);
   // Functional update: several edits in one render can't overwrite each other.
   const set = <K extends keyof InternetForm>(key: K, value: InternetForm[K]): void => {
     setEdit((current) => {
@@ -162,7 +166,11 @@ export function InternetPage(): ReactElement {
                 </div>
               </CardHeader>
               <CardContent className="divide-y">
-                <Field id="proto" label="Connection type">
+                <Field
+                  id="proto"
+                  label="Connection type"
+                  hint={queueTo === undefined ? undefined : `Smart Queue moves to ${queueTo} with it, where CAKE can read your traffic.`}
+                >
                   <Select
                     value={form.proto}
                     onValueChange={(v) => {
