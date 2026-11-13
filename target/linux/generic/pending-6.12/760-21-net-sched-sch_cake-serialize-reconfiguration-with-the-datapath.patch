@@ -1,0 +1,170 @@
+From d23a16d907dc991614eb301830bff8e5b713fb56 Mon Sep 17 00:00:00 2001
+From: Jamal Hadi Salim <jhs@mojatatu.com>
+Date: Tue, 20 Oct 2026 07:00:05 -0400
+Subject: [PATCH] net/sched/sch_cake: serialize reconfiguration with the
+ datapath
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This is a follow-up to commit 7cbfb180945c ("net/sched: sch_cake: fix
+autorate reconfiguration throttling").  That change only stored
+last_reconfig_time; it did not address the concurrency between the
+autorate rate update in cake_enqueue() and the netlink reconfiguration
+path, which the original review flagged.
+
+The issue:
+cake_change() -> cake_config_change() updates the fields of the shared
+struct cake_sched_config under RTNL but not under the qdisc lock: it only
+took sch_tree_lock() later, around cake_reconfigure().  The datapath in
+turn serializes cake_enqueue() with itself under the qdisc lock, and its
+autorate-ingress path stores the estimated rate into
+q->config->rate_bps.  Two writers therefore update the same rate with no
+common lock:
+
+  CPU0: cake_enqueue() sees CAKE_FLAG_AUTORATE_INGRESS, computes an
+        estimate, and is about to store it.
+  CPU1: 'tc qdisc change ... bandwidth X' clears autorate in its local
+        rate_flags, writes rate_bps = X, publishes the cleared flag, and
+        waits in sch_tree_lock().
+  CPU0: stores the estimate, calls cake_reconfigure(), and unlocks.
+  CPU1: reconfigures from the estimate and returns.
+
+The qdisc is left with autorate disabled but with the estimate installed
+instead of X.
+
+The fix:
+Commit the parsed configuration and reconfigure while holding the same
+qdisc lock that serializes the datapath, so the netlink writer and the
+autorate writer can no longer interleave.  rate_bps needs no atomic: it is
+only ever loaded and stored, so plain READ_ONCE()/WRITE_ONCE() annotations
+are enough for the accesses that run outside the lock.  The lockless
+paths read the rate once into a local and reuse that value, so a single
+coherent snapshot is used per operation.
+
+The annotations do not make a 64-bit access single-copy atomic on 32-bit:
+READ_ONCE()/WRITE_ONCE() are still two 32-bit accesses there.  The lockless
+readers -- cake_config_dump() and the cake_mq children, which observe the
+shared config under a different child's lock -- can therefore still see a
+torn rate on 32-bit.  That rate is an advisory shaper value and is accepted
+as best-effort; the state that must be consistent (the configured rate and
+the autorate flag) is written under the qdisc lock.
+
+Conditions to recreate the bug:
+The lost update (a) needs no sanitizer. Put cake in autorate-ingress on a
+device, drive bursty traffic with gaps so the 250 ms autorate reconfiguration
+fires, and concurrently loop 'tc qdisc change ... cake bandwidth <N>kbit'
+without autorate-ingress (specifying a bandwidth clears the flag).
+If the autorate store lands after the change wrote its rate but before the
+change reconfigures, the qdisc ends up with autorate disabled and the estimate
+installed instead of <N>; reading the rate back then shows the estimate, which
+an unfixed kernel can do and a fixed one cannot.
+(b) The unsynchronized access is reported by KCSAN: build with CONFIG_KCSAN=y
+and run the same trigger with the change loop keeping autorate-ingress set;
+KCSAN reports a data race in cake_config_change / cake_enqueue.
+The non-atomic 64-bit store only shows up as tearing on a 32-bit machine;
+on 64-bit the store is atomic and KCSAN flags the access discipline instead.
+
+Reported-by: Sashiko (gemini) <sashiko-bot@kernel.org>
+Link: https://sashiko.dev/#/patchset/20260816012109.2865223-1-ooonea@gmail.com
+Link: https://lore.kernel.org/netdev/20260816012109.2865223-1-ooonea@gmail.com/
+Link: https://lore.kernel.org/netdev/875wzctsky.fsf@toke.dk/
+Link: https://lore.kernel.org/netdev/87ld7t3kl3.fsf@all.your.base.are.belong.to.us/
+Reviewed-by: Victor Nogueira <victor@mojatatu.com>
+Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Acked-by: Toke Høiland-Jørgensen <toke@toke.dk>
+Link: https://patch.msgid.link/QDISC-5RTM.v3.r0.20261020053711-1@mojatatu.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[MilkFlint: on 760-08's cake_mq, whose resync reads the rate once
+ for its share and the share's bounds; cake_reconfigure() also takes
+ synced_rate from the rate it read. The overhead statistics stay plain
+ writes, as upstream's data-race annotations aren't here.]
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2568,7 +2568,8 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			if (ktime_after(now,
+ 					ktime_add_ms(q->last_reconfig_time,
+ 						     250))) {
+-				q->config->rate_bps = (q->avg_peak_bandwidth * 15) >> 4;
++				WRITE_ONCE(q->config->rate_bps,
++					   (q->avg_peak_bandwidth * 15) >> 4);
+ 				q->last_reconfig_time = now;
+ 				cake_reconfigure(sch);
+ 			}
+@@ -2835,16 +2836,15 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ 
+ 	if (q->config->is_shared && q->rate_ns &&
+ 	    now - q->last_checked_active >= q->config->sync_time) {
++		u64 rate = READ_ONCE(q->config->rate_bps);
+ 		struct cake_mq_peers peers;
+ 		u64 new_rate;
+ 
+ 		cake_mq_publish(q, now);
+ 		cake_mq_read_peers(sch, q, now, &peers);
+-		new_rate = cake_mq_share(q->config->rate_bps, q->mq_weight,
+-					 q->mq_sparse, &peers);
++		new_rate = cake_mq_share(rate, q->mq_weight, q->mq_sparse, &peers);
+ 
+-		if (cake_mq_share_moved(new_rate, q->synced_rate,
+-					q->config->rate_bps)) {
++		if (cake_mq_share_moved(new_rate, q->synced_rate, rate)) {
+ 			q->time_next_packet =
+ 				cake_mq_rescale_wait(q->time_next_packet, now,
+ 						     q->synced_rate, new_rate);
+@@ -3434,14 +3434,15 @@ static void cake_reconfigure(struct Qdisc *sch)
+ {
+ 	struct cake_sched_data *qd = qdisc_priv(sch);
+ 	struct cake_sched_config *q = qd->config;
++	u64 rate_bps = READ_ONCE(q->rate_bps);
+ 
+-	cake_configure_rates(sch, qd->config->rate_bps, false);
+-	qd->synced_rate = qd->config->rate_bps;
++	cake_configure_rates(sch, rate_bps, false);
++	qd->synced_rate = rate_bps;
+ 
+ 	if (q->buffer_config_limit) {
+ 		qd->buffer_limit = q->buffer_config_limit;
+-	} else if (q->rate_bps) {
+-		u64 t = q->rate_bps * q->interval;
++	} else if (rate_bps) {
++		u64 t = rate_bps * q->interval;
+ 
+ 		do_div(t, USEC_PER_SEC / 4);
+ 		qd->buffer_limit = max_t(u32, t, 4U << 20);
+@@ -3593,9 +3594,16 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	/* Once the qdisc is live, commit and reconfigure under the lock that
++	 * serializes the datapath, so a concurrent 'tc qdisc change' and the
++	 * autorate update cannot lose the configured rate.
++	 */
++	if (qd->tins)
++		sch_tree_lock(sch);
++
+ 	ret = cake_config_change(q, opt, extack, &overhead_changed);
+ 	if (ret)
+-		return ret;
++		goto unlock;
+ 
+ 	if (overhead_changed) {
+ 		qd->max_netlen = 0;
+@@ -3604,13 +3612,13 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
+ 		qd->min_adjlen = ~0;
+ 	}
+ 
+-	if (qd->tins) {
+-		sch_tree_lock(sch);
++	if (qd->tins)
+ 		cake_reconfigure(sch);
++unlock:
++	if (qd->tins)
+ 		sch_tree_unlock(sch);
+-	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void cake_destroy(struct Qdisc *sch)

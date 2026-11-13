@@ -1,0 +1,441 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 13 Nov 2026 18:00:00 +0000
+Subject: [PATCH] net/sched: sch_cake: KUnit tests for 760-20 to 760-23
+
+Each of the four upstream fixes before this one gets a case, run on a
+cake set up as cake_init() leaves one (cake_test_cake_live()):
+
+- autorate-ingress puts its estimate into the rate once in 250 ms,
+  however many it makes in between (760-20);
+- tc qdisc change: one whose options are refused changes nothing and
+  leaves the qdisc's lock free; and one run on another CPU while this one
+  holds the lock and stores an estimate, as autorate-ingress does from
+  cake_enqueue(), writes nothing until it has the lock, so its own rate is
+  the one in force at the end. Before 760-21 it wrote its rate first, and
+  then put the estimate in force (760-21);
+- under a classful parent, a change from diffserv8 to besteffort with
+  packets queued in four tins: the three tins' packets come off the
+  parent's counts too (760-22);
+- a TCP GSO packet through a VXLAN tunnel counts every header of each
+  segment, those inside the tunnel too (760-23).
+
+---
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -6,10 +6,14 @@
+  * CONFIG_NET_SCH_CAKE_KUNIT_TEST is set; the suite runs when it loads.
+  */
+ #include <kunit/test.h>
++#include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ipv6.h>
++#include <linux/kthread.h>
+ #include <linux/prandom.h>
+ #include <net/net_namespace.h>
++#include <net/rtnetlink.h>
+ 
+ static void cake_test_kvfree(void *p)
+ {
+@@ -2508,6 +2512,389 @@ static void cake_test_ecn_decays_back(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, cake_test_ecn_run(&e, skb, INET_ECN_ECT_0, 20 * NSEC_PER_MSEC, 1), 1);
+ }
+ 
++/* Sub-cake @i of @mq's device as a cake of its own, as cake_init() leaves
++ * one: its own config at @rate bytes/s in @tin_mode, every tin and flow set
++ * up, its lock and watchdogs ready (the watchdogs cancelled with the test)
++ */
++static struct cake_sched_data *cake_test_cake_live(struct kunit *test, struct cake_test_mq *mq,
++						   int i, u64 rate, u8 tin_mode)
++{
++	struct Qdisc *sch = mq->sch[i];
++	struct cake_sched_data *q = qdisc_priv(sch);
++	int t, j;
++
++	cake_config_init(&q->initial_config, false);
++	q->config = &q->initial_config;
++	q->config->rate_bps = rate;
++	q->config->tin_mode = tin_mode;
++	spin_lock_init(qdisc_lock(sch));
++	sch->limit = 10240;
++	q->tins = cake_test_alloc(test, CAKE_MAX_TINS * sizeof(*q->tins));
++	for (t = 0; t < CAKE_MAX_TINS; t++) {
++		struct cake_tin_data *b = &q->tins[t];
++
++		INIT_LIST_HEAD(&b->new_flows);
++		INIT_LIST_HEAD(&b->old_flows);
++		INIT_LIST_HEAD(&b->decaying_flows);
++		for (j = 0; j < CAKE_QUEUES; j++) {
++			u32 k = j * CAKE_MAX_TINS + t;
++
++			INIT_LIST_HEAD(&b->flows[j].flowchain);
++			cobalt_vars_init(&b->flows[j].cvars);
++			q->overflow_heap[k].t = t;
++			q->overflow_heap[k].b = j;
++			b->overflow_idx[j] = k;
++		}
++	}
++	qdisc_watchdog_init(&q->watchdog, sch);
++	qdisc_watchdog_init(&q->mq_watchdog, sch);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_cancel_watchdogs, q));
++	cake_reconfigure(sch);
++	q->min_netlen = ~0;
++	q->min_adjlen = ~0;
++	return q;
++}
++
++/* autorate-ingress puts its estimate of the line's capacity into the rate
++ * at most every 250 ms. It makes one after each gap in the traffic, and
++ * checked when it last put one in but never noted it, so every estimate
++ * went in, each a whole reconfiguration in cake_enqueue() (upstream
++ * 7cbfb180945c).
++ */
++static void cake_test_autorate_throttled(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 12500000,
++							CAKE_DIFFSERV_BESTEFFORT);
++	const u64 marker = 1;	/* a rate no estimate gives */
++	struct sk_buff *skb[5];
++	bool through[5];
++	u64 rate[5];
++	int i;
++
++	for (i = 0; i < 5; i++)
++		skb[i] = cake_test_skb(test, false, IPPROTO_UDP, 5, 41000, 0);
++	q->config->rate_flags |= CAKE_FLAG_AUTORATE_INGRESS;
++	rcu_read_lock_bh();
++	for (i = 0; i < 5; i++) {
++		ktime_t now = ktime_get();
++
++		/* the last estimate 300 ms ago before the first packet and the
++		 * last one; the three in between come within 250 ms of the first
++		 */
++		if (i == 0 || i == 4)
++			q->last_reconfig_time = ktime_sub_ms(now, 300);
++		/* a gap longer than the average between packets: an estimate,
++		 * here 1 Gbit/s
++		 */
++		q->avg_packet_interval = 0;
++		q->last_packet_time = ktime_sub_us(now, 100);
++		q->avg_window_begin = ktime_sub_ms(now, 1);
++		q->avg_window_bytes = 125000;
++		q->time_next_packet = 0;
++		q->failsafe_next_packet = 0;
++		q->config->rate_bps = marker;
++		through[i] = cake_test_through(mq->sch[0], skb[i]);
++		rate[i] = q->config->rate_bps;
++	}
++	rcu_read_unlock_bh();
++
++	for (i = 0; i < 5; i++) {
++		KUNIT_EXPECT_TRUE_MSG(test, through[i], "packet %d", i);
++		if (i == 0 || i == 4)
++			KUNIT_EXPECT_NE_MSG(test, rate[i], marker, "packet %d: no estimate taken", i);
++		else
++			KUNIT_EXPECT_EQ_MSG(test, rate[i], marker,
++					    "packet %d: an estimate within 250 ms of the last", i);
++	}
++}
++
++#define CAKE_TEST_UNSET	U32_MAX
++
++/* tc's options for cake_change(): TCA_OPTIONS with the rate, given as a
++ * u64, or as a u32 when @bad (the policy refuses that), and the diffserv
++ * mode unless CAKE_TEST_UNSET
++ */
++static struct nlattr *cake_test_opts(struct kunit *test, u64 rate, u32 diffserv, bool bad)
++{
++	struct sk_buff *msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	struct nlattr *opts;
++
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_free_skb, msg));
++	opts = nla_nest_start_noflag(msg, TCA_OPTIONS);
++	KUNIT_ASSERT_NOT_NULL(test, opts);
++	if (bad)
++		KUNIT_ASSERT_EQ(test, 0, nla_put_u32(msg, TCA_CAKE_BASE_RATE64, rate));
++	else
++		KUNIT_ASSERT_EQ(test, 0, nla_put_u64_64bit(msg, TCA_CAKE_BASE_RATE64, rate,
++							   TCA_CAKE_PAD));
++	if (diffserv != CAKE_TEST_UNSET)
++		KUNIT_ASSERT_EQ(test, 0, nla_put_u32(msg, TCA_CAKE_DIFFSERV_MODE, diffserv));
++	nla_nest_end(msg, opts);
++	return opts;
++}
++
++/* A change refused by its options changes nothing and leaves the qdisc's
++ * lock free; one accepted puts the rate in force, the tins' with it
++ */
++static void cake_test_change_refused(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 12500000,
++							CAKE_DIFFSERV_BESTEFFORT);
++	struct Qdisc *sch = mq->sch[0];
++	int ret;
++
++	rtnl_lock();
++	ret = cake_change(sch, cake_test_opts(test, 25000000, CAKE_TEST_UNSET, true), NULL);
++	rtnl_unlock();
++	KUNIT_EXPECT_LT(test, ret, 0);
++	KUNIT_EXPECT_FALSE(test, spin_is_locked(qdisc_lock(sch)));
++	KUNIT_EXPECT_EQ(test, q->config->rate_bps, 12500000);
++	KUNIT_EXPECT_EQ(test, q->tins[0].tin_rate_bps, 12500000);
++
++	rtnl_lock();
++	ret = cake_change(sch, cake_test_opts(test, 25000000, CAKE_TEST_UNSET, false), NULL);
++	rtnl_unlock();
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_FALSE(test, spin_is_locked(qdisc_lock(sch)));
++	KUNIT_EXPECT_EQ(test, q->config->rate_bps, 25000000);
++	KUNIT_EXPECT_EQ(test, q->tins[0].tin_rate_bps, 25000000);
++}
++
++struct cake_test_change_ctx {
++	struct Qdisc *sch;
++	struct nlattr *opts;
++	struct completion done;
++	int ret;
++};
++
++/* tc qdisc change, as rtnetlink calls it */
++static int cake_test_change_thread(void *data)
++{
++	struct cake_test_change_ctx *c = data;
++
++	rtnl_lock();
++	c->ret = cake_change(c->sch, c->opts, NULL);
++	rtnl_unlock();
++	complete(&c->done);
++	return 0;
++}
++
++/* 'tc qdisc change' against autorate-ingress, which writes the rate from
++ * cake_enqueue(), under the qdisc's lock. The change wrote its rate before
++ * it took that lock, so an estimate stored in between was what it then put
++ * in force, the rate it was given lost (upstream d23a16d907dc). Here the
++ * change runs on another CPU while this one holds the lock and stores an
++ * estimate, as the datapath does: the change must wait for the lock before
++ * it writes anything, and its rate is the one in force at the end.
++ */
++static void cake_test_change_vs_autorate(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 12500000,
++							CAKE_DIFFSERV_BESTEFFORT);
++	struct cake_test_change_ctx *c = cake_test_alloc(test, sizeof(*c));
++	struct task_struct *task;
++	u64 during;
++
++	if (num_online_cpus() < 2)
++		kunit_skip(test, "needs a second CPU for the change");
++
++	q->config->rate_flags |= CAKE_FLAG_AUTORATE_INGRESS;
++	c->sch = mq->sch[0];
++	c->opts = cake_test_opts(test, 25000000, CAKE_TEST_UNSET, false);
++	init_completion(&c->done);
++	task = kthread_create(cake_test_change_thread, c, "cake_test_change");
++	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
++
++	spin_lock_bh(qdisc_lock(mq->sch[0]));
++	wake_up_process(task);
++	/* long enough for the change to reach the lock on another CPU */
++	mdelay(50);
++	during = READ_ONCE(q->config->rate_bps);
++	/* an estimate going in, as cake_enqueue() puts one */
++	WRITE_ONCE(q->config->rate_bps, 5000000);
++	q->last_reconfig_time = ktime_get();
++	cake_reconfigure(mq->sch[0]);
++	spin_unlock_bh(qdisc_lock(mq->sch[0]));
++	wait_for_completion(&c->done);
++
++	KUNIT_EXPECT_EQ(test, c->ret, 0);
++	KUNIT_EXPECT_EQ_MSG(test, during, 12500000, "the change wrote the rate outside the lock");
++	KUNIT_EXPECT_EQ(test, q->config->rate_bps, 25000000);
++	KUNIT_EXPECT_EQ(test, q->tins[0].tin_rate_bps, 25000000);
++}
++
++/* A classful parent's class over a CAKE (HTB's, say): what the qdisc
++ * core needs of one to take a leaf's drops off its counts
++ */
++static const struct Qdisc_class_ops cake_test_parent_class_ops = {};
++static struct Qdisc_ops cake_test_parent_ops = {
++	.id	= "cake_test_parent",
++	.cl_ops	= &cake_test_parent_class_ops,
++};
++
++static void cake_test_noop_root(void *dev)
++{
++	rcu_assign_pointer(((struct net_device *)dev)->qdisc, &noop_qdisc);
++}
++
++/* @skb into @sch, which owns it from here */
++static int cake_test_enqueue(struct Qdisc *sch, struct sk_buff *skb)
++{
++	struct sk_buff *to_free = NULL;
++	int ret;
++
++	qdisc_skb_cb(skb)->pkt_len = skb->len;
++	ret = cake_enqueue(skb, sch, &to_free);
++	if (to_free)
++		kfree_skb_list(to_free);
++	return ret;
++}
++
++static void cake_test_reset(void *sch)
++{
++	cake_reset(sch);
++}
++
++/* CAKE under a classful parent: a change to fewer tins drops the packets
++ * queued in the others, and they come off the parent's counts too, as
++ * every other drop does (upstream d7010be1ba23). Here diffserv8 with two
++ * packets in each of four tins, changed to besteffort: tin 0's two stay.
++ */
++static void cake_test_clear_tin_parent(struct kunit *test)
++{
++	static const u8 tins[] = { 0, 2, 5, 7 };
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 12500000,
++							CAKE_DIFFSERV_DIFFSERV8);
++	struct Qdisc *parent = cake_test_alloc(test, sizeof(*parent));
++	struct Qdisc *sch = mq->sch[0];
++	struct sk_buff *skb[8];
++	u32 tin0_backlog = 0;
++	int i, ret[8];
++
++	parent->handle = TC_H_MAKE(1 << 16, 0);
++	parent->parent = TC_H_ROOT;
++	parent->ops = &cake_test_parent_ops;
++	parent->dev_queue = netdev_get_tx_queue(mq->dev, 0);
++	rcu_assign_pointer(mq->dev->qdisc, parent);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_noop_root, mq->dev));
++	sch->handle = TC_H_MAKE(2 << 16, 0);
++	sch->parent = TC_H_MAKE(1 << 16, 1);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
++
++	for (i = 0; i < 8; i++) {
++		skb[i] = cake_test_skb(test, false, IPPROTO_UDP, 5, 41000 + i, 0);
++		/* steered to a tin by priority, as a tc filter can */
++		skb[i]->priority = TC_H_MAKE(sch->handle, tins[i / 2] + 1);
++		if (!tins[i / 2])
++			tin0_backlog += skb[i]->len;
++		kunit_remove_action(test, cake_test_free_skb, skb[i]);
++	}
++	rcu_read_lock_bh();
++	for (i = 0; i < 8; i++)
++		ret[i] = cake_test_enqueue(sch, skb[i]);
++	rcu_read_unlock_bh();
++	for (i = 0; i < 8; i++)
++		KUNIT_ASSERT_EQ(test, ret[i], NET_XMIT_SUCCESS);
++	for (i = 0; i < 4; i++)
++		KUNIT_ASSERT_EQ(test, q->tins[tins[i]].tin_backlog, tin0_backlog);
++	/* what the parent counted as its class's packets went in */
++	parent->q.qlen = sch->q.qlen;
++	parent->qstats.backlog = sch->qstats.backlog;
++
++	rtnl_lock();
++	KUNIT_EXPECT_EQ(test, 0, cake_change(sch, cake_test_opts(test, 12500000,
++								   CAKE_DIFFSERV_BESTEFFORT, false),
++					     NULL));
++	rtnl_unlock();
++
++	KUNIT_EXPECT_EQ(test, q->tin_cnt, 1);
++	KUNIT_EXPECT_EQ(test, sch->q.qlen, 2);
++	KUNIT_EXPECT_EQ(test, sch->qstats.backlog, tin0_backlog);
++	KUNIT_EXPECT_EQ(test, parent->q.qlen, sch->q.qlen);
++	KUNIT_EXPECT_EQ(test, parent->qstats.backlog, sch->qstats.backlog);
++	KUNIT_EXPECT_EQ(test, parent->qstats.drops, 6);
++}
++
++/* A TCP GSO packet of @segs segments of @mss bytes as CAKE gets it: through
++ * a VXLAN tunnel (Ethernet, IPv4, UDP, VXLAN, inner Ethernet, IPv4, TCP)
++ * when @tunnel, or plain (Ethernet, IPv4, TCP)
++ */
++static struct sk_buff *cake_test_gso_skb(struct kunit *test, bool tunnel, u16 mss, u16 segs)
++{
++	const unsigned int outer = ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr) + 8;
++	unsigned int inner = tunnel ? outer : 0;
++	struct sk_buff *skb = alloc_skb(inner + ETH_HLEN + 40 + mss * segs, GFP_KERNEL);
++	struct tcphdr *th;
++	struct iphdr *ip;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_free_skb, skb));
++	skb_put_zero(skb, inner + ETH_HLEN + 40 + mss * segs);
++	skb_reset_mac_header(skb);
++	skb_set_network_header(skb, ETH_HLEN);
++	if (tunnel) {
++		ip = (struct iphdr *)(skb->data + ETH_HLEN);
++		ip->version = 4;
++		ip->ihl = 5;
++		ip->protocol = IPPROTO_UDP;
++		skb_set_transport_header(skb, ETH_HLEN + sizeof(*ip));
++		skb->encapsulation = 1;
++		skb_set_inner_mac_header(skb, inner);
++		skb_set_inner_network_header(skb, inner + ETH_HLEN);
++		skb_set_inner_transport_header(skb, inner + ETH_HLEN + sizeof(*ip));
++	} else {
++		skb_set_transport_header(skb, ETH_HLEN + sizeof(*ip));
++	}
++	ip = (struct iphdr *)(skb->data + inner + ETH_HLEN);
++	ip->version = 4;
++	ip->ihl = 5;
++	ip->protocol = IPPROTO_TCP;
++	th = (struct tcphdr *)(skb->data + inner + ETH_HLEN + sizeof(*ip));
++	th->doff = sizeof(*th) / 4;
++	skb_shinfo(skb)->gso_size = mss;
++	skb_shinfo(skb)->gso_segs = segs;
++	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4 | (tunnel ? SKB_GSO_UDP_TUNNEL : 0);
++	qdisc_skb_cb(skb)->pkt_len = skb->len;
++	return skb;
++}
++
++/* A GSO packet counts every header of each segment: for a tunnelled one,
++ * those inside the tunnel too, up to the inner TCP header (upstream
++ * a41851bea7bf). CAKE then charges what the segments carry on the wire;
++ * it counted only the outer headers, and read the UDP header there as a
++ * TCP one.
++ */
++static void cake_test_overhead_tunnel(struct kunit *test)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	const unsigned int outer = ETH_HLEN + sizeof(struct iphdr) + sizeof(struct udphdr) + 8;
++	const unsigned int mss = 1400, segs = 4;
++	/* each segment as it leaves: all its headers, then its share of data */
++	const unsigned int plain_seg = ETH_HLEN + 40 + mss;
++	struct sk_buff *skb;
++
++	q->config = cake_test_alloc(test, sizeof(*q->config));
++	q->min_netlen = ~0;
++	q->min_adjlen = ~0;
++
++	/* raw: CAKE counts what it sees from the MAC header on */
++	skb = cake_test_gso_skb(test, false, mss, segs);
++	KUNIT_EXPECT_EQ(test, cake_overhead(q, skb), segs * plain_seg);
++	skb = cake_test_gso_skb(test, true, mss, segs);
++	KUNIT_EXPECT_EQ(test, cake_overhead(q, skb), segs * (outer + plain_seg));
++
++	/* with overhead compensation: from the network header, plus 38 */
++	q->config->rate_flags = CAKE_FLAG_OVERHEAD;
++	q->config->rate_overhead = 38;
++	KUNIT_EXPECT_EQ(test, cake_overhead(q, skb),
++			segs * (outer + plain_seg - ETH_HLEN + 38));
++}
++
+ static int cake_test_init(struct kunit *test)
+ {
+ 	int i;
+@@ -2591,6 +2978,11 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_mq_drained_sparse),
+ 	KUNIT_CASE(cake_test_empty_no_watchdog),
+ 	KUNIT_CASE(cake_test_mq_host_table_matches),
++	KUNIT_CASE(cake_test_autorate_throttled),
++	KUNIT_CASE(cake_test_change_refused),
++	KUNIT_CASE(cake_test_change_vs_autorate),
++	KUNIT_CASE(cake_test_clear_tin_parent),
++	KUNIT_CASE(cake_test_overhead_tunnel),
+ 	{}
+ };
+ 

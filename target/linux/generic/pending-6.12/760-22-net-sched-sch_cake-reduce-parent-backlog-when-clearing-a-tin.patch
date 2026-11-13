@@ -1,0 +1,71 @@
+From d7010be1ba2337372ea32142951858f936c26e0d Mon Sep 17 00:00:00 2001
+From: Jamal Hadi Salim <jhs@mojatatu.com>
+Date: Tue, 20 Oct 2026 07:00:06 -0400
+Subject: [PATCH] net/sched/sch_cake: reduce parent backlog when clearing a tin
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The issue:
+CAKE has purged unused tins on DiffServ reconfiguration since commit
+83f8fd69af4f ("sch_cake: Add DiffServ handling") without propagating the
+resulting backlog reduction to classful parents. The issue was noticed
+while reviewing 7cbfb180945c, but predates that change.
+
+cake_clear_tin() drops every packet from a tin with
+kfree_skb_reason() but never calls qdisc_tree_reduce_backlog(), so a
+CAKE qdisc under a classful parent (e.g. HTB) leaves the dropped packets
+in the parent qdisc's and class's qlen/backlog accounting forever. The
+normal dequeue path does reduce the parent; only the live reconfigure
+purge misses it.
+
+The fix:
+Tins are cleared from cake_reset() and, on reconfigure, from
+cake_configure_rates(). The qdisc core already owns the parent delta for
+the reset path: qdisc_purge_queue() snapshots qlen/backlog, runs
+qdisc_reset(), then reduces the tree, so propagating the reduction from
+cake_clear_tin() itself would subtract the same backlog twice. Snapshot
+CAKE's qlen/backlog around only the reconfiguration purge in
+cake_configure_rates() and reduce the parent once afterwards, matching
+the delta pattern already used by cake_enqueue().
+
+Conditions to recreate the bug:
+put CAKE (diffserv8) under an HTB class, flood DSCP-classified traffic
+into a high tin so it backlogs, then change CAKE to diffserv3. The HTB
+parent keeps the purged packets in its qlen and backlog; a kernel with
+the fix shows the parent at the leaf's backlog (426b/5p) instead of
+retaining the purged packets.
+
+Reported-by: Sashiko (gemini) <sashiko-bot@kernel.org>
+Link: https://sashiko.dev/#/patchset/20260816012109.2865223-1-ooonea@gmail.com
+Link: https://lore.kernel.org/netdev/20260816012109.2865223-1-ooonea@gmail.com/
+Link: https://lore.kernel.org/netdev/8733ugtry8.fsf@toke.dk/
+Reviewed-by: Victor Nogueira <victor@mojatatu.com>
+Acked-by: Toke Høiland-Jørgensen <toke@toke.dk>
+Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Link: https://patch.msgid.link/QDISC-5RTM.v3.r0.20261020053711-2@mojatatu.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+[MilkFlint: the loop it wraps also retires cake_mq's tins (760-07).]
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -3418,12 +3418,19 @@ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+ 		cake_set_bulk_quantum(q, &qd->tins[c], rate);
+ 
+ 	if (!rate_adjust) {
++		u32 backlog = sch->qstats.backlog, qlen = sch->q.qlen;
++
+ 		for (c = qd->tin_cnt; c < CAKE_MAX_TINS; c++) {
+ 			cake_clear_tin(sch, c);
+ 			if (q->is_shared)
+ 				cake_mq_retire_tin(qd, &qd->tins[c], ktime_get());
+ 			qd->tins[c].cparams.mtu_time = qd->tins[ft].cparams.mtu_time;
+ 		}
++
++		backlog -= sch->qstats.backlog;
++		qlen -= sch->q.qlen;
++		if (qlen)
++			qdisc_tree_reduce_backlog(sch, qlen, backlog);
+ 	}
+ 
+ 	qd->rate_ns   = qd->tins[ft].tin_rate_ns;
