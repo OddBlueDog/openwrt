@@ -14,7 +14,7 @@ CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_zyxel_ex5601-t0-stock=y
 CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_zyxel_ex5601-t0-ubootmod=y
 
 # The firmware is MilkFlint, with its own version number on top of the
-# OpenWrt release ("MilkFlint 0.62a (OpenWrt 25.12.6)" in the banner and
+# OpenWrt release ("MilkFlint 0.7a (OpenWrt 25.12.6)" in the banner and
 # os-release). Images are named
 # milkflint-<version>-<revision>-mediatek-filogic-<board>-* (glinet_gl-mt6000,
 # zyxel_ex5601-t0-stock, zyxel_ex5601-t0-ubootmod).
@@ -22,7 +22,7 @@ CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_zyxel_ex5601-t0-ubootmod=y
 CONFIG_IMAGEOPT=y
 CONFIG_VERSIONOPT=y
 CONFIG_VERSION_DIST="MilkFlint"
-CONFIG_VERSION_NUMBER="0.62a"
+CONFIG_VERSION_NUMBER="0.7a"
 CONFIG_VERSION_CODE_FILENAMES=y
 CONFIG_VERSION_MANUFACTURER="MilkFlint"
 CONFIG_VERSION_MANUFACTURER_URL="https://github.com/OddBlueDog/openwrt"
@@ -61,6 +61,11 @@ CONFIG_VERSION_KMODS_REPO="https://milkflint-packages.pages.dev"
 # CONFIG_PACKAGE_kmod-mt7925u is not set
 
 CONFIG_PACKAGE_luci=y
+# HTTPS for this web interface and LuCI, as in OpenWrt's own images: luci-ssl
+# adds px5g, which makes the router's own (self-signed) certificate the first
+# time uhttpd starts. Without it uhttpd has no certificate, so nothing answers
+# on port 443 and LuCI's "Redirect to HTTPS" does nothing.
+CONFIG_PACKAGE_luci-ssl=y
 
 # MilkFlint's web interface at the router's address; LuCI stays under
 # "Advanced". Smart Queue needs SQM with CAKE.
