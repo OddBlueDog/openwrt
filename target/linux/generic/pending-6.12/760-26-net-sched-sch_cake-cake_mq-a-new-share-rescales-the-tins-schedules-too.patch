@@ -1,0 +1,117 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 13 Nov 2026 18:20:00 +0000
+Subject: [PATCH] net/sched: sch_cake: cake_mq: a new share rescales the tins' schedules too
+
+When a sub-cake's share moves, the shaper's waits are rescaled to it
+(760-08), but each tin's own schedule, which says whether the tin is
+within its threshold and so goes before the tins below it, kept the share
+it was set at. A tin that sent a packet while the share was small then
+counted as over its threshold, and lost its priority, for as many times
+longer as the share grew; one that sent at a large share kept its
+priority past its threshold when the share shrank. With diffserv tins on
+a multi-queue CAKE (layer_cake.qos), voice and video could go behind best
+effort for a while after the shares grew.
+
+The tins' schedules are rescaled with the shaper's now.
+
+KUnit: diffserv4's four tins and the shaper's waits, the share tripled and
+back again; the tins not in use left alone.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2396,6 +2396,26 @@ static ktime_t cake_mq_rescale_wait(ktime_t next, ktime_t now, u64 old, u64 shar
+ 				       NSEC_PER_SEC));
+ }
+ 
++/* A new share for every wait running: the shaper's, and each tin's
++ * schedule against its threshold, which decides whether it goes before the
++ * tins below it. Rescaled with the shaper's, a tin keeps its place as the
++ * share moves: one that sent a packet while the share was small would
++ * otherwise count as over its threshold, and lose its priority, for as many
++ * times longer as the share then grew.
++ */
++static void cake_mq_rescale_waits(struct cake_sched_data *q, ktime_t now,
++				  u64 old, u64 share)
++{
++	u16 tin;
++
++	q->time_next_packet = cake_mq_rescale_wait(q->time_next_packet, now, old, share);
++	q->failsafe_next_packet = cake_mq_rescale_wait(q->failsafe_next_packet, now,
++						       old, share);
++	for (tin = 0; tin < q->tin_cnt; tin++)
++		q->tins[tin].time_next_packet =
++			cake_mq_rescale_wait(q->tins[tin].time_next_packet, now, old, share);
++}
++
+ /* While a sub-cake waits for its shaper it also wakes every CAKE_MQ_TAU,
+  * so its share is worked out again: one that grows is then used.
+  */
+@@ -2859,12 +2879,7 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ 		new_rate = cake_mq_share(rate, q->mq_weight, q->mq_sparse, &peers);
+ 
+ 		if (cake_mq_share_moved(new_rate, q->synced_rate, rate)) {
+-			q->time_next_packet =
+-				cake_mq_rescale_wait(q->time_next_packet, now,
+-						     q->synced_rate, new_rate);
+-			q->failsafe_next_packet =
+-				cake_mq_rescale_wait(q->failsafe_next_packet, now,
+-						     q->synced_rate, new_rate);
++			cake_mq_rescale_waits(q, now, q->synced_rate, new_rate);
+ 			cake_configure_rates(sch, new_rate, true);
+ 			q->synced_rate = new_rate;
+ 		}
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -945,6 +945,43 @@ static void cake_test_mq_rescale_wait(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, cake_mq_wake_by(q, now + 50 * ms, now), now + 50 * ms);
+ }
+ 
++/* A new share rescales each tin's schedule with the shaper's: here
++ * diffserv4's four tins, the share tripled. A tin that sent while the share
++ * was a third of it would otherwise wait three times too long to count as
++ * within its threshold again, losing its priority meanwhile, and one past
++ * its schedule keeps it; the tins not in use are left alone.
++ */
++static void cake_test_mq_rescale_tins(struct kunit *test)
++{
++	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
++	const ktime_t now = 1000 * NSEC_PER_MSEC, ms = NSEC_PER_MSEC;
++	static const s64 left[CAKE_MAX_TINS] = { 9, 0, -2, 30, 6, 6, 6, 6 };
++	int t;
++
++	q->tins = cake_test_alloc(test, CAKE_MAX_TINS * sizeof(*q->tins));
++	q->tin_cnt = 4;
++	q->time_next_packet = now + 12 * ms;
++	q->failsafe_next_packet = now + 18 * ms;
++	for (t = 0; t < CAKE_MAX_TINS; t++)
++		q->tins[t].time_next_packet = now + left[t] * ms;
++
++	cake_mq_rescale_waits(q, now, 1000, 3000);
++
++	KUNIT_EXPECT_EQ(test, q->time_next_packet, now + 4 * ms);
++	KUNIT_EXPECT_EQ(test, q->failsafe_next_packet, now + 6 * ms);
++	KUNIT_EXPECT_EQ(test, q->tins[0].time_next_packet, now + 3 * ms);
++	KUNIT_EXPECT_EQ(test, q->tins[1].time_next_packet, now);
++	KUNIT_EXPECT_EQ(test, q->tins[2].time_next_packet, now - 2 * ms);
++	KUNIT_EXPECT_EQ(test, q->tins[3].time_next_packet, now + 10 * ms);
++	for (t = 4; t < CAKE_MAX_TINS; t++)
++		KUNIT_EXPECT_EQ(test, q->tins[t].time_next_packet, now + 6 * ms);
++
++	/* and back down: as they were */
++	cake_mq_rescale_waits(q, now, 3000, 1000);
++	KUNIT_EXPECT_EQ(test, q->tins[0].time_next_packet, now + 9 * ms);
++	KUNIT_EXPECT_EQ(test, q->tins[3].time_next_packet, now + 30 * ms);
++}
++
+ /* Sub-cakes with uneven demands (bytes/s; 0: idle; U64_MAX: all it can
+  * get) and bulk weights, each resyncing every 200 us as cake_dequeue()
+  * does and sending at the lower of its demand and its share. What one
+@@ -3144,6 +3181,7 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_mq_saturated),
+ 	KUNIT_CASE(cake_test_mq_idle_after),
+ 	KUNIT_CASE(cake_test_mq_rescale_wait),
++	KUNIT_CASE(cake_test_mq_rescale_tins),
+ 	KUNIT_CASE(cake_test_mq_share_converges),
+ 	KUNIT_CASE(cake_test_mq_share_within_rate),
+ 	KUNIT_CASE(cake_test_mq_host_load_shared),

@@ -1,0 +1,300 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 13 Nov 2026 18:10:00 +0000
+Subject: [PATCH] net/sched: sch_cake: cake_mq: a sub-cake held back goes on wanting more
+
+cake_mq let more than its rate through whenever traffic was spread over
+two or more sub-cakes: their shares added up to more than the rate, for
+moments at a time, again and again.
+
+A sub-cake counts as wanting more than its share when it used 7/8 of it
+with its shaper holding packets back. What it used is an average over its
+time scale (2 ms or more); its share is what it took at its last resync,
+200 us ago at most. When the share grows, because another sub-cake used
+less, the average lags: a sub-cake sending at all of its new share can
+count as using well under 7/8 of it, and so as wanting no more. The
+others then count it at its average and share out the rest, while it
+sends at the whole of its share: together they send more than the rate
+until its average catches up. TCP flows move their sub-cakes' shares all
+the time, so busy sub-cakes counted as wanting no more for part of the
+time their shapers held their packets back, and the excess came back each
+time.
+
+A sub-cake that wants more now goes on wanting more for as long as its
+shaper holds packets back between one resync and the next. One whose
+flows slow down is no longer held back, and drops out at its next resync
+as before: what it no longer uses still goes to the others at once.
+
+KUnit: wanting more, going on wanting more, and no longer; and sub-cakes
+fed by senders like TCP's, which slow down when their packets have waited
+and grow back, each sending what its shaper lets through in whole packets
+and resyncing as cake_dequeue() does: three and four sub-cakes in GRO
+packets, eight in MTU-sized ones at two upload speeds. Together they send
+no more than the rate and fill it, and each counts as wanting more
+whenever its shaper holds it back. With the rule as it was, each case goes
+over the rate.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2279,6 +2279,16 @@ static u64 cake_mq_idle_after(u64 idle, u64 bytes, u32 packets, u64 usage)
+  * it used 31/32 of it, or 7/8 with its shaper holding packets back lately.
+  * A TCP flow held back by its share averages 85-95% of it; a stream below
+  * its share never waits.
++ *
++ * Once it wants more, it goes on wanting more for as long as its shaper
++ * holds packets back between one resync and the next. Its average lags its
++ * share: when the share grows (another sub-cake used less), it can count
++ * as using well under 7/8 of it, and so as wanting no more, while it sends
++ * at all of it. The others would then share out what it doesn't use, as they read it,
++ * and take the part it does: together they'd send more than the rate, as
++ * long as its average took to catch up, and do it again each time the share
++ * moves. A sub-cake whose shaper stops holding packets back (its flows
++ * slowed down) still drops out at its next resync.
+  */
+ static void cake_mq_publish(struct cake_sched_data *q, u64 now)
+ {
+@@ -2304,7 +2314,8 @@ static void cake_mq_publish(struct cake_sched_data *q, u64 now)
+ 	WRITE_ONCE(q->mq_saturated,
+ 		   usage >= q->synced_rate - (q->synced_rate >> 5) ||
+ 		   (now - q->mq_held_at < tau &&
+-		    usage >= q->synced_rate - (q->synced_rate >> 3)));
++		    usage >= q->synced_rate - (q->synced_rate >> 3)) ||
++		   (q->mq_saturated && q->mq_held_at >= q->last_checked_active));
+ }
+ 
+ /* The sub-cakes sharing the rate with @q, @q included: those on the
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -841,26 +841,44 @@ static void cake_test_mq_ewma(struct kunit *test)
+ }
+ 
+ /* Wanting more than its share: using all of it, or most of it with packets
+- * held back by the shaper
++ * held back by the shaper; and once wanting more, for as long as the shaper
++ * holds packets back from one resync to the next, whatever its average
+  */
+ static void cake_test_mq_saturated(struct kunit *test)
+ {
+ 	struct cake_sched_data *q = cake_test_alloc(test, sizeof(*q));
+ 	const u64 dt = 200 * NSEC_PER_USEC, now = CAKE_TEST_NOW, share = CAKE_TEST_RATE;
++	/* when the shaper last held packets back: not lately, within the time
++	 * scale but before the last resync, since the last resync
++	 */
++	enum { NOT_HELD, HELD_BEFORE, HELD_SINCE };
+ 	static const struct {
+ 		u32 used;	/* per 1000 of the share */
+-		bool held;
++		u8 held;
++		bool was;	/* wanted more at the last resync */
+ 		bool saturated;
+ 	} cases[] = {
+-		{ 990, false, true },	/* all of it */
+-		{ 900, true, true },	/* TCP held back by its share */
+-		{ 900, false, false },	/* a stream just below it */
+-		{ 800, true, false },	/* well below, a burst waited */
+-		{ 500, false, false },
++		{ 990, NOT_HELD, false, true },		/* all of it */
++		{ 900, HELD_SINCE, false, true },	/* TCP held back by its share */
++		{ 900, NOT_HELD, false, false },	/* a stream just below it */
++		{ 800, HELD_SINCE, false, false },	/* well below, a burst waited */
++		{ 500, NOT_HELD, false, false },
++		/* TCP held back by a share that just grew: its average lags */
++		{ 700, HELD_SINCE, true, true },
++		{ 300, HELD_SINCE, true, true },
++		/* ... and once its flows slow down, nothing held since */
++		{ 900, HELD_BEFORE, true, true },
++		{ 800, HELD_BEFORE, true, false },
++		{ 700, NOT_HELD, true, false },
+ 	};
+ 	int c;
+ 
+ 	for (c = 0; c < ARRAY_SIZE(cases); c++) {
++		static const u64 held_at[] = {
++			[NOT_HELD] = 0,
++			[HELD_BEFORE] = CAKE_TEST_NOW - 3 * 100 * NSEC_PER_USEC,
++			[HELD_SINCE] = CAKE_TEST_NOW - 100 * NSEC_PER_USEC,
++		};
+ 		u64 usage = share * cases[c].used / 1000;
+ 
+ 		q->synced_rate = share;
+@@ -868,7 +886,8 @@ static void cake_test_mq_saturated(struct kunit *test)
+ 		q->mq_bytes = div64_u64(usage * dt, NSEC_PER_SEC);
+ 		q->mq_idle = CAKE_MQ_TAU;
+ 		q->last_checked_active = now - dt;
+-		q->mq_held_at = cases[c].held ? now - dt / 2 : 0;
++		q->mq_held_at = held_at[cases[c].held];
++		q->mq_saturated = cases[c].was;
+ 		cake_mq_publish(q, now);
+ 		KUNIT_EXPECT_EQ_MSG(test, q->mq_saturated, cases[c].saturated, "case %d", c);
+ 	}
+@@ -1051,6 +1070,162 @@ static void cake_test_mq_alloc_tins(struct kunit *test, struct cake_test_mq *mq)
+ 			cake_test_alloc(test, sizeof(struct cake_tin_data));
+ }
+ 
++/* What cake_test_mq_senders() saw: bytes sent, and the ticks in which a
++ * sub-cake's shaper held packets back, with those in which it counted as
++ * wanting more
++ */
++struct cake_test_mq_run {
++	u64 sent;
++	u64 held;
++	u64 held_saturated;
++};
++
++#define CAKE_TEST_TICK	(50 * NSEC_PER_USEC)
++
++/* @n sub-cakes sharing @rate (bytes/s) for @ms, each fed by a sender like
++ * TCP's: its rate grows steadily, and once its packets have waited 5 ms in
++ * the sub-cake it slows to 7/10 of it, at most once a 20 ms round trip.
++ * Every 50 us each one with packets sends what its shaper lets through, in
++ * packets of up to @pkt bytes, resyncing every 200 us first, as
++ * cake_dequeue() does.
++ */
++static void cake_test_mq_senders(struct cake_test_mq *mq, int n, u64 rate, u32 pkt, u32 ms,
++				 struct cake_test_mq_run *r)
++{
++	const u64 fair = div_u64(rate, n), sync = 200 * NSEC_PER_USEC;
++	u64 demand[CAKE_TEST_TXQS], backlog[CAKE_TEST_TXQS], arrived[CAKE_TEST_TXQS];
++	u64 slowed[CAKE_TEST_TXQS], now = 10 * NSEC_PER_MSEC;
++	const u64 end = now + ms * NSEC_PER_MSEC;
++	u32 t;
++	int i, k;
++
++	memset(r, 0, sizeof(*r));
++	mq->dev->real_num_tx_queues = CAKE_TEST_TXQS;
++	bitmap_zero(mq->cfg->used_qs, CAKE_TEST_TXQS);
++	mq->cfg->rate_bps = rate;
++	for (i = 0; i < CAKE_TEST_TXQS; i++) {
++		struct cake_sched_data *q = cake_test_mq_q(mq, i);
++
++		mq->sch[i]->q.qlen = 0;
++		q->tin_cnt = 1;
++		q->tins[0].mq_weight = 0;
++		q->synced_rate = rate;
++		q->last_checked_active = 0;
++		q->last_active = 0;
++		q->mq_usage = q->mq_sparse = q->mq_bytes = q->mq_sparse_bytes = 0;
++		q->mq_idle = 0;
++		q->mq_packets = 0;
++		q->mq_held_at = 0;
++		q->mq_weight = 0;
++		q->mq_saturated = false;
++		q->time_next_packet = 0;
++		/* not quite even, so they don't move in step */
++		demand[i] = fair + div_u64(fair * i, 4 * n);
++		backlog[i] = arrived[i] = slowed[i] = 0;
++	}
++
++	for (t = 0; now < end; t++) {
++		now += CAKE_TEST_TICK;
++		for (k = 0; k < n; k++) {
++			struct cake_sched_data *q = cake_test_mq_q(mq, (k + t) % n);
++
++			i = (k + t) % n;
++			arrived[i] += demand[i] * CAKE_TEST_TICK;
++			backlog[i] += div64_u64(arrived[i], NSEC_PER_SEC);
++			arrived[i] %= NSEC_PER_SEC;
++			if (!backlog[i])
++				continue;
++			if (!mq->sch[i]->q.qlen)
++				cake_test_mq_enqueue(mq, i);
++			if (now - q->last_checked_active >= sync) {
++				struct cake_mq_peers p;
++				u64 share;
++
++				cake_mq_publish(q, now);
++				cake_test_mq_peers(mq, i, now, &p);
++				share = cake_mq_share(rate, q->mq_weight, q->mq_sparse, &p);
++				if (cake_mq_share_moved(share, q->synced_rate, rate)) {
++					q->time_next_packet = cake_mq_rescale_wait(q->time_next_packet, now,
++										   q->synced_rate, share);
++					q->synced_rate = share;
++				}
++				q->last_checked_active = now;
++			}
++			/* no credit for the time it had nothing to send */
++			q->time_next_packet = max_t(u64, q->time_next_packet, now - CAKE_TEST_TICK);
++			while (backlog[i] && q->time_next_packet <= now) {
++				u32 len = min_t(u64, backlog[i], pkt);
++
++				backlog[i] -= len;
++				q->time_next_packet += div64_u64((u64)len * NSEC_PER_SEC, q->synced_rate);
++				q->mq_bytes += len;
++				q->mq_packets++;
++				q->last_active = now;
++				r->sent += len;
++			}
++			if (!backlog[i]) {
++				mq->sch[i]->q.qlen = 0;
++			} else if (q->time_next_packet > now) {
++				q->mq_held_at = now;
++				r->held++;
++				r->held_saturated += q->mq_saturated;
++			}
++		}
++		for (i = 0; i < n; i++) {
++			struct cake_sched_data *q = cake_test_mq_q(mq, i);
++			u64 wait = div64_u64(backlog[i] * NSEC_PER_SEC, q->synced_rate);
++
++			if (wait > 5 * NSEC_PER_MSEC && now - slowed[i] > 20 * NSEC_PER_MSEC) {
++				demand[i] = div_u64(demand[i] * 7, 10);
++				slowed[i] = now;
++			} else {
++				demand[i] += div64_u64(fair * CAKE_TEST_TICK, 60 * NSEC_PER_MSEC);
++			}
++		}
++	}
++}
++
++/* TCP flows on several sub-cakes, each slowing down now and then and
++ * growing back, as they do when they're the bottleneck's: together they
++ * send no more than the rate, and fill it. Each sub-cake's shaper holds its
++ * packets back nearly all the time, and it must count as wanting more for
++ * all of that time. It counted as not wanting more, for a few percent of
++ * it, whenever its share grew faster than its average of what it used, and
++ * then the others took the part it was about to use: the sub-cakes went
++ * over the rate together.
++ */
++static void cake_test_mq_share_within_rate(struct kunit *test)
++{
++	static const struct {
++		int n;
++		u64 rate;	/* bytes/s */
++		u32 pkt;
++	} cases[] = {
++		{ 3, 100000000, 17000 },	/* a download in GRO packets */
++		{ 4, 100000000, 17000 },
++		{ 8, 5000000, 1514 },		/* an upload over eight tx queues */
++		{ 8, 1875000, 1514 },
++	};
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_test_mq_run r;
++	int c;
++
++	cake_test_mq_alloc_tins(test, mq);
++	for (c = 0; c < ARRAY_SIZE(cases); c++) {
++		u64 allowed = cases[c].rate;	/* a second */
++
++		cake_test_mq_senders(mq, cases[c].n, cases[c].rate, cases[c].pkt, 1000, &r);
++		KUNIT_EXPECT_LE_MSG(test, r.sent * 1000, allowed * 1005,
++				    "case %d: %llu bytes, %llu allowed", c, r.sent, allowed);
++		KUNIT_EXPECT_GE_MSG(test, r.sent * 100, allowed * 98,
++				    "case %d: %llu bytes, %llu allowed", c, r.sent, allowed);
++		KUNIT_EXPECT_GT(test, r.held, 0);
++		KUNIT_EXPECT_GE_MSG(test, r.held_saturated * 1000, r.held * 999,
++				    "case %d: held back in %llu ticks, wanting more in %llu",
++				    c, r.held, r.held_saturated);
++	}
++}
++
+ /* The cases in the plan: uneven demand, sub-queues idle, weights by host */
+ static void cake_test_mq_share_converges(struct kunit *test)
+ {
+@@ -2970,6 +3145,7 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_mq_idle_after),
+ 	KUNIT_CASE(cake_test_mq_rescale_wait),
+ 	KUNIT_CASE(cake_test_mq_share_converges),
++	KUNIT_CASE(cake_test_mq_share_within_rate),
+ 	KUNIT_CASE(cake_test_mq_host_load_shared),
+ 	KUNIT_CASE(cake_test_mq_host_queues),
+ 	KUNIT_CASE(cake_test_mq_host_retag),
