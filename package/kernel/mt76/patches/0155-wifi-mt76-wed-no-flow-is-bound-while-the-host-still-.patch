@@ -1,0 +1,182 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:33:22 +0000
+Subject: [PATCH] wifi: mt76: wed: no flow is bound while the host still holds
+ WED's tokens
+
+When the first flow is bound to a radio, the Ethernet driver has mt76 give the upper half of the tx tokens to WED: mt76_wed_offload_enable() halves the host's range and waits a second for the host's frames that still hold tokens of that half to come back. If they didn't, it returned 1. The Ethernet driver takes only a negative value for a failure: mtk_wed_flow_add() counted no flow for it, mtk_flow_offload_replace() bound the flow all the same, and WED began handing out tokens the host's frames still had. A tx-free event for WED's frame then freed the host's, still mapped for the hardware, and the flow count was one short from then on, so the host got all the tokens back while a flow was still bound.
+
+A timeout is an error now, -EAGAIN, and the host has all of its tokens again as with no flow bound: the flow stays on the host's path, and the next one tries again.
+
+It takes more than half of the tokens out at once, 4096 frames in the hardware, so it is rare.
+
+KUnit: mt76-wed, in a test build that compiles the driver's WED code. Its tests stand in for the Ethernet driver's one symbol, with no WED registered.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ tests/wed-test.c | 121 +++++++++++++++++++++++++++++++++++++++++++++++
+ wed.c            |  19 +++++++-
+ 2 files changed, 139 insertions(+), 1 deletion(-)
+ create mode 100644 tests/wed-test.c
+
+diff --git a/tests/wed-test.c b/tests/wed-test.c
+new file mode 100644
+index 00000000..634c377b
+--- /dev/null
++++ b/tests/wed-test.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * KUnit tests for mt76's side of Wireless Ethernet Dispatch (WED): what the
++ * Ethernet driver calls when the first flow is bound to a radio and when the
++ * last one goes. Included at the end of wed.c when CONFIG_MT76_KUNIT_TEST is
++ * defined (milkflint's QEMU test build only).
++ *
++ * The test VM's kernel has no MediaTek Ethernet driver, so nothing there
++ * defines CONFIG_NET_MEDIATEK_SOC_WED or the WED it would attach to. The test
++ * build defines the option for mt76 alone, which
++ * compiles the driver's WED code as the router's kernel does, and this file
++ * stands in for the Ethernet driver's one symbol: no WED registered, so an
++ * attach finds none, and a test that wants an attached WED gives the device
++ * an ops table of its own (mtk_wed_device_active() only asks whether it has
++ * one).
++ */
++#include <kunit/test.h>
++#include "fake.h"
++
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++
++const struct mtk_wed_ops __rcu *mtk_soc_wed_ops;
++EXPORT_SYMBOL_GPL(mtk_soc_wed_ops);
++
++#define MT76_WED_TEST_TOKENS	8192
++#define MT76_WED_TEST_START	4096
++
++static const struct ieee80211_ops mt76_wed_test_hw_ops = {
++	.tx = mt76_test_tx,
++	.start = mt76_test_start,
++	.stop = mt76_test_stop,
++	.add_interface = mt76_test_add_interface,
++	.remove_interface = mt76_test_remove_interface,
++	.config = mt76_test_config,
++	.configure_filter = mt76_test_configure_filter,
++	.wake_tx_queue = mt76_test_wake_tx_queue,
++	.add_chanctx = ieee80211_emulate_add_chanctx,
++	.remove_chanctx = ieee80211_emulate_remove_chanctx,
++	.change_chanctx = ieee80211_emulate_change_chanctx,
++	.switch_vif_chanctx = ieee80211_emulate_switch_vif_chanctx,
++};
++
++static const struct mt76_driver_ops mt76_wed_test_drv_ops = {
++	.token_size = MT76_WED_TEST_TOKENS,
++};
++
++/* A device with all of its tokens, and the upper half promised to WED */
++static struct mt76_dev *mt76_wed_test_dev(struct kunit *test)
++{
++	struct mt76_dev *dev;
++
++	dev = mt76_test_dev(test, sizeof(*dev), &mt76_wed_test_hw_ops,
++			    &mt76_wed_test_drv_ops);
++	dev->token_size = MT76_WED_TEST_TOKENS;
++	dev->mmio.wed.wlan.token_start = MT76_WED_TEST_START;
++
++	return dev;
++}
++
++/* No WED is registered here: an attach finds none, and the device stays
++ * without one.
++ */
++static void mt76_wed_test_no_wed(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++
++	KUNIT_EXPECT_LT(test, mtk_wed_device_attach(&dev->mmio.wed), 0);
++	KUNIT_EXPECT_FALSE(test, mtk_wed_device_active(&dev->mmio.wed));
++}
++
++/* The first flow bound: the host keeps to the lower half of the tokens, and
++ * gets all of them back when the last flow goes.
++ */
++static void mt76_wed_test_offload_enable(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mmio.wed;
++
++	KUNIT_EXPECT_EQ(test, mt76_wed_offload_enable(wed), 0);
++	KUNIT_EXPECT_EQ(test, dev->token_size, MT76_WED_TEST_START);
++
++	mt76_wed_offload_disable(wed);
++	KUNIT_EXPECT_EQ(test, dev->token_size, MT76_WED_TEST_TOKENS);
++}
++
++/* A frame the host sent with one of WED's tokens is still in the hardware a
++ * second later: WED must not get that token too. The Ethernet driver takes
++ * only a negative value for "not now" (mtk_wed_flow_add() counts no flow,
++ * mtk_flow_offload_replace() binds none), and the host has all of its tokens
++ * again, as with no flow bound.
++ */
++static void mt76_wed_test_offload_enable_busy(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mmio.wed;
++
++	dev->wed_token_count = 1;
++	KUNIT_EXPECT_LT(test, mt76_wed_offload_enable(wed), 0);
++	KUNIT_EXPECT_EQ(test, dev->token_size, MT76_WED_TEST_TOKENS);
++
++	/* it came back: the next flow can be bound */
++	dev->wed_token_count = 0;
++	KUNIT_EXPECT_EQ(test, mt76_wed_offload_enable(wed), 0);
++	KUNIT_EXPECT_EQ(test, dev->token_size, MT76_WED_TEST_START);
++}
++
++static struct kunit_case mt76_wed_test_cases[] = {
++	KUNIT_CASE(mt76_wed_test_no_wed),
++	KUNIT_CASE(mt76_wed_test_offload_enable),
++	KUNIT_CASE(mt76_wed_test_offload_enable_busy),
++	{}
++};
++
++static struct kunit_suite mt76_wed_test_suite = {
++	.name = "mt76-wed",
++	.test_cases = mt76_wed_test_cases,
++};
++
++kunit_test_suites(&mt76_wed_test_suite);
++
++#endif /* CONFIG_NET_MEDIATEK_SOC_WED */
+diff --git a/wed.c b/wed.c
+index f210a0c5..f37f2ca6 100644
+--- a/wed.c
++++ b/wed.c
+@@ -91,7 +91,20 @@ int mt76_wed_offload_enable(struct mtk_wed_device *wed)
+ 	dev->token_size = wed->wlan.token_start;
+ 	spin_unlock_bh(&dev->token_lock);
+ 
+-	return !wait_event_timeout(dev->tx_wait, !dev->wed_token_count, HZ);
++	if (wait_event_timeout(dev->tx_wait, !dev->wed_token_count, HZ))
++		return 0;
++
++	/* Frames the host sent with tokens of WED's half are still in the
++	 * hardware. WED must not hand those tokens out as well: a tx-free
++	 * event for its frame would free the host's, still mapped. So no flow
++	 * is bound this time (the caller takes only a negative value for
++	 * that), and the host has all the tokens again.
++	 */
++	spin_lock_bh(&dev->token_lock);
++	dev->token_size = dev->drv->token_size;
++	spin_unlock_bh(&dev->token_lock);
++
++	return -EAGAIN;
+ }
+ EXPORT_SYMBOL_GPL(mt76_wed_offload_enable);
+ 
+@@ -212,3 +225,7 @@ void mt76_wed_dma_reset(struct mt76_dev *dev)
+ 		dev_err(dev->dev, "wed reset complete timeout\n");
+ }
+ EXPORT_SYMBOL_GPL(mt76_wed_dma_reset);
++
++#if IS_ENABLED(CONFIG_MT76_KUNIT_TEST)
++#include "tests/wed-test.c"
++#endif

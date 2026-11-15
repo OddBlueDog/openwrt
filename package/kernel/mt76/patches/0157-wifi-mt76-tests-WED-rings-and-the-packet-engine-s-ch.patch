@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:33:22 +0000
+Subject: [PATCH] wifi: mt76: tests: WED rings and the packet engine's check,
+ with a WED attached
+
+The tests of WED's rx and tx-free rings and of the frames handed to the packet engine ran in a build without the driver's WED code, on queues that only carried WED's flags. With that code compiled in, as on the router, a queue with WED's flags and no WED loses them, and its registers go through the WED.
+
+They get a WED now: one that takes a ring over as the real one does and reads and writes the queue's registers, and one that notes the frame, the reason and the flow entry it's asked to check. What changes with the code that really runs: a reset of a WED tx-free ring leaves it set up again for the WED, reset and filled, not empty; and the reorder (RRO) rings of WED version 3 stay without one, as on this chip.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ mt7915/tests/mac-test.c | 37 +++++++++++++++++++
+ tests/dma-test.c        | 82 +++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 115 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 5a445656..60f672f8 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -1463,6 +1463,28 @@ static void mt7915_test_vfree_buf(void *p)
+ 	vfree(p);
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* a WED that notes the frames it's asked to look at for the packet engine */
++static struct {
++	int n;
++	struct net_device *dev;
++	u32 reason, hash;
++} mt7915_test_ppe;
++
++static void mt7915_test_ppe_check(struct mtk_wed_device *wed,
++				  struct sk_buff *skb, u32 reason, u32 hash)
++{
++	mt7915_test_ppe.n++;
++	mt7915_test_ppe.dev = skb->dev;
++	mt7915_test_ppe.reason = reason;
++	mt7915_test_ppe.hash = hash;
++}
++
++static const struct mtk_wed_ops mt7915_test_ppe_wed_ops = {
++	.ppe_check = mt7915_test_ppe_check,
++};
++#endif
++
+ /* A translated frame the PPE (hardware NAT) marked, from a WED rx ring, is
+  * handed to the PPE check with the receiving interface's netdev; unmarked
+  * frames and frames from other rings aren't.
+@@ -1506,6 +1528,10 @@ static void mt7915_test_rx_wed_ppe(struct kunit *test)
+ 	kfree_skb(skb);
+ 
+ 	dev->mt76.q_rx[MT_RXQ_MAIN].flags = MT_WED_Q_RX(0);
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	memset(&mt7915_test_ppe, 0, sizeof(mt7915_test_ppe));
++	dev->mt76.mmio.wed.ops = &mt7915_test_ppe_wed_ops;
++#endif
+ 	skb = mt7915_test_rx_skb(test, &d, mt7915_test_frame_eth,
+ 				 sizeof(mt7915_test_frame_eth));
+ 	KUNIT_ASSERT_EQ(test, mt7915_test_fill_rx_info(dev, skb, 0, 0), 0);
+@@ -1516,10 +1542,21 @@ static void mt7915_test_rx_wed_ppe(struct kunit *test)
+ 				 sizeof(mt7915_test_frame_eth));
+ 	KUNIT_ASSERT_EQ(test, mt7915_test_fill_rx_info(dev, skb, 0,
+ 				MT_DMA_INFO_PPE_VLD |
++				FIELD_PREP(MT_DMA_PPE_CPU_REASON, 0x0f) |
+ 				FIELD_PREP(MT_DMA_PPE_ENTRY, 0x123)), 0);
+ 	KUNIT_EXPECT_PTR_EQ(test, skb->dev, ndev);
+ 	KUNIT_EXPECT_TRUE(test, ((struct mt76_rx_status *)skb->cb)->flag &
+ 			  RX_FLAG_8023);
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	/* the WED got that frame, once, with the packet engine's reason for
++	 * handing it up and its entry for the flow: what binds an upload
++	 */
++	KUNIT_EXPECT_EQ(test, mt7915_test_ppe.n, 1);
++	KUNIT_EXPECT_PTR_EQ(test, mt7915_test_ppe.dev, ndev);
++	KUNIT_EXPECT_EQ(test, mt7915_test_ppe.reason, 0x0f);
++	KUNIT_EXPECT_EQ(test, mt7915_test_ppe.hash, 0x123);
++	dev->mt76.mmio.wed.ops = NULL;
++#endif
+ 	skb->dev = NULL;
+ 	kfree_skb(skb);
+ 	dev->mt76.q_rx[MT_RXQ_MAIN].flags = 0;
+diff --git a/tests/dma-test.c b/tests/dma-test.c
+index 19b5e6c1..d5038ce9 100644
+--- a/tests/dma-test.c
++++ b/tests/dma-test.c
+@@ -310,6 +310,76 @@ mt76_dma_test_tx_queue(struct mt76_dma_test *t, int idx, int ndesc)
+ 	return q;
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* A WED for a queue with WED flags: it takes the ring over as the real one
++ * does, and from then on the queue's registers are read and written through
++ * it. Its own are the queue's, at this address in its register space.
++ */
++#define MT76_DMA_TEST_WED_BASE		0x4000
++
++static void __iomem *mt76_dma_test_wed_regs;
++
++static int mt76_dma_test_wed_rx_ring(struct mtk_wed_device *wed, int ring,
++				     void __iomem *regs, bool reset)
++{
++	wed->rx_ring[ring].reg_base = MT76_DMA_TEST_WED_BASE;
++	mt76_dma_test_wed_regs = regs;
++	return 0;
++}
++
++static int mt76_dma_test_wed_tx_ring(struct mtk_wed_device *wed, int ring,
++				     void __iomem *regs, bool reset)
++{
++	wed->tx_ring[ring].reg_base = MT76_DMA_TEST_WED_BASE;
++	mt76_dma_test_wed_regs = regs;
++	return 0;
++}
++
++static int mt76_dma_test_wed_txfree_ring(struct mtk_wed_device *wed,
++					 void __iomem *regs)
++{
++	wed->txfree_ring.reg_base = MT76_DMA_TEST_WED_BASE;
++	mt76_dma_test_wed_regs = regs;
++	return 0;
++}
++
++static u32 mt76_dma_test_wed_rr(struct mtk_wed_device *wed, u32 reg)
++{
++	return readl(mt76_dma_test_wed_regs + reg - MT76_DMA_TEST_WED_BASE);
++}
++
++static void mt76_dma_test_wed_wr(struct mtk_wed_device *wed, u32 reg, u32 val)
++{
++	writel(val, mt76_dma_test_wed_regs + reg - MT76_DMA_TEST_WED_BASE);
++}
++
++/* the teardown detaches an attached WED: nothing of this one to undo */
++static void mt76_dma_test_wed_detach(struct mtk_wed_device *wed)
++{
++}
++
++static const struct mtk_wed_ops mt76_dma_test_wed_ops = {
++	.rx_ring_setup = mt76_dma_test_wed_rx_ring,
++	.tx_ring_setup = mt76_dma_test_wed_tx_ring,
++	.txfree_ring_setup = mt76_dma_test_wed_txfree_ring,
++	.reg_read = mt76_dma_test_wed_rr,
++	.reg_write = mt76_dma_test_wed_wr,
++	.detach = mt76_dma_test_wed_detach,
++};
++#endif
++
++/* @q is a WED's ring: the device has a WED (version 2, the MT7986's), and
++ * the queue is its
++ */
++static void mt76_dma_test_wed_queue(struct mt76_dev *dev, struct mt76_queue *q)
++{
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	dev->mmio.wed.ops = &mt76_dma_test_wed_ops;
++	dev->mmio.wed.version = 2;
++	q->wed = &dev->mmio.wed;
++#endif
++}
++
+ /* rx queue @qid with @flags, its ring at MT76_DMA_TEST_RX_RING + qid. Its
+  * page pool links to the queue's NAPI context, which must look disabled
+  * when the pool goes (as netif_napi_add() leaves it): unless the test adds
+@@ -329,6 +399,9 @@ mt76_dma_test_rx_queue(struct mt76_dma_test *t, enum mt76_rxq_id qid,
+ 		WRITE_ONCE(napi->list_owner, -1);
+ 	}
+ 	q->flags = flags;
++	/* not the reorder (RRO) rings, which only WED version 3 has */
++	if ((flags & MT_QFLAG_WED) && !(flags & MT_QFLAG_WED_RRO))
++		mt76_dma_test_wed_queue(dev, q);
+ 	KUNIT_ASSERT_EQ(t->test, dev->queue_ops->alloc(dev, q, qid, ndesc,
+ 			MT76_DMA_TEST_BUF_SIZE, MT76_DMA_TEST_RX_RING), 0);
+ 	return q;
+@@ -1861,8 +1934,8 @@ static void mt76_dma_test_rx_reset(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->q_rx[MT_RXQ_BAND2].queued, 0);
+ }
+ 
+-/* A WED tx-free ring is emptied by a reset but not refilled here: WED
+- * sets it up again itself.
++/* A reset empties a WED tx-free ring and sets it up for the WED again as
++ * at the start: its indexes reset, filled, then handed over.
+  */
+ static void mt76_dma_test_rx_reset_wed_txfree(struct kunit *test)
+ {
+@@ -1876,8 +1949,9 @@ static void mt76_dma_test_rx_reset_wed_txfree(struct kunit *test)
+ 
+ 	dev->queue_ops->rx_reset(dev, MT_RXQ_MAIN_WA);
+ 
+-	KUNIT_EXPECT_EQ(test, q->queued, 0);
+-	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 0x55);
++	KUNIT_EXPECT_EQ(test, q->queued, 7);
++	KUNIT_EXPECT_EQ(test, mt76_dma_test_qregs(q)->cpu_idx, 7);
++	KUNIT_EXPECT_EQ(test, q->flags, MT_WED_Q_TXFREE);
+ }
+ 
+ /* The NAPI poll processes its own queue and, with budget to spare,

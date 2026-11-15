@@ -1,0 +1,320 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:33:22 +0000
+Subject: [PATCH] wifi: mt76: mt7915: with WED, a station's counters only from
+ what counts them
+
+With a WED attached, bound flows pass the host by, so a station's statistics take its tx packets from the WA and its rx bytes and packets from the WO. Two cases gave wrong numbers:
+
+- The WA was asked about any station index, also one the firmware doesn't have: a station not yet associated, disconnected for its removal, or dropped by a full reset until mac80211 re-adds it, when the index may be another station's. A round trip to the firmware for nothing, under the device mutex, and the answer went to whoever had the index. Asked only about a station the firmware has now, as the rx rate is.
+
+- The WO counts what stations receive only once it was told to, at each start of the WED. If that request failed (the driver carries on without, since the counters feed nothing else), every station's rx bytes and packets read 0 until a later start got through. The driver remembers whether the WO counts, and until it does mac80211's own counters stand, of what reached the host.
+
+KUnit: mt7915-main (the statistics), mt7915-dma (starting the WED with a WO that takes the request or doesn't).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ mt7915/dma.c             |   1 +
+ mt7915/main.c            |  13 ++++-
+ mt7915/mt7915.h          |   2 +
+ mt7915/tests/dma-test.c  |  94 ++++++++++++++++++++++++++++++++++++
+ mt7915/tests/main-test.c | 100 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 208 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/dma.c b/mt7915/dma.c
+index e0ba39e5..529899cc 100644
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -320,6 +320,7 @@ int mt7915_dma_start(struct mt7915_dev *dev, bool reset, bool wed_reset)
+ 		 * WED and the interrupts disabled if they can't be enabled
+ 		 */
+ 		ret = mt7915_mcu_wed_enable_rx_stats(dev);
++		dev->wed_rx_stats = !ret;
+ 		if (ret)
+ 			dev_warn(mdev->dev,
+ 				 "failed to enable WED rx stats: %d\n", ret);
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 722d2ead..e021a879 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1326,12 +1326,21 @@ static void mt7915_sta_statistics(struct ieee80211_hw *hw,
+ 		sinfo->tx_bytes = msta->wcid.stats.tx_bytes;
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
+ 
+-		if (!mt7915_mcu_wed_wa_tx_stats(phy->dev, msta->wcid.idx)) {
++		/* the WA's count, of a station the firmware has: as the rx
++		 * rate above
++		 */
++		if (msta->wcid.sta &&
++		    !mt7915_mcu_wed_wa_tx_stats(phy->dev, msta->wcid.idx)) {
+ 			sinfo->tx_packets = msta->wcid.stats.tx_packets;
+ 			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
+ 		}
+ 
+-		if (mtk_wed_get_rx_capa(&phy->dev->mt76.mmio.wed)) {
++		/* the WO counts what's received only once it was told to:
++		 * until then mac80211's own count stands, of what reached the
++		 * host
++		 */
++		if (mtk_wed_get_rx_capa(&phy->dev->mt76.mmio.wed) &&
++		    phy->dev->wed_rx_stats) {
+ 			sinfo->rx_bytes = msta->wcid.stats.rx_bytes;
+ 			sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BYTES64);
+ 
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 9a8165e3..25729c6e 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -452,6 +452,8 @@ struct mt7915_dev {
+ 	bool flash_mode;
+ 	bool muru_debug;
+ 	bool ibf;
++	/* the WO counts what each station receives (WED) */
++	bool wed_rx_stats;
+ 
+ 	u8 monitor_mask;
+ 
+diff --git a/mt7915/tests/dma-test.c b/mt7915/tests/dma-test.c
+index 3d880901..2415467a 100644
+--- a/mt7915/tests/dma-test.c
++++ b/mt7915/tests/dma-test.c
+@@ -354,6 +354,97 @@ static void mt7915_dma_test_start_reset(struct kunit *test)
+ 			BIT(0) | MT_INT_MCU_CMD);
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* A WED that only keeps count: whether the WO takes its messages, and the
++ * interrupt mask it was started with.
++ */
++static struct {
++	int msg_ret;
++	int n_msgs, n_start;
++	u32 start_mask;
++} mt7915_dma_test_wed;
++
++static int mt7915_dma_test_wed_msg(struct mtk_wed_device *wed, int cmd_id,
++				   void *data, int len)
++{
++	mt7915_dma_test_wed.n_msgs++;
++	return mt7915_dma_test_wed.msg_ret;
++}
++
++static void mt7915_dma_test_wed_start(struct mtk_wed_device *wed, u32 mask)
++{
++	mt7915_dma_test_wed.n_start++;
++	mt7915_dma_test_wed.start_mask = mask;
++}
++
++static u32 mt7915_dma_test_wed_irq_get(struct mtk_wed_device *wed, u32 mask)
++{
++	return 0;
++}
++
++static void mt7915_dma_test_wed_irq_set_mask(struct mtk_wed_device *wed,
++					     u32 mask)
++{
++}
++
++static const struct mtk_wed_ops mt7915_dma_test_wed_ops = {
++	.msg_update = mt7915_dma_test_wed_msg,
++	.start = mt7915_dma_test_wed_start,
++	.irq_get = mt7915_dma_test_wed_irq_get,
++	.irq_set_mask = mt7915_dma_test_wed_irq_set_mask,
++};
++
++static void mt7915_dma_test_wed_detach(void *data)
++{
++	struct mt7915_dev *dev = data;
++
++	tasklet_kill(&dev->mt76.irq_tasklet);
++	dev->mt76.mmio.wed.ops = NULL;
++}
++
++/* Starting DMA with a WED attached starts the WED with the tx-done interrupts
++ * too, whether or not the WO takes the request to count what stations
++ * receive; the driver remembers which, for the station statistics.
++ */
++static void mt7915_dma_test_start_wed(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_dma_test_dev(test);
++	u32 mask;
++
++	mt7915_dma_config(dev);
++	memset(&mt7915_dma_test_wed, 0, sizeof(mt7915_dma_test_wed));
++	dev->mt76.mmio.wed.ops = &mt7915_dma_test_wed_ops;
++	dev->mt76.mmio.wed.version = 2;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_dma_test_wed_detach, dev), 0);
++	mask = MT_INT_RX_DONE_MCU | MT_INT_TX_DONE_MCU | MT_INT_MCU_CMD |
++	       MT_INT_BAND0_RX_DONE | MT_INT_TX_DONE_BAND0 |
++	       MT_INT_TX_DONE_BAND1;
++
++	KUNIT_EXPECT_EQ(test, mt7915_dma_start(dev, false, true), 0);
++	tasklet_kill(&dev->mt76.irq_tasklet);
++	KUNIT_EXPECT_EQ(test, mt7915_dma_test_wed.n_msgs, 1);
++	KUNIT_EXPECT_EQ(test, mt7915_dma_test_wed.n_start, 1);
++	KUNIT_EXPECT_EQ(test, mt7915_dma_test_wed.start_mask, mask);
++	KUNIT_EXPECT_TRUE(test, dev->wed_rx_stats);
++
++	/* the WO doesn't answer: the WED starts all the same, without its
++	 * rx counters
++	 */
++	mt7915_dma_test_wed.msg_ret = -ETIMEDOUT;
++	KUNIT_EXPECT_EQ(test, mt7915_dma_start(dev, false, true), 0);
++	tasklet_kill(&dev->mt76.irq_tasklet);
++	KUNIT_EXPECT_EQ(test, mt7915_dma_test_wed.n_start, 2);
++	KUNIT_EXPECT_FALSE(test, dev->wed_rx_stats);
++
++	/* and has them again once a later start gets through */
++	mt7915_dma_test_wed.msg_ret = 0;
++	KUNIT_EXPECT_EQ(test, mt7915_dma_start(dev, false, true), 0);
++	tasklet_kill(&dev->mt76.irq_tasklet);
++	KUNIT_EXPECT_TRUE(test, dev->wed_rx_stats);
++}
++#endif
++
+ /* With a second PCIe interface (not on the MT7986) its WFDMA is started too
+  * and the host told to split the bands between the two.
+  */
+@@ -739,6 +830,9 @@ static struct kunit_case mt7915_dma_test_cases[] = {
+ 	KUNIT_CASE(mt7915_dma_test_disable_hif2),
+ 	KUNIT_CASE(mt7915_dma_test_start),
+ 	KUNIT_CASE(mt7915_dma_test_start_reset),
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_dma_test_start_wed),
++#endif
+ 	KUNIT_CASE(mt7915_dma_test_start_hif2),
+ 	KUNIT_CASE(mt7915_dma_test_enable),
+ 	KUNIT_CASE(mt7915_dma_test_mt7915),
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index c72ca90f..b98781fd 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -42,6 +42,9 @@ struct mt7915_main_test_fw {
+ 	struct mt7915_mcu_phy_rx_info rx;
+ 	bool sku;		/* answer tx power queries with @sku_val */
+ 	s8 sku_val[MT7915_SKU_RATE_NUM][2];
++	bool wa_tx;		/* answer the WA's tx count query ... */
++	u16 wa_wcid;		/* ... for this station ... */
++	u32 wa_packets;		/* ... with this many packets */
+ };
+ 
+ static void mt7915_main_test_reply(struct mt76_test_fake *fake,
+@@ -63,6 +66,14 @@ static void mt7915_main_test_reply(struct mt76_test_fake *fake,
+ 		   fw->sku && msg->data[0] == TX_POWER_LIMIT_INFO) {
+ 		skb_put_zero(reply, 4);
+ 		skb_put_data(reply, fw->sku_val, sizeof(fw->sku_val));
++	} else if (msg->cmd == MCU_WA_PARAM_CMD(QUERY) && fw->wa_tx) {
++		/* the MT7986's: four bytes, then the station and its counts */
++		__le32 v[4] = {
++			0, cpu_to_le32(fw->wa_wcid), 0,
++			cpu_to_le32(fw->wa_packets),
++		};
++
++		skb_put_data(reply, v, sizeof(v));
+ 	}
+ }
+ 
+@@ -3113,6 +3124,92 @@ static void mt7915_main_test_sta_statistics(struct kunit *test)
+ 			   BIT_ULL(NL80211_STA_INFO_TX_BITRATE));
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* an attached WED: these paths only ask whether there is one */
++static const struct mtk_wed_ops mt7915_main_test_wed_ops = {};
++
++static void mt7915_main_test_wed_detach(void *data)
++{
++	struct mtk_wed_device *wed = data;
++
++	wed->ops = NULL;
++}
++
++/* With a WED attached (version 2, the MT7986's, which receives too), bound
++ * flows pass the host by, so a station's counters are the firmware's: tx
++ * packets from the WA, asked only about a station the firmware has, and rx
++ * from the WO once it was told to count. Until it was, mac80211's own rx
++ * count stands rather than a zero.
++ */
++static void mt7915_main_test_sta_statistics_wed(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_main_test_fw *fw = fake->priv;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct station_info sinfo = {};
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	sta = mt7915_main_test_add_sta(test, hw, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	msta->wcid.stats.tx_bytes = 1000;
++	msta->wcid.stats.rx_bytes = 2000;
++	msta->wcid.stats.rx_packets = 20;
++	fw->wa_tx = true;
++	fw->wa_wcid = msta->wcid.idx;
++	fw->wa_packets = 7;
++	wed->ops = &mt7915_main_test_wed_ops;
++	wed->version = 2;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_main_test_wed_detach, wed), 0);
++	mt7915_main_test_clear(fake);
++
++	/* not associated (or disconnected for its removal, or dropped by a
++	 * full reset until it's re-added): the firmware isn't asked, about
++	 * its rate or its packets
++	 */
++	mt7915_sta_statistics(hw, vif, sta, &sinfo);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++	KUNIT_EXPECT_TRUE(test, sinfo.filled &
++			  BIT_ULL(NL80211_STA_INFO_TX_BYTES64));
++	KUNIT_EXPECT_EQ(test, sinfo.tx_bytes, 1000);
++	KUNIT_EXPECT_FALSE(test, sinfo.filled &
++			   BIT_ULL(NL80211_STA_INFO_TX_PACKETS));
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_packets, 0);
++
++	/* associated: the WA's packets; the WO wasn't told to count, so no
++	 * rx counters of its
++	 */
++	msta->wcid.sta = 1;
++	memset(&sinfo, 0, sizeof(sinfo));
++	mt7915_sta_statistics(hw, vif, sta, &sinfo);
++	KUNIT_EXPECT_NOT_NULL(test, mt76_test_find_msg(fake,
++						       MCU_WA_PARAM_CMD(QUERY)));
++	KUNIT_EXPECT_TRUE(test, sinfo.filled &
++			  BIT_ULL(NL80211_STA_INFO_TX_PACKETS));
++	KUNIT_EXPECT_EQ(test, sinfo.tx_packets, 7);
++	KUNIT_EXPECT_FALSE(test, sinfo.filled &
++			   BIT_ULL(NL80211_STA_INFO_RX_BYTES64));
++	KUNIT_EXPECT_FALSE(test, sinfo.filled &
++			   BIT_ULL(NL80211_STA_INFO_RX_PACKETS));
++
++	/* it was: its counters */
++	dev->wed_rx_stats = true;
++	memset(&sinfo, 0, sizeof(sinfo));
++	mt7915_sta_statistics(hw, vif, sta, &sinfo);
++	KUNIT_EXPECT_TRUE(test, sinfo.filled &
++			  BIT_ULL(NL80211_STA_INFO_RX_BYTES64));
++	KUNIT_EXPECT_EQ(test, sinfo.rx_bytes, 2000);
++	KUNIT_EXPECT_TRUE(test, sinfo.filled &
++			  BIT_ULL(NL80211_STA_INFO_RX_PACKETS));
++	KUNIT_EXPECT_EQ(test, sinfo.rx_packets, 20);
++}
++#endif
++
+ /* A rate control change of an associated station is queued for the rate
+  * control work, once, which updates the firmware's rate table; changes
+  * for a station that isn't associated are ignored.
+@@ -3873,6 +3970,9 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_sta_txpwr),
+ 	KUNIT_CASE(mt7915_main_test_sta_txpwr_auto),
+ 	KUNIT_CASE(mt7915_main_test_sta_statistics),
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_main_test_sta_statistics_wed),
++#endif
+ 	KUNIT_CASE(mt7915_main_test_sta_rc_update),
+ 	KUNIT_CASE(mt7915_main_test_set_bitrate_mask),
+ 	KUNIT_CASE(mt7915_main_test_post_channel_switch),
