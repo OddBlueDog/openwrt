@@ -1,0 +1,1 @@
+var e=`wg_in`,t=`wireguard_${e}`,n=[e,`${e}_port`,`${e}_dns`,`${e}_wan`,`${e}_lan`],r=`remote_access`;export{r as i,e as n,n as r,t};

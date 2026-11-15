@@ -37,6 +37,10 @@
 //   netifd, hostapd, dnsmasq and dnsproxy. snapshot=1 records everything at
 //   once, at most once a minute, when a Network Quality round loses the
 //   internet or DNS or a device gets NO TX.
+// - banIP's drops (the kernel's "banIP/<direction>/…" lines, when banIP
+//   logs them) stay out of system.log: MilkFlint's banIP monitor keeps them
+//   for the banIP page, and with scanners knocking all day they'd push
+//   everything else out;
 // - dns=1 (off unless turned on): the DNS log, dns.log. dnsmasq then logs
 //   every lookup (the Logs page turns its log-queries=extra on with this),
 //   and logd's millisecond times say how long each took, from the device's
@@ -200,7 +204,9 @@ if (dns_log)
 
 // ---- which system log lines are Wi-Fi lines ------------------------------
 
-const WIFI_KERNEL = /mt79|mt76|ieee80211|cfg80211|mac80211|phy[0-9]|wlan|-ap[0-9]|hostapd|wifi/i;
+// (the last three: the Ethernet driver's Wireless Ethernet Dispatch, whose
+// lines carry its device, "15010000.wed:", or its name)
+const WIFI_KERNEL = /mt79|mt76|ieee80211|cfg80211|mac80211|phy[0-9]|wlan|-ap[0-9]|hostapd|wifi|mtk_wed|[0-9a-f]\.wed[: ]|wed[0-9]/i;
 let trace = 0;	// lines left of a kernel warning's dump
 // hostapd's beacon report lines since the last sample, for rrm_replies()
 let beacon_lines = [];
@@ -242,7 +248,12 @@ function notable(rest) {
 		return false;
 	const tag = m[1], msg = m[3];
 	if (tag == 'procd')
-		return match(msg, /crash loop|Instance (network|wpad|hostapd|dnsmasq|dnsproxy)/) != null;
+		return match(msg, /crash loop|Instance (network|wpad|hostapd|dnsmasq|dnsproxy|adguardhome)/) != null;
+	if (tag == 'AdGuardHome')
+		return match(msg, /\[info\] starting adguard home/) != null;
+	// MilkFlint's monitor: lookups sent to AdGuard Home, or round it
+	if (tag == 'milkflint-adguardhome')
+		return true;
 	if (tag == 'netifd')
 		return match(msg, /Interface 'wan6?' /) != null;
 	if (tag == 'kernel')
@@ -356,14 +367,19 @@ function dns_lookup(ms, msg, live) {
 
 // The DNS services' own lines the DNS log copies: dnsproxy's errors and
 // warnings (an upstream timing out) and starts, dnsmasq's warnings and
-// restarts, procd restarting either.
+// restarts, AdGuard Home's errors, warnings and starts and MilkFlint's
+// monitor of it (lookups sent to it, or round it), procd restarting any.
 function dns_service(level, tag, msg) {
 	if (tag == 'dnsproxy')
 		return match(msg, / (ERROR|WARN) |starting dns proxy server/) != null;
 	if (tag == 'dnsmasq')
 		return level == 'warn' || level == 'err' || match(msg, /^(started, version|exiting on receipt)/) != null;
+	if (tag == 'AdGuardHome')
+		return match(msg, /\] \[(error|warn|warning)\] |\[info\] starting adguard home/) != null;
+	if (tag == 'milkflint-adguardhome')
+		return true;
 	if (tag == 'procd')
-		return match(msg, /(Instance|crash loop).*(dnsmasq|dnsproxy)/) != null;
+		return match(msg, /(Instance|crash loop).*(dnsmasq|dnsproxy|adguardhome)/) != null;
 	return false;
 }
 
@@ -468,7 +484,8 @@ function on_log_line(line) {
 			wrote = true;
 		}
 	}
-	if (system_log && !lookup && ms > system_log.since) {
+	const banip_drop = match(m[4], /^kern\.[a-z]+ kernel: (\[ *[0-9.]+\] )?banIP\//) != null;
+	if (system_log && !lookup && !banip_drop && ms > system_log.since) {
 		system_log.file.write(text);
 		state[system_log.path] = ms;
 		wrote = true;

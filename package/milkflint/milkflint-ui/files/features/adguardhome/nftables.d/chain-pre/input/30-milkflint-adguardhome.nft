@@ -1,0 +1,5 @@
+# MilkFlint (ui feature "adguardhome"): the DNS lookups its monitor sends to
+# AdGuard Home (port 53 redirected to 3053, table inet milkflint_adguardhome)
+# are let in from every inside zone, as the lookups to port 53 they were.
+# Only that redirect turns port 53 into 3053; nothing else is opened.
+meta l4proto { tcp, udp } th dport 3053 ct status dnat ct original proto-dst 53 counter accept comment "MilkFlint: DNS redirected to AdGuard Home"

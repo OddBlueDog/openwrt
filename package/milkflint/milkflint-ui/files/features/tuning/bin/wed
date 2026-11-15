@@ -1,0 +1,234 @@
+#!/bin/sh
+# Hardware flow offloading with Wireless Ethernet Dispatch (WED), from
+# milkflint.wifi.wed: "1" on, unset (or anything else) off.
+#
+# With it on, the SoC's packet engine forwards an established connection by
+# itself, Wi-Fi included: its packets no longer reach a CPU, so they pass by
+# everything the router does to packets in software. It needs the firewall's
+# flow offloading, software and hardware (flow_offloading, flow_offloading_hw),
+# and the Wi-Fi driver loaded with wed_enable=Y, which mt7915e reads only as
+# it loads. The driver isn't loaded again on a running router: the SoC's WED
+# doesn't come apart and together again cleanly, so the driver takes the
+# setting when the router next starts.
+#
+# One rule everywhere: while WED is on it wins, until it's turned off. What
+# can't work beside it is turned off and remembered, and put back as it was
+# when WED goes off:
+# - Smart Queue's queues (sqm), every one but the VPN's inside its tunnel: a
+#   hardware-forwarded packet never meets a queue, so a queue would shape only
+#   what's left. The internet port's and the guest networks' speed limits;
+# - the firewall's flow offloading, software and hardware, is turned on.
+# Remembered in milkflint.wed: sqm, the queues it turned off (section names),
+# and offload / offload_hw, what the firewall's two options were ("0" for
+# unset).
+# An access point (milkflint.mode.mode "ap") forwards nothing the hardware
+# could take over, so there WED is turned off again.
+#
+#   wed guard      hold the rule against the settings as they are now (a LuCI
+#                  edit, a restored backup, uci on the command line): changes
+#                  them where they break it, says so in the log, and has the
+#                  services take the change (reload_config). Also keeps
+#                  /etc/modules.conf in step (wed conf). milkflint-tuning
+#                  runs it on every start and reload
+#   wed conf       /etc/modules.conf's line for the driver, from the setting:
+#                  kmodloader loads mt7915e with it. A sysupgrade doesn't keep
+#                  that file, so preinit writes it again from the setting
+#                  before the modules load (81_milkflint-tuning)
+#   wed flowtable  a Wi-Fi interface appeared (the net hotplug,
+#                  30-milkflint-flowtable): with hardware offloading on, the
+#                  firewall's flow table lists every interface by itself, and
+#                  one made after the firewall loaded isn't in it, so what
+#                  arrives there takes the long way. Loads the firewall again
+#                  if its table would then differ
+#   wed status     wanted=, loaded=, active= for the page
+#
+# WED_ROOT (tests): a directory to find /etc/modules.conf, /sys and /var/run
+# under.
+
+R=${WED_ROOT:-}
+CONF=$R/etc/modules.conf
+PARAM=$R/sys/module/mt7915e/parameters/wed_enable
+LOCK=$R/var/run/milkflint-wed-flowtable.lock
+LINE='options mt7915e wed_enable=Y'
+
+log() {
+	logger -t milkflint-wed "$*"
+}
+
+wanted() {
+	[ "$(uci -q get milkflint.wifi.wed)" = 1 ]
+}
+
+# sqm's queue sections
+queues() {
+	uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p"
+}
+
+# <queue>: whether hardware-forwarded traffic passes it by. Not the VPN's:
+# what goes into the tunnel is never hardware-forwarded
+passed_by() {
+	[ "$(uci -q get "sqm.$1.interface")" != wg_out ]
+}
+
+# the firewall's defaults section
+fw_defaults() {
+	uci -q show firewall | sed -n "s/^firewall\.\([^.=]*\)=defaults$/\1/p" | head -n 1
+}
+
+# <config>: note it as changed, once
+CHANGED=
+changed() {
+	case " $CHANGED " in *" $1 "*) ;; *) CHANGED="$CHANGED $1" ;; esac
+}
+
+remember() {
+	[ -n "$(uci -q get milkflint.wed)" ] || uci set milkflint.wed=wed
+	changed milkflint
+}
+
+# WED on: Smart Queue off and flow offloading on, remembering what they were
+enforce() {
+	local q was fw off hw
+	for q in $(queues); do
+		passed_by "$q" || continue
+		[ "$(uci -q get "sqm.$q.enabled")" = 1 ] || continue
+		remember
+		was=$(uci -q get milkflint.wed.sqm)
+		case " $was " in
+		*" $q "*) ;;
+		*) uci set "milkflint.wed.sqm=${was:+$was }$q" ;;
+		esac
+		uci set "sqm.$q.enabled=0"
+		changed sqm
+		log "Smart Queue on $(uci -q get "sqm.$q.interface") (sqm.$q) turned off: hardware offloading (WED) is on, and the connections it forwards would pass the queue by. Turning WED off puts it back."
+	done
+	fw=$(fw_defaults)
+	[ -n "$fw" ] || return 0
+	off=$(uci -q get "firewall.$fw.flow_offloading")
+	hw=$(uci -q get "firewall.$fw.flow_offloading_hw")
+	[ "$off" = 1 ] && [ "$hw" = 1 ] && return 0
+	remember
+	# what they were before WED: kept from the first time, not from a later edit
+	[ -n "$(uci -q get milkflint.wed.offload)" ] || uci set "milkflint.wed.offload=${off:-0}"
+	[ -n "$(uci -q get milkflint.wed.offload_hw)" ] || uci set "milkflint.wed.offload_hw=${hw:-0}"
+	uci set "firewall.$fw.flow_offloading=1"
+	uci set "firewall.$fw.flow_offloading_hw=1"
+	changed firewall
+	log "The firewall's software and hardware flow offloading turned on: hardware offloading (WED) is on and needs both. Turning WED off puts them back."
+}
+
+# <defaults section> <option> <value>: a firewall offloading option back to
+# what it was ("0": unset or off, which fw4 reads the same, so an unset one
+# stays unset)
+put_back() {
+	local fw=$1 option=$2 value=$3
+	[ -n "$value" ] || return 0
+	[ "$(uci -q get "firewall.$fw.$option")" = "$value" ] && return 0
+	[ "$value" = 0 ] && [ -z "$(uci -q get "firewall.$fw.$option")" ] && return 0
+	uci set "firewall.$fw.$option=$value"
+	changed firewall
+}
+
+# WED off: what it turned off comes back, and what's remembered is forgotten
+restore() {
+	local q fw
+	[ -n "$(uci -q get milkflint.wed)" ] || return 0
+	for q in $(uci -q get milkflint.wed.sqm); do
+		[ "$(uci -q get "sqm.$q")" = queue ] || continue
+		[ "$(uci -q get "sqm.$q.enabled")" = 1 ] && continue
+		uci set "sqm.$q.enabled=1"
+		changed sqm
+		log "Smart Queue on $(uci -q get "sqm.$q.interface") (sqm.$q) turned back on: hardware offloading (WED) is off."
+	done
+	fw=$(fw_defaults)
+	if [ -n "$fw" ]; then
+		# hardware first: software off takes hardware with it
+		put_back "$fw" flow_offloading_hw "$(uci -q get milkflint.wed.offload_hw)"
+		put_back "$fw" flow_offloading "$(uci -q get milkflint.wed.offload)"
+	fi
+	uci delete milkflint.wed
+	changed milkflint
+}
+
+guard() {
+	local c
+	if wanted && [ "$(uci -q get milkflint.mode.mode)" = ap ]; then
+		uci delete milkflint.wifi.wed
+		changed milkflint
+		log "Hardware offloading (WED) turned off: as an access point the router forwards nothing it could take over."
+	fi
+	if wanted; then enforce; else restore; fi
+	conf
+	[ -n "$CHANGED" ] || return 0
+	for c in $CHANGED; do
+		uci commit "$c"
+	done
+	# sqm, firewall and milkflint-tuning each take their part; this script
+	# runs again from that and finds nothing left to change
+	reload_config
+}
+
+# /etc/modules.conf without the driver's WED option, wherever it was written
+without_option() {
+	[ -f "$CONF" ] || return 0
+	sed -e '/^[[:space:]]*options[[:space:]][[:space:]]*mt7915e[[:space:]]/s/[[:space:]][[:space:]]*wed_enable=[^[:space:]]*//g' \
+		-e '/^[[:space:]]*options[[:space:]][[:space:]]*mt7915e[[:space:]]*$/d' "$CONF"
+}
+
+conf() {
+	local new
+	new=$(
+		without_option
+		! wanted || echo "$LINE"
+	)
+	[ "$new" = "$(cat "$CONF" 2> /dev/null)" ] && return 0
+	[ -n "$new" ] || [ -f "$CONF" ] || return 0
+	printf '%s\n' "$new" > "$CONF.milkflint" && mv "$CONF.milkflint" "$CONF"
+}
+
+# a flow table's devices, one a line, sorted: from "devices = { a, b }"
+devices() {
+	sed -n 's/.*devices = {\(.*\)}.*/\1/p' | head -n 1 | tr -d '" ;\t' | tr ',' '\n' | sort
+}
+
+flowtable() {
+	local fw
+	fw=$(fw_defaults)
+	[ -n "$fw" ] && [ "$(uci -q get "firewall.$fw.flow_offloading_hw")" = 1 ] || return 0
+	# one at a time: a radio's networks appear within moments of each other
+	mkdir "$LOCK" 2> /dev/null || return 0
+	trap 'rmdir "$LOCK" 2> /dev/null' EXIT
+	sleep "${WED_SETTLE:-5}"
+	[ "$(fw4 print 2> /dev/null | devices)" = "$(nft list flowtable inet fw4 ft 2> /dev/null | devices)" ] && return 0
+	log "The firewall's flow table doesn't list every interface there is now: loading the firewall again."
+	fw4 -q reload
+}
+
+# whether a radio is attached to the SoC's WED right now: its debugfs prints
+# the rings only with a device attached
+active() {
+	local d
+	for d in "$R"/sys/kernel/debug/wed[0-9]*; do
+		[ -n "$(cat "$d/txinfo" 2> /dev/null)" ] && return 0
+	done
+	return 1
+}
+
+# wanted: the setting; loaded: Y or N as the loaded driver has it, nothing
+# without the driver; active: a radio is attached
+status() {
+	echo "wanted=$(wanted && echo 1 || echo 0)"
+	echo "loaded=$(cat "$PARAM" 2> /dev/null)"
+	echo "active=$(active && echo 1 || echo 0)"
+}
+
+case "$1" in
+guard) guard ;;
+conf) conf ;;
+flowtable) flowtable ;;
+status) status ;;
+*)
+	echo "usage: wed guard|conf|flowtable|status" >&2
+	exit 1
+	;;
+esac

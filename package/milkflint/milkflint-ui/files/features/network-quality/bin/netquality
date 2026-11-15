@@ -159,6 +159,17 @@ function as_list(v) {
 	return (type(v) == 'array') ? v : (v != null && v != '') ? [ v ] : [];
 }
 
+// AdGuard Home filters in front of them (ui feature "adguardhome": its
+// monitor's state)
+function adguardhome_on() {
+	try {
+		return json(readfile('/var/run/milkflint/adguardhome.json') ?? 'null')?.state == 'active';
+	}
+	catch (e) {
+		return false;
+	}
+}
+
 // The DNS servers devices' lookups go to, as the DNS page set them
 // (milkflint.dns.mode), each { key, host, addr }, at most four:
 // - encrypted: dnsproxy's upstreams, then its fallback, keyed by host name
@@ -194,8 +205,15 @@ function dns_targets() {
 		const ns = wan_dns_server();
 		push(out, { key: ns, host: ns, addr: ns });
 	}
-	return slice(out, 0, 4);
+	const targets = slice(out, 0, 4);
+	// AdGuard Home in front of them, while it filters (ui feature
+	// "adguardhome": its monitor's state): devices' lookups go through it
+	// first, so it gets a line too (last: the first server stays the score's)
+	if (adguardhome_on())
+		push(targets, { key: 'adguardhome', host: 'adguardhome', addr: '127.0.0.1#3053' });
+	return targets;
 }
+
 
 // time to resolve `domain` at `server`, in ms, or null on failure
 function dns_lookup(domain, server) {

@@ -348,7 +348,8 @@ function conntrack(members) {
 		if (!length(l))
 			continue;
 		out.n++;
-		const off = index(l, '[OFFLOAD]') >= 0;
+		// in software, or handed to the hardware (flow_offloading_hw)
+		const off = index(l, '[OFFLOAD]') >= 0 || index(l, '[HW_OFFLOAD]') >= 0;
 		if (off)
 			out.off++;
 		// a member's address anywhere on the line: its own connections, either way

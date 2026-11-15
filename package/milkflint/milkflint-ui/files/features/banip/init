@@ -1,0 +1,44 @@
+#!/bin/sh /etc/rc.common
+# banIP on MilkFlint (ui feature "banip"). banIP itself (/etc/init.d/banip)
+# does the blocking; this keeps what's around it in step with the router
+# (bin/banip-sync: banIP's own start at boot only while it's on and the
+# router isn't an access point, the update schedule in root's crontab,
+# Remote access's WireGuard ports always let through, the inside networks in
+# its allowlist), and runs the monitor while banIP is on (bin/banip-monitor:
+# its runs, drops and counters for the page; it only reads). Again whenever
+# banIP's, MilkFlint's, the network's or the firewall's settings change.
+
+# after banIP's own (95)
+START=96
+USE_PROCD=1
+
+wanted() {
+	[ -x /etc/init.d/banip ] || return 1
+	[ "$(uci -q get banip.global.ban_enabled)" = 1 ] || return 1
+	[ "$(uci -q get milkflint.mode.mode)" != ap ] || return 1
+	return 0
+}
+
+start_service() {
+	[ -x /etc/init.d/banip ] || return 0
+	/usr/bin/ucode /usr/libexec/milkflint/banip-sync all
+	wanted || return 0
+	procd_open_instance monitor
+	procd_set_param command /usr/bin/ucode /usr/libexec/milkflint/banip-monitor
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger banip milkflint network firewall
+}
+
+reload_service() {
+	if wanted; then
+		start
+	else
+		/usr/bin/ucode /usr/libexec/milkflint/banip-sync all
+		stop
+	fi
+}

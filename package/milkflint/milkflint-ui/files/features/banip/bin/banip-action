@@ -1,0 +1,28 @@
+#!/bin/sh
+# banip-action <start|restart|reload|report> (ui feature "banip"): banIP's
+# init, one at a time, after a run in progress has ended: banIP refuses to
+# start, restart or reload while one runs (its lock), and a save shouldn't be
+# lost to that. Started in the background by the page's rpcd methods.
+case "$1" in start | restart | reload | report) ;; *) exit 2 ;; esac
+exec 9> /var/run/milkflint-banip-action.lock
+flock 9
+# banIP's lock: a directory while a run is under way, with the run's pid
+n=900
+while [ -d /var/run/banIP/banIP.lock ] && [ $n -gt 0 ]; do
+	pid=$(cat /var/run/banIP/banIP.pid 2> /dev/null)
+	[ -n "$pid" ] && kill -0 "$pid" 2> /dev/null || break
+	sleep 1
+	n=$((n - 1))
+done
+if [ "$1" = report ]; then
+	exec nice -n 19 /etc/init.d/banip report gen
+fi
+[ "$(uci -q get banip.global.ban_enabled)" = 1 ] || exit 0
+[ "$(uci -q get milkflint.mode.mode)" != ap ] || exit 0
+# a start while it runs would leave banIP's lock behind for good (its init
+# makes the lock, procd keeps the instance as it is, and nothing takes the
+# lock away): every later restart and reload would then be refused
+if [ "$1" = start ] && /etc/init.d/banip running; then
+	exit 0
+fi
+exec /etc/init.d/banip "$1"

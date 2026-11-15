@@ -454,5 +454,12 @@ export function attempts_delta(a, b) {
 	const failed = (b?.failed ?? 0) - (a?.failed ?? 0);
 	if (failed < 0)
 		return null;
+	// A driver that has the counters but counted no frame: with Wireless
+	// Ethernet Dispatch attached it reads no frame's tries from the tx-free
+	// events, and only "failed" still moves, from another report. Nothing
+	// here to judge by, as without the counters: every frame would look
+	// failed, and a device lost after its first few.
+	if (frames == 0)
+		return null;
 	return { sends, delivered: max(0, frames - failed), failed };
 };

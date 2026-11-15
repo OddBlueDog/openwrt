@@ -1,0 +1,152 @@
+#!/usr/bin/ucode
+// banip-sync [all|networks] (ui feature "banip"): keeps what's around banIP
+// in step with the router. Run by MilkFlint's banIP init script (at boot and
+// whenever banip, milkflint, network or firewall settings change) and, for
+// the networks, every few minutes by the monitor (an IPv6 prefix can change
+// without a settings change). Idempotent: it writes only what differs.
+//
+// - banIP's own start at boot (/etc/init.d/banip enable) only while banIP is
+//   on and the router isn't an access point; in access point mode, or once
+//   turned off, a running banIP is stopped (its table goes);
+// - the update schedule (milkflint.banip: schedule, time, day) as a marked
+//   block of root's crontab, while banIP is on;
+// - WireGuard's listen ports (Remote access) in ban_allowflag, so devices
+//   away from home connect whatever the lists say: what MilkFlint added is
+//   remembered (milkflint.banip.managed_ports, managed_udp) and taken out
+//   again, the rest is the user's; banIP restarts when they change (its
+//   chains have them);
+// - the router's inside networks (home, guests, Remote access) in banIP's
+//   allowlist, as marked lines, in the file and the loaded set: banIP's log
+//   monitor then never blocks a device of your own.
+'use strict';
+
+import { readfile, access, popen } from 'fs';
+import { cursor } from 'uci';
+import * as b from '/usr/libexec/milkflint/banip.uc';
+
+if (!b.installed())
+	exit(0);
+
+const what = ARGV[0] ?? 'all';
+const c = cursor();
+const enabled = c.get('banip', 'global', 'ban_enabled') == '1';
+const ap = b.router_mode(c) == 'ap';
+const wanted = enabled && !ap;
+const banip_running = () => system('/etc/init.d/banip running > /dev/null 2>&1') == 0;
+
+function crontab() {
+	const CRONTAB = '/etc/crontabs/root';
+	const BEGIN = '# milkflint-banip begin (managed by the web interface)';
+	const END = '# milkflint-banip end';
+	const spec = wanted ? b.cron_spec(c.get('milkflint', 'banip', 'schedule') ?? 'daily', c.get('milkflint', 'banip', 'time'), c.get('milkflint', 'banip', 'day')) : null;
+	const old = readfile(CRONTAB) ?? '';
+	const kept = [];
+	let skip = false;
+	for (let l in split(old, '\n')) {
+		if (l == BEGIN)
+			skip = true;
+		else if (l == END)
+			skip = false;
+		else if (!skip)
+			push(kept, l);
+	}
+	while (length(kept) && kept[-1] == '')
+		pop(kept);
+	if (spec)
+		push(kept, BEGIN, `${spec} /usr/libexec/milkflint/banip-action reload`, END);
+	const text = length(kept) ? join('\n', kept) + '\n' : '';
+	if (text == old)
+		return;
+	b.write_atomic(CRONTAB, text, 0o600);
+	system('/etc/init.d/cron enable; /etc/init.d/cron restart');
+}
+
+function service() {
+	const on_boot = system('/etc/init.d/banip enabled') == 0;
+	if (wanted && !on_boot)
+		system('/etc/init.d/banip enable');
+	if (!wanted && on_boot)
+		system('/etc/init.d/banip disable');
+	if (!wanted && (banip_running() || b.table_loaded())) {
+		system('/etc/init.d/banip stop > /dev/null 2>&1');
+		system('nft delete table inet banIP > /dev/null 2>&1');
+	}
+	// back from access point mode (or turned on by hand): it starts
+	else if (wanted && !banip_running())
+		system('/usr/libexec/milkflint/banip-action start > /dev/null 2>&1 &');
+}
+
+function allowflag() {
+	const ports = b.wireguard_ports(c);
+	const managed = b.as_list(c.get('milkflint', 'banip', 'managed_ports'));
+	const managed_udp = c.get('milkflint', 'banip', 'managed_udp') == '1';
+	const now = b.as_list(c.get('banip', 'global', 'ban_allowflag'));
+	// the user's own: without what MilkFlint added before
+	const own = filter(now, (t) => !(index(managed, t) >= 0 || (t == 'udp' && managed_udp)));
+	let udp = false;
+	const want = [ ...own ];
+	if (length(ports)) {
+		if (index(own, 'udp') < 0) {
+			push(want, 'udp');
+			udp = true;
+		}
+		for (let p in ports)
+			if (index(want, p) < 0)
+				push(want, p);
+	}
+	// protocols first, as banIP's own examples have them
+	const protos = filter(want, (t) => t == 'tcp' || t == 'udp');
+	const rest = filter(want, (t) => t != 'tcp' && t != 'udp');
+	const text = join(' ', [ ...protos, ...rest ]);
+	const added = filter(ports, (p) => index(own, p) < 0);
+	let changed = false;
+	if (text != join(' ', now)) {
+		if (text == '')
+			c.delete('banip', 'global', 'ban_allowflag');
+		else
+			c.set('banip', 'global', 'ban_allowflag', text);
+		c.commit('banip');
+		changed = true;
+	}
+	if (join(' ', added) != join(' ', managed) || udp != managed_udp) {
+		if (c.get('milkflint', 'banip') == null)
+			c.set('milkflint', 'banip', 'banip');
+		if (length(added))
+			c.set('milkflint', 'banip', 'managed_ports', added);
+		else
+			c.delete('milkflint', 'banip', 'managed_ports');
+		c.set('milkflint', 'banip', 'managed_udp', udp ? '1' : '0');
+		c.commit('milkflint');
+	}
+	// its chains have the ports: a restart, once a run in progress is done
+	if (changed && wanted && banip_running())
+		system('/usr/libexec/milkflint/banip-action restart > /dev/null 2>&1 &');
+}
+
+function networks() {
+	const path = b.LISTS.allowlist;
+	const old = readfile(path) ?? '';
+	const before = b.parse_list(old);
+	const marker = `${b.MANAGED}inside network `;
+	const lines = [];
+	for (let e in before)
+		if (index(e.comment ?? '', marker) != 0 || e.kind == 'comment')
+			push(lines, e.text);
+	for (let n in b.inside_networks(c))
+		push(lines, b.format_entry(n.net, `${marker}${n.iface}`));
+	const text = length(lines) ? join('\n', lines) + '\n' : '';
+	if (text == old)
+		return;
+	b.write_atomic(path, text, 0o644);
+	b.apply_list('allowlist', before, b.parse_list(text));
+}
+
+if (what == 'all') {
+	service();
+	crontab();
+	if (wanted)
+		allowflag();
+}
+if (wanted)
+	networks();
+exit(0);

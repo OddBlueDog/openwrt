@@ -2,7 +2,8 @@
 // settings are doing right now. Each radio's best-effort AQL limits
 // (mac80211's debugfs), where packet steering put the network work, how
 // the internet port groups what it receives (GRO), and the drivers' latency
-// settings (their module parameters). Read-only: the settings
+// settings (their module parameters), and whether the Wi-Fi driver runs with
+// Wireless Ethernet Dispatch. Read-only: the settings
 // are uci (milkflint, network.globals, sqm), and
 // /etc/init.d/milkflint-tuning puts them into effect.
 'use strict';
@@ -195,6 +196,24 @@ function knobs() {
 	};
 }
 
+// Hardware offloading with WED (/usr/libexec/milkflint/wed status): whether the
+// setting asks for it, how the loaded Wi-Fi driver has it (null without the
+// driver; it takes the setting when the router starts), and whether a radio
+// is attached to the SoC's WED right now
+function wed() {
+	const kv = {};
+	for (let line in split(trim(run('/usr/libexec/milkflint/wed status')), '\n')) {
+		const m = match(line, /^([a-z]+)=(.*)$/);
+		if (m)
+			kv[m[1]] = m[2];
+	}
+	return {
+		wanted: kv.wanted == '1',
+		loaded: kv.loaded == 'Y' ? true : (kv.loaded == 'N' ? false : null),
+		active: kv.active == '1',
+	};
+}
+
 function kernel() {
 	return {
 		hz: tick_rate(),
@@ -208,7 +227,7 @@ return {
 	'milkflint.tuning': {
 		status: {
 			call: function() {
-				return { radios: radios(), steering: steering(), gro: gro(), kernel: kernel(), knobs: knobs() };
+				return { radios: radios(), steering: steering(), gro: gro(), kernel: kernel(), knobs: knobs(), wed: wed() };
 			}
 		}
 	}

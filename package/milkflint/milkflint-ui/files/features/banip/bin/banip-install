@@ -1,0 +1,14 @@
+#!/bin/sh
+# banip-install <msmtp|conntrack> (ui feature "banip"): a package banIP's
+# page can use that isn't in the image, from OpenWrt's package feed, in the
+# background: msmtp for banIP's e-mail, conntrack to end a blocked address's
+# open connections. Its progress and result: /tmp/milkflint-banip/install.json.
+case "$1" in msmtp | conntrack) ;; *) exit 2 ;; esac
+dir=/tmp/milkflint-banip
+mkdir -p $dir
+log=$dir/install.log
+printf '{ "busy": true, "package": "%s", "started": %s }\n' "$1" "$(date +%s)" > $dir/install.json
+{ apk update && apk add "$1"; } > $log 2>&1
+rc=$?
+tail -c 2000 $log | /usr/bin/ucode -e "import { stdin } from 'fs'; print(sprintf('%J\n', { busy: false, package: '$1', ok: $rc == 0, finished: time(), log: stdin.read('all') }));" > $dir/install.json.new
+mv $dir/install.json.new $dir/install.json

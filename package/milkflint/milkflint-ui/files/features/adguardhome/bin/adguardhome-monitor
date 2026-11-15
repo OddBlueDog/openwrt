@@ -1,0 +1,387 @@
+#!/usr/bin/ucode
+// AdGuard Home's monitor (ui feature "adguardhome", /etc/init.d/milkflint-
+// adguardhome): while AdGuard Home answers, its nftables table sends the
+// devices' DNS lookups to it; while it doesn't, the table is gone and
+// dnsmasq answers them, unfiltered, so the household keeps DNS.
+//
+// Every TICK_MS it asks AdGuard Home its health-check name (answered by
+// AdGuard Home itself, nothing upstream). The first answer puts the redirect
+// in; a check with no answer (asked twice, unless nothing listens on its
+// port, as after a crash) takes it out. The redirect (table
+// inet milkflint_adguardhome, before fw4's own port forwards):
+// - a lookup to the router's own address on port 53, from any interface of
+//   a zone that isn't an internet one (no masquerading: the home network,
+//   the guest networks, Remote access, any other inside zone);
+// - any lookup on port 53 from the zones where the DNS page catches devices
+//   with their own DNS (its milkflint_dns_intercept redirects), which would
+//   otherwise go to dnsmasq;
+// both to port DNS_PORT, keeping the device's own address. fw4's input
+// chain lets them in (its chain-pre include, 30-milkflint-adguardhome.nft).
+//
+// If AdGuard Home has stopped (procd gave up restarting it), it's started
+// again after RETRY_S. If the router's home address changed, AdGuard Home's
+// web interface follows it (its http.address), with AdGuard Home stopped
+// meanwhile. The state goes in STATE for the page and the Dashboard:
+//   { state: "starting" | "active" | "fallback", since, reason, checked,
+//     home: [devices], intercept: [devices], restarts }
+'use strict';
+
+import { readfile, writefile, mkdir, access } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+import * as agh from './adguardhome.uc';
+
+const TICK_MS = 500;
+// the state file, at least this often (else when it changes)
+const SAVE_EVERY_S = 5;
+const ZONES_EVERY_S = 30;
+const RETRY_S = 300;
+const TABLE = 'milkflint_adguardhome';
+// the page writes it (a time) while it changes AdGuard Home's settings
+const PAUSE = '/var/run/milkflint/adguardhome.pause';
+
+let state = { state: 'starting', since: time(), reason: 'starting', checked: 0, home: [], intercept: [], restarts: 0, vpn: { state: 'off' } };
+const VPN_EVERY_S = 10;
+let vpn_at = 0;
+const vpn_uid = (() => {
+	const m = match(readfile('/etc/passwd') ?? '', regexp(`(^|\\n)${agh.VPN_USER}:[^:]*:([0-9]+):`));
+	return m ? +m[2] : null;
+})();
+let redirect_on = false;
+let zones_at = 0;
+let stopped_at = null;
+let last_rules = null;
+let saved = null;
+
+// to the system log, as milkflint-adguardhome (the Logs page's DNS and debug
+// logs copy these lines)
+function log(msg) {
+	system(`logger -t milkflint-adguardhome ${agh.sh_quote(msg)}`);
+}
+
+function save(force) {
+	const now = time();
+	const text = sprintf('%J', { ...state, checked: null });
+	if (!force && text == saved && now - state.checked < SAVE_EVERY_S)
+		return;
+	mkdir('/var/run/milkflint', 0o755);
+	state.checked = now;
+	agh.write_atomic(agh.STATE, sprintf('%J', state), 0o644);
+	saved = text;
+}
+
+function set_state(s, reason) {
+	if (state.state != s || state.reason != reason) {
+		state.state = s;
+		state.reason = reason;
+		state.since = time();
+		if (s == 'fallback')
+			log(`AdGuard Home isn't answering (${reason}): devices get dnsmasq's answers, unfiltered`);
+		else if (s == 'active')
+			log('AdGuard Home answers: devices\' lookups go to it');
+	}
+}
+
+const as_list = (v) => (type(v) == 'array') ? v : (v != null && v != '') ? [ v ] : [];
+
+// the interfaces of the inside zones, and of the zones the DNS page's
+// intercept covers
+function zone_devices() {
+	const c = cursor();
+	const l3 = {};
+	for (let i in connect()?.call('network.interface', 'dump')?.interface ?? [])
+		if (i.l3_device || i.device)
+			l3[i.interface] = i.l3_device ?? i.device;
+	const devices = {};
+	const inside = [];
+	c.foreach('firewall', 'zone', (z) => {
+		const devs = [ ...as_list(z.device) ];
+		for (let n in as_list(z.network))
+			if (l3[n])
+				push(devs, l3[n]);
+		devices[z.name] = devs;
+		if (z.masq != '1' && z.enabled != '0')
+			for (let d in devs)
+				if (!(d in inside))
+					push(inside, d);
+	});
+	const caught = [];
+	c.foreach('firewall', 'redirect', (r) => {
+		if (!match(r['.name'], /^milkflint_dns_intercept(_[a-z0-9_]+)?$/) || r.enabled == '0')
+			return;
+		for (let d in devices[r.src] ?? [])
+			if (!(d in caught))
+				push(caught, d);
+	});
+	return { home: sort(inside), intercept: sort(caught) };
+}
+
+function nft_set(name, type_, elems, interval) {
+	return `\tset ${name} {\n\t\ttype ${type_}\n` + (interval ? '\t\tflags interval\n\t\tauto-merge\n' : '') +
+		(length(elems) ? `\t\telements = { ${join(', ', map(elems, (d) => (type_ == 'ifname') ? sprintf('%J', d) : d))} }\n` : '') +
+		'\t}\n';
+}
+
+function ruleset() {
+	const v = state.vpn;
+	const tunnel = v?.state == 'tunnel';
+	const mark = `meta mark & ${agh.VPN_MASK} == ${agh.VPN_MARK}`;
+	let text = `table inet ${TABLE}\ndelete table inet ${TABLE}\n` +
+		`table inet ${TABLE} {\n` +
+		nft_set('home', 'ifname', state.home) +
+		nft_set('intercept', 'ifname', state.intercept) +
+		'\tchain dstnat {\n' +
+		'\t\ttype nat hook prerouting priority dstnat - 5; policy accept;\n' +
+		`\t\tmeta l4proto { tcp, udp } th dport 53 iifname @home fib daddr type local counter redirect to :${agh.DNS_PORT} comment "MilkFlint: lookups to the router go to AdGuard Home"\n` +
+		`\t\tmeta l4proto { tcp, udp } th dport 53 iifname @intercept counter redirect to :${agh.DNS_PORT} comment "MilkFlint: the DNS page's caught lookups go to AdGuard Home"\n` +
+		'\t}\n';
+	if (tunnel) {
+		// the VPN's devices: a lookup from an address AdGuard Home doesn't
+		// know as theirs yet (a new IPv6 address, say) would take the way out
+		// past the tunnel: refused, so the device asks again another way
+		// (IPv4, or once the address is known); and the VPN dnsproxy's own
+		// traffic carries the VPN's mark, into the tunnel
+		const v4 = filter(v.ids, (a) => index(a, ':') < 0), v6 = filter(v.ids, (a) => index(a, ':') >= 0);
+		text += nft_set('vpn4', 'ipv4_addr', v4, true) + nft_set('vpn6', 'ipv6_addr', v6, true) +
+			'\tchain vpn_guard {\n' +
+			'\t\ttype filter hook prerouting priority mangle + 10; policy accept;\n';
+		for (let where in [ 'fib daddr type local', 'iifname @intercept' ]) {
+			text += `\t\t${mark} meta l4proto { tcp, udp } th dport 53 ${where} meta nfproto ipv4 ip saddr != @vpn4 counter reject comment "MilkFlint: a VPN device AdGuard Home doesn't know yet"\n`;
+			text += `\t\t${mark} meta l4proto { tcp, udp } th dport 53 ${where} meta nfproto ipv6 ip6 saddr != @vpn6 counter reject comment "MilkFlint: a VPN device AdGuard Home doesn't know yet"\n`;
+		}
+		text += '\t}\n';
+		if (vpn_uid != null)
+			text += '\tchain vpn_out {\n' +
+				'\t\ttype route hook output priority mangle; policy accept;\n' +
+				`\t\tmeta skuid ${vpn_uid} meta mark set meta mark & 0x0fffffff | ${agh.VPN_MARK} counter comment "MilkFlint: the VPN devices' lookups go out through the tunnel"\n` +
+				'\t}\n';
+	}
+	return text + '}\n';
+}
+
+// ---- devices sent through the VPN ---------------------------------------------
+
+
+// the VPN's own dnsproxy (milkflint-adguardhome's "vpn" instance) runs
+function forwarder_up() {
+	const svc = connect()?.call('service', 'list', { name: 'milkflint-adguardhome' });
+	return svc?.['milkflint-adguardhome']?.instances?.vpn?.running == true;
+}
+
+// What the VPN client page sends through the tunnel, as AdGuard Home needs
+// it: { state: 'off' | 'automatic' (the DNS page uses the provider's servers,
+// which don't answer through a VPN) | 'forwarder' (its dnsproxy isn't
+// running) | 'tunnel', ids, skip, conflicts }
+function vpn_wanted() {
+	const c = cursor();
+	const d = agh.vpn_devices(c);
+	if (!d)
+		return { state: 'off' };
+	if (!agh.vpn_upstreams(c))
+		return { state: 'automatic' };
+	if (!forwarder_up())
+		return { state: 'forwarder' };
+	const dump = connect()?.call('network.interface', 'dump')?.interface ?? [];
+	let ids = [], skip = [];
+	if (d.home == 'all')
+		ids = [ ...ids, ...agh.zone_subnets('lan', dump) ];
+	else if (d.home == 'only')
+		ids = [ ...ids, ...agh.addresses_of(d.macs) ];
+	if (d.home == 'all' && length(d.skip))
+		skip = agh.addresses_of(d.skip);
+	for (let g in d.guests)
+		ids = [ ...ids, ...agh.zone_subnets(g, dump) ];
+	return { state: 'tunnel', ids: uniq(ids), skip: uniq(skip) };
+}
+
+// AdGuard Home's two clients as `w` needs them: added, changed (only their
+// addresses and upstreams: what else is set on them in its web interface
+// stays) or removed. An address another client has already (AdGuard Home
+// allows each once) stays with that one: listed in `conflicts`.
+function vpn_clients(w) {
+	const have = agh.api('GET', '/control/clients');
+	if (type(have) != 'object')
+		return false;
+	const list = have.clients ?? [];
+	const theirs = {};
+	for (let cl in list)
+		if (!(cl.name in [ agh.VPN_CLIENT, agh.NOVPN_CLIENT, agh.ROUTER_CLIENT ]))
+			for (let id in cl.ids ?? [])
+				theirs[id] = cl.name;
+	const domain = cursor().get('dhcp', '@dnsmasq[0]', 'domain') ?? 'lan';
+	const tunnel = w.state == 'tunnel';
+	w.conflicts = tunnel ? uniq(filter(map(w.ids, (id) => theirs[id]), (n) => n != null)) : [];
+	const put = (name, ids, upstreams) => {
+		const cur = filter(list, (cl) => cl.name == name)[0];
+		if (!length(ids)) {
+			if (cur)
+				agh.api('POST', '/control/clients/delete', { name });
+			return;
+		}
+		if (cur && sprintf('%J', sort([ ...(cur.ids ?? []) ])) == sprintf('%J', sort([ ...ids ])) &&
+		    sprintf('%J', cur.upstreams ?? []) == sprintf('%J', upstreams))
+			return;
+		const data = cur ? { ...cur, ids, upstreams } : {
+			name, ids, upstreams, tags: [],
+			use_global_settings: true, use_global_blocked_services: true,
+			filtering_enabled: true, parental_enabled: false, safebrowsing_enabled: false,
+			safe_search: { enabled: false },
+			ignore_querylog: false, ignore_statistics: false,
+			upstreams_cache_enabled: false, upstreams_cache_size: 0
+		};
+		if (cur)
+			agh.api('POST', '/control/clients/update', { name, data });
+		else
+			agh.api('POST', '/control/clients/add', data);
+	};
+	put(agh.VPN_CLIENT, tunnel ? filter(w.ids, (id) => !theirs[id]) : [], [ `[/${domain}/]${agh.DNSMASQ}`, `127.0.0.1:${agh.VPN_PORT}` ]);
+	put(agh.NOVPN_CLIENT, tunnel ? filter(w.skip, (id) => !theirs[id]) : [], []);
+	// the router's own checks (Network Quality's probe, Test Bench) left out
+	// of its statistics and query log, which are about the devices
+	if (!length(filter(list, (cl) => cl.name == agh.ROUTER_CLIENT)) && !theirs['127.0.0.1'] && !theirs['::1'])
+		agh.api('POST', '/control/clients/add', {
+			name: agh.ROUTER_CLIENT, ids: [ '127.0.0.1', '::1' ], upstreams: [], tags: [],
+			use_global_settings: true, use_global_blocked_services: true,
+			filtering_enabled: true, parental_enabled: false, safebrowsing_enabled: false,
+			safe_search: { enabled: false },
+			ignore_querylog: true, ignore_statistics: true,
+			upstreams_cache_enabled: false, upstreams_cache_size: 0
+		});
+	return true;
+}
+
+function vpn_sync() {
+	const w = vpn_wanted();
+	if (vpn_clients(w)) {
+		state.vpn = w;
+		vpn_at = time();
+	}
+}
+
+function nft(text) {
+	const f = '/var/run/milkflint/adguardhome.nft';
+	writefile(f, text);
+	return system(`nft -f ${f}`) == 0;
+}
+
+function redirect(on) {
+	if (on) {
+		const r = ruleset();
+		if (!redirect_on || r != last_rules) {
+			if (nft(r)) {
+				redirect_on = true;
+				last_rules = r;
+			}
+		}
+	}
+	else if (redirect_on || last_rules == null) {
+		system(`nft delete table inet ${TABLE} 2>/dev/null`);
+		redirect_on = false;
+		last_rules = '';
+	}
+}
+
+function running() {
+	const svc = connect()?.call('service', 'list', { name: 'adguardhome' });
+	for (let name, inst in svc?.adguardhome?.instances ?? {})
+		if (inst.running)
+			return true;
+	return false;
+}
+
+// One check: answered at once, else (unless nothing listens on its port, as
+// after a crash) once more straight away, so one lost packet doesn't count
+function answers() {
+	const a = agh.dns_alive(700);
+	if (a == true)
+		return true;
+	if (a == 'refused')
+		return false;
+	return agh.dns_alive(500) == true;
+}
+
+// its web interface on the home network's address, once that changed
+function follow_lan_address() {
+	const text = readfile(agh.CONFIG);
+	const tree = agh.yaml_parse(text);
+	const have = agh.value(tree, 'http.address');
+	const want = agh.web_address();
+	if (!have || have == want)
+		return;
+	const m = match(have, /^([0-9.]+):([0-9]+)$/);
+	// only MilkFlint's own setting, at an address the router no longer has
+	if (!m || +m[2] != agh.WEB_PORT || index(agh.cmd('ip -4 -o addr show') ?? '', ` ${m[1]}/`) >= 0)
+		return;
+	log(`the router's address changed: AdGuard Home's web interface moves to ${want}`);
+	system('/etc/init.d/adguardhome stop');
+	const fixed = agh.yaml_set(text, 'http.address', want);
+	if (fixed)
+		agh.write_atomic(agh.CONFIG, fixed, 0o600);
+	system(`chown adguardhome:adguardhome ${agh.CONFIG}`);
+	system('/etc/init.d/adguardhome start');
+}
+
+signal('SIGTERM', () => {
+	redirect(false);
+	set_state('fallback', 'monitor stopped');
+	save();
+	exit(0);
+});
+
+// the zones, networks or mode changed (its init's reload): read them again
+signal('SIGHUP', () => {
+	zones_at = 0;
+	vpn_at = 0;
+	follow_lan_address();
+});
+
+redirect(false);
+follow_lan_address();
+
+for (;;) {
+	if (time() - zones_at >= ZONES_EVERY_S) {
+		const z = zone_devices();
+		state.home = z.home;
+		state.intercept = z.intercept;
+		zones_at = time();
+	}
+
+	// the page is changing its settings (it's stopped meanwhile)
+	const pause_until = +(readfile(PAUSE) ?? '0');
+	if (pause_until > time()) {
+		// "starting": no warning while it loads its lists again afterwards
+		set_state('starting', 'restarting');
+		redirect(false);
+		stopped_at = null;
+	}
+	else if (answers()) {
+		stopped_at = null;
+		set_state('active', 'answering');
+		if (time() - vpn_at >= VPN_EVERY_S)
+			vpn_sync();
+		redirect(true);
+	}
+	else {
+		const up = running();
+		if (state.state == 'starting' && up && time() - state.since < 120) {
+			// still loading its lists: dnsmasq answers meanwhile
+			redirect(false);
+		}
+		else {
+			set_state('fallback', up ? 'not answering' : 'stopped');
+			redirect(false);
+			if (!up) {
+				if (stopped_at == null)
+					stopped_at = time();
+				if (time() - stopped_at >= RETRY_S) {
+					log('starting AdGuard Home again');
+					state.restarts++;
+					stopped_at = time();
+					system('/etc/init.d/adguardhome start');
+				}
+			}
+		}
+	}
+	save();
+	sleep(TICK_MS);
+}

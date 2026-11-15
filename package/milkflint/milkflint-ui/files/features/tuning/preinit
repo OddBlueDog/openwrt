@@ -1,0 +1,13 @@
+# MilkFlint performance tuning (ui feature "tuning"), installed as
+# /lib/preinit/81_milkflint-tuning: writes /etc/modules.conf's line that loads
+# the Wi-Fi driver with Wireless Ethernet Dispatch from the setting
+# (milkflint.wifi.wed, /usr/libexec/milkflint/wed). A sysupgrade keeps the
+# setting but not that file, and a restored backup or uci on the command line
+# changes one without the other. Runs after 80_mount_root has restored the
+# kept config, before /etc/init.d/boot's kmodloader loads the driver.
+
+milkflint_tuning_preinit() {
+	/usr/libexec/milkflint/wed conf
+}
+
+boot_hook_add preinit_main milkflint_tuning_preinit

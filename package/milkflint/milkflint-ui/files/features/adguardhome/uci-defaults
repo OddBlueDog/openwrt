@@ -1,0 +1,30 @@
+#!/bin/sh
+# AdGuard Home (ui feature "adguardhome"): in the image, off until it's
+# turned on on its page. Its updates come from MilkFlint's own package feed:
+# a repository tagged @milkflint, next to the kmod feed's (same site, same
+# signing key), and apk's world asks for adguardhome@milkflint, so OpenWrt's
+# feed (which has a package of the same name, built another way) can't
+# replace it. Safe to run again (it is, after every upgrade).
+[ -x /usr/bin/AdGuardHome ] || exit 0
+
+list=/etc/apk/repositories.d/milkflint.list
+arch=$(head -n 1 /etc/apk/arch 2> /dev/null)
+# the kmod feed's site (patch 0055 writes kmods.list from the build's
+# CONFIG_VERSION_KMODS_REPO), else MilkFlint's own
+site=$(sed -n 's#^\(https\{0,1\}://[^/]*\)/targets/.*#\1#p' /etc/apk/repositories.d/kmods.list 2> /dev/null | head -n 1)
+[ -n "$site" ] || site=https://milkflint-packages.pages.dev
+if [ -n "$arch" ] && ! grep -q '^@milkflint ' "$list" 2> /dev/null; then
+	cat > "$list" <<-EOF
+	# MilkFlint's own packages (AdGuard Home), tagged: only what asks for
+	# @milkflint comes from here
+	@milkflint $site/packages/$arch/milkflint/packages.adb
+	EOF
+fi
+if grep -q '^@milkflint ' "$list" 2> /dev/null && grep -q '^adguardhome\(><.*\)\{0,1\}$' /etc/apk/world; then
+	sed -i 's/^adguardhome\(><.*\)\{0,1\}$/adguardhome@milkflint/' /etc/apk/world
+fi
+
+# the service stays off until the page turns it on (its own init checks
+# adguardhome.config.enabled), and the monitor runs once it's on
+/etc/init.d/milkflint-adguardhome enable
+exit 0

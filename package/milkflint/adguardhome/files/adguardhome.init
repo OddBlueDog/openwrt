@@ -1,0 +1,73 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+# MilkFlint's AdGuard Home service, from the packages feed's (net/adguardhome):
+# runs only once turned on (adguardhome.config.enabled), as its own account in
+# a jail, with no extra privileges (MilkFlint's settings give it ports above
+# 1024), and never offers to update itself (--no-check-update: updates come
+# from MilkFlint's package feed). It logs to the system log. If it keeps
+# failing, procd gives up after 5 tries; MilkFlint's monitor
+# (/etc/init.d/milkflint-adguardhome) answers DNS without it meanwhile.
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/AdGuardHome
+QUERYLOG_DIR=/tmp/adguardhome
+
+start_service() {
+	config_load adguardhome
+
+	local enabled config_file work_dir user group verbose gc maxprocs memlimit
+	config_get_bool enabled config enabled 0
+	[ "$enabled" = 1 ] || return 0
+	# MilkFlint as an access point: the main router answers DNS
+	[ "$(uci -q get milkflint.mode.mode)" != ap ] || return 0
+	config_get config_file config config_file /etc/adguardhome/AdGuardHome.yaml
+	config_get work_dir config work_dir /srv/adguardhome
+	config_get user config user adguardhome
+	config_get group config group adguardhome
+	config_get_bool verbose config verbose 0
+	config_get gc config gc 0
+	config_get maxprocs config maxprocs 0
+	config_get memlimit config memlimit 0
+
+	# MilkFlint's page writes it before turning the service on: without it,
+	# AdGuard Home would start its setup wizard on every address
+	[ -s "$config_file" ] || { echo "adguardhome: no $config_file" >&2; return 1; }
+
+	local config_dir
+	config_dir=$(dirname "$config_file")
+	[ "$config_dir" != /etc ] || { echo 'adguardhome: its settings need a directory of their own' >&2; return 1; }
+	mkdir -m 0700 -p "$config_dir" "$work_dir" "$QUERYLOG_DIR"
+	chown -R "$user:$group" "$config_dir" "$work_dir" "$QUERYLOG_DIR"
+	chmod 0600 "$config_file"
+
+	procd_open_instance adguardhome
+	procd_set_param command "$PROG" --config "$config_file" --work-dir "$work_dir" \
+		--logfile syslog --no-check-update
+	[ "$verbose" = 1 ] && procd_append_param command --verbose
+	[ "$gc" -le 0 ] || procd_append_param env GOGC="$gc"
+	[ "$maxprocs" -le 0 ] || procd_append_param env GOMAXPROCS="$maxprocs"
+	# Go reads a bare number as bytes
+	[ "$memlimit" -le 0 ] || procd_append_param env GOMEMLIMIT="${memlimit}MiB"
+
+	procd_set_param user "$user"
+	procd_set_param group "$group"
+	procd_set_param no_new_privs 1
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn 600 5 5
+
+	# log: for the system log; procfs: it reads /proc/self/exe and /proc/net/arp
+	procd_add_jail adguardhome log procfs
+	procd_add_jail_mount_rw "$config_dir" "$work_dir" "$QUERYLOG_DIR"
+	procd_add_jail_mount /etc/hosts /etc/ssl/certs
+	config_list_foreach config jail_mount procd_add_jail_mount
+	config_list_foreach config jail_mount_rw procd_add_jail_mount_rw
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger adguardhome
+}

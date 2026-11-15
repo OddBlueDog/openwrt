@@ -1,0 +1,32 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] run-openwrt: no queue starts while hardware offloading (WED) is on
+
+With MilkFlint's hardware offloading with Wireless Ethernet Dispatch on
+(milkflint.wifi.wed), the SoC forwards established connections by itself:
+their packets reach no qdisc, so a queue would shape only what's left, as
+if that were the whole line. The setting turns the queues off in the config
+(and back on with it), but a queue set to run by hand, by LuCI between two
+reloads or by a restored backup would still start.
+
+A start now leaves such a queue alone and says why in the log. The VPN's
+queue (wg_out) starts as before: what goes into the tunnel is never
+forwarded in hardware.
+
+--- a/src/run-openwrt.sh
++++ b/src/run-openwrt.sh
+@@ -111,6 +111,15 @@
+     [ -z "$RUN_IFACE" -o "$RUN_IFACE" = "$IFACE" ] || return
+     [ "$(config_get "$section" enabled)" -eq 1 ] || return 0
+     [ -f "${SQM_STATE_DIR}/${IFACE}.state" ] && return
++    # MilkFlint: with hardware offloading (WED) on, the SoC forwards
++    # established connections by itself, past every queue; only the VPN's,
++    # inside its tunnel, still sees all of its traffic. A queue set to run
++    # all the same (uci by hand, a restored backup) doesn't start, and says
++    # why.
++    if [ "$IFACE" != wg_out ] && [ "$(uci -q get milkflint.wifi.wed)" = 1 ]; then
++        sqm_warn "${IFACE}: not started. Hardware offloading (WED) is on, and the connections it forwards would pass this queue by: turn WED off to use it."
++        return 0
++    fi
+
+     export UPLINK=$(config_get "$section" upload)
+     export DOWNLINK=$(config_get "$section" download)

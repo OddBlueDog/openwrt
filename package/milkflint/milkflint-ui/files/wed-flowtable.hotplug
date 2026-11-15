@@ -1,0 +1,14 @@
+# MilkFlint: with hardware flow offloading on, the firewall's flow table lists
+# every interface by itself (a bridge's ports rather than the bridge), as they
+# were when the firewall loaded. A Wi-Fi interface made later, when Wi-Fi comes
+# up after the firewall at boot or again after a restart or a radar check,
+# isn't in it: what arrives there takes the long way through the router, and
+# with Wireless Ethernet Dispatch never reaches the hardware. So as one
+# appears, the firewall loads again if its table would then differ
+# (/usr/libexec/milkflint/wed flowtable; nothing with hardware offloading off).
+# Installed as /etc/hotplug.d/net/30-milkflint-flowtable; hotplug-call sources
+# it, so it returns rather than exits.
+
+[ "$ACTION" = add ] && [ "$DEVTYPE" = wlan ] || return 0
+
+/usr/libexec/milkflint/wed flowtable > /dev/null 2>&1 &

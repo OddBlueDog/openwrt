@@ -14,6 +14,9 @@ define Package/milkflint-ui
   DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +rpcd-mod-iwinfo +uhttpd +uhttpd-mod-ubus \
 	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-resolv +ucode-mod-nl80211 +ucode-mod-socket +ethtool +milkflint-rtprio
   PKGARCH:=all
+  # the account the dnsproxy for devices sent through a VPN runs as (feature
+  # adguardhome): its traffic is marked for the tunnel by its owner
+  USERID:=adguardvpn=854:adguardvpn=854
 endef
 
 define Package/milkflint-ui/description
@@ -24,6 +27,8 @@ endef
 
 define Package/milkflint-ui/conffiles
 /etc/config/milkflint
+/etc/milkflint/adguardhome.key
+/etc/milkflint/banip-feeds.json
 endef
 
 define Build/Compile
@@ -31,13 +36,14 @@ endef
 
 # Core files, then each feature's router side by convention
 # (files/features/<id>/: rpcd.uc, acl.json, init, uci-defaults, preinit, cgi,
-# bin/*). A preinit hook runs after preinit restores the config a sysupgrade
-# kept (80_mount_root), before anything in /etc/init.d. A cgi is served at
+# bin/*, nftables.d/<position>/<chain>/*.nft for fw4's includes). A preinit
+# hook runs after preinit restores the config a sysupgrade kept
+# (80_mount_root), before anything in /etc/init.d. A cgi is served at
 # /cgi-bin/milkflint-<id>.
 define Package/milkflint-ui/install
 	$(INSTALL_DIR) $(1)/www/milkflint $(1)/www/cgi-bin $(1)/usr/share/rpcd/acl.d $(1)/usr/share/rpcd/ucode \
 		$(1)/etc/uci-defaults $(1)/etc/init.d $(1)/usr/libexec/milkflint $(1)/usr/libexec/platform \
-		$(1)/etc/hotplug.d/ieee80211 $(1)/etc/hotplug.d/iface $(1)/lib/preinit $(1)/etc/sysctl.d
+		$(1)/etc/hotplug.d/ieee80211 $(1)/etc/hotplug.d/iface $(1)/etc/hotplug.d/net $(1)/lib/preinit $(1)/etc/sysctl.d
 	$(CP) ./htdocs/* $(1)/www/milkflint/
 	$(INSTALL_BIN) ./files/packet-steering.sh $(1)/usr/libexec/platform/packet-steering.sh
 	$(INSTALL_CONF) ./files/flowtable.sysctl $(1)/etc/sysctl.d/20-milkflint-flowtable.conf
@@ -46,6 +52,7 @@ define Package/milkflint-ui/install
 	$(INSTALL_DATA) ./files/wifi-spr.hotplug $(1)/etc/hotplug.d/ieee80211/33-milkflint-spr
 	$(INSTALL_DATA) ./files/wifi-twt.hotplug $(1)/etc/hotplug.d/ieee80211/34-milkflint-twt
 	$(INSTALL_DATA) ./files/cake-ecn.hotplug $(1)/etc/hotplug.d/iface/12-milkflint-cake-ecn
+	$(INSTALL_DATA) ./files/wed-flowtable.hotplug $(1)/etc/hotplug.d/net/30-milkflint-flowtable
 	$(INSTALL_DATA) ./files/milkflint.html $(1)/www/milkflint.html
 	$(INSTALL_DATA) ./files/acl.json $(1)/usr/share/rpcd/acl.d/milkflint-ui.json
 	$(INSTALL_DATA) ./files/rpcd.uc $(1)/usr/share/rpcd/ucode/milkflint
@@ -59,6 +66,7 @@ define Package/milkflint-ui/install
 		[ ! -f $$$$f/preinit ] || $(INSTALL_DATA) $$$$f/preinit $(1)/lib/preinit/81_milkflint-$$$$id; \
 		[ ! -f $$$$f/cgi ] || $(INSTALL_BIN) $$$$f/cgi $(1)/www/cgi-bin/milkflint-$$$$id; \
 		[ ! -d $$$$f/bin ] || $(INSTALL_BIN) $$$$f/bin/* $(1)/usr/libexec/milkflint/; \
+		[ ! -d $$$$f/nftables.d ] || { $(INSTALL_DIR) $(1)/usr/share/nftables.d && $(CP) $$$$f/nftables.d/* $(1)/usr/share/nftables.d/; }; \
 	done
 endef
 

@@ -1,0 +1,13 @@
+{
+	"milkflint-banip": {
+		"description": "MilkFlint web interface: banIP",
+		"read": {
+			"ubus": { "milkflint.banip": [ "status", "config", "list_get", "search", "survey", "report", "drops", "log", "mail_get" ] },
+			"uci": [ "banip", "milkflint" ]
+		},
+		"write": {
+			"ubus": { "milkflint.banip": [ "set", "enable", "action", "list_set", "entry", "unblock", "allow", "feed", "feed_test", "lookup", "flush", "install", "mail_set", "mail_test" ] },
+			"uci": [ "banip", "milkflint" ]
+		}
+	}
+}

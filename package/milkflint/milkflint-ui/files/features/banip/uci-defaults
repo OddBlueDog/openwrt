@@ -1,0 +1,44 @@
+#!/bin/sh
+# banIP (ui feature "banip"): in the image, off until it's turned on on its
+# page. The first time (a new install, or an upgrade from a MilkFlint without
+# it), MilkFlint's choices for banIP's options that aren't set yet: its
+# flood limits off (each is one allowance for the whole internet, so a flood
+# from one address would take the household's ping replies, path-MTU and
+# IPv6 neighbour messages with it, and fw4 already limits SYNs per address),
+# its rules and sets counting hits (the page's numbers), blocked connections
+# from devices logged, its start triggered by the internet interfaces coming
+# up, and a daily update at a time of its own between 3 and 6 a.m. banIP's
+# own start at boot stays off while banIP is off (it would only log that it's
+# off). Safe to run again (it is, after every upgrade): then it only writes
+# banIP's custom feed file again from its (maybe newer) catalogue and the
+# page's own feeds, unless that file was edited by hand.
+[ -x /etc/init.d/banip ] || exit 0
+
+if [ -z "$(uci -q get milkflint.banip)" ]; then
+	uci -q batch <<-UCI
+	set milkflint.banip=banip
+	set milkflint.banip.schedule='daily'
+	set milkflint.banip.time='$(awk 'BEGIN { srand(); printf "%02d:%02d", 3 + int(rand() * 3), int(rand() * 60) }')'
+	set milkflint.banip.preset='off'
+	UCI
+	for o in icmplimit synlimit udplimit; do
+		[ -n "$(uci -q get banip.global.ban_$o)" ] || uci -q set banip.global.ban_$o=0
+	done
+	[ -n "$(uci -q get banip.global.ban_nftcount)" ] || uci -q set banip.global.ban_nftcount=1
+	[ -n "$(uci -q get banip.global.ban_logoutbound)" ] || uci -q set banip.global.ban_logoutbound=1
+	if [ -z "$(uci -q get banip.global.ban_trigger)" ]; then
+		for z in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='wan'$/\1/p"); do
+			for n in $(uci -q get "firewall.$z.network"); do
+				uci -q add_list banip.global.ban_trigger="$n"
+			done
+		done
+	fi
+	[ -n "$(uci -q get banip.global.ban_enabled)" ] || uci -q set banip.global.ban_enabled=0
+	uci -q commit banip
+	uci -q commit milkflint
+fi
+
+[ "$(uci -q get banip.global.ban_enabled)" = 1 ] || /etc/init.d/banip disable
+/etc/init.d/milkflint-banip enable
+/usr/bin/ucode -e 'import * as b from "/usr/libexec/milkflint/banip.uc"; b.sync_custom();' > /dev/null 2>&1
+exit 0

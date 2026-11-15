@@ -18,7 +18,8 @@
 //   {"t": <router ms>, "p": <phase>, "s": "<site>", "k": "cold|up|warm|again",
 //    "ms": <ms | null>, "rc": <rcode | null>, "n": <A answers>, "ttl": <lowest TTL | null>, "fw": <forwarded | null>}
 // (null ms: no answer in TIMEOUT_MS), after a first line saying what the
-// upstream is: {"upstream": "dnsproxy" | "server" | null}. No addresses.
+// upstream is and which way lookups go in: {"upstream": "dnsproxy" | "server" |
+// null, "via": "dnsmasq" | "adguardhome"}. No addresses.
 'use strict';
 
 import { open, readfile, readlink, rename, stat, writefile } from 'fs';
@@ -45,7 +46,22 @@ const MAX_CUSTOM = 8;
 // a round of lookups at most this often in a phase; one lookup waits this long for its answer
 const ROUND_MS = 10000;
 const TIMEOUT_MS = 3000;
-const DNSMASQ = { address: '127.0.0.1', port: 53 };
+// The devices' way in: dnsmasq, or AdGuard Home (in front of dnsmasq) while
+// it answers them (ui feature "adguardhome": its monitor's state), so the
+// lookups take the same path theirs do. Its cache is off: dnsmasq's
+// forwarded counter still tells cached from passed on.
+function router_dns() {
+	try {
+		const s = json(readfile('/var/run/milkflint/adguardhome.json') ?? 'null');
+		if (s?.state == 'active')
+			return { address: '127.0.0.1', port: 3053, via: 'adguardhome' };
+	}
+	catch (e) {
+		// no AdGuard Home
+	}
+	return { address: '127.0.0.1', port: 53, via: 'dnsmasq' };
+}
+const DNSMASQ = router_dns();
 
 function mono_ms() {
 	const c = clock(true);
@@ -209,7 +225,7 @@ const bus = connect();
 const forwarded = () => bus?.call('dnsmasq', 'metrics', {})?.dns_queries_forwarded;
 
 const out = open(`${RUN}/dns.jsonl`, 'a');
-out?.write(sprintf('%J\n', { upstream: up?.kind }));
+out?.write(sprintf('%J\n', { upstream: up?.kind, via: DNSMASQ.via }));
 out?.flush();
 
 function record(t, p, site, k, r, fw) {

@@ -152,6 +152,14 @@ return {
 					return newest(map(tail(RADAR, n), (l) => replace(l, /^(.{24}) \[[0-9]+\.[0-9]+\]/, '$1')));
 				if (kind == 'crash')
 					return newest(crash_lines(n, s));
+				// banIP's own lines (its runs); its drops are on its page
+				// (MilkFlint's banIP monitor keeps them), and the keeper keeps
+				// them out of system.log
+				if (kind == 'banip') {
+					if (s.persist && stat(DISK + '/system.log'))
+						return newest(run(`cat ${DISK}/system.log.old ${DISK}/system.log 2>/dev/null | grep ' banIP-' | tail -n ${n}`));
+					return newest(run(`logread -e 'banIP-' | tail -n ${n}`));
+				}
 				if (s.persist && stat(DISK + '/system.log')) {
 					if (kind == 'kernel')
 						return newest(run(`cat ${DISK}/system.log.old ${DISK}/system.log | grep ' kernel: ' | tail -n ${n}`));

@@ -1,0 +1,111 @@
+#!/bin/sh /etc/rc.common
+# AdGuard Home's monitor (ui feature "adguardhome"): runs while AdGuard Home
+# is turned on (adguardhome.config.enabled) and the router isn't an access
+# point, and sends the devices' DNS lookups to AdGuard Home while it answers
+# (bin/adguardhome-monitor). Off, or stopped, its nftables table is gone and
+# dnsmasq answers everyone, as without AdGuard Home. It starts again when
+# the zones, the networks or the mode change (they decide which interfaces
+# the redirect covers).
+
+START=96
+STOP=05
+USE_PROCD=1
+
+TABLE=milkflint_adguardhome
+
+wanted() {
+	[ -x /usr/bin/AdGuardHome ] || return 1
+	[ "$(uci -q get adguardhome.config.enabled)" = 1 ] || return 1
+	[ "$(uci -q get milkflint.mode.mode)" != ap ] || return 1
+	return 0
+}
+
+# The VPN devices' own dnsproxy's arguments, one a line (none: not needed):
+# the DNS page's servers (they're asked through the tunnel: its traffic
+# carries the VPN's mark), and while rebinding protection is on, answers
+# with an inside address turned into "no such name", as dnsmasq does
+vpn_args() {
+	ucode -e '
+		import * as a from "/usr/libexec/milkflint/adguardhome.uc";
+		import { cursor } from "uci";
+		const c = cursor();
+		const u = a.vpn_upstreams(c);
+		if (!u || !a.vpn_devices(c))
+			exit(0);
+		const out = [ "--listen", "127.0.0.1", "--port", `${a.VPN_PORT}`, "--timeout", "3s",
+			"--cache", "--cache-size", "4194304", "--hosts-file-enabled=false" ];
+		for (let x in u.upstream) push(out, "--upstream", x);
+		for (let x in u.fallback) push(out, "--fallback", x);
+		for (let x in u.bootstrap) push(out, "--bootstrap", x);
+		if (u.mode) push(out, "--upstream-mode", u.mode);
+		if (c.get("dhcp", "@dnsmasq[0]", "rebind_protection") != "0")
+			for (let n in [ "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+			                "172.16.0.0/12", "192.168.0.0/16", "::1/128", "::ffff:0:0/96", "fc00::/7", "fe80::/10" ])
+				push(out, "--bogus-nxdomain", n);
+		print(join("\n", out), "\n");
+	' 2> /dev/null
+}
+
+start_service() {
+	if ! wanted; then
+		nft delete table inet $TABLE 2> /dev/null
+		rm -f /var/run/milkflint/adguardhome.json
+		# an access point: another router answers DNS, so it isn't needed
+		[ "$(uci -q get milkflint.mode.mode)" != ap ] || /etc/init.d/adguardhome stop 2> /dev/null
+		return 0
+	fi
+	# back from access point mode, say
+	/etc/init.d/adguardhome running || /etc/init.d/adguardhome start
+	procd_open_instance monitor
+	procd_set_param command /usr/bin/ucode /usr/libexec/milkflint/adguardhome-monitor
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+
+	# devices sent through the VPN (the VPN client page): their lookups'
+	# upstream, inside the tunnel
+	local args
+	[ -x /usr/bin/dnsproxy ] && grep -q '^adguardvpn:' /etc/passwd && args=$(vpn_args)
+	if [ -n "$args" ]; then
+		local IFS='
+'
+		procd_open_instance vpn
+		procd_set_param command /usr/bin/dnsproxy $args
+		procd_set_param user adguardvpn
+		procd_set_param group adguardvpn
+		procd_set_param no_new_privs 1
+		procd_set_param respawn 3600 5 0
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_add_jail adguardvpn ronly log
+		procd_add_jail_mount /etc/ssl/certs/ca-certificates.crt
+		procd_close_instance
+	fi
+}
+
+service_stopped() {
+	nft delete table inet $TABLE 2> /dev/null
+	wanted || rm -f /var/run/milkflint/adguardhome.json
+	return 0
+}
+
+service_triggers() {
+	procd_add_reload_trigger adguardhome firewall network milkflint dhcp dnsproxy
+}
+
+# A change of zones, networks, the VPN or the DNS page's servers: the VPN's
+# dnsproxy starts, stops or changes with them (start: procd compares its
+# instances), and the monitor reads them again (SIGHUP), its redirect staying
+# meanwhile; turned off, or now an access point: it stops.
+reload_service() {
+	if ! wanted; then
+		stop
+		# an access point: another router answers DNS, so it isn't needed
+		[ "$(uci -q get milkflint.mode.mode)" != ap ] || /etc/init.d/adguardhome stop 2> /dev/null
+	elif /etc/init.d/milkflint-adguardhome running; then
+		start
+		procd_send_signal milkflint-adguardhome monitor HUP
+	else
+		start
+	fi
+}

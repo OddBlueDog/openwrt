@@ -1,0 +1,367 @@
+#!/usr/bin/ucode
+// banIP's monitor (procd service milkflint-banip, ui feature "banip"): runs
+// while banIP is on, and only reads. It follows banIP's lines in the system
+// log:
+// - its runs: when one starts (and for what: start, restart, reload), its
+//   stage (setting up its table, the lists, the domain names), each list
+//   that failed and why, when it ended, and an error that stopped it;
+// - the drops it logs (prefix banIP/<inbound|outbound|pre-…>/<policy>/<set>),
+//   parsed, in DROPS (RAM: at most 1 MB, the older one in DROPS_OLD), and
+//   counted per five minutes;
+// - its log monitor's blocks ("add IP … to blocklist"), in EVENTS;
+// and every five minutes it reads the counters of banIP's rules (they count
+// with ban_nftcount) for the drops per five minutes over the last day. After
+// a run, and every half hour, it has banIP regenerate its report (the page's
+// per-list numbers), while the lists are small enough for that to be quick.
+// Its state, for the page: STATE.
+'use strict';
+
+import { open, stat, rename, mkdir, readfile, popen, unlink } from 'fs';
+import * as b from '/usr/libexec/milkflint/banip.uc';
+
+const STEP = 300;
+const SLOTS = 288;
+const DROPS_MAX = 1024 * 1024;
+const EVENTS_MAX = 256 * 1024;
+// banIP's report lists every element of every set: only while that's quick
+const REPORT_MAX = 200000;
+const REPORT_EVERY = 1800;
+
+mkdir(b.DIR, 0o755);
+
+let state = b.read_state();
+if (type(state) != 'object' || state.version != 1)
+	state = { version: 1, last_ms: 0 };
+state.started = time();
+state.series ??= { step: STEP, end: 0, counted: [], logged: [], flood: [] };
+state.counters ??= {};
+state.events ??= { autoblocked: 0, remote: 0 };
+
+// written when something changed: at once for a run's events (the page
+// shows its progress), else every few seconds at most
+let dirty = true, urgent = true, saved = 0;
+function save(now) {
+	if (!dirty || (!urgent && now - saved < 5))
+		return;
+	b.write_atomic(b.STATE, sprintf('%J', state), 0o644);
+	dirty = urgent = false;
+	saved = now;
+}
+
+// ---- the series: five-minute slots, the newest last --------------------------------
+
+function slot_of(t) {
+	return t - (t % STEP);
+}
+
+function advance(t) {
+	const s = state.series;
+	const now = slot_of(t);
+	if (s.end == 0) {
+		s.end = now;
+		s.counted = [ 0 ];
+		s.logged = [ 0 ];
+		s.flood = [ 0 ];
+		return;
+	}
+	if (now <= s.end)
+		return;
+	let n = int((now - s.end) / STEP);
+	if (n > SLOTS)
+		n = SLOTS;
+	for (let i = 0; i < n; i++) {
+		push(s.counted, 0);
+		push(s.logged, 0);
+		push(s.flood, 0);
+	}
+	while (length(s.counted) > SLOTS) {
+		shift(s.counted);
+		shift(s.logged);
+		shift(s.flood);
+	}
+	s.end = now;
+}
+
+function count(kind, n, t) {
+	advance(t);
+	const s = state.series;
+	// a line from the past (the log's buffer at a restart) goes in its own slot
+	const back = int((s.end - slot_of(t)) / STEP);
+	const i = length(s[kind]) - 1 - back;
+	if (i >= 0)
+		s[kind][i] += n;
+	dirty = true;
+}
+
+// ---- files in RAM ----------------------------------------------------------------
+
+let drops_f = null, events_f = null;
+function append(which, line) {
+	const path = (which == 'drops') ? b.DROPS : b.EVENTS;
+	const cap = (which == 'drops') ? DROPS_MAX : EVENTS_MAX;
+	let f = (which == 'drops') ? drops_f : events_f;
+	if (!f) {
+		f = open(path, 'a', 0o644);
+		if (!f)
+			return;
+	}
+	f.write(line + '\n');
+	f.flush();
+	if ((stat(path)?.size ?? 0) > cap) {
+		f.close();
+		f = null;
+		if (which == 'drops')
+			rename(b.DROPS, b.DROPS_OLD);
+		else {
+			// the events keep their newer half
+			const lines = split(readfile(path) ?? '', '\n');
+			b.write_atomic(path, join('\n', slice(lines, int(length(lines) / 2))), 0o644);
+		}
+	}
+	if (which == 'drops')
+		drops_f = f;
+	else
+		events_f = f;
+}
+
+const clean = (s) => replace(`${s ?? ''}`, /[\t\n\r]/g, ' ');
+
+// ---- banIP's lines -----------------------------------------------------------------
+
+// "banIP/outbound/reject/spamhaus.v4: IN=br-lan OUT=eth1 MAC=… SRC=… DST=… … PROTO=TCP SPT=… DPT=…"
+// "banIP/pre-icmp/drop: IN=eth1 …"
+function on_drop(t, msg) {
+	const m = match(msg, /banIP\/([a-z-]+)\/([a-z]+)(\/([A-Za-z0-9_.]+))?: (.*)$/);
+	if (!m)
+		return;
+	const kv = {};
+	for (let w in split(m[5], ' ')) {
+		const p = index(w, '=');
+		if (p > 0)
+			kv[substr(w, 0, p)] ??= substr(w, p + 1);
+	}
+	// MAC=<to (6 bytes)>:<from (6 bytes)>:<type (2 bytes)>
+	const mac = match(kv.MAC ?? '', /^([0-9a-f]{2}(:[0-9a-f]{2}){5}):([0-9a-f]{2}(:[0-9a-f]{2}){5}):/);
+	const dir = (m[1] == 'inbound') ? 'in' : (m[1] == 'outbound') ? 'out' : 'pre';
+	const proto = lc(kv.PROTO ?? '');
+	append('drops', join('\t', [
+		t, dir, (dir == 'pre') ? substr(m[1], 4) : '', m[2], clean(m[4] ?? ''), clean(kv.IN), clean(kv.OUT),
+		clean(kv.SRC), clean(kv.DST), clean(proto), clean(kv.SPT ?? kv.TYPE ?? ''), clean(kv.DPT ?? kv.CODE ?? ''), mac ? mac[3] : ''
+	]));
+	count('logged', 1, t);
+}
+
+// the set a failure names: "debl.v4", "country.v4/us" (a country of the shared set)
+const set_of = (s) => split(s, '/')[0];
+
+function stage(s) {
+	if (state.run) {
+		state.run.stage = s;
+		dirty = urgent = true;
+	}
+}
+
+function run_result(set, what) {
+	if (state.run) {
+		state.run.results ??= {};
+		state.run.results[set] = what;
+		dirty = true;
+	}
+}
+
+function finish(t, ok, error) {
+	const r = state.run ?? { action: null, started: null };
+	r.finished = t;
+	r.ok = ok;
+	if (error)
+		r.error = error;
+	state.last = r;
+	state.run = null;
+	dirty = urgent = true;
+	// its report, once banIP has written its status
+	if (ok)
+		state.report_due = t + 5;
+}
+
+function on_banip(t, level, msg) {
+	let m;
+	if ((m = match(msg, /^start banIP processing \(([a-z]+)/))) {
+		state.run = { action: m[1], started: t, stage: 'setup', results: {} };
+		dirty = urgent = true;
+	}
+	else if (match(msg, /^start banIP download processes/))
+		stage('lists');
+	else if (match(msg, /^start banIP domain lookup/))
+		stage('domains');
+	else if (match(msg, /^finish banIP processing/))
+		finish(t, true);
+	else if ((m = match(msg, /^download for feed '([^']+)' failed/)))
+		run_result(set_of(m[1]), 'download');
+	else if ((m = match(msg, /^processing for feed '([^']+)' failed/)))
+		run_result(m[1], state.run?.results?.[m[1]] ?? 'failed');
+	else if ((m = match(msg, /^skip empty feed '([^']+)'/)))
+		run_result(m[1], 'empty');
+	else if ((m = match(msg, /^can't load (initial|split) file .*nfset '([^']+)'/)))
+		run_result(m[2], 'load');
+	else if ((m = match(msg, /^skip incomplete feed '([^']+)'/)))
+		run_result(m[1], 'incomplete');
+	else if ((m = match(msg, /^remove unknown feed '([^']+)'/)))
+		run_result(m[1], 'unknown');
+	else if ((m = match(msg, /^skip feed '([^']+)' in allowlistonly mode/)))
+		run_result(m[1], 'skipped');
+	else if ((m = match(msg, /^add IP( range)? '([^']+)' \((.*)\) to (blocklist\.v[46])/))) {
+		append('events', join('\t', [ t, m[1] ? 'range' : 'monitor', clean(m[2]), clean(m[4]), clean(m[3]) ]));
+		state.events.autoblocked++;
+		dirty = true;
+	}
+	else if ((m = match(msg, /^received a suspicious remote IP '([^']+)'/))) {
+		append('events', join('\t', [ t, 'remote', clean(m[1]), '', '' ]));
+		state.events.remote++;
+		dirty = true;
+	}
+	if (level == 'err' || level == 'emerg') {
+		if (state.run)
+			finish(t, false, msg);
+		else {
+			state.error = { at: t, message: msg };
+			dirty = true;
+		}
+	}
+	if ((m = match(msg, /^start banIP processing/)))
+		state.error = null;
+}
+
+function on_line(line) {
+	const m = match(line, /^(.{24}) \[([0-9]+)\.([0-9]+)\] ([a-z0-9]+)\.([a-z]+) ([^:]+): (.*)$/);
+	if (!m)
+		return;
+	const ms = +m[2] * 1000 + +m[3];
+	// the log's buffer again (a restart of this monitor): only what's new
+	if (ms <= state.last_ms)
+		return;
+	state.last_ms = ms;
+	const t = +m[2];
+	if (m[6] == 'kernel' && index(m[7], 'banIP/') >= 0)
+		on_drop(t, m[7]);
+	else if (match(m[6], /^banIP-[^ ]*\[[0-9]+\]$/))
+		on_banip(t, m[5], m[7]);
+}
+
+// ---- the counters ------------------------------------------------------------------
+
+function nft_json(c) {
+	try {
+		return json(b.cmd(c) || 'null');
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+// the packets banIP's rules dropped or rejected (rules that count: with
+// ban_nftcount), and the flood counters, since its rules were made
+function read_counters() {
+	const out = { rules: {}, flood: 0 };
+	for (let chain in [ '_inbound', '_outbound' ]) {
+		const j = nft_json(`nft -t -j list chain inet banIP ${chain}`);
+		for (let x in j?.nftables ?? []) {
+			const r = x.rule;
+			if (!r)
+				continue;
+			let packets = null, verdict = null, set = null;
+			for (let e in r.expr ?? []) {
+				if (e.counter)
+					packets = e.counter.packets;
+				if (exists(e, 'drop'))
+					verdict = 'drop';
+				if (e.goto?.target == '_reject' || exists(e, 'reject'))
+					verdict = 'reject';
+				if (type(e.match?.right) == 'string' && substr(e.match.right, 0, 1) == '@')
+					set = substr(e.match.right, 1);
+			}
+			if (packets != null && verdict != null)
+				out.rules[`${chain}/${set ?? ''}/${r.handle}`] = packets;
+		}
+	}
+	const j = nft_json('nft -j list counters table inet banIP');
+	for (let x in j?.nftables ?? [])
+		if (x.counter && match(x.counter.name ?? '', /^cnt_/))
+			out.flood += x.counter.packets ?? 0;
+	return out;
+}
+
+function sample(t) {
+	if (!b.table_loaded())
+		return;
+	const c = read_counters();
+	const was = state.counters;
+	let dropped = 0;
+	for (let k, v in c.rules) {
+		// a rule made again (its list reloaded) counts from 0
+		const before = was.rules?.[k];
+		dropped += (before != null && v >= before) ? v - before : (before == null && was.at) ? v : 0;
+	}
+	const flood = (was.flood != null && c.flood >= was.flood) ? c.flood - was.flood : 0;
+	if (was.at) {
+		count('counted', dropped, t);
+		count('flood', flood, t);
+	}
+	state.counters = { at: t, rules: c.rules, flood: c.flood };
+	dirty = true;
+}
+
+// ---- banIP's report ------------------------------------------------------------------
+
+function report(t) {
+	state.report_due = null;
+	if (b.processing())
+		return;
+	// the lists' copy, for looking addresses up and paging through a list
+	b.dump_sets();
+	if (b.entries() > REPORT_MAX)
+		return;
+	system('nice -n 19 /etc/init.d/banip report gen > /dev/null 2>&1 &');
+	state.report_at = t;
+	dirty = true;
+}
+
+// ---- main ----------------------------------------------------------------------------
+
+// The log's banIP lines (its buffer first, then as they come): -t adds each
+// line's time in ms. "TICK" every 30 s; "EOF" once logread has stopped
+// (logd restarted): procd starts this again.
+const src = popen(`logread -f -t -l 1000000 -e banIP & LR=$!
+trap 'kill $LR 2> /dev/null; exit' PIPE TERM INT HUP
+while sleep 30; do
+	kill -0 $LR 2> /dev/null || { echo EOF; break; }
+	echo TICK 2> /dev/null || break
+done
+kill $LR 2> /dev/null`, 'r');
+if (!src)
+	exit(1);
+
+let sampled = 0;
+for (let line = src.read('line'); line != null && line != ''; line = src.read('line')) {
+	line = rtrim(line, '\n');
+	const now = time();
+	if (line == 'EOF')
+		break;
+	if (line != 'TICK')
+		on_line(line);
+	advance(now);
+	if (now - sampled >= STEP) {
+		sample(now);
+		sampled = now;
+		state.nft = b.table_loaded();
+	}
+	if (state.report_due && now >= state.report_due)
+		report(now);
+	else if (!state.run && state.nft && !b.dump_fresh() && b.runtime()?.status == 'active')
+		report(now);
+	else if (!state.run && state.counters?.at && now - (state.report_at ?? 0) >= REPORT_EVERY && state.last?.ok)
+		report(now);
+	save(now);
+}
+urgent = true;
+save(time());
+exit(1);

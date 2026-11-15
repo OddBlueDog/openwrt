@@ -528,6 +528,12 @@ function settings() {
 		push(out.wifi, { radio: s['.name'], band: s.band, channel: s.channel, htmode: s.htmode, disabled: s.disabled });
 	});
 	const release = readfile('/etc/openwrt_release') ?? '';
+	// banIP: on, and its lists (a list can block what a test reaches)
+	const banip = u.get('banip', 'global', 'ban_enabled');
+	if (banip != null) {
+		const feeds = u.get('banip', 'global', 'ban_feed');
+		out.banip = { enabled: banip, feeds: (type(feeds) == 'array') ? feeds : (feeds ? split(feeds, ' ') : []) };
+	}
 	out.firmware = match(release, /DISTRIB_DESCRIPTION='([^']*)'/)?.[1];
 	out.model = trim(readfile('/tmp/sysinfo/model') ?? '') || null;
 	return out;
