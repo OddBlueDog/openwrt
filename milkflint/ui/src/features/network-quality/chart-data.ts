@@ -127,14 +127,37 @@ export function formatLoss(share: number): string {
   return `${String(Math.round(pct * (pct < 10 ? 10 : 1)) / (pct < 10 ? 10 : 1))}%`;
 }
 
-/** A y scale: a round top at or above `peak` (never below `atLeast`) and even ticks up to it. */
-export function niceScale(peak: number, atLeast = 0): { max: number; ticks: number[] } {
-  const value = Math.max(peak * 1.1, atLeast, 1);
-  const rough = value / 4;
+/**
+ * A y scale fitted to the values between `lo` and `hi`: round ends a little
+ * outside them and even ticks between, so the lines fill the chart. It starts
+ * at 0 only when the values come near it: 14–20 ms shows from 12, not from 0.
+ * It never spans less than `minSpan`, so a steady line's jitter of a fraction
+ * of a millisecond doesn't fill the chart like a spike.
+ */
+export function niceRange(lo: number, hi: number, minSpan = 1): { min: number; max: number; ticks: number[] } {
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi < lo) [lo, hi] = [0, 0];
+  const pad = (hi - lo) * 0.1;
+  let bottom = lo - pad;
+  let top = hi + pad;
+  const span = Math.max(minSpan, 1e-9);
+  if (top - bottom < span) {
+    const mid = (lo + hi) / 2;
+    bottom = mid - span / 2;
+    top = mid + span / 2;
+  }
+  // near 0, or below it: from 0, which is easier to read than a few ms
+  if (bottom <= (top - bottom) / 2) {
+    top = Math.max(top, span);
+    bottom = 0;
+  }
+  const rough = (top - bottom) / 4;
   const exp = 10 ** Math.floor(Math.log10(rough));
-  const step = [1, 2, 2.5, 5, 10].map((m) => m * exp).find((s) => s >= rough) ?? 10 * exp;
-  const count = Math.ceil(value / step);
-  return { max: count * step, ticks: Array.from({ length: count + 1 }, (_, i) => i * step) };
+  const step = [1, 2, 5, 10].map((m) => m * exp).find((s) => s >= rough) ?? 10 * exp;
+  const round = (v: number): number => Math.round(v * 1e6) / 1e6;
+  const min = round(Math.floor(bottom / step) * step);
+  const max = round(Math.ceil(top / step) * step);
+  const count = Math.round((max - min) / step);
+  return { min, max, ticks: Array.from({ length: count + 1 }, (_, i) => round(min + i * step)) };
 }
 
 /** Clock times on round marks between `start` and `end`, in the browser's time zone. */

@@ -26,6 +26,7 @@ function formatTime(t: number, slotSeconds: number, spanSeconds: number): string
 export function ChartHover({
   series,
   slots,
+  min = 0,
   max,
   format,
   timeOf,
@@ -33,6 +34,8 @@ export function ChartHover({
 }: {
   series: readonly HoverSeries[];
   slots: number;
+  /** The bottom of the scale, as drawn. */
+  min?: number;
   /** The top of the scale, as drawn. */
   max: number;
   format: (value: number) => string;
@@ -61,7 +64,7 @@ export function ChartHover({
   const shown = slot !== undefined && rows.some((r) => r.v !== undefined || r.note !== undefined);
   const x = slot === undefined || slots <= 1 ? 100 : (slot / (slots - 1)) * 100;
   const t = slot === undefined ? undefined : timeOf?.(slot);
-  const yPct = (v: number): number => 100 - (max > 0 ? Math.min(v / max, 1) : 0) * 100;
+  const yPct = (v: number): number => 100 - (max > min ? Math.min(Math.max((v - min) / (max - min), 0), 1) : 0) * 100;
   // the step and span from the right, where the data is (it's right-aligned)
   const tEnd = timeOf?.(slots - 1);
   const tPrev = timeOf?.(slots - 2);

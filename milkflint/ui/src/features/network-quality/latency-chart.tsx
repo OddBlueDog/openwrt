@@ -1,17 +1,18 @@
 // A latency chart with its table: clock times along the bottom, a band up to
 // the worst answer where a point stands for several probes, red marks where
 // probes were lost, grey where nothing was recorded. The table under it is
-// also the legend: a name shows or hides a line, and the scale follows.
+// also the legend: a name shows or hides a line, and the scale fits the
+// lines left, from their lowest to their highest typical time.
 import { DownloadIcon, LoaderCircleIcon } from 'lucide-react';
 import { type PointerEvent, type ReactElement, useEffect, useRef, useState } from 'react';
 import { ChartHover } from '@/components/charts/chart-hover';
 import { Button } from '@/components/ui/button';
 import { cn, errorMessage } from '@/lib/utils';
-import { type ChartLine, formatLoss, formatSliceTime, type LineStats, lineStats, lossBins, lossSliceAt, niceScale, pointStep, runs, slotValues, timeTicks, unrecorded } from './chart-data';
+import { type ChartLine, formatLoss, formatSliceTime, type LineStats, lineStats, lossBins, lossSliceAt, niceRange, pointStep, runs, slotValues, timeTicks, unrecorded } from './chart-data';
 
-function linePaths(line: ChartLine, start: number, end: number, max: number): { line: string; band: string } {
+function linePaths(line: ChartLine, start: number, end: number, min: number, max: number): { line: string; band: string } {
   const x = (t: number): string => (((t - start) / (end - start)) * 100).toFixed(2);
-  const y = (v: number): string => (100 - Math.min(v / max, 1) * 100).toFixed(2);
+  const y = (v: number): string => (100 - Math.min(Math.max((v - min) / (max - min), 0), 1) * 100).toFixed(2);
   let d = '';
   let band = '';
   for (const run of runs(line.points)) {
@@ -118,7 +119,7 @@ function Plot({
   start,
   end,
   spanLabel,
-  minMax,
+  minSpan,
   format,
   hoverFormat,
 }: {
@@ -130,12 +131,14 @@ function Plot({
   start: number;
   end: number;
   spanLabel: string;
-  minMax: number;
+  minSpan: number;
   format: (v: number) => string;
   hoverFormat: (v: number) => string;
 }): ReactElement {
-  const peak = Math.max(0, ...lines.flatMap((l) => l.points.flatMap((p) => (p.v === undefined ? [] : [p.v]))));
-  const { max, ticks } = niceScale(peak, minMax);
+  // the typical times set the scale; a worst answer far above them is cut off at the top
+  const values = lines.flatMap((l) => l.points.flatMap((p) => (p.v === undefined ? [] : [p.v])));
+  const { min, max, ticks } = niceRange(Math.min(...values), Math.max(...values), minSpan);
+  const yPct = (v: number): number => 100 - ((v - min) / (max - min)) * 100;
   const xPct = (t: number): number => ((t - start) / (end - start)) * 100;
 
   const steps = lines.filter((l) => l.points.length > 1).map((l) => pointStep(l.points));
@@ -156,7 +159,7 @@ function Plot({
         ))}
         {/* the scale */}
         {ticks.map((v) => (
-          <div key={v} className="pointer-events-none absolute inset-x-0" style={{ top: `${String(100 - (v / max) * 100)}%` }}>
+          <div key={v} className="pointer-events-none absolute inset-x-0" style={{ top: `${String(yPct(v))}%` }}>
             <span className="absolute right-full w-12 -translate-y-1/2 pr-2 text-right font-mono text-[10px] text-muted-foreground tabular">{format(v)}</span>
             <div className={cn('h-px border-t', v === 0 ? 'border-border' : 'border-dashed border-border/70')} />
           </div>
@@ -173,7 +176,7 @@ function Plot({
           className="absolute inset-0 size-full overflow-visible"
         >
           {lines.map((l) => {
-            const p = linePaths(l, start, end, max);
+            const p = linePaths(l, start, end, min, max);
             return (
               <g key={l.key}>
                 {p.band !== '' && <path d={p.band} fill={l.color} fillOpacity="0.12" />}
@@ -183,7 +186,7 @@ function Plot({
           })}
         </svg>
         <div className="absolute inset-0">
-          <ChartHover series={hover} slots={slots} max={max} format={hoverFormat} timeOf={(slot) => start + slot * step} />
+          <ChartHover series={hover} slots={slots} min={min} max={max} format={hoverFormat} timeOf={(slot) => start + slot * step} />
         </div>
       </div>
       <LossStrip lines={lines} start={start} end={end} />
@@ -284,7 +287,7 @@ export function LatencyChart({
   start,
   end,
   spanLabel,
-  minMax = 25,
+  minSpan = 5,
   format,
   hoverFormat,
   csv,
@@ -294,7 +297,8 @@ export function LatencyChart({
   start: number;
   end: number;
   spanLabel: string;
-  minMax?: number;
+  /** The narrowest the scale gets, in the values' unit. */
+  minSpan?: number;
   /** The scale's labels. */
   format: (v: number) => string;
   /** Values when hovering and in the table. */
@@ -312,7 +316,7 @@ export function LatencyChart({
   };
   return (
     <div className="flex flex-col gap-3">
-      <Plot label={label} lines={shown} allLines={lines} start={start} end={end} spanLabel={spanLabel} minMax={minMax} format={format} hoverFormat={hoverFormat} />
+      <Plot label={label} lines={shown} allLines={lines} start={start} end={end} spanLabel={spanLabel} minSpan={minSpan} format={format} hoverFormat={hoverFormat} />
       <table className="w-full table-fixed text-xs sm:text-sm">
         <thead>
           <tr className="text-xs text-muted-foreground">
@@ -343,7 +347,7 @@ export function LatencyChart({
       </table>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="min-w-0 flex-1 basis-64 text-xs text-muted-foreground">
-          Select a name to hide its line and rescale the chart. Hover over or tap the “lost” strip to see what was lost when; grey is time with nothing recorded.
+          The scale fits the lines shown, so it may not start at 0. Select a name to hide its line and the scale fits the rest. Hover over or tap the “lost” strip to see what was lost when; grey is time with nothing recorded.
         </p>
         <DownloadButton csv={csv} />
       </div>

@@ -3,7 +3,7 @@
 // the Smart Queue inside the tunnel, and what the next save does to all of it.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { blankForm, type ClientData, type ClientForm, drift, fromConf, removal, sources, toChanges, validate, wanted } from '../src/features/vpn-client/model.ts';
+import { blankForm, type ClientData, type ClientForm, describe, drift, fromConf, removal, sources, toChanges, validate, wanted } from '../src/features/vpn-client/model.ts';
 import { CLIENT_MARK } from '../src/features/vpn-client/sections.ts';
 import { ipToInt } from '../src/lib/api/network.ts';
 import type { Wanted } from '../src/lib/api/owned.ts';
@@ -330,4 +330,16 @@ test('a provider’s config fills in its part of the form and leaves the rest', 
   assert.equal(f.who, 'only');
   assert.deepEqual(f.macs, [MAC]);
   assert.equal(f.killSwitch, false);
+});
+
+test('their DNS: with AdGuard Home on, through the tunnel (or why not); without it, outside', () => {
+  const line = (f: ClientForm, adguard: ClientData['adguard']): { ok: boolean; text: string } | undefined =>
+    describe(f, data(f, { adguard })).find((l) => l.text.startsWith('Their DNS lookups'));
+  assert.equal(line(form(), 'tunnel')?.ok, true);
+  assert.match(line(form(), 'tunnel')?.text ?? '', /through the tunnel.*nowhere else/);
+  assert.match(line(form({ killSwitch: false }), 'tunnel')?.text ?? '', /directly while the tunnel is down/);
+  assert.equal(line(form(), 'automatic')?.ok, false);
+  assert.match(line(form(), 'automatic')?.text ?? '', /Choose servers there/);
+  assert.equal(line(form(), undefined)?.ok, false);
+  assert.match(line(form(), undefined)?.text ?? '', /don’t go through the VPN/);
 });

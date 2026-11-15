@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { snrOf } from '@/lib/snr';
 import { call } from '@/lib/ubus';
 
 const radioStatus = z.object({
@@ -126,6 +127,11 @@ export function describeRate(r: z.output<typeof rate> | undefined): string | und
   if (r.nss !== undefined) parts.push(`${String(r.nss)}×${String(r.nss)}`);
   if (r.mhz !== undefined) parts.push(`${String(r.mhz)} MHz`);
   return parts.join(' · ');
+}
+
+/** A station's SNR: its own noise figure, else its radio's. */
+export function stationSnr(s: Station, radioNoise: number | undefined): number | undefined {
+  return snrOf(s.signal_avg ?? s.signal, s.noise !== undefined && s.noise < 0 ? s.noise : radioNoise);
 }
 
 /** 2412 -> "2.4 GHz", 5180 -> "5 GHz", 5955 -> "6 GHz". */

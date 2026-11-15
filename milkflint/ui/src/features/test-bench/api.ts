@@ -277,6 +277,8 @@ export const runSettingsSchema = z
       )
       .catch([]),
     dns: z.string().nullish(),
+    /** banIP, when it's in the firmware: on ('1'), and its lists */
+    banip: z.object({ enabled: z.string().nullish(), feeds: z.array(z.string()).nullish() }).loose().nullish().catch(null),
     firmware: z.string().nullish(),
     model: z.string().nullish(),
   })

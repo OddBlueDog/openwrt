@@ -78,15 +78,15 @@ test('the multi-queue choice shown is what the queue does', () => {
   assert.equal(multiQueueOf(undefined, undefined, 0), 'auto');
   assert.equal(multiQueueOf('0', undefined, 800_000), 'off');
   // use_mq as the setting gives at this speed: the setting
-  assert.equal(multiQueueOf(undefined, true, 750_000), 'auto');
-  assert.equal(multiQueueOf(undefined, false, 85_000), 'auto');
-  assert.equal(multiQueueOf('1', true, 85_000), 'on');
-  assert.equal(multiQueueOf('0', false, 750_000), 'off');
+  assert.equal(multiQueueOf(undefined, true, 900_000), 'auto');
+  assert.equal(multiQueueOf(undefined, false, 50_000), 'auto');
+  assert.equal(multiQueueOf('1', true, 50_000), 'on');
+  assert.equal(multiQueueOf('0', false, 900_000), 'off');
   // use_mq set elsewhere (LuCI) to something else: shown as it is, and saved so
-  assert.equal(multiQueueOf(undefined, false, 750_000), 'off');
-  assert.equal(multiQueueOf(undefined, true, 85_000), 'on');
-  assert.equal(multiQueueOf('1', false, 750_000), 'off');
-  assert.equal(multiQueueOf('0', true, 85_000), 'on');
+  assert.equal(multiQueueOf(undefined, false, 900_000), 'off');
+  assert.equal(multiQueueOf(undefined, true, 50_000), 'on');
+  assert.equal(multiQueueOf('1', false, 900_000), 'off');
+  assert.equal(multiQueueOf('0', true, 50_000), 'on');
 });
 
 const cake = (dev: string, over: Partial<CakeQdisc> = {}): CakeQdisc => ({ kind: 'cake', dev, ...over });

@@ -18,7 +18,7 @@ import {
 import { type ReactElement, type ReactNode, useCallback, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
-import { SignalBars } from '@/components/charts/signal-bars';
+import { SignalReading } from '@/components/charts/signal-bars';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
@@ -33,6 +33,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
+import { useWed } from '../tuning/use-wed';
+import { WedNotice } from '../tuning/wed-notice';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
 import { intToIp, ipToInt } from '@/lib/api/network';
@@ -106,10 +108,7 @@ function ConnectedGuests({ id, enabled }: { id: GuestId; enabled: boolean }): Re
                   {[g.ip, g.band, g.connected === undefined ? undefined : formatDuration(g.connected)].filter((x) => x !== undefined).join(' · ')}
                 </div>
               </div>
-              <span className="flex items-center gap-1.5 text-xs text-muted-foreground tabular">
-                <SignalBars dbm={g.signal} />
-                {g.signal === undefined ? '' : `${String(g.signal)} dBm`}
-              </span>
+              <SignalReading dbm={g.signal} snr={g.snr} className="shrink-0" />
             </div>
           ))}
         </CardContent>
@@ -482,10 +481,14 @@ export function GuestWifiPage(): ReactElement {
   const [selected, setSelected] = useState<GuestId>();
   const [adding, setAdding] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<NetData>();
+  // hardware offloading with WED turns the speed limits off; setting one here turns WED off
+  const wed = useWed();
+  const reloadWed = wed.reload;
   const onApplied = useCallback(() => {
     setEdit(undefined);
     reload();
-  }, [reload]);
+    reloadWed();
+  }, [reload, reloadWed]);
   const { state, apply } = useApply(onApplied);
 
   const saved = data?.nets.map((n) => n.form) ?? [];
@@ -505,6 +508,8 @@ export function GuestWifiPage(): ReactElement {
   const changed = (f: NetForm): boolean => JSON.stringify(f) !== JSON.stringify(saved.find((s) => s.id === f.id));
   const dirty = edit !== undefined && (edit.length !== saved.length || edit.some(changed));
   const invalid = forms.some((f) => Object.keys(errorsOf(f)).length > 0);
+  // a save would set a speed limit
+  const limitAsked = edit !== undefined && forms.some((f) => changed(f) && (f.downMbit !== '' || f.upMbit !== ''));
   const current = forms.find((f) => f.id === selected) ?? forms[0];
   const currentNet = current === undefined ? undefined : netOf(current);
   const errors = current === undefined ? {} : errorsOf(current);
@@ -531,6 +536,13 @@ export function GuestWifiPage(): ReactElement {
       <PageHeader title="Guest Wi-Fi" description="Networks of their own for visitors and smart-home devices: the internet, but none of your devices." />
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
+        {wed.on && (
+          <WedNotice title="Speed limits are off: hardware offloading (WED) is on" turningOff={limitAsked}>
+            {limitAsked
+              ? 'A speed limit and WED can’t both run: the connections WED forwards in hardware never reach the limit’s queue.'
+              : 'The router’s chip forwards established connections by itself, past a guest network’s speed limit, so the limits were turned off for it. They come back as they were when WED is turned off; setting one here turns WED off instead. Guests are still kept apart from your devices.'}
+          </WedNotice>
+        )}
         {error !== undefined && data === undefined ? (
           <LoadError error={error} retry={reload} />
         ) : loading || data === undefined ? (
@@ -684,7 +696,8 @@ export function GuestWifiPage(): ReactElement {
             const net = netOf(f);
             return net === undefined ? [] : toChanges(f, net, data);
           });
-          void apply(changes);
+          // a speed limit is WED off: its changes first, so this page's own stand
+          void apply([...(wed.on && limitAsked ? wed.offChanges() : []), ...changes]);
         }}
         onRevert={() => {
           setEdit(undefined);

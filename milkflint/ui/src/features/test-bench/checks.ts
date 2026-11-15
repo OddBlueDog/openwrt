@@ -598,7 +598,10 @@ function dns(x: Context): Check {
     ...base,
     status: worst(statuses),
     value: [cached === undefined ? undefined : `cached ${ms(cached)}`, passed === undefined ? undefined : `passed on ${ms(passed)}`].filter((s) => s !== undefined).join(' · '),
-    detail: 'The router’s own lookups, typical over the sites: a site’s name from dnsmasq’s cache, and a made-up name it had to pass on.',
+    detail:
+      x.data.dns.via === 'adguardhome'
+        ? 'The router’s own lookups, the way your devices’ go (through AdGuard Home, then dnsmasq), typical over the sites: a site’s name from dnsmasq’s cache, and a made-up name it had to pass on.'
+        : 'The router’s own lookups, typical over the sites: a site’s name from dnsmasq’s cache, and a made-up name it had to pass on.',
     notes,
   };
 }

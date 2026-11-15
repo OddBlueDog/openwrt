@@ -16,6 +16,8 @@ function hostOf(url: string): string | undefined {
  * "Cloudflare Family"); undefined when it's none of the DNS page's.
  */
 export function providerName(key: string): string | undefined {
+  // the probe's line for AdGuard Home on the router, in front of the servers
+  if (key === 'adguardhome') return 'AdGuard Home (this router)';
   const all: readonly DnsProvider[] = Object.values(providers);
   for (const p of all) {
     for (const [i, s] of p.servers.entries()) {

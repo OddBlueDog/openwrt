@@ -1,7 +1,7 @@
 import { CableIcon, LoaderCircleIcon, PencilIcon, PinIcon, SearchIcon, SmartphoneIcon } from 'lucide-react';
 import { type ReactElement, useCallback, useMemo, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
-import { SignalBars } from '@/components/charts/signal-bars';
+import { SignalReading } from '@/components/charts/signal-bars';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { Badge } from '@/components/ui/badge';
@@ -23,7 +23,7 @@ import { useApply } from '@/hooks/use-apply';
 import { usePoll } from '@/hooks/use-poll';
 import { getHostHints, getLeases, getNeighbors, hintName, inSubnet, ipToInt, isReachable, prefixLength } from '@/lib/api/network';
 import { type Change, getConfig, list, type Section, str } from '@/lib/api/uci';
-import { bandOf, getAccessPoints } from '@/lib/api/wireless';
+import { bandOf, getAccessPoints, stationSnr } from '@/lib/api/wireless';
 import { formatBitrate, formatDuration } from '@/lib/format';
 import { editChanges, reservedIp } from './model';
 
@@ -31,7 +31,7 @@ interface Device {
   mac: string;
   name: string | undefined;
   ip: string | undefined;
-  wifi: { band: string | undefined; ssid: string | undefined; signal: number | undefined; rate: number | undefined; connected: number | undefined } | undefined;
+  wifi: { band: string | undefined; ssid: string | undefined; signal: number | undefined; snr: number | undefined; rate: number | undefined; connected: number | undefined } | undefined;
   online: boolean;
   leaseExpires: number | undefined;
   reservation: Section | undefined;
@@ -93,6 +93,7 @@ async function loadClients(): Promise<ClientsData> {
         band: bandOf(ap.info?.frequency),
         ssid: ap.ssid,
         signal: s.signal_avg ?? s.signal,
+        snr: stationSnr(s, ap.info?.noise),
         rate: s.tx?.rate === undefined ? undefined : s.tx.rate * 1000,
         connected: s.connected_time,
       };
@@ -302,12 +303,7 @@ export function ClientsPage(): ReactElement {
                         {d.wifi === undefined ? (
                           <span className="text-muted-foreground">—</span>
                         ) : (
-                          <span className="flex items-center gap-2 tabular">
-                            <SignalBars dbm={d.wifi.signal} />
-                            <span className="text-xs text-muted-foreground">
-                              {d.wifi.signal === undefined ? '' : `${String(d.wifi.signal)} dBm`}
-                            </span>
-                          </span>
+                          <SignalReading dbm={d.wifi.signal} snr={d.wifi.snr} />
                         )}
                       </TableCell>
                       <TableCell className="tabular">

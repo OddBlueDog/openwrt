@@ -1,6 +1,6 @@
 import { SmartphoneIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { SignalBars } from '@/components/charts/signal-bars';
+import { SignalReading } from '@/components/charts/signal-bars';
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -140,12 +140,7 @@ export function ClientsCard({ d, className }: { d: Dashboard; className?: string
                   </TableCell>
                   <TableCell className="text-muted-foreground">{c.band ?? '—'}</TableCell>
                   <TableCell>
-                    <span className="flex items-center gap-2 tabular">
-                      <SignalBars dbm={c.signal} />
-                      <span className="text-xs text-muted-foreground">
-                        {c.signal === undefined ? '—' : `${String(c.signal)} dBm`}
-                      </span>
-                    </span>
+                    <SignalReading dbm={c.signal} snr={c.snr} empty="—" />
                   </TableCell>
                   <TableCell>
                     <Tooltip>

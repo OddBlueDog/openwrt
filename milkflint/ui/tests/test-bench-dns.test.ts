@@ -61,6 +61,12 @@ test('the router’s lookups: what it forwards to, each lookup, junk left out', 
   assert.equal(parseDns([]).upstream, null);
 });
 
+test('the way in: through AdGuard Home while it filters, else dnsmasq (and runs from before it say nothing)', () => {
+  assert.equal(parseDns(dnsLines).via, 'dnsmasq');
+  assert.equal(parseDns([JSON.stringify({ upstream: 'server', via: 'adguardhome' })]).via, 'adguardhome');
+  assert.equal(parseDns([JSON.stringify({ upstream: 'server', via: 'elsewhere' })]).via, 'dnsmasq');
+});
+
 test('per site: made-up names, the upstream alone, the site twice; what came from the cache', () => {
   const sites = routerSites(parseDns(dnsLines).lookups);
   assert.deepEqual(

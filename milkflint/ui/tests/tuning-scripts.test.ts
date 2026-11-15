@@ -362,7 +362,7 @@ const NO_QUEUE = 'dev=eth1 mode=fraglist auto=fraglist udp=0 max=65536 whole=0 o
 const WHOLE = 'dev=eth1 mode=plain auto=plain udp=1 max=16384 whole=1 offload=0';
 const wanQueue = { enabled: '1', interface: 'eth1', download: '650000', iqdisc_opts: 'no-split-gso' };
 const vpnQueue = { enabled: '1', interface: 'wg_out', download: '70000', iqdisc_opts: 'dual-dsthost nat' };
-const guestQueue = { enabled: '1', interface: 'br-guest', download: '30000', iqdisc_opts: 'dual-srchost' };
+const guestQueue = { enabled: '1', interface: 'br-guest', download: '25000', iqdisc_opts: 'dual-srchost' };
 
 test('gro: the internet queue’s download options decide, whatever comes before it', () => {
   assert.equal(groShow({}), NO_QUEUE);

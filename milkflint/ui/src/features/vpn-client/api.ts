@@ -7,11 +7,19 @@ import { bool, getConfig, list, type Section, str } from '@/lib/api/uci';
 import { getWgStatus } from '@/lib/api/wireguard';
 import { lanZone, parseFirewall, wanZone } from '../firewall/model';
 import { GUEST_IDS, type GuestId, guestLabels, isGuestShaper } from '../wifi-guest/guest';
+import { type AdGuardStatus, getAdGuardStatus } from '../adguardhome/api';
 import { blankForm, type ClientData, type Device, DEFAULT_KEEPALIVE, DEFAULT_PORT } from './model';
+
+/** Which way the VPN's devices' lookups go with AdGuard Home on (its monitor sends them through the tunnel when the DNS page has servers of its own). */
+function aghPath(agh: AdGuardStatus | undefined, milkflint: readonly Section[]): ClientData['adguard'] {
+  if (agh?.installed !== true || agh.enabled !== true || agh.mode === 'ap') return undefined;
+  const mode = str(milkflint.find((s) => s['.name'] === 'dns'), 'mode');
+  return mode === 'static' || mode === 'encrypted' ? 'tunnel' : 'automatic';
+}
 import { CLIENT, CLIENT_PEER, CLIENT_PEER_TYPE, CLIENT_QUEUE, CLIENT_SKIP, isVpnShaper, markSection } from './sections';
 
 export async function loadClient(): Promise<ClientData> {
-  const [network, firewall, sqm, milkflint, interfaces, status, leases, hints] = await Promise.all([
+  const [network, firewall, sqm, milkflint, interfaces, status, leases, hints, agh] = await Promise.all([
     getConfig('network'),
     getConfig('firewall'),
     getConfig('sqm').catch(() => undefined),
@@ -20,6 +28,7 @@ export async function loadClient(): Promise<ClientData> {
     getWgStatus().catch(() => ({ installed: false, now: 0, interfaces: [] })),
     getLeases().catch(() => []),
     getHostHints().catch(() => ({})),
+    getAdGuardStatus().catch(() => undefined),
   ]);
   const cfg = parseFirewall(firewall);
   const iface = network.find((s) => s['.type'] === 'interface' && s['.name'] === CLIENT);
@@ -80,6 +89,7 @@ export async function loadClient(): Promise<ClientData> {
     wanRates,
     lan: lanInt === undefined ? undefined : { ip: lanInt, prefix: lanCidr !== undefined ? Number(lanCidr) : prefixLength(str(lanSection, 'netmask')) },
     taken,
+    adguard: aghPath(agh, milkflint),
   };
   if (iface !== undefined) {
     const markLan = firewall.find((s) => s['.name'] === markSection('lan'));

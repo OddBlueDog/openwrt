@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { call } from '@/lib/ubus';
 import { bool, type Change, getConfig, str } from '@/lib/api/uci';
 
-export type LogKind = 'system' | 'kernel' | 'wifi' | 'radar' | 'debug' | 'dns' | 'crash';
+export type LogKind = 'system' | 'kernel' | 'wifi' | 'radar' | 'debug' | 'dns' | 'banip' | 'crash';
 
 const readSchema = z.object({
   lines: z.array(z.string()),

@@ -1,6 +1,8 @@
 // Airtime fairness on each band now: who is using the air, what the policy
 // makes of each device's link and the share it gives it, and the last minute.
 // Its switch is in each band's settings.
+import { useWed } from '../tuning/use-wed';
+import { WedNotice } from '../tuning/wed-notice';
 import { HourglassIcon, MoonIcon, ScaleIcon, SignalHighIcon, SignalIcon, SignalLowIcon, SignalMediumIcon, SignalZeroIcon } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
@@ -593,6 +595,8 @@ function RadioPanel({ radio, now }: { radio: AirtimeRadio; now: number }): React
 
 export function AirtimeCard({ className }: { className?: string }): ReactElement | null {
   const { data } = usePoll(getAirtime, POLL_MS);
+  // hardware offloading with WED: what it forwards passes the policy by
+  const wed = useWed();
   if (data === undefined || (data.running && data.radios.length === 0)) return null;
   const order = (band: string): number => ['2g', '5g', '6g'].indexOf(band);
   const radios = [...data.radios].sort((a, b) => order(a.band) - order(b.band));
@@ -612,7 +616,14 @@ export function AirtimeCard({ className }: { className?: string }): ReactElement
           </CardDescription>
         </div>
       </CardHeader>
-      <CardContent className="@container">
+      <CardContent className="@container flex flex-col gap-4">
+        {wed.on && (
+          <WedNotice title="Hardware offloading (WED) passes most of this by">
+            The Wi-Fi chip sends the connections WED forwards its own way: a device’s share, queue limit, tries and pacing reach only what
+            still goes through the router’s software. With WED on the policy also can’t tell delivered frames from failed ones, so it judges
+            a link by its rate alone.
+          </WedNotice>
+        )}
         {!data.running ? (
           <p className="text-sm text-muted-foreground">Nothing to show yet: the measuring has only just started, or the airtime service isn’t running.</p>
         ) : (

@@ -8,6 +8,7 @@ import {
   RouterIcon,
   ServerCogIcon,
   ServerIcon,
+  ShieldBanIcon,
   ShieldCheckIcon,
   TagIcon,
   Trash2Icon,
@@ -34,6 +35,7 @@ import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
 import { prefixLength } from '@/lib/api/network';
 import { bool, getConfig, list, type Section, str } from '@/lib/api/uci';
+import { type AdGuardStatus, getAdGuardStatus } from '../adguardhome/api';
 import { Choice, Segmented } from '../firewall/parts';
 import { SERVER } from '../remote-access/sections';
 import { type GuestId, isGuestNetwork } from '../wifi-guest/guest';
@@ -118,6 +120,8 @@ let nextKey = 0;
 function protosOf(provider: ProviderId | 'custom'): readonly Proto[] {
   return provider === 'custom' ? [] : providers[provider].protos;
 }
+
+const loadAdGuard = (): Promise<AdGuardStatus | undefined> => getAdGuardStatus().catch(() => undefined);
 
 async function loadDns(): Promise<DnsData> {
   const [dhcp, milkflint, firewall, proxy, network] = await Promise.all([
@@ -334,6 +338,9 @@ const slotTitles: Record<Pair, [string, string]> = {
 export function DnsPage(): ReactElement {
   const { data, error, loading, reload } = useLoad(loadDns);
   const status = usePoll(getDnsStatus, 5000).data;
+  // AdGuard Home on the router, filtering in front of these settings (a firmware without it: nothing)
+  const agh = useLoad(loadAdGuard).data;
+  const aghOn = agh?.installed === true && agh.enabled === true && agh.mode !== 'ap';
   const [edit, setEdit] = useState<DnsForm>();
   const onApplied = useCallback(() => {
     setEdit(undefined);
@@ -424,6 +431,18 @@ export function DnsPage(): ReactElement {
                     }
                   />
                   <CardContent className="flex flex-col gap-6">
+                    {aghOn && (
+                      <p className="flex max-w-3xl items-start gap-2 text-sm text-muted-foreground">
+                        <ShieldBanIcon className="mt-0.5 size-4 shrink-0" />
+                        <span>
+                          <a href="#/adguardhome" className="font-medium text-foreground underline">
+                            AdGuard Home
+                          </a>{' '}
+                          filters your devices’ lookups first; what it doesn’t block comes here. These servers, the cache and the protection below
+                          are set here, not in AdGuard Home.
+                        </span>
+                      </p>
+                    )}
                     <Part title="How lookups are sent">
                       <Choice
                         label="How lookups are sent"
@@ -542,7 +561,7 @@ export function DnsPage(): ReactElement {
                   </CardContent>
                 </Card>
 
-                <CacheCard form={form} set={set} sizeError={errors.form.cacheSize} />
+                <CacheCard form={form} set={set} sizeError={errors.form.cacheSize} adguard={aghOn} />
 
                 <Card className="xl:col-span-2">
                   <CardHeading
@@ -624,6 +643,12 @@ export function DnsPage(): ReactElement {
                           </li>
                           <li>Devices switch when they next renew their address; reconnecting one switches it at once.</li>
                           <li>Guest networks keep using the router.</li>
+                          {aghOn && (
+                            <li className="text-warning">
+                              AdGuard Home on the router doesn’t filter your home network’s devices then: they ask your server directly. Only the
+                              guest networks’ and Remote access’s lookups go through it.
+                            </li>
+                          )}
                         </ul>
                         {form.mode === 'static' && loops(form.devices, planned.dnsmasq) && (
                           <WarningBox title="Lookups could go round in circles">
@@ -642,7 +667,7 @@ export function DnsPage(): ReactElement {
                     <Field
                       id="dns-intercept"
                       label="Catch devices with their own DNS"
-                      hint="Devices on your home and guest networks set to use another DNS server are answered by the router instead. Apps that encrypt DNS themselves get past it."
+                      hint={`Devices on your home and guest networks set to use another DNS server are answered by the router instead${aghOn ? ', through AdGuard Home' : ''}. Apps that encrypt DNS themselves get past it.`}
                     >
                       <Switch
                         id="dns-intercept"

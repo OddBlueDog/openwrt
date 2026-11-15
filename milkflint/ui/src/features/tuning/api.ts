@@ -66,6 +66,17 @@ const statusSchema = z.object({
       wifi_vo_aggr: z.boolean().nullable().default(null),
     })
     .default({ rx_delay: null, cake_ecn: null, cake_l4s: null, cake_loaded: false, wifi_retries: null, wifi_vo_aggr: null }),
+  /** hardware offloading with WED (./wed.ts); an older router doesn't say */
+  wed: z
+    .object({
+      /** the setting asks for it */
+      wanted: z.boolean(),
+      /** how the loaded Wi-Fi driver has it, which it takes when the router starts; null without the driver */
+      loaded: z.boolean().nullable(),
+      /** a radio is attached to the chip's WED right now */
+      active: z.boolean(),
+    })
+    .optional(),
 });
 export type TuningStatus = z.output<typeof statusSchema>;
 

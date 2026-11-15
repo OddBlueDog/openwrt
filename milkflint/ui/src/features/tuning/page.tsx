@@ -1,5 +1,6 @@
-import { ActivityIcon, CpuIcon, EthernetPortIcon, GaugeIcon, LayersIcon, RotateCcwIcon, TimerIcon, WifiIcon, ZapIcon } from 'lucide-react';
-import { type ReactElement, useCallback, useState } from 'react';
+import { ActivityIcon, CpuIcon, EthernetPortIcon, GaugeIcon, LayersIcon, LoaderCircleIcon, RotateCcwIcon, TimerIcon, WifiIcon, ZapIcon } from 'lucide-react';
+import { type ReactElement, useCallback, useRef, useState } from 'react';
+import { Alert, AlertTitle } from '@/components/ui/alert';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading, InfoRow } from '@/components/card-heading';
 import { CpuLanes, RssTable } from '@/components/cpu-lanes';
@@ -19,11 +20,13 @@ import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { type NetworkLive, useNetworkLive } from '@/hooks/use-network-live';
 import { usePoll } from '@/hooks/use-poll';
+import { reboot } from '@/lib/api/system';
 import { bool, type Change, getConfig, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { formatNumber, formatPercent } from '@/lib/format';
 import { href } from '@/lib/router';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
+import { waitForRouterAndReload } from '../backup-reset/api';
 import { cakeTargetMs, GSO, takesWhole, type Whole, wholeOf, wholeValue, withOpts, words } from '../sqm/gso';
 import { multiQueueValue, usesMultiQueue } from '../sqm/multi-queue';
 import { isVpnShaper } from '../vpn-client/sections';
@@ -54,6 +57,8 @@ import {
   rxDelayChoices,
   rxDelayLabel,
 } from './knobs';
+import { speedsText, type WedConfig, wedEffects, wedNeedsRestart, wedNow, wedOffChanges, wedOn, wedOnChanges, wedRestores } from './wed';
+import { WedNotice } from './wed-notice';
 
 // The settings (router side: features/tuning/init puts them into effect):
 // - milkflint.wifi.aql_be: the Wi-Fi queue's best-effort limits, "<low>
@@ -76,7 +81,13 @@ import {
 //   .rings_rt and .rx_delay, milkflint.cake.ecn_drop and .l4s, milkflint.wifi.retries;
 // - firewall's defaults flow_offloading: software flow offloading, as the
 //   Firewall page sets it ("1" in the image). Turning it off turns hardware
-//   offloading (flow_offloading_hw) off too, as that needs it.
+//   offloading (flow_offloading_hw) off too, as that needs it;
+// - milkflint.wifi.wed "1": hardware offloading with Wireless Ethernet
+//   Dispatch (./wed.ts). Turning it on turns Smart Queue off and the
+//   firewall's flow offloading on, software and hardware, remembering what
+//   they were in milkflint.wed, and turning it off puts them back. The page
+//   says what a save will change before it's made, and the Wi-Fi driver takes
+//   the setting when the router restarts, which the save offers.
 // Unset everywhere is what the image does: Restore defaults unsets them.
 // Moving to or from RSS can also switch Smart Queue's multi-queue CAKE
 // (sqm's use_mq), which only spreads over CPUs when RSS does: to RSS it
@@ -106,6 +117,8 @@ interface TuningForm extends Knobs {
   whole: Whole;
   /** software flow offloading */
   offload: boolean;
+  /** hardware offloading with Wireless Ethernet Dispatch */
+  wed: boolean;
 }
 
 interface TuningData {
@@ -118,6 +131,10 @@ interface TuningData {
   firewall: { section: string; hardware: boolean } | undefined;
   /** Smart Queue's WAN queue section: multi-queue, download speed (kbit/s), CAKE's download options, the delay it aims for */
   sqm: { section: string; multiQueue: boolean; download: number; iqdiscOpts: string | undefined; targetMs: number | null } | undefined;
+  /** what hardware offloading with WED reads and changes: every milkflint, sqm and firewall section */
+  wed: WedConfig;
+  /** the router is an access point (the Operating Mode page), which forwards nothing WED could take over */
+  accessPoint: boolean;
 }
 
 const defaults: TuningForm = {
@@ -134,6 +151,7 @@ const defaults: TuningForm = {
   groMax: '',
   whole: 'auto',
   offload: true,
+  wed: false,
 };
 
 const groLabels: Record<Gro, string> = {
@@ -209,11 +227,14 @@ async function loadTuning(): Promise<TuningData> {
       // what the queue does, when LuCI changed it (../sqm/gso.ts)
       whole: wholeOf(str(gro, 'whole'), queue === undefined ? null : str(queue, 'iqdisc_opts'), Number(str(queue, 'download') ?? '0')),
       offload: bool(fwDefaults, 'flow_offloading'),
+      wed: wedOn(milkflint),
       ...readKnobs((name, option) => str(section(name), option)),
     },
     milkflint,
     globals: globals?.['.name'],
     packetSteering,
+    wed: { milkflint, sqm, firewall },
+    accessPoint: str(section('mode'), 'mode') === 'ap',
     firewall: fwDefaults === undefined ? undefined : { section: fwDefaults['.name'], hardware: bool(fwDefaults, 'flow_offloading_hw') },
     sqm:
       queue === undefined
@@ -273,6 +294,7 @@ function meaning(f: TuningForm, data: TuningData | undefined): string {
     f.groMax,
     f.whole,
     data?.firewall === undefined ? null : f.offload,
+    f.wed,
     f.wifiAll,
     f.ringsRt,
     f.rxDelay,
@@ -358,6 +380,13 @@ function toChanges(f: TuningForm, data: TuningData): Change[] {
         whole: wholeValue(f.whole),
       }),
     );
+  }
+  // WED first: a change of software offloading made with it comes after and stands
+  if (f.wed !== was.wed) changes.push(...(f.wed ? wedOnChanges(data.wed) : wedOffChanges(data.wed)));
+  // turning WED off puts the firewall's offloading back as it was before it; software offloading is this
+  // page's own switch, which WED had on, so it ends as the switch shows
+  if (!f.wed && was.wed && f.offload && data.firewall !== undefined) {
+    changes.push({ op: 'set', config: 'firewall', section: data.firewall.section, values: { flow_offloading: '1' } });
   }
   if (f.offload !== was.offload && data.firewall !== undefined) {
     const values: Record<string, string> = { flow_offloading: f.offload ? '1' : '0' };
@@ -725,13 +754,20 @@ function GroCard({
 function OffloadCard({
   form,
   data,
+  status,
   set,
+  onRestart,
 }: {
   form: TuningForm;
   data: TuningData;
+  status: TuningStatus | undefined;
   set: <K extends keyof TuningForm>(key: K, value: TuningForm[K]) => void;
+  /** restart the router, for a WED setting the Wi-Fi driver hasn't taken yet */
+  onRestart: () => void;
 }): ReactElement {
-  const hardware = data.firewall?.hardware === true;
+  // an older router has no WED status, and so no setting to offer
+  const wed = status?.wed;
+  const pending = wedNeedsRestart(data.form.wed, wed);
   return (
     <Card>
       <CardHeading
@@ -743,29 +779,204 @@ function OffloadCard({
         {data.firewall === undefined ? (
           <p className="text-sm text-muted-foreground">The firewall has no defaults section to set it in.</p>
         ) : (
-          <SwitchRow
-            id="offload"
-            checked={form.offload}
-            title="Software flow offloading"
-            hint={`Once a connection is established, its packets skip most of the firewall and routing work: much less CPU at high speeds. Smart Queue still shapes them. Off sends every packet the long way, for troubleshooting.${
-              !form.offload && hardware ? ' Hardware offloading, which needs it, is turned off too.' : ''
-            }`}
-            onChange={(v) => {
-              set('offload', v);
-            }}
-          />
-        )}
-        {data.firewall !== undefined && (
-          <div className="border-t">
-            <InfoRow label="Hardware offloading">
-              <a href={href('firewall')} className="hover:underline">
-                {hardware ? 'on: Smart Queue can’t shape it (Firewall)' : 'off (Firewall)'}
-              </a>
-            </InfoRow>
-          </div>
+          <>
+            <SwitchRow
+              id="offload"
+              checked={form.offload}
+              title="Software flow offloading"
+              hint={`Once a connection is established, its packets skip most of the firewall and routing work: much less CPU at high speeds. Smart Queue still shapes them. Off sends every packet the long way, for troubleshooting.${
+                !form.offload && (data.form.wed || data.firewall.hardware) ? ' Hardware offloading, which needs it, is turned off too.' : ''
+              }`}
+              onChange={(v) => {
+                set('offload', v);
+                if (!v) set('wed', false);
+              }}
+            />
+            <div className={cn('flex items-start gap-3 rounded-lg border p-3 text-sm', data.accessPoint && 'opacity-60')}>
+              <Switch
+                id="wed"
+                className="mt-0.5"
+                checked={form.wed}
+                disabled={data.accessPoint || (wed === undefined && !form.wed)}
+                onCheckedChange={(v) => {
+                  set('wed', v);
+                  if (v) set('offload', true);
+                }}
+              />
+              <label htmlFor="wed" className="flex flex-col gap-0.5">
+                <span className="flex flex-wrap items-center gap-x-2 gap-y-1 font-medium">
+                  Hardware offloading (Wireless Ethernet Dispatch, WED)
+                  <Badge variant="outline">Off by default</Badge>
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {data.accessPoint
+                    ? 'Not as an access point: nothing is routed there that the hardware could take over.'
+                    : 'The router’s chip forwards established connections by itself, Wi-Fi included, and no CPU sees their packets: the least CPU and the highest speeds. Those packets also pass by everything the router does in software to keep latency low, so Smart Queue is turned off and the Wi-Fi’s own queue limits, fairness and pacing no longer reach them: expect more delay when the line or the Wi-Fi is busy. You’re shown what changes before it’s saved, and it takes a restart of the router.'}
+                </span>
+              </label>
+            </div>
+            {wed !== undefined && (data.form.wed || wed.loaded === true) && (
+              <div className="border-t">
+                <InfoRow label="WED in use now">{wedNow(data.form.wed, wed)}</InfoRow>
+              </div>
+            )}
+            {pending && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dashed p-3 text-sm">
+                <span className="text-muted-foreground">
+                  {data.form.wed
+                    ? 'The Wi-Fi driver takes WED when the router restarts. Until then only wired connections are forwarded in hardware.'
+                    : 'The Wi-Fi driver lets go of WED when the router restarts. Until then the Wi-Fi’s fairness and the hold of a silent phone work only in part.'}
+                </span>
+                <Button size="sm" variant="outline" onClick={onRestart}>
+                  Restart the router
+                </Button>
+              </div>
+            )}
+            {!data.form.wed && data.firewall.hardware && (
+              <p className="text-xs text-muted-foreground">
+                Hardware offloading without WED is on in the{' '}
+                <a href={href('firewall')} className="underline">
+                  Firewall
+                </a>
+                : wired connections are forwarded in hardware, past Smart Queue.
+              </p>
+            )}
+          </>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/** "Smart Queue on eth1 (600 / 60 Mbit/s)", "a guest network’s speed limit (25 Mbit/s down)" */
+function queueText(q: { device: string; download: number; upload: number }): string {
+  // on a guest network's bridge the queue's upload is what its devices download
+  const speeds = isGuestShaper(q.device) ? speedsText(q.upload, q.download) : speedsText(q.download, q.upload);
+  const what = isGuestShaper(q.device) ? 'A guest network’s speed limit' : `Smart Queue on ${q.device}`;
+  return speeds === '' ? what : `${what} (${speeds})`;
+}
+
+/** What connections the hardware forwards pass by, in the words of the pages that set it. */
+const passedBy = [
+  'Smart Queue: shaping, fairness between devices, ECN and L4S marking, the ACK filter and restored DSCP.',
+  'The Wi-Fi’s queue limits (AQL) and its queues that send small flows first, on the way to a device.',
+  'Airtime fairness: each device’s weight, limit, tries and pacing. It also can’t tell delivered frames from failed ones while WED is on, so it judges devices by less.',
+  'The Wi-Fi priority map: the Wi-Fi chip picks the priority class of a download by itself.',
+  'Sends per frame, and the hold of a phone that stops answering, which doesn’t work at all with WED on.',
+  'Packet steering, receive interrupts and GRO: nothing of these connections reaches a CPU.',
+  'Live rates on the Dashboard and Wi-Fi pages can read low, and Data Statistics counts them a few seconds behind and less exactly.',
+];
+
+/**
+ * Before a save that turns hardware offloading with WED on or off: what it
+ * changes besides, what stops applying, and the restart it takes.
+ */
+function WedDialog({
+  to,
+  data,
+  onCancel,
+  onSave,
+}: {
+  /** turning it on or off; undefined: closed */
+  to: boolean | undefined;
+  data: TuningData;
+  onCancel: () => void;
+  onSave: (restart: boolean) => void;
+}): ReactElement {
+  const effects = wedEffects(data.wed);
+  const restores = wedRestores(data.wed);
+  return (
+    <Dialog
+      open={to !== undefined}
+      onOpenChange={(open) => {
+        if (!open) onCancel();
+      }}
+    >
+      <DialogContent className="max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle>{to === true ? 'Turn hardware offloading (WED) on?' : 'Turn hardware offloading (WED) off?'}</DialogTitle>
+          <DialogDescription>
+            {to === true
+              ? 'The router’s chip then forwards established connections by itself. That is the fastest and lightest way through the router, and it passes by what keeps latency low.'
+              : 'Connections go through the router’s software again, and what WED turned off comes back.'}
+          </DialogDescription>
+        </DialogHeader>
+        {to === true ? (
+          <div className="flex flex-col gap-3 text-sm">
+            <div>
+              <p className="font-medium">Turned off, and back on when WED is turned off:</p>
+              <ul className="list-disc pl-5 text-muted-foreground">
+                {effects.queues.length === 0 ? (
+                  <li>Nothing: Smart Queue and the guest speed limits are off already.</li>
+                ) : (
+                  effects.queues.map((q) => <li key={q.section}>{queueText(q)}</li>)
+                )}
+              </ul>
+            </div>
+            {(effects.offload || effects.offloadHw) && (
+              <div>
+                <p className="font-medium">Turned on, which WED needs:</p>
+                <ul className="list-disc pl-5 text-muted-foreground">
+                  {effects.offload && <li>The firewall’s software flow offloading.</li>}
+                  {effects.offloadHw && <li>The firewall’s hardware flow offloading, for wired connections too.</li>}
+                </ul>
+              </div>
+            )}
+            <div>
+              <p className="font-medium">No longer applied to connections the hardware forwards:</p>
+              <ul className="list-disc pl-5 text-muted-foreground">
+                {passedBy.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            </div>
+            <p className="text-muted-foreground">
+              Unchanged: the firewall’s rules and port forwards, blocked devices, guest isolation, VPNs (their traffic stays in software), DNS
+              and the rest of the Wi-Fi settings.
+            </p>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3 text-sm">
+            <div>
+              <p className="font-medium">Put back as they were:</p>
+              <ul className="list-disc pl-5 text-muted-foreground">
+                {restores.queues.map((q) => (
+                  <li key={q.section}>{isGuestShaper(q.device) ? 'A guest network’s speed limit' : `Smart Queue on ${q.device}`}, with its settings.</li>
+                ))}
+                {restores.offloadHw === false && <li>The firewall’s hardware flow offloading: off.</li>}
+                {restores.queues.length === 0 && restores.offloadHw === undefined && (
+                  <li>Nothing else was changed by it.</li>
+                )}
+              </ul>
+            </div>
+          </div>
+        )}
+        <p className="text-sm text-muted-foreground">
+          The Wi-Fi driver takes the change when the router restarts: everything is offline for a minute or two, Wi-Fi a little longer on
+          channels that check for radar first. The rest applies at once.
+        </p>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => {
+              onSave(false);
+            }}
+          >
+            Save, restart later
+          </Button>
+          <Button
+            onClick={() => {
+              onSave(true);
+            }}
+          >
+            Save and restart
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -824,12 +1035,15 @@ function EcnCard({
   status,
   targetMs,
   set,
+  wedOn,
 }: {
   form: TuningForm;
   status: TuningStatus | undefined;
   /** the queue delay Smart Queue aims for, ms; null if it isn't known */
   targetMs: number | null;
   set: <K extends keyof TuningForm>(key: K, value: TuningForm[K]) => void;
+  /** hardware offloading with WED is on, and Smart Queue off for it */
+  wedOn: boolean;
 }): ReactElement {
   return (
     <Card>
@@ -839,6 +1053,11 @@ function EcnCard({
         description="How Smart Queue (CAKE) treats traffic that asks to be slowed by marks (ECN) rather than drops."
       />
       <CardContent className="divide-y">
+        {wedOn && (
+          <p className="pb-3 text-xs text-muted-foreground">
+            Hardware offloading (WED) is on and Smart Queue off for it: these wait until it runs again.
+          </p>
+        )}
         <Field
           id="ecnDrop"
           label="Drop from downloads that ignore the marks"
@@ -898,11 +1117,14 @@ function AqlCard({
   errors,
   status,
   set,
+  wedOn,
 }: {
   form: TuningForm;
   errors: Errors;
   status: TuningStatus | undefined;
   set: <K extends keyof TuningForm>(key: K, value: TuningForm[K]) => void;
+  /** hardware offloading with WED is on: what it forwards passes these settings by */
+  wedOn: boolean;
 }): ReactElement {
   const radios = status?.radios ?? [];
   const first = radios[0];
@@ -921,6 +1143,11 @@ function AqlCard({
         description="How much airtime of best-effort traffic each device may have waiting in the Wi-Fi driver (AQL), and how often it sends a frame."
       />
       <CardContent className="divide-y">
+        {wedOn && (
+          <p className="pb-3 text-xs text-muted-foreground">
+            Hardware offloading (WED) is on: connections it forwards pass these by. They still apply to what goes through the router’s software.
+          </p>
+        )}
         <Field
           id="aql"
           label="Queue limit (AQL)"
@@ -1166,11 +1393,29 @@ export function TuningPage(): ReactElement {
   const refreshStatus = status.refresh;
   const [edit, setEdit] = useState<TuningForm>();
   const [restoring, setRestoring] = useState(false);
+  // a save that changes hardware offloading (WED) is confirmed first: the changes it waits with
+  const [wedSave, setWedSave] = useState<{ to: boolean; changes: Change[] }>();
+  const [restarting, setRestarting] = useState(false);
+  // restart the router once the save in progress is applied
+  const restartAfter = useRef(false);
+  const restart = useCallback(async (): Promise<void> => {
+    setRestarting(true);
+    try {
+      await reboot();
+    } catch {
+      // the router may drop the connection while answering
+    }
+    await waitForRouterAndReload();
+  }, []);
   const onApplied = useCallback(() => {
     setEdit(undefined);
     reload();
     refreshStatus();
-  }, [reload, refreshStatus]);
+    if (restartAfter.current) {
+      restartAfter.current = false;
+      void restart();
+    }
+  }, [reload, refreshStatus, restart]);
   const { state, apply } = useApply(onApplied);
   const form = edit ?? data?.form;
   const errors = form === undefined ? {} : validate(form);
@@ -1185,17 +1430,25 @@ export function TuningPage(): ReactElement {
   const atDefaults = data !== undefined && meaning(data.form, data) === meaning(defaults, data);
   const applying = state.phase === 'applying';
 
+  // a save goes ahead, unless it turns WED on or off: that one says first what it changes
+  const save = (f: TuningForm): void => {
+    if (data === undefined) return;
+    const changes = toChanges(f, data);
+    if (f.wed !== data.form.wed) setWedSave({ to: f.wed, changes });
+    else void apply(changes);
+  };
+
   const restore = (): void => {
     setRestoring(false);
     setEdit(undefined);
-    if (data !== undefined && !atDefaults) void apply(toChanges(defaults, data));
+    if (data !== undefined && !atDefaults) save(defaults);
   };
 
   return (
     <>
       <PageHeader
         title="Performance Tuning"
-        description="How the router handles heavy traffic: which CPUs do the network work, how the internet port groups and hands over what it receives, flow offloading, how Smart Queue treats ECN, and the Wi-Fi driver. Changes apply at once; Wi-Fi and the internet stay up."
+        description="How the router handles heavy traffic: which CPUs do the network work, how the internet port groups and hands over what it receives, flow offloading, how Smart Queue treats ECN, and the Wi-Fi driver. Changes apply at once and Wi-Fi and the internet stay up, except hardware offloading (WED), which takes a restart."
         actions={
           <Button
             variant="outline"
@@ -1211,6 +1464,18 @@ export function TuningPage(): ReactElement {
       />
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
+        {restarting && (
+          <Alert variant="info">
+            <LoaderCircleIcon className="animate-spin" />
+            <AlertTitle>Restarting the router…</AlertTitle>
+          </Alert>
+        )}
+        {data?.form.wed === true && (
+          <WedNotice title="Hardware offloading (WED) is on">
+            Smart Queue and the guest speed limits were turned off for it, and connections the hardware forwards pass by the Wi-Fi queue
+            limits, airtime fairness, packet steering and GRO settings below. Turning it off under Flow offloading puts everything back.
+          </WedNotice>
+        )}
         <WorkCard live={live} />
         {error !== undefined && data === undefined ? (
           <LoadError error={error} retry={reload} />
@@ -1220,10 +1485,18 @@ export function TuningPage(): ReactElement {
           <div className="grid items-start gap-4 xl:grid-cols-2">
             <SteeringCard form={form} data={data} live={live.data} set={set} />
             <GroCard form={form} data={data} port={status.data?.gro[0]} set={set} />
-            <OffloadCard form={form} data={data} set={set} />
+            <OffloadCard
+              form={form}
+              data={data}
+              status={status.data}
+              set={set}
+              onRestart={() => {
+                void restart();
+              }}
+            />
             <InterruptCard form={form} status={status.data} set={set} />
-            <EcnCard form={form} status={status.data} targetMs={data.sqm?.targetMs ?? null} set={set} />
-            <AqlCard form={form} errors={errors} status={status.data} set={set} />
+            <EcnCard form={form} status={status.data} targetMs={data.sqm?.targetMs ?? null} set={set} wedOn={data.form.wed} />
+            <AqlCard form={form} errors={errors} status={status.data} set={set} wedOn={data.form.wed} />
             <WaitsCard status={status.data} live={live.data} />
           </div>
         )}
@@ -1233,12 +1506,27 @@ export function TuningPage(): ReactElement {
         busy={applying}
         invalid={Object.keys(errors).length > 0}
         onSave={() => {
-          if (form !== undefined && data !== undefined) void apply(toChanges(form, data));
+          if (form !== undefined) save(form);
         }}
         onRevert={() => {
           setEdit(undefined);
         }}
       />
+      {data !== undefined && (
+        <WedDialog
+          to={wedSave?.to}
+          data={data}
+          onCancel={() => {
+            setWedSave(undefined);
+          }}
+          onSave={(andRestart) => {
+            const changes = wedSave?.changes ?? [];
+            setWedSave(undefined);
+            restartAfter.current = andRestart;
+            void apply(changes);
+          }}
+        />
+      )}
       <Dialog open={restoring} onOpenChange={setRestoring}>
         <DialogContent>
           <DialogHeader>
@@ -1290,6 +1578,7 @@ export function TuningPage(): ReactElement {
               {data.firewall !== undefined && (
                 <RestoreItem label="Software flow offloading" to="On" from={data.form.offload ? undefined : 'Off'} />
               )}
+              {data.form.wed && <RestoreItem label="Hardware offloading (WED)" to="Off, with a restart: you’re asked first" from="On" />}
               {queueSwitch(defaults, data) !== undefined && (
                 <RestoreItem label="Smart Queue" to="multi-queue CAKE" from="single-queue CAKE" />
               )}

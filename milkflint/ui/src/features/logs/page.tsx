@@ -39,6 +39,7 @@ const kinds: { id: LogKind; label: string; title: string }[] = [
   { id: 'radar', label: 'Radar', title: 'Radar log' },
   { id: 'debug', label: 'Debug', title: 'Debug log' },
   { id: 'dns', label: 'DNS', title: 'DNS log' },
+  { id: 'banip', label: 'banIP', title: 'banIP log' },
   { id: 'crash', label: 'Crashes', title: 'Crash reports' },
 ];
 
@@ -49,6 +50,7 @@ const placeholders: Record<LogKind, string> = {
   radar: 'Filter, e.g. RADAR-DETECTED or CAC',
   debug: 'Filter, e.g. snapshot, cake or RESTART',
   dns: 'Filter, e.g. slow, a device or a site',
+  banip: 'Filter, e.g. failed, a list or err',
   crash: 'Filter, e.g. Oops, KFENCE or mt7915',
 };
 
@@ -73,6 +75,7 @@ function source(kind: LogKind, status: LogStatus | undefined): string {
     const bytes = status.radar_bytes ?? null;
     return `kept across restarts${bytes === null ? '' : `, ${formatBytes(bytes)} saved`}`;
   }
+  if (kind === 'banip') return `banIP’s runs${status.persist ? ', kept across restarts' : ', since the last restart'}; what it blocked is on the banIP page`;
   if (kind === 'crash') {
     if (status.kfence_active === false) return 'crashes kept until the router loses power; the memory error checker is off';
     return `crashes kept until the router loses power, memory errors ${status.persist ? 'with the saved logs' : 'since the last restart'}`;

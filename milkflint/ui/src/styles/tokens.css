@@ -30,10 +30,12 @@
   --input: #d9d6cc;
   --ring: #b5410f;
   --sidebar: #efede6;
+  /* the chart series: checked so any two stay apart, with full colour vision and
+     with red-green colour blindness; light and dark are picked separately */
   --chart-1: #b5410f;
-  --chart-2: #2c5f8a;
-  --chart-3: #2f7a3f;
-  --chart-4: #9a6a00;
+  --chart-2: #345197;
+  --chart-3: #18a07e;
+  --chart-4: #c168d5;
   --radius: 0.5rem;
   --font-sans: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
@@ -68,8 +70,8 @@
   --ring: #f08a5d;
   --sidebar: #171715;
   --chart-1: #f08a5d;
-  --chart-2: #7fb3e0;
-  --chart-3: #6cc483;
-  --chart-4: #e0b04a;
+  --chart-2: #168dd9;
+  --chart-3: #4b853e;
+  --chart-4: #ac5f94;
   color-scheme: dark;
 }

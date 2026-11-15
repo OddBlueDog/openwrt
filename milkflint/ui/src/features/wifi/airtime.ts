@@ -10,6 +10,8 @@
 // service reads the option itself within a second: no radio restarts. What
 // the card (airtime-card.tsx) shows of its reply is worked out here.
 
+import { snrOf } from '@/lib/snr';
+
 /**
  * What the policy makes of a device's link, by its useful rate (the rate the
  * router sends to it at, times the share of its frames that get through).
@@ -346,15 +348,14 @@ export function airtimeHeldWords(held: number): string | undefined {
 
 /**
  * A device's signal in words, as the router hears it: "-67 dBm", and where
- * the radio's noise on the channel is known how far above it that is:
- * "-67 dBm, 25 dB above the noise". undefined without a signal.
+ * the radio's noise on the channel is known its signal-to-noise ratio:
+ * "-67 dBm · SNR 25 dB". undefined without a signal.
  */
 export function airtimeSignalWords(signal: number | null, noise: number | null): string | undefined {
   if (signal === null || !Number.isFinite(signal)) return undefined;
   const dbm = `${String(Math.round(signal))} dBm`;
-  // a noise figure of 0 or more is a radio that has none
-  if (noise === null || !Number.isFinite(noise) || noise >= 0 || signal <= noise) return dbm;
-  return `${dbm}, ${String(Math.round(signal - noise))} dB above the noise`;
+  const snr = snrOf(signal, noise);
+  return snr === undefined ? dbm : `${dbm} · SNR ${String(snr)} dB`;
 }
 
 /**

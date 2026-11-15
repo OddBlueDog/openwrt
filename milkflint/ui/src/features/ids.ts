@@ -20,6 +20,8 @@ export const featureIds = [
   'sqm',
   'tuning',
   'firewall',
+  'adguardhome',
+  'banip',
   'upnp',
   'system-overview',
   'admin-password',

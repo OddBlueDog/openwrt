@@ -15,7 +15,7 @@ import {
   liveLine,
   lossBins,
   lossSliceAt,
-  niceScale,
+  niceRange,
   runs,
   slotValues,
   timeTicks,
@@ -120,11 +120,29 @@ test('rare loss still shows', () => {
   assert.equal(formatLoss(0.25), '25%');
 });
 
-test('the scale ends on a round number with even ticks', () => {
-  assert.deepEqual(niceScale(113), { max: 150, ticks: [0, 50, 100, 150] });
-  assert.deepEqual(niceScale(148), { max: 200, ticks: [0, 50, 100, 150, 200] });
-  assert.deepEqual(niceScale(6, 25), { max: 30, ticks: [0, 10, 20, 30] });
-  assert.equal(niceScale(0).ticks[0], 0);
+test('the scale ends on round numbers with even ticks', () => {
+  assert.deepEqual(niceRange(2, 113, 5), { min: 0, max: 150, ticks: [0, 50, 100, 150] });
+  assert.deepEqual(niceRange(1, 148, 5), { min: 0, max: 200, ticks: [0, 50, 100, 150, 200] });
+  assert.deepEqual(niceRange(Infinity, -Infinity, 5).ticks[0], 0);
+});
+
+test('the scale fits the lines shown instead of starting at 0', () => {
+  // 14–20 ms: from 12, not from 0
+  assert.deepEqual(niceRange(14, 20, 5), { min: 12, max: 22, ticks: [12, 14, 16, 18, 20, 22] });
+  // a steady 15 ms line isn't blown up: at least 5 ms of scale
+  const flat = niceRange(14.8, 15.3, 5);
+  assert.ok(flat.min <= 12.5 && flat.max >= 17.5 && flat.min > 0);
+  // near 0 (a gateway at 0.4 ms), from 0
+  assert.deepEqual(niceRange(0.3, 0.5, 5), { min: 0, max: 6, ticks: [0, 2, 4, 6] });
+  // the gateway and the internet together: from 0
+  assert.equal(niceRange(1, 25, 5).min, 0);
+  // hiding the slow line rescales: only the far route left
+  assert.ok(niceRange(80, 95, 5).min >= 70);
+  for (const [lo, hi] of [[14, 20], [3, 250], [0.2, 0.9], [99.5, 100.5]] as const) {
+    const r = niceRange(lo, hi, 5);
+    assert.ok(r.min <= lo && r.max >= hi, `${String(lo)}–${String(hi)} inside ${String(r.min)}–${String(r.max)}`);
+    assert.ok(r.ticks.length >= 3 && r.ticks.length <= 7, `${String(r.ticks.length)} ticks`);
+  }
 });
 
 test('clock marks fall on round times and clear of "now"', () => {

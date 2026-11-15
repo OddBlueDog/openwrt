@@ -183,7 +183,7 @@ const fileSchema = z.object({
     members: z.record(z.string(), z.array(z.array(z.unknown()))),
     probes: z.array(z.unknown()),
     router: z.array(z.unknown()),
-    dns: z.object({ upstream: z.unknown(), lookups: z.array(z.unknown()) }),
+    dns: z.object({ upstream: z.unknown(), via: z.unknown().optional(), lookups: z.array(z.unknown()) }),
   }),
   thresholds: z.unknown(),
 });
@@ -209,7 +209,7 @@ export function parseExport(text: string): { data: RunData; thresholds: Threshol
       records,
       probes: parseProbes(lines(x.data.probes)),
       router: parseRouter(lines(x.data.router)),
-      dns: parseDns([JSON.stringify({ upstream: x.data.dns.upstream }), ...lines(x.data.dns.lookups)]),
+      dns: parseDns([JSON.stringify({ upstream: x.data.dns.upstream, via: x.data.dns.via }), ...lines(x.data.dns.lookups)]),
     },
     thresholds: parseThresholds(x.thresholds),
     exported: x.exported,

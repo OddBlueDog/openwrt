@@ -23,20 +23,24 @@ export type DnsLookup = z.output<typeof dnsLine>;
 export interface RouterDns {
   /** what dnsmasq forwards to: dnsproxy (encrypted DNS), a plain server, or nothing known */
   upstream: 'dnsproxy' | 'server' | null;
+  /** the way in, as the devices' lookups go: AdGuard Home (then dnsmasq) while it filters, else dnsmasq */
+  via: 'dnsmasq' | 'adguardhome';
   lookups: DnsLookup[];
 }
 
 export function parseDns(lines: readonly string[]): RouterDns {
   let upstream: RouterDns['upstream'] = null;
+  let via: RouterDns['via'] = 'dnsmasq';
   for (const l of lines.slice(0, 1)) {
     try {
-      const v = (JSON.parse(l) as { upstream?: unknown }).upstream;
-      if (v === 'dnsproxy' || v === 'server') upstream = v;
+      const first = JSON.parse(l) as { upstream?: unknown; via?: unknown };
+      if (first.upstream === 'dnsproxy' || first.upstream === 'server') upstream = first.upstream;
+      if (first.via === 'adguardhome') via = 'adguardhome';
     } catch {
       // not the first line it should be
     }
   }
-  return { upstream, lookups: parseLines(lines, dnsLine) };
+  return { upstream, via, lookups: parseLines(lines, dnsLine) };
 }
 
 const median = (v: readonly number[]): number | undefined => percentile([...v].sort((a, b) => a - b), 0.5);

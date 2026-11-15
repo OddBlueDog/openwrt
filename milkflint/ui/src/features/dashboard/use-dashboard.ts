@@ -16,7 +16,7 @@ import {
 import { getSqmStatus, getStats, type Stats } from '@/lib/api/stats';
 import { getBoard, getInfo, type Board, type SystemInfo } from '@/lib/api/system';
 import { getConfig, list, str } from '@/lib/api/uci';
-import { bandOf, describeRate, generationOf, getAccessPoints, getWirelessStatus } from '@/lib/api/wireless';
+import { bandOf, describeRate, generationOf, getAccessPoints, getWirelessStatus, stationSnr } from '@/lib/api/wireless';
 import { directionsOf, type DirectionSummary, summarize } from '../sqm/cake';
 
 export const POLL_MS = 2000;
@@ -63,6 +63,8 @@ export interface Client {
   band: string | undefined;
   ssid: string | undefined;
   signal: number | undefined;
+  /** Signal-to-noise ratio, dB. */
+  snr: number | undefined;
   /** Link rates in bit/s, as negotiated (not traffic). */
   rxRate: number | undefined;
   txRate: number | undefined;
@@ -206,6 +208,7 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
           band: bandOf(l.info?.frequency),
           ssid: l.ssid,
           signal: s.signal_avg ?? s.signal,
+          snr: stationSnr(s, l.info?.noise),
           rxRate: s.rx?.rate === undefined ? undefined : s.rx.rate * 1000,
           txRate: s.tx?.rate === undefined ? undefined : s.tx.rate * 1000,
           rxDescription: describeRate(s.rx),

@@ -16,6 +16,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useApply } from '@/hooks/use-apply';
+import { useWed } from '../tuning/use-wed';
+import { WedNotice } from '../tuning/wed-notice';
 import { useLoad } from '@/hooks/use-load';
 import { type NetworkLive, queueKey, useNetworkLive } from '@/hooks/use-network-live';
 import { getDevices, getInterfaces } from '@/lib/api/network';
@@ -383,10 +385,14 @@ function AdvancedButton({ why, onClick }: { why: string | undefined; onClick: ()
 export function SqmPage(): ReactElement {
   const { data, error, loading, reload } = useLoad(loadSqm);
   const [edit, setEdit] = useState<SqmForm>();
+  // hardware offloading with WED turns Smart Queue off; turning it on here turns WED off
+  const wed = useWed();
+  const reloadWed = wed.reload;
   const onApplied = useCallback(() => {
     setEdit(undefined);
     reload();
-  }, [reload]);
+    reloadWed();
+  }, [reload, reloadWed]);
   const { state, apply } = useApply(onApplied);
   const [advanced, setAdvanced] = useState(false);
   const live = useLive();
@@ -473,7 +479,14 @@ export function SqmPage(): ReactElement {
                 <AlertDescription>The sqm-scripts package is missing from this firmware image.</AlertDescription>
               </Alert>
             )}
-            {offloadOn && form.enabled && !form.offloadOff && (
+            {wed.on && (
+              <WedNotice title="Smart Queue is off: hardware offloading (WED) is on" turningOff={form.enabled}>
+                {form.enabled
+                  ? 'Smart Queue and WED can’t both run: the connections WED forwards in hardware never reach a queue.'
+                  : 'The router’s chip forwards established connections by itself, and they never reach a queue, so Smart Queue was turned off for it. Its settings are kept, and it comes back when WED is turned off; turning it on here turns WED off instead.'}
+              </WedNotice>
+            )}
+            {!wed.on && offloadOn && form.enabled && !form.offloadOff && (
               <Alert variant="warning">
                 <TriangleAlertIcon />
                 <AlertTitle>Hardware flow offloading bypasses Smart Queue</AlertTitle>
@@ -850,7 +863,9 @@ export function SqmPage(): ReactElement {
         busy={state.phase === 'applying'}
         invalid={Object.keys(errors).length > 0}
         onSave={() => {
-          if (form !== undefined && data !== undefined) void apply(toChanges(form, data));
+          if (form === undefined || data === undefined) return;
+          // Smart Queue on is WED off: its changes first, so this page's own stand
+          void apply([...(wed.on && form.enabled ? wed.offChanges() : []), ...toChanges(form, data)]);
         }}
         onRevert={() => {
           setEdit(undefined);

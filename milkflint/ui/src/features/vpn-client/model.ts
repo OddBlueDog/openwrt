@@ -87,6 +87,13 @@ export interface ClientData {
   wanRates: { down: number; up: number } | undefined;
   lan: { ip: number; prefix: number } | undefined;
   taken: { ip: number; prefix: number; name: string }[];
+  /**
+   * AdGuard Home on the router (its page): 'tunnel' sends these devices'
+   * lookups through the tunnel, to the DNS page's servers; 'automatic' can't
+   * (the DNS page uses the internet provider's servers, which don't answer
+   * through a VPN); undefined: it's off, or not in this firmware.
+   */
+  adguard?: 'tunnel' | 'automatic' | undefined;
 }
 
 export type Errors = Partial<Record<string, string>>;
@@ -387,10 +394,20 @@ export function describe(f: ClientForm, d: ClientData): Line[] {
     hasIpv6(f)
       ? { ok: true, text: 'Their IPv6 goes through the tunnel too.' }
       : { ok: true, text: 'The VPN has no IPv6, so their IPv6 is blocked rather than going out directly: their apps use IPv4.' },
-    {
-      ok: false,
-      text: 'Their DNS lookups don’t go through the VPN: the router answers them with the DNS page’s servers, which see your home address (your provider doesn’t, with encrypted DNS).',
-    },
+    d.adguard === 'tunnel'
+      ? {
+          ok: true,
+          text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the DNS page’s servers${f.killSwitch ? ', and nowhere else' : ' (directly while the tunnel is down, as the rest of their traffic)'}.`,
+        }
+      : d.adguard === 'automatic'
+        ? {
+            ok: false,
+            text: 'Their DNS lookups don’t go through the VPN: the DNS page uses your internet provider’s servers, which don’t answer through a VPN. Choose servers there (plain or encrypted) and AdGuard Home sends their lookups through the tunnel.',
+          }
+        : {
+            ok: false,
+            text: 'Their DNS lookups don’t go through the VPN: the router answers them with the DNS page’s servers, which see your home address (your provider doesn’t, with encrypted DNS).',
+          },
   ];
   if (d.sqm) {
     lines.push(

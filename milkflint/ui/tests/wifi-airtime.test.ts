@@ -544,8 +544,8 @@ test('airtime: the channels a radio is using, all of them', () => {
 test('airtime: a device’s signal in words, its strength and each antenna', () => {
   assert.equal(airtimeSignalWords(-67, null), '-67 dBm');
   // with the radio's noise, how far above it
-  assert.equal(airtimeSignalWords(-67, -92), '-67 dBm, 25 dB above the noise');
-  assert.equal(airtimeSignalWords(-54.4, -91.6), '-54 dBm, 37 dB above the noise');
+  assert.equal(airtimeSignalWords(-67, -92), '-67 dBm · SNR 25 dB');
+  assert.equal(airtimeSignalWords(-54.4, -91.6), '-54 dBm · SNR 37 dB');
   // a noise figure that isn't one, or a signal at or under it: just the signal
   assert.equal(airtimeSignalWords(-67, 0), '-67 dBm');
   assert.equal(airtimeSignalWords(-95, -92), '-95 dBm');

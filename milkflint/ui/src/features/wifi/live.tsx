@@ -2,6 +2,7 @@
 // what it runs on, devices, throughput now, airtime and signal.
 import { ArrowDownIcon, ArrowUpIcon, QrCodeIcon, WifiIcon, WifiOffIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useRef, useState } from 'react';
+import { SNR_HINT } from '@/components/charts/signal-bars';
 import { Sparkline } from '@/components/charts/sparkline';
 import { QrCode } from '@/components/qr-code';
 import { Badge } from '@/components/ui/badge';
@@ -11,7 +12,7 @@ import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
 import { getDevices, getLeases } from '@/lib/api/network';
 import { bool, getConfig, str } from '@/lib/api/uci';
-import { getAccessPoints, getSurvey, getWirelessStatus, type SurveyEntry } from '@/lib/api/wireless';
+import { getAccessPoints, getSurvey, getWirelessStatus, stationSnr, type SurveyEntry } from '@/lib/api/wireless';
 import { formatBitrate, formatBytes, formatPercent } from '@/lib/format';
 import { wifiQrText } from '@/lib/qr';
 import { onGuestNetwork } from '../wifi-guest/guest';
@@ -39,7 +40,7 @@ interface Band {
   clients: number;
   /** Devices on its guest network; undefined when it has none. */
   guests: number | undefined;
-  weakest: { name: string; signal: number } | undefined;
+  weakest: { name: string; signal: number; snr: number | undefined } | undefined;
   /** bits/s: what devices download (the access point's tx) and upload (its rx). */
   down: number | undefined;
   up: number | undefined;
@@ -135,9 +136,9 @@ function useWifiLive(): Band[] | undefined {
 
       const signals = mine.flatMap((a) => a.stations).flatMap((s) => {
         const signal = s.signal_avg ?? s.signal;
-        return signal === undefined ? [] : [{ name: names.get(s.mac.toLowerCase()) ?? s.mac, signal }];
+        return signal === undefined ? [] : [{ name: names.get(s.mac.toLowerCase()) ?? s.mac, signal, snr: stationSnr(s, info?.noise) }];
       });
-      const weakest = signals.reduce<{ name: string; signal: number } | undefined>((w, s) => (w === undefined || s.signal < w.signal ? s : w), undefined);
+      const weakest = signals.reduce<{ name: string; signal: number; snr: number | undefined } | undefined>((w, s) => (w === undefined || s.signal < w.signal ? s : w), undefined);
       // netifd lists only the networks that are on; a radio with none is up but has nothing to start
       const networkOn = (r.interfaces ?? []).some((i) => (i.config?.mode ?? 'ap') === 'ap' && i.config?.disabled !== true);
       // the interface, once hostapd has it: carrier while it broadcasts, none while it picks a channel or
@@ -310,6 +311,11 @@ function BandCard({ b }: { b: Band }): ReactElement {
               </Stat>
               <Stat label="Weakest signal">
                 {b.weakest === undefined ? '—' : `${String(b.weakest.signal)} dBm`}
+                {b.weakest?.snr !== undefined && (
+                  <span title={SNR_HINT} className="block cursor-help text-xs font-normal text-muted-foreground tabular">
+                    SNR {b.weakest.snr} dB
+                  </span>
+                )}
                 {b.weakest !== undefined && <span className="block truncate text-xs font-normal text-muted-foreground">{b.weakest.name}</span>}
               </Stat>
               <Stat label="Airtime used">{b.airtime === undefined ? '—' : formatPercent(b.airtime)}</Stat>

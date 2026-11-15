@@ -3,7 +3,7 @@
 // points' connected devices.
 import { getInterfaces, getLeases, ipToInt, type NetworkInterface, prefixLength } from '@/lib/api/network';
 import { bool, getConfig, list, type Section, str } from '@/lib/api/uci';
-import { bandOf, getAccessPoints } from '@/lib/api/wireless';
+import { bandOf, getAccessPoints, stationSnr } from '@/lib/api/wireless';
 import { interceptOn } from '../dns/intercept';
 import { type FirewallConfig, lanZone, parseFirewall, wanZone } from '../firewall/model';
 import { defaultGuestLabel, GUEST_IDS, type GuestId, guestBridge, isGuestIface, isGuestNetwork } from './guest';
@@ -160,6 +160,8 @@ export interface Guest {
   ip: string | undefined;
   band: string | undefined;
   signal: number | undefined;
+  /** Signal-to-noise ratio, dB. */
+  snr: number | undefined;
   connected: number | undefined;
 }
 
@@ -178,6 +180,7 @@ export async function loadGuests(id: GuestId): Promise<Guest[]> {
           ip: lease?.ipaddr,
           band: bandOf(ap.info?.frequency),
           signal: s.signal_avg ?? s.signal,
+          snr: stationSnr(s, ap.info?.noise),
           connected: s.connected_time,
         };
       }),

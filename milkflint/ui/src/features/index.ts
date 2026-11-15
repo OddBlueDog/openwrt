@@ -1,7 +1,9 @@
 // The feature registry: every page of the interface. Keyed by id, so the
 // compiler checks each id in ids.ts has exactly one feature.
+import { feature as adguardhome } from './adguardhome/feature';
 import { feature as adminPassword } from './admin-password/feature';
 import { feature as backupReset } from './backup-reset/feature';
+import { feature as banip } from './banip/feature';
 import { feature as clients } from './clients/feature';
 import { feature as dashboard } from './dashboard/feature';
 import { feature as dataStatistics } from './data-statistics/feature';
@@ -53,6 +55,8 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   sqm,
   tuning,
   firewall,
+  adguardhome,
+  banip,
   upnp,
   'system-overview': systemOverview,
   'admin-password': adminPassword,

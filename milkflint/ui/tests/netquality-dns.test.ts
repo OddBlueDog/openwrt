@@ -11,6 +11,8 @@ test('a server is named after its DNS page provider, by host name or address', (
   assert.equal(providerName('dns.google'), 'Google');
   assert.equal(providerName('dns.quad9.net'), 'Quad9');
   assert.equal(providerName('192.0.2.53'), undefined);
+  // the probe's line through AdGuard Home on the router
+  assert.equal(providerName('adguardhome'), 'AdGuard Home (this router)');
 });
 
 interface P {

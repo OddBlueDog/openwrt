@@ -288,8 +288,8 @@ const WAN: Section = {
 const GUEST: Section = {
   enabled: '1',
   interface: 'br-guest',
-  download: '30000',
-  upload: '200000',
+  download: '25000',
+  upload: '150000',
   qdisc: 'cake',
   script: 'piece_of_cake.qos',
   linklayer: 'none',
@@ -750,6 +750,27 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     await r.run('reload');
     assertNothing(r, 'eth1');
     assertShaping(r, 'eth2', 'cake', 'cake_mq');
+  });
+
+  test('with hardware offloading (WED) on, no queue starts but the VPN’s, and the log says why', { skip }, async () => {
+    const r = new Router();
+    r.dev('wg_out', 1);
+    r.sqm({ eth1: WAN, guest: GUEST, vpn: { ...GUEST, interface: 'wg_out' } });
+    r.write('milkflint', { wifi: { wed: '1' } }, 'wifi');
+    await r.run('start');
+    assertNothing(r, 'eth1');
+    assertNothing(r, 'br-guest');
+    assertShaping(r, 'wg_out');
+    const log = r.syslog().join('\n');
+    assert.match(log, /eth1: not started\. Hardware offloading \(WED\) is on/);
+    assert.match(log, /br-guest: not started/);
+    assert.doesNotMatch(log, /wg_out: not started/);
+    // WED off again: they start as they're set
+    r.write('milkflint', { wifi: {} }, 'wifi');
+    await r.run('reload');
+    assertShaping(r, 'eth1', 'cake', 'cake_mq');
+    assertShaping(r, 'br-guest');
+    assertShaping(r, 'wg_out');
   });
 
   test('two sections on one device: the first that is on runs, and a switch to the other restarts it', { skip }, async () => {

@@ -22,6 +22,8 @@ import { getConfig } from '@/lib/api/uci';
 import { useRouterMode } from '@/lib/router-mode';
 import { formatBitrate, formatBytes, formatDuration, formatPercent } from '@/lib/format';
 import { errorMessage } from '@/lib/utils';
+import { AdGuardHomeNote } from '../adguardhome/dashboard-note';
+import { BanipNote } from '../banip/dashboard-note';
 import { zoneChosen } from '../time/zone';
 import { ClientsCard } from './clients-card';
 import { QualityCard } from './quality-card';
@@ -224,6 +226,8 @@ export function DashboardPage(): ReactElement {
       ) : (
         <div className="flex flex-col gap-4">
           <SetupNote />
+          <AdGuardHomeNote />
+          <BanipNote />
           <StatCards d={data} />
           <div className="grid gap-4 xl:grid-cols-3">
             <TrafficCard d={data} className="xl:col-span-2" />

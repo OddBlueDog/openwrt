@@ -85,10 +85,13 @@ export function CacheCard({
   form,
   set,
   sizeError,
+  adguard = false,
 }: {
   form: DnsForm;
   set: <K extends keyof DnsForm>(key: K, value: DnsForm[K]) => void;
   sizeError: string | undefined;
+  /** AdGuard Home is on: it keeps a cache of its own in front of this one */
+  adguard?: boolean;
 }): ReactElement {
   const stages = cacheStages(form);
   const reuse = (
@@ -153,6 +156,15 @@ export function CacheCard({
             <Alert variant="info">
               <InfoIcon />
               <AlertDescription>Your devices ask another server, so only lookups that still reach the router use this cache.</AlertDescription>
+            </Alert>
+          )}
+          {adguard && !form.devices.own && (
+            <Alert variant="info">
+              <InfoIcon />
+              <AlertDescription>
+                AdGuard Home keeps a small cache of its own in front of this one, so your devices’ repeat lookups don’t wait for the round trip to
+                it. This one keeps what AdGuard Home passes on, and the router’s own lookups.
+              </AlertDescription>
             </Alert>
           )}
           <Section title="What the router keeps">

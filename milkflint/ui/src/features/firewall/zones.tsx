@@ -16,6 +16,8 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/
 import type { Change, Section } from '@/lib/api/uci';
 import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
+import { useWed } from '../tuning/use-wed';
+import { WedNotice } from '../tuning/wed-notice';
 import type { Counters, FirewallData } from './api';
 import type { Actions } from './forms';
 import {
@@ -448,6 +450,10 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
   if (f.offload !== was.offload) values['flow_offloading'] = bit(f.offload);
   if (f.offloadHw !== was.offloadHw) values['flow_offloading_hw'] = bit(f.offloadHw);
   const section: Section | undefined = data.sections.find((s) => s['.name'] === d.section);
+  // hardware offloading with WED needs both kinds of flow offloading: either one off here turns WED off,
+  // which puts back what it had turned off; the firewall's own options stay as this sheet sets them
+  const wed = useWed();
+  const wedOff = wed.on && (!f.offload || !f.offloadHw);
   const changes = Object.keys(values).length === 0 ? [] : editSection('defaults', section, values);
   const toggle = (key: 'synFlood' | 'dropInvalid' | 'offload' | 'offloadHw', label: string, opt: string, hint: string, disabled = false): ReactElement => (
     <SwitchRow
@@ -553,7 +559,14 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
               'The Ethernet chip forwards established connections by itself: no CPU at all, but Smart Queue can’t shape them. Needs software offloading.',
               !f.offload && !f.offloadHw,
             )}
-            {f.offloadHw && (
+            {wed.on && (
+              <WedNotice title="Hardware offloading runs with Wireless Ethernet Dispatch (WED)" turningOff={wedOff}>
+                {wedOff
+                  ? 'WED needs both software and hardware flow offloading.'
+                  : 'Both kinds of flow offloading are on for it, and Smart Queue is off. Turning either off here turns WED off too, and Smart Queue comes back.'}
+              </WedNotice>
+            )}
+            {f.offloadHw && !wed.on && (
               <Alert variant="warning">
                 <AlertDescription>
                   Smart Queue can’t shape what bypasses the CPU: latency under load comes back (
@@ -578,7 +591,7 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
             <Button
               disabled={changes.length === 0 || rateError !== undefined}
               onClick={() => {
-                onSave(changes);
+                onSave([...(wedOff ? wed.offChanges({ keepFirewall: true }) : []), ...changes]);
               }}
             >
               Save defaults
