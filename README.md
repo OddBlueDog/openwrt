@@ -93,6 +93,9 @@ images on the Releases page.
 | `package/kernel/mt76/patches/` | The mt76 driver fork, on upstream mt76 of the date in its Makefile |
 | `package/milkflint/milkflint-ui/` | The web interface package (`htdocs/` is the built interface) |
 | `package/milkflint/` | Newer versions of dnsproxy, miniupnpd, nlbwmon and sqm-scripts; they replace the feeds' copies |
+| `package/milkflint/adguardhome/` | AdGuard Home (GPL-3.0), built from its own source, web interface included; off until its page turns it on (see [AdGuard Home](#adguard-home)) |
+| `package/milkflint/golang1.27/` | Go 1.27 at the 25.12 branch's newer release, which AdGuard Home needs |
+| `package/milkflint/gawk/` | GNU awk (GPL-3.0) from OpenWrt's packages feed, installed as `gawk` only (not as the system's `awk`) and without readline, for banIP |
 | `milkflint/ui/` | The web interface's source (React, TypeScript) |
 | `milkflint/diffconfig` | The build configuration |
 
@@ -132,6 +135,52 @@ pnpm package
 
 `pnpm package` checks it (TypeScript, ESLint), builds it and copies it into
 `package/milkflint/milkflint-ui/htdocs/`.
+
+## AdGuard Home
+
+The images include [AdGuard Home](https://github.com/AdguardTeam/AdGuardHome),
+off until it's turned on on the router's AdGuard Home page (under Security).
+Its filtering is set in its own web interface. MilkFlint keeps the DNS
+chain around it: devices still ask the router, which sends their lookups
+to AdGuard Home with their own address, and AdGuard Home sends what it
+doesn't block (and hasn't cached) to the router's dnsmasq, which uses the
+DNS page's servers.
+If AdGuard Home stops answering, the router answers them itself,
+unfiltered, until it does again. MilkFlint is not made or endorsed by
+AdGuard; "AdGuard" is their trademark.
+
+**How it's built.** `package/milkflint/adguardhome/` builds AdGuard Home
+from its source release (the tarball its `PKG_HASH` pins), web interface
+included: the build compiles OpenWrt's `node/host` and runs `npm ci` in
+its `client/` directory, from its `package-lock.json`, then the Go build
+embeds the result. It needs Go 1.27.3 or later
+(`package/milkflint/golang1.27/`). Besides the source tarball, the build
+downloads Go's and Node.js's sources (hashes in their Makefiles), the Go
+modules its `go.sum` pins (from proxy.golang.org) and the npm packages its
+lockfile pins (from registry.npmjs.org); they're kept in `dl/`.
+
+**Licenses.** AdGuard Home is GPL-3.0 (`PKG_LICENSE`, `LICENSE.txt`). The
+image installs its license and a third-party notices file, with the
+license of every Go module linked into it and every npm package its web
+interface bundles, in `/www/licenses/adguardhome/` (linked from its page).
+MilkFlint's own code (the web interface, the page's router side) stays MIT
+and copies nothing from AdGuard Home.
+
+**Its source.** AdGuard Home's source is AdGuard's own, at the
+version's tag on [GitHub](https://github.com/AdguardTeam/AdGuardHome)
+(linked from its page), built unchanged by this branch's
+`package/milkflint/adguardhome/` at the release's tag; the Go modules and
+npm packages built into it are the ones its `go.sum` and
+`client/package-lock.json` pin. MilkFlint's package site also keeps a copy
+of each version's source tarball, with the Makefile and a `SOURCE.txt` of
+hashes, next to the package:
+`https://milkflint-packages.pages.dev/sources/adguardhome/<version>/SOURCE.txt`.
+
+**Updates** come from that same site, a feed signed with the key the
+images trust, tagged `@milkflint` in apk so OpenWrt's own `adguardhome`
+package (built another way) never replaces it. The page installs the
+newest, or goes back to one of the earlier versions the feed keeps.
+AdGuard Home's own updater is off (`--no-check-update`).
 
 ---
 
