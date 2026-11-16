@@ -661,12 +661,29 @@ export function remove_element(set, element) {
 	return nft_batch([ cmd_ ]);
 };
 
+// The backups of the lists whose contents a change alters (a country added
+// to the shared country set, say): banIP's restart would put the old ones
+// back otherwise, and only downloads a list without one.
+export function drop_backups(c, groups) {
+	c ??= cursor();
+	const dir = c.get('banip', 'global', 'ban_backupdir') ?? '/tmp/banIP-backup';
+	for (let n in lsdir(dir) ?? [])
+		for (let g in groups)
+			if (index(n, `banIP.${g}.`) == 0)
+				unlink(`${dir}/${n}`);
+};
+
 // Applies the change of a list's entries to banIP's loaded sets (the file
 // is written by the caller): what's gone is taken out, what's new put in,
 // each as one batch (one at a time only when a batch is refused: an
 // element that isn't there). Nothing while banIP's table isn't loaded: it
 // reads the file when it starts.
 export function apply_list(list, before, after) {
+	// banIP's start and restart load the allowlist from their own copy of
+	// it, and read the file only when there's none (a reload always reads
+	// it): without this a restart would undo the change
+	if (list == 'allowlist')
+		drop_backups(null, [ 'allowlist' ]);
 	if (!table_loaded())
 		return { applied: false };
 	const key = (e) => `${e.kind} ${e.value}`;

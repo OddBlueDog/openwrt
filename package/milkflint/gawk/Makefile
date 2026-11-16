@@ -9,7 +9,8 @@
 # tested with; banIP calls gawk by name. No readline (or ncurses, which only
 # readline needs here): that's for gawk's interactive debugger. Only the
 # program: not its dynamic extensions or awk library scripts, which banIP
-# doesn't use.
+# doesn't use. And its license (COPYING, GPL-3.0) where the banIP page links
+# to it (/www/licenses/gawk), with /usr/share/licenses/gawk pointing there.
 
 include $(TOPDIR)/rules.mk
 
@@ -42,6 +43,9 @@ CONFIGURE_ARGS+= --disable-mpfr --without-readline
 define Package/gawk/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(CP) $(PKG_INSTALL_DIR)/usr/bin/gawk $(1)/usr/bin/
+	$(INSTALL_DIR) $(1)/www/licenses/gawk $(1)/usr/share/licenses
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/COPYING $(1)/www/licenses/gawk/COPYING
+	$(LN) /www/licenses/gawk $(1)/usr/share/licenses/gawk
 endef
 
 $(eval $(call BuildPackage,gawk))

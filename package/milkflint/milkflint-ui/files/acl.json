@@ -3,7 +3,7 @@
 		"description": "MilkFlint web interface: status, and the settings its pages change",
 		"read": {
 			"ubus": {
-				"milkflint": [ "stats", "sqm_status", "neighbors", "pipeline" ],
+				"milkflint": [ "stats", "sqm_status", "neighbors", "pipeline", "processes" ],
 				"system": [ "board", "info" ],
 				"iwinfo": [ "devices", "info", "assoclist", "freqlist", "txpowerlist", "countrylist", "survey" ],
 				"network.interface": [ "dump" ],

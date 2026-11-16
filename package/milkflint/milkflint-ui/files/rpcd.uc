@@ -277,6 +277,91 @@ function temperatures() {
 	return out;
 }
 
+// Every process, as top lists them: its user, name, command line, the
+// memory it holds (its resident set) and its CPU time so far, in clock ticks
+// (USER_HZ, 100 a second). The app turns two readings into each one's share
+// of the processor against `cpu`, the same ticks summed over every core.
+// Kernel threads (PF_KTHREAD) have no command line or memory of their own,
+// so only their stat file is read. The word after a password-like argument
+// is blanked, so a password on a command line (pppd's, for PPPoE) never
+// leaves the router. Only read while the app's process list is open.
+const PF_KTHREAD = 0x00200000;
+const SECRET_ARG = /^-{0,2}(password|passwd|pass|pwd|secret|psk|key|token)$/i;
+const SECRET_SET = /^(-{0,2}(password|passwd|pass|pwd|secret|psk|key|token)=)/i;
+const HIDDEN = '********';
+
+function user_names() {
+	const out = {};
+	for (let line in split(readfile('/etc/passwd') ?? '', '\n')) {
+		const f = split(line, ':');
+		if (length(f) > 2)
+			out[f[2]] = f[0];
+	}
+	return out;
+}
+
+function command_line(pid) {
+	const args = filter(split(readfile(`/proc/${pid}/cmdline`) ?? '', '\u0000'), length);
+	for (let i = 0; i < length(args); i++) {
+		const set = match(args[i], SECRET_SET);
+		if (set)
+			args[i] = set[1] + HIDDEN;
+		else if (i + 1 < length(args) && match(args[i], SECRET_ARG))
+			args[++i] = HIDDEN;
+	}
+	return substr(join(' ', args), 0, 1024);
+}
+
+function processes() {
+	const names = user_names();
+	const out = [];
+	for (let pid in lsdir('/proc') ?? []) {
+		if (!match(pid, /^[0-9]+$/))
+			continue;
+		// "pid (comm) state ppid ...": comm may hold spaces and brackets
+		const stat = readfile(`/proc/${pid}/stat`) ?? '';
+		const open = index(stat, '(');
+		const close = rindex(stat, ')');
+		if (open < 0 || close < open)
+			continue;   // gone since the listing
+		// f[0] is proc(5)'s field 3 (state), so field n is f[n - 3]
+		const f = split(substr(stat, close + 2), ' ');
+		const kernel = (+f[6] & PF_KTHREAD) != 0;
+		const p = {
+			pid: +pid,
+			ppid: +f[1],
+			name: substr(stat, open + 1, close - open - 1),
+			state: f[0],
+			ticks: +f[11] + +f[12],
+			threads: +f[17],
+			start: +f[19],
+			kernel,
+			user: 'root',
+			rss: 0,
+			cmd: ''
+		};
+		if (!kernel) {
+			const status = readfile(`/proc/${pid}/status`) ?? '';
+			const uid = match(status, /\nUid:[ \t]*([0-9]+)/)?.[1];
+			p.user = names[uid] ?? uid ?? '';
+			p.rss = +(match(status, /\nVmRSS:[ \t]*([0-9]+)/)?.[1] ?? 0) * 1024;
+			p.cmd = command_line(pid);
+		}
+		push(out, p);
+	}
+	const meminfo = readfile('/proc/meminfo') ?? '';
+	const kb = (key) => +(match(meminfo, regexp(`(^|\n)${key}:[ \t]*([0-9]+)`))?.[2] ?? 0) * 1024;
+	const cpus = cpu_times();
+	const all = filter(cpus, (c) => c.name == 'cpu')[0];
+	return {
+		uptime: +split(readfile('/proc/uptime') ?? '0', ' ')[0],
+		cpu: { total: all?.total ?? 0, idle: all?.idle ?? 0 },
+		cores: length(cpus) - 1,
+		memory: { total: kb('MemTotal'), available: kb('MemAvailable') },
+		processes: out
+	};
+}
+
 const methods = {
 	// IPv4 neighbours with the kernel's reachability state (NUD_*): a device
 	// is "online" when it answered recently, not just when it's remembered.
@@ -332,6 +417,12 @@ const methods = {
 	pipeline: {
 		call: function() {
 			return pipeline();
+		}
+	},
+
+	processes: {
+		call: function() {
+			return processes();
 		}
 	}
 };

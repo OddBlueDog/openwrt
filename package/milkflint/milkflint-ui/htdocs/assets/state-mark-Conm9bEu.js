@@ -1,0 +1,1 @@
+import{a as e,o as t}from"./button-S0Mir7og.js";var n=e();function r({className:e}){return(0,n.jsx)(`span`,{"aria-hidden":`true`,className:t(`inline-flex size-[1.15em] shrink-0 items-center justify-center rounded-full border-[0.1em] border-current text-[0.75em] leading-none font-bold`,e),children:`!`})}export{r as t};

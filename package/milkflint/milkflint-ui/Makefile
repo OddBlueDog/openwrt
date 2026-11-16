@@ -29,6 +29,7 @@ define Package/milkflint-ui/conffiles
 /etc/config/milkflint
 /etc/milkflint/adguardhome.key
 /etc/milkflint/banip-feeds.json
+/etc/milkflint/themes.json
 endef
 
 define Build/Compile
@@ -36,7 +37,9 @@ endef
 
 # Core files, then each feature's router side by convention
 # (files/features/<id>/: rpcd.uc, acl.json, init, uci-defaults, preinit, cgi,
-# bin/*, nftables.d/<position>/<chain>/*.nft for fw4's includes). A preinit
+# bin/*, nftables.d/<position>/<chain>/*.nft for fw4's includes, licenses/*:
+# the license texts of what the feature installs, served at /licenses/<id>/
+# for its page to link to and in /usr/share/licenses/<id>). A preinit
 # hook runs after preinit restores the config a sysupgrade kept
 # (80_mount_root), before anything in /etc/init.d. A cgi is served at
 # /cgi-bin/milkflint-<id>.
@@ -67,6 +70,7 @@ define Package/milkflint-ui/install
 		[ ! -f $$$$f/cgi ] || $(INSTALL_BIN) $$$$f/cgi $(1)/www/cgi-bin/milkflint-$$$$id; \
 		[ ! -d $$$$f/bin ] || $(INSTALL_BIN) $$$$f/bin/* $(1)/usr/libexec/milkflint/; \
 		[ ! -d $$$$f/nftables.d ] || { $(INSTALL_DIR) $(1)/usr/share/nftables.d && $(CP) $$$$f/nftables.d/* $(1)/usr/share/nftables.d/; }; \
+		[ ! -d $$$$f/licenses ] || { $(INSTALL_DIR) $(1)/www/licenses/$$$$id $(1)/usr/share/licenses && $(INSTALL_DATA) $$$$f/licenses/* $(1)/www/licenses/$$$$id/ && $(LN) /www/licenses/$$$$id $(1)/usr/share/licenses/$$$$id; }; \
 	done
 endef
 

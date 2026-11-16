@@ -1,0 +1,11 @@
+{
+	"milkflint-themes": {
+		"description": "MilkFlint web interface: themes",
+		"read": {
+			"ubus": { "milkflint.themes": [ "get" ] }
+		},
+		"write": {
+			"ubus": { "milkflint.themes": [ "set" ] }
+		}
+	}
+}

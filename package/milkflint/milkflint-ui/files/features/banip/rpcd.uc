@@ -22,8 +22,20 @@ const ACTION = '/usr/libexec/milkflint/banip-action';
 const INSTALLER = '/usr/libexec/milkflint/banip-install';
 const MSMTPRC = '/etc/msmtprc';
 const REPLY = 900 * 1024;
+// the license texts the image carries (features/banip/licenses, gawk's package), served at /licenses/
+const LICENSES = '/www/licenses';
 
+// banIP's package version, read again only when apk's database changes (an
+// upgrade from a package feed, without a restart of rpcd)
+const APK_DB = '/lib/apk/db/installed';
 let version_cache = null;
+
+function package_version() {
+	const mtime = stat(APK_DB)?.mtime ?? null;
+	if (version_cache?.mtime !== mtime)
+		version_cache = { mtime, version: b.package_version() };
+	return version_cache.version;
+}
 
 const ok = (x) => ({ ok: true, ...(x ?? {}) });
 const fail = (error, x) => ({ error, ...(x ?? {}) });
@@ -173,7 +185,7 @@ function status() {
 	const st = b.read_state() ?? {};
 	const loaded = b.table_loaded();
 	const running = service_running();
-	version_cache ??= b.package_version();
+	const version = package_version();
 	let state;
 	if (!enabled)
 		state = 'off';
@@ -196,7 +208,12 @@ function status() {
 	const feeds = uniq(filter(map(rt?.sets ?? [], (s) => b.feed_of(s)), (f) => f != 'allowlist' && f != 'blocklist'));
 	return {
 		installed: true,
-		version: version_cache,
+		version,
+		// linked from the page when this image carries them (0.81a and earlier don't)
+		licenses: {
+			banip: access(`${LICENSES}/banip/COPYING`) ? '/licenses/banip/COPYING' : null,
+			gawk: access(`${LICENSES}/gawk/COPYING`) ? '/licenses/gawk/COPYING' : null
+		},
 		enabled,
 		mode,
 		state,
@@ -290,17 +307,6 @@ function own_allowed() {
 		if (index([ 'v4', 'v6', 'mac', 'domain' ], e.kind) >= 0 && index(e.comment ?? '', b.MANAGED) != 0 && !match(e.comment ?? '', /^uplink added on /))
 			n++;
 	return n;
-}
-
-// The backups of the lists whose contents a change alters (a country added
-// to the shared country set, say): banIP's restart would put the old ones
-// back otherwise, and only downloads a list without one.
-function drop_backups(c, groups) {
-	const dir = c.get('banip', 'global', 'ban_backupdir') ?? '/tmp/banIP-backup';
-	for (let n in lsdir(dir) ?? [])
-		for (let g in groups)
-			if (index(n, `banIP.${g}.`) == 0)
-				unlink(`${dir}/${n}`);
 }
 
 function config() {
@@ -437,7 +443,7 @@ function set_options(req) {
 	const restart = filter(changed, (k) => spec[k].apply == 'restart');
 	if (length(restart) && after.ban_enabled == '1' && b.router_mode(c) != 'ap') {
 		const groups = uniq(filter(map(restart, (k) => spec[k].refetch), (g) => g != null));
-		drop_backups(c, groups);
+		b.drop_backups(c, groups);
 		background('restart');
 		action = 'restart';
 	}
@@ -876,7 +882,7 @@ function after_feed_change(c, names) {
 	// a selected feed's list is downloaded again
 	const hit = filter(names, (n) => selected(c, n));
 	if (length(hit) && c.get('banip', 'global', 'ban_enabled') == '1' && service_running()) {
-		drop_backups(c, hit);
+		b.drop_backups(c, hit);
 		background('restart');
 		return 'restart';
 	}
