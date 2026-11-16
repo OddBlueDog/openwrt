@@ -57,7 +57,13 @@ test('points from before the probe asked each server make a last line, "DNS (ear
 });
 
 test('a server no longer asked keeps its line while its values are shown', () => {
-  const got = lines([{ dns: 5, dns_servers: { '9.9.9.9': 5 } }, { dns: 6, dns_servers: { 'dns.google': 6 } }], ['dns.google']);
+  const got = lines(
+    [
+      { dns: 5, dns_servers: { '9.9.9.9': 5 } },
+      { dns: 6, dns_servers: { 'dns.google': 6 } },
+    ],
+    ['dns.google'],
+  );
   assert.deepEqual(
     got.map((l) => [l.label, l.current]),
     [

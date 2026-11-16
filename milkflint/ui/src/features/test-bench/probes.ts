@@ -73,7 +73,13 @@ export function internetProbe(target: LatencyTarget): ProbeLine {
  * first two (DNS, connection setup) aren't recorded. `last` gets each
  * time, for the live figures.
  */
-export async function probe(line: ProbeLine, clock: Clock, signal: AbortSignal, record: (r: RunRecord) => void, last: (ms: number) => void): Promise<void> {
+export async function probe(
+  line: ProbeLine,
+  clock: Clock,
+  signal: AbortSignal,
+  record: (r: RunRecord) => void,
+  last: (ms: number) => void,
+): Promise<void> {
   let n = 0;
   let next = performance.now();
   while (!signal.aborted) {

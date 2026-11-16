@@ -5,7 +5,16 @@
 // marks it), the blocklist's against your own networks too; a save goes
 // into the loaded sets at once as well as the file. The lines MilkFlint and
 // banIP keep up themselves are marked.
-import { DownloadIcon, ListChecksIcon, LoaderCircleIcon, PlusIcon, ShieldCheckIcon, ShieldXIcon, TriangleAlertIcon, UploadIcon } from 'lucide-react';
+import {
+  DownloadIcon,
+  ListChecksIcon,
+  LoaderCircleIcon,
+  PlusIcon,
+  ShieldCheckIcon,
+  ShieldXIcon,
+  TriangleAlertIcon,
+  UploadIcon,
+} from 'lucide-react';
 import { type ChangeEvent, type ReactElement, useEffect, useMemo, useRef, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
@@ -39,7 +48,8 @@ const TEXT: Record<ListName, { title: string; description: string; empty: string
   allowlist: {
     title: 'Allowlist',
     description: 'Always let through, ahead of every list: addresses, networks, devices (MAC addresses) and domain names.',
-    empty: 'Nothing allowed yet. Add an address that a list blocks by mistake, or use Always allow from a lookup or the Activity tab.',
+    empty:
+      'Nothing allowed yet. Add an address that a list blocks by mistake, or use Always allow from a lookup or the Activity tab.',
     icon: ShieldCheckIcon,
   },
   blocklist: {
@@ -84,7 +94,10 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
   const quickOk = ['v4', 'v6', 'mac', 'domain'].includes(q.kind);
   const save = (): void => {
     setState({ phase: 'applying' });
-    const body = lines.map((l) => l.trimEnd()).join('\n').replace(/\n+$/, '');
+    const body = lines
+      .map((l) => l.trimEnd())
+      .join('\n')
+      .replace(/\n+$/, '');
     saveList(list, body === '' ? '' : `${body}\n`).then(
       (r) => {
         setState({
@@ -192,15 +205,21 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
             <PlusIcon /> Add
           </Button>
         </form>
-        {quick.trim() !== '' && !quickOk && <p className="text-xs text-destructive">{ENTRY_PROBLEMS[q.reason ?? 'unknown'] ?? ENTRY_PROBLEMS['unknown']}</p>}
+        {quick.trim() !== '' && !quickOk && (
+          <p className="text-xs text-destructive">{ENTRY_PROBLEMS[q.reason ?? 'unknown'] ?? ENTRY_PROBLEMS['unknown']}</p>
+        )}
         {tooBig ? (
           <p className="text-sm text-muted-foreground">
-            This list is too big to edit here ({formatNumber(Math.round(saved.length / 1024))} KB). Export it to look through it; adding one entry above still
-            works.
+            This list is too big to edit here ({formatNumber(Math.round(saved.length / 1024))} KB). Export it to look through it;
+            adding one entry above still works.
           </p>
         ) : (
           <div className="flex h-80 overflow-hidden rounded-md border bg-card focus-within:ring-2 focus-within:ring-ring">
-            <div ref={gutter} aria-hidden="true" className="w-12 shrink-0 overflow-hidden border-r bg-muted/40 py-2 text-right font-mono text-xs leading-5">
+            <div
+              ref={gutter}
+              aria-hidden="true"
+              className="w-12 shrink-0 overflow-hidden border-r bg-muted/40 py-2 text-right font-mono text-xs leading-5"
+            >
               {entries.map((e, i) => {
                 const owner = lineOwner(e.comment);
                 const conflict = conflicts.some((x) => x.value === e.value);
@@ -209,7 +228,11 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
                     key={i}
                     className={cn(
                       'pr-2',
-                      e.kind === 'invalid' || conflict ? 'bg-destructive/15 text-destructive' : owner !== 'you' && e.kind !== 'comment' && e.kind !== 'blank' ? 'text-muted-foreground/60' : 'text-muted-foreground',
+                      e.kind === 'invalid' || conflict
+                        ? 'bg-destructive/15 text-destructive'
+                        : owner !== 'you' && e.kind !== 'comment' && e.kind !== 'blank'
+                          ? 'text-muted-foreground/60'
+                          : 'text-muted-foreground',
                     )}
                   >
                     {i + 1}
@@ -243,7 +266,8 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
             .filter((x) => x !== false)
             .join(', ')
             .replace(/^$/, 'Empty')}
-          {summary.managed > 0 && `. ${String(summary.managed)} kept up by MilkFlint and banIP (your networks, the internet connection): changes to those come back`}
+          {summary.managed > 0 &&
+            `. ${String(summary.managed)} kept up by MilkFlint and banIP (your networks, the internet connection): changes to those come back`}
           .
         </p>
         {problems.length > 0 && (
@@ -268,7 +292,9 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
         )}
         {dirty && (
           <div className="flex items-center justify-end gap-2 border-t pt-3">
-            <p className="mr-auto text-xs text-muted-foreground">{problems.length > 0 || conflicts.length > 0 ? 'Fix the marked lines to save.' : 'Not saved yet.'}</p>
+            <p className="mr-auto text-xs text-muted-foreground">
+              {problems.length > 0 || conflicts.length > 0 ? 'Fix the marked lines to save.' : 'Not saved yet.'}
+            </p>
             <Button
               variant="ghost"
               size="sm"
@@ -297,8 +323,8 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
           <DialogHeader>
             <DialogTitle>Import into the {list}</DialogTitle>
             <DialogDescription>
-              {formatNumber((importing ?? '').split('\n').filter((l) => l.trim() !== '').length)} lines. Add them to what’s there, or replace it? Nothing is saved
-              until you save.
+              {formatNumber((importing ?? '').split('\n').filter((l) => l.trim() !== '').length)} lines. Add them to what’s there,
+              or replace it? Nothing is saved until you save.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -313,7 +339,10 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
             </Button>
             <Button
               onClick={() => {
-                setText((x) => `${x.replace(/\n*$/, '')}${x.trim() === '' ? '' : '\n'}${(importing ?? '').replace(/\r/g, '').replace(/\n*$/, '')}\n`);
+                setText(
+                  (x) =>
+                    `${x.replace(/\n*$/, '')}${x.trim() === '' ? '' : '\n'}${(importing ?? '').replace(/\r/g, '').replace(/\n*$/, '')}\n`,
+                );
                 setImporting(undefined);
               }}
             >
@@ -347,7 +376,11 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
     setState({ phase: 'applying' });
     saveOptions(changes).then(
       () => {
-        setState({ phase: 'done', nothingChanged: false, note: c.enabled === true ? 'banIP is loading its lists again with these.' : undefined });
+        setState({
+          phase: 'done',
+          nothingChanged: false,
+          note: c.enabled === true ? 'banIP is loading its lists again with these.' : undefined,
+        });
         onSaved();
       },
       (err: unknown) => {
@@ -361,7 +394,11 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
       <CardContent className="flex flex-col gap-2">
         <ApplyStatus state={state} />
         <div className="divide-y">
-          <Field id="banip-autoallow" label="Keep it up to date" hint="Adds your internet connection’s own addresses, and the addresses of the domain names in it, at each update.">
+          <Field
+            id="banip-autoallow"
+            label="Keep it up to date"
+            hint="Adds your internet connection’s own addresses, and the addresses of the domain names in it, at each update."
+          >
             <Switch
               id="banip-autoallow"
               checked={effective(o, 'ban_autoallowlist') === '1'}
@@ -370,7 +407,11 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
               }}
             />
           </Field>
-          <Field id="banip-uplink" label="Your internet connection" hint="So nothing on your provider’s side of the line is blocked. The whole subnet is banIP’s default.">
+          <Field
+            id="banip-uplink"
+            label="Your internet connection"
+            hint="So nothing on your provider’s side of the line is blocked. The whole subnet is banIP’s default."
+          >
             <Select
               value={effective(o, 'ban_autoallowuplink') as string}
               disabled={effective(o, 'ban_autoallowlist') !== '1'}
@@ -388,7 +429,11 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
               </SelectContent>
             </Select>
           </Field>
-          <Field id="banip-allowurl" label="Allowlists from the internet" hint="Web addresses of lists to allow as well, e.g. a country’s networks in allowlist-only mode.">
+          <Field
+            id="banip-allowurl"
+            label="Allowlists from the internet"
+            hint="Web addresses of lists to allow as well, e.g. a country’s networks in allowlist-only mode."
+          >
             <div className="flex flex-col gap-2">
               {urls.map((u) => (
                 <div key={u} className="flex items-center gap-2">
@@ -443,7 +488,11 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
             />
           </Field>
           {only && (
-            <Field id="banip-monitorallowed" label="Watch allowed addresses too" hint="The log monitor may block an attacker inside an allowed range; your own allowlist entries stay exempt.">
+            <Field
+              id="banip-monitorallowed"
+              label="Watch allowed addresses too"
+              hint="The log monitor may block an attacker inside an allowed range; your own allowlist entries stay exempt."
+            >
               <Switch
                 id="banip-monitorallowed"
                 checked={effective(o, 'ban_monitorallowed') === '1'}
@@ -476,8 +525,8 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
           <DialogHeader>
             <DialogTitle>Block everything but the allowlist?</DialogTitle>
             <DialogDescription>
-              Every device loses the internet except the addresses in your allowlist (and its lists from the internet), both ways. The router itself,
-              its pages and Remote access keep working.
+              Every device loses the internet except the addresses in your allowlist (and its lists from the internet), both ways.
+              The router itself, its pages and Remote access keep working.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

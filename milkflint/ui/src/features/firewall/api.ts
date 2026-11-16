@@ -60,7 +60,12 @@ export async function loadFirewall(): Promise<FirewallData> {
     .map((s): Network => {
       const i = live.get(s['.name']);
       const a = i?.['ipv4-address']?.[0];
-      return { name: s['.name'], up: i?.up === true, device: i?.l3_device ?? i?.device, ipv4: a === undefined ? undefined : { address: a.address, prefix: a.mask } };
+      return {
+        name: s['.name'],
+        up: i?.up === true,
+        device: i?.l3_device ?? i?.device,
+        ipv4: a === undefined ? undefined : { address: a.address, prefix: a.mask },
+      };
     });
   const lan = networks.find((n) => n.name === 'lan');
   const lanSection = network.find((s) => s['.name'] === 'lan');
@@ -113,7 +118,8 @@ export async function loadFirewall(): Promise<FirewallData> {
   // the devices a forward or block can be for: on the home side, not the router itself
   const own = new Set(networks.flatMap((n) => (n.ipv4 === undefined ? [] : [n.ipv4.address])));
   const homeNets = networks.filter((n) => !wanNets.includes(n.name) && n.ipv4 !== undefined);
-  const atHome = (ip: string): boolean => !own.has(ip) && homeNets.some((n) => n.ipv4 !== undefined && inSubnet(ip, n.ipv4.address, n.ipv4.prefix));
+  const atHome = (ip: string): boolean =>
+    !own.has(ip) && homeNets.some((n) => n.ipv4 !== undefined && inSubnet(ip, n.ipv4.address, n.ipv4.prefix));
   const upnpSection = upnpd.find((s) => s['.type'] === 'upnpd');
   return {
     sections,
@@ -178,7 +184,12 @@ function add(map: Map<string, number>, key: string, n: number): void {
 
 /** The counters since fw4 last loaded the ruleset (every firewall change reloads it). */
 export async function getCounters(): Promise<Counters> {
-  const res = await call('file', 'exec', { command: '/usr/sbin/nft', params: ['--terse', '--json', 'list', 'ruleset'] }, execResult);
+  const res = await call(
+    'file',
+    'exec',
+    { command: '/usr/sbin/nft', params: ['--terse', '--json', 'list', 'ruleset'] },
+    execResult,
+  );
   const rules = new Map<string, number>();
   const nat = new Map<string, number>();
   const parsed = z.object({ nftables: z.array(z.unknown()) }).safeParse(JSON.parse(res.stdout ?? '{}'));

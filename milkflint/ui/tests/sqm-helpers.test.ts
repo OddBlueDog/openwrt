@@ -4,7 +4,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { delayMs, directionsOf, summarize } from '../src/features/sqm/cake.ts';
 import { cakeTargetMs, GSO, optValue, takesWhole, wholeOf, wholeSetting, wholeValue, withOpts } from '../src/features/sqm/gso.ts';
-import { MULTI_QUEUE_KBIT, multiQueueOf, multiQueueSetting, multiQueueValue, usesMultiQueue } from '../src/features/sqm/multi-queue.ts';
+import {
+  MULTI_QUEUE_KBIT,
+  multiQueueOf,
+  multiQueueSetting,
+  multiQueueValue,
+  usesMultiQueue,
+} from '../src/features/sqm/multi-queue.ts';
 import type { CakeQdisc } from '../src/lib/api/stats.ts';
 
 test('a managed keyword is replaced, the rest stay in order', () => {
@@ -101,7 +107,13 @@ test('the internet port’s directions, download first; guests’ and the VPN’
     cake('wg_out'),
     cake('ifb4wg_out'),
   ]);
-  assert.deepEqual(out.map((d) => [d.dev, d.download]), [['ifb4eth1', true], ['eth1', false]]);
+  assert.deepEqual(
+    out.map((d) => [d.dev, d.download]),
+    [
+      ['ifb4eth1', true],
+      ['eth1', false],
+    ],
+  );
 });
 
 test('cake_mq: its own sub-queues, on its own device only', () => {
@@ -123,7 +135,13 @@ test('a CAKE under something else isn’t a direction of its own', () => {
 
 test('one direction’s figures: added over queues, delays from the busiest tin of the worst', () => {
   const q = (sent: number, avg: number, peak: number): CakeQdisc =>
-    cake('eth1', { bytes: 10, tins: [{ sent_bytes: sent, avg_delay_us: avg, peak_delay_us: peak, drops: 1, ecn_mark: 2, sparse_flows: 3, bulk_flows: 4 }, { sent_bytes: 0, avg_delay_us: 99999, peak_delay_us: 99999, drops: 1 }] });
+    cake('eth1', {
+      bytes: 10,
+      tins: [
+        { sent_bytes: sent, avg_delay_us: avg, peak_delay_us: peak, drops: 1, ecn_mark: 2, sparse_flows: 3, bulk_flows: 4 },
+        { sent_bytes: 0, avg_delay_us: 99999, peak_delay_us: 99999, drops: 1 },
+      ],
+    });
   const root = cake('eth1', { options: { bandwidth: 1000 } });
   const s = summarize({ dev: 'eth1', download: false, root, queues: [q(100, 500, 800), q(50, 700, 900)] });
   assert.equal(s.bandwidth, 8000);

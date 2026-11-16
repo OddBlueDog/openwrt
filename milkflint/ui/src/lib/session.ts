@@ -25,7 +25,11 @@ function readStored(): SessionState {
     const raw = sessionStorage.getItem(STORAGE_KEY);
     if (raw !== null) {
       const parsed = z
-        .object({ id: z.string().length(32), username: z.string(), adminPassword: z.enum(['none', 'old-default', 'set']).default('set') })
+        .object({
+          id: z.string().length(32),
+          username: z.string(),
+          adminPassword: z.enum(['none', 'old-default', 'set']).default('set'),
+        })
         .safeParse(JSON.parse(raw));
       if (parsed.success) return { status: 'authenticated', ...parsed.data };
     }
@@ -44,7 +48,10 @@ function update(next: SessionState): void {
   setSessionId(next.status === 'authenticated' ? next.id : NULL_SESSION);
   try {
     if (next.status === 'authenticated') {
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ id: next.id, username: next.username, adminPassword: next.adminPassword }));
+      sessionStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ id: next.id, username: next.username, adminPassword: next.adminPassword }),
+      );
     } else {
       sessionStorage.removeItem(STORAGE_KEY);
     }

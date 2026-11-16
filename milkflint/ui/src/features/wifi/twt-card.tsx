@@ -1,10 +1,8 @@
 // Target Wake Time on each band now: which devices can ask for it, the agreements
-// the radio has, and how requests have gone. Its settings are in each band's
-// settings.
-import { MoonIcon } from 'lucide-react';
+// the radio has, and how requests have gone. Its settings are above it, on the
+// Wi-Fi driver page's Target Wake Time card.
 import { type ReactElement, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { usePoll } from '@/hooks/use-poll';
 import { getLeases } from '@/lib/api/network';
 import { endTwt, getTwt, getWirelessStatus, type TwtStatus } from '@/lib/api/wireless';
@@ -25,15 +23,18 @@ interface Loaded {
 async function load(): Promise<Loaded> {
   const [status, leases] = await Promise.all([getWirelessStatus(), getLeases().catch(() => [])]);
   const bands = await Promise.all(
-    Object.entries(status).map(async ([radio, r]): Promise<Band> => {
-      const device = r.iwinfo?.phy;
-      return {
-        radio,
-        band: r.config?.band ?? '',
-        device,
-        twt: device === undefined ? undefined : await getTwt(device).catch(() => undefined),
-      };
-    }),
+    // a radio that's turned off has nothing to report
+    Object.entries(status)
+      .filter(([, r]) => r.disabled !== true)
+      .map(async ([radio, r]): Promise<Band> => {
+        const device = r.iwinfo?.phy;
+        return {
+          radio,
+          band: r.config?.band ?? '',
+          device,
+          twt: device === undefined ? undefined : await getTwt(device).catch(() => undefined),
+        };
+      }),
   );
   return {
     bands,
@@ -74,7 +75,12 @@ function BandStatus({
     return <p className="text-sm text-muted-foreground">Unknown: this firmware doesn’t report it.</p>;
   }
   if (!t.running) return <p className="text-sm text-muted-foreground">Off while this band’s network is off.</p>;
-  if (!t.offered) return <p className="text-sm text-muted-foreground">Not offered: it’s off in this band’s settings, or the Wi-Fi mode is older than Wi-Fi 6.</p>;
+  if (!t.offered)
+    return (
+      <p className="text-sm text-muted-foreground">
+        Not offered: it’s off for this band above, or the band’s Wi-Fi mode is older than Wi-Fi 6.
+      </p>
+    );
 
   const device = band.device;
   const end = (mac: string, flow: number): void => {
@@ -123,32 +129,23 @@ function BandStatus({
   );
 }
 
-export function TwtCard({ className }: { className?: string }): ReactElement | null {
+/** Target Wake Time on each band now, for the card on the Wi-Fi driver page, under its settings. */
+export function TwtLive(): ReactElement {
   const { data, refresh } = usePoll(load, 15_000);
-  if (data === undefined || data.bands.length === 0) return null;
-
+  if (data === undefined) return <p className="text-sm text-muted-foreground">Reading the radios…</p>;
+  const order = (band: string): number => ['2g', '5g', '6g'].indexOf(band);
+  const bands = [...data.bands].sort((a, b) => order(a.band) - order(b.band));
   return (
-    <Card className={className}>
-      <CardHeader className="items-center">
-        <div className="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-          <MoonIcon className="size-4" />
-        </div>
-        <div className="flex flex-col gap-1">
-          <CardTitle className="text-base">Target Wake Time</CardTitle>
-          <CardDescription>
-            A Wi-Fi 6 device can agree a schedule with the router and sleep between wake times, saving battery. The device asks and chooses; each band’s settings
-            say what the router agrees to. Few devices ask yet, and most only when their battery matters.
-          </CardDescription>
-        </div>
-      </CardHeader>
-      <CardContent className="grid gap-4 sm:grid-cols-2">
-        {data.bands.map((b) => (
-          <div key={b.radio} className="flex flex-col gap-3 rounded-lg border bg-background/60 p-3">
-            <span className="text-sm font-medium">{bandLabel(b.band)}</span>
+    // the bands side by side like the settings above, each under its own hairline: no boxes
+    <div className="@container">
+      <div className="grid gap-x-8 gap-y-5 @min-[44rem]:grid-cols-2">
+        {bands.map((b) => (
+          <div key={b.radio} className="flex min-w-0 flex-col gap-2">
+            <h4 className="border-b pb-2 text-sm font-semibold">{bandLabel(b.band)}</h4>
             <BandStatus band={b} names={data.names} reload={refresh} />
           </div>
         ))}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }

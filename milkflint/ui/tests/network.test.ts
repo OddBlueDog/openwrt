@@ -26,7 +26,18 @@ test('addresses to numbers and back', () => {
 });
 
 test('anything else is not an address', () => {
-  for (const bad of ['', '1.2.3', '1.2.3.4.5', '1.2.3.256', '1.2.3.-1', ' 1.2.3.4', '1.2.3.4 ', 'a.b.c.d', '1..2.3', '1.2.3.1000']) {
+  for (const bad of [
+    '',
+    '1.2.3',
+    '1.2.3.4.5',
+    '1.2.3.256',
+    '1.2.3.-1',
+    ' 1.2.3.4',
+    '1.2.3.4 ',
+    'a.b.c.d',
+    '1..2.3',
+    '1.2.3.1000',
+  ]) {
     assert.equal(ipToInt(bad), undefined, bad);
   }
 });
@@ -53,8 +64,10 @@ test('a private or shared (CGNAT) internet address means nothing reaches port fo
 });
 
 test('private (made-up) MAC addresses: the locally administered bit', () => {
-  for (const mac of ['02:00:00:00:00:01', '0A:12:34:56:78:9A', '3e:00:00:00:00:02', 'f6:aa:bb:cc:dd:ee']) assert.equal(isPrivateMac(mac), true, mac);
-  for (const mac of ['00:00:5e:00:53:01', 'A4:83:E7:12:34:56', '94:00:00:00:00:01', '']) assert.equal(isPrivateMac(mac), false, mac);
+  for (const mac of ['02:00:00:00:00:01', '0A:12:34:56:78:9A', '3e:00:00:00:00:02', 'f6:aa:bb:cc:dd:ee'])
+    assert.equal(isPrivateMac(mac), true, mac);
+  for (const mac of ['00:00:5e:00:53:01', 'A4:83:E7:12:34:56', '94:00:00:00:00:01', ''])
+    assert.equal(isPrivateMac(mac), false, mac);
 });
 
 test('hint names lose the local domain', () => {
@@ -66,10 +79,10 @@ test('hint names lose the local domain', () => {
 });
 
 test('only global IPv6 addresses', () => {
-  assert.deepEqual(
-    globalIpv6(['2001:db8:1:2::618', 'fd00:1:2::618', 'fe80::1', 'FC00::1', '2001:db8::1']),
-    ['2001:db8:1:2::618', '2001:db8::1'],
-  );
+  assert.deepEqual(globalIpv6(['2001:db8:1:2::618', 'fd00:1:2::618', 'fe80::1', 'FC00::1', '2001:db8::1']), [
+    '2001:db8:1:2::618',
+    '2001:db8::1',
+  ]);
   assert.deepEqual(globalIpv6(undefined), []);
 });
 

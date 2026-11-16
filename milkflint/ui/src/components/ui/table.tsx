@@ -18,7 +18,13 @@ export function TableBody({ className, ...props }: ComponentProps<'tbody'>): Rea
 }
 
 export function TableRow({ className, ...props }: ComponentProps<'tr'>): ReactElement {
-  return <tr data-slot="table-row" className={cn('border-b transition-colors hover:bg-muted/50', className)} {...props} />;
+  return (
+    <tr
+      data-slot="table-row"
+      className={cn('border-b transition-colors duration-fast hover:bg-muted/60', className)}
+      {...props}
+    />
+  );
 }
 
 export function TableHead({ className, ...props }: ComponentProps<'th'>): ReactElement {
@@ -26,7 +32,7 @@ export function TableHead({ className, ...props }: ComponentProps<'th'>): ReactE
     <th
       data-slot="table-head"
       className={cn(
-        'h-9 px-3 text-left align-middle text-xs font-medium whitespace-nowrap text-muted-foreground first:pl-5 last:pr-5',
+        'h-10 px-3 text-left align-middle text-xs font-medium whitespace-nowrap text-muted-foreground first:pl-5 last:pr-5',
         className,
       )}
       {...props}
@@ -38,7 +44,7 @@ export function TableCell({ className, ...props }: ComponentProps<'td'>): ReactE
   return (
     <td
       data-slot="table-cell"
-      className={cn('px-3 py-2.5 align-middle whitespace-nowrap first:pl-5 last:pr-5', className)}
+      className={cn('px-3 py-3 align-middle whitespace-nowrap first:pl-5 last:pr-5', className)}
       {...props}
     />
   );

@@ -1,0 +1,8 @@
+# built output and installed packages
+dist
+dist-ssr
+node_modules
+# written by pnpm
+pnpm-lock.yaml
+# copied as they are
+public

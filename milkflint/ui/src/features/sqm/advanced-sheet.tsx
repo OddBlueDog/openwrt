@@ -1,7 +1,9 @@
 // Smart Queue's advanced settings, in a sheet from the page's header: what
 // sqm-scripts and CAKE take for the internet port's queue, as LuCI has
 // them, by direction, with what CAKE will get and the file as it will be.
-// It saves on its own, and only what changed (./advanced.ts).
+// The expert choices the page used to show (multi-queue, the upload's ACK
+// filter and memory limit) are here too. It saves on its own, and only what
+// changed (./advanced.ts).
 import { ArrowDownIcon, ArrowUpIcon, CableIcon, ListIcon, type LucideIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useId, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
@@ -10,6 +12,7 @@ import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 import { Switch } from '@/components/ui/switch';
+import { TabPanel, Tabs } from '@/components/ui/tabs';
 import type { Change } from '@/lib/api/uci';
 import { formatBitrate } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -23,14 +26,16 @@ import {
   cakeEffect,
   type Direction,
   type DirectionForm,
+  downloadMq,
   RTT_PRESETS,
   scriptTins,
   validateAdvanced,
 } from './advanced';
 import { cakeTargetMs, NO_SPLIT_GSO_KBIT, takesWhole } from './gso';
-import { linkPresets, presetOverhead } from './model';
+import { linkPresets, lowMemlimit, presetOverhead } from './model';
+import { MULTI_QUEUE_KBIT, usesMultiQueue } from './multi-queue';
 
-type TabId = Direction | 'line' | 'queue';
+export type TabId = Direction | 'line' | 'queue';
 const tabs: { id: TabId; label: string; icon: LucideIcon }[] = [
   { id: 'down', label: 'Download', icon: ArrowDownIcon },
   { id: 'up', label: 'Upload', icon: ArrowUpIcon },
@@ -107,14 +112,12 @@ function Pick<T extends string>({
   options,
   onChange,
   disabled = false,
-  mono = false,
 }: {
   id: string;
   value: T;
   options: readonly Option<T>[];
   onChange: (value: T) => void;
   disabled?: boolean;
-  mono?: boolean;
 }): ReactElement {
   // a value set by hand that no option names is shown as it is
   const all: readonly Option<string>[] = options.some((o) => o.value === value) ? options : [...options, { value, label: value }];
@@ -126,7 +129,7 @@ function Pick<T extends string>({
         onChange(dec(v) as T);
       }}
     >
-      <SelectTrigger id={id} className={cn(mono && 'font-mono')}>
+      <SelectTrigger id={id}>
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
@@ -143,7 +146,7 @@ function Pick<T extends string>({
 function Changed({ on }: { on: boolean }): ReactElement | null {
   if (!on) return null;
   return (
-    <span className="ml-auto flex items-center gap-1 text-[11px] font-medium text-primary">
+    <span className="ml-auto flex items-center gap-1 text-xs font-medium text-primary">
       <span className="size-1.5 rounded-full bg-primary" />
       changed
     </span>
@@ -221,7 +224,7 @@ function SwitchField({
 function Group({ title, children }: { title: string; children: ReactNode }): ReactElement {
   return (
     <section className="flex flex-col gap-4 border-t pt-5 first:border-t-0 first:pt-0">
-      <h3 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">{title}</h3>
+      <h3 className="text-sm font-semibold">{title}</h3>
       {children}
     </section>
   );
@@ -261,7 +264,7 @@ function CakePreview({ f, data, dir }: { f: AdvancedForm; data: AdvancedData; di
           </Badge>
         ))}
       </div>
-      <p className="border-t px-3 py-1.5 text-[11px] text-muted-foreground">
+      <p className="border-t px-3 py-1.5 text-xs text-muted-foreground">
         Grey: from sqm-scripts and the other tabs. <span className="text-primary">Highlighted</span>: this direction’s options (
         {dir === 'down' ? 'iqdisc_opts' : 'eqdisc_opts'}). CAKE takes the last of each kind.
       </p>
@@ -275,6 +278,7 @@ function DirectionTab({
   f,
   data,
   errors,
+  rssNote,
   setDir,
   set,
 }: {
@@ -283,6 +287,8 @@ function DirectionTab({
   f: AdvancedForm;
   data: AdvancedData;
   errors: AdvancedErrors;
+  /** why the download's queues don't spread over the CPUs now, when they don't */
+  rssNote: string | undefined;
   setDir: <K extends keyof DirectionForm>(dir: Direction, key: K, value: DirectionForm[K]) => void;
   set: <K extends keyof AdvancedForm>(key: K, value: AdvancedForm[K]) => void;
 }): ReactElement {
@@ -293,9 +299,46 @@ function DirectionTab({
   const ch = (k: keyof DirectionForm): boolean => d[k] !== was[k];
   const rttChoice = d.rtt === '' || (RTT_PRESETS as readonly string[]).includes(d.rtt) ? d.rtt : 'custom';
   const scriptTin = scriptTins(f.script, dir, f.squashIngress);
+  const mq = downloadMq(f, data);
   return (
     <>
       <CakePreview f={f} data={data} dir={dir} />
+      {down && (
+        <Group title="Queues">
+          <Row
+            id={fid('mq')}
+            label="Multi-queue"
+            opt="use_mq"
+            changed={f.multiQueue !== data.form.multiQueue}
+            hint={
+              <>
+                One CAKE per network-card queue, sharing the speed by what each needs, so more than one CPU can shape at once
+                (cake_mq). With RSS (Performance Tuning), each receive ring feeds its own queue on its own CPU. Each queue holds
+                its packets to its share of the speed, so a packet can wait a little longer than in one CAKE, more so on a slower
+                line, which one CPU shapes easily: Automatic uses it from {MULTI_QUEUE_KBIT / 1000} Mbit/s. Saved as
+                milkflint.cake.multi_queue too.
+                {rssNote !== undefined && mq && <span className="mt-1 block text-warning">{rssNote}</span>}
+              </>
+            }
+          >
+            <Pick
+              id={fid('mq')}
+              value={f.multiQueue}
+              options={[
+                {
+                  value: 'auto',
+                  label: `Automatic: ${usesMultiQueue(data.downloadKbit, 'auto') ? 'on' : 'off'} at ${formatBitrate(data.downloadKbit * 1000)}`,
+                },
+                { value: 'on', label: 'On (cake_mq)' },
+                { value: 'off', label: 'Off: one CAKE' },
+              ]}
+              onChange={(v) => {
+                set('multiQueue', v);
+              }}
+            />
+          </Row>
+        </Group>
+      )}
       <Group title="Tins and fairness">
         <Row
           id={fid('diffserv')}
@@ -456,7 +499,10 @@ function DirectionTab({
               id={fid('whole')}
               value={f.whole}
               options={[
-                { value: 'auto', label: `Automatic: ${takesWhole(data.downloadKbit, 'auto') ? 'whole' : 'split'} at ${formatBitrate(data.downloadKbit * 1000)}` },
+                {
+                  value: 'auto',
+                  label: `Automatic: ${takesWhole(data.downloadKbit, 'auto') ? 'whole' : 'split'} at ${formatBitrate(data.downloadKbit * 1000)}`,
+                },
                 { value: 'on', label: 'Always whole (no-split-gso)' },
                 { value: 'off', label: 'Never: split each one (split-gso)' },
               ]}
@@ -508,8 +554,8 @@ function DirectionTab({
               changed={ch('autorate')}
               error={errors['down.autorate']}
               // multi-queue CAKE can't: one set in LuCI can still be turned off
-              disabled={data.useMq && !d.autorate}
-              hint={`CAKE measures how fast downloads arrive and shapes to that instead of the speed you set: for lines whose speed changes, such as 4G or 5G.${data.useMq ? ' Not with multi-queue CAKE, which the download uses now (Multi-queue, on the page).' : ''}`}
+              disabled={mq && !d.autorate}
+              hint={`CAKE measures how fast downloads arrive and shapes to that instead of the speed you set: for lines whose speed changes, such as 4G or 5G.${mq ? ' Not with multi-queue CAKE, which the download uses (Multi-queue, above).' : ''}`}
               onChange={(v) => {
                 setDir(dir, 'autorate', v);
               }}
@@ -542,7 +588,7 @@ function DirectionTab({
             {rttChoice === 'custom' && (
               <Input
                 aria-label="Round trip"
-                className="w-28 shrink-0 font-mono"
+                className="w-28 shrink-0 tabular"
                 value={d.rtt}
                 aria-invalid={errors[`${dir}.rtt`] !== undefined}
                 onChange={(e) => {
@@ -558,18 +604,37 @@ function DirectionTab({
           opt="memlimit"
           changed={ch('memlimit')}
           error={errors[`${dir}.memlimit`]}
-          hint="How much the queue may hold before CAKE drops from its biggest flow. Empty: CAKE’s own, four round trips at the speed and at least 4 MiB."
+          hint={
+            down
+              ? 'How much the queue may hold before CAKE drops from its biggest flow. Empty: CAKE’s own, four round trips at the speed and at least 4 MiB.'
+              : 'How much the queue may hold before CAKE drops from its biggest flow. Empty: CAKE’s own, four round trips at the speed and at least 4 MiB. Low allows one 100 ms round trip (at least 1 MiB), so a device starting a fast upload fills less of it, and the page keeps it in step with the upload speed.'
+          }
         >
-          <Input
-            id={fid('memlimit')}
-            className="font-mono"
-            placeholder="Automatic"
-            value={d.memlimit}
-            aria-invalid={errors[`${dir}.memlimit`] !== undefined}
-            onChange={(e) => {
-              setDir(dir, 'memlimit', e.target.value.trim());
-            }}
-          />
+          <div className="flex gap-2">
+            <Input
+              id={fid('memlimit')}
+              className="tabular"
+              placeholder="Automatic"
+              value={d.memlimit}
+              aria-invalid={errors[`${dir}.memlimit`] !== undefined}
+              onChange={(e) => {
+                setDir(dir, 'memlimit', e.target.value.trim());
+              }}
+            />
+            {!down && (
+              <Button
+                type="button"
+                variant="outline"
+                className="shrink-0"
+                disabled={d.memlimit === String(lowMemlimit(data.uploadKbit))}
+                onClick={() => {
+                  setDir(dir, 'memlimit', String(lowMemlimit(data.uploadKbit)));
+                }}
+              >
+                Low
+              </Button>
+            )}
+          </div>
         </Row>
       </Group>
       <Group title="More">
@@ -661,8 +726,8 @@ function LineTab({
           ))}
         </div>
         <p className="text-xs text-muted-foreground">
-          How much each packet grows on your line, so CAKE shapes what it really carries. These fill in the fields below; nothing is
-          saved until you save.
+          How much each packet grows on your line, so CAKE shapes what it really carries. These fill in the fields below; nothing
+          is saved until you save.
         </p>
       </Group>
       <Group title="Link layer">
@@ -692,7 +757,7 @@ function LineTab({
             <Input
               id={`${id}-overhead`}
               inputMode="numeric"
-              className="font-mono"
+              className="tabular"
               value={f.overhead}
               aria-invalid={errors['overhead'] !== undefined}
               onChange={(e) => {
@@ -711,7 +776,7 @@ function LineTab({
             <Input
               id={`${id}-mpu`}
               inputMode="numeric"
-              className="font-mono"
+              className="tabular"
               placeholder="0"
               value={f.mpu}
               aria-invalid={errors['mpu'] !== undefined}
@@ -761,7 +826,7 @@ function LineTab({
               <Input
                 id={`${id}-mtu`}
                 inputMode="numeric"
-                className="font-mono"
+                className="tabular"
                 placeholder="2047"
                 value={f.mtu}
                 aria-invalid={errors['mtu'] !== undefined}
@@ -774,7 +839,7 @@ function LineTab({
               <Input
                 id={`${id}-tsize`}
                 inputMode="numeric"
-                className="font-mono"
+                className="tabular"
                 placeholder="512"
                 value={f.tsize}
                 aria-invalid={errors['tsize'] !== undefined}
@@ -829,13 +894,13 @@ function QueueTab({
           label="Upload multi-queue"
           opt="use_mq_egress"
           changed={f.mqEgress !== was.mqEgress}
-          hint="The Flint 2’s Ethernet sends everything on one queue, so multi-queue CAKE on the upload only adds idle queues. Downloads: Multi-queue on the page."
+          hint="The Flint 2’s Ethernet sends everything on one queue, so multi-queue CAKE on the upload only adds idle queues. Downloads: Multi-queue on the Download tab."
         >
           <Pick
             id={`${id}-mq`}
             value={f.mqEgress}
             options={[
-              { value: '', label: `Like downloads: ${data.useMq ? 'on' : 'off'} (use_mq)` },
+              { value: '', label: `Like downloads: ${downloadMq(f, data) ? 'on' : 'off'} (use_mq)` },
               { value: '1', label: 'On' },
               { value: '0', label: 'Off' },
             ]}
@@ -885,16 +950,22 @@ const tabOf = (key: string): TabId => (key.startsWith('down.') ? 'down' : key.st
 
 export function AdvancedSheet({
   data,
+  tab: firstTab = 'down',
+  rssNote,
   onClose,
   onSave,
 }: {
   data: AdvancedData;
+  /** the tab it opens on */
+  tab?: TabId;
+  /** why the download's queues don't spread over the CPUs now, when they don't */
+  rssNote?: string | undefined;
   onClose: () => void;
   onSave: (changes: Change[]) => void;
 }): ReactElement {
   const id = useId();
   const [f, setF] = useState(data.form);
-  const [tab, setTab] = useState<TabId>('down');
+  const [tab, setTab] = useState<TabId>(firstTab);
   const set = <K extends keyof AdvancedForm>(key: K, value: AdvancedForm[K]): void => {
     setF((x) => ({ ...x, [key]: value }));
   };
@@ -904,8 +975,17 @@ export function AdvancedSheet({
   const errors = validateAdvanced(f, data);
   const wrong = new Set(Object.keys(errors).map(tabOf));
   const changes = advancedChanges(f, data);
-  const options = changes.reduce((n, c) => n + (c.op === 'set' || c.op === 'add' ? Object.keys(c.values).length : c.op === 'unset' ? c.options.length : 1), 0);
+  const options = changes.reduce(
+    (n, c) => n + (c.op === 'set' || c.op === 'add' ? Object.keys(c.values).length : c.op === 'unset' ? c.options.length : 1),
+    0,
+  );
   const invalid = Object.keys(errors).length > 0;
+  // what a save writes in /etc/config/milkflint, which the preview (sqm's queue) doesn't show
+  const milkflint = [
+    ...(f.whole === data.form.whole ? [] : ['milkflint.gro.whole (the GRO choice, shared with Performance Tuning)']),
+    ...(f.multiQueue === data.form.multiQueue ? [] : ['milkflint.cake.multi_queue (Multi-queue)']),
+  ];
+  const prefix = `${id}-sqm`;
 
   return (
     <Sheet
@@ -915,58 +995,61 @@ export function AdvancedSheet({
       }}
     >
       <SheetContent aria-describedby={`${id}-desc`} className="sm:max-w-2xl">
-        <div className="border-b px-6 pt-4">
+        <div className="px-6 pt-4">
           <SheetTitle className="pr-8">Advanced Smart Queue settings</SheetTitle>
-          <SheetDescription id={`${id}-desc`} className="mt-0.5 text-xs">
+          <SheetDescription id={`${id}-desc`} className="mt-0.5">
             Everything sqm-scripts and CAKE take for {data.device}, as in LuCI. Only what you change is saved.
           </SheetDescription>
-          <div role="tablist" aria-label="Settings" className="mt-3 flex gap-5 overflow-x-auto">
-            {tabs.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                role="tab"
-                id={`${id}-tab-${t.id}`}
-                aria-selected={tab === t.id}
-                aria-controls={`${id}-panel`}
-                onClick={() => {
-                  setTab(t.id);
-                }}
-                className={cn(
-                  '-mb-px flex shrink-0 items-center gap-1.5 border-b-2 pb-2 text-sm transition-colors',
-                  tab === t.id ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground',
-                )}
-              >
-                <t.icon className="size-3.5" />
-                {t.label}
-                {wrong.has(t.id) && <span className="size-1.5 rounded-full bg-destructive" aria-label="has a problem" />}
-              </button>
-            ))}
-          </div>
         </div>
+        <Tabs
+          label="Settings"
+          prefix={prefix}
+          className="mt-3 px-6"
+          value={tab}
+          onChange={setTab}
+          items={tabs.map((t) => ({
+            id: t.id,
+            label: (
+              <span className="flex items-center gap-1.5">
+                <t.icon className="size-3.5" aria-hidden />
+                {t.label}
+                {wrong.has(t.id) && (
+                  <span className="size-1.5 rounded-full bg-destructive" role="img" aria-label="has a problem" />
+                )}
+              </span>
+            ),
+          }))}
+        />
         <div className="flex-1 overflow-y-auto">
-          <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-tab-${tab}`} className="flex flex-col gap-5 px-6 py-5">
-            {(tab === 'down' || tab === 'up') && (
-              <DirectionTab id={id} dir={tab} f={f} data={data} errors={errors} setDir={setDir} set={set} />
-            )}
-            {tab === 'line' && <LineTab id={id} f={f} data={data} errors={errors} set={set} setF={setF} />}
-            {tab === 'queue' && <QueueTab id={id} f={f} data={data} set={set} />}
-          </div>
+          {(['down', 'up'] as const).map((dir) => (
+            <TabPanel key={dir} prefix={prefix} id={dir} value={tab} className="flex flex-col gap-5 px-6 py-5">
+              <DirectionTab id={id} dir={dir} f={f} data={data} errors={errors} rssNote={rssNote} setDir={setDir} set={set} />
+            </TabPanel>
+          ))}
+          <TabPanel prefix={prefix} id="line" value={tab} className="flex flex-col gap-5 px-6 py-5">
+            <LineTab id={id} f={f} data={data} errors={errors} set={set} setF={setF} />
+          </TabPanel>
+          <TabPanel prefix={prefix} id="queue" value={tab} className="flex flex-col gap-5 px-6 py-5">
+            <QueueTab id={id} f={f} data={data} set={set} />
+          </TabPanel>
           <div className="flex flex-col gap-2 border-t px-6 py-5">
             <UciPreview config="sqm" type="queue" original={data.queue} changes={changes} />
-            {changes.some((c) => c.config === 'milkflint') && (
+            {milkflint.length > 0 && (
               <p className="text-xs text-muted-foreground">
-                And the GRO choice in <span className="font-mono">/etc/config/milkflint</span> (milkflint.gro.whole), shared with Performance
-                Tuning.
+                And in <span className="font-mono">/etc/config/milkflint</span>: {milkflint.join('; ')}.
               </p>
             )}
           </div>
         </div>
-        <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t px-6 py-3">
           <p className="text-xs text-muted-foreground">
-            {invalid ? 'Fix what’s marked to save.' : options === 0 ? 'No changes yet.' : `${String(options)} option${options === 1 ? '' : 's'} to change. Smart Queue restarts for a moment.`}
+            {invalid
+              ? 'Fix what’s marked to save.'
+              : options === 0
+                ? 'No changes yet.'
+                : `${String(options)} option${options === 1 ? '' : 's'} to change. Smart Queue restarts for a moment.`}
           </p>
-          <div className="flex gap-2">
+          <div className="ml-auto flex gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>

@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'schedules',
-  title: 'Scheduled Tasks',
+  title: 'Scheduled tasks',
   description: 'Restart the router, or turn Wi-Fi off and on, at set times.',
   icon: CalendarClockIcon,
   group: 'system',
-  order: 30,
-  page: lazyPage(() => import('./page'), (m) => m.SchedulesPage),
+  order: 50,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.SchedulesPage,
+  ),
 } satisfies Feature;

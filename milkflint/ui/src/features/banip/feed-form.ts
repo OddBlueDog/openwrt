@@ -25,7 +25,8 @@ export function checkFeedForm(f: FeedForm, taken: readonly string[], editing: bo
   if (f.url_4 !== '' && !URL.test(f.url_4)) e.url_4 = 'A web address (http or https), without spaces.';
   if (f.url_6 !== '' && !URL.test(f.url_6)) e.url_6 = 'A web address (http or https), without spaces.';
   if (!/^(feed|suricata)( [^ "\\]{1,40}| "){1,3}$/.test(f.rule)) e.rule = 'A rule as banIP takes it, e.g. “feed 1”.';
-  if (f.flag !== '' && !/^(gz|tcp|udp|\d{1,5}(-\d{1,5})?)( (gz|tcp|udp|\d{1,5}(-\d{1,5})?))*$/.test(f.flag)) e.flag = 'gz, tcp, udp and ports, e.g. “tcp udp 80 443”.';
+  if (f.flag !== '' && !/^(gz|tcp|udp|\d{1,5}(-\d{1,5})?)( (gz|tcp|udp|\d{1,5}(-\d{1,5})?))*$/.test(f.flag))
+    e.flag = 'gz, tcp, udp and ports, e.g. “tcp udp 80 443”.';
   return e;
 }
 
@@ -39,4 +40,3 @@ export function definitionOf(f: FeedForm): FeedDefinition {
     ...(f.flag === '' ? {} : { flag: f.flag }),
   };
 }
-

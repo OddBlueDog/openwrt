@@ -57,7 +57,14 @@ export function loads(role: string | undefined, dir: 'd' | 'u'): boolean {
  * which it was to load that way and moved nothing are 0 (it records only
  * what arrived).
  */
-export function memberRate(records: readonly RunRecord[], dir: 'd' | 'u', t0: number, phases: readonly Phase[], member: string, end: number): TPoint[] {
+export function memberRate(
+  records: readonly RunRecord[],
+  dir: 'd' | 'u',
+  t0: number,
+  phases: readonly Phase[],
+  member: string,
+  end: number,
+): TPoint[] {
   const by = new Map<number, number | null>();
   for (const p of phases) {
     if (!loads(p.roles[member], dir)) continue;
@@ -93,7 +100,11 @@ export function wanPort(lines: readonly RouterLine[]): string | undefined {
 }
 
 /** A value per sample, from the router's lines (null where `pick` has none). */
-export function routerSeries(lines: readonly RouterLine[], t0: number, pick: (l: RouterLine) => number | null | undefined): TPoint[] {
+export function routerSeries(
+  lines: readonly RouterLine[],
+  t0: number,
+  pick: (l: RouterLine) => number | null | undefined,
+): TPoint[] {
   const out: TPoint[] = [];
   for (const l of lines) {
     const v = pick(l);
@@ -168,7 +179,10 @@ export function cakeSeconds(lines: readonly RouterLine[], t0: number, dir: 'down
 }
 
 /** Each CPU's busy share (and its softirq share) per sample, a row per CPU; each sample covers `spans` (the time since the one before). */
-export function cpuRows(lines: readonly RouterLine[], t0: number): { spans: [number, number][]; busy: (number | null)[][]; softirq: (number | null)[][] } {
+export function cpuRows(
+  lines: readonly RouterLine[],
+  t0: number,
+): { spans: [number, number][]; busy: (number | null)[][]; softirq: (number | null)[][] } {
   const spans: [number, number][] = [];
   const busy: (number | null)[][] = [];
   const softirq: (number | null)[][] = [];
@@ -190,7 +204,9 @@ export function cpuRows(lines: readonly RouterLine[], t0: number): { spans: [num
 
 /** softnet each second, every CPU summed: packets dropped from a backlog (1), and times NAPI ran out of budget (2). */
 export function softnetRate(lines: readonly RouterLine[], t0: number, i: 1 | 2): TPoint[] {
-  return routerSeries(lines, t0, (l) => (l.sn === undefined || l.dt === undefined || l.dt <= 0 ? undefined : l.sn.reduce((a, c) => a + (c[i] ?? 0), 0) / l.dt));
+  return routerSeries(lines, t0, (l) =>
+    l.sn === undefined || l.dt === undefined || l.dt <= 0 ? undefined : l.sn.reduce((a, c) => a + (c[i] ?? 0), 0) / l.dt,
+  );
 }
 
 export interface StationSample {
@@ -215,7 +231,8 @@ export function stationSamples(lines: readonly RouterLine[], t0: number, member:
     if (s === undefined) continue;
     const c = s.c.map((x) => x ?? 0);
     const frames = prev === undefined ? 0 : Math.max(0, (c[0] ?? 0) - (prev[0] ?? 0));
-    const share = (i: number): number | null => (prev === undefined || frames === 0 ? null : Math.max(0, (c[i] ?? 0) - (prev[i] ?? 0)) / frames);
+    const share = (i: number): number | null =>
+      prev === undefined || frames === 0 ? null : Math.max(0, (c[i] ?? 0) - (prev[i] ?? 0)) / frames;
     out.push({
       t: l.t - t0,
       txMbit: s.tx_mbit ?? null,

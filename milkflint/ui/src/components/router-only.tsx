@@ -15,8 +15,8 @@ export function RouterOnly({ feature }: { feature: Feature }): ReactElement {
         <AlertTitle>Not in access point mode</AlertTitle>
         <AlertDescription>
           <span>
-            Your main router does this now, and its own settings page is where to change it. To have MilkFlint do it
-            again, switch it back to router mode on the{' '}
+            Your main router does this now, and its own settings page is where to change it. To have MilkFlint do it again, switch
+            it back to router mode on the{' '}
             <a href={href('mode')} className="font-medium text-foreground underline underline-offset-2">
               Operating Mode
             </a>{' '}

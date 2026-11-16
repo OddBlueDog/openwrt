@@ -1,8 +1,9 @@
-import { FlaskConicalIcon, LoaderCircleIcon, type LucideIcon, PowerIcon, QrCodeIcon, TimerIcon } from 'lucide-react';
+import { FlaskConicalIcon, LoaderCircleIcon, PowerIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, type SyntheticEvent, useEffect, useRef, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -15,11 +16,14 @@ import { BenchView } from './bench-view';
 import { HistoryCard } from './history-card';
 import { benchMember, useMember } from './member';
 
-function Step({ icon: Icon, title, children }: { icon: LucideIcon; title: string; children: ReactNode }): ReactElement {
+function Step({ n, title, children }: { n: number; title: string; children: ReactNode }): ReactElement {
   return (
     <li className="flex gap-3">
-      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-        <Icon className="size-4" />
+      <span
+        className="flex size-6 shrink-0 items-center justify-center rounded-full border text-xs font-medium text-muted-foreground tabular"
+        aria-hidden="true"
+      >
+        {n}
       </span>
       <span className="flex flex-col gap-0.5">
         <span className="text-sm font-medium">{title}</span>
@@ -46,24 +50,30 @@ function OpenCard({ onOpen }: { onOpen: (name: string) => Promise<void> }): Reac
   };
   return (
     <Card>
-      <CardHeading icon={FlaskConicalIcon} title="Open a bench" description="Several of your devices test the network together, while the router records what it does" />
-      <CardContent className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+      <CardHeading
+        title="No bench is open"
+        description="Open one, and several of your devices test the network together while the router records what it does"
+      />
+      <CardContent className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem] lg:gap-8">
         <ol className="flex flex-col gap-4">
-          <Step icon={FlaskConicalIcon} title="Open a bench here">
+          <Step n={1} title="Open a bench here">
             This device joins it and coordinates: it picks the plan and starts runs.
           </Step>
-          <Step icon={QrCodeIcon} title="Add your other devices">
-            Each scans the bench&apos;s QR code, or types its code on the router&apos;s sign-in page. They don&apos;t need the admin password, and can do
-            nothing on the router but take part.
+          <Step n={2} title="Add your other devices">
+            Each scans the bench&apos;s QR code, or types its code on the router&apos;s sign-in page. They don&apos;t need the
+            admin password, and can do nothing on the router but take part.
           </Step>
-          <Step icon={TimerIcon} title="Run a plan">
-            Every device runs its part at the same moment, by the router&apos;s clock, and any of them can stop it. Nothing runs until you press Start,
-            and every run stops by itself.
+          <Step n={3} title="Run a plan">
+            Every device runs its part at the same moment, by the router&apos;s clock, and any of them can stop it. Nothing runs
+            until you press Start, and every run stops by itself.
           </Step>
         </ol>
-        <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-3 self-start rounded-xl border bg-muted/30 p-4">
+        <form
+          onSubmit={(e) => void submit(e)}
+          className="flex flex-col gap-3 self-start border-t pt-5 lg:border-t-0 lg:border-l lg:pt-0 lg:pl-8"
+        >
           <div className="flex flex-col gap-2">
-            <Label htmlFor="bench-name">Name</Label>
+            <Label htmlFor="bench-name">The bench’s name</Label>
             <Input
               id="bench-name"
               value={name}
@@ -102,7 +112,8 @@ function CloseButton({ onClose }: { onClose: () => Promise<void> }): ReactElemen
           <DialogHeader>
             <DialogTitle>Close the bench?</DialogTitle>
             <DialogDescription>
-              Every device leaves it, and its code and QR code stop working. A run that&apos;s on stops. Finished runs stay on the router.
+              Every device leaves it, and its code and QR code stop working. A run that&apos;s on stops. Finished runs stay on the
+              router.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -170,7 +181,7 @@ export function TestBenchPage(): ReactElement {
 
   const header = (
     <PageHeader
-      title="Test Bench"
+      title="Test bench"
       description="Test the network from several devices at once: latency under load, speeds, device to device, DNS, and what the router does meanwhile."
       actions={
         bench !== undefined && bench !== null ? (
@@ -209,7 +220,15 @@ export function TestBenchPage(): ReactElement {
         </div>
       ) : (
         <div className="flex flex-col gap-4">
-          {joinError !== undefined && <p className="text-sm text-destructive">This device couldn&apos;t join the bench: {joinError}</p>}
+          {joinError !== undefined && (
+            <Alert variant="destructive">
+              <TriangleAlertIcon />
+              <AlertTitle>This device couldn&apos;t join the bench</AlertTitle>
+              <AlertDescription>
+                {joinError}. Reload the page to try again, or close the bench and open a new one.
+              </AlertDescription>
+            </Alert>
+          )}
           <BenchView
             member={member}
             state={state}

@@ -248,7 +248,8 @@ export function sqmData({ sqm, firewall, milkflint, wanDevice, wanProto, devices
     latency: latencyOf(str(queue, 'iqdisc_opts'), str(queue, 'eqdisc_opts')),
     uploadMemory: uploadMemoryOf(str(queue, 'eqdisc_opts'), Number(str(queue, 'upload') ?? '0')),
     ackFilter: ackFilterOf(words(str(queue, 'eqdisc_opts'))),
-    perDevice: words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost'),
+    perDevice:
+      words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost'),
     multiQueue: multiQueueOf(
       str(cake, 'multi_queue'),
       queue === undefined ? undefined : bool(queue, 'use_mq'),
@@ -261,7 +262,13 @@ export function sqmData({ sqm, firewall, milkflint, wanDevice, wanProto, devices
     form,
     // not the VPN's tunnel nor a guest network's: a queue there is theirs
     devices: devices.filter(
-      (d) => d !== 'lo' && !d.startsWith('ifb') && !d.startsWith('br-') && !d.startsWith('phy') && !isVpnShaper(d) && !isGuestShaper(d),
+      (d) =>
+        d !== 'lo' &&
+        !d.startsWith('ifb') &&
+        !d.startsWith('br-') &&
+        !d.startsWith('phy') &&
+        !isVpnShaper(d) &&
+        !isGuestShaper(d),
     ),
     wanDevice: wan,
     pppoe,
@@ -281,7 +288,10 @@ export function sqmData({ sqm, firewall, milkflint, wanDevice, wanProto, devices
     eqdiscOpts: str(queue, 'eqdisc_opts'),
     mpu: str(queue, 'tcMPU'),
     whole: wholeOf(
-      str(milkflint?.find((s) => s['.name'] === 'gro'), 'whole'),
+      str(
+        milkflint?.find((s) => s['.name'] === 'gro'),
+        'whole',
+      ),
       queue === undefined ? null : str(queue, 'iqdisc_opts'),
       Number(str(queue, 'download') ?? '0'),
     ),
@@ -309,7 +319,8 @@ export function validate(f: SqmForm, data: SqmData): SqmErrors {
   // the kernel refuses a multi-queue CAKE that estimates the line's speed,
   // and the download then goes unshaped
   if (f.enabled && usesMultiQueue(kbit(f.downloadMbit), f.multiQueue) && words(data.iqdiscOpts).includes('autorate-ingress')) {
-    e.multiQueue = 'Multi-queue CAKE can’t estimate the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
+    e.multiQueue =
+      'Multi-queue CAKE can’t estimate the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
   }
   return e;
 }
@@ -348,7 +359,8 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
     values['script'] = f.prioritise ? 'layer_cake.qos' : 'piece_of_cake.qos';
   }
   const multiQueue = usesMultiQueue(download, f.multiQueue);
-  if (changed('multiQueue') || multiQueue !== usesMultiQueue(wasDownload, f.multiQueue)) values['use_mq'] = multiQueue ? '1' : '0';
+  if (changed('multiQueue') || multiQueue !== usesMultiQueue(wasDownload, f.multiQueue))
+    values['use_mq'] = multiQueue ? '1' : '0';
   // the upload stays one CAKE, as the hint says (./multi-queue.ts): first
   // boot set use_mq_egress on the queues it found, and where it's unset
   // the upload follows use_mq
@@ -374,7 +386,11 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
     // CAKE's own compensation, where LuCI chose tc's size table or HTB's
     if (!CAKE_LLAM.includes(str(data.queue, 'linklayer_adaptation_mechanism'))) unset.push('linklayer_adaptation_mechanism');
     both(['ptm'], preset.ptm === true ? ['ptm'] : []);
-  } else if (changed('device') && preset !== undefined && presetOverhead(preset, f.device) !== presetOverhead(preset, was.device)) {
+  } else if (
+    changed('device') &&
+    preset !== undefined &&
+    presetOverhead(preset, f.device) !== presetOverhead(preset, was.device)
+  ) {
     // onto or off a PPPoE session's own device: the preset's figure there
     values['overhead'] = presetOverhead(preset, f.device);
   }
@@ -417,7 +433,8 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
     if (opts !== '') {
       values[key] = opts;
       // LuCI shows these options only in its advanced mode
-      for (const mode of ['qdisc_advanced', 'qdisc_really_really_advanced']) if (str(data.queue, mode) !== '1') values[mode] = '1';
+      for (const mode of ['qdisc_advanced', 'qdisc_really_really_advanced'])
+        if (str(data.queue, mode) !== '1') values[mode] = '1';
     } else if (current !== undefined) {
       unset.push(key);
     }

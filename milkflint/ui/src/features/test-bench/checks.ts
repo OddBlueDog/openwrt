@@ -131,7 +131,8 @@ export interface Check {
 const ms = (v: number): string => `${formatNumber(v, Math.abs(v) < 10 ? 1 : 0)} ms`;
 const signed = (v: number): string => `${v >= 0 ? '+' : '−'}${ms(Math.abs(v))}`;
 /** a share as a percentage, with the decimals small ones need */
-const pct = (share: number): string => `${formatNumber(share * 100, share === 0 ? 0 : share < 0.001 ? 3 : share < 0.01 ? 2 : share < 0.1 ? 1 : 0)}%`;
+const pct = (share: number): string =>
+  `${formatNumber(share * 100, share === 0 ? 0 : share < 0.001 ? 3 : share < 0.01 ? 2 : share < 0.1 ? 1 : 0)}%`;
 const count = (n: number): string => formatNumber(n);
 
 /** A latency row in words: "Mac, to the internet", "The router’s pings to Mac". */
@@ -180,10 +181,13 @@ function addedCheck(
 ): Check {
   const base = { id, title, uses: [key], why };
   if (!x.windows.some((w) => kinds.has(w.phase.kind))) return skip({ ...base, detail: 'The plan has no phase that loads it.' });
-  if (!x.windows.some((w) => w.phase.kind === 'idle')) return skip({ ...base, detail: 'The plan has no idle phase to compare with.' });
+  if (!x.windows.some((w) => w.phase.kind === 'idle'))
+    return skip({ ...base, detail: 'The plan has no idle phase to compare with.' });
   const found = x.rows
     .filter((r) => targets.includes(r.target) && !r.silent)
-    .flatMap((r) => r.phases.filter((p) => kinds.has(p.window.phase.kind) && p.added !== undefined).map((p) => ({ r, p, added: p.added ?? 0 })));
+    .flatMap((r) =>
+      r.phases.filter((p) => kinds.has(p.window.phase.kind) && p.added !== undefined).map((p) => ({ r, p, added: p.added ?? 0 })),
+    );
   if (found.length === 0) return skip({ ...base, detail: 'Nothing measured it both idle and under load.' });
   const top = found.reduce((a, b) => (b.added > a.added ? b : a));
   // each device's (and the router's) worst
@@ -203,7 +207,12 @@ function addedCheck(
 }
 
 function spikes(x: Context): Check {
-  const base = { id: 'spikes' as const, title: 'Latency spikes', uses: ['spikes' as const], why: 'Short stalls you notice even when the typical figures are fine.' };
+  const base = {
+    id: 'spikes' as const,
+    title: 'Latency spikes',
+    uses: ['spikes' as const],
+    why: 'Short stalls you notice even when the typical figures are fine.',
+  };
   const found = x.rows
     .filter((r) => !r.silent)
     .flatMap((r) => r.phases.filter((p) => p.stats.p99 !== undefined).map((p) => ({ r, p, p99: p.stats.p99 ?? 0 })));
@@ -231,7 +240,10 @@ function lanLoss(x: Context): Check {
   for (const m of x.data.meta.members) {
     const s = rttStats(routerRtts(x.data.probes, m.id, run));
     if (s.sent === 0) continue;
-    if (s.lost === s.sent) notes.push(`${m.name} doesn’t answer pings (a firewall, as Windows has by default), so the router’s pings can’t measure its loss.`);
+    if (s.lost === s.sent)
+      notes.push(
+        `${m.name} doesn’t answer pings (a firewall, as Windows has by default), so the router’s pings can’t measure its loss.`,
+      );
     else sources.push({ who: `the router’s pings to ${m.name}`, lost: s.lost, sent: s.sent });
   }
   for (const p of pairResults(x.t0, x.end, x.data.meta.schedule.phases, x.data.records)) {
@@ -239,17 +251,22 @@ function lanLoss(x: Context): Check {
       [p.a, p.b, p.loss.ab],
       [p.b, p.a, p.loss.ba],
     ] as const) {
-      if (l !== undefined && l.sent > 0) sources.push({ who: `${x.name(from)} to ${x.name(to)}, direct`, lost: l.lost, sent: l.sent });
+      if (l !== undefined && l.sent > 0)
+        sources.push({ who: `${x.name(from)} to ${x.name(to)}, direct`, lost: l.lost, sent: l.sent });
     }
   }
-  if (sources.length === 0) return { ...skip({ ...base, detail: 'Nothing measured it: no pings were answered and no devices were paired.' }), notes };
+  if (sources.length === 0)
+    return { ...skip({ ...base, detail: 'Nothing measured it: no pings were answered and no devices were paired.' }), notes };
   const top = sources.reduce((a, b) => (b.lost / b.sent > a.lost / a.sent ? b : a));
   const share = top.lost / top.sent;
   return {
     ...base,
     status: grade('lanLoss', share * 100, x.t),
     value: pct(share),
-    detail: top.lost === 0 ? `Nothing lost, of ${count(sources.reduce((a, s) => a + s.sent, 0))} probes and pings.` : `The most: ${top.who}, ${count(top.lost)} of ${count(top.sent)} lost.`,
+    detail:
+      top.lost === 0
+        ? `Nothing lost, of ${count(sources.reduce((a, s) => a + s.sent, 0))} probes and pings.`
+        : `The most: ${top.who}, ${count(top.lost)} of ${count(top.sent)} lost.`,
     notes: [...sources.map((s) => `${s.who}: ${count(s.lost)} of ${count(s.sent)} lost`), ...notes],
   };
 }
@@ -302,14 +319,18 @@ function sqm(x: Context): Check {
       values.push(`${arrow[dir]} ${ms(delay)}`);
       notes.push(
         `${arrow[dir]} full for ${count(full.length)} s: the busiest tin’s delay ${ms(delay)} typical, ${ms(delays[delays.length - 1] ?? 0)} at most; ${count(full.reduce((a, s) => a + s.drops, 0))} drops, ${count(full.reduce((a, s) => a + s.marks, 0))} ECN marks.` +
-          (signals === 0 ? ' It neither dropped nor marked anything, so the queue that kept the line full may be somewhere else.' : ''),
+          (signals === 0
+            ? ' It neither dropped nor marked anything, so the queue that kept the line full may be somewhere else.'
+            : ''),
       );
     } else {
       const peak = Math.max(...secs.map((s) => s.mbit));
       const share = (peak * 1000) / kbit;
       if (share < 0.7) {
         statuses.push('info');
-        notes.push(`${arrow[dir]} the line never came near the shaped rate (at most ${pct(share)} of it): Smart Queue wasn’t what limited it.`);
+        notes.push(
+          `${arrow[dir]} the line never came near the shaped rate (at most ${pct(share)} of it): Smart Queue wasn’t what limited it.`,
+        );
       } else {
         notes.push(`${arrow[dir]} at the shaped rate for only ${count(full.length)} s, too short to judge.`);
       }
@@ -331,7 +352,12 @@ function sqm(x: Context): Check {
 }
 
 function shaperReach(x: Context): Check {
-  const base = { id: 'shaper' as const, title: 'Shaped rate reached', uses: ['shaperReach' as const], why: 'Tells the line’s or a server’s limit from the shaper’s.' };
+  const base = {
+    id: 'shaper' as const,
+    title: 'Shaped rate reached',
+    uses: ['shaperReach' as const],
+    why: 'Tells the line’s or a server’s limit from the shaper’s.',
+  };
   const rates = shaper(x.data.meta.settings);
   if (rates === undefined) return skip({ ...base, detail: 'Smart Queue is off, so there’s no shaped rate to compare with.' });
   const dirs = wanDirections(x);
@@ -352,7 +378,9 @@ function shaperReach(x: Context): Check {
     const share = (best * 1000) / kbit;
     statuses.push(grade('shaperReach', share * 100, x.t));
     values.push(`${arrow[dir]} ${pct(share)}`);
-    notes.push(`${arrow[dir]} ${formatNumber(best, best < 10 ? 1 : 0)} of ${formatNumber(kbit / 1000, 0)} Mbit/s, over its best 5 s`);
+    notes.push(
+      `${arrow[dir]} ${formatNumber(best, best < 10 ? 1 : 0)} of ${formatNumber(kbit / 1000, 0)} Mbit/s, over its best 5 s`,
+    );
   }
   const status = worst(statuses);
   if (status === 'skip') return skip({ ...base, detail: 'CAKE wasn’t seen while the line was loaded.' });
@@ -360,20 +388,32 @@ function shaperReach(x: Context): Check {
     ...base,
     status,
     value: values.join(' · '),
-    detail: status === 'info' ? 'Short of the shaped rate: something else was the limit (the line, the server, a device or its link).' : 'What CAKE sent, of the rate it shapes to.',
+    detail:
+      status === 'info'
+        ? 'Short of the shaped rate: something else was the limit (the line, the server, a device or its link).'
+        : 'What CAKE sent, of the rate it shapes to.',
     notes,
   };
 }
 
 function cpu(x: Context): Check {
-  const base = { id: 'cpu' as const, title: 'Router CPU', uses: ['cpu' as const], why: 'Forwarding and CAKE run in softirqs: a core that’s pegged queues and drops packets.' };
+  const base = {
+    id: 'cpu' as const,
+    title: 'Router CPU',
+    uses: ['cpu' as const],
+    why: 'Forwarding and CAKE run in softirqs: a core that’s pegged queues and drops packets.',
+  };
   const ws = x.windows.filter((w) => LOAD_KINDS.has(w.phase.kind));
   const busiest = x.data.router.flatMap((l) => {
     if (!inAny(l.t, ws)) return [];
     const c = (l.cpu ?? []).flatMap((v) => (v === null ? [] : [v[0]]));
     return c.length === 0 ? [] : [Math.max(...c)];
   });
-  if (busiest.length === 0) return skip({ ...base, detail: ws.length === 0 ? 'The plan has no phase that loads the network.' : 'The router recorded nothing under load.' });
+  if (busiest.length === 0)
+    return skip({
+      ...base,
+      detail: ws.length === 0 ? 'The plan has no phase that loads the network.' : 'The router recorded nothing under load.',
+    });
   const warnAt = (x.t.cpu.warn ?? 95) / 100;
   let run = 0;
   let longest = 0;
@@ -381,7 +421,11 @@ function cpu(x: Context): Check {
     run = b >= warnAt ? run + 1 : 0;
     longest = Math.max(longest, run);
   }
-  const p95 = percentile([...busiest].sort((a, b) => a - b), 0.95) ?? 0;
+  const p95 =
+    percentile(
+      [...busiest].sort((a, b) => a - b),
+      0.95,
+    ) ?? 0;
   const pegged = longest >= 3;
   return {
     ...base,
@@ -422,7 +466,12 @@ function softnet(x: Context): Check {
 }
 
 function drops(x: Context): Check {
-  const base = { id: 'drops' as const, title: 'Interface and driver drops', uses: ['ifDrops' as const], why: 'Packets an interface or its driver dropped or got wrong.' };
+  const base = {
+    id: 'drops' as const,
+    title: 'Interface and driver drops',
+    uses: ['ifDrops' as const],
+    why: 'Packets an interface or its driver dropped or got wrong.',
+  };
   const loaded = x.windows.filter((w) => LOAD_KINDS.has(w.phase.kind));
   const idle = x.windows.filter((w) => w.phase.kind === 'idle');
   if (loaded.length === 0) return skip({ ...base, detail: 'The plan has no phase that loads the network.' });
@@ -474,7 +523,10 @@ function drops(x: Context): Check {
     ...base,
     status: grade('ifDrops', share * 100, x.t),
     value: top.bad === 0 ? 'none' : `${pct(share)} on ${top.dev}`,
-    detail: top.bad === 0 ? 'No interface dropped or got a packet wrong under load.' : `The most: ${top.dev}, ${count(top.bad)} of ${count(top.packets)} packets under load.`,
+    detail:
+      top.bad === 0
+        ? 'No interface dropped or got a packet wrong under load.'
+        : `The most: ${top.dev}, ${count(top.bad)} of ${count(top.packets)} packets under load.`,
     notes,
   };
 }
@@ -502,7 +554,8 @@ function offload(x: Context): Check {
   }
   const off = [...per.values()].reduce((a, v) => a + v[0], 0);
   const est = [...per.values()].reduce((a, v) => a + v[1], 0);
-  if (est === 0) return skip({ ...base, detail: 'The connection scans saw no established connections from the devices under load.' });
+  if (est === 0)
+    return skip({ ...base, detail: 'The connection scans saw no established connections from the devices under load.' });
   const share = Math.min(1, off / est);
   return {
     ...base,
@@ -556,7 +609,8 @@ function wifi(x: Context): Check {
     ...base,
     status: worst(statuses),
     value: top.text,
-    detail: 'Each Wi-Fi device’s link as the router saw it: retries and failed frames of those it sent under load, and its typical signal.',
+    detail:
+      'Each Wi-Fi device’s link as the router saw it: retries and failed frames of those it sent under load, and its typical signal.',
     notes,
   };
 }
@@ -568,7 +622,8 @@ function dns(x: Context): Check {
     uses: ['dnsCached' as const, 'dnsUpstream' as const],
     why: 'Lookups dnsmasq answers from its cache should take no time; those it passes on take as long as its upstream.',
   };
-  if (!x.windows.some((w) => w.phase.kind === 'dns' || w.phase.kind === 'household')) return skip({ ...base, detail: 'The plan has no DNS or busy-household phase.' });
+  if (!x.windows.some((w) => w.phase.kind === 'dns' || w.phase.kind === 'household'))
+    return skip({ ...base, detail: 'The plan has no DNS or busy-household phase.' });
   const sites = routerSites(x.data.dns.lookups.filter((l) => l.t >= x.t0 && l.t < x.end));
   if (sites.length === 0) return skip({ ...base, detail: 'The router’s own lookups didn’t run.' });
   const cached = siteMedian(sites.flatMap((s) => (s.fromCache.median === undefined ? [] : [s.fromCache.median])));
@@ -597,7 +652,12 @@ function dns(x: Context): Check {
   return {
     ...base,
     status: worst(statuses),
-    value: [cached === undefined ? undefined : `cached ${ms(cached)}`, passed === undefined ? undefined : `passed on ${ms(passed)}`].filter((s) => s !== undefined).join(' · '),
+    value: [
+      cached === undefined ? undefined : `cached ${ms(cached)}`,
+      passed === undefined ? undefined : `passed on ${ms(passed)}`,
+    ]
+      .filter((s) => s !== undefined)
+      .join(' · '),
     detail:
       x.data.dns.via === 'adguardhome'
         ? 'The router’s own lookups, the way your devices’ go (through AdGuard Home, then dnsmasq), typical over the sites: a site’s name from dnsmasq’s cache, and a made-up name it had to pass on.'
@@ -607,20 +667,34 @@ function dns(x: Context): Check {
 }
 
 function overhead(x: Context): Check {
-  const base = { id: 'overhead' as const, title: 'The bench’s own cost', uses: ['overhead' as const], why: 'The recorder mustn’t change what it measures.' };
-  const shares = x.data.router.flatMap((l) => (l.self === undefined || l.t < x.t0 || l.t >= x.end ? [] : [l.self.reduce((a, b) => a + b, 0)]));
+  const base = {
+    id: 'overhead' as const,
+    title: 'The bench’s own cost',
+    uses: ['overhead' as const],
+    why: 'The recorder mustn’t change what it measures.',
+  };
+  const shares = x.data.router.flatMap((l) =>
+    l.self === undefined || l.t < x.t0 || l.t >= x.end ? [] : [l.self.reduce((a, b) => a + b, 0)],
+  );
   if (shares.length === 0) return skip({ ...base, detail: 'The router recorded nothing.' });
   const mean = shares.reduce((a, b) => a + b, 0) / shares.length;
   const peak = Math.max(...shares);
   // what the members' polls cost the router's web side
-  const web = x.data.router.flatMap((l) => (l.th === undefined || l.t < x.t0 || l.t >= x.end ? [] : [(l.th['rpcd'] ?? 0) + (l.th['uhttpd'] ?? 0)]));
+  const web = x.data.router.flatMap((l) =>
+    l.th === undefined || l.t < x.t0 || l.t >= x.end ? [] : [(l.th['rpcd'] ?? 0) + (l.th['uhttpd'] ?? 0)],
+  );
   const webMean = web.length === 0 ? undefined : web.reduce((a, b) => a + b, 0) / web.length;
   return {
     ...base,
     status: grade('overhead', mean * 100, x.t),
     value: `${pct(mean)} of a core`,
     detail: `The recorder, its pings and its DNS lookups: ${pct(mean)} of a core on average, ${pct(peak)} at most.`,
-    notes: webMean === undefined ? [] : [`The router’s web side (rpcd, uhttpd), which the devices’ polls and pages go through: ${pct(webMean)} of a core on average.`],
+    notes:
+      webMean === undefined
+        ? []
+        : [
+            `The router’s web side (rpcd, uhttpd), which the devices’ polls and pages go through: ${pct(webMean)} of a core on average.`,
+          ],
   };
 }
 
@@ -659,7 +733,8 @@ function quality(x: Context): Check {
     ...base,
     status: worst(statuses),
     value: `clock ±${ms(clock)}`,
-    detail: 'How far a device’s clock sync could be off at worst, whether every device started its phases, and stayed in front and in touch.',
+    detail:
+      'How far a device’s clock sync could be off at worst, whether every device started its phases, and stayed in front and in touch.',
     notes,
   };
 }

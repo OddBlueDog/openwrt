@@ -3,7 +3,15 @@
 // that at once, or both unset for fw4's own).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { editSection, parseFirewall, synRateError, synRateLabel, synRatePerSecond, synRateText, synRateValues } from '../src/features/firewall/model.ts';
+import {
+  editSection,
+  parseFirewall,
+  synRateError,
+  synRateLabel,
+  synRatePerSecond,
+  synRateText,
+  synRateValues,
+} from '../src/features/firewall/model.ts';
 
 test('fw4’s ways of writing a rate, in connections a second', () => {
   assert.equal(synRatePerSecond('50/second'), 50);

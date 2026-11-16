@@ -19,7 +19,13 @@ const queue = (values: Record<string, string> = {}): Section =>
   });
 
 /** a plain CAKE at a device's root, as tc -j shows it: the speed in bytes/s */
-const cake = (dev: string, kbit: number): CakeQdisc => ({ kind: 'cake', dev, handle: '8001:', root: true, options: { bandwidth: kbit * 125 } });
+const cake = (dev: string, kbit: number): CakeQdisc => ({
+  kind: 'cake',
+  dev,
+  handle: '8001:',
+  root: true,
+  options: { bandwidth: kbit * 125 },
+});
 
 /** multi-queue CAKE: its root and a CAKE per transmit queue under it, each with the whole speed */
 const multi = (dev: string, kbit: number): CakeQdisc[] => [
@@ -30,7 +36,10 @@ const multi = (dev: string, kbit: number): CakeQdisc[] => [
 test('as saved: nothing to say', () => {
   assert.deepEqual(shapingProblems(queue(), [...multi('ifb4eth1', 800000), cake('eth1', 60000)]), []);
   // one CAKE each way
-  assert.deepEqual(shapingProblems(queue({ download: '300000', use_mq: '0' }), [cake('ifb4eth1', 300000), cake('eth1', 60000)]), []);
+  assert.deepEqual(
+    shapingProblems(queue({ download: '300000', use_mq: '0' }), [cake('ifb4eth1', 300000), cake('eth1', 60000)]),
+    [],
+  );
   // the guest networks' and the VPN's CAKEs are theirs
   const others = [cake('br-guest', 50000), cake('ifb4br-guest', 10000), cake('wg_out', 40000), cake('ifb4wg_out', 40000)];
   assert.deepEqual(shapingProblems(queue(), [...others, ...multi('ifb4eth1', 800000), cake('eth1', 60000)]), []);
@@ -49,9 +58,10 @@ test('one CAKE where multi-queue was saved, or the other way round', () => {
   assert.deepEqual(shapingProblems(queue(), [cake('ifb4eth1', 800000), cake('eth1', 60000)]), [
     'Downloads run one CAKE, not multi-queue CAKE as saved.',
   ]);
-  assert.deepEqual(shapingProblems(queue({ download: '300000', use_mq: '0' }), [...multi('ifb4eth1', 300000), cake('eth1', 60000)]), [
-    'Downloads run multi-queue CAKE, not one CAKE as saved.',
-  ]);
+  assert.deepEqual(
+    shapingProblems(queue({ download: '300000', use_mq: '0' }), [...multi('ifb4eth1', 300000), cake('eth1', 60000)]),
+    ['Downloads run multi-queue CAKE, not one CAKE as saved.'],
+  );
   // the upload kept to one CAKE, and running multi-queue
   assert.deepEqual(shapingProblems(queue(), [...multi('ifb4eth1', 800000), ...multi('eth1', 60000)]), [
     'Uploads run multi-queue CAKE, not one CAKE as saved.',
@@ -74,7 +84,9 @@ test('the speed: an old one still running is reported; an estimated one isn’t 
     'Uploads are shaped at 60 Mbit/s, not the 45 Mbit/s saved.',
   ]);
   const unlimited: CakeQdisc = { ...cake('eth1', 0), options: { bandwidth: 'unlimited' } };
-  assert.deepEqual(shapingProblems(queue(), [...multi('ifb4eth1', 800000), unlimited]), ['Uploads are shaped at no limit, not the 60 Mbit/s saved.']);
+  assert.deepEqual(shapingProblems(queue(), [...multi('ifb4eth1', 800000), unlimited]), [
+    'Uploads are shaped at no limit, not the 60 Mbit/s saved.',
+  ]);
   // autorate-ingress: CAKE sets the download's speed itself
   const estimating = queue({ use_mq: '0', iqdisc_opts: 'autorate-ingress' });
   assert.deepEqual(shapingProblems(estimating, [cake('ifb4eth1', 612345), cake('eth1', 60000)]), []);
@@ -83,12 +95,18 @@ test('the speed: an old one still running is reported; an estimated one isn’t 
 test('off, or a direction at 0: no CAKE wanted, and one still there is reported', () => {
   const off = queue({ enabled: '0' });
   assert.deepEqual(shapingProblems(off, []), []);
-  assert.deepEqual(shapingProblems(off, [cake('eth1', 60000)]), ['CAKE still shapes uploads on eth1, though Smart Queue is off.']);
+  assert.deepEqual(shapingProblems(off, [cake('eth1', 60000)]), [
+    'CAKE still shapes uploads on eth1, though Smart Queue is off.',
+  ]);
   // sqm leaves a direction with no speed (0, or what isn't a number) unshaped
   for (const download of ['0', 'NaN', '']) {
     const one = queue({ download });
     assert.deepEqual(shapingProblems(one, [cake('eth1', 60000)]), [], download);
-    assert.deepEqual(shapingProblems(one, [cake('ifb4eth1', 800000), cake('eth1', 60000)]), ['CAKE still shapes downloads on ifb4eth1, though their speed is 0.'], download);
+    assert.deepEqual(
+      shapingProblems(one, [cake('ifb4eth1', 800000), cake('eth1', 60000)]),
+      ['CAKE still shapes downloads on ifb4eth1, though their speed is 0.'],
+      download,
+    );
   }
 });
 

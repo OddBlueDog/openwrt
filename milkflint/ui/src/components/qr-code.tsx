@@ -13,7 +13,13 @@ export function QrCode({ text, label, className }: { text: string; label: string
     });
   });
   return (
-    <svg viewBox={`0 0 ${String(size)} ${String(size)}`} role="img" aria-label={label} className={className} shapeRendering="crispEdges">
+    <svg
+      viewBox={`0 0 ${String(size)} ${String(size)}`}
+      role="img"
+      aria-label={label}
+      className={className}
+      shapeRendering="crispEdges"
+    >
       <rect width={size} height={size} fill="#fff" />
       <path d={d} fill="#000" />
     </svg>

@@ -2,6 +2,8 @@ import { fileURLToPath, URL } from 'node:url';
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig, type Plugin } from 'vite';
+import { themeCss } from './src/theme/css.ts';
+import { themes } from './src/theme/themes/index.ts';
 
 /**
  * The router's web server (uhttpd) can't send cache headers, so browsers may
@@ -43,6 +45,21 @@ function stableEntry(): Plugin {
         .replace(/<link rel="stylesheet" crossorigin href="[^"]+">/g, '')
         .replace('</head>', `${loader}\n  </head>`);
     },
+  };
+}
+
+/**
+ * The themes as CSS custom properties, written from src/theme/themes at build
+ * time (main.tsx imports virtual:milkflint-themes.css). Editing a theme file
+ * restarts the dev server, as the config depends on it.
+ */
+function themeStyles(): Plugin {
+  const id = 'virtual:milkflint-themes.css';
+  const resolved = `\0${id}`;
+  return {
+    name: 'milkflint-themes',
+    resolveId: (source) => (source === id ? resolved : undefined),
+    load: (loaded) => (loaded === resolved ? themeCss(themes) : undefined),
   };
 }
 
@@ -109,7 +126,7 @@ const vm = process.env['MILKFLINT_VM'] ?? 'http://127.0.0.1:8088';
 
 export default defineConfig({
   base: '/milkflint/',
-  plugins: [react(), tailwindcss(), stableEntry(), benchDevEndpoint()],
+  plugins: [themeStyles(), react(), tailwindcss(), stableEntry(), benchDevEndpoint()],
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
@@ -120,6 +137,8 @@ export default defineConfig({
       '/ubus': { target: vm, changeOrigin: true },
       '/cgi-bin': { target: vm, changeOrigin: true },
       '/luci-static': { target: vm, changeOrigin: true },
+      // license texts (/www/licenses), linked from the AdGuard Home and banIP pages
+      '/licenses': { target: vm, changeOrigin: true },
       // the test bench's latency probe: the router's own web server, not this one
       '/milkflint/bench-ping': { target: vm, changeOrigin: true },
     },

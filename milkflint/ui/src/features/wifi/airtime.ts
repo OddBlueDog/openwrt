@@ -130,7 +130,15 @@ const RATE_MAX = 10000;
 /** The service's defaults for a band (airtime-policy.uc's FULL, PACE, WEAK and GOALS) */
 export function airtimeBandDefaults(band: string): AirtimeBands {
   const narrow = band === '2g';
-  return { full: narrow ? '15' : '60', pace: narrow ? '8' : '30', weak: narrow ? '4' : '12', goal_slow: '17', goal_weak: '12', goal_lost: '5', auto: 'manual' };
+  return {
+    full: narrow ? '15' : '60',
+    pace: narrow ? '8' : '30',
+    weak: narrow ? '4' : '12',
+    goal_slow: '17',
+    goal_weak: '12',
+    goal_lost: '5',
+    auto: 'manual',
+  };
 }
 
 /** milkflint.wifi's option for how a band's shares are set */
@@ -178,7 +186,13 @@ export function airtimeBandsErrors(b: AirtimeBands): Partial<Record<AirtimeBandK
     }
   }
   if (auto) {
-    if (errors.weak === undefined && errors.full === undefined && n.weak !== undefined && n.full !== undefined && n.weak > n.full) {
+    if (
+      errors.weak === undefined &&
+      errors.full === undefined &&
+      n.weak !== undefined &&
+      n.full !== undefined &&
+      n.weak > n.full
+    ) {
       errors.weak = 'A very slow link can’t start above a good one.';
     }
     return errors;
@@ -195,7 +209,9 @@ export function airtimeBandsErrors(b: AirtimeBands): Partial<Record<AirtimeBandK
 /** Whether every number shown is the band's default (how the shares are set isn't one: the reset keeps it) */
 export function airtimeBandsAreDefault(band: string, b: AirtimeBands): boolean {
   const defaults = airtimeBandDefaults(band);
-  return AIRTIME_BAND_KEYS.every((k) => (b.auto !== 'manual' && MANUAL_KEYS.includes(k)) || bandNumber(b[k]) === Number(defaults[k]));
+  return AIRTIME_BAND_KEYS.every(
+    (k) => (b.auto !== 'manual' && MANUAL_KEYS.includes(k)) || bandNumber(b[k]) === Number(defaults[k]),
+  );
 }
 
 /** A band's settings at their defaults, keeping how its shares are set and, with auto, what isn't shown */
@@ -266,7 +282,9 @@ export function airtimeClassHint(cls: AirtimeClass, pacing = false): string {
  * back and want the air (`competing`; 0 or unknown counts as one).
  */
 function waitingWords(competing: number | undefined): string {
-  return competing === undefined || competing <= 1 ? 'a device with a better link is waiting' : `${String(competing)} devices with better links are waiting`;
+  return competing === undefined || competing <= 1
+    ? 'a device with a better link is waiting'
+    : `${String(competing)} devices with better links are waiting`;
 }
 
 /**
@@ -463,7 +481,11 @@ export type AirtimeSegment<D extends AirtimeUse> = {
  * shares add up to more than the whole second, the bar is theirs alone, to
  * scale.
  */
-export function airtimeSegments<D extends AirtimeUse>(devices: readonly D[], busy: number | null, rest: number | null = null): AirtimeSegment<D>[] {
+export function airtimeSegments<D extends AirtimeUse>(
+  devices: readonly D[],
+  busy: number | null,
+  rest: number | null = null,
+): AirtimeSegment<D>[] {
   const rank = (d: D): number => AIRTIME_CLASSES.indexOf(d.class);
   const ordered = [...devices].sort((a, b) => (a.class !== b.class ? rank(a) - rank(b) : byName(a, b)));
   const ours = ordered.reduce((n, d) => n + airtimeShare(d), 0);
@@ -476,8 +498,15 @@ export function airtimeSegments<D extends AirtimeUse>(devices: readonly D[], bus
     const share = airtimeShare(device);
     return { kind: 'device', key: airtimeKey(device), label: device.name ?? device.mac, share, width: share * scale, device };
   });
-  if (busy !== null) segments.push({ kind: 'other', key: 'other', label: 'Other networks and noise', share: other, width: other * scale });
-  segments.push({ kind: 'free', key: 'free', label: busy === null ? 'Not used by this band’s devices' : 'Free', share: free, width: free });
+  if (busy !== null)
+    segments.push({ kind: 'other', key: 'other', label: 'Other networks and noise', share: other, width: other * scale });
+  segments.push({
+    kind: 'free',
+    key: 'free',
+    label: busy === null ? 'Not used by this band’s devices' : 'Free',
+    share: free,
+    width: free,
+  });
   return segments;
 }
 
@@ -488,7 +517,11 @@ export function airtimeSegments<D extends AirtimeUse>(devices: readonly D[], bus
  * "Channels 36–64 (primary 36) · 160 MHz". `channels`: lowest first; while
  * they aren't known, just the one it's on. undefined with nothing known.
  */
-export function airtimeChannelsLabel(channel: number | string | null, channels: readonly number[], width: number | null): string | undefined {
+export function airtimeChannelsLabel(
+  channel: number | string | null,
+  channels: readonly number[],
+  width: number | null,
+): string | undefined {
   const first = channels[0];
   const last = channels.at(-1);
   if (first !== undefined && last !== undefined && channels.length > 1) {
@@ -525,7 +558,8 @@ export interface AirtimeColumn<S> {
  */
 export function airtimeColumns<S extends { t: number }>(history: readonly S[], slots: number): AirtimeColumn<S>[] {
   const last = history.at(-1);
-  if (last === undefined || slots <= 0) return Array.from({ length: Math.max(0, slots) }, (_, i) => ({ t: i - slots + 1, second: undefined }));
+  if (last === undefined || slots <= 0)
+    return Array.from({ length: Math.max(0, slots) }, (_, i) => ({ t: i - slots + 1, second: undefined }));
   const end = Math.round(last.t);
   const out: AirtimeColumn<S>[] = Array.from({ length: slots }, (_, i) => ({ t: end - slots + 1 + i, second: undefined }));
   for (const s of history) {
@@ -573,7 +607,11 @@ export interface AirtimeSecondPart {
  * wasn't read in.
  */
 export function airtimeSecondParts(s: AirtimeSecond): AirtimeSecondPart[] {
-  const classes = AIRTIME_CLASSES.map((cls): AirtimeSecondPart => ({ key: cls, label: AIRTIME_CLASS_LABELS[cls], share: Math.max(0, s[cls]) }));
+  const classes = AIRTIME_CLASSES.map((cls): AirtimeSecondPart => ({
+    key: cls,
+    label: AIRTIME_CLASS_LABELS[cls],
+    share: Math.max(0, s[cls]),
+  }));
   const ours = classes.reduce((n, part) => n + (part.share ?? 0), 0);
   const other = s.other === undefined || s.other === null ? null : Math.max(0, Math.min(1, s.other));
   return [

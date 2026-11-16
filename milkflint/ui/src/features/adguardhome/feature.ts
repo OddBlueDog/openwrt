@@ -8,7 +8,10 @@ export const feature = {
   description: 'Ad and tracker blocking for every device, set up in its own web interface.',
   icon: ShieldBanIcon,
   group: 'security',
-  order: 20,
+  order: 40,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.AdGuardHomePage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.AdGuardHomePage,
+  ),
 } satisfies Feature;

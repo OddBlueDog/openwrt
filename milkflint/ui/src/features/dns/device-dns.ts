@@ -30,7 +30,10 @@ const isIpv6 = (v: string): boolean => /^[0-9a-f:.]+$/i.test(v) && v.includes(':
 
 /** The DHCP section that serves the home network (interface lan). */
 export function homeDhcp(dhcp: readonly Section[]): Section | undefined {
-  return dhcp.find((s) => s['.type'] === 'dhcp' && str(s, 'interface') === 'lan') ?? dhcp.find((s) => s['.name'] === 'lan' && s['.type'] === 'dhcp');
+  return (
+    dhcp.find((s) => s['.type'] === 'dhcp' && str(s, 'interface') === 'lan') ??
+    dhcp.find((s) => s['.name'] === 'lan' && s['.type'] === 'dhcp')
+  );
 }
 
 export function readDeviceDns(lan: Section | undefined): DeviceDns {

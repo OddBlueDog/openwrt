@@ -50,7 +50,11 @@ export function fixture(o: FixtureOptions = {}): RunData {
   for (let t = T0 + 10_000; t < T0 + 20_000; t += 100) mac.push(['tp', 'd', t, 125_000]);
   if (o.hidden === true) mac.push(['hidden', T0 + 15_000], ['visible', T0 + 16_000]);
   if (o.publicAddresses === true) mac.push(['err', T0 + 11_000, 'connection to 203.0.113.7 failed (via 192.168.1.1)']);
-  pc.push(['cold', 'google.com', T0 + 22_000, 31, 'failed'], ['page', 'google.com', T0 + 22_100, 120, 'first'], ['page', 'google.com', T0 + 22_300, 40, 'repeat']);
+  pc.push(
+    ['cold', 'google.com', T0 + 22_000, 31, 'failed'],
+    ['page', 'google.com', T0 + 22_100, 120, 'first'],
+    ['page', 'google.com', T0 + 22_300, 40, 'repeat'],
+  );
 
   // the router's pings: the Mac's (one lost of 100), the PC's (never answered), its gateway's
   const probes: string[] = [];
@@ -98,7 +102,16 @@ export function fixture(o: FixtureOptions = {}): RunData {
         o.sqm === false
           ? {}
           : {
-              'ifb4eth1 1:': [down, s * 900, 0, loaded(t) ? 30_000 : 0, [[tin, 0, marks, 0, 5000, 8000, 4000, 1, 2], [500, 0, 0, 0, 5000, 20_000, 15_000, 0, 0]]],
+              'ifb4eth1 1:': [
+                down,
+                s * 900,
+                0,
+                loaded(t) ? 30_000 : 0,
+                [
+                  [tin, 0, marks, 0, 5000, 8000, 4000, 1, 2],
+                  [500, 0, 0, 0, 5000, 20_000, 15_000, 0, 0],
+                ],
+              ],
               'eth1 1:': [s * 2000, s * 400, 0, 0, [[s * 2000, 0, 0, 0, 5000, 1000, 500, 1, 0]]],
             },
       ct: 40 + s,
@@ -110,7 +123,19 @@ export function fixture(o: FixtureOptions = {}): RunData {
     if (s % 2 === 0) {
       txp += 1000;
       retries += 50;
-      line['wifi'] = { sta: { m1: { dev: 'phy1-ap0', signal: -70, tx_mbit: 800, rx_mbit: 600, c: [txp, retries, 0, 500, 0, 0, null, null], aql: 2000 } }, ap: {} };
+      line['wifi'] = {
+        sta: {
+          m1: {
+            dev: 'phy1-ap0',
+            signal: -70,
+            tx_mbit: 800,
+            rx_mbit: 600,
+            c: [txp, retries, 0, 500, 0, 0, null, null],
+            aql: 2000,
+          },
+        },
+        ap: {},
+      };
     }
     if (s % 10 === 5) line['ct_scan'] = { n: 50, off: 9, m: { m1: [12, 9, 10, 2, 10] }, ms: 3 };
     router.push(JSON.stringify(line));
@@ -134,7 +159,13 @@ export function fixture(o: FixtureOptions = {}): RunData {
     created_wall: 1_700_000_000,
     t0: T0,
     end,
-    schedule: { name: 'Test', dry: o.dry === true, phases, length: 26_000, options: { endpoint: 'dev', latency: 'uk', budget_mb: 100, custom_sites: [] } },
+    schedule: {
+      name: 'Test',
+      dry: o.dry === true,
+      phases,
+      length: 26_000,
+      options: { endpoint: 'dev', latency: 'uk', budget_mb: 100, custom_sites: [] },
+    },
     members: [
       {
         id: 'm1',
@@ -144,7 +175,14 @@ export function fixture(o: FixtureOptions = {}): RunData {
         platform: 'macOS',
         link: { kind: 'wifi', band: '5', signal: -70 },
       },
-      { id: 'm2', name: 'PC', ip: o.publicAddresses === true ? '2a00:1450:4009:81f::200e' : '192.168.1.20', ua: 'Windows', platform: 'Windows', link: { kind: 'wired', port: 'lan2' } },
+      {
+        id: 'm2',
+        name: 'PC',
+        ip: o.publicAddresses === true ? '2a00:1450:4009:81f::200e' : '192.168.1.20',
+        ua: 'Windows',
+        platform: 'Windows',
+        link: { kind: 'wired', port: 'lan2' },
+      },
     ],
     coordinator: 'Mac',
     settings: {

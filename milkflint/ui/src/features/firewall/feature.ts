@@ -10,5 +10,8 @@ export const feature = {
   group: 'security',
   order: 10,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.FirewallPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.FirewallPage,
+  ),
 } satisfies Feature;

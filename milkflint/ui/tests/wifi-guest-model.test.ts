@@ -4,12 +4,34 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { cakeEffect } from '../src/features/sqm/advanced.ts';
-import { ADDRESSES, bandCreds, blankNet, freeAddress, type GuestData, newForm, type NetData, type NetForm, overlaps, removal, toChanges, validate } from '../src/features/wifi-guest/model.ts';
+import {
+  ADDRESSES,
+  apSections,
+  bandCreds,
+  blankNet,
+  freeAddress,
+  type GuestData,
+  joinCodes,
+  moreSummary,
+  networkSummary,
+  newForm,
+  type NetData,
+  type NetForm,
+  overlaps,
+  removal,
+  saveWarnings,
+  toChanges,
+  validate,
+} from '../src/features/wifi-guest/model.ts';
 import { ipToInt } from '../src/lib/api/network.ts';
 import type { Change, Section } from '../src/lib/api/uci.ts';
 import { applied, nameOf, section } from './uci-fixture.ts';
 
-const range = (ip: string, prefix: number, name = 'Other'): { ip: number; prefix: number; name: string } => ({ ip: ipToInt(ip) ?? 0, prefix, name });
+const range = (ip: string, prefix: number, name = 'Other'): { ip: number; prefix: number; name: string } => ({
+  ip: ipToInt(ip) ?? 0,
+  prefix,
+  name,
+});
 
 const data = (over: Partial<GuestData> = {}): GuestData => ({
   radios: [
@@ -33,7 +55,8 @@ const form = (over: Partial<NetForm> = {}): NetForm => ({
   ...over,
 });
 
-const added = (changes: readonly Change[], config: string): string[] => changes.flatMap((c) => (c.op === 'add' && c.config === config ? [c.name ?? ''] : []));
+const added = (changes: readonly Change[], config: string): string[] =>
+  changes.flatMap((c) => (c.op === 'add' && c.config === config ? [c.name ?? ''] : []));
 function add(changes: readonly Change[], name: string): Record<string, string | string[]> {
   const c = changes.find((x) => x.op === 'add' && x.name === name);
   assert.ok(c?.op === 'add', `${name} is added: ${changes.map(nameOf).join(' ')}`);
@@ -43,7 +66,8 @@ function add(changes: readonly Change[], name: string): Record<string, string | 
 /** A network as it is on the router after the page set it up. */
 function existing(f: NetForm, d: GuestData = data()): NetData {
   const present = applied({}, toChanges(f, blankNet(f, d), d));
-  const by = (config: string, name: string): ReturnType<typeof section> | undefined => present[config]?.find((s) => s['.name'] === name);
+  const by = (config: string, name: string): ReturnType<typeof section> | undefined =>
+    present[config]?.find((s) => s['.name'] === name);
   const firewall = present['firewall'] ?? [];
   return {
     ...blankNet(f, d),
@@ -75,7 +99,11 @@ test('a new network takes the first address that’s free', () => {
   assert.equal(freeAddress(data({ taken: [range('192.168.9.77', 24), range('192.168.10.2', 24)] }), []), '192.168.20.1');
   // a wide LAN or WAN takes the whole of 192.168.x
   assert.equal(freeAddress(data({ lan: range('192.168.0.1', 16) }), []), '10.99.0.1');
-  assert.equal(freeAddress(data({ taken: [range('10.0.0.1', 8)], lan: range('192.168.0.1', 16) }), []), ADDRESSES[0], 'none free: the first, which validate refuses');
+  assert.equal(
+    freeAddress(data({ taken: [range('10.0.0.1', 8)], lan: range('192.168.0.1', 16) }), []),
+    ADDRESSES[0],
+    'none free: the first, which validate refuses',
+  );
   const first = form({ ipaddr: '192.168.9.1' });
   const second = form({ id: 'guest2', ipaddr: '192.168.10.1' });
   assert.equal(freeAddress(data(), [first]), '192.168.10.1');
@@ -102,10 +130,30 @@ test('smart home devices: WPA2, may talk to each other, 2.4 GHz only', () => {
   assert.deepEqual(f.bands, { radio0: true, radio1: false });
   assert.equal(f.shared.ssid, 'Home-IoT');
   // no 2.4 GHz radio on: what is on
-  const only5 = newForm('guest2', 'devices', data({ radios: [{ name: 'radio0', band: '2g', on: false }, { name: 'radio1', band: '5g', on: true }] }), []);
+  const only5 = newForm(
+    'guest2',
+    'devices',
+    data({
+      radios: [
+        { name: 'radio0', band: '2g', on: false },
+        { name: 'radio1', band: '5g', on: true },
+      ],
+    }),
+    [],
+  );
   assert.deepEqual(only5.bands, { radio0: false, radio1: true });
   // none on: every radio, so the network is ready for when one comes on
-  const none = newForm('guest', 'visitors', data({ radios: [{ name: 'radio0', band: '2g', on: false }, { name: 'radio1', band: '5g', on: false }] }), []);
+  const none = newForm(
+    'guest',
+    'visitors',
+    data({
+      radios: [
+        { name: 'radio0', band: '2g', on: false },
+        { name: 'radio1', band: '5g', on: false },
+      ],
+    }),
+    [],
+  );
   assert.deepEqual(none.bands, { radio0: true, radio1: true });
 });
 
@@ -113,9 +161,18 @@ test('a second and third network get labels and names of their own, within 32 by
   const a = newForm('guest', 'visitors', data(), []);
   const b = newForm('guest2', 'visitors', data(), [a]);
   const c = newForm('guest3', 'visitors', data(), [a, b]);
-  assert.deepEqual([a, b, c].map((f) => f.label), ['Guests', 'Guests 2', 'Guests 3']);
-  assert.deepEqual([a, b, c].map((f) => f.shared.ssid), ['Home-Guest', 'Home-Guest2', 'Home-Guest3']);
-  assert.deepEqual([a, b, c].map((f) => f.ipaddr), ['192.168.9.1', '192.168.10.1', '192.168.20.1']);
+  assert.deepEqual(
+    [a, b, c].map((f) => f.label),
+    ['Guests', 'Guests 2', 'Guests 3'],
+  );
+  assert.deepEqual(
+    [a, b, c].map((f) => f.shared.ssid),
+    ['Home-Guest', 'Home-Guest2', 'Home-Guest3'],
+  );
+  assert.deepEqual(
+    [a, b, c].map((f) => f.ipaddr),
+    ['192.168.9.1', '192.168.10.1', '192.168.20.1'],
+  );
   // a main name it wouldn't fit after
   assert.equal(newForm('guest', 'visitors', data({ mainSsid: 'x'.repeat(26) }), []).shared.ssid, 'Guest');
   assert.equal(newForm('guest', 'visitors', data({ mainSsid: undefined }), []).shared.ssid, 'Guest');
@@ -125,13 +182,16 @@ test('what a new network is made of', () => {
   const f = form();
   const changes = toChanges(f, blankNet(f, data()), data());
   assert.deepEqual(add(changes, 'guest_dev'), { name: 'br-guest', type: 'bridge', bridge_empty: '1' });
-    assert.deepEqual(changes.find((c) => c.op === 'add' && c.config === 'network' && c.name === 'guest'), {
-    op: 'add',
-    config: 'network',
-    type: 'interface',
-    name: 'guest',
-    values: { proto: 'static', device: 'br-guest', ipaddr: ['192.168.9.1/24'] },
-  });
+  assert.deepEqual(
+    changes.find((c) => c.op === 'add' && c.config === 'network' && c.name === 'guest'),
+    {
+      op: 'add',
+      config: 'network',
+      type: 'interface',
+      name: 'guest',
+      values: { proto: 'static', device: 'br-guest', ipaddr: ['192.168.9.1/24'] },
+    },
+  );
   assert.deepEqual(added(changes, 'firewall'), ['guest', 'guest_wan', 'guest_dns', 'guest_dhcp']);
   const zone = changes.find((c) => c.op === 'add' && c.config === 'firewall' && c.name === 'guest');
   assert.ok(zone?.op === 'add');
@@ -178,9 +238,15 @@ test('saving a network that’s there again leaves its setup alone', () => {
   const f = form();
   const net = existing(f);
   const changes = toChanges(f, net, data());
-  assert.deepEqual(changes.filter((c) => c.op === 'add'), []);
+  assert.deepEqual(
+    changes.filter((c) => c.op === 'add'),
+    [],
+  );
   // the access points are set to what's asked, nothing else
-  assert.deepEqual(changes.map((c) => (c.op === 'set' ? c.config : c.op)), ['wireless', 'wireless']);
+  assert.deepEqual(
+    changes.map((c) => (c.op === 'set' ? c.config : c.op)),
+    ['wireless', 'wireless'],
+  );
 });
 
 test('rules made elsewhere count, unless they’re off or not accepting', () => {
@@ -213,14 +279,26 @@ test('a band turned off keeps its access point, off; on again it’s set back', 
   const f = form();
   const net = existing(f);
   const changes = toChanges(form({ bands: { radio0: true, radio1: false } }), net, data());
-  assert.deepEqual(changes.find((c) => nameOf(c) === 'guest_radio1'), { op: 'set', config: 'wireless', section: 'guest_radio1', values: { disabled: '1' } });
-  assert.equal(changes.find((c): c is Extract<Change, { op: 'set' }> => nameOf(c) === 'guest_radio0' && c.op === 'set')?.values['disabled'], '0');
+  assert.deepEqual(
+    changes.find((c) => nameOf(c) === 'guest_radio1'),
+    { op: 'set', config: 'wireless', section: 'guest_radio1', values: { disabled: '1' } },
+  );
+  assert.equal(
+    changes.find((c): c is Extract<Change, { op: 'set' }> => nameOf(c) === 'guest_radio0' && c.op === 'set')?.values['disabled'],
+    '0',
+  );
 });
 
 test('each band its own name and password', () => {
-  const own = { radio0: { ssid: 'G24', encryption: 'psk2', cipher: '', key: 'password-two-four' }, radio1: { ssid: 'G5', encryption: 'sae', cipher: 'gcmp', key: 'password-five' } };
+  const own = {
+    radio0: { ssid: 'G24', encryption: 'psk2', cipher: '', key: 'password-two-four' },
+    radio1: { ssid: 'G5', encryption: 'sae', cipher: 'gcmp', key: 'password-five' },
+  };
   const f = form({ same: false, own });
-  assert.deepEqual(bandCreds(f, data().radios).map((b) => b.creds.ssid), ['G24', 'G5']);
+  assert.deepEqual(
+    bandCreds(f, data().radios).map((b) => b.creds.ssid),
+    ['G24', 'G5'],
+  );
   const changes = toChanges(f, blankNet(f, data()), data());
   assert.equal(add(changes, 'guest_radio0')['ssid'], 'G24');
   assert.equal(add(changes, 'guest_radio1')['ssid'], 'G5');
@@ -245,7 +323,10 @@ test('a new address: the interface moves to it, with any old netmask gone', () =
     { op: 'set', config: 'network', section: 'guest', values: { ipaddr: ['192.168.50.1/24'] } },
     { op: 'unset', config: 'network', section: 'guest', options: ['netmask'] },
   ]);
-  assert.ok(!toChanges(moved, { ...net, addressFixed: true }, data()).some((c) => c.config === 'network'), 'set in LuCI: left as it is');
+  assert.ok(
+    !toChanges(moved, { ...net, addressFixed: true }, data()).some((c) => c.config === 'network'),
+    'set in LuCI: left as it is',
+  );
 });
 
 test('the speed limit: its own queue, each way as its devices see it', () => {
@@ -268,7 +349,8 @@ test('the speed limit is fair per guest: CAKE’s NAT lookup, which sqm gives it
   const queue = toChanges(f, blankNet(f, data()), data()).find((c) => c.op === 'add' && c.config === 'sqm');
   assert.ok(queue?.op === 'add');
   // as sqm-scripts gives CAKE each direction: its own words first, the queue's after; CAKE takes the last of each kind
-  const effect = (key: string): ReturnType<typeof cakeEffect> => cakeEffect(['diffserv3', 'nat', 'besteffort', ...String(queue.values[key]).split(' ')]);
+  const effect = (key: string): ReturnType<typeof cakeEffect> =>
+    cakeEffect(['diffserv3', 'nat', 'besteffort', ...String(queue.values[key]).split(' ')]);
   assert.equal(effect('iqdisc_opts').nat, 'nonat');
   assert.equal(effect('eqdisc_opts').nat, 'nonat');
   assert.equal(effect('iqdisc_opts').isolation, 'dual-srchost');
@@ -283,7 +365,9 @@ test('a speed limit set up before keeps its own options: only its speeds and swi
   Object.assign(shaper, { iqdisc_opts: 'dual-srchost', eqdisc_opts: 'dual-dsthost conservative' });
   const luci = { ...net, shaper };
   const changes = toChanges(form({ downMbit: '80', upMbit: '10' }), luci, data()).filter((c) => c.config === 'sqm');
-  assert.deepEqual(changes, [{ op: 'set', config: 'sqm', section: 'guest', values: { enabled: '1', upload: '80000', download: '10000' } }]);
+  assert.deepEqual(changes, [
+    { op: 'set', config: 'sqm', section: 'guest', values: { enabled: '1', upload: '80000', download: '10000' } },
+  ]);
 });
 
 test('one way only: the other is left alone', () => {
@@ -297,7 +381,9 @@ test('the speed limit’s life: changed, cleared, back, and not at all without S
   const limited = form({ downMbit: '50', upMbit: '10' });
   const net = existing(limited);
   const sqm = (f: NetForm, n: NetData = net): Change[] => toChanges(f, n, data()).filter((c) => c.config === 'sqm');
-  assert.deepEqual(sqm(form({ downMbit: '80', upMbit: '10' })), [{ op: 'set', config: 'sqm', section: 'guest', values: { enabled: '1', upload: '80000', download: '10000' } }]);
+  assert.deepEqual(sqm(form({ downMbit: '80', upMbit: '10' })), [
+    { op: 'set', config: 'sqm', section: 'guest', values: { enabled: '1', upload: '80000', download: '10000' } },
+  ]);
   assert.deepEqual(sqm(form()), [{ op: 'set', config: 'sqm', section: 'guest', values: { enabled: '0' } }]);
   // already off: nothing to write
   assert.ok(net.shaper !== null && net.shaper !== undefined);
@@ -317,7 +403,9 @@ test('the DNS page’s intercept comes along while it’s on, once', () => {
   const net = existing(f, d);
   assert.deepEqual(added(toChanges(f, net, d), 'firewall'), []);
   const noIntercept = form();
-  assert.ok(!added(toChanges(noIntercept, blankNet(noIntercept, data()), data()), 'firewall').some((n) => n.includes('intercept')));
+  assert.ok(
+    !added(toChanges(noIntercept, blankNet(noIntercept, data()), data()), 'firewall').some((n) => n.includes('intercept')),
+  );
 });
 
 test('its label: written only when it isn’t the default', () => {
@@ -327,11 +415,19 @@ test('its label: written only when it isn’t the default', () => {
   };
   assert.deepEqual(made('Guests'), []);
   assert.deepEqual(made('Guest network 2', 'guest2'), []);
-  assert.deepEqual(made('Friends'), [{ op: 'add', config: 'milkflint', type: 'guest_network', name: 'guest', values: { label: 'Friends' } }]);
+  assert.deepEqual(made('Friends'), [
+    { op: 'add', config: 'milkflint', type: 'guest_network', name: 'guest', values: { label: 'Friends' } },
+  ]);
   const f = form({ label: 'Friends' });
   const net = existing(f);
-  assert.deepEqual(toChanges(form({ label: 'Family' }), net, data()).filter((c) => c.config === 'milkflint'), [{ op: 'set', config: 'milkflint', section: 'guest', values: { label: 'Family' } }]);
-  assert.deepEqual(toChanges(form({ label: ' ' }), net, data()).filter((c) => c.config === 'milkflint'), [{ op: 'unset', config: 'milkflint', section: 'guest', options: ['label'] }]);
+  assert.deepEqual(
+    toChanges(form({ label: 'Family' }), net, data()).filter((c) => c.config === 'milkflint'),
+    [{ op: 'set', config: 'milkflint', section: 'guest', values: { label: 'Family' } }],
+  );
+  assert.deepEqual(
+    toChanges(form({ label: ' ' }), net, data()).filter((c) => c.config === 'milkflint'),
+    [{ op: 'unset', config: 'milkflint', section: 'guest', options: ['label'] }],
+  );
 });
 
 test('Remove takes everything a network is made of, and nothing else', () => {
@@ -342,14 +438,21 @@ test('Remove takes everything a network is made of, and nothing else', () => {
   const present = applied({}, toChanges(f, blankNet(f, d), d));
   for (const sections of Object.values(present)) sections.push(other('kept'));
   const left = applied(present, removal(net));
-  for (const [config, sections] of Object.entries(left)) assert.deepEqual(sections.map((s) => s['.name']), ['kept'], config);
+  for (const [config, sections] of Object.entries(left))
+    assert.deepEqual(
+      sections.map((s) => s['.name']),
+      ['kept'],
+      config,
+    );
 });
 
-const errors = (f: NetForm, others: NetForm[] = [], d: GuestData = data()): Record<string, string | undefined> => validate(f, blankNet(f, d), d, others);
+const errors = (f: NetForm, others: NetForm[] = [], d: GuestData = data()): Record<string, string | undefined> =>
+  validate(f, blankNet(f, d), d, others);
 
 test('its address: private, a host, and on no other network', () => {
   assert.deepEqual(errors(form()), {});
-  const ip = (ipaddr: string, others: NetForm[] = [], d: GuestData = data()): string | undefined => errors(form({ ipaddr }), others, d)['guest-ip'];
+  const ip = (ipaddr: string, others: NetForm[] = [], d: GuestData = data()): string | undefined =>
+    errors(form({ ipaddr }), others, d)['guest-ip'];
   for (const a of ['192.168.50.1', '10.1.2.3', '172.16.0.1', '172.31.0.1']) assert.equal(ip(a), undefined, a);
   for (const a of ['8.8.8.8', '172.32.0.1', '192.167.0.1', 'x', '']) assert.notEqual(ip(a), undefined, a);
   for (const a of ['192.168.50.0', '192.168.50.255']) assert.match(ip(a) ?? '', /1 to 254/, a);
@@ -364,18 +467,120 @@ test('its address: private, a host, and on no other network', () => {
 
 test('its names, passwords, bands and speed', () => {
   assert.notEqual(errors(form({ shared: { ssid: '', encryption: 'none', cipher: '', key: '' } }))['guest-ssid'], undefined);
-  assert.notEqual(errors(form({ shared: { ssid: 'é'.repeat(17), encryption: 'none', cipher: '', key: '' } }))['guest-ssid'], undefined, '34 bytes');
-  assert.equal(errors(form({ shared: { ssid: 'é'.repeat(16), encryption: 'none', cipher: '', key: '' } }))['guest-ssid'], undefined, '32 bytes');
+  assert.notEqual(
+    errors(form({ shared: { ssid: 'é'.repeat(17), encryption: 'none', cipher: '', key: '' } }))['guest-ssid'],
+    undefined,
+    '34 bytes',
+  );
+  assert.equal(
+    errors(form({ shared: { ssid: 'é'.repeat(16), encryption: 'none', cipher: '', key: '' } }))['guest-ssid'],
+    undefined,
+    '32 bytes',
+  );
   assert.notEqual(errors(form({ shared: { ssid: 'x', encryption: 'psk2', cipher: '', key: 'short' } }))['guest-key'], undefined);
   assert.notEqual(errors(form({ label: 'x'.repeat(33) }))['guest-label'], undefined);
   assert.notEqual(errors(form({ bands: { radio0: false, radio1: false } }))['guest-bands'], undefined);
   assert.equal(errors(form({ enabled: false, bands: { radio0: false, radio1: false } }))['guest-bands'], undefined);
-  for (const downMbit of ['0.4', '10001', '1.55', 'x']) assert.notEqual(errors(form({ downMbit }))['guest-speed'], undefined, downMbit);
+  for (const downMbit of ['0.4', '10001', '1.55', 'x'])
+    assert.notEqual(errors(form({ downMbit }))['guest-speed'], undefined, downMbit);
   for (const upMbit of ['', '0.5', '10000', '1.5']) assert.equal(errors(form({ upMbit }))['guest-speed'], undefined, upMbit);
   // own names: only the bands that are on are checked
-  const own = { radio0: { ssid: 'G', encryption: 'psk2', cipher: '', key: 'long-enough-key' }, radio1: { ssid: '', encryption: 'psk2', cipher: '', key: 'x' } };
+  const own = {
+    radio0: { ssid: 'G', encryption: 'psk2', cipher: '', key: 'long-enough-key' },
+    radio1: { ssid: '', encryption: 'psk2', cipher: '', key: 'x' },
+  };
   assert.deepEqual(errors(form({ same: false, own, bands: { radio0: true, radio1: false } })), {});
   const e = errors(form({ same: false, own }));
   assert.notEqual(e['guest-radio1-ssid'], undefined);
   assert.notEqual(e['guest-radio1-key'], undefined);
+});
+
+test('the lease time: a new pool starts with the kind’s, a changed one is set, an unchanged one left alone', () => {
+  const f = form();
+  const pool = toChanges(f, blankNet(f, data()), data()).find((c) => c.op === 'add' && c.config === 'dhcp');
+  assert.equal(pool?.op === 'add' ? pool.values['leasetime'] : undefined, '1h');
+  const net = existing(f);
+  assert.deepEqual(
+    toChanges(form({ leasetime: '12h' }), net, data()).filter((c) => c.config === 'dhcp'),
+    [{ op: 'set', config: 'dhcp', section: 'guest', values: { leasetime: '12h' } }],
+  );
+  assert.deepEqual(
+    toChanges(f, net, data()).filter((c) => c.config === 'dhcp'),
+    [],
+  );
+});
+
+test('what the overview says: the name on its bands, each band’s own, or off', () => {
+  const radios = data().radios;
+  assert.equal(networkSummary(form(), radios), 'Visitors on 2.4 GHz and 5 GHz');
+  assert.equal(networkSummary(form({ enabled: false }), radios), 'Off');
+  assert.equal(networkSummary(form({ bands: { radio0: false, radio1: false } }), radios), 'On no band');
+  const own = {
+    radio0: { ssid: 'G24', encryption: 'psk2', cipher: '', key: 'password-two-four' },
+    radio1: { ssid: 'G5', encryption: 'sae', cipher: '', key: 'password-five' },
+  };
+  assert.equal(networkSummary(form({ same: false, own }), radios), 'G24 on 2.4 GHz, G5 on 5 GHz');
+});
+
+test('the QR codes to join: one when the bands are the same, one per band when not, none off or with a username', () => {
+  const radios = data().radios;
+  assert.deepEqual(
+    joinCodes(form(), radios).map((c) => [c.ssid, c.band, c.encryption]),
+    [['Visitors', undefined, 'sae-mixed']],
+  );
+  const own = {
+    radio0: { ssid: 'G24', encryption: 'psk2', cipher: '', key: 'password-two-four' },
+    radio1: { ssid: 'G5', encryption: 'owe', cipher: '', key: '' },
+  };
+  assert.deepEqual(
+    joinCodes(form({ same: false, own }), radios).map((c) => [c.ssid, c.band, c.encryption]),
+    [
+      ['G24', '2.4 GHz', 'psk2'],
+      ['G5', '5 GHz', 'none'],
+    ],
+  );
+  assert.deepEqual(joinCodes(form({ enabled: false }), radios), []);
+  assert.deepEqual(joinCodes(form({ shared: { ssid: 'Work', encryption: 'wpa2', cipher: '', key: '' } }), radios), []);
+});
+
+test('More settings in a line: what’s set there, so nothing hides behind the fold', () => {
+  const radios = data().radios;
+  assert.equal(moreSummary(form(), radios), 'Devices kept apart · 192.168.9.1');
+  assert.equal(
+    moreSummary(form({ isolate: false, same: false, downMbit: '50', upMbit: '' }), radios),
+    'Each band its own name · Devices can reach each other · Limited to 50 down Mbit/s · 192.168.9.1',
+  );
+});
+
+test('the UCI sections a setting writes: the access points it has, or will have, on its bands', () => {
+  const f = form({ bands: { radio0: true, radio1: false } });
+  assert.deepEqual(apSections(f, blankNet(f, data()), data().radios), ['guest_radio0']);
+  const net = existing(form());
+  net.aps['radio0'] = { ...net.aps['radio0'], '.name': 'cfg0a1b2c', '.type': 'wifi-iface' } as Section;
+  assert.deepEqual(apSections(form(), net, data().radios), ['cfg0a1b2c', 'guest_radio1']);
+});
+
+test('what saving does to devices on networks on air now', () => {
+  const radios = data().radios;
+  const on = form();
+  const second = form({ id: 'guest2', label: 'Smart home', ipaddr: '192.168.10.1' });
+  // a new network and an unchanged one: nothing
+  assert.deepEqual(saveWarnings([on, second], [on], radios), []);
+  assert.deepEqual(saveWarnings([form({ enabled: false })], [on], radios), ['Guests goes off the air: its devices lose it.']);
+  assert.deepEqual(saveWarnings([form({ shared: { ...on.shared, key: 'another-long-key' } })], [on], radios), [
+    'Devices on Guests have to join again with its new password.',
+  ]);
+  assert.deepEqual(saveWarnings([form({ shared: { ...on.shared, ssid: 'New name', key: 'another-long-key' } })], [on], radios), [
+    'Devices on Guests have to join again with its new name and password.',
+  ]);
+  assert.deepEqual(saveWarnings([form({ isolate: false })], [on], radios), [
+    'Guests’s Wi-Fi restarts where it changes: its devices reconnect within a few seconds.',
+  ]);
+  assert.deepEqual(saveWarnings([form({ bands: { radio0: true, radio1: false } })], [on], radios), [
+    'Guests’s Wi-Fi restarts where it changes: its devices reconnect within a few seconds.',
+  ]);
+  // a speed limit or a label: its devices stay
+  assert.deepEqual(saveWarnings([form({ downMbit: '20', label: 'Visitors' })], [on], radios), []);
+  // one that was off has nobody to drop
+  assert.deepEqual(saveWarnings([on], [form({ enabled: false })], radios), []);
 });

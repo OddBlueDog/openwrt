@@ -40,7 +40,12 @@ export function cfL4(description: string): { rtt: number; minRtt: number; retran
     return Number.isFinite(v) ? v : 0;
   };
   // its RTTs are µs
-  return { rtt: rtt / 1000, minRtt: Number.isFinite(minRtt) ? minRtt / 1000 : rtt / 1000, retrans: count('retrans'), lost: count('lost') };
+  return {
+    rtt: rtt / 1000,
+    minRtt: Number.isFinite(minRtt) ? minRtt / 1000 : rtt / 1000,
+    retrans: count('retrans'),
+    lost: count('lost'),
+  };
 }
 
 /** Whether `signal` has aborted (a function, so a check after an await reads it again). */
@@ -118,7 +123,13 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
 let streams = 0;
 
 /** One download stream: chunk after chunk until `signal` aborts. */
-export async function download(endpoint: Endpoint, meter: Meter, clock: Clock, signal: AbortSignal, record: (r: RunRecord) => void): Promise<void> {
+export async function download(
+  endpoint: Endpoint,
+  meter: Meter,
+  clock: Clock,
+  signal: AbortSignal,
+  record: (r: RunRecord) => void,
+): Promise<void> {
   while (!signal.aborted) {
     const url = downloadUrl(endpoint, streams++);
     try {
@@ -182,7 +193,13 @@ function uploadOnce(url: string, meter: Meter, signal: AbortSignal): Promise<num
 }
 
 /** One upload stream: chunk after chunk until `signal` aborts. */
-export async function upload(endpoint: Endpoint, meter: Meter, clock: Clock, signal: AbortSignal, record: (r: RunRecord) => void): Promise<void> {
+export async function upload(
+  endpoint: Endpoint,
+  meter: Meter,
+  clock: Clock,
+  signal: AbortSignal,
+  record: (r: RunRecord) => void,
+): Promise<void> {
   while (!signal.aborted) {
     const url = uploadUrl(endpoint, streams++);
     try {

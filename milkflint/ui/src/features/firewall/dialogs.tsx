@@ -1,36 +1,111 @@
 import type { ReactElement } from 'react';
 import type { Change } from '@/lib/api/uci';
+import { ForwardSheet } from '../port-forwards/forward-sheet';
 import type { FirewallData } from './api';
-import { BlockDialog } from './blocks';
-import { ForwardDialog } from './forwards';
-import { NatDialog } from './nat';
+import { BlockSheet } from './blocks';
+import type { Actions } from './forms';
+import { managedBy } from './model';
+import { NatSheet } from './nat';
 import { ConfirmDialog } from './parts';
 import { RuleSheet } from './rule-sheet';
 import type { OpenDialog } from './use-actions';
 
-/** Whichever of the Firewall page's dialogs is open. */
+const deleteChange = (section: string): Change[] => [{ op: 'delete', config: 'firewall', section }];
+
+/** Whichever of the Firewall and Port forwards pages' editors (side sheets) or confirmations is open. */
 export function FirewallDialogs({
   dialog,
   data,
   onClose,
   onSave,
+  confirm,
 }: {
   dialog: OpenDialog | undefined;
   data: FirewallData;
   onClose: () => void;
   onSave: (changes: Change[]) => void;
+  /** ask before a delete (it replaces the open sheet) */
+  confirm: Actions['confirm'];
 }): ReactElement | null {
   switch (dialog?.kind) {
     case undefined:
       return null;
-    case 'forward':
-      return <ForwardDialog forward={dialog.forward} data={data} onClose={onClose} onSave={onSave} />;
-    case 'rule':
-      return <RuleSheet rule={dialog.rule} preset={dialog.preset} data={data} onClose={onClose} onSave={onSave} />;
+    case 'forward': {
+      const r = dialog.forward;
+      return (
+        <ForwardSheet
+          forward={r}
+          data={data}
+          onClose={onClose}
+          onSave={onSave}
+          onDelete={
+            r === undefined
+              ? undefined
+              : () => {
+                  confirm({
+                    title: `Delete ${r.name ?? r.label}?`,
+                    body: 'The port closes and the forward is gone; turning it off keeps it for later.',
+                    action: 'Delete',
+                    changes: deleteChange(r.section),
+                  });
+                }
+          }
+        />
+      );
+    }
+    case 'rule': {
+      const r = dialog.rule;
+      return (
+        <RuleSheet
+          rule={r}
+          preset={dialog.preset}
+          data={data}
+          onClose={onClose}
+          onSave={onSave}
+          onDelete={
+            r === undefined
+              ? undefined
+              : () => {
+                  const managed = managedBy[r.section];
+                  confirm({
+                    title: `Delete ${r.name ?? r.label}?`,
+                    body:
+                      managed === undefined
+                        ? 'The rule is gone for good; turning it off keeps it for later.'
+                        : `The ${managed.title} page made it, and adds it back when you next save there. Turning it off keeps it for later.`,
+                    action: 'Delete',
+                    changes: deleteChange(r.section),
+                  });
+                }
+          }
+        />
+      );
+    }
     case 'block':
-      return <BlockDialog rule={dialog.rule} data={data} onClose={onClose} onSave={onSave} />;
-    case 'nat':
-      return <NatDialog nat={dialog.nat} data={data} onClose={onClose} onSave={onSave} />;
+      return <BlockSheet rule={dialog.rule} data={data} onClose={onClose} onSave={onSave} />;
+    case 'nat': {
+      const r = dialog.nat;
+      return (
+        <NatSheet
+          nat={r}
+          data={data}
+          onClose={onClose}
+          onSave={onSave}
+          onDelete={
+            r === undefined
+              ? undefined
+              : () => {
+                  confirm({
+                    title: `Delete ${r.name ?? r.label}?`,
+                    body: 'The NAT rule is gone for good; turning it off keeps it for later.',
+                    action: 'Delete',
+                    changes: deleteChange(r.section),
+                  });
+                }
+          }
+        />
+      );
+    }
     case 'confirm':
       return (
         <ConfirmDialog

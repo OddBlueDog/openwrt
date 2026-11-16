@@ -40,7 +40,14 @@ test('nothing set is the image’s defaults, and writes nothing', () => {
 
 test('each setting read back as set', () => {
   const k = readKnobs(
-    getter({ 'steering.wifi_all': '0', 'steering.rings_rt': '0', 'steering.rx_delay': '80', 'cake.ecn_drop': '0', 'cake.l4s': '0', 'wifi.retries': '7' }),
+    getter({
+      'steering.wifi_all': '0',
+      'steering.rings_rt': '0',
+      'steering.rx_delay': '80',
+      'cake.ecn_drop': '0',
+      'cake.l4s': '0',
+      'wifi.retries': '7',
+    }),
   );
   assert.deepEqual(k, { wifiAll: false, ringsRt: false, rxDelay: '80', ecnDrop: '0', l4s: '0', retries: '7', voAggr: '' });
   assert.deepEqual(knobOptions(k), {
@@ -91,10 +98,9 @@ test('only the sections whose options differ are changed', () => {
   assert.deepEqual([...knobSectionsChanged(knobDefaults, { ...knobDefaults, l4s: '60' })], ['cake']);
   assert.deepEqual([...knobSectionsChanged(knobDefaults, { ...knobDefaults, ecnDrop: '256' })], ['cake']);
   assert.deepEqual([...knobSectionsChanged(knobDefaults, { ...knobDefaults, retries: '4' })], ['wifi']);
-  assert.deepEqual(
-    [...knobSectionsChanged(knobDefaults, { ...knobDefaults, wifiAll: false, rxDelay: '20' })].sort(),
-    ['steering'],
-  );
+  assert.deepEqual([...knobSectionsChanged(knobDefaults, { ...knobDefaults, wifiAll: false, rxDelay: '20' })].sort(), [
+    'steering',
+  ]);
 });
 
 test('labels for the choices and for what the drivers report now', () => {

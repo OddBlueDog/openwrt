@@ -60,7 +60,10 @@ export async function loadServer(): Promise<ServerData> {
   const lanSection = network.find((s) => s['.type'] === 'interface' && s['.name'] === 'lan');
   const [lanIp = '', lanCidr] = (list(lanSection, 'ipaddr')[0] ?? '').split('/');
   const lanInt = ipToInt(lanIp);
-  const lan: Range | undefined = lanInt === undefined ? undefined : { ip: lanInt, prefix: lanCidr !== undefined ? Number(lanCidr) : prefixLength(str(lanSection, 'netmask')) };
+  const lan: Range | undefined =
+    lanInt === undefined
+      ? undefined
+      : { ip: lanInt, prefix: lanCidr !== undefined ? Number(lanCidr) : prefixLength(str(lanSection, 'netmask')) };
   // every other network's live addresses: the internet port's, the guest networks', another VPN's…
   const taken = interfaces.flatMap((i) =>
     i.interface === 'lan' || i.interface === 'loopback' || i.interface === SERVER
@@ -108,12 +111,17 @@ export async function loadServer(): Promise<ServerData> {
       ipv4: wanIf?.['ipv4-address']?.[0]?.address,
       ipv6: wan6If?.['ipv6-address']?.[0]?.address ?? wanIf?.['ipv6-address']?.[0]?.address,
       gateway: wanIf?.route?.find((r) => r.target === '0.0.0.0' && r.mask === 0)?.nexthop,
+      // 'static' when the provider gives a fixed address; DHCP and PPPoE addresses can change
+      proto: wanIf?.proto,
     },
     dnsIntercept: interceptOn(firewall),
     // its own socket isn't in the way
     portsInUse: ports.filter((p) => p !== running?.listen_port),
     forwards: firewall
-      .filter((s) => s['.type'] === 'redirect' && str(s, 'src') === wanName && bool(s, 'enabled', true) && str(s, 'src_dport') !== undefined)
+      .filter(
+        (s) =>
+          s['.type'] === 'redirect' && str(s, 'src') === wanName && bool(s, 'enabled', true) && str(s, 'src_dport') !== undefined,
+      )
       .filter((s) => {
         const proto = list(s, 'proto').map((p) => p.toLowerCase());
         return proto.length === 0 || proto.some((p) => p === 'udp' || p === 'all' || p === 'tcpudp');

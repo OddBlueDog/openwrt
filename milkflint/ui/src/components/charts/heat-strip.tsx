@@ -49,7 +49,7 @@ export function HeatStrip({
     <div className="flex" role="img" aria-label={label}>
       <div className="flex shrink-0 flex-col gap-1" style={{ width: PLOT_LEFT }}>
         {rows.map((r) => (
-          <span key={r.label} className="h-4 pr-2 text-right font-mono text-[10px] leading-4 text-muted-foreground">
+          <span key={r.label} className="h-4 pr-2 text-right text-xs leading-4 text-muted-foreground tabular">
             {r.label}
           </span>
         ))}
@@ -57,11 +57,25 @@ export function HeatStrip({
       <div className="relative min-w-0 flex-1">
         <div className="flex flex-col gap-1">
           {rows.map((r) => (
-            <svg key={r.label} viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true" className="h-4 w-full rounded-sm bg-muted">
+            <svg
+              key={r.label}
+              viewBox="0 0 100 10"
+              preserveAspectRatio="none"
+              aria-hidden="true"
+              className="h-4 w-full rounded-sm bg-muted"
+            >
               {r.values.map((v, i) =>
                 v === null || v <= 0 ? null : (
                   // a hair wider than its span, so neighbours meet without a seam
-                  <rect key={i} x={x(spans[i]?.[0] ?? 0)} width={x(spans[i]?.[1] ?? 0) - x(spans[i]?.[0] ?? 0) + 0.05} y="0" height="10" fill={color} fillOpacity={Math.min(1, 0.08 + v * 0.92)} />
+                  <rect
+                    key={i}
+                    x={x(spans[i]?.[0] ?? 0)}
+                    width={x(spans[i]?.[1] ?? 0) - x(spans[i]?.[0] ?? 0) + 0.05}
+                    y="0"
+                    height="10"
+                    fill={color}
+                    fillOpacity={Math.min(1, 0.08 + v * 0.92)}
+                  />
                 ),
               )}
             </svg>
@@ -77,7 +91,10 @@ export function HeatStrip({
           }}
         >
           {hover !== undefined && hover >= from && hover <= to && (
-            <div className="pointer-events-none absolute inset-y-0 w-px bg-foreground/40" style={{ left: `${String(x(hover))}%` }} />
+            <div
+              className="pointer-events-none absolute inset-y-0 w-px bg-foreground/40"
+              style={{ left: `${String(x(hover))}%` }}
+            />
           )}
           {at >= 0 && (
             <HoverCard
@@ -86,7 +103,11 @@ export function HeatStrip({
               rows={rows.map((r) => {
                 const v = r.values[at];
                 const more = r.detail?.(at);
-                return { label: r.label, color, value: v === null || v === undefined ? '—' : `${format(v)}${more === undefined ? '' : ` · ${more}`}` };
+                return {
+                  label: r.label,
+                  color,
+                  value: v === null || v === undefined ? '—' : `${format(v)}${more === undefined ? '' : ` · ${more}`}`,
+                };
               })}
             />
           )}

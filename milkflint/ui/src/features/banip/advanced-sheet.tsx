@@ -5,17 +5,47 @@
 // logged, counting, the log monitor), Downloads (how and where it fetches,
 // your own lists' file), Email. Each says what it does and its default,
 // with a reset; a save writes only what changed.
-import { CableIcon, DownloadIcon, LoaderCircleIcon, type LucideIcon, MailIcon, RotateCcwIcon, ScrollTextIcon, ShieldIcon, UploadIcon } from 'lucide-react';
+import {
+  CableIcon,
+  DownloadIcon,
+  LoaderCircleIcon,
+  type LucideIcon,
+  MailIcon,
+  RotateCcwIcon,
+  ScrollTextIcon,
+  ShieldIcon,
+  UploadIcon,
+} from 'lucide-react';
 import { type ChangeEvent, type ReactElement, type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 import { Switch } from '@/components/ui/switch';
+import { TabPanel, Tabs } from '@/components/ui/tabs';
 import { cn, errorMessage } from '@/lib/utils';
 import { Opt } from '../firewall/sheet-parts';
-import { type BanipConfig, customFile, getMail, importFeeds, installPackage, type MailAccount, type MailSettings, saveMail, testMail } from './api';
-import { checkValue, effective, type OptionName, type Options, OPTIONS, type OptionSpec, optionChanges, type OptionValue } from './options';
+import {
+  type BanipConfig,
+  customFile,
+  getMail,
+  importFeeds,
+  installPackage,
+  type MailAccount,
+  type MailSettings,
+  saveMail,
+  testMail,
+} from './api';
+import {
+  checkValue,
+  effective,
+  type OptionName,
+  type Options,
+  OPTIONS,
+  type OptionSpec,
+  optionChanges,
+  type OptionValue,
+} from './options';
 
 type TabId = 'general' | 'firewall' | 'logging' | 'downloads' | 'email';
 const TABS: { id: TabId; label: string; icon: LucideIcon }[] = [
@@ -47,10 +77,20 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
     {
       title: 'The internet connection',
       fields: [
-        { name: 'ban_autodetect', label: 'Find it by itself', hint: 'banIP finds the interfaces with the default route, their devices and addresses at each start. On by default.' },
+        {
+          name: 'ban_autodetect',
+          label: 'Find it by itself',
+          hint: 'banIP finds the interfaces with the default route, their devices and addresses at each start. On by default.',
+        },
         { name: 'ban_protov4', label: 'IPv4', hint: 'Block over IPv4.', when: autoOff },
         { name: 'ban_protov6', label: 'IPv6', hint: 'Block over IPv6.', when: autoOff },
-        { name: 'ban_ifv4', label: 'IPv4 interfaces', hint: 'The network interfaces of the internet connection, e.g. wan.', when: autoOff, now: (c) => c.runtime?.interfaces.join(' ') },
+        {
+          name: 'ban_ifv4',
+          label: 'IPv4 interfaces',
+          hint: 'The network interfaces of the internet connection, e.g. wan.',
+          when: autoOff,
+          now: (c) => c.runtime?.interfaces.join(' '),
+        },
         { name: 'ban_ifv6', label: 'IPv6 interfaces', hint: 'e.g. wan6.', when: autoOff },
         {
           name: 'ban_dev',
@@ -64,8 +104,18 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
     {
       title: 'Starting',
       fields: [
-        { name: 'ban_trigger', label: 'Start when these come up', hint: 'banIP starts (or refreshes its own addresses) when these interfaces come up. MilkFlint sets the internet zone’s.', now: (c) => c.runtime?.triggers.join(' ') },
-        { name: 'ban_triggerdelay', label: 'Wait before starting', hint: 'At boot and after an interface event. 20 s by default.', unit: 's' },
+        {
+          name: 'ban_trigger',
+          label: 'Start when these come up',
+          hint: 'banIP starts (or refreshes its own addresses) when these interfaces come up. MilkFlint sets the internet zone’s.',
+          now: (c) => c.runtime?.triggers.join(' '),
+        },
+        {
+          name: 'ban_triggerdelay',
+          label: 'Wait before starting',
+          hint: 'At boot and after an interface event. 20 s by default.',
+          unit: 's',
+        },
       ],
     },
   ],
@@ -82,16 +132,33 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
             { value: 'reject', label: 'Reject' },
           ],
         },
-        { name: 'ban_nftpriority', label: 'Chain priority', hint: 'Where banIP’s chains run among the firewall’s: lower runs earlier. -100 by default, before the firewall’s own (0).', now: nft('priority') },
+        {
+          name: 'ban_nftpriority',
+          label: 'Chain priority',
+          hint: 'Where banIP’s chains run among the firewall’s: lower runs earlier. -100 by default, before the firewall’s own (0).',
+          now: nft('priority'),
+        },
         {
           name: 'ban_allowflag',
           label: 'Always let through',
           hint: 'Protocols and ports coming in that no list blocks, e.g. “tcp 22 443”. MilkFlint adds Remote access’s WireGuard port itself.',
           placeholder: 'tcp udp 443',
         },
-        { name: 'ban_vlanallow', label: 'Allow these networks out', hint: 'Bridge or VLAN devices whose traffic out no list blocks, e.g. br-lan.20.' },
-        { name: 'ban_vlanblock', label: 'Block these networks out', hint: 'Devices whose traffic to the internet is always refused.' },
-        { name: 'ban_bcp38', label: 'Drop spoofed sources (BCP38)', hint: 'Drops packets whose source address can’t come from where they arrived. Off by default.' },
+        {
+          name: 'ban_vlanallow',
+          label: 'Allow these networks out',
+          hint: 'Bridge or VLAN devices whose traffic out no list blocks, e.g. br-lan.20.',
+        },
+        {
+          name: 'ban_vlanblock',
+          label: 'Block these networks out',
+          hint: 'Devices whose traffic to the internet is always refused.',
+        },
+        {
+          name: 'ban_bcp38',
+          label: 'Drop spoofed sources (BCP38)',
+          hint: 'Drops packets whose source address can’t come from where they arrived. Off by default.',
+        },
       ],
     },
     {
@@ -103,8 +170,18 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
           hint: 'Packets a second from the internet, all together; 0 is off. Off here: one allowance for the whole internet, so a flood would also drop your own ping replies and IPv6’s neighbour messages. banIP’s default is 25.',
           unit: '/s',
         },
-        { name: 'ban_synlimit', label: 'New TCP connections', hint: 'Off here: the firewall already limits them for each address (one allowance for all would let a flood shut out the rest). banIP’s default is 10.', unit: '/s' },
-        { name: 'ban_udplimit', label: 'New UDP flows', hint: 'Off here: it would count Remote access, games and peer-to-peer traffic too. banIP’s default is 100.', unit: '/s' },
+        {
+          name: 'ban_synlimit',
+          label: 'New TCP connections',
+          hint: 'Off here: the firewall already limits them for each address (one allowance for all would let a flood shut out the rest). banIP’s default is 10.',
+          unit: '/s',
+        },
+        {
+          name: 'ban_udplimit',
+          label: 'New UDP flows',
+          hint: 'Off here: it would count Remote access, games and peer-to-peer traffic too. banIP’s default is 100.',
+          unit: '/s',
+        },
       ],
     },
     {
@@ -120,9 +197,22 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
           ],
           now: nft('policy'),
         },
-        { name: 'ban_splitsize', label: 'Load in parts of', hint: 'Entries at a time (512 at least, 0 for all at once): less memory while a big list loads, more time.', unit: 'entries' },
-        { name: 'ban_nftretry', label: 'Load attempts', hint: 'Tries to load a list into the firewall before giving up on it. 3 by default.' },
-        { name: 'ban_cores', label: 'Lists at once', hint: 'How many lists banIP fetches and loads at the same time. By default one a CPU core, fewer when memory is short.' },
+        {
+          name: 'ban_splitsize',
+          label: 'Load in parts of',
+          hint: 'Entries at a time (512 at least, 0 for all at once): less memory while a big list loads, more time.',
+          unit: 'entries',
+        },
+        {
+          name: 'ban_nftretry',
+          label: 'Load attempts',
+          hint: 'Tries to load a list into the firewall before giving up on it. 3 by default.',
+        },
+        {
+          name: 'ban_cores',
+          label: 'Lists at once',
+          hint: 'How many lists banIP fetches and loads at the same time. By default one a CPU core, fewer when memory is short.',
+        },
       ],
     },
   ],
@@ -130,15 +220,27 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
     {
       title: 'Counting and logging',
       fields: [
-        { name: 'ban_nftcount', label: 'Count hits', hint: 'Each rule and each entry counts what it blocked: the Activity numbers and the drops over time. Costs a little memory an entry (in the estimate). On here; banIP’s default is off.' },
-        { name: 'ban_logprerouting', label: 'Log what the flood limits drop', hint: 'Each packet dropped before the lists, in the system log.' },
+        {
+          name: 'ban_nftcount',
+          label: 'Count hits',
+          hint: 'Each rule and each entry counts what it blocked: the Activity numbers and the drops over time. Costs a little memory an entry (in the estimate). On here; banIP’s default is off.',
+        },
+        {
+          name: 'ban_logprerouting',
+          label: 'Log what the flood limits drop',
+          hint: 'Each packet dropped before the lists, in the system log.',
+        },
         {
           name: 'ban_nftloglevel',
           label: 'Log level',
           hint: 'The system log level of banIP’s firewall lines. Warn by default.',
           choices: ['emerg', 'alert', 'crit', 'err', 'warn', 'notice', 'info', 'debug'].map((v) => ({ value: v, label: v })),
         },
-        { name: 'ban_logratelimit', label: 'Lines a second', hint: 'At most this many firewall lines a second, for all of banIP’s rules together (0: no limit). 10 by default.' },
+        {
+          name: 'ban_logratelimit',
+          label: 'Lines a second',
+          hint: 'At most this many firewall lines a second, for all of banIP’s rules together (0: no limit). 10 by default.',
+        },
         { name: 'ban_logburstlimit', label: 'Burst', hint: 'Lines let through at once above that. 5 by default.' },
         { name: 'ban_debug', label: 'Debug log', hint: 'banIP says much more in its log, for chasing a problem.' },
       ],
@@ -146,14 +248,49 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
     {
       title: 'The log monitor',
       fields: [
-        { name: 'ban_loglimit', label: 'Log lines in mails', hint: 'banIP watches the system log for failed sign-ins and blocks their source; 0 turns that off. Otherwise, the lines of its log a mail includes.' },
-        { name: 'ban_logcount', label: 'Failures before a block', hint: 'Times the same address must fail before it’s blocked. 1 by default.' },
-        { name: 'ban_nftexpiry', label: 'Forget them after', hint: 'e.g. 2h, 1d or 1h30m: blocked addresses expire (and aren’t written to the blocklist). Empty: kept for good.', placeholder: 'kept for good' },
-        { name: 'ban_autoblocklist', label: 'Write them to the blocklist', hint: 'Without an expiry, each one goes into the blocklist file too.' },
-        { name: 'ban_autoblocksubnet', label: 'Block their whole network', hint: 'Asks the address’s registry (RDAP) for its network and blocks that. Off by default.' },
-        { name: 'ban_logreadfile', label: 'Read this file instead', hint: 'A log file to watch rather than the system log (syslog-ng and the like).', placeholder: '/var/log/messages' },
-        { name: 'ban_remotelog', label: 'Take reports from other devices', hint: 'Other devices at home can report an address to block through banIP’s page at /cgi-bin/banip, with the token below.' },
-        { name: 'ban_remotetoken', label: 'Token', hint: '3 to 20 letters, digits, dots or colons: a request carries it as <token>=<address>.', when: (o) => effective(o, 'ban_remotelog') === '1' },
+        {
+          name: 'ban_loglimit',
+          label: 'Log lines in mails',
+          hint: 'banIP watches the system log for failed sign-ins and blocks their source; 0 turns that off. Otherwise, the lines of its log a mail includes.',
+        },
+        {
+          name: 'ban_logcount',
+          label: 'Failures before a block',
+          hint: 'Times the same address must fail before it’s blocked. 1 by default.',
+        },
+        {
+          name: 'ban_nftexpiry',
+          label: 'Forget them after',
+          hint: 'e.g. 2h, 1d or 1h30m: blocked addresses expire (and aren’t written to the blocklist). Empty: kept for good.',
+          placeholder: 'kept for good',
+        },
+        {
+          name: 'ban_autoblocklist',
+          label: 'Write them to the blocklist',
+          hint: 'Without an expiry, each one goes into the blocklist file too.',
+        },
+        {
+          name: 'ban_autoblocksubnet',
+          label: 'Block their whole network',
+          hint: 'Asks the address’s registry (RDAP) for its network and blocks that. Off by default.',
+        },
+        {
+          name: 'ban_logreadfile',
+          label: 'Read this file instead',
+          hint: 'A log file to watch rather than the system log (syslog-ng and the like).',
+          placeholder: '/var/log/messages',
+        },
+        {
+          name: 'ban_remotelog',
+          label: 'Take reports from other devices',
+          hint: 'Other devices at home can report an address to block through banIP’s page at /cgi-bin/banip, with the token below.',
+        },
+        {
+          name: 'ban_remotetoken',
+          label: 'Token',
+          hint: '3 to 20 letters, digits, dots or colons: a request carries it as <token>=<address>.',
+          when: (o) => effective(o, 'ban_remotelog') === '1',
+        },
       ],
     },
   ],
@@ -172,21 +309,54 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
           ],
           now: (c) => c.runtime?.system.fetch ?? undefined,
         },
-        { name: 'ban_fetchparm', label: 'Its options', hint: 'Instead of banIP’s own for that tool; the output option (-o or -O) last.' },
-        { name: 'ban_fetchretry', label: 'Attempts', hint: 'Downloads tried before a list counts as failed (not with uclient-fetch). 5 by default.' },
-        { name: 'ban_fetchinsecure', label: 'Skip certificate checks', hint: 'Don’t check the lists’ servers are who they say: anyone between could change the lists. Off by default.' },
-        { name: 'ban_resolver', label: 'DNS server for names', hint: 'For the domain names in your lists. The router’s own DNS by default.', placeholder: 'the router’s' },
+        {
+          name: 'ban_fetchparm',
+          label: 'Its options',
+          hint: 'Instead of banIP’s own for that tool; the output option (-o or -O) last.',
+        },
+        {
+          name: 'ban_fetchretry',
+          label: 'Attempts',
+          hint: 'Downloads tried before a list counts as failed (not with uclient-fetch). 5 by default.',
+        },
+        {
+          name: 'ban_fetchinsecure',
+          label: 'Skip certificate checks',
+          hint: 'Don’t check the lists’ servers are who they say: anyone between could change the lists. Off by default.',
+        },
+        {
+          name: 'ban_resolver',
+          label: 'DNS server for names',
+          hint: 'For the domain names in your lists. The router’s own DNS by default.',
+          placeholder: 'the router’s',
+        },
       ],
     },
     {
       title: 'Processing',
       fields: [
-        { name: 'ban_deduplicate', label: 'Remove duplicates', hint: 'An address in two lists is kept in the first only: less memory. On by default.' },
+        {
+          name: 'ban_deduplicate',
+          label: 'Remove duplicates',
+          hint: 'An address in two lists is kept in the first only: less memory. On by default.',
+        },
         { name: 'ban_feedcomplete', label: 'Keep whole', hint: 'Lists left out of that, so each shows all its own entries.' },
-        { name: 'ban_nicelimit', label: 'CPU priority', hint: 'From -20 (first) to 19 (last); 0 by default. Higher keeps banIP’s updates further out of the way.' },
-        { name: 'ban_filelimit', label: 'Open files', hint: 'banIP’s limit; raise it for many lists loaded in parts. 1024 by default.' },
+        {
+          name: 'ban_nicelimit',
+          label: 'CPU priority',
+          hint: 'From -20 (first) to 19 (last); 0 by default. Higher keeps banIP’s updates further out of the way.',
+        },
+        {
+          name: 'ban_filelimit',
+          label: 'Open files',
+          hint: 'banIP’s limit; raise it for many lists loaded in parts. 1024 by default.',
+        },
         { name: 'ban_basedir', label: 'Working directory', hint: 'In memory (/tmp) by default.' },
-        { name: 'ban_backupdir', label: 'Backups', hint: 'The last copy of each list, used when a download fails. /tmp/banIP-backup by default (in memory: gone at a restart).' },
+        {
+          name: 'ban_backupdir',
+          label: 'Backups',
+          hint: 'The last copy of each list, used when a download fails. /tmp/banIP-backup by default (in memory: gone at a restart).',
+        },
         { name: 'ban_reportdir', label: 'Reports', hint: '/tmp/banIP-report by default.' },
         { name: 'ban_errordir', label: 'Errors', hint: 'What banIP couldn’t load, for a look. /tmp/banIP-error by default.' },
       ],
@@ -200,7 +370,11 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
         { name: 'ban_mailreceiver', label: 'To', hint: 'The address mails go to.', placeholder: 'you@example.com' },
         { name: 'ban_mailsender', label: 'From', hint: 'no-reply@banIP by default.' },
         { name: 'ban_mailtopic', label: 'Subject', hint: '“banIP notification” by default.' },
-        { name: 'ban_mailprofile', label: 'msmtp account', hint: 'The account in msmtp’s settings: ban_notify by default (the one below).' },
+        {
+          name: 'ban_mailprofile',
+          label: 'msmtp account',
+          hint: 'The account in msmtp’s settings: ban_notify by default (the one below).',
+        },
       ],
     },
   ],
@@ -209,7 +383,17 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
 const DEFAULT = '__default';
 
 /** A list as words: typed freely, kept as the words it holds. */
-function ListInput({ id, value, invalid, onChange }: { id: string; value: readonly string[]; invalid: boolean; onChange: (v: string[]) => void }): ReactElement {
+function ListInput({
+  id,
+  value,
+  invalid,
+  onChange,
+}: {
+  id: string;
+  value: readonly string[];
+  invalid: boolean;
+  onChange: (v: string[]) => void;
+}): ReactElement {
   const [text, setText] = useState(value.join(' '));
   return (
     <Input
@@ -227,7 +411,21 @@ function ListInput({ id, value, invalid, onChange }: { id: string; value: readon
   );
 }
 
-function Row({ def, o, saved, c, set, error }: { def: Def; o: Options; saved: Options; c: BanipConfig; set: (n: OptionName, v: OptionValue) => void; error: string | undefined }): ReactElement | null {
+function Row({
+  def,
+  o,
+  saved,
+  c,
+  set,
+  error,
+}: {
+  def: Def;
+  o: Options;
+  saved: Options;
+  c: BanipConfig;
+  set: (n: OptionName, v: OptionValue) => void;
+  error: string | undefined;
+}): ReactElement | null {
   const id = useId();
   if (def.when !== undefined && !def.when(o)) return null;
   const spec: OptionSpec = OPTIONS[def.name];
@@ -271,7 +469,10 @@ function Row({ def, o, saved, c, set, error }: { def: Def; o: Options; saved: Op
           <SelectValue />
         </SelectTrigger>
         <SelectContent>
-          <SelectItem value={DEFAULT}>Default{spec.default !== undefined ? ` (${def.choices.find((x) => x.value === spec.default)?.label ?? spec.default})` : ''}</SelectItem>
+          <SelectItem value={DEFAULT}>
+            Default
+            {spec.default !== undefined ? ` (${def.choices.find((x) => x.value === spec.default)?.label ?? spec.default})` : ''}
+          </SelectItem>
           {def.choices.map((x) => (
             <SelectItem key={x.value} value={x.value}>
               {x.label}
@@ -316,7 +517,7 @@ function Row({ def, o, saved, c, set, error }: { def: Def; o: Options; saved: Op
         <label htmlFor={id}>{def.label}</label>
         <Opt>{def.name}</Opt>
         {changed && (
-          <span className="flex items-center gap-1 text-[11px] font-medium text-primary">
+          <span className="flex items-center gap-1 text-xs font-medium text-primary">
             <span className="size-1.5 rounded-full bg-primary" />
             changed
           </span>
@@ -327,7 +528,12 @@ function Row({ def, o, saved, c, set, error }: { def: Def; o: Options; saved: Op
       {error !== undefined && <p className="text-xs text-destructive">{error}</p>}
       <p className={cn('text-xs text-muted-foreground', spec.type === 'bool' && 'col-start-1')}>
         {def.hint}
-        {now !== undefined && now !== '' && <span> Now: <span className="font-mono">{now}</span>.</span>}
+        {now !== undefined && now !== '' && (
+          <span>
+            {' '}
+            Now: <span className="font-mono">{now}</span>.
+          </span>
+        )}
       </p>
     </div>
   );
@@ -375,7 +581,10 @@ function LogTerms({ o, set }: { o: Options; set: (n: OptionName, v: OptionValue)
               variant="ghost"
               className="h-6 px-2 text-xs"
               onClick={() => {
-                set('ban_logterm', terms.filter((y) => y !== x));
+                set(
+                  'ban_logterm',
+                  terms.filter((y) => y !== x),
+                );
               }}
             >
               Remove
@@ -424,7 +633,8 @@ function LogTerms({ o, set }: { o: Options; set: (n: OptionName, v: OptionValue)
         </Button>
       </form>
       <p className="text-xs text-muted-foreground">
-        Patterns (regular expressions) for log lines; banIP takes the last address in the line, or the first with “first:” in front (web server logs).
+        Patterns (regular expressions) for log lines; banIP takes the last address in the line, or the first with “first:” in
+        front (web server logs).
       </p>
     </div>
   );
@@ -452,7 +662,15 @@ function CustomFile({ c, onChanged }: { c: BanipConfig; onChanged: () => void })
   };
   const exportOwn = (): void => {
     const o: Record<string, unknown> = {};
-    for (const f of own) o[f.name] = { url_4: f.url_4 ?? undefined, url_6: f.url_6 ?? undefined, rule: f.rule, chain: f.chain, descr: f.descr, flag: f.flag ?? undefined };
+    for (const f of own)
+      o[f.name] = {
+        url_4: f.url_4 ?? undefined,
+        url_6: f.url_6 ?? undefined,
+        rule: f.rule,
+        chain: f.chain,
+        descr: f.descr,
+        flag: f.flag ?? undefined,
+      };
     const url = URL.createObjectURL(new Blob([JSON.stringify(o, null, '\t')], { type: 'application/json' }));
     const a = document.createElement('a');
     a.href = url;
@@ -464,8 +682,8 @@ function CustomFile({ c, onChanged }: { c: BanipConfig; onChanged: () => void })
     <section className="flex flex-col gap-3 border-t pt-5">
       <h3 className="text-sm font-semibold">Your own lists’ file</h3>
       <p className="text-xs text-muted-foreground">
-        banIP reads /etc/banip/banip.custom.feeds instead of its own catalogue when it isn’t empty. MilkFlint keeps it as banIP’s catalogue with your
-        lists added, and again after an upgrade brings a new catalogue.{' '}
+        banIP reads /etc/banip/banip.custom.feeds instead of its own catalogue when it isn’t empty. MilkFlint keeps it as banIP’s
+        catalogue with your lists added, and again after an upgrade brings a new catalogue.{' '}
         {c.custom?.state === 'edited'
           ? 'It was changed outside this page (by hand or LuCI): take it over to edit your lists here, or go back to banIP’s.'
           : own.length === 0
@@ -474,7 +692,14 @@ function CustomFile({ c, onChanged }: { c: BanipConfig; onChanged: () => void })
       </p>
       <div className="flex flex-wrap gap-2">
         {c.custom?.state === 'edited' && (
-          <Button size="sm" variant="outline" disabled={busy !== undefined} onClick={() => { run('adopt', () => customFile('adopt'), 'Taken over: its lists that differ from banIP’s are yours now.'); }}>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy !== undefined}
+            onClick={() => {
+              run('adopt', () => customFile('adopt'), 'Taken over: its lists that differ from banIP’s are yours now.');
+            }}
+          >
             {busy === 'adopt' && <LoaderCircleIcon className="animate-spin" />}
             Take it over
           </Button>
@@ -482,7 +707,12 @@ function CustomFile({ c, onChanged }: { c: BanipConfig; onChanged: () => void })
         <Button size="sm" variant="outline" disabled={own.length === 0} onClick={exportOwn}>
           <DownloadIcon /> Export your lists
         </Button>
-        <Button size="sm" variant="outline" disabled={busy !== undefined || c.custom?.state === 'edited'} onClick={() => file.current?.click()}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy !== undefined || c.custom?.state === 'edited'}
+          onClick={() => file.current?.click()}
+        >
           <UploadIcon /> Import lists
         </Button>
         <input
@@ -492,12 +722,23 @@ function CustomFile({ c, onChanged }: { c: BanipConfig; onChanged: () => void })
           className="hidden"
           onChange={(e: ChangeEvent<HTMLInputElement>) => {
             const f = e.target.files?.[0];
-            if (f !== undefined) void f.text().then((x) => { run('import', () => importFeeds(x), 'Imported.'); });
+            if (f !== undefined)
+              void f.text().then((x) => {
+                run('import', () => importFeeds(x), 'Imported.');
+              });
             e.target.value = '';
           }}
         />
         {(own.length > 0 || c.custom?.state === 'edited') && (
-          <Button size="sm" variant="ghost" className="text-destructive" disabled={busy !== undefined} onClick={() => { run('reset', () => customFile('reset'), 'Back to banIP’s own catalogue.'); }}>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="text-destructive"
+            disabled={busy !== undefined}
+            onClick={() => {
+              run('reset', () => customFile('reset'), 'Back to banIP’s own catalogue.');
+            }}
+          >
             Back to banIP’s catalogue
           </Button>
         )}
@@ -516,10 +757,20 @@ function MailAccountForm({ c, onChanged }: { c: BanipConfig; onChanged: () => vo
   const install = c.install;
   useEffect(() => {
     if (!installed) return;
-    getMail().then((x) => {
-      setM(x);
-      setF({ host: x.host ?? '', port: x.port ?? 587, tls: x.tls ?? 'starttls', user: x.user ?? '', password: '', from: x.from ?? '' });
-    }, () => undefined);
+    getMail().then(
+      (x) => {
+        setM(x);
+        setF({
+          host: x.host ?? '',
+          port: x.port ?? 587,
+          tls: x.tls ?? 'starttls',
+          user: x.user ?? '',
+          password: '',
+          from: x.from ?? '',
+        });
+      },
+      () => undefined,
+    );
   }, [installed]);
   const run = (what: string, fn: () => Promise<unknown>, done: string): void => {
     setBusy(what);
@@ -541,24 +792,40 @@ function MailAccountForm({ c, onChanged }: { c: BanipConfig; onChanged: () => vo
       <section className="flex flex-col gap-3 border-t pt-5">
         <h3 className="text-sm font-semibold">Sending them</h3>
         <p className="text-xs text-muted-foreground">
-          banIP sends mail with msmtp, which isn’t in the firmware. It’s a small package from OpenWrt’s feed (the router needs the internet).
+          banIP sends mail with msmtp, which isn’t in the firmware. It’s a small package from OpenWrt’s feed (the router needs the
+          internet).
         </p>
         {install?.package === 'msmtp' && install.busy ? (
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
             <LoaderCircleIcon className="size-4 animate-spin" /> Installing msmtp…
           </p>
         ) : (
-          <Button size="sm" variant="outline" className="w-fit" disabled={busy !== undefined} onClick={() => { run('install', () => installPackage('msmtp'), 'Installing: this takes a moment.'); }}>
+          <Button
+            size="sm"
+            variant="outline"
+            className="w-fit"
+            disabled={busy !== undefined}
+            onClick={() => {
+              run('install', () => installPackage('msmtp'), 'Installing: this takes a moment.');
+            }}
+          >
             <DownloadIcon /> Install msmtp
           </Button>
         )}
-        {install?.package === 'msmtp' && install.ok === false && <p className="text-xs text-destructive">The last install didn’t work: {install.log?.split('\n').slice(-2).join(' ')}</p>}
+        {install?.package === 'msmtp' && install.ok === false && (
+          <p className="text-xs text-destructive">The last install didn’t work: {install.log?.split('\n').slice(-2).join(' ')}</p>
+        )}
         {note !== undefined && <p className="text-xs text-muted-foreground">{note}</p>}
       </section>
     );
   }
-  const bad = f.host === '' || !/^[A-Za-z0-9.-]+$/.test(f.host) || f.port < 1 || f.port > 65535 || !/^[^@\s]+@[^@\s]+$/.test(f.from);
-  const input = (k: keyof MailSettings, label: string, props: Partial<{ type: string; placeholder: string; mono: boolean }> = {}): ReactElement => (
+  const bad =
+    f.host === '' || !/^[A-Za-z0-9.-]+$/.test(f.host) || f.port < 1 || f.port > 65535 || !/^[^@\s]+@[^@\s]+$/.test(f.from);
+  const input = (
+    k: keyof MailSettings,
+    label: string,
+    props: Partial<{ type: string; placeholder: string; mono: boolean }> = {},
+  ): ReactElement => (
     <label className="grid gap-1 text-sm">
       <span className="font-medium">{label}</span>
       <Input
@@ -585,8 +852,15 @@ function MailAccountForm({ c, onChanged }: { c: BanipConfig; onChanged: () => vo
         {input('host', 'Server', { placeholder: 'smtp.example.com', mono: true })}
         {input('port', 'Port', { type: 'number' })}
         <div className="grid gap-1 text-sm">
-          <span id="banip-mail-tls" className="font-medium">Encryption</span>
-          <Select value={f.tls} onValueChange={(v) => { setF({ ...f, tls: v as MailSettings['tls'] }); }}>
+          <span id="banip-mail-tls" className="font-medium">
+            Encryption
+          </span>
+          <Select
+            value={f.tls}
+            onValueChange={(v) => {
+              setF({ ...f, tls: v as MailSettings['tls'] });
+            }}
+          >
             <SelectTrigger aria-labelledby="banip-mail-tls">
               <SelectValue />
             </SelectTrigger>
@@ -602,11 +876,24 @@ function MailAccountForm({ c, onChanged }: { c: BanipConfig; onChanged: () => vo
         {input('password', m?.password === true ? 'Password (kept if empty)' : 'Password', { type: 'password' })}
       </div>
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" disabled={busy !== undefined || bad} onClick={() => { run('save', () => saveMail(f), 'Saved.'); }}>
+        <Button
+          size="sm"
+          disabled={busy !== undefined || bad}
+          onClick={() => {
+            run('save', () => saveMail(f), 'Saved.');
+          }}
+        >
           {busy === 'save' && <LoaderCircleIcon className="animate-spin" />}
           Save the account
         </Button>
-        <Button size="sm" variant="outline" disabled={busy !== undefined} onClick={() => { run('test', testMail, 'Sent: it goes out with the next minute. msmtp’s answer is in the system log.'); }}>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy !== undefined}
+          onClick={() => {
+            run('test', testMail, 'Sent: it goes out with the next minute. msmtp’s answer is in the system log.');
+          }}
+        >
           Send a test mail
         </Button>
       </div>
@@ -616,7 +903,8 @@ function MailAccountForm({ c, onChanged }: { c: BanipConfig; onChanged: () => vo
 }
 
 const tabOf = (name: OptionName): TabId => {
-  for (const [tab, groups] of Object.entries(FIELDS) as [TabId, (typeof FIELDS)[TabId]][]) if (groups.some((g) => g.fields.some((f) => f.name === name))) return tab;
+  for (const [tab, groups] of Object.entries(FIELDS) as [TabId, (typeof FIELDS)[TabId]][])
+    if (groups.some((g) => g.fields.some((f) => f.name === name))) return tab;
   return name === 'ban_logterm' ? 'logging' : 'general';
 };
 
@@ -660,68 +948,83 @@ export function AdvancedSheet({
       }}
     >
       <SheetContent aria-describedby={`${id}-desc`} className="sm:max-w-2xl">
-        <div className="border-b px-6 pt-4">
-          <SheetTitle className="pr-8">Advanced banIP settings</SheetTitle>
-          <SheetDescription id={`${id}-desc`} className="mt-0.5 text-xs">
-            Everything else banIP takes, as in LuCI. Only what you change is saved; most of it restarts banIP for a moment.
-          </SheetDescription>
-          <div role="tablist" aria-label="Settings" className="mt-3 flex gap-5 overflow-x-auto">
-            {TABS.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                role="tab"
-                id={`${id}-tab-${t.id}`}
-                aria-selected={tab === t.id}
-                aria-controls={`${id}-panel`}
-                onClick={() => {
-                  setTab(t.id);
-                }}
-                className={cn(
-                  '-mb-px flex shrink-0 items-center gap-1.5 border-b-2 pb-2 text-sm transition-colors',
-                  tab === t.id ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground',
-                )}
-              >
-                <t.icon className="size-3.5" />
-                {t.label}
-                {wrong.has(t.id) && <span className="size-1.5 rounded-full bg-destructive" aria-label="has a problem" />}
-              </button>
-            ))}
+        <div className="pt-4">
+          <div className="px-6">
+            <SheetTitle className="pr-8">Advanced banIP settings</SheetTitle>
+            <SheetDescription id={`${id}-desc`} className="mt-0.5 text-xs">
+              Everything else banIP takes, as in LuCI. Only what you change is saved; most of it restarts banIP for a moment.
+            </SheetDescription>
           </div>
+          <Tabs
+            label="Settings"
+            prefix="banip-adv"
+            value={tab}
+            onChange={setTab}
+            className="mt-3 px-6"
+            items={TABS.map((t) => ({
+              id: t.id,
+              label: (
+                <span className="flex items-center gap-1.5">
+                  <t.icon className="size-3.5" aria-hidden="true" />
+                  {t.label}
+                  {wrong.has(t.id) && (
+                    <>
+                      <span className="size-1.5 rounded-full bg-destructive" aria-hidden="true" />
+                      <span className="sr-only">(has a problem)</span>
+                    </>
+                  )}
+                </span>
+              ),
+            }))}
+          />
         </div>
         <div className="flex-1 overflow-y-auto">
-          <div id={`${id}-panel`} role="tabpanel" aria-labelledby={`${id}-tab-${tab}`} className="flex flex-col gap-6 px-6 py-5">
-            {tab === 'general' && c.runtime !== null && c.runtime !== undefined && (
-              <p className="rounded-lg border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                banIP found: {c.runtime.devices.length > 0 ? c.runtime.devices.join(', ') : 'no device'} ({c.runtime.interfaces.length > 0 ? c.runtime.interfaces.join(', ') : 'no interface'})
-                {c.runtime.uplink.length > 0 ? `, its own addresses ${c.runtime.uplink.join(', ')}` : ''}. Its table has{' '}
-                {c.runtime.counts !== null && c.runtime.counts !== undefined
-                  ? `${String(c.runtime.counts.chains)} chains, ${String(c.runtime.counts.sets)} sets and ${String(c.runtime.counts.rules)} rules`
-                  : 'nothing loaded'}
-                ; it uses {String(c.runtime.system.cores)} cores and {c.runtime.system.fetch ?? 'no download tool'}.
-              </p>
-            )}
-            {FIELDS[tab].map((g) => (
-              <section key={g.title} className="flex flex-col gap-4">
-                <h3 className="text-sm font-semibold">{g.title}</h3>
-                {g.fields.map((d) => (
-                  <Row key={d.name} def={d} o={o} saved={saved} c={c} set={set} error={errors[d.name]} />
-                ))}
-                {g.title === 'The log monitor' && <LogTerms o={o} set={set} />}
-              </section>
-            ))}
-            {tab === 'firewall' && (c.managed?.wireguard.length ?? 0) > 0 && (
-              <p className="text-xs text-muted-foreground">
-                Always let through by MilkFlint: UDP {c.managed?.wireguard.join(', ')} (WireGuard: Remote access), so devices away from home connect whatever the
-                lists say.
-              </p>
-            )}
-            {tab === 'downloads' && <CustomFile c={c} onChanged={onChanged} />}
-            {tab === 'email' && <MailAccountForm c={c} onChanged={onChanged} />}
-          </div>
+          {/* each tab's content only while it's shown: the Email tab asks the router for its account as it opens */}
+          {TABS.map((t) => (
+            <TabPanel key={t.id} prefix="banip-adv" id={t.id} value={tab} className="flex flex-col gap-6 px-6 py-5">
+              {tab === t.id && (
+                <>
+                  {t.id === 'general' && c.runtime !== null && c.runtime !== undefined && (
+                    <p className="text-xs text-muted-foreground">
+                      banIP found: {c.runtime.devices.length > 0 ? c.runtime.devices.join(', ') : 'no device'} (
+                      {c.runtime.interfaces.length > 0 ? c.runtime.interfaces.join(', ') : 'no interface'})
+                      {c.runtime.uplink.length > 0 ? `, its own addresses ${c.runtime.uplink.join(', ')}` : ''}. Its table has{' '}
+                      {c.runtime.counts !== null && c.runtime.counts !== undefined
+                        ? `${String(c.runtime.counts.chains)} chains, ${String(c.runtime.counts.sets)} sets and ${String(c.runtime.counts.rules)} rules`
+                        : 'nothing loaded'}
+                      ; it uses {String(c.runtime.system.cores)} cores and {c.runtime.system.fetch ?? 'no download tool'}.
+                    </p>
+                  )}
+                  {FIELDS[t.id].map((g) => (
+                    <section key={g.title} className="flex flex-col gap-4">
+                      <h3 className="text-sm font-semibold">{g.title}</h3>
+                      {g.fields.map((d) => (
+                        <Row key={d.name} def={d} o={o} saved={saved} c={c} set={set} error={errors[d.name]} />
+                      ))}
+                      {g.title === 'The log monitor' && <LogTerms o={o} set={set} />}
+                    </section>
+                  ))}
+                  {t.id === 'firewall' && (c.managed?.wireguard.length ?? 0) > 0 && (
+                    <p className="text-xs text-muted-foreground">
+                      Always let through by MilkFlint: UDP {c.managed?.wireguard.join(', ')} (WireGuard: Remote access), so
+                      devices away from home connect whatever the lists say.
+                    </p>
+                  )}
+                  {t.id === 'downloads' && <CustomFile c={c} onChanged={onChanged} />}
+                  {t.id === 'email' && <MailAccountForm c={c} onChanged={onChanged} />}
+                </>
+              )}
+            </TabPanel>
+          ))}
         </div>
         <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
-          <p className="text-xs text-muted-foreground">{invalid ? 'Fix what’s marked to save.' : count === 0 ? 'No changes yet.' : `${String(count)} option${count === 1 ? '' : 's'} to change.`}</p>
+          <p className="text-xs text-muted-foreground">
+            {invalid
+              ? 'Fix what’s marked to save.'
+              : count === 0
+                ? 'No changes yet.'
+                : `${String(count)} option${count === 1 ? '' : 's'} to change.`}
+          </p>
           <div className="flex gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel

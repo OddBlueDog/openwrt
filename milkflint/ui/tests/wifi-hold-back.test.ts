@@ -26,7 +26,12 @@ test('hold-back: what a radio has, from its four timers', () => {
 });
 
 test('hold-back: what a choice writes', () => {
-  assert.deepEqual(HOLD_BACK_OPTIONS, ['he_mu_edca_ac_be_timer', 'he_mu_edca_ac_bk_timer', 'he_mu_edca_ac_vi_timer', 'he_mu_edca_ac_vo_timer']);
+  assert.deepEqual(HOLD_BACK_OPTIONS, [
+    'he_mu_edca_ac_be_timer',
+    'he_mu_edca_ac_bk_timer',
+    'he_mu_edca_ac_vi_timer',
+    'he_mu_edca_ac_vo_timer',
+  ]);
   // the shortest: all four set
   assert.deepEqual(holdBackValues('short'), {
     he_mu_edca_ac_be_timer: '1',

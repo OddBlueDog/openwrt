@@ -94,7 +94,8 @@ export async function startScan(radio: string, phy: string, blocks: readonly Blo
     { radio, phy, blocks, seconds },
     z.object({ started: z.boolean().optional(), error: z.string().optional() }),
   );
-  if (res.error !== undefined) throw new Error(res.error === 'busy' ? 'A radar scan is already running.' : `The router refused the scan (${res.error}).`);
+  if (res.error !== undefined)
+    throw new Error(res.error === 'busy' ? 'A radar scan is already running.' : `The router refused the scan (${res.error}).`);
 }
 
 export async function stopScan(): Promise<void> {
@@ -103,5 +104,7 @@ export async function stopScan(): Promise<void> {
 
 /** The chip's last radar reports, newest last; null when the Wi-Fi driver doesn't keep them. */
 export function getChipReports(phy: string): Promise<ChipReport[] | null> {
-  return call('milkflint.radarscan', 'reports', { phy }, z.object({ reports: z.array(report).nullable() })).then((r) => r.reports);
+  return call('milkflint.radarscan', 'reports', { phy }, z.object({ reports: z.array(report).nullable() })).then(
+    (r) => r.reports,
+  );
 }

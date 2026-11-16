@@ -20,7 +20,14 @@ const queue = (values: Record<string, string> = {}): Section =>
   });
 
 const load = (sqm: Section[] | undefined, milkflint: Section[] = []): SqmData =>
-  sqmData({ sqm, firewall: [section('defaults', 'cfg01')], milkflint, wanDevice: 'eth1', wanProto: 'dhcp', devices: ['eth0', 'eth1', 'lo', 'br-lan'] });
+  sqmData({
+    sqm,
+    firewall: [section('defaults', 'cfg01')],
+    milkflint,
+    wanDevice: 'eth1',
+    wanProto: 'dhcp',
+    devices: ['eth0', 'eth1', 'lo', 'br-lan'],
+  });
 
 const save = (data: SqmData, over: Partial<SqmForm>): Change[] => toChanges({ ...data.form, ...over }, data);
 
@@ -86,7 +93,9 @@ test('Performance Tuning’s GRO choice isn’t touched by a speed change', () =
   for (const whole of ['1', '0']) {
     const sqm = [queue({ download: '400000', iqdisc_opts: 'nat' })];
     const data = load(sqm, [section('gro', 'gro', { whole })]);
-    assert.deepEqual(save(data, { downloadMbit: '600' }), [{ op: 'set', config: 'sqm', section: 'wan', values: { download: '600000' } }]);
+    assert.deepEqual(save(data, { downloadMbit: '600' }), [
+      { op: 'set', config: 'sqm', section: 'wan', values: { download: '600000' } },
+    ]);
   }
 });
 
@@ -121,7 +130,14 @@ test('each setting writes only its own keywords', () => {
 
   // the ACK filter: the upload only
   const noAck = save(data, { ackFilter: 'off' });
-  assert.deepEqual(noAck, [{ op: 'set', config: 'sqm', section: 'wan', values: { eqdisc_opts: 'nat', qdisc_advanced: '1', qdisc_really_really_advanced: '1' } }]);
+  assert.deepEqual(noAck, [
+    {
+      op: 'set',
+      config: 'sqm',
+      section: 'wan',
+      values: { eqdisc_opts: 'nat', qdisc_advanced: '1', qdisc_really_really_advanced: '1' },
+    },
+  ]);
 
   // fairness: its keywords, the rest stay
   const fair = s({ perDevice: true });
@@ -190,7 +206,9 @@ test('nothing changed, nothing written', () => {
 test('a queue with no interface gets the one the page shows', () => {
   const sqm = [section('queue', 'wan', { enabled: '1', download: '800000', upload: '60000' })];
   const data = load(sqm);
-  assert.deepEqual(save(data, { uploadMbit: '50' }), [{ op: 'set', config: 'sqm', section: 'wan', values: { interface: 'eth1', upload: '50000' } }]);
+  assert.deepEqual(save(data, { uploadMbit: '50' }), [
+    { op: 'set', config: 'sqm', section: 'wan', values: { interface: 'eth1', upload: '50000' } },
+  ]);
 });
 
 test('a new queue gets everything, and loads back as saved', () => {
@@ -225,7 +243,15 @@ test('a new queue gets everything, and loads back as saved', () => {
 test('a save loads back as the form that made it', () => {
   const sqm = [queue({ iqdisc_opts: 'nat dual-dsthost ingress', eqdisc_opts: 'nat dual-srchost' })];
   const data = load(sqm);
-  const form: SqmForm = { ...data.form, downloadMbit: '450', uploadMbit: '45', latency: 'low', uploadMemory: 'low', ackFilter: 'on', link: 'docsis' };
+  const form: SqmForm = {
+    ...data.form,
+    downloadMbit: '450',
+    uploadMbit: '45',
+    latency: 'low',
+    uploadMemory: 'low',
+    ackFilter: 'on',
+    link: 'docsis',
+  };
   assert.deepEqual(load([after(data, sqm, toChanges(form, data))]).form, form);
 });
 
@@ -299,7 +325,8 @@ test('multi-queue CAKE can’t estimate the speed: the kernel refuses it and dow
 
 test('a new queue’s upload stays one CAKE; an existing queue’s choice isn’t touched', () => {
   const data = load([]);
-  const sqm = applied({ sqm: [] }, toChanges({ ...data.form, enabled: true, downloadMbit: '800', uploadMbit: '100' }, data))['sqm'] ?? [];
+  const sqm =
+    applied({ sqm: [] }, toChanges({ ...data.form, enabled: true, downloadMbit: '800', uploadMbit: '100' }, data))['sqm'] ?? [];
   const q = sqm[0];
   assert.ok(q !== undefined);
   assert.equal(q['use_mq'], '1');
@@ -402,7 +429,22 @@ test('the Interface choices leave out the VPN’s tunnel and the guest networks�
     milkflint: [],
     wanDevice: 'eth1',
     wanProto: 'dhcp',
-    devices: ['eth0', 'eth1', 'eth1.911', 'lo', 'br-lan', 'br-guest', 'ifb4br-guest', 'br-guest2', 'wg_out', 'ifb4wg_out', 'ifb4eth1', 'phy1-ap0', 'pppoe-wan', 'wwan0'],
+    devices: [
+      'eth0',
+      'eth1',
+      'eth1.911',
+      'lo',
+      'br-lan',
+      'br-guest',
+      'ifb4br-guest',
+      'br-guest2',
+      'wg_out',
+      'ifb4wg_out',
+      'ifb4eth1',
+      'phy1-ap0',
+      'pppoe-wan',
+      'wwan0',
+    ],
   });
   assert.deepEqual(data.devices, ['eth0', 'eth1', 'eth1.911', 'pppoe-wan', 'wwan0']);
   // the reason: a queue there is the VPN's or a guest network's, and the page loses its own

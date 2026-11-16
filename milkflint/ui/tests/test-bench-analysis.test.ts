@@ -22,7 +22,12 @@ import type { RunRecord } from '../src/features/test-bench/member.ts';
 import { buildPlan, dataEstimate, defaultBudget } from '../src/features/test-bench/plans.ts';
 import { cfL4, Meter } from '../src/features/test-bench/wan.ts';
 
-const phase = (kind: Phase['kind'], start: number, dur: number, roles: Record<string, string> = {}): Phase => ({ kind, start, dur, roles });
+const phase = (kind: Phase['kind'], start: number, dur: number, roles: Record<string, string> = {}): Phase => ({
+  kind,
+  start,
+  dur,
+  roles,
+});
 
 test('percentiles interpolate between neighbours', () => {
   assert.equal(percentile([], 0.5), undefined);
@@ -97,8 +102,25 @@ test("Cloudflare's view: its median RTT, retransmits and losses added up", () =>
 
 test("the router's pings: each once, in the window", () => {
   const lines = parseProbes([
-    JSON.stringify({ t: 2000, r: { m1: [[0, 1000, 0.5], [1, 1200, null]], wan: [[0, 1100, 10]] } }),
-    JSON.stringify({ t: 3000, r: { m1: [[1, 1200, null], [2, 2500, 0.7]] } }),
+    JSON.stringify({
+      t: 2000,
+      r: {
+        m1: [
+          [0, 1000, 0.5],
+          [1, 1200, null],
+        ],
+        wan: [[0, 1100, 10]],
+      },
+    }),
+    JSON.stringify({
+      t: 3000,
+      r: {
+        m1: [
+          [1, 1200, null],
+          [2, 2500, 0.7],
+        ],
+      },
+    }),
     'not json',
     JSON.stringify({ t: 'x' }),
   ]);
@@ -113,7 +135,17 @@ test("the router's pings: each once, in the window", () => {
 });
 
 // a router sample: CPUs [busy, softirq, irq]; softnet [done, dropped, squeezed]; CAKE [bytes, packets, drops, backlog, tins]
-const tin = (drops: number, marks: number, peakUs: number, avgUs: number): number[] => [0, drops, marks, 0, 5000, peakUs, avgUs, 0, 0];
+const tin = (drops: number, marks: number, peakUs: number, avgUs: number): number[] => [
+  0,
+  drops,
+  marks,
+  0,
+  5000,
+  peakUs,
+  avgUs,
+  0,
+  0,
+];
 const sample = (t: number, cpu: [number, number][], drops: number, marks: number, avgUs: number, sn: number[][]): string =>
   JSON.stringify({
     t,
@@ -130,10 +162,50 @@ const sample = (t: number, cpu: [number, number][], drops: number, marks: number
 
 test("the router's samples in a window: the busiest core, Smart Queue's delay and its drops and marks there, softnet", () => {
   const lines = parseRouter([
-    sample(1000, [[0.1, 0], [0.2, 0.1]], 5, 1, 1000, [[1, 0, 0]]),
-    sample(2000, [[0.5, 0.4], [0.9, 0.8]], 7, 4, 3000, [[1, 2, 3]]),
-    sample(3000, [[0.4, 0.3], [0.3, 0.2]], 12, 6, 2000, [[1, 0, 1]]),
-    sample(9000, [[1, 1], [1, 1]], 99, 99, 99_000, [[0, 9, 9]]),
+    sample(
+      1000,
+      [
+        [0.1, 0],
+        [0.2, 0.1],
+      ],
+      5,
+      1,
+      1000,
+      [[1, 0, 0]],
+    ),
+    sample(
+      2000,
+      [
+        [0.5, 0.4],
+        [0.9, 0.8],
+      ],
+      7,
+      4,
+      3000,
+      [[1, 2, 3]],
+    ),
+    sample(
+      3000,
+      [
+        [0.4, 0.3],
+        [0.3, 0.2],
+      ],
+      12,
+      6,
+      2000,
+      [[1, 0, 1]],
+    ),
+    sample(
+      9000,
+      [
+        [1, 1],
+        [1, 1],
+      ],
+      99,
+      99,
+      99_000,
+      [[0, 9, 9]],
+    ),
   ]);
   const r = routerWindow(lines, { from: 1000, to: 4000 });
   assert.equal(r.cpuMax, 0.9);

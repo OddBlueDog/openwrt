@@ -4,9 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'clients',
-  title: 'Clients',
-  description: 'Devices on your network.',
+  title: 'All devices',
+  description: 'Every device on your network: rename one, fix its address, block it.',
   icon: MonitorSmartphoneIcon,
-  order: 30,
-  page: lazyPage(() => import('./page'), (m) => m.ClientsPage),
+  group: 'devices',
+  order: 10,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.ClientsPage,
+  ),
 } satisfies Feature;

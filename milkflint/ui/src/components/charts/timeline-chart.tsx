@@ -6,6 +6,8 @@ import type { PointerEvent, ReactElement } from 'react';
 import { cn } from '@/lib/utils';
 import { niceCeil } from './path';
 import { nearest, PLOT_LEFT, pointerTime, type TimePoint } from './time-axis';
+import { seriesDash } from './series';
+import { SeriesSwatch } from './series-swatch';
 
 export interface TimelineSeries {
   label: string;
@@ -39,13 +41,21 @@ function linePath(points: readonly TimePoint[], x: (t: number) => number, y: (v:
   return d.trim();
 }
 
-export function HoverCard({ x, title, rows }: { x: number; title: string; rows: readonly { label: string; color: string; value: string }[] }): ReactElement {
+export function HoverCard({
+  x,
+  title,
+  rows,
+}: {
+  x: number;
+  title: string;
+  rows: readonly { label: string; color: string; value: string }[];
+}): ReactElement {
   return (
     <div
       className="pointer-events-none absolute top-0 z-10 flex min-w-36 flex-col gap-1 rounded-md border bg-popover px-2.5 py-2 text-xs whitespace-nowrap text-popover-foreground shadow-md"
       style={{ left: `${String(x)}%`, transform: x > 55 ? 'translateX(calc(-100% - 10px))' : 'translateX(10px)' }}
     >
-      <span className="font-mono text-[10px] text-muted-foreground">{title}</span>
+      <span className="text-xs text-muted-foreground tabular">{title}</span>
       {rows.map((r) => (
         <span key={r.label} className="flex items-center gap-2">
           <span className="size-2 shrink-0 rounded-full" style={{ background: r.color }} />
@@ -95,6 +105,8 @@ export function TimelineChart({
   className?: string;
   label: string;
 }): ReactElement {
+  // a chart that dashes some lines to say something (peak against average) keeps its own dashes
+  const ownDashes = series.some((s) => s.dashed === true);
   const peak = Math.max(0, ...series.flatMap((s) => s.points.flatMap((p) => (p[1] === null ? [] : [p[1]]))));
   const max = fixedMax ?? niceCeil(Math.max(peak * 1.1, minMax));
   const span = Math.max(1, to - from);
@@ -119,7 +131,7 @@ export function TimelineChart({
         <div className="pointer-events-none absolute inset-0 flex flex-col justify-between">
           {[max, max / 2, 0].map((v) => (
             <div key={v} className="flex items-center gap-2">
-              <span className="w-20 shrink-0 text-right font-mono text-[10px] text-muted-foreground tabular">{format(v)}</span>
+              <span className="w-20 shrink-0 text-right text-xs text-muted-foreground tabular">{format(v)}</span>
               <div className="h-px flex-1 border-t border-dashed border-border" />
             </div>
           ))}
@@ -131,11 +143,20 @@ export function TimelineChart({
                 <div
                   key={b.from}
                   className="absolute inset-y-0 bg-muted/45"
-                  style={{ left: `${String(Math.max(0, x(b.from)))}%`, width: `${String(Math.max(0, Math.min(100, x(b.to)) - Math.max(0, x(b.from))))}%` }}
+                  style={{
+                    left: `${String(Math.max(0, x(b.from)))}%`,
+                    width: `${String(Math.max(0, Math.min(100, x(b.to)) - Math.max(0, x(b.from))))}%`,
+                  }}
                 />
               ),
           )}
-          <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label={label} className="absolute inset-0 size-full overflow-visible">
+          <svg
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+            role="img"
+            aria-label={label}
+            className="absolute inset-0 size-full overflow-visible"
+          >
             {series.map((s) => (
               <g key={s.label}>
                 <path
@@ -145,6 +166,8 @@ export function TimelineChart({
                   strokeWidth="1.6"
                   strokeLinejoin="round"
                   strokeDasharray={s.dashed === true ? '4 3' : undefined}
+                  // the theme's dash, unless this chart's dashes already mean something
+                  style={{ strokeDasharray: seriesDash(s.color, series.length, ownDashes) }}
                   vectorEffect="non-scaling-stroke"
                 />
                 {s.marks !== undefined && s.marks.length > 0 && (
@@ -186,16 +209,24 @@ export function TimelineChart({
               <HoverCard
                 x={hx}
                 title={timeText(hover)}
-                rows={rows.map(({ s, p }) => ({ label: s.label, color: s.color, value: p?.[1] === undefined || p[1] === null ? '—' : hoverFormat(p[1]) }))}
+                rows={rows.map(({ s, p }) => ({
+                  label: s.label,
+                  color: s.color,
+                  value: p?.[1] === undefined || p[1] === null ? '—' : hoverFormat(p[1]),
+                }))}
               />
             )}
           </div>
         </div>
       </div>
-      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground" style={{ paddingLeft: PLOT_LEFT }}>
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground" style={{ paddingLeft: PLOT_LEFT }}>
         {series.map((s) => (
           <span key={s.label} className="inline-flex items-center gap-1.5">
-            <span className={cn('h-0.5 w-3 rounded-full', s.dashed === true && 'opacity-60')} style={{ background: s.color }} />
+            <SeriesSwatch
+              color={s.color}
+              dash={s.dashed === true ? '4 3' : seriesDash(s.color, series.length, ownDashes)}
+              className={cn(s.dashed === true && 'opacity-60')}
+            />
             {s.label}
           </span>
         ))}

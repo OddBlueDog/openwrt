@@ -30,7 +30,10 @@ export function defaultGuestLabel(id: GuestId): string {
 /** What the Guest Wi-Fi page calls each guest network: its label in /etc/config/milkflint, or the default. */
 export function guestLabels(milkflint: readonly Section[]): Record<GuestId, string> {
   const label = (id: GuestId): string => {
-    const set = str(milkflint.find((s) => s['.type'] === 'guest_network' && s['.name'] === id), 'label')?.trim();
+    const set = str(
+      milkflint.find((s) => s['.type'] === 'guest_network' && s['.name'] === id),
+      'label',
+    )?.trim();
     return set === undefined || set === '' ? defaultGuestLabel(id) : set;
   };
   return { guest: label('guest'), guest2: label('guest2'), guest3: label('guest3') };

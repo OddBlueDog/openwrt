@@ -111,15 +111,21 @@ export function wedOnChanges(cfg: WedConfig): Change[] {
   changes.push(...sectionChanges('milkflint', [...cfg.milkflint], 'wifi', { wed: '1' }));
   if (Object.keys(remember).length > 0) {
     // only what's new: what the section already remembers stays
-    const values = Object.fromEntries(Object.entries(remember).filter(([option, value]) => str(had, option) !== value)) as Record<string, string>;
+    const values = Object.fromEntries(Object.entries(remember).filter(([option, value]) => str(had, option) !== value)) as Record<
+      string,
+      string
+    >;
     if (Object.keys(values).length > 0) {
       changes.push(
-        had === undefined ? { op: 'add', config: 'milkflint', type: 'wed', name: 'wed', values } : { op: 'set', config: 'milkflint', section: 'wed', values },
+        had === undefined
+          ? { op: 'add', config: 'milkflint', type: 'wed', name: 'wed', values }
+          : { op: 'set', config: 'milkflint', section: 'wed', values },
       );
     }
   }
   for (const q of off) changes.push({ op: 'set', config: 'sqm', section: q['.name'], values: { enabled: '0' } });
-  if (fw !== undefined && Object.keys(fwValues).length > 0) changes.push({ op: 'set', config: 'firewall', section: fw['.name'], values: fwValues });
+  if (fw !== undefined && Object.keys(fwValues).length > 0)
+    changes.push({ op: 'set', config: 'firewall', section: fw['.name'], values: fwValues });
   return changes;
 }
 
@@ -166,7 +172,8 @@ export function wedOffChanges(cfg: WedConfig, { keepFirewall = false } = {}): Ch
   const had = section(cfg.milkflint, 'wed');
   changes.push(...sectionChanges('milkflint', [...cfg.milkflint], 'wifi', { wed: undefined }));
   if (had === undefined) return changes;
-  for (const q of wedRestores(cfg).queues) changes.push({ op: 'set', config: 'sqm', section: q.section, values: { enabled: '1' } });
+  for (const q of wedRestores(cfg).queues)
+    changes.push({ op: 'set', config: 'sqm', section: q.section, values: { enabled: '1' } });
   if (fw !== undefined && !keepFirewall) {
     const values: Record<string, string> = {};
     const hw = putBack(fw, 'flow_offloading_hw', str(had, 'offload_hw'));

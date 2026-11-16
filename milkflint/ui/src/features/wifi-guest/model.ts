@@ -18,7 +18,10 @@ export const PREFIX = 24;
 /** What a network is for decides what it starts with; after that, it's all settings. */
 export type Kind = 'visitors' | 'devices';
 
-export const kinds: Record<Kind, { label: string; suffix: string; encryption: string; isolate: boolean; leasetime: string; only2g: boolean }> = {
+export const kinds: Record<
+  Kind,
+  { label: string; suffix: string; encryption: string; isolate: boolean; leasetime: string; only2g: boolean }
+> = {
   // phones and laptops: WPA3 where they can, kept from each other
   visitors: { label: 'Guests', suffix: 'Guest', encryption: 'sae-mixed', isolate: true, leasetime: '1h', only2g: false },
   // plugs, bulbs, cameras: mostly 2.4 GHz only and WPA2 only (some won't join a WPA2/WPA3 network), and
@@ -133,6 +136,22 @@ export interface GuestData {
   dnsIntercept: boolean;
 }
 
+/**
+ * How long a device keeps its address before it asks again (dnsmasq's lease
+ * time, OpenWrt's dhcp `leasetime`). A pool without one gets OpenWrt's 12h.
+ */
+export const LEASE_TIMES = [
+  { value: '1h', label: '1 hour' },
+  { value: '4h', label: '4 hours' },
+  { value: '12h', label: '12 hours' },
+  { value: '1d', label: '1 day' },
+  { value: '7d', label: '1 week' },
+] as const;
+
+export function leaseLabel(value: string): string {
+  return LEASE_TIMES.find((l) => l.value === value)?.label ?? value;
+}
+
 export function bandLabel(band: string): string {
   return band === '2g' ? '2.4 GHz' : band === '5g' ? '5 GHz' : band === '6g' ? '6 GHz' : band;
 }
@@ -162,7 +181,9 @@ export function credsOf(s: Section | undefined, fallback: Creds): Creds {
 
 /** What each band that's on broadcasts. */
 export function bandCreds(f: NetForm, radios: readonly Radio[]): { radio: Radio; creds: Creds }[] {
-  return radios.filter((r) => f.bands[r.name] === true).map((radio) => ({ radio, creds: f.same ? f.shared : (f.own[radio.name] ?? f.shared) }));
+  return radios
+    .filter((r) => f.bands[r.name] === true)
+    .map((radio) => ({ radio, creds: f.same ? f.shared : (f.own[radio.name] ?? f.shared) }));
 }
 
 /** The first of the addresses that's free: not the LAN's, another network's, or a guest network's. */
@@ -175,7 +196,9 @@ export function freeAddress(d: GuestData, others: readonly NetForm[]): string {
       return ip === undefined ? [] : [{ ip, prefix: PREFIX }];
     }),
   ];
-  return ADDRESSES.find((a) => !used.some((u) => overlaps(ipToInt(a) ?? 0, PREFIX, u.ip, u.prefix))) ?? ADDRESSES[0] ?? '192.168.9.1';
+  return (
+    ADDRESSES.find((a) => !used.some((u) => overlaps(ipToInt(a) ?? 0, PREFIX, u.ip, u.prefix))) ?? ADDRESSES[0] ?? '192.168.9.1'
+  );
 }
 
 /** A new network's settings, by what it's for; `others` are the networks it joins. */
@@ -185,7 +208,10 @@ export function newForm(id: GuestId, kind: Kind, d: GuestData, others: readonly 
   let label = k.label;
   for (let n = 2; labels.has(label); n++) label = `${k.label} ${String(n)}`;
   const names = new Set(others.flatMap((f) => [f.shared.ssid, ...Object.values(f.own).map((c) => c.ssid)]));
-  const base = d.mainSsid === undefined || new TextEncoder().encode(`${d.mainSsid}-${k.suffix}`).length > 30 ? k.suffix : `${d.mainSsid}-${k.suffix}`;
+  const base =
+    d.mainSsid === undefined || new TextEncoder().encode(`${d.mainSsid}-${k.suffix}`).length > 30
+      ? k.suffix
+      : `${d.mainSsid}-${k.suffix}`;
   let ssid = base;
   for (let n = 2; names.has(ssid); n++) ssid = `${base}${String(n)}`;
   const shared: Creds = { ssid, encryption: k.encryption, cipher: '', key: generateKey() };
@@ -266,8 +292,10 @@ export function validate(f: NetForm, net: NetData, d: GuestData, others: readonl
     else if (!(first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168)))
       e[`${id}-ip`] = 'Use a private address (10.x, 172.16–31.x or 192.168.x).';
     else if (host === 0 || host === 255) e[`${id}-ip`] = 'End it in 1 to 254.';
-    else if (d.lan !== undefined && overlaps(ip, PREFIX, d.lan.ip, d.lan.prefix)) e[`${id}-ip`] = 'That’s inside your main network (LAN): pick another range.';
-    else if (clash !== undefined) e[`${id}-ip`] = `That’s the range of another network on the router (${clash.name}): pick another.`;
+    else if (d.lan !== undefined && overlaps(ip, PREFIX, d.lan.ip, d.lan.prefix))
+      e[`${id}-ip`] = 'That’s inside your main network (LAN): pick another range.';
+    else if (clash !== undefined)
+      e[`${id}-ip`] = `That’s the range of another network on the router (${clash.name}): pick another.`;
     else if (sibling !== undefined) e[`${id}-ip`] = `${labelOf(sibling)} uses that range: pick another.`;
   }
   if (!speedOk(f.downMbit) || !speedOk(f.upMbit)) e[`${id}-speed`] = 'Use 0.5 to 10,000 Mbit/s, or leave it empty for no limit.';
@@ -289,7 +317,8 @@ export function toChanges(f: NetForm, net: NetData, d: GuestData): Change[] {
   const label = f.label.trim();
   if (label !== (str(net.meta, 'label') ?? '')) {
     if (net.meta === undefined) {
-      if (label !== '' && label !== defaultGuestLabel(id)) changes.push({ op: 'add', config: 'milkflint', type: 'guest_network', name: id, values: { label } });
+      if (label !== '' && label !== defaultGuestLabel(id))
+        changes.push({ op: 'add', config: 'milkflint', type: 'guest_network', name: id, values: { label } });
     } else if (label === '') {
       changes.push({ op: 'unset', config: 'milkflint', section: net.meta['.name'], options: ['label'] });
     } else {
@@ -299,35 +328,66 @@ export function toChanges(f: NetForm, net: NetData, d: GuestData): Change[] {
 
   // off: the access points stop, the rest stays (and stays in LuCI) for next time
   if (!f.enabled) {
-    for (const s of Object.values(net.aps)) changes.push({ op: 'set', config: 'wireless', section: s['.name'], values: { disabled: '1' } });
+    for (const s of Object.values(net.aps))
+      changes.push({ op: 'set', config: 'wireless', section: s['.name'], values: { disabled: '1' } });
     return changes;
   }
 
   // a bridge of its own, so the bands' access points share one network; up
   // even while they're down, so the address and DHCP don't come and go
   if (net.device === undefined) {
-    changes.push({ op: 'add', config: 'network', type: 'device', name: `${id}_dev`, values: { name: bridge, type: 'bridge', bridge_empty: '1' } });
+    changes.push({
+      op: 'add',
+      config: 'network',
+      type: 'device',
+      name: `${id}_dev`,
+      values: { name: bridge, type: 'bridge', bridge_empty: '1' },
+    });
   }
   const cidr = `${f.ipaddr}/${String(PREFIX)}`;
   if (net.iface === undefined) {
-    changes.push({ op: 'add', config: 'network', type: 'interface', name: id, values: { proto: 'static', device: bridge, ipaddr: [cidr] } });
+    changes.push({
+      op: 'add',
+      config: 'network',
+      type: 'interface',
+      name: id,
+      values: { proto: 'static', device: bridge, ipaddr: [cidr] },
+    });
   } else if (!net.addressFixed && f.ipaddr !== net.form.ipaddr) {
     changes.push({ op: 'set', config: 'network', section: net.iface['.name'], values: { ipaddr: [cidr] } });
     changes.push({ op: 'unset', config: 'network', section: net.iface['.name'], options: ['netmask'] });
   }
   if (net.dhcp === undefined) {
-    changes.push({ op: 'add', config: 'dhcp', type: 'dhcp', name: id, values: { interface: id, start: '100', limit: '150', leasetime: f.leasetime } });
+    changes.push({
+      op: 'add',
+      config: 'dhcp',
+      type: 'dhcp',
+      name: id,
+      values: { interface: id, start: '100', limit: '150', leasetime: f.leasetime },
+    });
+  } else if (f.leasetime !== net.form.leasetime) {
+    changes.push({ op: 'set', config: 'dhcp', section: net.dhcp['.name'], values: { leasetime: f.leasetime } });
   }
   // it may only go out to the internet; of the router, it gets DNS and DHCP
   if (net.zone === undefined) {
-    changes.push({ op: 'add', config: 'firewall', type: 'zone', name: id, values: { name: id, network: [id], input: 'REJECT', output: 'ACCEPT', forward: 'REJECT' } });
+    changes.push({
+      op: 'add',
+      config: 'firewall',
+      type: 'zone',
+      name: id,
+      values: { name: id, network: [id], input: 'REJECT', output: 'ACCEPT', forward: 'REJECT' },
+    });
   }
   if (!net.forwardings.some((s) => str(s, 'src') === id && str(s, 'dest') === d.wanZone)) {
     changes.push({ op: 'add', config: 'firewall', type: 'forwarding', name: `${id}_wan`, values: { src: id, dest: d.wanZone } });
   }
   const allows = (port: string): boolean =>
     net.rules.some(
-      (s) => str(s, 'src') === id && list(s, 'dest_port').includes(port) && (str(s, 'target') ?? '').toUpperCase() === 'ACCEPT' && bool(s, 'enabled', true),
+      (s) =>
+        str(s, 'src') === id &&
+        list(s, 'dest_port').includes(port) &&
+        (str(s, 'target') ?? '').toUpperCase() === 'ACCEPT' &&
+        bool(s, 'enabled', true),
     );
   // Allow-DNS-Guest, Allow-DNS-Guest2…
   const suffix = `${id.charAt(0).toUpperCase()}${id.slice(1)}`;
@@ -407,14 +467,22 @@ export function toChanges(f: NetForm, net: NetData, d: GuestData): Change[] {
     };
     if (ap !== undefined) {
       changes.push({ op: 'set', config: 'wireless', section: ap['.name'], values: { ...values, disabled: '0' } });
-      if (creds.encryption === 'none' && str(ap, 'key') !== undefined) changes.push({ op: 'unset', config: 'wireless', section: ap['.name'], options: ['key'] });
+      if (creds.encryption === 'none' && str(ap, 'key') !== undefined)
+        changes.push({ op: 'unset', config: 'wireless', section: ap['.name'], options: ['key'] });
     } else {
       changes.push({
         op: 'add',
         config: 'wireless',
         type: 'wifi-iface',
         name: `${id}_${r.name}`,
-        values: { device: r.name, mode: 'ap', network: id, ...values, ...(d.dtim === undefined ? {} : { dtim_period: d.dtim }), disabled: '0' },
+        values: {
+          device: r.name,
+          mode: 'ap',
+          network: id,
+          ...values,
+          ...(d.dtim === undefined ? {} : { dtim_period: d.dtim }),
+          disabled: '0',
+        },
       });
     }
   }
@@ -423,7 +491,8 @@ export function toChanges(f: NetForm, net: NetData, d: GuestData): Change[] {
 
 /** Everything a network is made of, for Remove. */
 export function removal(net: NetData): Change[] {
-  const del = (config: string, s: Section | null | undefined): Change[] => (s === undefined || s === null ? [] : [{ op: 'delete', config, section: s['.name'] }]);
+  const del = (config: string, s: Section | null | undefined): Change[] =>
+    s === undefined || s === null ? [] : [{ op: 'delete', config, section: s['.name'] }];
   return [
     ...Object.values(net.aps).flatMap((s) => del('wireless', s)),
     ...del('network', net.iface),
@@ -434,4 +503,101 @@ export function removal(net: NetData): Change[] {
     ...del('sqm', net.shaper),
     ...del('milkflint', net.meta),
   ];
+}
+
+/** "Name on 2.4 and 5 GHz", "A on 2.4 GHz, B on 5 GHz", "On no band" or "Off". */
+export function networkSummary(f: NetForm, radios: readonly Radio[]): string {
+  if (!f.enabled) return 'Off';
+  const on = bandCreds(f, radios);
+  if (on.length === 0) return 'On no band';
+  const names = [...new Set(on.map((b) => b.creds.ssid))];
+  if (names.length === 1) return `${names[0] ?? ''} on ${on.map((b) => bandLabel(b.radio.band)).join(' and ')}`;
+  return on.map((b) => `${b.creds.ssid} on ${bandLabel(b.radio.band)}`).join(', ');
+}
+
+/** What "More settings" holds now, in a line, so nothing there goes unseen while it's folded. */
+export function moreSummary(f: NetForm, radios: readonly Radio[]): string {
+  const down = f.downMbit === '' ? undefined : `${f.downMbit} down`;
+  const up = f.upMbit === '' ? undefined : `${f.upMbit} up`;
+  return [
+    radios.length > 1 && !f.same ? 'Each band its own name' : undefined,
+    f.isolate ? 'Devices kept apart' : 'Devices can reach each other',
+    down !== undefined || up !== undefined
+      ? `Limited to ${[down, up].filter((x) => x !== undefined).join(', ')} Mbit/s`
+      : undefined,
+    f.ipaddr,
+  ]
+    .filter((x) => x !== undefined && x !== '')
+    .join(' · ');
+}
+
+/** A QR code to join a network: its text, the name it joins, and its band when the bands differ. */
+export interface JoinCode {
+  key: string;
+  ssid: string;
+  band: string | undefined;
+  /** The security and password, as OpenWrt has them (for wifiQrText). */
+  encryption: string;
+  password: string;
+}
+
+/**
+ * The codes that join a network as it's set up: one when every band is the
+ * same, else one per band. None while it's off, and none for a security mode a
+ * QR code can't carry (one with a username).
+ */
+export function joinCodes(f: NetForm, radios: readonly Radio[]): JoinCode[] {
+  if (!f.enabled) return [];
+  const on = bandCreds(f, radios);
+  const codes = f.same
+    ? on.slice(0, 1).map((b) => ({ ...b, band: undefined }))
+    : on.map((b) => ({ ...b, band: bandLabel(b.radio.band) }));
+  return codes.flatMap(({ radio, creds, band }) => {
+    // OWE is open to a phone
+    const encryption = creds.encryption === 'owe' ? 'none' : creds.encryption;
+    if (encryption !== 'none' && !/^(psk|sae)/.test(encryption)) return [];
+    if (creds.ssid === '') return [];
+    return [{ key: radio.name, ssid: creds.ssid, band, encryption, password: creds.key }];
+  });
+}
+
+/** The access points (wireless sections) a network has or will have on the bands it's on: for the UCI options a setting writes. */
+export function apSections(f: NetForm, net: NetData, radios: readonly Radio[]): string[] {
+  return radios.filter((r) => f.bands[r.name] === true).map((r) => net.aps[r.name]?.['.name'] ?? `${f.id}_${r.name}`);
+}
+
+/**
+ * What saving does to the devices on networks that are on air now, a
+ * sentence each, for the warning above the save bar: a network going off,
+ * a new name or password to join again with, or a restart of its Wi-Fi.
+ */
+export function saveWarnings(forms: readonly NetForm[], saved: readonly NetForm[], radios: readonly Radio[]): string[] {
+  const out: string[] = [];
+  for (const f of forms) {
+    const before = saved.find((s) => s.id === f.id);
+    // a new network, or one that's off, has no devices to drop
+    if (before?.enabled !== true) continue;
+    const label = labelOf(f);
+    if (!f.enabled) {
+      out.push(`${label} goes off the air: its devices lose it.`);
+      continue;
+    }
+    const was = new Map(bandCreds(before, radios).map((b) => [b.radio.name, b.creds]));
+    const now = bandCreds(f, radios);
+    const kept = now.filter((b) => was.has(b.radio.name));
+    const renamed = kept.some((b) => b.creds.ssid !== was.get(b.radio.name)?.ssid);
+    const rekeyed = kept.some((b) => b.creds.encryption !== 'none' && b.creds.key !== was.get(b.radio.name)?.key);
+    const restarted =
+      now.length !== was.size ||
+      now.some((b) => !was.has(b.radio.name)) ||
+      kept.some((b) => b.creds.encryption !== was.get(b.radio.name)?.encryption) ||
+      f.isolate !== before.isolate;
+    if (renamed || rekeyed) {
+      const what = renamed && rekeyed ? 'name and password' : renamed ? 'name' : 'password';
+      out.push(`Devices on ${label} have to join again with its new ${what}.`);
+    } else if (restarted) {
+      out.push(`${label}’s Wi-Fi restarts where it changes: its devices reconnect within a few seconds.`);
+    }
+  }
+  return out;
 }

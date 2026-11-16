@@ -11,14 +11,17 @@ export const Sheet = DialogPrimitive.Root;
 export function SheetContent({ className, children, ...props }: ComponentProps<typeof DialogPrimitive.Content>): ReactElement {
   return (
     <DialogPrimitive.Portal>
-      <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-[2px]" />
+      <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-scrim data-[state=open]:animate-[mf-fade-in_var(--mf-duration-base)_var(--mf-ease-standard)]" />
       <DialogPrimitive.Content
         data-slot="sheet-content"
-        className={cn('fixed inset-y-0 right-0 z-50 flex w-full flex-col border-l bg-popover text-popover-foreground shadow-lg sm:max-w-xl', className)}
+        className={cn(
+          'fixed inset-y-0 right-0 z-50 flex w-full flex-col border-l bg-popover text-popover-foreground shadow-lg data-[state=open]:animate-[mf-sheet-in_var(--mf-duration-slow)_var(--mf-ease-enter)] sm:max-w-xl',
+          className,
+        )}
         {...props}
       >
         {children}
-        <DialogPrimitive.Close className="absolute top-4 right-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
+        <DialogPrimitive.Close className="absolute top-3.5 right-3.5 flex size-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors duration-fast hover:bg-accent hover:text-foreground">
           <XIcon className="size-4" />
           <span className="sr-only">Close</span>
         </DialogPrimitive.Close>
@@ -28,7 +31,7 @@ export function SheetContent({ className, children, ...props }: ComponentProps<t
 }
 
 export function SheetTitle({ className, ...props }: ComponentProps<typeof DialogPrimitive.Title>): ReactElement {
-  return <DialogPrimitive.Title className={cn('text-base font-semibold', className)} {...props} />;
+  return <DialogPrimitive.Title className={cn('pr-8 text-base font-semibold', className)} {...props} />;
 }
 
 export function SheetDescription({ className, ...props }: ComponentProps<typeof DialogPrimitive.Description>): ReactElement {

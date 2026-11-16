@@ -48,11 +48,36 @@ test('a device’s speed each second: nothing arriving in its load phase is 0, o
 
 test('Smart Queue each second: drops and marks since the last sample, the busiest tin of those that sent', () => {
   const lines = parseRouter([
-    JSON.stringify({ t: T0, cake: { 'ifb4eth1 1:': [0, 0, 0, 0, [[0, 0, 0, 0, 5000, 0, 0], [0, 0, 0, 0, 5000, 0, 0]]] } }),
+    JSON.stringify({
+      t: T0,
+      cake: {
+        'ifb4eth1 1:': [
+          0,
+          0,
+          0,
+          0,
+          [
+            [0, 0, 0, 0, 5000, 0, 0],
+            [0, 0, 0, 0, 5000, 0, 0],
+          ],
+        ],
+      },
+    }),
     JSON.stringify({
       t: T0 + 1000,
       dt: 1,
-      cake: { 'ifb4eth1 1:': [1_250_000, 900, 2, 1500, [[1_250_000, 2, 5, 1500, 5000, 7000, 3000], [0, 0, 0, 0, 5000, 30_000, 9000]]] },
+      cake: {
+        'ifb4eth1 1:': [
+          1_250_000,
+          900,
+          2,
+          1500,
+          [
+            [1_250_000, 2, 5, 1500, 5000, 7000, 3000],
+            [0, 0, 0, 0, 5000, 30_000, 9000],
+          ],
+        ],
+      },
     }),
   ]);
   const [s] = cakeSeconds(lines, T0, 'down');
@@ -73,7 +98,10 @@ test('a Wi-Fi station every 2 s: retries and failed frames as shares of those se
 
 test('the WAN port: as the first sample names it, else from Smart Queue’s queue on it', () => {
   assert.equal(wanPort(fixture().router), 'eth1');
-  assert.equal(wanPort(parseRouter([JSON.stringify({ t: 1, cake: { 'ifb4wan 1:': [0, 0, 0, 0, []], 'wan 1:': [0, 0, 0, 0, []] } })])), 'wan');
+  assert.equal(
+    wanPort(parseRouter([JSON.stringify({ t: 1, cake: { 'ifb4wan 1:': [0, 0, 0, 0, []], 'wan 1:': [0, 0, 0, 0, []] } })])),
+    'wan',
+  );
   assert.equal(wanPort([]), undefined);
 });
 

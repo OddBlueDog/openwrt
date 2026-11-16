@@ -1,6 +1,8 @@
 // Turning probe samples into a summary and a 0-100 score. Pure functions, so
-// the scoring is easy to check and tune.
+// the scoring is easy to check and tune. Rounds with an impossible time
+// (plausible.ts) are left out of every figure.
 import type { Sample } from './api';
+import { possibleSamples } from './plausible';
 
 export type Probe = 'gateway' | 'internet' | 'dns';
 
@@ -37,7 +39,11 @@ function summarizeProbe(samples: readonly Sample[], probe: Probe): ProbeSummary 
 
 /** A DNS server over the rounds that asked it; the score uses the main one's (Sample.dns). */
 export function summarizeDnsServer(samples: readonly Sample[], key: string): ProbeSummary {
-  return summarizeValues(samples.flatMap((s) => (s.dns_servers === undefined || !(key in s.dns_servers) ? [] : [s.dns_servers[key] ?? null])));
+  return summarizeValues(
+    possibleSamples(samples).flatMap((s) =>
+      s.dns_servers === undefined || !(key in s.dns_servers) ? [] : [s.dns_servers[key] ?? null],
+    ),
+  );
 }
 
 function summarizeValues(values: readonly (number | null)[]): ProbeSummary {
@@ -64,7 +70,8 @@ function scale(value: number, good: number, bad: number): number {
  * no gateway), a gateway that answered nothing in the window while the
  * internet did counts as silent.
  */
-export function summarize(samples: readonly Sample[], gatewayAnswers?: boolean | null): Summary {
+export function summarize(all: readonly Sample[], gatewayAnswers?: boolean | null): Summary {
+  const samples = possibleSamples(all);
   const probes = {
     gateway: summarizeProbe(samples, 'gateway'),
     internet: summarizeProbe(samples, 'internet'),
@@ -85,7 +92,10 @@ export function summarize(samples: readonly Sample[], gatewayAnswers?: boolean |
 
   const gatewaySilent =
     gatewayAnswers === false ||
-    ((gatewayAnswers === null || gatewayAnswers === undefined) && samples.length >= 3 && probes.gateway.answered === 0 && probes.internet.answered > 0);
+    ((gatewayAnswers === null || gatewayAnswers === undefined) &&
+      samples.length >= 3 &&
+      probes.gateway.answered === 0 &&
+      probes.internet.answered > 0);
   const parts: [weight: number, score: number][] = [];
   const net = probes.internet;
   parts.push([0.25, scale(net.loss, 0, 0.1)]);
@@ -94,7 +104,10 @@ export function summarize(samples: readonly Sample[], gatewayAnswers?: boolean |
   if (jitter !== undefined) parts.push([0.15, scale(jitter, 3, 50)]);
   parts.push([0.15, probes.dns.typical === undefined ? 0 : scale(probes.dns.typical, 30, 400) * (1 - probes.dns.loss)]);
   if (!gatewaySilent) {
-    parts.push([0.15, probes.gateway.typical === undefined ? 0 : scale(probes.gateway.typical, 3, 50) * (1 - probes.gateway.loss)]);
+    parts.push([
+      0.15,
+      probes.gateway.typical === undefined ? 0 : scale(probes.gateway.typical, 3, 50) * (1 - probes.gateway.loss),
+    ]);
   }
   const weight = parts.reduce((w, [x]) => w + x, 0);
   const score = samples.length === 0 ? undefined : Math.round(parts.reduce((s, [w, v]) => s + w * v, 0) / weight);

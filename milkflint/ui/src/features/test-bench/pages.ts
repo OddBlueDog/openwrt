@@ -65,7 +65,13 @@ export function parseSites(text: string): { sites: string[]; bad: string[] } {
 
 /** The fixed list and a plan's own sites (loaded as they're named). */
 export function siteList(custom: readonly string[] = []): Site[] {
-  return [...SITES, ...custom.slice(0, MAX_CUSTOM_SITES).filter(validHost).map((name) => ({ site: name, host: name }))];
+  return [
+    ...SITES,
+    ...custom
+      .slice(0, MAX_CUSTOM_SITES)
+      .filter(validHost)
+      .map((name) => ({ site: name, host: name })),
+  ];
 }
 
 /** A round at most this often; a made-up name's lookup and a page fetch are given up after these. */
@@ -118,7 +124,13 @@ async function cold(s: Site, clock: Clock, signal: AbortSignal, record: (r: RunR
 }
 
 /** A page's favicon, cache-busted: its whole time, or null if it failed. */
-async function page(s: Site, kind: 'first' | 'repeat', clock: Clock, signal: AbortSignal, record: (r: RunRecord) => void): Promise<number | undefined> {
+async function page(
+  s: Site,
+  kind: 'first' | 'repeat',
+  clock: Clock,
+  signal: AbortSignal,
+  record: (r: RunRecord) => void,
+): Promise<number | undefined> {
   const url = `https://${s.host}/favicon.ico?mfb=${randomLabel()}`;
   const t0 = performance.now();
   const t = clock.router(t0);

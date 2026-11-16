@@ -62,7 +62,11 @@ export function isRecord(r: unknown[]): r is RunRecord {
       return num(1) && num(2);
     case 'peer':
       return (
-        num(1) && partner(2) && (r[3] === 'p' || r[3] === 'b') && (r[4] === 'open' || r[4] === 'fail' || r[4] === 'wait') && linkDiagSchema.safeParse(r[5]).success
+        num(1) &&
+        partner(2) &&
+        (r[3] === 'p' || r[3] === 'b') &&
+        (r[4] === 'open' || r[4] === 'fail' || r[4] === 'wait') &&
+        linkDiagSchema.safeParse(r[5]).success
       );
     case 'pp':
       return partner(1) && num(2) && num(3) && (r[4] === null || num(4));

@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'backup-reset',
-  title: 'Backup & Reset',
+  title: 'Backup & reset',
   description: 'Save your settings, restart, or go back to factory settings.',
   icon: ArchiveRestoreIcon,
   group: 'system',
-  order: 80,
-  page: lazyPage(() => import('./page'), (m) => m.BackupResetPage),
+  order: 30,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.BackupResetPage,
+  ),
 } satisfies Feature;

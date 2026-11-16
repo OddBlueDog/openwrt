@@ -3,11 +3,22 @@
 // made-up run, at the edges that change its verdict.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { type Check, type CheckId, defaultThresholds, grade, parseThresholds, runChecks, THRESHOLDS, thresholdKeys, worst } from '../src/features/test-bench/checks.ts';
+import {
+  type Check,
+  type CheckId,
+  defaultThresholds,
+  grade,
+  parseThresholds,
+  runChecks,
+  THRESHOLDS,
+  thresholdKeys,
+  worst,
+} from '../src/features/test-bench/checks.ts';
 import { latencyRows } from '../src/features/test-bench/latency.ts';
 import { fixture, type FixtureOptions } from './test-bench-fixture.ts';
 
-const checks = (o: FixtureOptions = {}, t = defaultThresholds()): Map<CheckId, Check> => new Map(runChecks(fixture(o), t).map((c) => [c.id, c]));
+const checks = (o: FixtureOptions = {}, t = defaultThresholds()): Map<CheckId, Check> =>
+  new Map(runChecks(fixture(o), t).map((c) => [c.id, c]));
 const status = (o: FixtureOptions, id: CheckId): string | undefined => checks(o).get(id)?.status;
 
 // ---- Thresholds ----
@@ -19,7 +30,12 @@ test('thresholds: every check’s default, and a stored copy read back with junk
   assert.deepEqual(d.shaperReach, { pass: 85, warn: null });
   assert.deepEqual(parseThresholds(d), d);
   assert.deepEqual(parseThresholds('nonsense'), d);
-  const p = parseThresholds({ wanAdded: { pass: 20, warn: 'x' }, cpu: { pass: Infinity }, shaperReach: { pass: 70, warn: 60 }, extra: { pass: 1 } });
+  const p = parseThresholds({
+    wanAdded: { pass: 20, warn: 'x' },
+    cpu: { pass: Infinity },
+    shaperReach: { pass: 70, warn: 60 },
+    extra: { pass: 1 },
+  });
   assert.deepEqual(p.wanAdded, { pass: 20, warn: 30 });
   assert.deepEqual(p.cpu, d.cpu);
   assert.deepEqual(p.shaperReach, { pass: 70, warn: null });

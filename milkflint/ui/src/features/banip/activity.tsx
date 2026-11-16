@@ -3,7 +3,17 @@
 // each with a lookup and its fix; what's blocked most (addresses, devices,
 // ports, lists); each list's hits from banIP's report, and its contents a
 // page at a time; the log monitor's own blocks; banIP's own log.
-import { ActivityIcon, ChevronLeftIcon, ChevronRightIcon, FileTextIcon, ListIcon, LoaderCircleIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon } from 'lucide-react';
+import {
+  ActivityIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  FileTextIcon,
+  ListIcon,
+  LoaderCircleIcon,
+  RefreshCwIcon,
+  SearchIcon,
+  ShieldCheckIcon,
+} from 'lucide-react';
 import { type ReactElement, useEffect, useMemo, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Badge } from '@/components/ui/badge';
@@ -37,7 +47,7 @@ import {
 import { infoOf } from './feeds';
 import { LookupResult } from './lookup';
 import { describeDrop, parseLogLine, serviceOf } from './model';
-import { Segmented } from './segmented';
+import { Segmented } from '@/components/ui/segmented';
 
 const PAGE = 50;
 
@@ -77,20 +87,44 @@ function Recording({ c, s, onSaved }: { c: BanipConfig; s: BanipStatus | undefin
   const inb = s?.logging?.inbound ?? c.options?.['ban_loginbound'] === '1';
   return (
     <Card>
-      <CardHeading icon={ActivityIcon} title="What’s recorded" description="Each blocked connection can be listed here. banIP counts them all either way, while counting is on." />
+      <CardHeading
+        icon={ActivityIcon}
+        title="What’s recorded"
+        description="Each blocked connection can be listed here. banIP counts them all either way, while counting is on."
+      />
       <CardContent className="flex flex-col gap-3">
         <div className="flex items-start gap-3">
-          <Switch className="mt-0.5" checked={out} disabled={busy !== undefined} onCheckedChange={(v) => { set('ban_logoutbound', v); }} aria-label="List blocked connections from your devices" />
+          <Switch
+            className="mt-0.5"
+            checked={out}
+            disabled={busy !== undefined}
+            onCheckedChange={(v) => {
+              set('ban_logoutbound', v);
+            }}
+            aria-label="List blocked connections from your devices"
+          />
           <span className="flex flex-col gap-0.5">
             <span className="text-sm font-medium">Blocked connections from your devices</span>
-            <span className="text-xs text-muted-foreground">Rare, and the ones to look at: a list may have blocked something a device needs.</span>
+            <span className="text-xs text-muted-foreground">
+              Rare, and the ones to look at: a list may have blocked something a device needs.
+            </span>
           </span>
         </div>
         <div className="flex items-start gap-3">
-          <Switch className="mt-0.5" checked={inb} disabled={busy !== undefined} onCheckedChange={(v) => { set('ban_loginbound', v); }} aria-label="List blocked attempts from the internet" />
+          <Switch
+            className="mt-0.5"
+            checked={inb}
+            disabled={busy !== undefined}
+            onCheckedChange={(v) => {
+              set('ban_loginbound', v);
+            }}
+            aria-label="List blocked attempts from the internet"
+          />
           <span className="flex flex-col gap-0.5">
             <span className="text-sm font-medium">Blocked attempts from the internet</span>
-            <span className="text-xs text-muted-foreground">Many: scanners knock all day. They’re kept out of the saved system log, but fill its part in memory faster.</span>
+            <span className="text-xs text-muted-foreground">
+              Many: scanners knock all day. They’re kept out of the saved system log, but fill its part in memory faster.
+            </span>
           </span>
         </div>
         {busy !== undefined && <p className="text-xs text-muted-foreground">banIP restarts to change this.</p>}
@@ -100,7 +134,17 @@ function Recording({ c, s, onSaved }: { c: BanipConfig; s: BanipStatus | undefin
   );
 }
 
-function Top({ title, rows, mono = false, label }: { title: string; rows: readonly { key: string; count: number }[]; mono?: boolean; label?: (k: string) => string }): ReactElement {
+function Top({
+  title,
+  rows,
+  mono = false,
+  label,
+}: {
+  title: string;
+  rows: readonly { key: string; count: number }[];
+  mono?: boolean;
+  label?: (k: string) => string;
+}): ReactElement {
   const max = Math.max(1, ...rows.map((r) => r.count));
   return (
     <div className="flex min-w-0 flex-col gap-2">
@@ -126,7 +170,17 @@ function Top({ title, rows, mono = false, label }: { title: string; rows: readon
   );
 }
 
-function LookupDialog({ query, conntrack, onClose, onChanged }: { query: string; conntrack: boolean; onClose: () => void; onChanged: () => void }): ReactElement {
+function LookupDialog({
+  query,
+  conntrack,
+  onClose,
+  onChanged,
+}: {
+  query: string;
+  conntrack: boolean;
+  onClose: () => void;
+  onChanged: () => void;
+}): ReactElement {
   const [result, setResult] = useState<Search>();
   const [failed, setFailed] = useState<string>();
   const go = (): void => {
@@ -169,7 +223,11 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
   const [allowed, setAllowed] = useState<Record<string, string>>({});
   const filter: DropFilter = {
     ...(dir === 'all' ? {} : { dir }),
-    ...(/^\d{1,5}$/.test(q.trim()) ? { port: q.trim() } : q.trim() !== '' && /^[0-9a-fA-F.:]+$/.test(q.trim()) ? { address: q.trim() } : {}),
+    ...(/^\d{1,5}$/.test(q.trim())
+      ? { port: q.trim() }
+      : q.trim() !== '' && /^[0-9a-fA-F.:]+$/.test(q.trim())
+        ? { address: q.trim() }
+        : {}),
   };
   const key = JSON.stringify([filter, page]);
   const { data, loading, refresh } = usePoll(() => getDrops(page * PAGE, PAGE, filter), 15000, key);
@@ -184,15 +242,69 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
     }
     return m;
   }, [hints]);
-  const device = (ip: string | null, mac: string): string | undefined => (mac !== '' ? names.get(mac.toLowerCase()) : undefined) ?? (ip === null ? undefined : names.get(ip));
+  const device = (ip: string | null, mac: string): string | undefined =>
+    (mac !== '' ? names.get(mac.toLowerCase()) : undefined) ?? (ip === null ? undefined : names.get(ip));
   const pages = Math.max(1, Math.ceil((data?.total ?? 0) / PAGE));
   const conntrack = c.tools?.conntrack === true;
+  const deviceCell = (d: Drop, w: ReturnType<typeof describeDrop>): ReactElement | string => {
+    const who = d.dir === 'out' ? device(d.src, d.mac) : w.inside === null ? undefined : device(w.inside, '');
+    return (
+      who ??
+      (w.inside === null ? (
+        <span className="text-muted-foreground">the router</span>
+      ) : (
+        <span className="font-mono">{w.inside}</span>
+      ))
+    );
+  };
+  const rowActions = (d: Drop, w: ReturnType<typeof describeDrop>, end: boolean): ReactElement => (
+    <div className={cn('flex gap-1', end && 'justify-end')}>
+      <Button
+        size="sm"
+        variant="ghost"
+        onClick={() => {
+          setLook(w.outside);
+        }}
+      >
+        Look up
+      </Button>
+      {d.dir !== 'pre' && (
+        <Button
+          size="sm"
+          variant="ghost"
+          title="Always allow"
+          aria-label={`Always allow ${w.outside}`}
+          disabled={allowed[w.outside] !== undefined}
+          onClick={() => {
+            setAllowed((a) => ({ ...a, [w.outside]: 'busy' }));
+            allowAddress(w.outside).then(
+              () => {
+                setAllowed((a) => ({ ...a, [w.outside]: 'done' }));
+                onChanged();
+              },
+              () => {
+                setAllowed((a) => Object.fromEntries(Object.entries(a).filter(([k]) => k !== w.outside)));
+              },
+            );
+          }}
+        >
+          {allowed[w.outside] === 'busy' ? (
+            <LoaderCircleIcon className="animate-spin" />
+          ) : (
+            <ShieldCheckIcon className={cn(allowed[w.outside] === 'done' && 'text-success')} />
+          )}
+          <span className={cn(end && 'hidden xl:inline')}>{allowed[w.outside] === 'done' ? 'Allowed' : 'Always allow'}</span>
+        </Button>
+      )}
+    </div>
+  );
   return (
     <Card>
       <CardHeading
         icon={ListIcon}
         title="Blocked connections"
-        description={data?.first !== null && data?.first !== undefined ? `Since ${timeText(data.first)}, newest first. Kept in memory: a restart starts afresh.` : 'Newest first, kept in memory.'}
+        description="Newest first. Kept in memory: a restart starts afresh."
+        status={data?.first !== null && data?.first !== undefined ? `Since ${timeText(data.first)}` : undefined}
         action={
           <Button size="icon" variant="ghost" aria-label="Refresh" onClick={refresh}>
             <RefreshCwIcon className={cn(loading && 'animate-spin')} />
@@ -230,14 +342,14 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
           </div>
         </div>
         {data !== undefined && data.total > 0 && (
-          <div className="grid gap-6 rounded-lg border bg-muted/30 p-4 sm:grid-cols-2 xl:grid-cols-4">
+          <div className="grid gap-6 border-y py-4 sm:grid-cols-2 xl:grid-cols-4">
             <Top title="Addresses" rows={data.top.sources} mono />
             <Top title="Your devices" rows={data.top.devices} label={(k) => device(k, '') ?? k} />
             <Top title="What for" rows={data.top.ports} label={portLabel} />
             <Top title="Lists" rows={data.top.sets} label={setName} />
           </div>
         )}
-        <div className="overflow-x-auto">
+        <div className="hidden lg:block">
           <Table className="min-w-[44rem]">
             <TableHeader>
               <TableRow>
@@ -254,7 +366,6 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
             <TableBody>
               {(data?.rows ?? []).map((d: Drop, i) => {
                 const w = describeDrop(d);
-                const who = d.dir === 'out' ? device(d.src, d.mac) : w.inside === null ? undefined : device(w.inside, '');
                 return (
                   <TableRow key={`${String(d.t)}-${String(i)}`}>
                     <TableCell className="text-xs text-muted-foreground tabular">{timeText(d.t)}</TableCell>
@@ -263,69 +374,84 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
                       <span className="text-xs text-muted-foreground">{w.service}</span>
                     </TableCell>
                     <TableCell className="font-mono text-xs">{w.outside}</TableCell>
-                    <TableCell className="text-xs">
-                      {who ?? (w.inside === null ? <span className="text-muted-foreground">the router</span> : <span className="font-mono">{w.inside}</span>)}
-                    </TableCell>
+                    <TableCell className="text-xs">{deviceCell(d, w)}</TableCell>
                     <TableCell className="text-xs">{setName(d.set)}</TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex justify-end gap-1">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => {
-                            setLook(w.outside);
-                          }}
-                        >
-                          Look up
-                        </Button>
-                        {d.dir !== 'pre' && (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            title="Always allow"
-                            aria-label={`Always allow ${w.outside}`}
-                            disabled={allowed[w.outside] !== undefined}
-                            onClick={() => {
-                              setAllowed((a) => ({ ...a, [w.outside]: 'busy' }));
-                              allowAddress(w.outside).then(
-                                () => {
-                                  setAllowed((a) => ({ ...a, [w.outside]: 'done' }));
-                                  onChanged();
-                                },
-                                () => {
-                                  setAllowed((a) => Object.fromEntries(Object.entries(a).filter(([k]) => k !== w.outside)));
-                                },
-                              );
-                            }}
-                          >
-                            {allowed[w.outside] === 'busy' ? <LoaderCircleIcon className="animate-spin" /> : <ShieldCheckIcon className={cn(allowed[w.outside] === 'done' && 'text-success')} />}
-                            <span className="hidden xl:inline">{allowed[w.outside] === 'done' ? 'Allowed' : 'Always allow'}</span>
-                          </Button>
-                        )}
-                      </div>
-                    </TableCell>
+                    <TableCell className="text-right">{rowActions(d, w, true)}</TableCell>
                   </TableRow>
                 );
               })}
               {data?.rows.length === 0 && (
                 <TableRow>
                   <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
-                    {Object.keys(filter).length > 0 ? 'Nothing matches.' : 'Nothing blocked and recorded yet. Turn on what’s recorded above to see each one here.'}
+                    {Object.keys(filter).length > 0
+                      ? 'Nothing matches.'
+                      : 'Nothing blocked and recorded yet. Turn on what’s recorded above to see each one here.'}
                   </TableCell>
                 </TableRow>
               )}
             </TableBody>
           </Table>
         </div>
+        {/* on a phone, each blocked connection is a card */}
+        <ul className="flex flex-col divide-y border-y lg:hidden">
+          {(data?.rows ?? []).map((d: Drop, i) => {
+            const w = describeDrop(d);
+            return (
+              <li key={`${String(d.t)}-${String(i)}`} className="flex flex-col gap-2 py-3">
+                <span className="flex items-baseline justify-between gap-3">
+                  <span className="text-sm font-medium">{w.direction}</span>
+                  <span className="shrink-0 text-xs text-muted-foreground tabular">{timeText(d.t)}</span>
+                </span>
+                <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-xs">
+                  <dt className="text-muted-foreground">For</dt>
+                  <dd>{w.service}</dd>
+                  <dt className="text-muted-foreground">Address</dt>
+                  <dd className="font-mono break-all">{w.outside}</dd>
+                  <dt className="text-muted-foreground">Device</dt>
+                  <dd className="break-all">{deviceCell(d, w)}</dd>
+                  <dt className="text-muted-foreground">List</dt>
+                  <dd>{setName(d.set)}</dd>
+                </dl>
+                <div className="-ml-3">{rowActions(d, w, false)}</div>
+              </li>
+            );
+          })}
+          {data?.rows.length === 0 && (
+            <li className="py-6 text-center text-sm text-muted-foreground">
+              {Object.keys(filter).length > 0
+                ? 'Nothing matches.'
+                : 'Nothing blocked and recorded yet. Turn on what’s recorded above to see each one here.'}
+            </li>
+          )}
+        </ul>
         {pages > 1 && (
           <div className="flex items-center justify-end gap-2 text-sm text-muted-foreground">
             <span className="tabular">
-              {formatNumber(page * PAGE + 1)}–{formatNumber(Math.min((page + 1) * PAGE, data?.total ?? 0))} of {formatNumber(data?.total ?? 0)}
+              {formatNumber(page * PAGE + 1)}–{formatNumber(Math.min((page + 1) * PAGE, data?.total ?? 0))} of{' '}
+              {formatNumber(data?.total ?? 0)}
             </span>
-            <Button size="icon" variant="outline" className="size-8" aria-label="Newer" disabled={page === 0} onClick={() => { setPage((p) => p - 1); }}>
+            <Button
+              size="icon"
+              variant="outline"
+              className="size-8"
+              aria-label="Newer"
+              disabled={page === 0}
+              onClick={() => {
+                setPage((p) => p - 1);
+              }}
+            >
               <ChevronLeftIcon />
             </Button>
-            <Button size="icon" variant="outline" className="size-8" aria-label="Older" disabled={page + 1 >= pages} onClick={() => { setPage((p) => p + 1); }}>
+            <Button
+              size="icon"
+              variant="outline"
+              className="size-8"
+              aria-label="Older"
+              disabled={page + 1 >= pages}
+              onClick={() => {
+                setPage((p) => p + 1);
+              }}
+            >
               <ChevronRightIcon />
             </Button>
           </div>
@@ -333,15 +459,29 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
         {(data?.events.length ?? 0) > 0 && (
           <div className="flex flex-col gap-2 border-t pt-4">
             <h3 className="text-sm font-medium">Blocked by the log monitor</h3>
-            <p className="text-xs text-muted-foreground">Addresses that failed to sign in (SSH, LuCI…) and were added to the blocklist.</p>
+            <p className="text-xs text-muted-foreground">
+              Addresses that failed to sign in (SSH, LuCI…) and were added to the blocklist.
+            </p>
             <ul className="flex flex-col gap-1 text-xs">
               {data?.events.slice(0, 10).map((e, i) => (
                 <li key={`${String(e.t)}-${String(i)}`} className="flex flex-wrap items-baseline gap-x-3">
                   <span className="text-muted-foreground tabular">{timeText(e.t)}</span>
-                  <button type="button" className="font-mono underline-offset-2 hover:underline" onClick={() => { setLook(e.address.split('-')[0] ?? e.address); }}>
+                  <button
+                    type="button"
+                    className="font-mono underline-offset-2 hover:underline"
+                    onClick={() => {
+                      setLook(e.address.split('-')[0] ?? e.address);
+                    }}
+                  >
                     {e.address}
                   </button>
-                  <span className="text-muted-foreground">{e.kind === 'remote' ? 'reported by another device' : e.kind === 'range' ? 'its whole network, from its registry' : e.detail}</span>
+                  <span className="text-muted-foreground">
+                    {e.kind === 'remote'
+                      ? 'reported by another device'
+                      : e.kind === 'range'
+                        ? 'its whole network, from its registry'
+                        : e.detail}
+                  </span>
                 </li>
               ))}
             </ul>
@@ -411,7 +551,14 @@ function SurveyDialog({ set, onClose, onLook }: { set: string; onClose: () => vo
             }}
           />
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Switch checked={hits} onCheckedChange={(v) => { setHits(v); setPage(0); }} aria-label="Only those that blocked something" />
+            <Switch
+              checked={hits}
+              onCheckedChange={(v) => {
+                setHits(v);
+                setPage(0);
+              }}
+              aria-label="Only those that blocked something"
+            />
             Only with hits
           </div>
         </div>
@@ -419,7 +566,13 @@ function SurveyDialog({ set, onClose, onLook }: { set: string; onClose: () => vo
         <ul className="max-h-80 divide-y overflow-y-auto rounded-md border">
           {(data?.elements ?? []).map((e) => (
             <li key={e.value} className="flex items-center justify-between gap-3 px-3 py-1.5">
-              <button type="button" className="font-mono text-xs underline-offset-2 hover:underline" onClick={() => { onLook(e.value.split(/[/ -]/)[0] ?? e.value); }}>
+              <button
+                type="button"
+                className="font-mono text-xs underline-offset-2 hover:underline"
+                onClick={() => {
+                  onLook(e.value.split(/[/ -]/)[0] ?? e.value);
+                }}
+              >
                 {e.value}
               </button>
               <span className="text-xs text-muted-foreground tabular">
@@ -428,17 +581,37 @@ function SurveyDialog({ set, onClose, onLook }: { set: string; onClose: () => vo
               </span>
             </li>
           ))}
-          {data !== undefined && (data.elements ?? []).length === 0 && <li className="px-3 py-6 text-center text-sm text-muted-foreground">Nothing matches.</li>}
+          {data !== undefined && (data.elements ?? []).length === 0 && (
+            <li className="px-3 py-6 text-center text-sm text-muted-foreground">Nothing matches.</li>
+          )}
         </ul>
         {pages > 1 && (
           <div className="flex items-center justify-end gap-2 text-sm text-muted-foreground">
             <span className="tabular">
               Page {page + 1} of {formatNumber(pages)}
             </span>
-            <Button size="icon" variant="outline" className="size-8" aria-label="Previous page" disabled={page === 0} onClick={() => { setPage((p) => p - 1); }}>
+            <Button
+              size="icon"
+              variant="outline"
+              className="size-8"
+              aria-label="Previous page"
+              disabled={page === 0}
+              onClick={() => {
+                setPage((p) => p - 1);
+              }}
+            >
               <ChevronLeftIcon />
             </Button>
-            <Button size="icon" variant="outline" className="size-8" aria-label="Next page" disabled={page + 1 >= pages} onClick={() => { setPage((p) => p + 1); }}>
+            <Button
+              size="icon"
+              variant="outline"
+              className="size-8"
+              aria-label="Next page"
+              disabled={page + 1 >= pages}
+              onClick={() => {
+                setPage((p) => p + 1);
+              }}
+            >
               <ChevronRightIcon />
             </Button>
           </div>
@@ -483,13 +656,14 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
   // the lists first, your own allowlist and blocklist after
   const own = (n: string): number => (/^(allowlist|blocklist)\./.test(n) ? 1 : 0);
   const sets = Object.entries(report?.sets ?? {}).sort(([a], [b]) => (own(a) - own(b)) * 1000 + a.localeCompare(b));
-  const hitsOf = (x: { in_packets?: number | null | undefined; out_packets?: number | null | undefined }): number => (x.in_packets ?? 0) + (x.out_packets ?? 0);
+  const hitsOf = (x: { in_packets?: number | null | undefined; out_packets?: number | null | undefined }): number =>
+    (x.in_packets ?? 0) + (x.out_packets ?? 0);
   return (
     <Card>
       <CardHeading
         icon={FileTextIcon}
         title="Each list"
-        description={
+        status={
           report?.counting === false
             ? 'Counting is off (Advanced, Logging): the hits read 0.'
             : report?.generated !== null && report?.generated !== undefined
@@ -497,14 +671,21 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
               : 'Hits since each list was last loaded.'
         }
         action={
-          <Button size="sm" variant="outline" disabled={busy || c.enabled !== true} onClick={() => { load(true); }}>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy || c.enabled !== true}
+            onClick={() => {
+              load(true);
+            }}
+          >
             {busy ? <LoaderCircleIcon className="animate-spin" /> : <RefreshCwIcon />} Recount
           </Button>
         }
       />
       <CardContent className="flex flex-col gap-4">
         {failed !== undefined && <p className="text-sm text-destructive">{failed}</p>}
-        <div className="overflow-x-auto">
+        <div className="hidden lg:block">
           <Table className="min-w-[36rem]">
             <TableHeader>
               <TableRow>
@@ -522,12 +703,25 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
               {sets.map(([name, x]) => (
                 <TableRow key={name}>
                   <TableCell className="py-1 font-mono text-xs">{name}</TableCell>
-                  <TableCell className="text-right text-xs tabular">{x.elements === null || x.elements === undefined ? '–' : formatNumber(x.elements)}</TableCell>
-                  <TableCell className="text-right text-xs tabular">{x.inbound ? formatNumber(x.in_packets ?? 0) : <span className="text-muted-foreground">–</span>}</TableCell>
-                  <TableCell className="text-right text-xs tabular">{x.outbound ? formatNumber(x.out_packets ?? 0) : <span className="text-muted-foreground">–</span>}</TableCell>
+                  <TableCell className="text-right text-xs tabular">
+                    {x.elements === null || x.elements === undefined ? '–' : formatNumber(x.elements)}
+                  </TableCell>
+                  <TableCell className="text-right text-xs tabular">
+                    {x.inbound ? formatNumber(x.in_packets ?? 0) : <span className="text-muted-foreground">–</span>}
+                  </TableCell>
+                  <TableCell className="text-right text-xs tabular">
+                    {x.outbound ? formatNumber(x.out_packets ?? 0) : <span className="text-muted-foreground">–</span>}
+                  </TableCell>
                   <TableCell className="text-xs">{x.ports ?? ''}</TableCell>
                   <TableCell className="py-1">
-                    <Button size="sm" variant="ghost" className="h-7" onClick={() => { setOpen(name); }}>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7"
+                      onClick={() => {
+                        setOpen(name);
+                      }}
+                    >
                       Contents
                     </Button>
                   </TableCell>
@@ -543,9 +737,38 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
             </TableBody>
           </Table>
         </div>
+        <ul className="flex flex-col divide-y border-y lg:hidden">
+          {sets.map(([name, x]) => (
+            <li key={name} className="flex items-center justify-between gap-3 py-2.5">
+              <span className="flex min-w-0 flex-col gap-0.5">
+                <span className="font-mono text-xs break-all">{name}</span>
+                <span className="text-xs text-muted-foreground tabular">
+                  {x.elements === null || x.elements === undefined ? '–' : formatNumber(x.elements)} entries
+                  {x.inbound ? ` · ${formatNumber(x.in_packets ?? 0)} coming in` : ''}
+                  {x.outbound ? ` · ${formatNumber(x.out_packets ?? 0)} going out` : ''}
+                  {x.ports !== null && x.ports !== undefined && x.ports !== '' ? ` · ports ${x.ports}` : ''}
+                </span>
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="shrink-0"
+                onClick={() => {
+                  setOpen(name);
+                }}
+              >
+                Contents
+              </Button>
+            </li>
+          ))}
+          {sets.length === 0 && (
+            <li className="py-6 text-center text-sm text-muted-foreground">No report yet: it’s made after each update.</li>
+          )}
+        </ul>
         {sets.length > 0 && (
           <p className="text-xs text-muted-foreground">
-            Most hits: {sets
+            Most hits:{' '}
+            {sets
               .filter(([, x]) => hitsOf(x) > 0)
               .sort(([, a], [, b]) => hitsOf(b) - hitsOf(a))
               .slice(0, 3)
@@ -568,7 +791,8 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
             </div>
             {report.autoadd !== null && report.autoadd !== undefined && (
               <p className="text-xs text-muted-foreground">
-                Added today by banIP itself: {formatNumber(report.autoadd.allow)} to the allowlist, {formatNumber(report.autoadd.block)} to the blocklist.
+                Added today by banIP itself: {formatNumber(report.autoadd.allow)} to the allowlist,{' '}
+                {formatNumber(report.autoadd.block)} to the blocklist.
               </p>
             )}
           </div>
@@ -592,7 +816,11 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
 
 function ProcessingLog(): ReactElement {
   const [open, setOpen] = useState(false);
-  const { data, refresh } = usePoll(() => (open ? getProcessingLog(300) : Promise.resolve({ lines: [] as string[] })), 10000, open ? 'open' : 'closed');
+  const { data, refresh } = usePoll(
+    () => (open ? getProcessingLog(300) : Promise.resolve({ lines: [] as string[] })),
+    10000,
+    open ? 'open' : 'closed',
+  );
   const lines = (data?.lines ?? []).map((l) => ({ raw: l, p: parseLogLine(l) })).reverse();
   return (
     <Card>
@@ -601,7 +829,14 @@ function ProcessingLog(): ReactElement {
         title="banIP’s log"
         description="What banIP says about each update, newest first. All of it is on the Logs page too."
         action={
-          <Button size="sm" variant="outline" onClick={() => { setOpen((o) => !o); if (!open) refresh(); }}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setOpen((o) => !o);
+              if (!open) refresh();
+            }}
+          >
             {open ? 'Hide' : 'Show'}
           </Button>
         }
@@ -610,7 +845,16 @@ function ProcessingLog(): ReactElement {
         <CardContent>
           <ol className="max-h-96 overflow-y-auto rounded-md border bg-muted/30 px-3 py-2 font-mono text-xs leading-5">
             {lines.map(({ raw, p }, i) => (
-              <li key={i} className={cn(p?.level === 'err' || p?.level === 'emerg' ? 'text-destructive' : p?.level === 'debug' ? 'text-muted-foreground' : '')}>
+              <li
+                key={i}
+                className={cn(
+                  p?.level === 'err' || p?.level === 'emerg'
+                    ? 'text-destructive'
+                    : p?.level === 'debug'
+                      ? 'text-muted-foreground'
+                      : '',
+                )}
+              >
                 {p === null ? raw : `${p.time.slice(4, 19)}  ${p.message}`}
               </li>
             ))}
@@ -622,7 +866,15 @@ function ProcessingLog(): ReactElement {
   );
 }
 
-export function ActivityTab({ c, s, onSaved }: { c: BanipConfig; s: BanipStatus | undefined; onSaved: () => void }): ReactElement {
+export function ActivityTab({
+  c,
+  s,
+  onSaved,
+}: {
+  c: BanipConfig;
+  s: BanipStatus | undefined;
+  onSaved: () => void;
+}): ReactElement {
   const [look, setLook] = useState<string>();
   return (
     <div className="flex flex-col gap-4">

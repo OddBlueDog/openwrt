@@ -5,7 +5,7 @@
 // steps of 8 ms. OpenWrt's own is the longest there is, about 2 seconds, and
 // with the router keeping the air busy a device's sending can then be stuck
 // for a moment at a time. MilkFlint sets the shortest on first boot
-// (uci-defaults.sh); the band's card (page.tsx) offers the two.
+// (uci-defaults.sh); the Wi-Fi driver page offers the two.
 
 /**
  * What a band has: the shortest period, OpenWrt's own (the options unset, or
@@ -15,7 +15,12 @@
 export type HoldBack = 'short' | 'openwrt' | 'custom';
 
 /** The radio's options, one per kind of traffic: best effort, background, video, voice */
-export const HOLD_BACK_OPTIONS = ['he_mu_edca_ac_be_timer', 'he_mu_edca_ac_bk_timer', 'he_mu_edca_ac_vi_timer', 'he_mu_edca_ac_vo_timer'] as const;
+export const HOLD_BACK_OPTIONS = [
+  'he_mu_edca_ac_be_timer',
+  'he_mu_edca_ac_bk_timer',
+  'he_mu_edca_ac_vi_timer',
+  'he_mu_edca_ac_vo_timer',
+] as const;
 
 /** In steps of 8 ms: the shortest that is still a period at all, and OpenWrt's */
 export const HOLD_BACK_SHORT = '1';
@@ -48,16 +53,22 @@ export function holdBackChoices(now: HoldBack): HoldBack[] {
   return now === 'custom' ? ['short', 'openwrt', 'custom'] : ['short', 'openwrt'];
 }
 
-export function holdBackHint(choice: HoldBack): string {
-  const what =
-    'After the router has scheduled a Wi-Fi 6 device’s turn to send, the device may not try to send on its own again for this long.';
-  const restart = 'Changing it restarts this band’s network.';
+/** What the period is, for the setting's "Why?" */
+export const HOLD_BACK_WHAT =
+  'After the router has scheduled a Wi-Fi 6 device’s turn to send, the device may not try to send on its own again for this long.';
+
+/** What a choice does, in a sentence */
+export function holdBackChoiceHint(choice: HoldBack): string {
   switch (choice) {
     case 'short':
-      return `${what} The shortest keeps a device’s sending from getting stuck while the router is busy. ${restart}`;
+      return 'The shortest keeps a device’s sending from getting stuck while the router is busy.';
     case 'openwrt':
-      return `${what} With this long a period, a busy router can leave a device’s sending stuck for a moment at a time. ${restart}`;
+      return 'With this long a period, a busy router can leave a device’s sending stuck for a moment at a time.';
     case 'custom':
-      return `${what} The periods set on this radio aren’t one of the two choices; they are kept until you pick one. ${restart}`;
+      return 'The periods set on this radio aren’t one of the two choices; they are kept until you pick one.';
   }
+}
+
+export function holdBackHint(choice: HoldBack): string {
+  return `${HOLD_BACK_WHAT} ${holdBackChoiceHint(choice)} Changing it restarts this band’s network.`;
 }

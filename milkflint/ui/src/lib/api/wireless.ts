@@ -19,7 +19,10 @@ const radioStatus = z.object({
     .loose()
     .optional(),
   // what the radio can do, e.g. HT20 … HE160, and its phy (luci-rpc adds iwinfo's info, Wi-Fi on or off)
-  iwinfo: z.object({ phy: z.string().optional(), htmodes: z.array(z.string()).optional() }).loose().optional(),
+  iwinfo: z
+    .object({ phy: z.string().optional(), htmodes: z.array(z.string()).optional() })
+    .loose()
+    .optional(),
   interfaces: z
     .array(
       z.object({
@@ -490,9 +493,12 @@ export interface Country {
 
 /** The countries the radio knows rules for ("00", the world rules, left out). Works with a phy name, so Wi-Fi needn't be on. */
 export function getCountries(device: string): Promise<Country[]> {
-  return call('iwinfo', 'countrylist', { device }, z.object({ results: z.array(z.object({ code: z.string(), country: z.string() }).loose()) })).then(
-    (r) => r.results.filter((c) => c.code !== '00').map((c) => ({ code: c.code, name: c.country })),
-  );
+  return call(
+    'iwinfo',
+    'countrylist',
+    { device },
+    z.object({ results: z.array(z.object({ code: z.string(), country: z.string() }).loose()) }),
+  ).then((r) => r.results.filter((c) => c.code !== '00').map((c) => ({ code: c.code, name: c.country })));
 }
 
 const regRule = z.object({

@@ -2,6 +2,7 @@ import { type ReactElement, useId } from 'react';
 import { formatBitrate } from '@/lib/format';
 import { ChartHover } from './chart-hover';
 import { niceCeil, paths, toPoints } from './path';
+import { seriesDash } from './series';
 
 export interface Series {
   label: string;
@@ -42,9 +43,7 @@ export function ThroughputChart({
         <div className="pointer-events-none absolute inset-0 flex flex-col justify-between">
           {[max, max / 2, 0].map((v) => (
             <div key={v} className="flex items-center gap-2">
-              <span className="w-20 shrink-0 text-right font-mono text-[10px] text-muted-foreground tabular">
-                {format(v)}
-              </span>
+              <span className="w-20 shrink-0 text-right text-xs text-muted-foreground tabular">{format(v)}</span>
               <div className="h-px flex-1 border-t border-dashed border-border" />
             </div>
           ))}
@@ -73,6 +72,7 @@ export function ThroughputChart({
                   d={line}
                   fill="none"
                   stroke={s.color}
+                  style={{ strokeDasharray: seriesDash(s.color, series.length) }}
                   strokeWidth="1.8"
                   strokeLinejoin="round"
                   vectorEffect="non-scaling-stroke"
@@ -85,7 +85,7 @@ export function ThroughputChart({
           <ChartHover series={series} slots={slots} max={max} format={hoverFormat} timeOf={timeOf} />
         </div>
       </div>
-      <div className="flex justify-between pl-[5.5rem] font-mono text-[10px] text-muted-foreground">
+      <div className="flex justify-between pl-[5.5rem] text-xs text-muted-foreground tabular">
         <span>{spanLabel} ago</span>
         <span>now</span>
       </div>

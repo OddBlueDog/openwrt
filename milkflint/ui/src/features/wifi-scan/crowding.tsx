@@ -32,7 +32,9 @@ export function ChannelCrowding({
   const numbered = new Set(
     band === '2g'
       ? loads.map((l) => l.channel)
-      : [...marks, ours[0], ours.at(-1), quiet?.[0], quiet?.at(-1), ...(empty ?? []).flatMap((b) => [b[0], b.at(-1)])].filter((c) => c !== undefined),
+      : [...marks, ours[0], ours.at(-1), quiet?.[0], quiet?.at(-1), ...(empty ?? []).flatMap((b) => [b[0], b.at(-1)])].filter(
+          (c) => c !== undefined,
+        ),
   );
   return (
     <div className="flex min-w-0 flex-col gap-2">
@@ -50,8 +52,14 @@ export function ChannelCrowding({
             >
               <div
                 className={cn(
-                  'w-full rounded-t-[3px] transition-[height] duration-500',
-                  mine ? 'bg-primary' : quietSet.has(l.channel) ? 'bg-success' : emptySet.has(l.channel) ? 'bg-success/40' : 'bg-muted-foreground/30',
+                  'w-full rounded-t-sm transition-[height] duration-slow',
+                  mine
+                    ? 'bg-primary'
+                    : quietSet.has(l.channel)
+                      ? 'bg-success'
+                      : emptySet.has(l.channel)
+                        ? 'bg-success/40'
+                        : 'bg-muted-foreground/30',
                 )}
                 style={{ height: `${String(Math.max(3, (l.load / peak) * 100))}%` }}
               />
@@ -69,7 +77,7 @@ export function ChannelCrowding({
             <span
               key={l.channel}
               className={cn(
-                'min-w-0 flex-1 text-center font-mono text-[9px] leading-none text-muted-foreground tabular',
+                'min-w-0 flex-1 text-center text-xs leading-none text-muted-foreground tabular',
                 gap && 'ml-2',
                 own.has(l.channel) && 'font-semibold text-primary',
                 (quietSet.has(l.channel) || emptySet.has(l.channel)) && 'text-success',

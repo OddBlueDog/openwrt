@@ -169,13 +169,20 @@ export function validate(f: ClientForm, d: ClientData): Errors {
     if (host === '') e['host'] = 'The server’s address ([Peer] Endpoint).';
     else if (ipToInt(host) === undefined && !host.includes(':') && !HOSTNAME.test(host)) e['host'] = 'A hostname or an address.';
     if (!portOk(f.endpointPort, 1)) e['port'] = 'A port from 1 to 65535.';
-    const v4 = addressesOf(f).map(v4Of).filter((a) => a !== undefined);
+    const v4 = addressesOf(f)
+      .map(v4Of)
+      .filter((a) => a !== undefined);
     if (v4.length === 0) e['addresses'] = 'At least one IPv4 address ([Interface] Address), like 10.64.12.7/32.';
     else {
-      const clash = v4.find((a) => (d.lan !== undefined && overlaps(a.ip, a.prefix, d.lan.ip, d.lan.prefix)) || d.taken.some((t) => overlaps(a.ip, a.prefix, t.ip, t.prefix)));
+      const clash = v4.find(
+        (a) =>
+          (d.lan !== undefined && overlaps(a.ip, a.prefix, d.lan.ip, d.lan.prefix)) ||
+          d.taken.some((t) => overlaps(a.ip, a.prefix, t.ip, t.prefix)),
+      );
       if (clash !== undefined) e['addresses'] = `${intToIp(clash.ip)} is inside one of this router’s own networks.`;
     }
-    if (f.mtu !== '' && (!/^\d+$/.test(f.mtu) || Number(f.mtu) < 1280 || Number(f.mtu) > 1500)) e['mtu'] = 'From 1280 to 1500, or empty for 1420.';
+    if (f.mtu !== '' && (!/^\d+$/.test(f.mtu) || Number(f.mtu) < 1280 || Number(f.mtu) > 1500))
+      e['mtu'] = 'From 1280 to 1500, or empty for 1420.';
     if (f.keepalive !== '' && !portOk(f.keepalive, 0)) e['keepalive'] = 'Seconds, or empty.';
   }
   if ((f.who === 'only' || f.who === 'except') && f.macs.length === 0) e['macs'] = 'Add at least one device.';
@@ -213,7 +220,8 @@ export function wanted(f: ClientForm, d: ClientData): Wanted[] {
   const disabled = on ? undefined : '1';
   const v6 = hasIpv6(f);
   const zoneOf = (z: SourceZone): string => (z === 'lan' ? d.lanZone : z);
-  const label = (z: SourceZone): string => (z === 'lan' ? 'Home' : (d.guestZones.find((g) => g.id === z)?.label ?? z).replace(/[^A-Za-z0-9]+/g, '-'));
+  const label = (z: SourceZone): string =>
+    z === 'lan' ? 'Home' : (d.guestZones.find((g) => g.id === z)?.label ?? z).replace(/[^A-Za-z0-9]+/g, '-');
   const rule = (name: string, type: 'rule' | 'rule6', values: Record<string, string>): Wanted => ({
     config: 'network',
     type,
@@ -306,7 +314,17 @@ export function wanted(f: ClientForm, d: ClientData): Wanted[] {
         config: 'firewall',
         type: 'rule',
         name: CLIENT_SKIP,
-        values: { name: 'Skip-VPN-Home', src, dest: '*', proto: 'all', family: 'any', src_mac: f.macs, target: 'MARK', set_xmark: `0x0/${CLIENT_MARK.split('/')[1] ?? ''}`, enabled },
+        values: {
+          name: 'Skip-VPN-Home',
+          src,
+          dest: '*',
+          proto: 'all',
+          family: 'any',
+          src_mac: f.macs,
+          target: 'MARK',
+          set_xmark: `0x0/${CLIENT_MARK.split('/')[1] ?? ''}`,
+          enabled,
+        },
       });
     }
     if (f.killSwitch) {
@@ -314,7 +332,16 @@ export function wanted(f: ClientForm, d: ClientData): Wanted[] {
         config: 'firewall',
         type: 'rule',
         name: leakSection(z),
-        values: { name: `Block-VPN-Leak-${label(z)}`, src, dest: d.wanZone, proto: 'all', family: 'any', mark: CLIENT_MARK, target: 'DROP', enabled },
+        values: {
+          name: `Block-VPN-Leak-${label(z)}`,
+          src,
+          dest: d.wanZone,
+          proto: 'all',
+          family: 'any',
+          mark: CLIENT_MARK,
+          target: 'DROP',
+          enabled,
+        },
       });
     }
   }
@@ -369,10 +396,27 @@ export interface Line {
 function whoText(f: ClientForm, d: ClientData): string {
   const n = f.macs.length;
   const devices = `${String(n)} device${n === 1 ? '' : 's'}`;
-  const home = { all: 'every device on your home network', only: `${devices} on your home network`, except: `every home-network device but ${devices}`, none: '' }[f.who];
+  const home = {
+    all: 'every device on your home network',
+    only: `${devices} on your home network`,
+    except: `every home-network device but ${devices}`,
+    none: '',
+  }[f.who];
   const guests = f.guests.map((g) => `everything on ${d.guestZones.find((z) => z.id === g)?.label ?? g}`);
   const parts = [home, ...guests].filter((x) => x !== '');
   return parts.length <= 1 ? (parts[0] ?? 'nothing') : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1) ?? ''}`;
+}
+
+/** Who uses it, in a few words for the page's answer: "Every home device", "Only 2 devices and Guest Wi-Fi". */
+export function whoSummary(f: ClientForm, d: Pick<ClientData, 'guestZones'>): string {
+  const n = f.macs.length;
+  const devices = `${String(n)} device${n === 1 ? '' : 's'}`;
+  const home = { all: 'Every home device', only: `Only ${devices}`, except: `Every home device but ${devices}`, none: '' }[f.who];
+  const guests = f.guests.map((g) => d.guestZones.find((z) => z.id === g)?.label ?? g);
+  const parts = [home, ...guests].filter((x) => x !== '');
+  if (parts.length === 0) return 'No one';
+  const text = parts.length === 1 ? (parts[0] ?? '') : `${parts.slice(0, -1).join(', ')} and ${parts.at(-1) ?? ''}`;
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
 export function serverText(f: ClientForm): string {
@@ -384,7 +428,10 @@ export function describe(f: ClientForm, d: ClientData): Line[] {
   if (!f.enabled) return [{ ok: false, text: 'Off: every device goes out to the internet directly.' }];
   const lines: Line[] = [
     { ok: true, text: `Connects to ${serverText(f)} and sends ${whoText(f, d)} through it.` },
-    { ok: true, text: 'Other devices, and the router’s own traffic (updates, the time, remote access), go out directly as before.' },
+    {
+      ok: true,
+      text: 'Other devices, and the router’s own traffic (updates, the time, remote access), go out directly as before.',
+    },
     f.killSwitch
       ? {
           ok: true,
@@ -412,8 +459,14 @@ export function describe(f: ClientForm, d: ClientData): Line[] {
   if (d.sqm) {
     lines.push(
       f.shaper
-        ? { ok: true, text: `A Smart Queue inside the tunnel (${f.downMbit} down, ${f.upMbit} up, Mbit/s) keeps latency low when one of them downloads.` }
-        : { ok: false, text: 'No Smart Queue inside the tunnel: the internet port’s queue sees it as one connection, so one big download slows everything in it.' },
+        ? {
+            ok: true,
+            text: `A Smart Queue inside the tunnel (${f.downMbit} down, ${f.upMbit} up, Mbit/s) keeps latency low when one of them downloads.`,
+          }
+        : {
+            ok: false,
+            text: 'No Smart Queue inside the tunnel: the internet port’s queue sees it as one connection, so one big download slows everything in it.',
+          },
     );
   }
   return lines;
@@ -422,15 +475,30 @@ export function describe(f: ClientForm, d: ClientData): Line[] {
 /** What a save did, compared with before, in the past tense. */
 export function summary(before: ClientForm | undefined, after: ClientForm, d: ClientData): string[] {
   const out: string[] = [];
-  if (after.enabled && before?.enabled !== true) out.push(`Turned the VPN on: ${serverText(after)} now carries ${whoText(after, d)}.`);
+  if (after.enabled && before?.enabled !== true)
+    out.push(`Turned the VPN on: ${serverText(after)} now carries ${whoText(after, d)}.`);
   else if (!after.enabled && before?.enabled === true) out.push('Turned the VPN off: every device goes out directly again.');
   else if (after.enabled && before !== undefined) {
-    if (whoText(before, d) !== whoText(after, d) || JSON.stringify(before.macs) !== JSON.stringify(after.macs)) out.push(`It now carries ${whoText(after, d)}.`);
-    if (serverText(before) !== serverText(after) || before.publicKey !== after.publicKey || before.privateKey !== after.privateKey) out.push(`Connected to ${serverText(after)} with the new settings.`);
+    if (whoText(before, d) !== whoText(after, d) || JSON.stringify(before.macs) !== JSON.stringify(after.macs))
+      out.push(`It now carries ${whoText(after, d)}.`);
+    if (
+      serverText(before) !== serverText(after) ||
+      before.publicKey !== after.publicKey ||
+      before.privateKey !== after.privateKey
+    )
+      out.push(`Connected to ${serverText(after)} with the new settings.`);
   }
-  if (before !== undefined && before.killSwitch !== after.killSwitch) out.push(after.killSwitch ? 'Turned the kill switch on.' : 'Turned the kill switch off.');
-  if (before !== undefined && (before.shaper !== after.shaper || before.downMbit !== after.downMbit || before.upMbit !== after.upMbit)) {
-    out.push(after.shaper ? `Set the Smart Queue inside the tunnel to ${after.downMbit} down, ${after.upMbit} up (Mbit/s).` : 'Took the Smart Queue out of the tunnel.');
+  if (before !== undefined && before.killSwitch !== after.killSwitch)
+    out.push(after.killSwitch ? 'Turned the kill switch on.' : 'Turned the kill switch off.');
+  if (
+    before !== undefined &&
+    (before.shaper !== after.shaper || before.downMbit !== after.downMbit || before.upMbit !== after.upMbit)
+  ) {
+    out.push(
+      after.shaper
+        ? `Set the Smart Queue inside the tunnel to ${after.downMbit} down, ${after.upMbit} up (Mbit/s).`
+        : 'Took the Smart Queue out of the tunnel.',
+    );
   }
   if (out.length === 0) out.push('Saved.');
   return out;

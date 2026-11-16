@@ -3,7 +3,24 @@
 // against Remove.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { confFileName, drift, freeAddress, moveTo, newPeerSection, nextPeerIp, peerConfig, type PeerForm, reachOf, removal, type ServerData, type ServerForm, subnetOf, toChanges, validate, wanted } from '../src/features/remote-access/model.ts';
+import {
+  confFileName,
+  drift,
+  freeAddress,
+  moveTo,
+  newPeerSection,
+  nextPeerIp,
+  peerConfig,
+  type PeerForm,
+  reachOf,
+  removal,
+  type ServerData,
+  type ServerForm,
+  subnetOf,
+  toChanges,
+  validate,
+  wanted,
+} from '../src/features/remote-access/model.ts';
 import { ipToInt } from '../src/lib/api/network.ts';
 import type { Wanted } from '../src/lib/api/owned.ts';
 import { applied, presentOf, section } from './uci-fixture.ts';
@@ -69,7 +86,10 @@ const onRouter = (f: ServerForm, over: Partial<ServerData> = {}): ServerData['pr
 test('moving the tunnel keeps each device’s host number', () => {
   const moved = moveTo(form({ peers: [peer({ ip: '10.42.17.2' }), peer({ section: 'b', ip: '10.42.17.200' })] }), '10.99.3.1');
   assert.equal(moved.address, '10.99.3.1');
-  assert.deepEqual(moved.peers.map((p) => p.ip), ['10.99.3.2', '10.99.3.200']);
+  assert.deepEqual(
+    moved.peers.map((p) => p.ip),
+    ['10.99.3.2', '10.99.3.200'],
+  );
 });
 
 test('on a wider network, the host part kept is all of it', () => {
@@ -86,7 +106,8 @@ test('half-typed addresses move nothing', () => {
 });
 
 test('its UDP port can’t be one in use, or one a port forward sends on', () => {
-  const error = (f: Partial<ServerForm>, d: Partial<ServerData> = {}): string | undefined => validate(form(f), data(form(f), d))['port'];
+  const error = (f: Partial<ServerForm>, d: Partial<ServerData> = {}): string | undefined =>
+    validate(form(f), data(form(f), d))['port'];
   assert.equal(error({}), undefined);
   for (const port of ['0', '65536', 'x', '']) assert.notEqual(error({ port }), undefined, port);
   assert.match(error({}, { portsInUse: [51820] }) ?? '', /already uses/);
@@ -114,7 +135,11 @@ test('its devices: unique names and addresses, inside the network, real keys', (
   const errors = (peers: PeerForm[]): Record<string, string | undefined> => validate(form({ peers }), data(form({ peers })));
   assert.deepEqual(errors([peer(), peer({ section: 's2', name: 'Laptop', ip: '10.42.17.3' })]), {});
   assert.notEqual(errors([peer(), peer({ section: 's2', name: 'PHONE ', ip: '10.42.17.3' })])['peer-s2-name'], undefined);
-  assert.equal(errors([peer({ name: '' }), peer({ section: 's2', name: '', ip: '10.42.17.3' })])['peer-s2-name'], undefined, 'blank names may repeat');
+  assert.equal(
+    errors([peer({ name: '' }), peer({ section: 's2', name: '', ip: '10.42.17.3' })])['peer-s2-name'],
+    undefined,
+    'blank names may repeat',
+  );
   assert.match(errors([peer(), peer({ section: 's2', name: 'L', ip: '10.42.17.2' })])['peer-s2-ip'] ?? '', /Another device/);
   for (const ip of ['10.42.18.2', '10.42.17.1', '10.42.17.0', '10.42.17.255', 'x']) {
     assert.notEqual(errors([peer({ ip })])['peer-wg_in_device1-ip'], undefined, ip);
@@ -164,10 +189,22 @@ test('Remove deletes every part, what LuCI added included, and nothing else', ()
   present.network.push(section('wireguard_wg_in', 'cfg0abc'), section('interface', 'lan'));
   present.firewall.push(section('rule', 'Allow-Ping'));
   present.milkflint.push(section('dns', 'dns'));
-  const left = applied({ network: present.network, firewall: present.firewall, milkflint: present.milkflint }, removal(data(f, { present })));
-  assert.deepEqual(left['network']?.map((s) => s['.name']), ['lan']);
-  assert.deepEqual(left['firewall']?.map((s) => s['.name']), ['Allow-Ping']);
-  assert.deepEqual(left['milkflint']?.map((s) => s['.name']), ['dns']);
+  const left = applied(
+    { network: present.network, firewall: present.firewall, milkflint: present.milkflint },
+    removal(data(f, { present })),
+  );
+  assert.deepEqual(
+    left['network']?.map((s) => s['.name']),
+    ['lan'],
+  );
+  assert.deepEqual(
+    left['firewall']?.map((s) => s['.name']),
+    ['Allow-Ping'],
+  );
+  assert.deepEqual(
+    left['milkflint']?.map((s) => s['.name']),
+    ['dns'],
+  );
 });
 
 test('addresses and networks set in LuCI are kept', () => {
@@ -192,7 +229,9 @@ test('the DNS page’s intercept comes along while it’s on, and goes with the 
   assert.equal(get(off, 'milkflint_dns_intercept_wg_in').values['enabled'], '0');
   const f = form();
   const present = onRouter(f, { dnsIntercept: true });
-  assert.deepEqual(toChanges(f, data(f, { present })), [{ op: 'delete', config: 'firewall', section: 'milkflint_dns_intercept_wg_in' }]);
+  assert.deepEqual(toChanges(f, data(f, { present })), [
+    { op: 'delete', config: 'firewall', section: 'milkflint_dns_intercept_wg_in' },
+  ]);
 });
 
 test('the hostname devices connect to is kept beside it, and removed when cleared', () => {
@@ -204,7 +243,12 @@ test('the hostname devices connect to is kept beside it, and removed when cleare
 });
 
 test('the next save with the same settings changes nothing', () => {
-  for (const f of [form(), form({ enabled: false }), form({ admin: true, between: true, internet: false, lan: false }), form({ endpoint: 'x.example.com', peers: [] })]) {
+  for (const f of [
+    form(),
+    form({ enabled: false }),
+    form({ admin: true, between: true, internet: false, lan: false }),
+    form({ endpoint: 'x.example.com', peers: [] }),
+  ]) {
     for (const dnsIntercept of [false, true]) {
       const d = data(f, { present: onRouter(f, { dnsIntercept }), exists: true, dnsIntercept });
       assert.deepEqual(toChanges(f, d), []);
@@ -255,7 +299,10 @@ test('a device’s config: everything through home, or only home’s networks', 
   // nothing to make one from
   assert.equal(peerConfig(peer({ privateKey: '' }), form(), data(), true), undefined);
   assert.equal(peerConfig(p, form(), data(form(), { publicKey: undefined }), true), undefined);
-  assert.equal(peerConfig(p, form(), data(form(), { wan: { ipv4: undefined, ipv6: undefined, gateway: undefined } }), true), undefined);
+  assert.equal(
+    peerConfig(p, form(), data(form(), { wan: { ipv4: undefined, ipv6: undefined, gateway: undefined } }), true),
+    undefined,
+  );
 });
 
 test('names and subnets', () => {

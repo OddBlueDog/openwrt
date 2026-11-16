@@ -101,9 +101,13 @@ test('a queue on the port under PPPoE: flagged for the page, and moving it takes
   assert.equal(load([moved], 'pppoe').form.link, 'ethernet');
   // VDSL2's figure is the same on both; custom figures stay as they are
   const vdsl = [queue({ linklayer: 'ethernet', overhead: '34', tcMPU: '68', iqdisc_opts: 'ptm', eqdisc_opts: 'ptm' })];
-  assert.deepEqual(save(load(vdsl, 'pppoe'), { device: 'pppoe-wan' }), [{ op: 'set', config: 'sqm', section: 'wan', values: { interface: 'pppoe-wan' } }]);
+  assert.deepEqual(save(load(vdsl, 'pppoe'), { device: 'pppoe-wan' }), [
+    { op: 'set', config: 'sqm', section: 'wan', values: { interface: 'pppoe-wan' } },
+  ]);
   const custom = [queue({ linklayer: 'ethernet', overhead: '40' })];
-  assert.deepEqual(save(load(custom, 'pppoe'), { device: 'pppoe-wan' }), [{ op: 'set', config: 'sqm', section: 'wan', values: { interface: 'pppoe-wan' } }]);
+  assert.deepEqual(save(load(custom, 'pppoe'), { device: 'pppoe-wan' }), [
+    { op: 'set', config: 'sqm', section: 'wan', values: { interface: 'pppoe-wan' } },
+  ]);
   // a queue without an interface under PPPoE: shown, and saved, on the session
   const bare = load([section('queue', 'wan', { enabled: '1', download: '80000', upload: '20000', ...ethernet })], 'pppoeDown');
   assert.equal(bare.form.device, 'pppoe-wan');
@@ -139,7 +143,10 @@ test('an older preset (no mpu, no ptm) is near it, and choosing it again complet
   // the others
   assert.deepEqual(load([queue({ linklayer: 'ethernet', overhead: '44' })]).linkNear, { preset: 'ethernet', gaps: ['mpu'] });
   assert.deepEqual(load([queue({ linklayer: 'ethernet', overhead: '18' })]).linkNear, { preset: 'docsis', gaps: ['mpu'] });
-  assert.deepEqual(load([queue({ linklayer: 'ethernet', overhead: '34', tcMPU: '68' })]).linkNear, { preset: 'vdsl', gaps: ['ptm'] });
+  assert.deepEqual(load([queue({ linklayer: 'ethernet', overhead: '34', tcMPU: '68' })]).linkNear, {
+    preset: 'vdsl',
+    gaps: ['ptm'],
+  });
   // ADSL never had more: it's ADSL
   assert.equal(load([queue({ linklayer: 'atm', overhead: '44' })]).form.link, 'adsl');
 });
@@ -167,7 +174,10 @@ test('a preset is CAKE’s own compensation: tc’s size table or HTB’s isn’
     assert.equal(data.form.link, 'custom', llam);
     assert.deepEqual(data.linkNear, { preset: 'ethernet', gaps: ['mechanism'] }, llam);
     const changes = save(data, { link: 'ethernet' });
-    assert.ok(changes.some((c) => c.op === 'unset' && c.options.includes('linklayer_adaptation_mechanism')), llam);
+    assert.ok(
+      changes.some((c) => c.op === 'unset' && c.options.includes('linklayer_adaptation_mechanism')),
+      llam,
+    );
     const done = after(sqm, changes);
     assert.equal(load([done]).form.link, 'ethernet', llam);
     // what sqm-scripts then gives CAKE: its own overhead and mpu, no stab in front
@@ -190,8 +200,14 @@ test('a preset is CAKE’s own compensation: tc’s size table or HTB’s isn’
 
 test('moving the queue for the Internet page: its interface, and a preset’s overhead there', () => {
   assert.deepEqual(queueMove(queue(ethernet), 'pppoe-wan'), { interface: 'pppoe-wan', overhead: '52' });
-  assert.deepEqual(queueMove(queue({ ...ethernet, interface: 'pppoe-wan', overhead: '52' }), 'eth1'), { interface: 'eth1', overhead: '44' });
-  assert.deepEqual(queueMove(queue({ linklayer: 'ethernet', overhead: '18', tcMPU: '64' }), 'pppoe-wan'), { interface: 'pppoe-wan', overhead: '26' });
+  assert.deepEqual(queueMove(queue({ ...ethernet, interface: 'pppoe-wan', overhead: '52' }), 'eth1'), {
+    interface: 'eth1',
+    overhead: '44',
+  });
+  assert.deepEqual(queueMove(queue({ linklayer: 'ethernet', overhead: '18', tcMPU: '64' }), 'pppoe-wan'), {
+    interface: 'pppoe-wan',
+    overhead: '26',
+  });
   // the same figure on both, custom, near a preset, or none: only the interface
   for (const values of [
     { linklayer: 'ethernet', overhead: '34', tcMPU: '68', iqdisc_opts: 'ptm', eqdisc_opts: 'ptm' },

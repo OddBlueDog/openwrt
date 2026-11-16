@@ -31,7 +31,12 @@ export function Sparkline({
   const id = useId();
   const { line, area } = paths(toPoints(values, max, slots));
   const svg = (
-    <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true" className={cn('h-10 w-full', format !== undefined && 'h-full', format === undefined && className)}>
+    <svg
+      viewBox="0 0 100 100"
+      preserveAspectRatio="none"
+      aria-hidden="true"
+      className={cn('h-10 w-full', format !== undefined && 'h-full', format === undefined && className)}
+    >
       <defs>
         <linearGradient id={id} x1="0" x2="0" y1="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="0.28" />
@@ -46,7 +51,14 @@ export function Sparkline({
   return (
     <div className={cn('relative h-10 w-full', className)}>
       {svg}
-      <ChartHover series={[{ label: label ?? '', color, values }]} slots={slots} max={max} format={format} timeOf={timeOf} above />
+      <ChartHover
+        series={[{ label: label ?? '', color, values }]}
+        slots={slots}
+        max={max}
+        format={format}
+        timeOf={timeOf}
+        above
+      />
     </div>
   );
 }

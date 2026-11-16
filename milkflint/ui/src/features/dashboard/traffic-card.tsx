@@ -1,82 +1,90 @@
+import { ArrowDownUpIcon } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
-import { ThroughputChart } from '@/components/charts/throughput-chart';
-import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { niceCeil } from '@/components/charts/path';
 import { formatBitrate } from '@/lib/format';
-import { cn } from '@/lib/utils';
+import { Segmented } from '@/components/ui/segmented';
+import { agoLabels } from './model';
+import { TimeChart } from './time-chart';
 import { type Dashboard, HISTORY, POLL_MS } from './use-dashboard';
+import { Widget } from './widget';
+import { SeriesSwatch } from '@/components/charts/series-swatch';
+import { seriesDash } from '@/components/charts/series';
 
 const views = {
   internet: { label: 'Internet', down: 'wanDown', up: 'wanUp', hint: 'Traffic on the WAN port' },
-  wifi: { label: 'Wi-Fi', down: 'wifiDown', up: 'wifiUp', hint: 'Traffic to and from Wi-Fi clients' },
+  wifi: { label: 'Wi-Fi', down: 'wifiDown', up: 'wifiUp', hint: 'Traffic to and from Wi-Fi devices' },
 } as const;
 type View = keyof typeof views;
 
-export function TrafficCard({ d, className }: { d: Dashboard; className?: string }): ReactElement {
+// download and upload keep the colours they have on every page
+const DOWN = 'var(--chart-2)';
+const UP = 'var(--chart-1)';
+
+export function TrafficCard({ d }: { d: Dashboard }): ReactElement {
   const [view, setView] = useState<View>('internet');
   const v = views[view];
-  const down = d.history.map((s) => s[v.down]);
-  const up = d.history.map((s) => s[v.up]);
   const last = d.history[d.history.length - 1];
-  const span = `${String((HISTORY * POLL_MS) / 60_000)} min`;
+  const seconds = (HISTORY * POLL_MS) / 1000;
+  // the newest sample is the one this poll took
+  const to = last?.t ?? 0;
+  const from = to - seconds + POLL_MS / 1000;
+  const peak = Math.max(0, ...d.history.flatMap((s) => [s[v.down] ?? 0, s[v.up] ?? 0]));
+  // never below 1 Mbit/s, so a quiet line doesn't look busy
+  const max = niceCeil(Math.max(peak * 1.1, 1e6));
 
   return (
-    <Card className={className}>
-      <CardHeader>
-        <div className="flex flex-col gap-1.5">
-          <CardTitle>Throughput</CardTitle>
-          <CardDescription>{v.hint}</CardDescription>
-        </div>
-        <CardAction>
-          <div role="radiogroup" aria-label="Traffic shown" className="flex rounded-md border bg-muted/50 p-0.5 text-xs">
-            {(Object.keys(views) as View[]).map((key) => (
-              <button
-                key={key}
-                type="button"
-                role="radio"
-                aria-checked={view === key}
-                onClick={() => {
-                  setView(key);
-                }}
-                className={cn(
-                  'rounded-sm px-2.5 py-1 text-muted-foreground transition-colors hover:text-foreground',
-                  view === key && 'bg-card text-foreground shadow-xs',
-                )}
-              >
-                {views[key].label}
-              </button>
-            ))}
-          </div>
-        </CardAction>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <div className="flex gap-8">
-          <Legend color="var(--chart-2)" label="Download" value={last?.[v.down]} />
-          <Legend color="var(--chart-1)" label="Upload" value={last?.[v.up]} />
-        </div>
-        <ThroughputChart
-          slots={HISTORY}
-          spanLabel={span}
-          timeOf={(slot) => d.history[slot - (HISTORY - d.history.length)]?.t}
-          series={[
-            { label: 'Download', color: 'var(--chart-2)', values: down },
-            { label: 'Upload', color: 'var(--chart-1)', values: up },
-          ]}
+    <Widget
+      icon={ArrowDownUpIcon}
+      title="Throughput"
+      description={v.hint}
+      aside={
+        <Segmented
+          label="Traffic shown"
+          value={view}
+          options={(Object.keys(views) as View[]).map((key) => ({ value: key, label: views[key].label }))}
+          onChange={setView}
         />
-      </CardContent>
-    </Card>
+      }
+    >
+      <div className="flex flex-col gap-3 px-5">
+        <dl className="flex gap-8">
+          <Legend color={DOWN} label="Download" value={last?.[v.down]} />
+          <Legend color={UP} label="Upload" value={last?.[v.up]} />
+        </dl>
+        <TimeChart
+          lines={[
+            { label: 'Download', color: DOWN, points: d.history.map((s) => [s.t, s[v.down] ?? null] as const), area: true },
+            { label: 'Upload', color: UP, points: d.history.map((s) => [s.t, s[v.up] ?? null] as const), area: true },
+          ]}
+          from={from}
+          to={to}
+          max={max}
+          step={POLL_MS / 1000}
+          format={formatBitrate}
+          label={`${v.label} download and upload over the last ${String(seconds / 60)} minutes`}
+          xLabels={agoLabels(from, to, `${String(seconds / 60)} min`)}
+          className="h-36 @2xl:h-44"
+          empty={
+            peak === 0
+              ? `No traffic in the last ${String(seconds / 60)} minutes`
+              : peak < max / 50
+                ? `Quiet: at most ${formatBitrate(peak)} in the last ${String(seconds / 60)} minutes`
+                : undefined
+          }
+        />
+      </div>
+    </Widget>
   );
 }
 
 function Legend({ color, label, value }: { color: string; label: string; value: number | undefined }): ReactElement {
   return (
     <div className="flex flex-col gap-0.5">
-      <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-        <span className="size-2 rounded-full" style={{ background: color }} />
+      <dt className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <SeriesSwatch color={color} dash={seriesDash(color, 2)} />
         {label}
-      </span>
-      <span className="text-xl font-semibold tracking-tight tabular">
-        {value === undefined ? '—' : formatBitrate(value)}
-      </span>
+      </dt>
+      <dd className="text-xl font-semibold tracking-tight tabular">{value === undefined ? '—' : formatBitrate(value)}</dd>
     </div>
   );
 }

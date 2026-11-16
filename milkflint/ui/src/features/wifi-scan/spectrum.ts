@@ -215,7 +215,11 @@ export function securityOf(n: ScannedNetwork): Security {
   const akm = new Set([...(rsn?.akm ?? []), ...(wpa?.akm ?? [])]);
   const has = (...names: string[]): boolean => names.some((a) => akm.has(a));
   if (has('eap', 'ft-eap', 'eap-sha256', 'eap-suite-b', 'eap-suite-b-192'))
-    return { label: has('eap-suite-b-192') || rsn?.mfp === 'required' ? 'WPA3-Enterprise' : 'Enterprise', weak: false, open: false };
+    return {
+      label: has('eap-suite-b-192') || rsn?.mfp === 'required' ? 'WPA3-Enterprise' : 'Enterprise',
+      weak: false,
+      open: false,
+    };
   const sae = has('sae', 'ft-sae', 'sae-ext', 'ft-sae-ext');
   const psk = has('psk', 'ft-psk', 'psk-sha256');
   if (sae && psk) return { label: 'WPA2/WPA3', weak: false, open: false };

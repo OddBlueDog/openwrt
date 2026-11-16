@@ -5,7 +5,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { formatFingerprint, fromBase64, parseCertificate } from '../src/features/https/certificate.ts';
-import { configOf, DEFAULT_LISTEN, formOf, type HttpsConfig, moveTo, pageUrl, portOf, toChanges } from '../src/features/https/model.ts';
+import {
+  configOf,
+  DEFAULT_LISTEN,
+  formOf,
+  type HttpsConfig,
+  moveTo,
+  pageUrl,
+  portOf,
+  toChanges,
+} from '../src/features/https/model.ts';
 import type { Section } from '../src/lib/api/uci.ts';
 import { routerUrl } from '../src/lib/router-url.ts';
 
@@ -41,7 +50,8 @@ test('one an authority issued: a date after 2049, host names before addresses, I
 
 test('anything that isn’t a whole certificate gives nothing, never a throw', () => {
   const der = fromBase64(OWN);
-  for (let n = 0; n < der.length; n++) assert.equal(parseCertificate(der.subarray(0, n)), undefined, `the first ${String(n)} bytes`);
+  for (let n = 0; n < der.length; n++)
+    assert.equal(parseCertificate(der.subarray(0, n)), undefined, `the first ${String(n)} bytes`);
   assert.equal(parseCertificate(new TextEncoder().encode('-----BEGIN CERTIFICATE-----')), undefined);
   assert.equal(parseCertificate(Uint8Array.from([0x30, 0x84, 0xff, 0xff, 0xff, 0xff])), undefined);
   // a byte flipped anywhere: a certificate or nothing
@@ -61,7 +71,9 @@ const section = (values: Record<string, string | string[]>): Section[] => [{ '.t
 const stock: HttpsConfig = { listen: DEFAULT_LISTEN, listenHttp: ['0.0.0.0:80', '[::]:80'], redirect: false };
 
 test('uhttpd’s settings, as OpenWrt ships them: HTTPS on, no redirect', () => {
-  const c = configOf(section({ listen_https: ['0.0.0.0:443', '[::]:443'], listen_http: ['0.0.0.0:80', '[::]:80'], redirect_https: '0' }));
+  const c = configOf(
+    section({ listen_https: ['0.0.0.0:443', '[::]:443'], listen_http: ['0.0.0.0:80', '[::]:80'], redirect_https: '0' }),
+  );
   assert.deepEqual(c, stock);
   assert.deepEqual(formOf(stock), { https: true, redirect: false });
   assert.equal(configOf([]), undefined);

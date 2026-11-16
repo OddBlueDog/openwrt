@@ -3,7 +3,14 @@
 // adds), and each device's page loads and lookups.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { deviceSites, deviceSummary, dnsmasqAdds, parseDns, routerSites, wildcardSites } from '../src/features/test-bench/dns-pages.ts';
+import {
+  deviceSites,
+  deviceSummary,
+  dnsmasqAdds,
+  parseDns,
+  routerSites,
+  wildcardSites,
+} from '../src/features/test-bench/dns-pages.ts';
 import type { RunRecord } from '../src/features/test-bench/member.ts';
 import { MAX_CUSTOM_SITES, parseSites, siteList, SITES, validHost } from '../src/features/test-bench/pages.ts';
 import { memberRecords } from '../src/features/test-bench/timing.ts';
@@ -18,7 +25,17 @@ test('the fixed list has the sites asked for, each loaded at www', () => {
 
 test('only host names pass', () => {
   for (const ok of ['example.org', 'a.b-c.example.co.uk', 'xn--bcher-kva.example']) assert.ok(validHost(ok), ok);
-  for (const bad of ['', 'localhost', 'example.org; reboot', '-x.example', 'x_y.example', '1.2.3.4', 'example.org/x', 'EXAMPLE.ORG', `${'a'.repeat(64)}.org`]) {
+  for (const bad of [
+    '',
+    'localhost',
+    'example.org; reboot',
+    '-x.example',
+    'x_y.example',
+    '1.2.3.4',
+    'example.org/x',
+    'EXAMPLE.ORG',
+    `${'a'.repeat(64)}.org`,
+  ]) {
     assert.ok(!validHost(bad), bad);
   }
 });

@@ -5,17 +5,19 @@
 // Activity (what's been blocked); everything else in the Advanced sheet.
 // banIP does the work (its own nftables table); the router side is
 // source/feed/milkflint-ui/files/features/banip.
-import { InfoIcon, SlidersHorizontalIcon } from 'lucide-react';
+import { ArrowUpCircleIcon, ChevronRightIcon, InfoIcon, PackageXIcon, SlidersHorizontalIcon } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
+import { TabPanel, Tabs } from '@/components/ui/tabs';
 import type { ApplyState } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
-import { cn, errorMessage } from '@/lib/utils';
+import { href } from '@/lib/router';
+import { errorMessage } from '@/lib/utils';
 import { ActivityTab } from './activity';
 import { AdvancedSheet } from './advanced-sheet';
 import { enableBanip, getConfig, getStatus, runAction, saveOptions } from './api';
@@ -25,6 +27,7 @@ import { PRESETS } from './feeds';
 import { plainFeeds } from './model';
 import type { Options } from './options';
 import { StatusCard } from './status-card';
+import { LicenseCard } from './license-card';
 
 type TabId = 'protection' | 'lists' | 'activity';
 const TABS: { id: TabId; label: string }[] = [
@@ -107,9 +110,19 @@ export function BanipPage(): ReactElement {
       <>
         {header}
         <Alert>
-          <InfoIcon />
+          <PackageXIcon />
           <AlertTitle>Not in this firmware</AlertTitle>
-          <AlertDescription>banIP’s package isn’t installed on this router.</AlertDescription>
+          <AlertDescription>
+            <p>
+              banIP’s package isn’t installed on this router. MilkFlint’s images include it, off until you turn it on: install the
+              newest release to get it.
+            </p>
+            <Button size="sm" variant="outline" className="mt-2" asChild>
+              <a href={href('upgrade')}>
+                <ArrowUpCircleIcon /> Upgrade
+              </a>
+            </Button>
+          </AlertDescription>
         </Alert>
       </>
     );
@@ -118,13 +131,13 @@ export function BanipPage(): ReactElement {
   // the settings as saved: when they change (a save), the tabs' drafts start again from them
   const version = JSON.stringify([c.options, c.milkflint, c.custom, (c.catalogue ?? []).map((f) => f.name)]);
 
+  // nothing chosen yet: turning it on starts the recommended lists, rather than nothing
+  const empty = plainFeeds(c.options ?? {}).length === 0 && (c.options?.['ban_feed'] ?? []).length === 0;
   const toggle = (on: boolean): void => {
     if (!on) {
       run('toggle', () => enableBanip(false), 'banIP is off: nothing is blocked, and its rules are gone.');
       return;
     }
-    // nothing chosen yet: the recommended lists, rather than nothing
-    const empty = plainFeeds(c.options ?? {}).length === 0 && (c.options?.['ban_feed'] ?? []).length === 0;
     const recommended = PRESETS.find((p) => p.id === 'recommended')?.feeds ?? [];
     run(
       'toggle',
@@ -132,7 +145,9 @@ export function BanipPage(): ReactElement {
         if (empty) await saveOptions({ ban_feed: [...recommended] }, { preset: 'recommended' });
         await enableBanip(true);
       },
-      empty ? 'banIP is on, with the Recommended lists: it’s downloading and loading them now.' : 'banIP is on: it’s loading the lists now.',
+      empty
+        ? 'banIP is on, with the Recommended lists: it’s downloading and loading them now.'
+        : 'banIP is on: it’s loading the lists now.',
     );
   };
 
@@ -146,7 +161,14 @@ export function BanipPage(): ReactElement {
             <InfoIcon />
             <AlertTitle>Not used in access point mode</AlertTitle>
             <AlertDescription>
-              Another router faces the internet and filters what reaches your network, so banIP stays off here. Run it on that router.
+              <p>
+                Another router faces the internet and filters what reaches your network, so banIP stays off here. Run it on that
+                router.
+              </p>
+              <a href={href('mode')} className="mt-1 inline-flex w-fit items-center gap-0.5 font-medium link underline-offset-4">
+                Operating mode
+                <ChevronRightIcon className="size-4" />
+              </a>
             </AlertDescription>
           </Alert>
         )}
@@ -154,9 +176,14 @@ export function BanipPage(): ReactElement {
           s={s}
           busy={busy}
           conntrack={c.tools?.conntrack === true}
+          nothingChosen={empty}
           onToggle={toggle}
           onUpdate={() => {
-            run('update', () => runAction('reload'), 'Updating: banIP downloads every list again, then loads the ones that changed.');
+            run(
+              'update',
+              () => runAction('reload'),
+              'Updating: banIP downloads every list again, then loads the ones that changed.',
+            );
           }}
           onRestart={() => {
             run('restart', () => runAction('restart'), 'Starting banIP again.');
@@ -167,39 +194,20 @@ export function BanipPage(): ReactElement {
         />
         {c.mode !== 'ap' && (
           <>
-            <div role="tablist" aria-label="banIP" className="flex w-full overflow-x-auto rounded-lg border bg-muted/50 p-1 sm:w-fit">
-              {TABS.map((t) => (
-                <button
-                  key={t.id}
-                  id={`banip-tab-${t.id}`}
-                  type="button"
-                  role="tab"
-                  aria-selected={tab === t.id}
-                  aria-controls={`banip-panel-${t.id}`}
-                  onClick={() => {
-                    setTab(t.id);
-                  }}
-                  className={cn(
-                    'flex-1 rounded-md px-3 py-1.5 text-sm whitespace-nowrap text-muted-foreground transition-colors sm:flex-none',
-                    tab === t.id ? 'bg-card font-medium text-foreground shadow-xs' : 'hover:text-foreground',
-                  )}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-            {/* every tab stays mounted, so unsaved edits survive a look at another */}
-            <div id="banip-panel-protection" role="tabpanel" aria-labelledby="banip-tab-protection" hidden={tab !== 'protection'}>
+            <Tabs label="banIP" prefix="banip" items={TABS} value={tab} onChange={setTab} className="mt-2" />
+            {/* Protection and Your lists stay mounted, so unsaved edits survive a look at another tab; Activity polls, so only while it's shown */}
+            <TabPanel prefix="banip" id="protection" value={tab}>
               <ProtectionTab key={version} c={c} s={s} onSaved={reload} />
-            </div>
-            <div id="banip-panel-lists" role="tabpanel" aria-labelledby="banip-tab-lists" hidden={tab !== 'lists'}>
+            </TabPanel>
+            <TabPanel prefix="banip" id="lists" value={tab}>
               <ListsTab key={version} c={c} onSaved={reload} />
-            </div>
-            <div id="banip-panel-activity" role="tabpanel" aria-labelledby="banip-tab-activity" hidden={tab !== 'activity'}>
+            </TabPanel>
+            <TabPanel prefix="banip" id="activity" value={tab}>
               {tab === 'activity' && <ActivityTab c={c} s={s} onSaved={reload} />}
-            </div>
+            </TabPanel>
           </>
         )}
+        <LicenseCard s={s} />
       </div>
       {advanced && (
         <AdvancedSheet
@@ -210,7 +218,11 @@ export function BanipPage(): ReactElement {
           onChanged={reload}
           onSave={(changes: Options) => {
             setAdvanced(false);
-            run('advanced', () => saveOptions(changes), c.enabled === true ? 'Saved. banIP restarts with them, keeping the lists it has.' : 'Saved.');
+            run(
+              'advanced',
+              () => saveOptions(changes),
+              c.enabled === true ? 'Saved. banIP restarts with them, keeping the lists it has.' : 'Saved.',
+            );
           }}
         />
       )}

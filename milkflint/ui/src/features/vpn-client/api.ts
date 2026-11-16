@@ -13,7 +13,10 @@ import { blankForm, type ClientData, type Device, DEFAULT_KEEPALIVE, DEFAULT_POR
 /** Which way the VPN's devices' lookups go with AdGuard Home on (its monitor sends them through the tunnel when the DNS page has servers of its own). */
 function aghPath(agh: AdGuardStatus | undefined, milkflint: readonly Section[]): ClientData['adguard'] {
   if (agh?.installed !== true || agh.enabled !== true || agh.mode === 'ap') return undefined;
-  const mode = str(milkflint.find((s) => s['.name'] === 'dns'), 'mode');
+  const mode = str(
+    milkflint.find((s) => s['.name'] === 'dns'),
+    'mode',
+  );
   return mode === 'static' || mode === 'encrypted' ? 'tunnel' : 'automatic';
 }
 import { CLIENT, CLIENT_PEER, CLIENT_PEER_TYPE, CLIENT_QUEUE, CLIENT_SKIP, isVpnShaper, markSection } from './sections';
@@ -45,11 +48,14 @@ export async function loadClient(): Promise<ClientData> {
   };
 
   // the internet port's queue, for the tunnel's rates
-  const wanQueue = sqm?.find((s) => s['.type'] === 'queue' && !isGuestShaper(str(s, 'interface')) && !isVpnShaper(str(s, 'interface')));
+  const wanQueue = sqm?.find(
+    (s) => s['.type'] === 'queue' && !isGuestShaper(str(s, 'interface')) && !isVpnShaper(str(s, 'interface')),
+  );
   const mbit = (s: Section | undefined, option: string): number => Number(str(s, option) ?? '0') / 1000;
-  const wanRates = wanQueue !== undefined && bool(wanQueue, 'enabled') && mbit(wanQueue, 'download') > 0 && mbit(wanQueue, 'upload') > 0
-    ? { down: mbit(wanQueue, 'download'), up: mbit(wanQueue, 'upload') }
-    : undefined;
+  const wanRates =
+    wanQueue !== undefined && bool(wanQueue, 'enabled') && mbit(wanQueue, 'download') > 0 && mbit(wanQueue, 'upload') > 0
+      ? { down: mbit(wanQueue, 'download'), up: mbit(wanQueue, 'upload') }
+      : undefined;
   const queue = sqm?.find((s) => s['.type'] === 'queue' && s['.name'] === CLIENT_QUEUE);
 
   const labels = guestLabels(milkflint);
@@ -87,7 +93,10 @@ export async function loadClient(): Promise<ClientData> {
     devices: [...byMac.values()].sort((a, b) => (a.name ?? a.mac).localeCompare(b.name ?? b.mac)),
     sqm: sqm !== undefined,
     wanRates,
-    lan: lanInt === undefined ? undefined : { ip: lanInt, prefix: lanCidr !== undefined ? Number(lanCidr) : prefixLength(str(lanSection, 'netmask')) },
+    lan:
+      lanInt === undefined
+        ? undefined
+        : { ip: lanInt, prefix: lanCidr !== undefined ? Number(lanCidr) : prefixLength(str(lanSection, 'netmask')) },
     taken,
     adguard: aghPath(agh, milkflint),
   };

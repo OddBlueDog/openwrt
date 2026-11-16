@@ -1,4 +1,4 @@
-import { DownloadIcon, TableIcon } from 'lucide-react';
+import { DownloadIcon } from 'lucide-react';
 import { type ReactElement, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { errorMessage } from '@/lib/utils';
@@ -15,7 +15,15 @@ import { Timelines } from './timelines-report';
 import { useThresholds } from './thresholds';
 import { Verdict } from './verdict';
 
-function ExportButton({ data, checks, thresholds }: { data: RunData; checks: readonly Check[]; thresholds: Thresholds }): ReactElement {
+function ExportButton({
+  data,
+  checks,
+  thresholds,
+}: {
+  data: RunData;
+  checks: readonly Check[];
+  thresholds: Thresholds;
+}): ReactElement {
   const [error, setError] = useState<string>();
   const save = (): void => {
     try {
@@ -56,10 +64,12 @@ export function RunReport({ data, note }: { data: RunData; note?: string | undef
   const run = reportRun(data);
   const { schedule, members } = data.meta;
   return (
-    <div className="flex flex-col gap-6">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <span className="text-xs text-muted-foreground">
-          {note ?? 'Everything below is worked out in this browser from what the devices and the router recorded; the file has all of it.'}
+    // each part a section of its own, a hairline between them
+    <div className="flex flex-col gap-6 [&>section+section]:border-t [&>section+section]:pt-6">
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+        <span className="max-w-prose min-w-0 flex-1 text-xs text-muted-foreground">
+          {note ??
+            'Everything below is worked out in this browser from what the devices and the router recorded; the file has all of it.'}
         </span>
         <ExportButton data={data} checks={checks} thresholds={thresholds} />
       </div>
@@ -67,10 +77,8 @@ export function RunReport({ data, note }: { data: RunData; note?: string | undef
       {!schedule.dry && (
         <>
           <LatencyReport rows={rows} members={members} thresholds={thresholds} />
-          <section className="flex flex-col gap-2">
-            <h3 className="flex items-center gap-2 text-sm font-semibold">
-              <TableIcon className="size-4 text-muted-foreground" /> Phase by phase
-            </h3>
+          <section className="flex flex-col gap-3">
+            <h3 className="text-sm font-semibold">Phase by phase</h3>
             <ResultsTable data={data} run={run} schedule={schedule} members={members} />
           </section>
           <Timelines data={data} />

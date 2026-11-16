@@ -1,26 +1,35 @@
-import { CheckCircle2Icon, CloudUploadIcon, FileIcon, LoaderCircleIcon, ShieldAlertIcon, TriangleAlertIcon, XCircleIcon } from 'lucide-react';
-import { type ChangeEvent, type ReactElement, useCallback, useEffect, useState } from 'react';
-import { CardHeading, InfoRow } from '@/components/card-heading';
+// The Upgrade page: what the router runs now, then the image to install.
+// An image is uploaded to the router's RAM and checked there; nothing is
+// installed until Install is confirmed. Keeping the settings starts on when
+// a MilkFlint router gets a MilkFlint image (./keep.ts), and off otherwise
+// with the reason; erasing them is the destructive choice, and the
+// confirmation offers a backup first.
+import { CheckCircle2Icon, CloudUploadIcon, FileIcon, LoaderCircleIcon, TriangleAlertIcon, XCircleIcon } from 'lucide-react';
+import { type ChangeEvent, type ReactElement, type ReactNode, useCallback, useEffect, useState } from 'react';
+import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Note } from '@/components/note';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
 import { Switch } from '@/components/ui/switch';
 import { usePoll } from '@/hooks/use-poll';
-import { firmwareName, getBoard, getInfo } from '@/lib/api/system';
+import { type Board, firmwareName, getBoard, getInfo } from '@/lib/api/system';
 import { formatBytes, formatDuration } from '@/lib/format';
+import { href } from '@/lib/router';
 import { cn, errorMessage } from '@/lib/utils';
 import { type RestartPhase, waitForRouterAndReload } from '../backup-reset/api';
+import { BackupFirst } from '../backup-reset/backup-first';
 import { type Check, checkImage, discardImage, startUpgrade, uploadImage, type Validation, validateImage } from './api';
+import { erasedText, type KeepChoice, keepChoice } from './keep';
 
 type Stage =
   | { kind: 'idle' }
   | { kind: 'uploading'; name: string; progress: number }
   | { kind: 'checking'; name: string }
-  | { kind: 'ready'; name: string; validation: Validation; check: Check }
+  | { kind: 'ready'; name: string; validation: Validation; check: Check; choice: KeepChoice }
   | { kind: 'upgrading'; since: number; phase: RestartPhase }
   | { kind: 'error'; message: string };
 
@@ -30,6 +39,8 @@ const UPGRADE_SECONDS = 120;
 const MAX_IMAGE_BYTES = 128 * 1024 * 1024;
 /** When Install was pressed (ms since 1970), kept over the reload so the page can tell how it went. */
 const STARTED_KEY = 'milkflint.upgrade-started';
+/** MilkFlint's published images */
+const RELEASES = 'https://github.com/OddBlueDog/milkflint2/releases';
 
 const PHASES: Record<RestartPhase, string> = {
   starting: 'Starting the upgrade…',
@@ -51,19 +62,83 @@ function UpgradeCountdown({ since, phase }: { since: number; phase: RestartPhase
   const elapsed = Math.min(UPGRADE_SECONDS, Math.floor((now - since) / 1000));
   const left = UPGRADE_SECONDS - elapsed;
   return (
-    <div className="flex flex-col gap-2 rounded-lg border p-4">
-      <div className="flex items-center justify-between gap-3">
+    <div className="flex flex-col gap-2 border-t pt-4">
+      <div className="flex items-end justify-between gap-3">
         <div className="flex flex-col gap-0.5">
           <span className="text-sm font-medium">{PHASES[phase]}</span>
           <span className="text-xs text-muted-foreground">
-            {phase === 'back' ? 'Sign in again to see the new firmware.' : left > 0 ? 'Usually back in about 2 minutes.' : 'Taking a little longer than usual; still checking.'}
+            {phase === 'back'
+              ? 'Sign in again to see the new firmware.'
+              : left > 0
+                ? 'Usually back in about 2 minutes.'
+                : 'Taking a little longer than usual; still checking.'}
           </span>
         </div>
-        <span className="font-mono text-2xl font-medium tabular-nums">
+        <span
+          className="text-2xl font-semibold tabular"
+          aria-label={`${String(Math.floor(left / 60))} minutes ${String(left % 60)} seconds left`}
+        >
           {String(Math.floor(left / 60))}:{String(left % 60).padStart(2, '0')}
         </span>
       </div>
-      <Progress value={phase === 'back' ? 100 : (elapsed / UPGRADE_SECONDS) * 100} />
+      <Progress value={phase === 'back' ? 100 : (elapsed / UPGRADE_SECONDS) * 100} aria-label="Upgrade progress" />
+    </div>
+  );
+}
+
+/** A label above its value, one of the cells of the page's opening answer. */
+function Cell({ label, children }: { label: string; children: ReactNode }): ReactElement {
+  return (
+    <div className="flex min-w-0 flex-col gap-1 px-5 py-4">
+      <dt className="text-sm text-muted-foreground">{label}</dt>
+      <dd className="text-sm font-medium break-words">{children}</dd>
+    </div>
+  );
+}
+
+/** What the router runs now, and how the last upgrade went. */
+function RunningNow({
+  board,
+  outcome,
+}: {
+  board: Board | undefined;
+  outcome: { restarted: boolean; uptime: number } | undefined;
+}): ReactElement {
+  return (
+    <Card className="gap-0 py-0">
+      {outcome !== undefined && (
+        <div className="border-b px-5 py-4">
+          {outcome.restarted ? (
+            <Note tone="success" icon={<CheckCircle2Icon />} title="Upgrade finished">
+              The router restarted {formatDuration(outcome.uptime)} ago and runs{' '}
+              {firmwareName(board?.release) ?? 'the new firmware'}.
+            </Note>
+          ) : (
+            <Note tone="warning" icon={<TriangleAlertIcon />} title="The router didn’t restart">
+              So the new firmware wasn’t installed. Upload the image again to retry; the{' '}
+              <a href={href('logs')} className="font-medium link">
+                system log
+              </a>{' '}
+              may say what stopped it.
+            </Note>
+          )}
+        </div>
+      )}
+      <dl className="grid divide-y md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)] md:divide-x md:divide-y-0">
+        <Cell label="Running now">{firmwareName(board?.release) ?? '—'}</Cell>
+        <Cell label="Model">{board?.model ?? '—'}</Cell>
+        <Cell label="Kernel">{board?.kernel ?? '—'}</Cell>
+      </dl>
+    </Card>
+  );
+}
+
+/** A file's detail on one line: the label, then its value. */
+function Detail({ label, children }: { label: string; children: ReactNode }): ReactElement {
+  return (
+    <div className="grid gap-1 py-2.5 text-sm sm:grid-cols-[6rem_minmax(0,1fr)] sm:gap-4">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="min-w-0 font-medium break-all">{children}</dd>
     </div>
   );
 }
@@ -71,12 +146,13 @@ function UpgradeCountdown({ since, phase }: { since: number; phase: RestartPhase
 export function UpgradePage(): ReactElement {
   const board = usePoll(getBoard, 60_000).data;
   const [stage, setStage] = useState<Stage>({ kind: 'idle' });
-  // off by default: a fresh start avoids settings the new firmware doesn't expect
+  // set from the image when it's checked (./keep.ts)
   const [keep, setKeep] = useState(false);
   const [force, setForce] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [outcome, setOutcome] = useState<{ restarted: boolean; uptime: number }>();
+  const running = board?.release?.distribution;
 
   // After an upgrade's reload (and signing in again): did the router restart?
   // If it was up for longer than since Install, it didn't.
@@ -100,25 +176,29 @@ export function UpgradePage(): ReactElement {
       .catch(() => undefined);
   }, []);
 
-  const upload = useCallback(async (file: File): Promise<void> => {
-    if (file.size > MAX_IMAGE_BYTES) {
-      setStage({ kind: 'error', message: `${file.name} is ${formatBytes(file.size)}, too big for a firmware image.` });
-      return;
-    }
-    setForce(false);
-    try {
-      setStage({ kind: 'uploading', name: file.name, progress: 0 });
-      await uploadImage(file, (progress) => {
-        setStage({ kind: 'uploading', name: file.name, progress });
-      });
-      setStage({ kind: 'checking', name: file.name });
-      const [validation, check] = await Promise.all([validateImage(), checkImage()]);
-      setKeep(false);
-      setStage({ kind: 'ready', name: file.name, validation, check });
-    } catch (err) {
-      setStage({ kind: 'error', message: errorMessage(err) });
-    }
-  }, []);
+  const upload = useCallback(
+    async (file: File): Promise<void> => {
+      if (file.size > MAX_IMAGE_BYTES) {
+        setStage({ kind: 'error', message: `${file.name} is ${formatBytes(file.size)}, too big for a firmware image.` });
+        return;
+      }
+      setForce(false);
+      try {
+        setStage({ kind: 'uploading', name: file.name, progress: 0 });
+        await uploadImage(file, (progress) => {
+          setStage({ kind: 'uploading', name: file.name, progress });
+        });
+        setStage({ kind: 'checking', name: file.name });
+        const [validation, check] = await Promise.all([validateImage(), checkImage()]);
+        const choice = keepChoice({ running, image: file.name, allowBackup: validation.allow_backup });
+        setKeep(choice.keep);
+        setStage({ kind: 'ready', name: file.name, validation, check, choice });
+      } catch (err) {
+        setStage({ kind: 'error', message: errorMessage(err) });
+      }
+    },
+    [running],
+  );
 
   // A firmware file dropped anywhere on the page is uploaded while the drop
   // zone shows; at other times a drop does nothing (rather than the browser
@@ -189,114 +269,148 @@ export function UpgradePage(): ReactElement {
   };
 
   const ready = stage.kind === 'ready' ? stage : undefined;
-  const failedTests = ready === undefined ? [] : Object.entries(ready.validation.tests ?? {}).filter(([, ok]) => !ok).map(([name]) => name);
+  const failedTests =
+    ready === undefined
+      ? []
+      : Object.entries(ready.validation.tests ?? {})
+          .filter(([, ok]) => !ok)
+          .map(([name]) => name);
   const installable = ready !== undefined && (ready.validation.valid || (force && ready.validation.forceable === true));
+  const erasing = !keep;
 
   return (
     <>
-      <PageHeader title="Upgrade" description="Install a new firmware image." />
-      <div className="grid items-start gap-4 xl:grid-cols-[1fr_24rem]">
+      <PageHeader
+        title="Upgrade"
+        description="Install a new firmware image. Upgrading from MilkFlint keeps your settings, unless you choose to erase them."
+      />
+      <div className="flex flex-col gap-4">
+        <RunningNow board={board} outcome={stage.kind === 'idle' ? outcome : undefined} />
+
         <Card>
-          <CardHeading icon={CloudUploadIcon} title="Firmware image" description="A sysupgrade image for this router (from your own build, or openwrt.org)." />
+          <CardHeading
+            title="Firmware image"
+            description="A sysupgrade image for this router: a MilkFlint release, your own build, or one from openwrt.org."
+          />
           <CardContent className="flex flex-col gap-4">
-            {outcome !== undefined && stage.kind === 'idle' && (
-              outcome.restarted ? (
-                <Alert variant="success">
-                  <CheckCircle2Icon />
-                  <AlertTitle>Upgrade finished</AlertTitle>
-                  <AlertDescription>
-                    The router restarted {formatDuration(outcome.uptime)} ago and runs {firmwareName(board?.release) ?? 'the new firmware'}.
-                  </AlertDescription>
-                </Alert>
-              ) : (
-                <Alert variant="warning">
-                  <TriangleAlertIcon />
-                  <AlertTitle>The router didn&apos;t restart</AlertTitle>
-                  <AlertDescription>So the new firmware wasn&apos;t installed. Upload the image again to retry; the system log may say what stopped it.</AlertDescription>
-                </Alert>
-              )
-            )}
             {stage.kind === 'upgrading' ? (
               <>
-                <Alert variant="info">
-                  <LoaderCircleIcon className="animate-spin" />
-                  <AlertTitle>Upgrading… don&apos;t unplug the router</AlertTitle>
-                  <AlertDescription>
-                    This takes about 2 minutes; the lights may flash. The page reloads when the router is back
-                    {keep ? '' : ' (at http://192.168.1.1/, with factory settings)'}.
-                  </AlertDescription>
-                </Alert>
+                <Note tone="info" icon={<LoaderCircleIcon className="animate-spin" />} title="Upgrading… don’t unplug the router">
+                  This takes about 2 minutes; the lights may flash. The page reloads when the router is back
+                  {keep ? '' : ' (at http://192.168.1.1/, with factory settings)'}.
+                </Note>
                 <UpgradeCountdown since={stage.since} phase={stage.phase} />
               </>
             ) : stage.kind === 'uploading' || stage.kind === 'checking' ? (
-              <div className="flex flex-col gap-2 rounded-lg border p-4">
-                <div className="flex items-center gap-2 text-sm">
-                  <FileIcon className="size-4 text-muted-foreground" />
-                  <span className="font-medium">{stage.name}</span>
-                  <span className="ml-auto text-muted-foreground">{stage.kind === 'uploading' ? 'Uploading…' : 'Checking the image…'}</span>
+              <div className="flex flex-col gap-2 py-2">
+                <div className="flex min-w-0 items-center gap-2 text-sm">
+                  <FileIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+                  <span className="min-w-0 truncate font-medium">{stage.name}</span>
+                  <span className="ml-auto shrink-0 text-muted-foreground">
+                    {stage.kind === 'uploading' ? 'Uploading…' : 'Checking the image…'}
+                  </span>
                 </div>
-                <Progress value={stage.kind === 'uploading' ? stage.progress * 100 : 100} />
+                <Progress
+                  value={stage.kind === 'uploading' ? stage.progress * 100 : 100}
+                  aria-label={stage.kind === 'uploading' ? 'Upload progress' : 'Checking the image'}
+                />
               </div>
             ) : ready !== undefined ? (
-              <div className="flex flex-col gap-3">
-                <div className="divide-y rounded-lg border px-4">
-                  <InfoRow label="File">{ready.name}</InfoRow>
-                  <InfoRow label="Size">{ready.check.size === undefined ? '—' : formatBytes(ready.check.size)}</InfoRow>
-                  <InfoRow label="SHA-256">
-                    <span className="font-mono text-[11px] break-all whitespace-normal">{ready.check.sha256 ?? '—'}</span>
-                  </InfoRow>
-                </div>
+              <div className="flex flex-col gap-4">
+                <dl className="divide-y border-y">
+                  <Detail label="File">{ready.name}</Detail>
+                  <Detail label="Size">{ready.check.size === undefined ? '—' : formatBytes(ready.check.size)}</Detail>
+                  <Detail label="SHA-256">
+                    <span className="font-mono text-xs font-normal">{ready.check.sha256 ?? '—'}</span>
+                  </Detail>
+                </dl>
                 {ready.validation.valid ? (
-                  <Alert variant="success">
-                    <CheckCircle2Icon />
-                    <AlertTitle>The image fits this router</AlertTitle>
-                    <AlertDescription>Compare the SHA-256 with the one on the download page before installing.</AlertDescription>
-                  </Alert>
+                  <Note tone="success" icon={<CheckCircle2Icon />} title="The image fits this router">
+                    Compare the SHA-256 with the one on the download page before installing.
+                  </Note>
                 ) : (
-                  <Alert variant="destructive">
-                    <XCircleIcon />
-                    <AlertTitle>This image doesn&apos;t look right for this router</AlertTitle>
-                    <AlertDescription>
-                      {failedTests.length > 0 ? `Failed checks: ${failedTests.join(', ')}.` : 'It failed the image checks.'}
-                      {ready.check.test_output !== undefined && ready.check.test_output !== '' && (
-                        <pre className="mt-1 max-h-32 overflow-auto font-mono text-[11px] whitespace-pre-wrap">{ready.check.test_output}</pre>
-                      )}
-                    </AlertDescription>
-                  </Alert>
+                  <Note tone="destructive" icon={<XCircleIcon />} title="This image doesn’t look right for this router">
+                    {failedTests.length > 0 ? `Failed checks: ${failedTests.join(', ')}.` : 'It failed the image checks.'}
+                    {ready.check.test_output !== undefined && ready.check.test_output !== '' && (
+                      <pre className="mt-1 max-h-32 overflow-auto font-mono text-xs whitespace-pre-wrap">
+                        {ready.check.test_output}
+                      </pre>
+                    )}
+                  </Note>
                 )}
-                <Field id="up-keep" label="Keep settings" hint={
-                    ready.validation.allow_backup === false
-                      ? "This image can't keep the current settings."
-                      : 'Off (recommended): the router starts with factory settings, and you set it up again. Settings kept from another firmware or version may not suit this one.'
-                  }>
-                  <Switch id="up-keep" checked={keep} disabled={ready.validation.allow_backup === false} onCheckedChange={setKeep} />
-                </Field>
-                {!ready.validation.valid && ready.validation.forceable === true && (
-                  <Field id="up-force" label="Install anyway" hint="Only if you know this image is right; a wrong image can stop the router from starting.">
-                    <Switch id="up-force" checked={force} onCheckedChange={setForce} />
+                <div className="divide-y border-t">
+                  <Field
+                    id="up-keep"
+                    label="Keep settings"
+                    // why it can't be kept is the switch's state, so it shows in every theme
+                    hint={ready.choice.allowed ? ready.choice.reason : undefined}
+                    status={ready.choice.allowed ? undefined : ready.choice.reason}
+                    why={
+                      <div className="flex flex-col gap-1.5">
+                        <p>
+                          Kept, the router comes back with the same address, admin password and Wi-Fi. Erased:{' '}
+                          {erasedText(ready.choice.kind)}
+                        </p>
+                        <p>
+                          Settings kept from another firmware or version may not suit it, which is why only a MilkFlint image
+                          keeps them to start with.
+                        </p>
+                        <p className="text-muted-foreground">
+                          Erasing is <code className="font-mono text-foreground">sysupgrade -n</code>.
+                        </p>
+                      </div>
+                    }
+                  >
+                    <div className="flex items-center gap-3">
+                      <Switch id="up-keep" checked={keep} disabled={!ready.choice.allowed} onCheckedChange={setKeep} />
+                      <span className="text-sm">{keep ? 'Kept' : 'Erased'}</span>
+                    </div>
                   </Field>
+                  {!ready.validation.valid && ready.validation.forceable === true && (
+                    <Field
+                      id="up-force"
+                      label="Install anyway"
+                      hint="Only if you know this image is right; a wrong image can stop the router from starting."
+                    >
+                      <Switch id="up-force" checked={force} onCheckedChange={setForce} />
+                    </Field>
+                  )}
+                </div>
+                {erasing && (
+                  <Note tone="warning" icon={<TriangleAlertIcon />} title="Installing this erases every setting">
+                    {erasedText(ready.choice.kind)}
+                  </Note>
                 )}
               </div>
             ) : (
               <>
                 {stage.kind === 'error' && (
-                  <Alert variant="destructive">
-                    <TriangleAlertIcon />
-                    <AlertTitle>Couldn&apos;t check the image</AlertTitle>
-                    <AlertDescription>{stage.message}</AlertDescription>
-                  </Alert>
+                  <Note tone="destructive" icon={<TriangleAlertIcon />} title="Couldn’t check the image">
+                    {stage.message}
+                  </Note>
                 )}
                 <label
                   className={cn(
-                    'flex cursor-pointer flex-col items-center gap-2 rounded-lg border border-dashed p-8 text-center transition-colors hover:bg-accent/50',
-                    dragging && 'border-primary bg-primary/5 hover:bg-primary/5',
+                    'flex cursor-pointer flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-10 text-center transition-colors duration-fast hover:bg-accent/50 has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-ring',
+                    dragging && 'border-primary bg-primary-subtle hover:bg-primary-subtle',
                   )}
                 >
-                  <CloudUploadIcon className={cn('size-6 text-muted-foreground', dragging && 'text-primary')} />
-                  <span className="text-sm font-medium">{dragging ? 'Drop it to upload' : 'Choose a firmware file, or drop it here'}</span>
-                  <span className="text-xs text-muted-foreground">It&apos;s uploaded to the router and checked; nothing is installed yet.</span>
+                  <CloudUploadIcon className={cn('size-6 text-muted-foreground', dragging && 'text-primary')} aria-hidden />
+                  <span className="text-sm font-medium">
+                    {dragging ? 'Drop it to upload' : 'Choose a firmware file, or drop it here'}
+                  </span>
+                  <span className="text-xs text-muted-foreground">
+                    It’s uploaded to the router and checked; nothing is installed yet.
+                  </span>
                   <input type="file" className="sr-only" accept=".bin,.img,.gz,.itb" onChange={choose} />
                 </label>
+                <p className="text-sm text-muted-foreground">
+                  MilkFlint’s images are on its{' '}
+                  <a href={RELEASES} target="_blank" rel="noreferrer" className="font-medium link">
+                    releases page
+                  </a>
+                  : take the one ending in sysupgrade.bin.
+                </p>
               </>
             )}
           </CardContent>
@@ -311,30 +425,43 @@ export function UpgradePage(): ReactElement {
                   setConfirming(true);
                 }}
               >
-                Install
+                Install…
               </Button>
             </CardFooter>
           )}
-        </Card>
-
-        <Card>
-          <CardHeading icon={ShieldAlertIcon} title="Running now" />
-          <CardContent className="divide-y">
-            <InfoRow label="Firmware">{firmwareName(board?.release) ?? '—'}</InfoRow>
-            <InfoRow label="Model">{board?.model ?? '—'}</InfoRow>
-            <InfoRow label="Kernel">{board?.kernel ?? '—'}</InfoRow>
-          </CardContent>
         </Card>
       </div>
 
       <Dialog open={confirming} onOpenChange={setConfirming}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Install {ready?.name}?</DialogTitle>
+            <DialogTitle>{erasing ? 'Install and erase every setting?' : 'Install and keep your settings?'}</DialogTitle>
             <DialogDescription>
-              The router restarts and is offline for a few minutes. {keep ? 'Settings are kept.' : 'All settings are erased.'} Don&apos;t unplug it while it upgrades.
+              The router installs <span className="font-mono text-xs break-all text-foreground">{ready?.name}</span> and restarts:
+              it’s offline for about 2 minutes. Don’t unplug it while it upgrades.
             </DialogDescription>
           </DialogHeader>
+          <div className="flex flex-col gap-4 text-sm">
+            {erasing ? (
+              <Note tone="destructive" icon={<TriangleAlertIcon />} title="All settings are erased">
+                {erasedText(ready?.choice.kind ?? 'unknown')} A backup brings them back, on{' '}
+                <a href={href('backup-reset')} className="font-medium link">
+                  Backup &amp; reset
+                </a>
+                .
+              </Note>
+            ) : (
+              <Note tone="success" icon={<CheckCircle2Icon />} title="Settings are kept">
+                It comes back with the same address, admin password and Wi-Fi.
+              </Note>
+            )}
+            {force && (
+              <Note tone="warning" icon={<TriangleAlertIcon />} title="It failed the image checks">
+                It’s installed anyway, as you chose. A wrong image can stop the router from starting.
+              </Note>
+            )}
+            <BackupFirst />
+          </div>
           <DialogFooter>
             <Button
               variant="ghost"
@@ -344,8 +471,8 @@ export function UpgradePage(): ReactElement {
             >
               Cancel
             </Button>
-            <Button variant={force ? 'destructive' : 'default'} onClick={() => void upgrade()}>
-              Install and restart
+            <Button variant={erasing || force ? 'destructive' : 'default'} onClick={() => void upgrade()}>
+              {erasing ? 'Erase and install' : 'Install and restart'}
             </Button>
           </DialogFooter>
         </DialogContent>

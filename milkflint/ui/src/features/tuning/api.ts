@@ -26,7 +26,9 @@ export type GroPort = z.output<typeof groPortSchema>;
 
 const statusSchema = z.object({
   /** each radio's best-effort AQL limits and the total that holds devices to the low one, in µs (an older router has no total) */
-  radios: z.array(z.object({ phy: z.string(), low: z.number(), high: z.number(), threshold: z.number().nullable().default(null) })),
+  radios: z.array(
+    z.object({ phy: z.string(), low: z.number(), high: z.number(), threshold: z.number().nullable().default(null) }),
+  ),
   steering: z.object({
     cpus: z.number(),
     /** where the Ethernet receive (NAPI) threads may run */

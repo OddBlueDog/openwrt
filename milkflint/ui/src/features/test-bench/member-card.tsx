@@ -15,9 +15,12 @@ import { SignalBars } from '@/components/charts/signal-bars';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatNumber } from '@/lib/format';
-import { cn, errorMessage } from '@/lib/utils';
+import { errorMessage } from '@/lib/utils';
 import type { Link, Member } from './api';
+import { Arrowed, Dir } from './dir';
+import { presence } from './summary';
 import { agentText, parseAgent } from './ua';
 
 /** "5 GHz · ch 44 · 80 MHz" */
@@ -38,10 +41,15 @@ export function LinkLine({ link }: { link: Link | null | undefined }): ReactElem
     return <span className="text-muted-foreground">Link not known</span>;
   }
   if (link.kind === 'wired') {
-    const speed = link.speed === undefined || link.speed === null ? undefined : link.speed >= 1000 ? `${formatNumber(link.speed / 1000, 1)} Gbit/s` : `${String(link.speed)} Mbit/s`;
+    const speed =
+      link.speed === undefined || link.speed === null
+        ? undefined
+        : link.speed >= 1000
+          ? `${formatNumber(link.speed / 1000, 1)} Gbit/s`
+          : `${String(link.speed)} Mbit/s`;
     return (
       <span className="inline-flex min-w-0 items-center gap-1.5">
-        <EthernetPortIcon className="size-3.5 shrink-0 text-chart-3" />
+        <EthernetPortIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="truncate">
           Wired · {link.port ?? link.dev ?? 'port not known'}
           {speed !== undefined && ` · ${speed}`}
@@ -52,16 +60,18 @@ export function LinkLine({ link }: { link: Link | null | undefined }): ReactElem
   return (
     <span className="flex min-w-0 flex-col gap-0.5">
       <span className="inline-flex min-w-0 items-center gap-1.5">
-        <WifiIcon className="size-3.5 shrink-0 text-chart-4" />
+        <WifiIcon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <span className="truncate">{wifiText(link)}</span>
-        {link.generation !== undefined && link.generation !== null && <span className="text-muted-foreground">· Wi-Fi {link.generation}</span>}
+        {link.generation !== undefined && link.generation !== null && (
+          <span className="shrink-0 text-muted-foreground">· Wi-Fi {link.generation}</span>
+        )}
       </span>
       {link.signal !== undefined && link.signal !== null && (
-        <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+        <span className="inline-flex flex-wrap items-center gap-x-1.5 text-muted-foreground">
           <SignalBars dbm={link.signal} className="ml-0.5" />
           {/* the router's send rate is the device's download */}
-          <span className="tabular">
-            {link.signal} dBm · ↓{mbit(link.tx_mbit)} ↑{mbit(link.rx_mbit)} Mbit/s
+          <span className="inline-flex items-center gap-1 tabular">
+            {link.signal} dBm · <Dir d="down" /> {mbit(link.tx_mbit)} <Dir d="up" /> {mbit(link.rx_mbit)} Mbit/s
           </span>
         </span>
       )}
@@ -72,36 +82,26 @@ export function LinkLine({ link }: { link: Link | null | undefined }): ReactElem
 function DeviceIcon({ ua }: { ua: string | null | undefined }): ReactElement {
   const a = parseAgent(ua);
   const Icon = a.device === 'phone' ? SmartphoneIcon : a.device === 'tablet' ? TabletIcon : LaptopIcon;
-  return (
-    <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-      <Icon className="size-4" />
-    </div>
-  );
+  return <Icon className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden="true" />;
 }
 
+/** Whether the device is there and its page in front, in a word. */
 function Presence({ m }: { m: Member }): ReactElement {
-  if (m.seen_ms > 15_000) {
-    return (
-      <span className="inline-flex items-center gap-1.5 text-warning">
-        <span className="size-2 rounded-full bg-warning" /> Away · {formatNumber(m.seen_ms / 1000)} s
-      </span>
-    );
-  }
-  if (m.visible === false) {
-    return (
-      <span className="inline-flex items-center gap-1.5 text-warning">
-        <span className="size-2 rounded-full bg-warning" /> Page in the background
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1.5 text-muted-foreground">
-      <span className="size-2 rounded-full bg-success" /> Ready
-    </span>
-  );
+  const p = presence(m);
+  if (p === 'away') return <Badge variant="warning">Away · {formatNumber(m.seen_ms / 1000)} s</Badge>;
+  if (p === 'hidden') return <Badge variant="warning">Page hidden</Badge>;
+  return <Badge variant="success">Ready</Badge>;
 }
 
-function NameEditor({ name, onSave, onCancel }: { name: string; onSave: (name: string) => Promise<void>; onCancel: () => void }): ReactElement {
+function NameEditor({
+  name,
+  onSave,
+  onCancel,
+}: {
+  name: string;
+  onSave: (name: string) => Promise<void>;
+  onCancel: () => void;
+}): ReactElement {
   const [value, setValue] = useState(name);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -122,12 +122,19 @@ function NameEditor({ name, onSave, onCancel }: { name: string; onSave: (name: s
           aria-label="Name"
           value={value}
           maxLength={32}
-          className="h-8"
+          className="h-8 min-w-0"
           onChange={(e) => {
             setValue(e.target.value);
           }}
         />
-        <Button type="submit" size="icon" variant="ghost" className="size-8" disabled={busy || value.trim() === ''} aria-label="Save the name">
+        <Button
+          type="submit"
+          size="icon"
+          variant="ghost"
+          className="size-8"
+          disabled={busy || value.trim() === ''}
+          aria-label="Save the name"
+        >
           <CheckIcon />
         </Button>
         <Button type="button" size="icon" variant="ghost" className="size-8" onClick={onCancel} aria-label="Keep the name">
@@ -145,25 +152,26 @@ export interface MemberActions {
   remove?: () => Promise<void>;
 }
 
-/** A member of the bench: name, browser, address and how it's connected. */
-export function MemberCard({
-  m,
-  me,
-  coordinator,
-  phaseLabel,
-  actions,
-}: {
+export interface MemberEntry {
   m: Member;
   me: boolean;
   coordinator: boolean;
   /** what it's doing in the run, when one is on */
   phaseLabel: string | undefined;
   actions: MemberActions;
-}): ReactElement {
+}
+
+/** A member's row state: renaming, and an action under way or failed. */
+function useRow(): {
+  editing: boolean;
+  setEditing: (v: boolean) => void;
+  busy: boolean;
+  error: string | undefined;
+  act: (f: (() => Promise<void>) | undefined) => Promise<void>;
+} {
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
-  const agent = parseAgent(m.ua);
   const act = async (f: (() => Promise<void>) | undefined): Promise<void> => {
     if (f === undefined) return;
     setBusy(true);
@@ -176,81 +184,226 @@ export function MemberCard({
       setBusy(false);
     }
   };
+  return { editing, setEditing, busy, error, act };
+}
+
+/** You and Coordinator, as marks beside a device. */
+function Marks({ e }: { e: MemberEntry }): ReactElement | null {
+  if (!e.me && !e.coordinator) return null;
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1.5">
+      {e.me && <Badge variant="secondary">You</Badge>}
+      {e.coordinator && (
+        <Badge variant="outline">
+          <CrownIcon /> Coordinator
+        </Badge>
+      )}
+    </span>
+  );
+}
+
+/** The device's name (renamed in place) and its browser, with its address when `ip`; `marks` beside the name. */
+function NameBlock({
+  e,
+  editing,
+  setEditing,
+  marks,
+  ip,
+}: {
+  e: MemberEntry;
+  editing: boolean;
+  setEditing: (v: boolean) => void;
+  marks: boolean;
+  ip: boolean;
+}): ReactElement {
+  const { m, actions } = e;
   const rename = actions.rename;
   return (
-    <div className={cn('flex flex-col gap-3 rounded-xl border bg-card p-4', me && 'border-primary/40 ring-1 ring-primary/15')}>
-      <div className="flex items-start gap-3">
-        <DeviceIcon ua={m.ua} />
-        {editing && rename !== undefined ? (
-          <NameEditor
-            name={m.name}
-            onSave={async (name) => {
-              await rename(name);
-              setEditing(false);
-            }}
-            onCancel={() => {
-              setEditing(false);
-            }}
-          />
-        ) : (
-          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <span className="truncate font-medium">{m.name}</span>
-              {rename !== undefined && (
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="size-6 text-muted-foreground"
-                  aria-label={`Rename ${m.name}`}
-                  onClick={() => {
-                    setEditing(true);
-                  }}
-                >
-                  <PencilIcon className="size-3" />
-                </Button>
-              )}
-            </div>
-            <span className="truncate text-xs text-muted-foreground">{agentText(agent)}</span>
+    <div className="flex min-w-0 flex-1 items-start gap-2.5">
+      <DeviceIcon ua={m.ua} />
+      {editing && rename !== undefined ? (
+        <NameEditor
+          name={m.name}
+          onSave={async (name) => {
+            await rename(name);
+            setEditing(false);
+          }}
+          onCancel={() => {
+            setEditing(false);
+          }}
+        />
+      ) : (
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+            <span className="truncate font-medium">{m.name}</span>
+            {rename !== undefined && (
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="size-6 text-muted-foreground"
+                aria-label={`Rename ${m.name}`}
+                onClick={() => {
+                  setEditing(true);
+                }}
+              >
+                <PencilIcon className="size-3" />
+              </Button>
+            )}
+            {marks && <Marks e={e} />}
           </div>
-        )}
-        <div className="flex shrink-0 flex-col items-end gap-1">
-          {me && <Badge variant="secondary">You</Badge>}
-          {coordinator && (
-            <Badge variant="outline" className="gap-1">
-              <CrownIcon className="text-chart-4" /> Coordinator
-            </Badge>
+          <span className="truncate text-xs text-muted-foreground">
+            {agentText(parseAgent(m.ua))}
+            {ip && <span className="font-mono"> · {m.ip}</span>}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const clockText = (m: Member): string =>
+  m.clock_us === undefined || m.clock_us === null
+    ? 'not synced yet'
+    : `±${formatNumber(m.clock_us / 1000, m.clock_us < 10_000 ? 1 : 0)} ms`;
+
+/** A device as a table row, on a wide screen. */
+function MemberTableRow({ e }: { e: MemberEntry }): ReactElement {
+  const { m, actions } = e;
+  const row = useRow();
+  return (
+    <TableRow className={e.me ? 'bg-primary-subtle/40 hover:bg-primary-subtle/40' : undefined}>
+      <TableCell className="min-w-48 whitespace-normal">
+        <NameBlock e={e} editing={row.editing} setEditing={row.setEditing} marks ip />
+        {row.error !== undefined && <p className="mt-1 text-xs text-destructive">{row.error}</p>}
+      </TableCell>
+      <TableCell className="max-w-72 text-xs whitespace-normal">
+        <LinkLine link={m.link} />
+      </TableCell>
+      <TableCell className="text-xs text-muted-foreground tabular">{clockText(m)}</TableCell>
+      <TableCell className="whitespace-normal">
+        <div className="flex flex-col items-start gap-1">
+          <Presence m={m} />
+          {e.phaseLabel !== undefined && (
+            <span className="text-xs font-medium">
+              <Arrowed text={e.phaseLabel} />
+            </span>
           )}
         </div>
+      </TableCell>
+      <TableCell className="text-right">
+        <div className="flex justify-end gap-1">
+          {actions.makeCoordinator !== undefined && (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-8 text-muted-foreground hover:text-foreground"
+              aria-label={`Make ${m.name} the coordinator`}
+              title={`Make ${m.name} the coordinator`}
+              disabled={row.busy}
+              onClick={() => void row.act(actions.makeCoordinator)}
+            >
+              <CrownIcon />
+            </Button>
+          )}
+          {actions.remove !== undefined && (
+            <Button
+              type="button"
+              size="icon"
+              variant="ghost"
+              className="size-8 text-muted-foreground hover:text-foreground"
+              aria-label={`Remove ${m.name} from the bench`}
+              title={`Remove ${m.name} from the bench`}
+              disabled={row.busy}
+              onClick={() => void row.act(actions.remove)}
+            >
+              <UserMinusIcon />
+            </Button>
+          )}
+        </div>
+      </TableCell>
+    </TableRow>
+  );
+}
+
+/** A device as stacked lines, on a phone. */
+function MemberListItem({ e }: { e: MemberEntry }): ReactElement {
+  const { m, actions } = e;
+  const row = useRow();
+  return (
+    <li className="flex flex-col gap-2 px-5 py-3">
+      <NameBlock e={e} editing={row.editing} setEditing={row.setEditing} marks={false} ip={false} />
+      <div className="flex flex-wrap items-center gap-1.5 pl-6.5">
+        <Presence m={m} />
+        <Marks e={e} />
       </div>
-      <div className="flex flex-col gap-1.5 border-t pt-3 text-xs">
-        <div className="flex items-center justify-between gap-3">
-          <span className="font-mono text-[11px] text-muted-foreground">{m.ip}</span>
-          <Presence m={m} />
-        </div>
+      <div className="flex flex-col gap-1 pl-6.5 text-xs">
         <LinkLine link={m.link} />
-        <div className="flex items-center justify-between gap-3 text-muted-foreground">
-          <span className="tabular">
-            Clock {m.clock_us === undefined || m.clock_us === null ? 'not synced yet' : `±${formatNumber(m.clock_us / 1000, m.clock_us < 10_000 ? 1 : 0)} ms`}
+        <span className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-muted-foreground">
+          <span className="font-mono">{m.ip}</span>
+          <span className="tabular">Clock {clockText(m)}</span>
+        </span>
+        {e.phaseLabel !== undefined && (
+          <span className="font-medium">
+            <Arrowed text={e.phaseLabel} />
           </span>
-          {phaseLabel !== undefined && <span className="truncate font-medium text-foreground">{phaseLabel}</span>}
-        </div>
+        )}
       </div>
       {(actions.makeCoordinator !== undefined || actions.remove !== undefined) && (
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 pl-6.5">
           {actions.makeCoordinator !== undefined && (
-            <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void act(actions.makeCoordinator)}>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={row.busy}
+              onClick={() => void row.act(actions.makeCoordinator)}
+            >
               <CrownIcon /> Make coordinator
             </Button>
           )}
           {actions.remove !== undefined && (
-            <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => void act(actions.remove)}>
+            <Button type="button" size="sm" variant="ghost" disabled={row.busy} onClick={() => void row.act(actions.remove)}>
               <UserMinusIcon /> Remove
             </Button>
           )}
         </div>
       )}
-      {error !== undefined && <p className="text-xs text-destructive">{error}</p>}
-    </div>
+      {row.error !== undefined && <p className="pl-6.5 text-xs text-destructive">{row.error}</p>}
+    </li>
+  );
+}
+
+/** The bench's devices: name, browser, how it's connected, its address, clock and state. A table on a wide screen, stacked rows on a phone. */
+export function MemberList({ entries }: { entries: readonly MemberEntry[] }): ReactElement {
+  return (
+    <>
+      <div className="hidden lg:block">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Device</TableHead>
+              <TableHead>Connected</TableHead>
+              <TableHead>Clock</TableHead>
+              <TableHead>State</TableHead>
+              <TableHead className="text-right">
+                <span className="sr-only">Actions</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {entries.map((e) => (
+              <MemberTableRow key={e.m.id} e={e} />
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+      <ul className="divide-y border-t lg:hidden">
+        {entries.map((e) => (
+          <MemberListItem key={e.m.id} e={e} />
+        ))}
+      </ul>
+    </>
   );
 }

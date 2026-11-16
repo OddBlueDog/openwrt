@@ -209,7 +209,9 @@ const pollSchema = z.object({
     code: z.string().nullish(),
     code_disabled: z.boolean().nullish(),
     /** Smart Queue's shaped rates, kbit/s (null: it's off) */
-    shaper: z.object({ interface: z.string().nullish(), down_kbit: z.number(), up_kbit: z.number(), qdisc: z.string().nullish() }).nullish(),
+    shaper: z
+      .object({ interface: z.string().nullish(), down_kbit: z.number(), up_kbit: z.number(), qdisc: z.string().nullish() })
+      .nullish(),
   }),
   members: z.array(memberSchema),
   run: runSchema.nullish(),
@@ -266,19 +268,33 @@ export const runSettingsSchema = z
       )
       .catch([]),
     firewall: z
-      .object({ flow_offloading: z.string().nullish(), flow_offloading_hw: z.string().nullish(), flow_offloading_bridge: z.string().nullish() })
+      .object({
+        flow_offloading: z.string().nullish(),
+        flow_offloading_hw: z.string().nullish(),
+        flow_offloading_bridge: z.string().nullish(),
+      })
       .loose()
       .catch({}),
     wifi: z
       .array(
         z
-          .object({ radio: z.string().nullish(), band: z.string().nullish(), channel: z.union([z.string(), z.number()]).nullish(), htmode: z.string().nullish(), disabled: z.string().nullish() })
+          .object({
+            radio: z.string().nullish(),
+            band: z.string().nullish(),
+            channel: z.union([z.string(), z.number()]).nullish(),
+            htmode: z.string().nullish(),
+            disabled: z.string().nullish(),
+          })
           .loose(),
       )
       .catch([]),
     dns: z.string().nullish(),
     /** banIP, when it's in the firmware: on ('1'), and its lists */
-    banip: z.object({ enabled: z.string().nullish(), feeds: z.array(z.string()).nullish() }).loose().nullish().catch(null),
+    banip: z
+      .object({ enabled: z.string().nullish(), feeds: z.array(z.string()).nullish() })
+      .loose()
+      .nullish()
+      .catch(null),
     firmware: z.string().nullish(),
     model: z.string().nullish(),
   })
@@ -376,7 +392,15 @@ export interface PollArgs {
 }
 
 export async function poll(session: string, a: PollArgs): Promise<Poll> {
-  const args = { run: a.run, signals: a.signals, visible: a.visible, clock_us: Math.round(a.clockUs), phase: a.phase, note: a.note, live: a.live };
+  const args = {
+    run: a.run,
+    signals: a.signals,
+    visible: a.visible,
+    clock_us: Math.round(a.clockUs),
+    phase: a.phase,
+    note: a.note,
+    live: a.live,
+  };
   return ok(await call('milkflint.bench.member', 'poll', args, orError(pollSchema), { session }));
 }
 
@@ -388,8 +412,11 @@ export async function rename(session: string, name: string, member?: string): Pr
 
 /** One report of results (at most 32 KB of JSON); false: a repeat the router already has. */
 export async function report(session: string, run: string, seq: number, records: unknown[]): Promise<boolean> {
-  return ok(await call('milkflint.bench.member', 'report', { run, seq, records }, orError(z.object({ stored: z.boolean() })), { session }))
-    .stored;
+  return ok(
+    await call('milkflint.bench.member', 'report', { run, seq, records }, orError(z.object({ stored: z.boolean() })), {
+      session,
+    }),
+  ).stored;
 }
 
 export async function sendSignal(session: string, to: string, pair: string, kind: Signal['kind'], sdp?: string): Promise<void> {
@@ -406,7 +433,8 @@ export async function leave(session: string): Promise<void> {
 }
 
 export async function memberRuns(session: string): Promise<RunSummary[]> {
-  return ok(await call('milkflint.bench.member', 'runs', {}, orError(z.object({ runs: z.array(runSummarySchema) })), { session })).runs;
+  return ok(await call('milkflint.bench.member', 'runs', {}, orError(z.object({ runs: z.array(runSummarySchema) })), { session }))
+    .runs;
 }
 
 export async function memberRunMeta(session: string, run: string): Promise<RunMeta> {
@@ -422,7 +450,11 @@ export type ScheduleRequest = Omit<Schedule, 'length' | 'options'> & { options: 
 
 /** Start a run (the coordinator): it begins a few seconds from now, at `t0`. */
 export async function startRun(session: string, schedule: ScheduleRequest): Promise<{ run: string; t0: number }> {
-  return ok(await call('milkflint.bench.member', 'start', { schedule }, orError(z.object({ run: z.string(), t0: z.number() })), { session }));
+  return ok(
+    await call('milkflint.bench.member', 'start', { schedule }, orError(z.object({ run: z.string(), t0: z.number() })), {
+      session,
+    }),
+  );
 }
 
 export async function handoff(session: string, member: string): Promise<void> {
@@ -437,7 +469,13 @@ export async function kick(session: string, member: string): Promise<void> {
 
 export const JOIN_URL = '/cgi-bin/milkflint-test-bench';
 
-const joinedSchema = z.object({ sid: z.string().length(32), member: z.string(), key: z.string(), bench: z.string(), name: z.string() });
+const joinedSchema = z.object({
+  sid: z.string().length(32),
+  member: z.string(),
+  key: z.string(),
+  bench: z.string(),
+  name: z.string(),
+});
 export type Joined = z.output<typeof joinedSchema>;
 
 /** What a device joins with: the QR code's token, the typed code, or its own key to join again. */
@@ -449,7 +487,12 @@ export async function join(how: JoinWith, name?: string, platform?: string): Pro
   if (platform !== undefined) body['platform'] = platform;
   let res: Response;
   try {
-    res = await fetch(JOIN_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), cache: 'no-store' });
+    res = await fetch(JOIN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    });
   } catch (err) {
     throw new UnreachableError(err);
   }

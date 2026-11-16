@@ -120,7 +120,11 @@ export interface Throughput {
 }
 
 /** A member's download ('d') or upload ('u') in a window; undefined if it moved nothing. */
-export function memberThroughput(records: readonly RunRecord[], dir: 'd' | 'u', w: { from: number; to: number }): Throughput | undefined {
+export function memberThroughput(
+  records: readonly RunRecord[],
+  dir: 'd' | 'u',
+  w: { from: number; to: number },
+): Throughput | undefined {
   let bytes = 0;
   const perSecond = new Map<number, number>();
   for (const r of records) {
@@ -137,7 +141,10 @@ export function memberThroughput(records: readonly RunRecord[], dir: 'd' | 'u', 
 }
 
 /** Cloudflare's view of a member's transfers in a window: its median RTT, and retransmits and losses in all. */
-export function serverView(records: readonly RunRecord[], w: { from: number; to: number }): { rtt: number | undefined; retrans: number; lost: number; n: number } {
+export function serverView(
+  records: readonly RunRecord[],
+  w: { from: number; to: number },
+): { rtt: number | undefined; retrans: number; lost: number; n: number } {
   const rtts: number[] = [];
   let retrans = 0;
   let lost = 0;
@@ -153,7 +160,10 @@ export function serverView(records: readonly RunRecord[], w: { from: number; to:
 
 // ---- The router's pings ----
 
-const probeLine = z.object({ t: z.number(), r: z.record(z.string(), z.array(z.tuple([z.number(), z.number(), z.number().nullable()]))) });
+const probeLine = z.object({
+  t: z.number(),
+  r: z.record(z.string(), z.array(z.tuple([z.number(), z.number(), z.number().nullable()]))),
+});
 export type ProbeLine = z.output<typeof probeLine>;
 
 export function parseLines<T>(lines: readonly string[], schema: z.ZodType<T>): T[] {
@@ -227,7 +237,9 @@ const routerLine = z.object({
     .optional()
     .catch(undefined),
   /** the connection scan: tracked, offloaded, and per member (to the router itself left out) flows, offloaded, TCP, UDP, established */
-  ct_scan: z.object({ n: z.number(), off: z.number(), m: z.record(z.string(), z.array(z.number())).catch({}), ms: z.number().optional() }).nullish(),
+  ct_scan: z
+    .object({ n: z.number(), off: z.number(), m: z.record(z.string(), z.array(z.number())).catch({}), ms: z.number().optional() })
+    .nullish(),
   /** every 5 s: the Ethernet driver's drop and error counters, so far */
   eth: z.record(z.string(), z.record(z.string(), z.number())).optional().catch(undefined),
   /** every 5 s: dnsmasq's counters, so far */
@@ -326,7 +338,11 @@ export function routerWindow(lines: readonly RouterLine[], w: { from: number; to
 }
 
 /** The share of a member's connections the router offloaded (software flow offloading), from the scans in a window. */
-export function offloaded(lines: readonly RouterLine[], member: string, w: { from: number; to: number }): { flows: number; offloaded: number } | undefined {
+export function offloaded(
+  lines: readonly RouterLine[],
+  member: string,
+  w: { from: number; to: number },
+): { flows: number; offloaded: number } | undefined {
   let flows = 0;
   let off = 0;
   for (const l of lines) {

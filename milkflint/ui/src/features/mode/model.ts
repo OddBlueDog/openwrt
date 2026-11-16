@@ -3,6 +3,16 @@
 // the router checks before it switches, and the request it gets. Plain
 // functions without the app's imports, so ui/tests can run them.
 
+/** An interface's address with its prefix, as netifd has it ("192.168.0.2/24"); none: undefined. */
+export function addressText(
+  a: { ipaddr?: string | null | undefined; prefix?: number | null | undefined } | null | undefined,
+): string | undefined {
+  if (a?.ipaddr === undefined || a.ipaddr === null) return undefined;
+  return a.prefix === undefined || a.prefix === null ? a.ipaddr : `${a.ipaddr}/${String(a.prefix)}`;
+}
+
+export const modeName = (m: 'router' | 'ap'): string => (m === 'ap' ? 'access point' : 'router');
+
 export interface ApForm {
   proto: 'dhcp' | 'static';
   ipaddr: string;
@@ -79,7 +89,8 @@ export function validate(f: ApForm): Partial<Record<'ipaddr' | 'gateway' | 'dns'
   else if (ip % size === 0 || ip % size === size - 1) e.ipaddr = 'That’s the network’s own or broadcast address.';
   const gw = ipToInt(f.gateway);
   if (gw === undefined) e.gateway = 'Enter your main router’s address, e.g. 192.168.0.1.';
-  else if (ip !== undefined && network(gw) !== network(ip)) e.gateway = 'Your main router has to be on the same network as this address.';
+  else if (ip !== undefined && network(gw) !== network(ip))
+    e.gateway = 'Your main router has to be on the same network as this address.';
   else if (gw === ip) e.gateway = 'That’s the address you picked for MilkFlint.';
   const dns = dnsList(f.dns);
   if (dns.length > 3) e.dns = 'Up to three.';

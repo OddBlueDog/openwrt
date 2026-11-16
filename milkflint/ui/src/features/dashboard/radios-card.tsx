@@ -1,53 +1,69 @@
 import { RadioTowerIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { Badge } from '@/components/ui/badge';
-import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { formatBitrate, formatNumber } from '@/lib/format';
 import { href } from '@/lib/router';
 import type { Dashboard } from './use-dashboard';
+import { Dot, OffNote, Way, Widget, WidgetLink } from './widget';
 
 export function RadiosCard({ d }: { d: Dashboard }): ReactElement {
   const radios = d.radios;
+  const link = <WidgetLink href={href('wifi')}>Wi-Fi settings</WidgetLink>;
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex flex-col gap-1.5">
-          <CardTitle>Radios</CardTitle>
-          <CardDescription>
-            {radios.length} active · {d.clients.length} client{d.clients.length === 1 ? '' : 's'}
-          </CardDescription>
-        </div>
-        <CardAction>
-          <a href={href('wifi')} className="text-xs text-primary hover:underline">
-            Wi-Fi settings
-          </a>
-        </CardAction>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-3">
-        {radios.length === 0 && <p className="text-sm text-muted-foreground">No Wi-Fi radio is up.</p>}
-        {radios.map((r) => (
-          <div key={r.name} className="flex gap-3 rounded-lg border bg-background/60 p-3">
-            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-secondary">
-              <RadioTowerIcon className="size-4 text-muted-foreground" />
-            </div>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-medium">{r.band ?? r.name}</span>
-                <Badge variant={r.up ? 'success' : 'secondary'}>{r.up ? 'On' : 'Off'}</Badge>
-              </div>
-              <div className="truncate text-sm text-muted-foreground">{r.ssids.length > 0 ? r.ssids.join(', ') : 'No network'}</div>
-              <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[11px] text-muted-foreground">
-                {r.channel !== undefined && <span>ch {r.channel}</span>}
-                {r.htmode !== undefined && <span>{r.htmode}</span>}
-                {r.txpower !== undefined && <span>{r.txpower} dBm</span>}
-                {r.noise !== undefined && r.noise !== 0 && <span>noise {r.noise} dBm</span>}
-                <span>
-                  {r.clients} client{r.clients === 1 ? '' : 's'}
+    <Widget
+      icon={RadioTowerIcon}
+      title="Radios"
+      status={`${String(radios.length)} turned on`}
+      aside={radios.length === 0 ? undefined : link}
+    >
+      {radios.length === 0 ? (
+        <OffNote action={link}>No Wi-Fi band is turned on.</OffNote>
+      ) : (
+        <ul className="flex flex-col divide-y px-5">
+          {radios.map((r) => (
+            <li key={r.name} className="flex flex-col gap-1 py-3 first:pt-0 last:pb-0">
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-semibold">{r.band ?? r.name}</span>
+                <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                  <Dot tone={r.off ? 'off' : r.up ? 'success' : 'warning'} />
+                  {r.off ? 'Off' : r.up ? 'On' : 'Down'}
                 </span>
               </div>
-            </div>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
+              <div className="truncate text-sm text-muted-foreground">
+                {r.ssids.length > 0 ? r.ssids.join(', ') : 'No network'}
+              </div>
+              <dl className="mt-1 grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-0.5 text-xs">
+                {r.channel !== undefined && (
+                  <>
+                    <dt className="text-muted-foreground">Channel</dt>
+                    <dd className="tabular">
+                      {r.channel}
+                      {r.htmode !== undefined && ` · ${r.htmode}`}
+                    </dd>
+                  </>
+                )}
+                {r.txpower !== undefined && (
+                  <>
+                    <dt className="text-muted-foreground">Power</dt>
+                    <dd className="tabular">
+                      {r.txpower} dBm{r.noise !== undefined && r.noise !== 0 && ` · noise ${String(r.noise)} dBm`}
+                    </dd>
+                  </>
+                )}
+                <dt className="text-muted-foreground">Devices</dt>
+                <dd className="tabular">
+                  {formatNumber(r.clients)}
+                  {r.rateDown !== undefined && (
+                    <>
+                      {' · '}
+                      <Way dir="down" /> {formatBitrate(r.rateDown)} <Way dir="up" /> {formatBitrate(r.rateUp ?? 0)}
+                    </>
+                  )}
+                </dd>
+              </dl>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Widget>
   );
 }

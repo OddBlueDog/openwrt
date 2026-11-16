@@ -34,10 +34,15 @@ export type Tone = 'success' | 'warning' | 'muted' | 'info';
 /** Its state as a badge and a sentence. */
 export function describeState(s: AdGuardStatus): { tone: Tone; label: string; text: string } {
   const state: State = s.enabled === true ? (s.state ?? 'starting') : 'off';
-  if (s.mode === 'ap') return { tone: 'muted', label: 'Not used', text: 'In access point mode the main router answers your devices’ DNS lookups.' };
+  if (s.mode === 'ap')
+    return { tone: 'muted', label: 'Not used', text: 'In access point mode the main router answers your devices’ DNS lookups.' };
   switch (state) {
     case 'active':
-      return { tone: 'success', label: 'Filtering', text: 'Your devices’ lookups go through AdGuard Home, then to the DNS page’s servers.' };
+      return {
+        tone: 'success',
+        label: 'Filtering',
+        text: 'Your devices’ lookups go through AdGuard Home, then to the DNS page’s servers.',
+      };
     case 'starting':
       return {
         tone: 'info',
@@ -121,7 +126,10 @@ export interface NetworkRow {
 }
 
 /** The networks it can tell apart, each with the subnets to give AdGuard Home's clients (it knows devices by address, not MAC). */
-export function networkRows(networks: readonly Network[] | undefined, guestLabel: (zone: string) => string | undefined): NetworkRow[] {
+export function networkRows(
+  networks: readonly Network[] | undefined,
+  guestLabel: (zone: string) => string | undefined,
+): NetworkRow[] {
   const order = (n: Network): number => (n.zone === 'lan' ? 0 : n.zone === 'wg_in' ? 2 : 1);
   return [...(networks ?? [])]
     .sort((a, b) => (order(a) !== order(b) ? order(a) - order(b) : a.interface.localeCompare(b.interface)))

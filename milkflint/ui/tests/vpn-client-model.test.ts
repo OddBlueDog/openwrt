@@ -3,7 +3,20 @@
 // the Smart Queue inside the tunnel, and what the next save does to all of it.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { blankForm, type ClientData, type ClientForm, describe, drift, fromConf, removal, sources, toChanges, validate, wanted } from '../src/features/vpn-client/model.ts';
+import {
+  blankForm,
+  type ClientData,
+  type ClientForm,
+  describe,
+  drift,
+  fromConf,
+  removal,
+  sources,
+  toChanges,
+  validate,
+  wanted,
+  whoSummary,
+} from '../src/features/vpn-client/model.ts';
 import { CLIENT_MARK } from '../src/features/vpn-client/sections.ts';
 import { ipToInt } from '../src/lib/api/network.ts';
 import type { Wanted } from '../src/lib/api/owned.ts';
@@ -172,10 +185,12 @@ test('a tunnel with IPv6: into its table, nowhere only with the kill switch', ()
 test('turned off: every part stays and is off, so LuCI shows it and nothing routes', () => {
   const f = form({ enabled: false, shaper: true, downMbit: '100', upMbit: '20' });
   const w = wanted(f, data(f));
-  for (const name of ['wg_out_main', 'wg_out_via', 'wg_out_kill', 'wg_out_main6', 'wg_out_kill6']) assert.equal(get(w, name).values['disabled'], '1', name);
+  for (const name of ['wg_out_main', 'wg_out_via', 'wg_out_kill', 'wg_out_main6', 'wg_out_kill6'])
+    assert.equal(get(w, name).values['disabled'], '1', name);
   assert.equal(w.find((s) => s.config === 'network' && s.name === 'wg_out')?.values['disabled'], '1');
   assert.equal(w.find((s) => s.config === 'firewall' && s.name === 'wg_out')?.values['enabled'], '0');
-  for (const name of ['wg_out_lan', 'wg_out_mark_lan', 'wg_out_leak_lan']) assert.equal(get(w, name).values['enabled'], '0', name);
+  for (const name of ['wg_out_lan', 'wg_out_mark_lan', 'wg_out_leak_lan'])
+    assert.equal(get(w, name).values['enabled'], '0', name);
   assert.equal(w.find((s) => s.config === 'sqm')?.values['enabled'], '0');
 });
 
@@ -183,7 +198,10 @@ test('on again: the off options are unset rather than set to on', () => {
   const off = form({ enabled: false });
   const on = form();
   const changes = toChanges(on, data(on, { present: onRouter(off) }));
-  assert.deepEqual(changes.find((c) => nameOf(c) === 'wg_out_main' && c.op === 'unset'), { op: 'unset', config: 'network', section: 'wg_out_main', options: ['disabled'] });
+  assert.deepEqual(
+    changes.find((c) => nameOf(c) === 'wg_out_main' && c.op === 'unset'),
+    { op: 'unset', config: 'network', section: 'wg_out_main', options: ['disabled'] },
+  );
   assert.ok(!changes.some((c) => c.op === 'set' && (c.values['enabled'] === '1' || c.values['disabled'] === '0')));
 });
 
@@ -230,16 +248,22 @@ test('what someone changed in LuCI shows as drift; options the page doesn’t ma
   assert.ok(rule !== undefined);
   rule['priority'] = '50';
   rule['in'] = 'lan';
-  assert.deepEqual(drift(data(f, { present, exists: true })), [{ op: 'set', config: 'network', section: 'wg_out_main', values: { priority: '1000' } }]);
+  assert.deepEqual(drift(data(f, { present, exists: true })), [
+    { op: 'set', config: 'network', section: 'wg_out_main', values: { priority: '1000' } },
+  ]);
 });
 
 test('settings no longer needed go; going from “only” to everyone unsets the list', () => {
   const was = form({ who: 'only', macs: [MAC], guests: ['guest'], addresses: ['10.64.12.7/32', 'fd00::7/128'] });
   const now = form({ addresses: ['10.64.12.7/32'] });
   const changes = toChanges(now, data(now, { present: onRouter(was) }));
-  assert.deepEqual(changes.find((c) => c.op === 'unset' && c.section === 'wg_out_mark_lan'), { op: 'unset', config: 'firewall', section: 'wg_out_mark_lan', options: ['src_mac'] });
+  assert.deepEqual(
+    changes.find((c) => c.op === 'unset' && c.section === 'wg_out_mark_lan'),
+    { op: 'unset', config: 'firewall', section: 'wg_out_mark_lan', options: ['src_mac'] },
+  );
   const gone = changes.filter((c) => c.op === 'delete').map(nameOf);
-  for (const name of ['wg_out_guest', 'wg_out_mark_guest', 'wg_out_leak_guest', 'wg_out_via6']) assert.ok(gone.includes(name), name);
+  for (const name of ['wg_out_guest', 'wg_out_mark_guest', 'wg_out_leak_guest', 'wg_out_via6'])
+    assert.ok(gone.includes(name), name);
   assert.ok(!gone.includes('wg_out_kill6'), 'kept: a tunnel without IPv6 needs it');
 });
 
@@ -248,9 +272,18 @@ test('Remove takes every part, a peer LuCI made included, and nothing else', () 
   const present = onRouter(f);
   present.network.push(section('wireguard_wg_out', 'cfg123abc'), section('interface', 'lan'));
   present.firewall.push(section('rule', 'Allow-Ping'));
-  const left = applied({ network: present.network, firewall: present.firewall, sqm: present.sqm ?? [] }, removal(data(f, { present })));
-  assert.deepEqual(left['network']?.map((s) => s['.name']), ['lan']);
-  assert.deepEqual(left['firewall']?.map((s) => s['.name']), ['Allow-Ping']);
+  const left = applied(
+    { network: present.network, firewall: present.firewall, sqm: present.sqm ?? [] },
+    removal(data(f, { present })),
+  );
+  assert.deepEqual(
+    left['network']?.map((s) => s['.name']),
+    ['lan'],
+  );
+  assert.deepEqual(
+    left['firewall']?.map((s) => s['.name']),
+    ['Allow-Ping'],
+  );
   assert.deepEqual(left['sqm'], []);
 });
 
@@ -342,4 +375,14 @@ test('their DNS: with AdGuard Home on, through the tunnel (or why not); without 
   assert.match(line(form(), 'automatic')?.text ?? '', /Choose servers there/);
   assert.equal(line(form(), undefined)?.ok, false);
   assert.match(line(form(), undefined)?.text ?? '', /don’t go through the VPN/);
+});
+
+test('who uses it, in a few words for the answer', () => {
+  const zones = { guestZones: [{ id: 'guest' as const, label: 'Guest Wi-Fi' }] };
+  assert.equal(whoSummary(form(), zones), 'Every home device');
+  assert.equal(whoSummary(form({ who: 'only', macs: [MAC] }), zones), 'Only 1 device');
+  assert.equal(whoSummary(form({ who: 'except', macs: [MAC, 'aa:bb:cc:dd:ee:02'] }), zones), 'Every home device but 2 devices');
+  assert.equal(whoSummary(form({ who: 'none', guests: ['guest'] }), zones), 'Guest Wi-Fi');
+  assert.equal(whoSummary(form({ who: 'only', macs: [MAC], guests: ['guest'] }), zones), 'Only 1 device and Guest Wi-Fi');
+  assert.equal(whoSummary(form({ who: 'none' }), zones), 'No one');
 });

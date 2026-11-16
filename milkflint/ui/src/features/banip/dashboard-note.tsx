@@ -42,7 +42,9 @@ export function BanipNote(): ReactElement | null {
       <ShieldXIcon className="size-4 text-primary" aria-hidden="true" />
       <span className="font-medium">banIP: {words.label.toLowerCase()}</span>
       <span className="text-muted-foreground tabular">
-        {data.elements !== null && data.elements !== undefined ? `${formatNumber(data.elements)} addresses blocked` : 'loading its lists'}
+        {data.elements !== null && data.elements !== undefined
+          ? `${formatNumber(data.elements)} addresses blocked`
+          : 'loading its lists'}
         {data.drops !== undefined ? `, ${formatNumber(data.drops.hour)} blocked in the last hour` : ''}
       </span>
     </a>

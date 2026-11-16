@@ -178,7 +178,8 @@ export function qrModules(text: string): boolean[][] | undefined {
   align.forEach((ax, i) => {
     align.forEach((ay, j) => {
       if ((i === 0 && j === 0) || (i === 0 && j === last) || (i === last && j === 0)) return;
-      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) set(ax + dx, ay + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+      for (let dy = -2; dy <= 2; dy++)
+        for (let dx = -2; dx <= 2; dx++) set(ax + dx, ay + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
     });
   });
 
@@ -261,7 +262,14 @@ export function qrModules(text: string): boolean[][] | undefined {
       for (let x = 0; x < size; x++) {
         const c = modules[y]?.[x];
         if (c === true) dark++;
-        if (x < size - 1 && y < size - 1 && c === modules[y]?.[x + 1] && c === modules[y + 1]?.[x] && c === modules[y + 1]?.[x + 1]) score += 3;
+        if (
+          x < size - 1 &&
+          y < size - 1 &&
+          c === modules[y]?.[x + 1] &&
+          c === modules[y + 1]?.[x] &&
+          c === modules[y + 1]?.[x + 1]
+        )
+          score += 3;
       }
     }
     return score + Math.floor(Math.abs(dark * 20 - size * size * 10) / (size * size)) * 10;

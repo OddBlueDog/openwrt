@@ -1,5 +1,6 @@
 // What the Firewall page's dialogs share that isn't a component: schedules,
 // device labels, lists typed into a field, and the actions the tabs call.
+import type { MouseEvent } from 'react';
 import type { Change } from '@/lib/api/uci';
 import type { Device } from './api';
 import { normalizeDay, type NatRule, type Redirect, type Rule, type Schedule, type Values, WEEKDAYS } from './model';
@@ -36,7 +37,11 @@ export function scheduleError(s: ScheduleForm): string | undefined {
 export function scheduleForm(s: Schedule | undefined): ScheduleForm {
   if (s === undefined) return bedtime;
   const days = s.weekdays.map(normalizeDay).filter((d) => d !== undefined);
-  return { start: s.start?.slice(0, 5) ?? '00:00', stop: s.stop?.slice(0, 5) ?? '23:59', days: days.length === 0 ? [...WEEKDAYS] : days };
+  return {
+    start: s.start?.slice(0, 5) ?? '00:00',
+    stop: s.stop?.slice(0, 5) ?? '23:59',
+    days: days.length === 0 ? [...WEEKDAYS] : days,
+  };
 }
 
 /** fw4's start_time, stop_time and weekdays; undefined schedule: always (all unset). */
@@ -79,4 +84,15 @@ const compact = new Intl.NumberFormat('en-GB', { notation: 'compact', maximumFra
 /** A counter for a table cell: 3.4k, 222.9k. */
 export function hitsText(n: number | undefined): string {
   return n === undefined ? '–' : compact.format(n).toLowerCase();
+}
+
+/**
+ * A click anywhere on a table row opens it, as its edit button does, unless
+ * the click was on one of the row's own controls (switch, link, grip).
+ */
+export function rowClick(open: () => void): (e: MouseEvent<HTMLElement>) => void {
+  return (e) => {
+    if (e.target instanceof Element && e.target.closest('button, a, input, label, [role="switch"]') !== null) return;
+    open();
+  };
 }

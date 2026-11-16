@@ -5,7 +5,7 @@ export function Card({ className, ...props }: ComponentProps<'section'>): ReactE
   return (
     <section
       data-slot="card"
-      className={cn('flex flex-col gap-4 rounded-xl border bg-card py-5 text-card-foreground shadow-xs', className)}
+      className={cn('flex min-w-0 flex-col gap-4 rounded-xl border bg-card py-5 text-card-foreground shadow-xs', className)}
       {...props}
     />
   );
@@ -17,7 +17,7 @@ export function CardHeader({ className, ...props }: ComponentProps<'div'>): Reac
 
 export function CardTitle({ className, children, ...props }: ComponentProps<'h2'>): ReactElement {
   return (
-    <h2 data-slot="card-title" className={cn('text-sm leading-none font-semibold', className)} {...props}>
+    <h2 data-slot="card-title" className={cn('text-base font-semibold text-balance', className)} {...props}>
       {children}
     </h2>
   );
@@ -36,7 +36,5 @@ export function CardContent({ className, ...props }: ComponentProps<'div'>): Rea
 }
 
 export function CardFooter({ className, ...props }: ComponentProps<'div'>): ReactElement {
-  return (
-    <div data-slot="card-footer" className={cn('flex items-center gap-2 border-t px-5 pt-4', className)} {...props} />
-  );
+  return <div data-slot="card-footer" className={cn('flex items-center gap-2 border-t px-5 pt-4', className)} {...props} />;
 }

@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'system-overview',
-  title: 'Overview',
+  title: 'About this router',
   description: 'The router itself: hardware, firmware and resources.',
   icon: RouterIcon,
   group: 'system',
   order: 10,
-  page: lazyPage(() => import('./page'), (m) => m.SystemOverviewPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.SystemOverviewPage,
+  ),
 } satisfies Feature;

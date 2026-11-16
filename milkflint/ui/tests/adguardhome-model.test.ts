@@ -48,10 +48,15 @@ test('the Dashboard warns while lookups go round it, or a setting breaks the cha
   assert.deepEqual(needsAttention(status()), { fallback: false, broken: [] });
   assert.equal(needsAttention(status({ state: 'fallback' })).fallback, true);
   assert.deepEqual(
-    needsAttention(status({ settings: [setting('dns.port', true), setting('dns.cache_enabled', false)] })).broken.map((s) => s.key),
+    needsAttention(status({ settings: [setting('dns.port', true), setting('dns.cache_enabled', false)] })).broken.map(
+      (s) => s.key,
+    ),
     ['dns.port'],
   );
-  assert.deepEqual(needsAttention(status({ enabled: false, state: 'fallback', settings: [setting('dns.port', true)] })), { fallback: false, broken: [] });
+  assert.deepEqual(needsAttention(status({ enabled: false, state: 'fallback', settings: [setting('dns.port', true)] })), {
+    fallback: false,
+    broken: [],
+  });
   assert.deepEqual(needsAttention(status({ mode: 'ap', state: 'fallback' })), { fallback: false, broken: [] });
   assert.deepEqual(needsAttention(undefined), { fallback: false, broken: [] });
   assert.deepEqual(needsAttention({ installed: false }), { fallback: false, broken: [] });
@@ -96,7 +101,13 @@ test('updates: a newer one to install, earlier ones to go back to, and one kept 
   assert.equal(back.pinned, true);
   assert.deepEqual(back.earlier, []);
   // never checked
-  assert.deepEqual(updateChoice('0.107.80-r1', null), { installed: '0.107.80-r1', latest: undefined, newer: false, earlier: [], pinned: false });
+  assert.deepEqual(updateChoice('0.107.80-r1', null), {
+    installed: '0.107.80-r1',
+    latest: undefined,
+    newer: false,
+    earlier: [],
+    pinned: false,
+  });
 });
 
 test('a blocked share: one decimal under 10%', () => {

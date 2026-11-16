@@ -1,4 +1,3 @@
-import { ChartSplineIcon } from 'lucide-react';
 import { type ReactElement, useMemo, useState } from 'react';
 import { HeatStrip } from '@/components/charts/heat-strip';
 import { PLOT_LEFT } from '@/components/charts/time-axis';
@@ -7,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { formatNumber, formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { memberRtts, routerRtts } from './analysis';
+import { Arrowed } from './dir';
 import { phaseName } from './phase-names';
 import { clockText, phaseStyle } from './phases';
 import { memberPeerRtts } from './pairs';
@@ -31,7 +31,17 @@ const mbit = (v: number): string => `${formatNumber(v, v < 10 ? 1 : 0)} Mbit/s`;
 const perSecond = (v: number): string => `${formatNumber(v, v < 10 ? 1 : 0)}/s`;
 const kb = (v: number): string => `${formatNumber(v / 1024, v < 10240 ? 1 : 0)} KB`;
 
-function Picker<K extends string>({ value, options, onChange, label }: { value: K; options: readonly { key: K; label: string }[]; onChange: (k: K) => void; label: string }): ReactElement {
+function Picker<K extends string>({
+  value,
+  options,
+  onChange,
+  label,
+}: {
+  value: K;
+  options: readonly { key: K; label: string }[];
+  onChange: (k: K) => void;
+  label: string;
+}): ReactElement {
   return (
     <div role="group" aria-label={label} className="inline-flex w-fit flex-wrap gap-0.5 rounded-md border p-0.5">
       {options.map((o) => (
@@ -53,13 +63,23 @@ function Picker<K extends string>({ value, options, onChange, label }: { value: 
   );
 }
 
-function Chart({ title, hint, action, children }: { title: string; hint?: string; action?: ReactElement | false; children: ReactElement }): ReactElement {
+function Chart({
+  title,
+  hint,
+  action,
+  children,
+}: {
+  title: string;
+  hint?: string;
+  action?: ReactElement | false;
+  children: ReactElement;
+}): ReactElement {
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-col">
           <span className="text-sm font-medium">{title}</span>
-          {hint !== undefined && <span className="text-[11px] text-muted-foreground">{hint}</span>}
+          {hint !== undefined && <span className="text-xs text-muted-foreground">{hint}</span>}
         </div>
         {action}
       </div>
@@ -117,19 +137,31 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
       // a device that never answers the router's pings (a firewall) has only unanswered ones: left out
       return out.filter((s) => s.points.some((p) => p[1] !== null));
     };
-    const latencyViews = (['router', 'internet', 'ping', 'peers'] as const).map((k) => ({ k, series: lat(k) })).filter((v) => v.series.length > 0);
+    const latencyViews = (['router', 'internet', 'ping', 'peers'] as const)
+      .map((k) => ({ k, series: lat(k) }))
+      .filter((v) => v.series.length > 0);
 
     const wan = wanPort(data.router);
     const speed: TimelineSeries[] = [];
     if (wan !== undefined) {
-      speed.push({ label: 'Internet line ↓', color: 'var(--chart-2)', points: ifRate(data.router, t0, wan, 0) });
-      speed.push({ label: 'Internet line ↑', color: 'var(--chart-1)', points: ifRate(data.router, t0, wan, 1) });
+      speed.push({ label: 'Internet line, download', color: 'var(--chart-2)', points: ifRate(data.router, t0, wan, 0) });
+      speed.push({ label: 'Internet line, upload', color: 'var(--chart-1)', points: ifRate(data.router, t0, wan, 1) });
     }
     for (const m of members) {
       const recs = data.records.get(m.id) ?? [];
       const c = color(m.id);
-      speed.push({ label: `${m.name} ↓`, color: c, points: memberRate(recs, 'd', t0, phases, m.id, t0 + to), dashed: true });
-      speed.push({ label: `${m.name} ↑`, color: c, points: memberRate(recs, 'u', t0, phases, m.id, t0 + to), dashed: true });
+      speed.push({
+        label: `${m.name}, download`,
+        color: c,
+        points: memberRate(recs, 'd', t0, phases, m.id, t0 + to),
+        dashed: true,
+      });
+      speed.push({
+        label: `${m.name}, upload`,
+        color: c,
+        points: memberRate(recs, 'u', t0, phases, m.id, t0 + to),
+        dashed: true,
+      });
       speed.push({ label: `${m.name} from its peer`, color: c, points: peerRate(recs, t0) });
     }
 
@@ -137,20 +169,20 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
     const up = cakeSeconds(data.router, t0, 'up');
     const cake = down.length + up.length > 0;
     const delay: TimelineSeries[] = [
-      { label: '↓ average', color: 'var(--chart-2)', points: pts(down, (s) => s.avgMs) },
-      { label: '↑ average', color: 'var(--chart-1)', points: pts(up, (s) => s.avgMs) },
-      { label: '↓ peak', color: 'var(--chart-2)', points: pts(down, (s) => s.peakMs), dashed: true },
-      { label: '↑ peak', color: 'var(--chart-1)', points: pts(up, (s) => s.peakMs), dashed: true },
+      { label: 'Download, average', color: 'var(--chart-2)', points: pts(down, (s) => s.avgMs) },
+      { label: 'Upload, average', color: 'var(--chart-1)', points: pts(up, (s) => s.avgMs) },
+      { label: 'Download, peak', color: 'var(--chart-2)', points: pts(down, (s) => s.peakMs), dashed: true },
+      { label: 'Upload, peak', color: 'var(--chart-1)', points: pts(up, (s) => s.peakMs), dashed: true },
     ];
     const signals: TimelineSeries[] = [
-      { label: '↓ drops', color: 'var(--chart-2)', points: pts(down, (s) => s.drops) },
-      { label: '↓ ECN marks', color: 'var(--chart-2)', points: pts(down, (s) => s.marks), dashed: true },
-      { label: '↑ drops', color: 'var(--chart-1)', points: pts(up, (s) => s.drops) },
-      { label: '↑ ECN marks', color: 'var(--chart-1)', points: pts(up, (s) => s.marks), dashed: true },
+      { label: 'Download drops', color: 'var(--chart-2)', points: pts(down, (s) => s.drops) },
+      { label: 'Download ECN marks', color: 'var(--chart-2)', points: pts(down, (s) => s.marks), dashed: true },
+      { label: 'Upload drops', color: 'var(--chart-1)', points: pts(up, (s) => s.drops) },
+      { label: 'Upload ECN marks', color: 'var(--chart-1)', points: pts(up, (s) => s.marks), dashed: true },
     ];
     const backlog: TimelineSeries[] = [
-      { label: '↓ queued', color: 'var(--chart-2)', points: pts(down, (s) => s.backlog) },
-      { label: '↑ queued', color: 'var(--chart-1)', points: pts(up, (s) => s.backlog) },
+      { label: 'Download queued', color: 'var(--chart-2)', points: pts(down, (s) => s.backlog) },
+      { label: 'Upload queued', color: 'var(--chart-1)', points: pts(up, (s) => s.backlog) },
     ];
 
     const cpu = cpuRows(data.router, t0);
@@ -170,30 +202,55 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
         color: color(m.id),
         points: s.map((x): TPoint => [x.t, view === 'rate' ? x.txMbit : view === 'retries' ? x.retries : x.aqlMs]),
       }));
-    return { to, phases, bands, latencyViews, speed: speed.filter(hasData), cake, delay, signals, backlog, cpu, conns, softnet, stations: stations.length, wifi };
+    return {
+      to,
+      phases,
+      bands,
+      latencyViews,
+      speed: speed.filter(hasData),
+      cake,
+      delay,
+      signals,
+      backlog,
+      cpu,
+      conns,
+      softnet,
+      stations: stations.length,
+      wifi,
+    };
   }, [data]);
   const { to, phases } = built;
   const common = { from: 0, to, bands: built.bands, timeText: clockText, hover, onHover: setHover };
 
   if (data.router.length === 0 && built.latencyViews.length === 0) return null;
   const view = built.latencyViews.find((v) => v.k === latency) ?? built.latencyViews[0];
-  const latencyNames: Record<LatencyView, string> = { router: 'To the router', internet: 'To the internet', ping: 'Router’s pings', peers: 'To peers' };
+  const latencyNames: Record<LatencyView, string> = {
+    router: 'To the router',
+    internet: 'To the internet',
+    ping: 'Router’s pings',
+    peers: 'To peers',
+  };
   const softnetQuiet = !built.softnet.some(hasData);
 
   return (
     <section className="flex flex-col gap-5">
-      <h3 className="flex items-center gap-2 text-sm font-semibold">
-        <ChartSplineIcon className="size-4 text-muted-foreground" /> Over time
-      </h3>
+      <h3 className="text-sm font-semibold">Over time</h3>
 
-      <div className="relative h-5" style={{ marginLeft: PLOT_LEFT }} aria-label="The run’s phases">
+      <div className="relative h-6" style={{ marginLeft: PLOT_LEFT }} aria-label="The run’s phases">
         {phases.map((p, i) => {
           const left = (p.start / to) * 100;
           const width = (Math.min(p.dur, to - p.start) / to) * 100;
           return (
-            <div key={i} className="absolute inset-y-0 flex min-w-0 flex-col gap-0.5" style={{ left: `${String(left)}%`, width: `${String(width)}%` }} title={phaseName(p)}>
+            <div
+              key={i}
+              className="absolute inset-y-0 flex min-w-0 flex-col gap-0.5"
+              style={{ left: `${String(left)}%`, width: `${String(width)}%` }}
+              title={phaseName(p)}
+            >
               <span className={cn('h-1.5 rounded-full', phaseStyle[p.kind].bar)} />
-              <span className="truncate px-0.5 text-[10px] leading-3 text-muted-foreground">{phaseName(p)}</span>
+              <span className="truncate px-0.5 text-xs leading-4 text-muted-foreground">
+                <Arrowed text={phaseName(p)} />
+              </span>
             </div>
           );
         })}
@@ -214,7 +271,13 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
             )
           }
         >
-          <TimelineChart {...common} series={view.series} format={msText} minMax={10} label={`Latency ${latencyNames[view.k].toLowerCase()}`} />
+          <TimelineChart
+            {...common}
+            series={view.series}
+            format={msText}
+            minMax={10}
+            label={`Latency ${latencyNames[view.k].toLowerCase()}`}
+          />
         </Chart>
       )}
 
@@ -227,19 +290,43 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
       {built.cake && (
         <>
           <Chart title="Smart Queue delay" hint="The busiest tin’s, of those that sent anything that second">
-            <TimelineChart {...common} series={built.delay} format={msText} minMax={5} className="h-28" label="Smart Queue delay" />
+            <TimelineChart
+              {...common}
+              series={built.delay}
+              format={msText}
+              minMax={5}
+              className="h-28"
+              label="Smart Queue delay"
+            />
           </Chart>
           <Chart title="Smart Queue drops and marks" hint="Each second, every tin">
-            <TimelineChart {...common} series={built.signals} format={perSecond} minMax={1} className="h-28" label="Smart Queue drops and marks" />
+            <TimelineChart
+              {...common}
+              series={built.signals}
+              format={perSecond}
+              minMax={1}
+              className="h-28"
+              label="Smart Queue drops and marks"
+            />
           </Chart>
           <Chart title="Smart Queue backlog">
-            <TimelineChart {...common} series={built.backlog} format={kb} minMax={1024} className="h-28" label="Smart Queue backlog" />
+            <TimelineChart
+              {...common}
+              series={built.backlog}
+              format={kb}
+              minMax={1024}
+              className="h-28"
+              label="Smart Queue backlog"
+            />
           </Chart>
         </>
       )}
 
       {built.cpu.spans.length > 0 && (
-        <Chart title="Router CPU, per core" hint="Busy share each second, the deeper the busier; the hover adds its softirq share">
+        <Chart
+          title="Router CPU, per core"
+          hint="Busy share each second, the deeper the busier; the hover adds its softirq share"
+        >
           <HeatStrip
             {...common}
             rows={built.cpu.busy.map((values, i) => ({
@@ -259,13 +346,23 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
 
       {built.conns.some(hasData) && (
         <Chart title="Connections" hint="Offloaded: from the connection scans, every few seconds">
-          <TimelineChart {...common} series={built.conns} format={(v) => formatNumber(v)} minMax={10} tolerance={6000} className="h-28" label="Connections" />
+          <TimelineChart
+            {...common}
+            series={built.conns}
+            format={(v) => formatNumber(v)}
+            minMax={10}
+            tolerance={6000}
+            className="h-28"
+            label="Connections"
+          />
         </Chart>
       )}
 
       {built.cpu.spans.length > 0 &&
         (softnetQuiet ? (
-          <p className="text-xs text-muted-foreground">softnet: no packets dropped from a CPU’s backlog and no squeezes in the run.</p>
+          <p className="text-xs text-muted-foreground">
+            softnet: no packets dropped from a CPU’s backlog and no squeezes in the run.
+          </p>
         ) : (
           <Chart title="softnet" hint="Packets dropped from a CPU’s backlog, and the times NAPI ran out of budget, every CPU">
             <TimelineChart {...common} series={built.softnet} format={perSecond} minMax={1} className="h-28" label="softnet" />

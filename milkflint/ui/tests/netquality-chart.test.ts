@@ -36,7 +36,14 @@ const sample = (t: number, us?: number | null): Sample => ({
   dns: 8,
   ...(us === undefined ? {} : { routes: { us } }),
 });
-const line = (points: ChartLine['points'], over: Partial<ChartLine> = {}): ChartLine => ({ key: 'x', label: 'X', color: 'red', countLoss: true, points, ...over });
+const line = (points: ChartLine['points'], over: Partial<ChartLine> = {}): ChartLine => ({
+  key: 'x',
+  label: 'X',
+  color: 'red',
+  countLoss: true,
+  points,
+  ...over,
+});
 const at = (t: number, v?: number): ChartLine['points'][number] => ({ t, v, lost: v === undefined ? 1 : 0, rounds: 1 });
 
 test('an hour of once-a-minute route pings fills the whole hour, not half of it', () => {
@@ -104,7 +111,12 @@ test('the table: now, median, best, 95th percentile (of the worsts where there a
   assert.equal(s.worst, 96);
   assert.equal(s.loss, 0);
 
-  const buckets = lineStats(line([{ t: 0, v: 10, worst: 90, lost: 1, rounds: 4 }, { t: 60, v: undefined, lost: 4, rounds: 4 }]));
+  const buckets = lineStats(
+    line([
+      { t: 0, v: 10, worst: 90, lost: 1, rounds: 4 },
+      { t: 60, v: undefined, lost: 4, rounds: 4 },
+    ]),
+  );
   assert.equal(buckets.now, null);
   assert.equal(buckets.typical, 10);
   assert.equal(buckets.worst, 90);
@@ -138,7 +150,12 @@ test('the scale fits the lines shown instead of starting at 0', () => {
   assert.equal(niceRange(1, 25, 5).min, 0);
   // hiding the slow line rescales: only the far route left
   assert.ok(niceRange(80, 95, 5).min >= 70);
-  for (const [lo, hi] of [[14, 20], [3, 250], [0.2, 0.9], [99.5, 100.5]] as const) {
+  for (const [lo, hi] of [
+    [14, 20],
+    [3, 250],
+    [0.2, 0.9],
+    [99.5, 100.5],
+  ] as const) {
     const r = niceRange(lo, hi, 5);
     assert.ok(r.min <= lo && r.max >= hi, `${String(lo)}–${String(hi)} inside ${String(r.min)}–${String(r.max)}`);
     assert.ok(r.ticks.length >= 3 && r.ticks.length <= 7, `${String(r.ticks.length)} ticks`);
@@ -196,7 +213,13 @@ test('hovering finds the nearest point even when the rounds drift off the slots'
   assert.deepEqual(upper, [undefined, undefined, undefined, 113, 113]);
   assert.deepEqual(notes, [undefined, undefined, 'lost', 'worst 113 ms', 'worst 113 ms']);
   // far from any point: nothing, rather than the nearest one
-  assert.deepEqual(slotValues(line([at(0, 1)]), 0, 60, 8, String).values.slice(3), [undefined, undefined, undefined, undefined, undefined]);
+  assert.deepEqual(slotValues(line([at(0, 1)]), 0, 60, 8, String).values.slice(3), [
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ]);
 });
 
 test('a second dot only where a point stands for several probes and the worst differs', () => {
@@ -211,7 +234,10 @@ test('the CSV has a row per time, empty cells where a line was not asked or lost
   const a = line([at(1000, 7.1234), at(1060)], { label: 'DNS · Cloudflare' });
   const b = line([{ t: 1060, v: 75, worst: 113, lost: 0, rounds: 2 }], { key: 'y', label: 'US' });
   const csv = linesToCsv([a, b]).split('\r\n');
-  assert.equal(csv[0], 'local time,unix time,DNS Cloudflare ms,DNS Cloudflare lost,DNS Cloudflare probes,US ms,US worst ms,US lost,US probes');
+  assert.equal(
+    csv[0],
+    'local time,unix time,DNS Cloudflare ms,DNS Cloudflare lost,DNS Cloudflare probes,US ms,US worst ms,US lost,US probes',
+  );
   assert.match(csv[1] ?? '', /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,1000,7\.123,0,1,,,,$/);
   assert.match(csv[2] ?? '', /,1060,,1,1,75,113,0,2$/);
   assert.equal(csv[3], '');

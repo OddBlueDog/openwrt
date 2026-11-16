@@ -1,29 +1,32 @@
+// The DNS page: how the router looks names up for your devices. It opens on
+// the answer (who your devices ask, where the router sends their lookups,
+// what the cache and protection do), from the saved settings; then the
+// servers (the everyday choice), your devices' DNS server with the rarer
+// settings folded under More settings, and the DNS cache with what happens
+// to each answer over time. Everything is read and written through UCI
+// (dnsmasq in dhcp, dnsproxy, milkflint.dns, the firewall's intercept
+// redirects), as LuCI does.
 import {
-  ArrowDownIcon,
+  ArrowRightIcon,
   LockIcon,
   LockOpenIcon,
   type LucideIcon,
-  MonitorSmartphoneIcon,
   PlusIcon,
   RouterIcon,
   ServerCogIcon,
-  ServerIcon,
   ShieldBanIcon,
-  ShieldCheckIcon,
-  TagIcon,
   Trash2Icon,
   TriangleAlertIcon,
   WandSparklesIcon,
-  ZapIcon,
 } from 'lucide-react';
-import { type ReactElement, type ReactNode, useCallback, useState } from 'react';
+import { type ReactElement, useCallback, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
+import { Note } from '@/components/note';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { SaveBar } from '@/components/save-bar';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -35,14 +38,19 @@ import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
 import { prefixLength } from '@/lib/api/network';
 import { bool, getConfig, list, type Section, str } from '@/lib/api/uci';
+import { href } from '@/lib/router';
 import { type AdGuardStatus, getAdGuardStatus } from '../adguardhome/api';
-import { Choice, Segmented } from '../firewall/parts';
+import { Segmented } from '../firewall/parts';
+import { Answer, AnswerCell, ChoiceCards, Figure, GoLink } from '@/components/page-kit';
 import { SERVER } from '../remote-access/sections';
+import { explain } from '@/components/explain';
+import { MoreSettings } from '@/components/more-settings';
 import { type GuestId, isGuestNetwork } from '../wifi-guest/guest';
+import { dnsAnswer, moreSummary } from './answer';
 import { getDnsStatus } from './api';
 import { CacheCard } from './cache-card';
 import { homeDhcp, loops, readDeviceDns } from './device-dns';
-import { INTERCEPT_SECTIONS, interceptOn, interceptSection } from './intercept';
+import { INTERCEPT, INTERCEPT_SECTIONS, interceptOn, interceptSection } from './intercept';
 import {
   backupPick,
   backupUseOf,
@@ -77,6 +85,8 @@ import {
   TIMEOUT_S,
 } from './upstreams';
 
+const DNSMASQ = 'dhcp.@dnsmasq[0]';
+
 // How lookups are sent: the page's first choice. 'static' is plain DNS
 // (the stock firmware's name for it, kept in milkflint.dns.mode).
 const modes: Record<Mode, { label: string; hint: string; icon: LucideIcon }> = {
@@ -92,7 +102,7 @@ const modes: Record<Mode, { label: string; hint: string; icon: LucideIcon }> = {
   },
   encrypted: {
     label: 'Encrypted DNS',
-    hint: 'Servers you choose, encrypted: your internet provider can’t see or change lookups. Recommended.',
+    hint: 'Servers you choose, encrypted: your internet provider can’t see or change lookups.',
     icon: LockIcon,
   },
 };
@@ -104,16 +114,30 @@ const pairs: Record<Pair, { label: string; hint: (mode: Mode) => string }> = {
   parallel: {
     label: 'Fastest of two',
     hint: () =>
-      'Each lookup goes to both servers and the first answer is used, so nothing waits when one is slow or down. Both providers see your lookups.',
+      'Each lookup goes to both servers and the first answer is used. Nothing waits when one is slow or down, but both providers see your lookups.',
   },
   fallback: {
     label: 'Main + backup',
     hint: (mode) =>
       mode === 'encrypted'
-        ? `Lookups go to the main server. The backup is asked only when it fails or hasn’t answered in ${String(TIMEOUT_S)} seconds: it sees few lookups, but during an outage each one waits those seconds first.`
-        : 'Lookups go to the main server. The backup is asked only when it doesn’t answer: it sees few lookups, but during an outage each one waits first.',
+        ? `Lookups go to the main server, and to the backup only when the main one fails or is slow. Slow means no answer in ${String(TIMEOUT_S)} seconds. The backup sees few lookups, but during an outage each one waits those seconds first.`
+        : 'Lookups go to the main server, and to the backup only when the main one doesn’t answer. The backup sees few lookups, but during an outage each one waits first.',
   },
 };
+
+/** What each server slot is called, and the line under it, for one server or two. */
+function slotTitles(pair: Pair): [string, string] {
+  return pair === 'one' ? ['Server', ''] : pair === 'parallel' ? ['Server 1', 'Server 2'] : ['Main server', 'Backup server'];
+}
+
+function slotHints(pair: Pair, mode: Mode, main: string): [string, string] {
+  if (pair === 'one') return ['Every lookup goes here.', ''];
+  if (pair === 'parallel') return ['Asked at the same time as server 2.', `Asked at the same time as ${main}.`];
+  return [
+    'Every lookup goes here first.',
+    `Asked only if ${main} ${mode === 'encrypted' ? 'fails or is slow' : 'doesn’t answer'}.`,
+  ];
+}
 
 let nextKey = 0;
 
@@ -160,7 +184,8 @@ async function loadDns(): Promise<DnsData> {
       backupCustom: str(rf, 'backup_custom') ?? '',
       cacheOn: str(dnsmasq, 'cachesize') !== '0',
       // off is a size of 0: turning it back on starts from the default
-      cacheSize: (str(dnsmasq, 'cachesize') ?? '0') === '0' ? DEFAULT_CACHE_SIZE : (str(dnsmasq, 'cachesize') ?? DEFAULT_CACHE_SIZE),
+      cacheSize:
+        (str(dnsmasq, 'cachesize') ?? '0') === '0' ? DEFAULT_CACHE_SIZE : (str(dnsmasq, 'cachesize') ?? DEFAULT_CACHE_SIZE),
       cacheHttps: cacheRr.some(isHttpsRr),
       // dnsproxy reuses expired answers for encrypted DNS, dnsmasq for the others
       quick: mode === 'encrypted' ? bool(cache, 'enabled') && bool(cache, 'cache_optimistic') : stale !== undefined,
@@ -190,41 +215,29 @@ async function loadDns(): Promise<DnsData> {
         return s['.type'] === 'zone' && isGuestNetwork(name) ? [name] : [];
       }),
       // Remote access's zone while it's on (off, the page turns its redirect off with the rest)
-      ...firewall.flatMap((s): (typeof SERVER)[] => (s['.type'] === 'zone' && str(s, 'name') === SERVER && bool(s, 'enabled', true) ? [SERVER] : [])),
+      ...firewall.flatMap((s): (typeof SERVER)[] =>
+        s['.type'] === 'zone' && str(s, 'name') === SERVER && bool(s, 'enabled', true) ? [SERVER] : [],
+      ),
     ],
     proxyInstalled: proxy.some((s) => s['.name'] === 'global'),
-    proxyEnabled: bool(proxy.find((s) => s['.name'] === 'global'), 'enabled'),
+    proxyEnabled: bool(
+      proxy.find((s) => s['.name'] === 'global'),
+      'enabled',
+    ),
     lanDhcp,
     routerIp: ipaddr?.split('/')[0] ?? '192.168.1.1',
     prefix: ipaddr?.includes('/') === true ? Number(ipaddr.split('/')[1]) : prefixLength(str(lan, 'netmask')),
   };
 }
 
-// ---- the servers section --------------------------------------------------
+// ---- the servers ------------------------------------------------------------
 
-/**
- * A part of the DNS servers card: a heading with its choice beside it (below
- * on narrow screens), then what the choice means, then the rest.
- */
-function Part({ title, hint, action, children }: { title: string; hint?: ReactNode; action?: ReactNode; children: ReactNode }): ReactElement {
-  return (
-    <section className="flex flex-col gap-3">
-      <div className="flex flex-col gap-1.5">
-        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-          <h3 className="text-sm font-medium">{title}</h3>
-          {action}
-        </div>
-        {hint !== undefined && <p className="max-w-2xl text-xs text-muted-foreground">{hint}</p>}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-/** One server: its provider and level (or a custom address), and what it blocks and checks. */
+/** One server: its provider and level (or a custom address), what it blocks and checks, and what it's for. */
 function ServerSlot({
   id,
   title,
+  hint,
+  uci,
   mode,
   pick,
   providerIds,
@@ -235,6 +248,8 @@ function ServerSlot({
 }: {
   id: string;
   title: string;
+  hint: string;
+  uci: readonly string[];
   mode: Mode;
   pick: ServerPick;
   providerIds: readonly ProviderId[];
@@ -246,8 +261,7 @@ function ServerSlot({
   const server = serverOf(pick);
   const custom = pick.provider === 'custom';
   return (
-    <div className="flex flex-col gap-2 rounded-lg border p-3">
-      <span className="text-xs font-medium text-muted-foreground uppercase">{title}</span>
+    <Field id={`${id}-provider`} label={title} {...explain(hint, uci)} error={error}>
       <div className="grid gap-2 sm:grid-cols-2">
         <Select
           value={pick.provider}
@@ -255,7 +269,7 @@ function ServerSlot({
             if (v === 'custom' || isProviderId(v)) onProvider(v);
           }}
         >
-          <SelectTrigger id={`${id}-provider`} aria-label={`${title}: provider`}>
+          <SelectTrigger id={`${id}-provider`}>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
@@ -277,6 +291,7 @@ function ServerSlot({
             placeholder={mode === 'static' ? '192.0.2.53, 198.51.100.53' : 'https://dns.example/dns-query'}
             value={pick.custom}
             aria-invalid={error !== undefined}
+            aria-describedby={error === undefined ? undefined : `${id}-provider-error`}
             onChange={(e) => {
               onCustom(e.target.value);
             }}
@@ -305,35 +320,26 @@ function ServerSlot({
             ? ''
             : serverHint(server)}
       </p>
-      {error !== undefined && <p className="text-xs text-destructive">{error}</p>}
-    </div>
+    </Field>
   );
 }
 
-/** Between two servers: how the second relates to the first. */
-function Connector({ pair, mode, main }: { pair: Pair; mode: Mode; main: string }): ReactElement {
-  return (
-    <div className="flex items-center gap-2 py-0.5 pl-4 text-xs text-muted-foreground" aria-hidden>
-      <span className="h-5 border-l border-dashed" />
-      {pair === 'parallel' ? <ZapIcon className="size-3.5" /> : <ArrowDownIcon className="size-3.5" />}
-      {pair === 'parallel' ? 'Asked at the same time' : `Only if ${main} ${mode === 'encrypted' ? 'fails or is slow' : 'doesn’t answer'}`}
-    </div>
-  );
+const warn = <TriangleAlertIcon />;
+
+/** The UCI options a server slot writes, for its "Why?". */
+function slotUci(slot: 'main' | 'backup', mode: Mode, pair: Pair): string[] {
+  const own =
+    slot === 'main'
+      ? ['milkflint.dns.provider', 'milkflint.dns.server', 'milkflint.dns.custom']
+      : ['milkflint.dns.backup', 'milkflint.dns.backup_server', 'milkflint.dns.backup_custom'];
+  const out =
+    mode === 'static'
+      ? [`${DNSMASQ}.server`]
+      : slot === 'backup' && pair === 'fallback'
+        ? ['dnsproxy.servers.fallback']
+        : ['dnsproxy.servers.upstream', 'dnsproxy.servers.bootstrap'];
+  return [...own, ...out];
 }
-
-const WarningBox = ({ title, children }: { title: string; children: ReactNode }): ReactElement => (
-  <Alert variant="warning">
-    <TriangleAlertIcon />
-    <AlertTitle>{title}</AlertTitle>
-    <AlertDescription>{children}</AlertDescription>
-  </Alert>
-);
-
-const slotTitles: Record<Pair, [string, string]> = {
-  one: ['Server', ''],
-  parallel: ['Server 1', 'Server 2'],
-  fallback: ['Main server', 'Backup server'],
-};
 
 export function DnsPage(): ReactElement {
   const { data, error, loading, reload } = useLoad(loadDns);
@@ -381,7 +387,11 @@ export function DnsPage(): ReactElement {
       if (v === 'custom' || f.backup !== v) return next;
       return f.provider === 'custom'
         ? { ...next, backup: 'custom', backupCustom: f.custom }
-        : { ...next, backup: f.provider, backupServer: matchingServer(f.provider, serverOf({ provider: v, server, custom: '' })?.blocks) };
+        : {
+            ...next,
+            backup: f.provider,
+            backupServer: matchingServer(f.provider, serverOf({ provider: v, server, custom: '' })?.blocks),
+          };
     });
   };
   const setBackup = (v: ProviderId | 'custom'): void => {
@@ -414,76 +424,124 @@ export function DnsPage(): ReactElement {
             const backupDnssec = chosen && backup !== undefined ? backupDnssecWarning(backup, use) : undefined;
             // the second server can't use the chosen encryption type: it falls back to DNS over HTTPS
             const protoFallback = form.mode === 'encrypted' ? protoNote(main, backup, form.proto) : undefined;
-            const sends = form.mode === 'static' ? planned.dnsmasq : [...(planned.proxy?.upstream ?? []), ...(planned.proxy?.fallback ?? [])];
+            const sends =
+              form.mode === 'static' ? planned.dnsmasq : [...(planned.proxy?.upstream ?? []), ...(planned.proxy?.fallback ?? [])];
             const ids = Object.keys(providers) as ProviderId[];
-            const [mainTitle, backupTitle] = slotTitles[form.pair];
+            const [mainTitle, backupTitle] = slotTitles(form.pair);
+            const [mainHint, backupHint] = slotHints(form.pair, form.mode, shortName(main));
+            const now = dnsAnswer(data.form, data.routerIp, aghOn);
+            const notRunning = data.form.mode === 'encrypted' && status?.running === false;
+            const lan = data.lanDhcp?.['.name'] ?? 'lan';
+            const foldErrors = errors.form.domain !== undefined || Object.keys(errors.records).length > 0;
             return (
-              <div className="grid items-start gap-4 xl:grid-cols-2">
-                <Card className="xl:col-span-2">
-                  <CardHeading
-                    icon={ServerIcon}
-                    title="DNS servers"
-                    description={describe(form.mode, main, backup, form.pair)}
-                    action={
-                      data.form.mode === 'encrypted' && (
-                        <Badge variant={status?.running === true ? 'success' : 'warning'}>{status?.running === true ? 'Active' : 'Not running'}</Badge>
-                      )
+              <>
+                <Answer columns={3} label="DNS now">
+                  <AnswerCell
+                    title="Your devices ask"
+                    value={<Figure>{now.devices.value}</Figure>}
+                    action={now.devices.who === 'adguard' ? <GoLink href={href('adguardhome')}>AdGuard Home</GoLink> : undefined}
+                  >
+                    {now.devices.text}
+                  </AnswerCell>
+                  <AnswerCell
+                    title="The router sends lookups to"
+                    value={
+                      <>
+                        <Figure>{now.upstream.value}</Figure>
+                        {notRunning ? (
+                          <Badge variant="warning">Not running</Badge>
+                        ) : now.upstream.encrypted ? (
+                          <Badge variant="success">Encrypted</Badge>
+                        ) : (
+                          <Badge variant="outline">Not encrypted</Badge>
+                        )}
+                      </>
                     }
-                  />
-                  <CardContent className="flex flex-col gap-6">
+                    action={notRunning ? <GoLink href={href('logs')}>The system log</GoLink> : undefined}
+                  >
+                    {notRunning ? 'Encrypted DNS is set up, but its service (dnsproxy) isn’t running.' : now.upstream.text}
+                  </AnswerCell>
+                  <AnswerCell title="Cache and protection" value={<Figure>{now.protection.value}</Figure>}>
+                    {now.protection.text}
+                  </AnswerCell>
+                </Answer>
+
+                <Card>
+                  <CardHeading title="DNS servers" status={describe(form.mode, main, backup, form.pair)} />
+                  <CardContent className="flex flex-col gap-5">
                     {aghOn && (
-                      <p className="flex max-w-3xl items-start gap-2 text-sm text-muted-foreground">
-                        <ShieldBanIcon className="mt-0.5 size-4 shrink-0" />
-                        <span>
-                          <a href="#/adguardhome" className="font-medium text-foreground underline">
-                            AdGuard Home
-                          </a>{' '}
-                          filters your devices’ lookups first; what it doesn’t block comes here. These servers, the cache and the protection below
-                          are set here, not in AdGuard Home.
-                        </span>
-                      </p>
+                      <Note tone="info" icon={<ShieldBanIcon />}>
+                        <a href={href('adguardhome')} className="font-medium link underline-offset-4">
+                          AdGuard Home
+                        </a>{' '}
+                        filters your devices’ lookups first; what it doesn’t block comes here. These servers, the cache and the
+                        protection below are set here, not in AdGuard Home.
+                      </Note>
                     )}
-                    <Part title="How lookups are sent">
-                      <Choice
+                    <section aria-labelledby="dns-how" className="flex flex-col gap-3">
+                      <h3 id="dns-how" className="text-sm font-medium">
+                        How lookups are sent
+                      </h3>
+                      <ChoiceCards
                         label="How lookups are sent"
                         columns={3}
                         value={form.mode}
-                        options={(Object.keys(modes) as Mode[])
-                          .filter((m) => m !== 'encrypted' || data.proxyInstalled)
-                          .map((m) => ({ value: m, label: modes[m].label, hint: modes[m].hint, icon: modes[m].icon }))}
+                        options={(Object.keys(modes) as Mode[]).map((m) => ({
+                          value: m,
+                          label: modes[m].label,
+                          icon: modes[m].icon,
+                          hint:
+                            m === 'encrypted' && !data.proxyInstalled
+                              ? 'Needs the dnsproxy package, which isn’t in this firmware.'
+                              : modes[m].hint,
+                          ...(m === 'encrypted' && data.proxyInstalled
+                            ? { badge: <Badge variant="secondary">Recommended</Badge> }
+                            : {}),
+                          disabled: m === 'encrypted' && !data.proxyInstalled,
+                        }))}
                         onChange={(m) => {
                           set('mode', m);
                         }}
                       />
-                      {!data.proxyInstalled && (
-                        <p className="text-xs text-muted-foreground">Encrypted DNS needs the dnsproxy package, which isn&apos;t in this firmware.</p>
-                      )}
-                    </Part>
+                    </section>
 
                     {chosen && (
-                      <Part
-                        title="Servers"
-                        hint={pairs[form.pair].hint(form.mode)}
-                        action={
-                          <Segmented
+                      <section aria-label="Servers" className="flex flex-col gap-4">
+                        <div className="divide-y border-t">
+                          <Field
+                            id="dns-pair"
                             label="Servers"
-                            value={form.pair}
-                            options={(Object.keys(pairs) as Pair[]).map((p) => ({ value: p, label: pairs[p].label }))}
-                            onChange={(p) => {
-                              update((f) => {
-                                // a second server from the main one's provider (left from earlier): a fresh suggestion
-                                const fresh = p !== 'one' && f.backup !== 'custom' && f.backup === f.provider;
-                                const s = fresh ? suggestBackup(mainPick(f)) : undefined;
-                                return { ...f, pair: p, ...(s === undefined ? {} : { backup: s.provider, backupServer: s.server }) };
-                              });
-                            }}
-                          />
-                        }
-                      >
-                        <div className="flex flex-col">
+                            {...explain(pairs[form.pair].hint(form.mode), [
+                              'milkflint.dns.backup',
+                              'milkflint.dns.backup_use',
+                              ...(form.mode === 'static'
+                                ? [`${DNSMASQ}.allservers`, `${DNSMASQ}.strictorder`]
+                                : ['dnsproxy.global.upstream_mode']),
+                            ])}
+                          >
+                            <Segmented
+                              label="Servers"
+                              value={form.pair}
+                              options={(Object.keys(pairs) as Pair[]).map((p) => ({ value: p, label: pairs[p].label }))}
+                              onChange={(p) => {
+                                update((f) => {
+                                  // a second server from the main one's provider (left from earlier): a fresh suggestion
+                                  const fresh = p !== 'one' && f.backup !== 'custom' && f.backup === f.provider;
+                                  const s = fresh ? suggestBackup(mainPick(f)) : undefined;
+                                  return {
+                                    ...f,
+                                    pair: p,
+                                    ...(s === undefined ? {} : { backup: s.provider, backupServer: s.server }),
+                                  };
+                                });
+                              }}
+                            />
+                          </Field>
                           <ServerSlot
                             id="dns"
                             title={mainTitle}
+                            hint={mainHint}
+                            uci={slotUci('main', form.mode, form.pair)}
                             mode={form.mode}
                             pick={main}
                             providerIds={ids}
@@ -497,80 +555,91 @@ export function DnsPage(): ReactElement {
                             }}
                           />
                           {backup !== undefined && (
-                            <>
-                              <Connector pair={form.pair} mode={form.mode} main={shortName(main)} />
-                              <ServerSlot
-                                id="dns-backup"
-                                title={backupTitle}
-                                mode={form.mode}
-                                pick={backup}
-                                providerIds={ids.filter((p) => p !== form.provider || p === form.backup)}
-                                error={errors.form.backup ?? errors.form.backupCustom}
-                                onProvider={setBackup}
-                                onServer={(v) => {
-                                  set('backupServer', v);
+                            <ServerSlot
+                              id="dns-backup"
+                              title={backupTitle}
+                              hint={backupHint}
+                              uci={slotUci('backup', form.mode, form.pair)}
+                              mode={form.mode}
+                              pick={backup}
+                              providerIds={ids.filter((p) => p !== form.provider || p === form.backup)}
+                              error={errors.form.backup ?? errors.form.backupCustom}
+                              onProvider={setBackup}
+                              onServer={(v) => {
+                                set('backupServer', v);
+                              }}
+                              onCustom={(v) => {
+                                set('backupCustom', v);
+                              }}
+                            />
+                          )}
+                          {form.mode === 'encrypted' && form.provider !== 'custom' && (
+                            <Field
+                              id="dns-proto"
+                              label="Encryption"
+                              {...explain(
+                                backup === undefined
+                                  ? 'All three keep lookups private; DNS over HTTPS is the hardest for a network to block.'
+                                  : 'Used for both servers. All three keep lookups private; DNS over HTTPS is the hardest for a network to block.',
+                                ['milkflint.dns.proto'],
+                              )}
+                            >
+                              <Select
+                                value={form.proto}
+                                onValueChange={(v) => {
+                                  set('proto', v as Proto);
                                 }}
-                                onCustom={(v) => {
-                                  set('backupCustom', v);
-                                }}
-                              />
-                            </>
+                              >
+                                <SelectTrigger id="dns-proto">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  {protosOf(form.provider).map((p) => (
+                                    <SelectItem key={p} value={p}>
+                                      {protoLabels[p]}
+                                    </SelectItem>
+                                  ))}
+                                </SelectContent>
+                              </Select>
+                              {protoFallback !== undefined && <p className="text-xs text-muted-foreground">{protoFallback}</p>}
+                            </Field>
                           )}
                         </div>
-                        {form.mode === 'encrypted' && form.provider !== 'custom' && (
-                          <Field
-                            id="dns-proto"
-                            label="Encryption"
-                            className="pb-0"
-                            hint={
-                              backup === undefined
-                                ? 'All three keep lookups private; DNS over HTTPS is the hardest for a network to block.'
-                                : 'Used for both servers.'
-                            }
-                          >
-                            <Select
-                              value={form.proto}
-                              onValueChange={(v) => {
-                                set('proto', v as Proto);
-                              }}
-                            >
-                              <SelectTrigger id="dns-proto">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent>
-                                {protosOf(form.provider).map((p) => (
-                                  <SelectItem key={p} value={p}>
-                                    {protoLabels[p]}
-                                  </SelectItem>
-                                ))}
-                              </SelectContent>
-                            </Select>
-                            {protoFallback !== undefined && <p className="text-xs text-muted-foreground">{protoFallback}</p>}
-                          </Field>
+                        {filter !== undefined && (
+                          <Note tone="warning" icon={warn} title="They don’t filter the same">
+                            {filter}
+                          </Note>
                         )}
-                        {filter !== undefined && <WarningBox title="They don’t filter the same">{filter}</WarningBox>}
-                        {dnssec !== undefined && <WarningBox title="Doesn’t check DNSSEC">{dnssec}</WarningBox>}
-                        {backupDnssec !== undefined && <WarningBox title="The second server doesn’t check DNSSEC">{backupDnssec}</WarningBox>}
-                        {sends.length > 0 && Object.keys(errors.form).every((k) => k === 'domain' || k === 'cacheSize' || k.startsWith('own')) && (
-                          <p className="text-xs text-muted-foreground">
-                            Sends to <span className="font-mono break-all text-foreground">{sends.join(', ')}</span>
-                          </p>
+                        {dnssec !== undefined && (
+                          <Note tone="warning" icon={warn} title="Doesn’t check DNSSEC">
+                            {dnssec}
+                          </Note>
                         )}
-                      </Part>
+                        {backupDnssec !== undefined && (
+                          <Note tone="warning" icon={warn} title="The second server doesn’t check DNSSEC">
+                            {backupDnssec}
+                          </Note>
+                        )}
+                        {sends.length > 0 &&
+                          Object.keys(errors.form).every((k) => k === 'domain' || k === 'cacheSize' || k.startsWith('own')) && (
+                            <p className="text-xs text-muted-foreground">
+                              Sends to <span className="font-mono break-all text-foreground">{sends.join(', ')}</span>
+                            </p>
+                          )}
+                      </section>
                     )}
                   </CardContent>
                 </Card>
 
-                <CacheCard form={form} set={set} sizeError={errors.form.cacheSize} adguard={aghOn} />
-
-                <Card className="xl:col-span-2">
+                <Card>
                   <CardHeading
-                    icon={MonitorSmartphoneIcon}
                     title="Your devices’ DNS server"
-                    description={form.devices.own ? 'Devices on your home network ask another server directly.' : 'Devices ask the router.'}
+                    status={
+                      form.devices.own ? 'Devices on your home network ask another server directly.' : 'Devices ask the router.'
+                    }
                   />
                   <CardContent className="flex flex-col gap-4">
-                    <Choice
+                    <ChoiceCards
                       label="Your devices’ DNS server"
                       columns={2}
                       value={form.devices.own ? 'own' : 'router'}
@@ -598,7 +667,10 @@ export function DnsPage(): ReactElement {
                           <Field
                             id="dns-own-ipv4"
                             label="IPv4 address"
-                            hint="Give the server an address that doesn’t change (a reservation). Two addresses for two servers."
+                            {...explain(
+                              'Give the server an address that doesn’t change (a reservation). Two addresses for two servers.',
+                              [`dhcp.${lan}.dhcp_option (6,…)`],
+                            )}
                             error={errors.form.ownIpv4}
                           >
                             <Input
@@ -618,7 +690,10 @@ export function DnsPage(): ReactElement {
                           <Field
                             id="dns-own-ipv6"
                             label="IPv6 address (optional)"
-                            hint="If it has one that doesn’t change. Without one, the router stops offering itself for DNS over IPv6, so devices can’t skip your server that way."
+                            {...explain(
+                              'If it has one that doesn’t change. Without one, the router stops offering itself for DNS over IPv6, so devices can’t skip your server that way.',
+                              [`dhcp.${lan}.dns`, `dhcp.${lan}.dns_service`],
+                            )}
                             error={errors.form.ownIpv6}
                           >
                             <Input
@@ -638,139 +713,181 @@ export function DnsPage(): ReactElement {
                         </div>
                         <ul className="flex max-w-3xl list-disc flex-col gap-1 pl-4 text-xs text-muted-foreground">
                           <li>
-                            For its own lookups, your server can use the router (<span className="font-mono text-foreground">{data.routerIp}</span>): it then
-                            gets the DNS servers above, and names on your network (name.{form.domain}).
+                            For its own lookups, your server can use the router (
+                            <span className="font-mono text-foreground">{data.routerIp}</span>): it then gets the DNS servers
+                            above, and names on your network (name.{form.domain}).
                           </li>
                           <li>Devices switch when they next renew their address; reconnecting one switches it at once.</li>
                           <li>Guest networks keep using the router.</li>
-                          {aghOn && (
-                            <li className="text-warning">
-                              AdGuard Home on the router doesn’t filter your home network’s devices then: they ask your server directly. Only the
-                              guest networks’ and Remote access’s lookups go through it.
-                            </li>
-                          )}
                         </ul>
+                        {aghOn && (
+                          <Note tone="warning" icon={warn}>
+                            AdGuard Home on the router doesn’t filter your home network’s devices then: they ask your server
+                            directly. Only the guest networks’ and Remote access’s lookups go through it.
+                          </Note>
+                        )}
                         {form.mode === 'static' && loops(form.devices, planned.dnsmasq) && (
-                          <WarningBox title="Lookups could go round in circles">
-                            The router sends its own lookups to your server. If your server sends its lookups to the router too, none get answered: give one
-                            of them a server on the internet.
-                          </WarningBox>
+                          <Note tone="warning" icon={warn} title="Lookups could go round in circles">
+                            The router sends its own lookups to your server. If your server sends its lookups to the router too,
+                            none get answered: give one of them a server on the internet.
+                          </Note>
                         )}
                       </>
                     )}
-                  </CardContent>
-                </Card>
-
-                <Card>
-                  <CardHeading icon={ShieldCheckIcon} title="Protection" />
-                  <CardContent className="divide-y">
-                    <Field
-                      id="dns-intercept"
-                      label="Catch devices with their own DNS"
-                      hint={`Devices on your home and guest networks set to use another DNS server are answered by the router instead${aghOn ? ', through AdGuard Home' : ''}. Apps that encrypt DNS themselves get past it.`}
-                    >
-                      <Switch
+                    <MoreSettings summary={moreSummary(form, { uncovered, invalid: foldErrors })}>
+                      <Field
                         id="dns-intercept"
-                        checked={form.intercept && !form.devices.own}
-                        disabled={form.devices.own}
-                        onCheckedChange={(v) => {
-                          set('intercept', v);
-                        }}
-                      />
-                      {form.devices.own && (
-                        <p className="text-xs text-muted-foreground">Off while devices use another DNS server: it would catch that server’s own lookups too.</p>
-                      )}
-                      {uncovered && <p className="text-xs text-muted-foreground">Not on every guest network yet: save to add it there.</p>}
-                    </Field>
-                    <Field
-                      id="dns-rebind"
-                      label="Rebinding protection"
-                      hint="Stops websites from pointing names at addresses inside your network (DNS rebinding attacks)."
-                    >
-                      <Switch
-                        id="dns-rebind"
-                        checked={form.rebind}
-                        onCheckedChange={(v) => {
-                          set('rebind', v);
-                        }}
-                      />
-                    </Field>
-                    <Field id="dns-domain" label="Local domain" hint={`Devices are reachable as name.${form.domain}`} error={errors.form.domain}>
-                      <Input
-                        id="dns-domain"
-                        className="font-mono"
-                        value={form.domain}
-                        aria-invalid={errors.form.domain !== undefined}
-                        onChange={(e) => {
-                          set('domain', e.target.value.trim());
-                        }}
-                      />
-                    </Field>
-                  </CardContent>
-                </Card>
-
-                <Card>
-                  <CardHeading
-                    icon={TagIcon}
-                    title="Custom names"
-                    description="Names the router answers itself, for every device on your network."
-                    action={
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => {
-                          update((f) => ({ ...f, records: [...f.records, { key: `new-${String(nextKey++)}`, section: undefined, name: '', ip: '' }] }));
-                        }}
+                        label="Catch devices with their own DNS"
+                        {...explain(
+                          `The router answers devices set to use another DNS server. That covers your home and guest networks${aghOn ? ', through AdGuard Home' : ''}. Apps that encrypt DNS themselves get past it. It’s one firewall redirect per network.`,
+                          [`firewall.${INTERCEPT}`, `firewall.${INTERCEPT}_<zone>`],
+                        )}
                       >
-                        <PlusIcon /> Add
-                      </Button>
-                    }
-                  />
-                  <CardContent className="flex flex-col gap-2">
-                    {form.records.length === 0 && <p className="text-sm text-muted-foreground">None yet. Example: nas → 192.168.1.20.</p>}
-                    {form.records.map((r) => (
-                      <div key={r.key} className="flex flex-col gap-1">
-                        <div className="flex items-center gap-2">
-                          <Input
-                            aria-label="Name"
-                            placeholder="nas"
-                            className="font-mono"
-                            value={r.name}
-                            aria-invalid={errors.records[r.key] !== undefined}
-                            onChange={(e) => {
-                              const name = e.target.value.trim();
-                              update((f) => ({ ...f, records: f.records.map((x) => (x.key === r.key ? { ...x, name } : x)) }));
-                            }}
-                          />
-                          <span className="text-muted-foreground">→</span>
-                          <Input
-                            aria-label="IP address"
-                            placeholder="192.168.1.20"
-                            className="font-mono"
-                            value={r.ip}
-                            aria-invalid={errors.records[r.key] !== undefined}
-                            onChange={(e) => {
-                              const ip = e.target.value.trim();
-                              update((f) => ({ ...f, records: f.records.map((x) => (x.key === r.key ? { ...x, ip } : x)) }));
-                            }}
-                          />
+                        <Switch
+                          id="dns-intercept"
+                          checked={form.intercept && !form.devices.own}
+                          disabled={form.devices.own}
+                          onCheckedChange={(v) => {
+                            set('intercept', v);
+                          }}
+                        />
+                        {form.devices.own && (
+                          <p className="text-xs text-muted-foreground">
+                            Off while devices use another DNS server: it would catch that server’s own lookups too.
+                          </p>
+                        )}
+                        {uncovered && (
+                          <p className="text-xs text-muted-foreground">Not on every guest network yet: save to add it there.</p>
+                        )}
+                      </Field>
+                      <Field
+                        id="dns-rebind"
+                        label="Rebinding protection"
+                        {...explain(
+                          'Stops websites pointing names at addresses inside your network. That’s what DNS rebinding attacks do.',
+                          [`${DNSMASQ}.rebind_protection`],
+                        )}
+                      >
+                        <Switch
+                          id="dns-rebind"
+                          checked={form.rebind}
+                          onCheckedChange={(v) => {
+                            set('rebind', v);
+                          }}
+                        />
+                      </Field>
+                      <Field
+                        id="dns-domain"
+                        label="Local domain"
+                        {...explain(`Devices are reachable as name.${form.domain}.`, [`${DNSMASQ}.domain`, `${DNSMASQ}.local`])}
+                        error={errors.form.domain}
+                      >
+                        <Input
+                          id="dns-domain"
+                          className="font-mono"
+                          value={form.domain}
+                          aria-invalid={errors.form.domain !== undefined}
+                          onChange={(e) => {
+                            set('domain', e.target.value.trim());
+                          }}
+                        />
+                      </Field>
+                      <section aria-labelledby="dns-names" className="flex flex-col gap-3 py-3.5">
+                        <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+                          <div className="flex min-w-0 flex-col gap-1">
+                            <h3 id="dns-names" className="text-sm font-medium">
+                              Custom names
+                            </h3>
+                            <p className="text-xs text-muted-foreground">
+                              Names the router answers itself, for every device on your network. Each is a{' '}
+                              <code className="font-mono">domain</code> section in dhcp.
+                            </p>
+                          </div>
                           <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Remove"
+                            variant="outline"
+                            size="sm"
                             onClick={() => {
-                              update((f) => ({ ...f, records: f.records.filter((x) => x.key !== r.key) }));
+                              update((f) => ({
+                                ...f,
+                                records: [
+                                  ...f.records,
+                                  { key: `new-${String(nextKey++)}`, section: undefined, name: '', ip: '' },
+                                ],
+                              }));
                             }}
                           >
-                            <Trash2Icon />
+                            <PlusIcon /> Add
                           </Button>
                         </div>
-                        {errors.records[r.key] !== undefined && <p className="text-xs text-destructive">{errors.records[r.key]}</p>}
-                      </div>
-                    ))}
+                        {form.records.length === 0 ? (
+                          <p className="text-sm text-muted-foreground">None yet. For example: nas, at 192.168.1.20.</p>
+                        ) : (
+                          <ul className="flex max-w-2xl flex-col gap-3">
+                            {form.records.map((r, i) => {
+                              const which = r.name === '' ? `custom name ${String(i + 1)}` : r.name;
+                              const rowError = errors.records[r.key];
+                              return (
+                                <li key={r.key} className="flex flex-col gap-1">
+                                  <div className="flex items-start gap-2">
+                                    <div className="grid min-w-0 flex-1 gap-2 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] sm:items-center">
+                                      <Input
+                                        aria-label={`Name, ${which}`}
+                                        placeholder="nas"
+                                        className="font-mono"
+                                        value={r.name}
+                                        aria-invalid={rowError !== undefined}
+                                        onChange={(e) => {
+                                          const name = e.target.value.trim();
+                                          update((f) => ({
+                                            ...f,
+                                            records: f.records.map((x) => (x.key === r.key ? { ...x, name } : x)),
+                                          }));
+                                        }}
+                                      />
+                                      <ArrowRightIcon
+                                        className="hidden size-4 text-muted-foreground sm:block"
+                                        aria-hidden="true"
+                                      />
+                                      <Input
+                                        aria-label={`IP address, ${which}`}
+                                        placeholder="192.168.1.20"
+                                        className="font-mono"
+                                        value={r.ip}
+                                        aria-invalid={rowError !== undefined}
+                                        onChange={(e) => {
+                                          const ip = e.target.value.trim();
+                                          update((f) => ({
+                                            ...f,
+                                            records: f.records.map((x) => (x.key === r.key ? { ...x, ip } : x)),
+                                          }));
+                                        }}
+                                      />
+                                    </div>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      className="text-muted-foreground hover:text-foreground"
+                                      aria-label={`Remove ${which}`}
+                                      onClick={() => {
+                                        update((f) => ({ ...f, records: f.records.filter((x) => x.key !== r.key) }));
+                                      }}
+                                    >
+                                      <Trash2Icon />
+                                    </Button>
+                                  </div>
+                                  {rowError !== undefined && <p className="text-xs font-medium text-destructive">{rowError}</p>}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </section>
+                    </MoreSettings>
                   </CardContent>
                 </Card>
-              </div>
+
+                <CacheCard form={form} set={set} sizeError={errors.form.cacheSize} adguard={aghOn} />
+              </>
             );
           })()
         )}

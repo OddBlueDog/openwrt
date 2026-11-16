@@ -1,4 +1,7 @@
-import { ActivityIcon, GlobeIcon, LoaderCircleIcon, RadarIcon, SettingsIcon } from 'lucide-react';
+// The Network quality page: the probe's live answer first (the score, the
+// internet ping, its jitter and loss, each probe's typical time), then the
+// latency and route charts with their tables, loss strip and CSV, then what
+// to measure. Its on/off sits in the page header, as on Smart Queue.
 import { type ReactElement, type ReactNode, useCallback, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
@@ -6,25 +9,25 @@ import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { SaveBar } from '@/components/save-bar';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
-import { bool, type Change, getConfig, str } from '@/lib/api/uci';
-import { formatNumber, formatPercent } from '@/lib/format';
-import { cn } from '@/lib/utils';
-import { type Live, useLive, WINDOW_SECONDS } from './live';
-import { Button } from '@/components/ui/button';
 import { usePoll } from '@/hooks/use-poll';
-import { type Bucket, type DnsTarget, getHistory, type History, type Route, type Sample } from './api';
+import { bool, type Change, getConfig, str } from '@/lib/api/uci';
+import { formatNumber } from '@/lib/format';
+import { PowerSwitch } from '@/components/power-switch';
+import { QualityNow, QualityOff } from './answer';
+import { type Bucket, getHistory, type History, type Route, type Sample } from './api';
 import { type ChartLine, csvName, historyLine, type LineSpec, linesToCsv, liveLine } from './chart-data';
-import { type DnsLine, dnsLines, providerName } from './dns-lines';
+import { type DnsLine, dnsLines } from './dns-lines';
+import { ms } from './format';
 import { LatencyChart } from './latency-chart';
-import { type Probe, type ProbeSummary, rating, summarize, summarizeDnsServer } from './score';
-import { ScoreRing } from './score-ring';
+import { type Live, useLive, WINDOW_SECONDS } from './live';
+import { summarize } from './score';
 
 const pingTargets = [
   { value: '1.1.1.1', label: 'Cloudflare (1.1.1.1)' },
@@ -32,79 +35,13 @@ const pingTargets = [
   { value: '9.9.9.9', label: 'Quad9 (9.9.9.9)' },
 ] as const;
 
-const probes: readonly { key: Probe; label: string; scaleMs: number }[] = [
-  { key: 'gateway', label: 'WAN gateway', scaleMs: 50 },
-  { key: 'internet', label: 'Internet', scaleMs: 200 },
-  { key: 'dns', label: 'DNS lookup', scaleMs: 400 },
-];
-
-const ms = (v: number): string => `${formatNumber(v, v < 10 ? 1 : 0)} ms`;
-
-function ProbeBar({
-  label,
-  target,
-  summary,
-  scaleMs,
-  silent = false,
-}: {
-  label: string;
-  target: string | undefined;
-  summary: ProbeSummary;
-  scaleMs: number;
-  /** a gateway that never answers pings: not a failure */
-  silent?: boolean;
-}): ReactElement {
-  const value = summary.typical;
-  const failing = summary.answered === 0 && !silent;
-  const pct = silent ? 0 : value === undefined ? 100 : Math.min(100, (value / scaleMs) * 100);
-  const tone = silent ? 'bg-muted-foreground/30' : failing ? 'bg-destructive' : pct > 66 ? 'bg-warning' : 'bg-success';
-  return (
-    <div className="grid grid-cols-[9rem_1fr_6rem] items-center gap-4 py-2.5">
-      <div className="min-w-0">
-        <div className="text-sm font-medium">{label}</div>
-        <div className="truncate font-mono text-[11px] text-muted-foreground">{target ?? '—'}</div>
-      </div>
-      <div className="h-2.5 overflow-hidden rounded-full bg-muted">
-        <div className={cn('h-full rounded-full transition-[width] duration-500', tone)} style={{ width: `${String(Math.max(pct, 2))}%` }} />
-      </div>
-      <div className={cn('text-right text-sm font-medium tabular', failing && 'text-destructive', silent && 'text-muted-foreground')}>
-        {silent ? 'no ping reply' : failing ? 'no answer' : value === undefined ? '—' : ms(value)}
-        {!failing && !silent && summary.loss > 0 && (
-          <div className="text-[11px] font-normal text-warning">{formatPercent(summary.loss)} lost</div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function Stat({ label, value, hint }: { label: string; value: string; hint?: string }): ReactElement {
-  return (
-    <div className="flex flex-col gap-0.5">
-      <span className="text-xs text-muted-foreground">{label}</span>
-      <span className="text-2xl font-semibold tracking-tight tabular">{value}</span>
-      {hint !== undefined && <span className="text-[11px] text-muted-foreground">{hint}</span>}
-    </div>
-  );
-}
-
 const routeColors = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)'];
-// the DNS servers asked now: blue, amber, then paler ones (the probe asks
-// four at most); servers asked earlier in the span, and the line from before
-// the probe asked each, muted
-const dnsColors = [
-  'var(--chart-2)',
-  'var(--chart-4)',
-  'color-mix(in oklab, var(--chart-2) 55%, var(--muted-foreground))',
-  'color-mix(in oklab, var(--chart-4) 55%, var(--muted-foreground))',
-];
+// the DNS servers asked now: the theme's series 2, 4, 5 and 6 (the probe
+// asks four at most); servers asked earlier in the span, and the line from
+// before the probe asked each, muted
+const dnsColors = ['var(--chart-2)', 'var(--chart-4)', 'var(--chart-5)', 'var(--chart-6)'];
 const dnsColor = (l: DnsLine, order: readonly string[]): string =>
   l.current ? (dnsColors[order.indexOf(l.key)] ?? 'var(--chart-2)') : 'var(--muted-foreground)';
-
-/** A DNS server's row: its provider's name when it's one of the DNS page's. */
-function dnsRowLabel(d: DnsTarget): string {
-  const name = providerName(d.key);
-  return name === undefined ? 'DNS lookup' : `DNS · ${name}`;
-}
 
 // The charts' time span: the last hour from the live samples, or the
 // probe's minute history merged into `step`-second buckets. `csvStep` is
@@ -156,7 +93,10 @@ function latencyLines(source: Source, dnsOrder: readonly string[], gatewayAnswer
         )
       : dnsLines(
           source.history.buckets,
-          (b) => (b.dns_servers === undefined ? undefined : Object.fromEntries(Object.entries(b.dns_servers).map(([k, v]) => [k, v?.[0] ?? null]))),
+          (b) =>
+            b.dns_servers === undefined
+              ? undefined
+              : Object.fromEntries(Object.entries(b.dns_servers).map(([k, v]) => [k, v?.[0] ?? null])),
           (b) => b.dns?.[0],
           dnsOrder,
         );
@@ -253,8 +193,8 @@ function ChartNote({ children }: { children: ReactNode }): ReactElement {
   return <div className="flex h-52 items-center justify-center text-sm text-muted-foreground">{children}</div>;
 }
 
-/** The chart's axis labels: whole numbers. */
-const axisMs = (v: number): string => `${formatNumber(v)} ms`;
+/** The chart's axis labels: whole numbers, in seconds from 10 s so a long stall's scale stays short. */
+const axisMs = (v: number): string => (v >= 10_000 ? `${formatNumber(v / 1000)} s` : `${formatNumber(v)} ms`);
 
 /** The UK, Europe and US servers: whether a slowdown is the line or a route abroad. */
 function Routes({
@@ -271,7 +211,6 @@ function Routes({
   return (
     <Card>
       <CardHeading
-        icon={GlobeIcon}
         title="Routes"
         description="A server each in the UK, Europe and the US, pinged once a minute. Not part of the score."
         action={<div className="hidden sm:block">{picker}</div>}
@@ -304,20 +243,19 @@ function Results({ live }: { live: Live }): ReactElement {
   const { status, samples } = live;
   const recent = samples.filter((s) => s.t > status.now - WINDOW_SECONDS);
   const summary = summarize(recent, status.gateway_answers);
-  const r = summary.score === undefined ? undefined : rating(summary.score);
   const targets = status.targets;
   const interval = status.interval ?? 5;
-  const stale = samples.length > 0 && status.now - (samples[samples.length - 1]?.t ?? 0) > interval * 3 + 5;
   const [span, setSpan] = useState<Span>(spans[0]);
   const history = usePoll(
     async (): Promise<History | undefined> => (span.step === undefined ? undefined : getHistory(span.seconds, span.step)),
     60_000,
     span.key,
   );
-  const dnsTargets = targets?.dns_servers ?? [];
-  const dnsOrder = dnsTargets.map((d) => d.key);
+  const dnsOrder = (targets?.dns_servers ?? []).map((d) => d.key);
   const chart =
-    span.step === undefined ? liveChart(samples, interval, status.now) : historyChart(span, history.data, history.loading, status.now, interval);
+    span.step === undefined
+      ? liveChart(samples, interval, status.now)
+      : historyChart(span, history.data, history.loading, status.now, interval);
   const routes = targets?.routes ?? [];
   const gatewayAnswers = status.gateway_answers;
   // the CSV's data: as charted for the hour and the 7 days, by the minute for the 24 hours
@@ -336,125 +274,38 @@ function Results({ live }: { live: Live }): ReactElement {
   });
   const picker = <SpanPicker span={span} onChange={setSpan} />;
 
-  if (samples.length === 0) {
-    return (
-      <Alert variant="info">
-        <LoaderCircleIcon className="animate-spin" />
-        <AlertTitle>Measuring…</AlertTitle>
-        <AlertDescription>The first results arrive within a few seconds.</AlertDescription>
-      </Alert>
-    );
-  }
-
   return (
     <div className="flex flex-col gap-4">
-      {stale && (
-        <Alert variant="warning">
-          <ActivityIcon />
-          <AlertTitle>No new measurements</AlertTitle>
-          <AlertDescription>The probe hasn&apos;t reported for a while; it restarts by itself if it stopped.</AlertDescription>
-        </Alert>
-      )}
-      <div className="grid items-stretch gap-4 xl:grid-cols-[minmax(0,26rem)_1fr]">
-        <Card>
-          <CardHeading icon={RadarIcon} title="Quality score" description="Over the last 5 minutes" />
-          <CardContent className="flex items-center gap-6">
-            <ScoreRing score={summary.score} />
-            <div className="flex flex-col gap-1">
-              <span
-                className={cn(
-                  'text-2xl font-semibold',
-                  r?.tone === 'success' ? 'text-success' : r?.tone === 'warning' ? 'text-warning' : 'text-destructive',
-                )}
-              >
-                {r?.label ?? '—'}
-              </span>
-              <p className="text-sm text-muted-foreground">
-                From internet latency, loss and jitter, DNS speed{summary.gatewaySilent ? '' : ' and the gateway'}.
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeading icon={ActivityIcon} title="Response times" description="Typical values over the last 5 minutes" />
-          <CardContent>
-            <div className="divide-y">
-              {probes.map((p) =>
-                p.key === 'dns' && dnsTargets.length > 0 && recent.some((s) => s.dns_servers !== undefined) ? (
-                  // a row per DNS server the DNS page uses
-                  dnsTargets.map((d) => (
-                    <ProbeBar
-                      key={`dns:${d.key}`}
-                      label={dnsRowLabel(d)}
-                      scaleMs={p.scaleMs}
-                      summary={summarizeDnsServer(recent, d.key)}
-                      target={`${targets?.dns_domain ?? ''} @ ${d.addr ?? d.host}`}
-                    />
-                  ))
-                ) : (
-                  <ProbeBar
-                    key={p.key}
-                    label={p.label}
-                    scaleMs={p.scaleMs}
-                    summary={summary.probes[p.key]}
-                    silent={p.key === 'gateway' && summary.gatewaySilent}
-                    target={
-                      p.key === 'gateway'
-                        ? (targets?.gateway ?? undefined)
-                        : p.key === 'internet'
-                          ? targets?.internet
-                          : targets === null
-                            ? undefined
-                            : `${targets.dns_domain} @ ${targets.dns_server}`
-                    }
-                  />
-                ),
-              )}
-            </div>
-            {dnsTargets.length > 1 && (
-              <p className="pt-2 text-xs text-muted-foreground">
-                Each DNS server is asked over plain DNS at its address, the same server your encrypted lookups reach; the score uses the
-                first.
-              </p>
-            )}
-            {summary.gatewaySilent && (
-              <p className="pt-2 text-xs text-muted-foreground">
-                The gateway doesn&apos;t answer pings (common with providers), so it&apos;s left out of the score.
-              </p>
-            )}
-            <div className="mt-4 grid grid-cols-2 gap-4 border-t pt-4 sm:grid-cols-4">
-              <Stat label="Typical" value={summary.probes.internet.typical === undefined ? '—' : ms(summary.probes.internet.typical)} hint="internet ping" />
-              <Stat label="Worst" value={summary.probes.internet.worst === undefined ? '—' : ms(summary.probes.internet.worst)} hint="95th percentile" />
-              <Stat label="Jitter" value={summary.jitter === undefined ? '—' : ms(summary.jitter)} hint="change between pings" />
-              <Stat label="Loss" value={formatPercent(summary.probes.internet.loss)} hint="pings without answer" />
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
-        <CardHeading icon={ActivityIcon} title="Latency" description={chart.description} action={<div className="hidden sm:block">{picker}</div>} />
-        <CardContent>
-          <div className="pb-3 sm:hidden">{picker}</div>
-          {chart.note !== undefined || chart.source === undefined ? (
-            <ChartNote>{chart.note}</ChartNote>
-          ) : (
-            <LatencyChart
-              label="Latency"
-              lines={latencyLines(chart.source, dnsOrder, gatewayAnswers)}
-              start={chart.start}
-              end={chart.end}
-              spanLabel={chart.spanLabel}
-              format={axisMs}
-              hoverFormat={ms}
-              csv={latencyCsv}
+      <QualityNow status={status} samples={samples} recent={recent} summary={summary} />
+      {samples.length > 0 && (
+        <>
+          <Card>
+            <CardHeading
+              title="Latency"
+              description={chart.description}
+              action={<div className="hidden sm:block">{picker}</div>}
             />
-          )}
-        </CardContent>
-      </Card>
-
-      {routes.length > 0 && <Routes routes={routes} chart={chart} picker={picker} csv={routesCsv} />}
+            <CardContent>
+              <div className="pb-3 sm:hidden">{picker}</div>
+              {chart.note !== undefined || chart.source === undefined ? (
+                <ChartNote>{chart.note}</ChartNote>
+              ) : (
+                <LatencyChart
+                  label="Latency"
+                  lines={latencyLines(chart.source, dnsOrder, gatewayAnswers)}
+                  start={chart.start}
+                  end={chart.end}
+                  spanLabel={chart.spanLabel}
+                  format={axisMs}
+                  hoverFormat={ms}
+                  csv={latencyCsv}
+                />
+              )}
+            </CardContent>
+          </Card>
+          {routes.length > 0 && <Routes routes={routes} chart={chart} picker={picker} csv={routesCsv} />}
+        </>
+      )}
     </div>
   );
 }
@@ -505,7 +356,8 @@ export function NetworkQualityPage(): ReactElement {
 
   const errors: Partial<Record<keyof QualityForm, string>> = {};
   if (form?.pingTarget === 'custom' && !HOST.test(form.customTarget)) errors.customTarget = 'An IP address or host name.';
-  if (form !== undefined && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(form.dnsDomain)) errors.dnsDomain = 'A domain name, e.g. openwrt.org.';
+  if (form !== undefined && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(form.dnsDomain))
+    errors.dnsDomain = 'A domain name, e.g. openwrt.org.';
   const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data);
 
   const toChanges = (f: QualityForm): Change[] => [
@@ -526,20 +378,18 @@ export function NetworkQualityPage(): ReactElement {
   return (
     <>
       <PageHeader
-        title="Network Quality"
+        title="Network quality"
         description="Latency to your gateway, the internet and DNS, measured continuously."
         actions={
           form !== undefined && (
-            <label className="flex items-center gap-2 text-sm">
-              <span className="text-muted-foreground">{form.enabled ? 'On' : 'Off'}</span>
-              <Switch
-                checked={form.enabled}
-                onCheckedChange={(v) => {
-                  set('enabled', v);
-                }}
-                aria-label="Network Quality on"
-              />
-            </label>
+            <PowerSwitch
+              name="Network quality"
+              on={form.enabled}
+              saved={data?.enabled}
+              onChange={(v) => {
+                set('enabled', v);
+              }}
+            />
           )
         }
       />
@@ -554,20 +404,21 @@ export function NetworkQualityPage(): ReactElement {
         ) : live.data.status.enabled ? (
           <Results live={live.data} />
         ) : (
-          <Alert variant="info">
-            <RadarIcon />
-            <AlertTitle>Network Quality is off</AlertTitle>
-            <AlertDescription>Turn it on to measure latency continuously. It sends one small ping and a DNS query to each DNS server per round, and a ping each to three test servers once a minute.</AlertDescription>
-          </Alert>
+          <QualityOff />
         )}
 
         {error !== undefined && data === undefined ? (
           <LoadError error={error} retry={reload} />
         ) : loading || form === undefined ? null : (
           <Card>
-            <CardHeading icon={SettingsIcon} title="Settings" description="What to measure, and how often." />
+            <CardHeading title="Settings" description="What to measure, and how often." />
             <CardContent className="divide-y">
-              <Field id="nq-target" label="Internet target" hint="Pinged every round. An IP address avoids timing DNS twice.">
+              <Field
+                id="nq-target"
+                label="Internet target"
+                hint="Pinged every round."
+                why="An IP address avoids timing a DNS lookup as well as the ping. Saved as milkflint.netquality.ping_target."
+              >
                 <Select
                   value={form.pingTarget}
                   onValueChange={(v) => {
@@ -603,7 +454,8 @@ export function NetworkQualityPage(): ReactElement {
               <Field
                 id="nq-dns"
                 label="DNS test domain"
-                hint="Looked up at each DNS server the DNS page uses, or your internet provider's when DNS is Automatic."
+                hint="Looked up at each DNS server the DNS page uses."
+                why="Or at your internet provider’s DNS server when DNS is Automatic. Saved as milkflint.netquality.dns_domain."
                 error={errors.dnsDomain}
               >
                 <Input
@@ -616,7 +468,12 @@ export function NetworkQualityPage(): ReactElement {
                   }}
                 />
               </Field>
-              <Field id="nq-interval" label="Measure every">
+              <Field
+                id="nq-interval"
+                label="Measure every"
+                hint="How often a round of measurements runs."
+                why="Saved as milkflint.netquality.interval."
+              >
                 <Select
                   value={form.interval}
                   onValueChange={(v) => {
@@ -632,14 +489,17 @@ export function NetworkQualityPage(): ReactElement {
                         {s} seconds
                       </SelectItem>
                     ))}
-                    {!['2', '5', '10', '30'].includes(form.interval) && <SelectItem value={form.interval}>{form.interval} seconds</SelectItem>}
+                    {!['2', '5', '10', '30'].includes(form.interval) && (
+                      <SelectItem value={form.interval}>{form.interval} seconds</SelectItem>
+                    )}
                   </SelectContent>
                 </Select>
               </Field>
               <Field
                 id="nq-routes"
                 label="Compare routes"
-                hint="Once a minute, one ping each to test servers in London, Frankfurt and New Jersey (Vultr's, made for latency tests)."
+                hint="Once a minute, one ping each to test servers in London, Frankfurt and New Jersey."
+                why="Vultr’s, made for latency tests. They’re not part of the score. Saved as milkflint.netquality.routes."
               >
                 <Switch
                   id="nq-routes"

@@ -1,6 +1,7 @@
 import { LoaderCircleIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { Button } from '@/components/ui/button';
+import { cn } from '@/lib/utils';
 
 /** Sticky bar at the bottom of a settings page while there are unsaved edits. */
 export function SaveBar({
@@ -18,8 +19,12 @@ export function SaveBar({
 }): ReactElement | null {
   if (!visible && !busy) return null;
   return (
-    <div className="sticky bottom-4 z-20 mt-6 flex items-center justify-between gap-4 rounded-xl border bg-popover/95 px-4 py-3 shadow-lg backdrop-blur">
-      <p className="text-sm text-muted-foreground">
+    <div
+      role="region"
+      aria-label="Unsaved changes"
+      className="sticky bottom-4 z-20 mt-6 flex animate-[mf-pop-in_var(--mf-duration-base)_var(--mf-ease-enter)] flex-wrap items-center justify-between gap-3 rounded-xl border bg-popover px-4 py-3 shadow-lg"
+    >
+      <p aria-live="polite" className={cn('text-sm', invalid ? 'font-medium text-destructive' : 'text-muted-foreground')}>
         {invalid ? 'Fix the highlighted fields to save.' : busy ? 'Applying your changes…' : 'You have unsaved changes.'}
       </p>
       <div className="flex gap-2">

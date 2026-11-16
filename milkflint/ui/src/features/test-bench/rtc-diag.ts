@@ -185,7 +185,9 @@ export function noPathCauses(a: Side, b: Side): string[] {
     [b, db],
   ] as const) {
     if (d !== undefined && total(d.local) === 0) {
-      out.push(`${s.name}'s browser offered no addresses at all: a privacy setting or extension (WebRTC leak protection) blocks it.`);
+      out.push(
+        `${s.name}'s browser offered no addresses at all: a privacy setting or extension (WebRTC leak protection) blocks it.`,
+      );
     }
   }
   if (out.length > 0) return out;
@@ -203,7 +205,9 @@ export function noPathCauses(a: Side, b: Side): string[] {
       "Each side had only the other's .local name, and neither got an address for it: mDNS (multicast) didn't get across between them. A peer-reflexive path needs just one side to resolve the other.",
     );
   } else if (sent > 0 && heard === 0) {
-    out.push('Both sides sent connectivity checks, and none arrived: something between them, or on one of them, drops the packets.');
+    out.push(
+      'Both sides sent connectivity checks, and none arrived: something between them, or on one of them, drops the packets.',
+    );
   } else if (sent > 0) {
     for (const [x, y, dx, dy] of [
       [a, b, da, db],
@@ -214,13 +218,19 @@ export function noPathCauses(a: Side, b: Side): string[] {
       }
     }
   }
-  if (a.wifi === true && b.wifi === true) out.push('Both are on Wi-Fi: client isolation on the access point (a guest network has it) keeps Wi-Fi devices apart.');
+  if (a.wifi === true && b.wifi === true)
+    out.push('Both are on Wi-Fi: client isolation on the access point (a guest network has it) keeps Wi-Fi devices apart.');
   for (const s of [a, b]) {
-    if (s.os === 'Windows') out.push(`On ${s.name}, Windows Defender Firewall may block the browser's incoming UDP, especially on a network marked Public.`);
+    if (s.os === 'Windows')
+      out.push(
+        `On ${s.name}, Windows Defender Firewall may block the browser's incoming UDP, especially on a network marked Public.`,
+      );
   }
   for (const s of [a, b]) {
     if (s.browser === 'Chrome' || s.browser === 'Edge') {
-      out.push(`${s.name}'s ${s.browser} may have asked for permission to reach local devices; if that was dismissed, it blocks the connection.`);
+      out.push(
+        `${s.name}'s ${s.browser} may have asked for permission to reach local devices; if that was dismissed, it blocks the connection.`,
+      );
     }
   }
   out.push('A VPN on either device can capture its LAN traffic.');
@@ -231,7 +241,9 @@ export function noPathCauses(a: Side, b: Side): string[] {
 export function pathNotes(path: LinkDiag['path']): string[] {
   if (path === null) return [];
   const out: string[] = [];
-  if (protocolOf(path.local) === 'tcp') out.push('Only ICE over TCP connected: TCP resends what is lost, so loss between these two can’t be measured.');
-  if (!pathIsLocal(path)) out.push('The path leaves the home network’s addresses (a VPN, or a public address): its figures aren’t the LAN’s.');
+  if (protocolOf(path.local) === 'tcp')
+    out.push('Only ICE over TCP connected: TCP resends what is lost, so loss between these two can’t be measured.');
+  if (!pathIsLocal(path))
+    out.push('The path leaves the home network’s addresses (a VPN, or a public address): its figures aren’t the LAN’s.');
   return out;
 }

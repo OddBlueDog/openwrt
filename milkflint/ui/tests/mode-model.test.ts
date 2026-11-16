@@ -3,7 +3,16 @@
 // form prefilled from the main router's network as the WAN port sees it.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { type ApForm, apAddress, initialForm, netmaskOf, toRequest, validate } from '../src/features/mode/model.ts';
+import {
+  addressText,
+  type ApForm,
+  apAddress,
+  initialForm,
+  modeName,
+  netmaskOf,
+  toRequest,
+  validate,
+} from '../src/features/mode/model.ts';
 
 const fixed = (over: Partial<ApForm> = {}): ApForm => ({
   proto: 'static',
@@ -70,11 +79,27 @@ test('the form starts automatic, with the main router and its network size from 
   assert.equal(f.ipaddr, '');
   assert.equal(f.bridgeOffload, true);
   // without an address on the WAN port (or a strange prefix): /24, nothing filled in
-  assert.deepEqual(initialForm(null, false), { proto: 'dhcp', ipaddr: '', prefix: '24', gateway: '', dns: '', bridgeOffload: false });
+  assert.deepEqual(initialForm(null, false), {
+    proto: 'dhcp',
+    ipaddr: '',
+    prefix: '24',
+    gateway: '',
+    dns: '',
+    bridgeOffload: false,
+  });
   assert.equal(initialForm({ prefix: 31 }, false).prefix, '24');
 });
 
 test('where to open MilkFlint afterwards: its fixed address, or unknown when the main router picks', () => {
   assert.equal(apAddress(fixed({ ipaddr: ' 192.168.0.2 ' })), '192.168.0.2');
   assert.equal(apAddress(fixed({ proto: 'dhcp' })), undefined);
+});
+
+test('an address with its prefix, as the page shows it', () => {
+  assert.equal(addressText({ ipaddr: '192.168.0.2', prefix: 24 }), '192.168.0.2/24');
+  assert.equal(addressText({ ipaddr: '192.168.0.2', prefix: null }), '192.168.0.2');
+  assert.equal(addressText({ ipaddr: null, prefix: 24 }), undefined);
+  assert.equal(addressText(undefined), undefined);
+  assert.equal(modeName('ap'), 'access point');
+  assert.equal(modeName('router'), 'router');
 });

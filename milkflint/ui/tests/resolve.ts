@@ -2,7 +2,7 @@
 // any module in src/ the way Vite resolves it there, with the @/ alias
 // (tsconfig.app.json's paths) and without file extensions. Node's own
 // resolution needs neither, so it handles everything else.
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -11,8 +11,7 @@ const src = new URL('../src/', import.meta.url).href;
 // A file there: as named, or with .ts or /index.ts added
 function existing(url: string): string | undefined {
   for (const candidate of [url, `${url}.ts`, `${url}/index.ts`]) {
-    const path = fileURLToPath(candidate);
-    if (existsSync(path) && !path.endsWith('/')) return candidate;
+    if (statSync(fileURLToPath(candidate), { throwIfNoEntry: false })?.isFile() === true) return candidate;
   }
   return undefined;
 }

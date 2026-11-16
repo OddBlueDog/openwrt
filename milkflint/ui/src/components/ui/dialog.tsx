@@ -15,18 +15,18 @@ export function DialogContent({
 }: ComponentProps<typeof DialogPrimitive.Content> & { showClose?: boolean }): ReactElement {
   return (
     <DialogPrimitive.Portal>
-      <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/40 backdrop-blur-[2px]" />
+      <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-scrim data-[state=open]:animate-[mf-fade-in_var(--mf-duration-base)_var(--mf-ease-standard)]" />
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          'fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border bg-popover p-6 text-popover-foreground shadow-lg sm:max-w-md',
+          'fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl border bg-popover p-6 text-popover-foreground shadow-lg data-[state=open]:animate-[mf-pop-in_var(--mf-duration-base)_var(--mf-ease-enter)] sm:max-w-md',
           className,
         )}
         {...props}
       >
         {children}
         {showClose && (
-          <DialogPrimitive.Close className="absolute top-4 right-4 rounded-sm opacity-70 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
+          <DialogPrimitive.Close className="absolute top-3.5 right-3.5 flex size-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors duration-fast hover:bg-accent hover:text-foreground">
             <XIcon className="size-4" />
             <span className="sr-only">Close</span>
           </DialogPrimitive.Close>
@@ -51,12 +51,9 @@ export function DialogFooter({ className, ...props }: ComponentProps<'div'>): Re
 }
 
 export function DialogTitle({ className, ...props }: ComponentProps<typeof DialogPrimitive.Title>): ReactElement {
-  return <DialogPrimitive.Title className={cn('text-lg leading-none font-semibold', className)} {...props} />;
+  return <DialogPrimitive.Title className={cn('pr-8 text-lg font-semibold text-balance', className)} {...props} />;
 }
 
-export function DialogDescription({
-  className,
-  ...props
-}: ComponentProps<typeof DialogPrimitive.Description>): ReactElement {
+export function DialogDescription({ className, ...props }: ComponentProps<typeof DialogPrimitive.Description>): ReactElement {
   return <DialogPrimitive.Description className={cn('text-sm text-muted-foreground', className)} {...props} />;
 }

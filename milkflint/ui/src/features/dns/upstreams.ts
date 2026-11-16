@@ -5,7 +5,17 @@
 // cache).
 // No imports from the app, so the tests (ui/tests) load it as it is.
 
-import { type Block, blockLabels, type DnsServer, type Proto, protoLabels, protoOf, type ProviderId, providers, urlFor } from './providers.ts';
+import {
+  type Block,
+  blockLabels,
+  type DnsServer,
+  type Proto,
+  protoLabels,
+  protoOf,
+  type ProviderId,
+  providers,
+  urlFor,
+} from './providers.ts';
 
 /** A provider's server (by name), or a custom address. */
 export interface ServerPick {
@@ -71,7 +81,8 @@ export interface ProxyServers {
 export function proxyServers(main: ServerPick, proto: Proto, backup: ServerPick | undefined, use: BackupUse): ProxyServers {
   const mainUrl = encryptedUrl(main, proto);
   const backupUrl = backup === undefined ? undefined : encryptedUrl(backup, backupProto(main, proto));
-  const plain = (pick: ServerPick): readonly string[] => (pick.provider === 'custom' ? ['1.1.1.1', '9.9.9.9'] : (serverOf(pick)?.v4 ?? []));
+  const plain = (pick: ServerPick): readonly string[] =>
+    pick.provider === 'custom' ? ['1.1.1.1', '9.9.9.9'] : (serverOf(pick)?.v4 ?? []);
   const bootstrap = [...new Set([...plain(main), ...(backup === undefined ? [] : plain(backup))])].map((ip) => `${ip}:53`);
   if (mainUrl === undefined) return { upstream: [], fallback: [], bootstrap, mode: undefined };
   if (backupUrl === undefined || backupUrl === mainUrl) return { upstream: [mainUrl], fallback: [], bootstrap, mode: undefined };
@@ -166,7 +177,12 @@ export function suggestBackup(main: ServerPick): { provider: ProviderId; server:
 }
 
 /** What happens to a lookup, in a sentence: the DNS page's summary. */
-export function describe(mode: 'auto' | 'static' | 'encrypted', main: ServerPick, backup: ServerPick | undefined, pair: Pair): string {
+export function describe(
+  mode: 'auto' | 'static' | 'encrypted',
+  main: ServerPick,
+  backup: ServerPick | undefined,
+  pair: Pair,
+): string {
   if (mode === 'auto') return 'Lookups go to your internet provider’s DNS servers.';
   const how = mode === 'encrypted' ? 'encrypted' : 'unencrypted';
   const a = shortName(main);

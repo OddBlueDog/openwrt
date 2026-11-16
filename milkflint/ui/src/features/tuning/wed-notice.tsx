@@ -11,7 +11,15 @@ import { href } from '@/lib/router';
  * settings, with the way back. turningOff: the page's unsaved changes turn
  * WED off when they're saved.
  */
-export function WedNotice({ title, children, turningOff = false }: { title: string; children: ReactNode; turningOff?: boolean }): ReactElement {
+export function WedNotice({
+  title,
+  children,
+  turningOff = false,
+}: {
+  title: string;
+  children: ReactNode;
+  turningOff?: boolean;
+}): ReactElement {
   return (
     <Alert variant={turningOff ? 'warning' : 'info'}>
       <ZapIcon />
@@ -23,7 +31,7 @@ export function WedNotice({ title, children, turningOff = false }: { title: stri
             'What it had turned off comes back as it was. The Wi-Fi driver lets go of WED when the router next restarts.'
           ) : (
             <a href={href('tuning')} className="font-medium text-primary underline">
-              Performance Tuning
+              Performance tuning
             </a>
           )}
         </span>

@@ -44,7 +44,8 @@ export function toChanges(f: HttpsForm, c: HttpsConfig): Change[] {
   if (redirect !== c.redirect) values['redirect_https'] = redirect ? '1' : '0';
   const changes: Change[] = [];
   if (Object.keys(values).length > 0) changes.push({ op: 'set', config: 'uhttpd', section: 'main', values });
-  if (!f.https && c.listen.length > 0) changes.push({ op: 'unset', config: 'uhttpd', section: 'main', options: ['listen_https'] });
+  if (!f.https && c.listen.length > 0)
+    changes.push({ op: 'unset', config: 'uhttpd', section: 'main', options: ['listen_https'] });
   return changes;
 }
 
@@ -70,6 +71,7 @@ export function pageUrl(protocol: 'http' | 'https', host: string, listen: readon
  */
 export function moveTo(f: HttpsForm, c: HttpsConfig, page: { protocol: string; hostname: string }): string | undefined {
   if (page.protocol === 'https:' && !f.https) return pageUrl('http', page.hostname, c.listenHttp);
-  if (page.protocol === 'http:' && f.https && f.redirect) return pageUrl('https', page.hostname, c.listen.length > 0 ? c.listen : DEFAULT_LISTEN);
+  if (page.protocol === 'http:' && f.https && f.redirect)
+    return pageUrl('https', page.hostname, c.listen.length > 0 ? c.listen : DEFAULT_LISTEN);
   return undefined;
 }

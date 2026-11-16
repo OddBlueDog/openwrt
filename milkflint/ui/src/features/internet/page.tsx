@@ -1,13 +1,17 @@
-import { ArrowDownUpIcon, GlobeIcon } from 'lucide-react';
+// The Internet page: the connection as it is now first (online or not, the
+// address, how long, the DNS servers the provider gave), live from netifd
+// every 5 s, then how the router connects: the everyday settings, and the
+// provider-specific ones (client ID, VLAN) under More settings.
 import { type ReactElement, useCallback, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
+import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { SaveBar } from '@/components/save-bar';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
@@ -17,9 +21,12 @@ import { usePoll } from '@/hooks/use-poll';
 import { getInterfaces, ipv4 } from '@/lib/api/network';
 import { bool, getConfig, list, str } from '@/lib/api/uci';
 import { formatDuration } from '@/lib/format';
+import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { internetQueue } from '../sqm/model';
+import { explain } from '@/components/explain';
 import { type ClientIdMode, hexToText, textToHex } from './client-id';
+import { Answer, AnswerCell, Figure, GoLink } from '@/components/page-kit';
 import { clientIdForm, type InternetForm, sqmQueueTo, toChanges, validate, wanPort } from './model';
 
 async function loadInternet(): Promise<InternetForm> {
@@ -55,62 +62,91 @@ const PPP_ERRORS: Record<string, string> = {
   HANGUP: 'Your provider ended the connection.',
 };
 
-function StatusCard({ proto }: { proto: string }): ReactElement {
-  const { data } = usePoll(getInterfaces, 5000);
+const protoLabels: Record<string, string> = {
+  dhcp: 'Automatic (DHCP)',
+  pppoe: 'PPPoE',
+  static: 'Static IP',
+};
+
+/** A value in mono that wraps anywhere, for addresses in a sentence. */
+function Mono({ children }: { children: string }): ReactElement {
+  return <span className="font-mono text-xs break-all text-foreground">{children}</span>;
+}
+
+/** The connection now, live from the WAN port: online or not, its address, how long, its DNS servers. */
+function InternetAnswer({ proto }: { proto: string | undefined }): ReactElement {
+  const { data, error } = usePoll(getInterfaces, 5000);
   const wan = data?.find((i) => i.interface === 'wan');
   // pppd keeps looking for a server without reporting anything, and a stop
   // (USER_REQUEST) leaves its code behind: neither says what's wrong
   const code = wan?.up === true || proto !== 'pppoe' ? undefined : wan?.errors?.[0]?.code;
-  const reason = code !== undefined && code !== 'USER_REQUEST' ? (PPP_ERRORS[code] ?? `The connection failed (${code}).`) : undefined;
+  const reason =
+    code !== undefined && code !== 'USER_REQUEST' ? (PPP_ERRORS[code] ?? `The connection failed (${code}).`) : undefined;
   const trying = proto === 'pppoe' && wan?.up !== true && wan?.pending === true && reason === undefined;
   const wan6 = data?.find((i) => i.interface === 'wan6');
   const gateway = wan?.route?.find((r) => r.target === '0.0.0.0')?.nexthop;
   const v6 = wan6?.['ipv6-address']?.[0] ?? wan6?.['ipv6-prefix-assignment']?.[0];
+  const address = ipv4(wan);
+  const dns = wan?.['dns-server'] ?? [];
+  const up = wan?.up === true;
+  const reading = data === undefined;
 
-  const rows: [string, readonly string[] | string | undefined][] = [
-    ['IPv4 address', ipv4(wan)],
-    ['Gateway', gateway],
-    ['DNS servers', wan?.['dns-server']],
-    ['IPv6', v6 === undefined ? undefined : `${v6.address}/${String(v6.mask)}`],
-    ['Connected for', wan?.uptime === undefined ? undefined : formatDuration(wan.uptime)],
-  ];
+  const state = reading ? (
+    <span className="text-sm text-muted-foreground">{error === undefined ? 'Reading…' : 'Couldn’t read it'}</span>
+  ) : up ? (
+    <Badge variant="success">Online</Badge>
+  ) : trying ? (
+    <Badge variant="warning">Connecting…</Badge>
+  ) : (
+    <Badge variant="destructive">Not connected</Badge>
+  );
+  const stateText = reading
+    ? error === undefined
+      ? 'From the WAN port.'
+      : 'The router didn’t answer; it tries again in a few seconds.'
+    : up
+      ? `${proto === undefined ? 'Connected' : (protoLabels[proto] ?? proto)}, through the WAN port.`
+      : (reason ??
+        (trying
+          ? 'If it stays like this, check the WAN cable, and whether your provider needs a VLAN ID (More settings, below).'
+          : 'Check the WAN cable, and the connection settings below.'));
+
   return (
-    <Card>
-      <CardHeader className="items-center">
-        <div className="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-          <GlobeIcon className="size-4" />
-        </div>
-        <div className="flex flex-col gap-1">
-          <CardTitle className="text-base">Status</CardTitle>
-          <CardDescription>Live, from the WAN port</CardDescription>
-        </div>
-        <Badge variant={wan?.up === true ? 'success' : 'destructive'} className="ml-auto">
-          {wan?.up === true ? 'Connected' : 'Not connected'}
-        </Badge>
-      </CardHeader>
-      <CardContent className="divide-y">
-        {reason !== undefined && <p className="pb-3 text-sm text-destructive">{reason}</p>}
-        {trying && (
-          <p className="pb-3 text-sm text-muted-foreground">
-            Connecting… If it stays like this, check the WAN cable, and whether your provider needs a VLAN ID.
-          </p>
+    <Answer columns={4} label="The connection now">
+      <AnswerCell title="Connection" value={state}>
+        <span className={cn(reason !== undefined && 'text-foreground')}>{stateText}</span>
+      </AnswerCell>
+      <AnswerCell title="Address" value={<Figure>{address ?? '—'}</Figure>}>
+        {address === undefined ? (
+          'None from your provider yet.'
+        ) : (
+          <span className="flex flex-col gap-0.5">
+            <span>Gateway {gateway === undefined ? '—' : <Mono>{gateway}</Mono>}</span>
+            <span>IPv6 {v6 === undefined ? 'none' : <Mono>{`${v6.address}/${String(v6.mask)}`}</Mono>}</span>
+          </span>
         )}
-        {rows.map(([label, value]) => (
-          <div key={label} className="flex justify-between gap-4 py-2 text-sm">
-            <span className="shrink-0 text-muted-foreground">{label}</span>
-            <span className="min-w-0 text-right font-mono text-xs break-all">
-              {value === undefined || value.length === 0
-                ? '—'
-                : (typeof value === 'string' ? [value] : value).map((v) => (
-                    <span key={v} className="block">
-                      {v}
-                    </span>
-                  ))}
-            </span>
-          </div>
-        ))}
-      </CardContent>
-    </Card>
+      </AnswerCell>
+      <AnswerCell
+        title="Connected for"
+        value={<Figure>{up && wan.uptime !== undefined ? formatDuration(wan.uptime) : '—'}</Figure>}
+      >
+        {up ? 'Since the connection last came up.' : 'Not connected now.'}
+      </AnswerCell>
+      <AnswerCell
+        title="DNS servers"
+        value={<Figure>{dns.length === 0 ? '—' : `${String(dns.length)} ${dns.length === 1 ? 'server' : 'servers'}`}</Figure>}
+        action={<GoLink href={href('dns')}>DNS settings</GoLink>}
+      >
+        <span className="flex flex-col gap-0.5">
+          {dns.length > 0 && <Mono>{dns.join(', ')}</Mono>}
+          <span>
+            {proto === 'static'
+              ? 'Your provider’s, as set below.'
+              : 'Your provider’s. The router uses them unless the DNS page chooses others.'}
+          </span>
+        </span>
+      </AnswerCell>
+    </Answer>
   );
 }
 
@@ -149,27 +185,25 @@ export function InternetPage(): ReactElement {
       <PageHeader title="Internet" description="How the router connects to your internet provider." />
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
+        <InternetAnswer proto={data?.proto} />
         {error !== undefined && data === undefined ? (
           <LoadError error={error} retry={reload} />
         ) : loading || form === undefined ? (
           <FormSkeleton />
         ) : (
-          <div className="grid items-start gap-4 xl:grid-cols-[1fr_22rem]">
-            <Card>
-              <CardHeader className="items-center">
-                <div className="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                  <ArrowDownUpIcon className="size-4" />
-                </div>
-                <div className="flex flex-col gap-1">
-                  <CardTitle className="text-base">Connection</CardTitle>
-                  <CardDescription>Most fibre and cable connections use Automatic.</CardDescription>
-                </div>
-              </CardHeader>
-              <CardContent className="divide-y">
+          <Card>
+            <CardHeading title="Connection settings" description="Most fibre and cable connections use Automatic." />
+            <CardContent className="flex flex-col">
+              <div className="divide-y border-t">
                 <Field
                   id="proto"
                   label="Connection type"
-                  hint={queueTo === undefined ? undefined : `Smart Queue moves to ${queueTo} with it, where CAKE can read your traffic.`}
+                  {...explain(
+                    queueTo === undefined
+                      ? 'PPPoE when your provider gave you a username and password.'
+                      : `Smart Queue moves to ${queueTo} with it, where CAKE can read your traffic.`,
+                    ['network.wan.proto'],
+                  )}
                 >
                   <Select
                     value={form.proto}
@@ -192,7 +226,12 @@ export function InternetPage(): ReactElement {
                 </Field>
                 {form.proto === 'pppoe' && (
                   <>
-                    <Field id="username" label="Username" error={errors.username}>
+                    <Field
+                      id="username"
+                      label="Username"
+                      {...explain('From your provider, with the password.', ['network.wan.username', 'network.wan.password'])}
+                      error={errors.username}
+                    >
                       <Input
                         id="username"
                         autoComplete="off"
@@ -222,6 +261,13 @@ export function InternetPage(): ReactElement {
                       key={key}
                       id={key}
                       label={key === 'ipaddr' ? 'IP address' : key === 'netmask' ? 'Netmask' : 'Gateway'}
+                      {...(key === 'ipaddr'
+                        ? explain('The fixed address, netmask and gateway your provider gave you.', [
+                            'network.wan.ipaddr',
+                            'network.wan.netmask',
+                            'network.wan.gateway',
+                          ])
+                        : {})}
                       error={errors[key]}
                     >
                       <Input
@@ -235,22 +281,73 @@ export function InternetPage(): ReactElement {
                       />
                     </Field>
                   ))}
+                {form.proto === 'static' && (
+                  <Field
+                    id="staticDns"
+                    label="DNS servers"
+                    hint="Your provider’s."
+                    status={
+                      <>
+                        To use others, see{' '}
+                        <a href={href('dns')} className="font-medium text-foreground underline underline-offset-2">
+                          DNS
+                        </a>
+                        .
+                      </>
+                    }
+                    why={explain('', ['network.wan.dns', 'network.wan.peerdns']).why}
+                    error={errors.staticDns}
+                  >
+                    <Input
+                      id="staticDns"
+                      className="font-mono"
+                      placeholder="203.0.113.53, 203.0.113.54"
+                      value={form.staticDns}
+                      aria-invalid={errors.staticDns !== undefined}
+                      onChange={(e) => {
+                        set('staticDns', e.target.value);
+                      }}
+                    />
+                  </Field>
+                )}
+                <Field
+                  id="ipv6"
+                  label="IPv6"
+                  {...explain(
+                    'Gets IPv6 from your provider automatically when it offers it.',
+                    form.proto === 'pppoe' ? ['network.wan6.disabled', 'network.wan.ipv6'] : ['network.wan6.disabled'],
+                    <p>
+                      How your devices get IPv6 addresses is on the{' '}
+                      <a href={href('ipv6')} className="font-medium underline underline-offset-2">
+                        IPv6 page
+                      </a>
+                      .
+                    </p>,
+                  )}
+                >
+                  <Switch
+                    id="ipv6"
+                    checked={form.ipv6}
+                    onCheckedChange={(v) => {
+                      set('ipv6', v);
+                    }}
+                  />
+                </Field>
+                {/* every setting shown: the client ID and VLAN are rarely needed, but when they are, they're the ones to find */}
                 {form.proto === 'dhcp' && (
                   <Field
                     id="clientid"
-                    label="Client ID (option 61)"
-                    hint={
-                      <>
-                        Only if your provider asks for it, e.g. Sky: <span className="font-mono">username@skydsl|password</span>. Leave
-                        it empty otherwise.
-                      </>
-                    }
+                    label="Provider’s client ID (option 61)"
+                    {...explain(
+                      'Only if your provider asks for one, as Sky does; leave it empty otherwise. DHCP option 61: the router sends it when it asks your provider for an address. Sky’s looks like username@skydsl|password. Type it as text or as hex: OpenWrt keeps it as hex.',
+                      ['network.wan.clientid'],
+                    )}
                     error={errors.clientId}
                   >
                     <div className="flex gap-2">
                       <Input
                         id="clientid"
-                        className={cn(form.clientIdMode === 'hex' && 'font-mono')}
+                        className={cn('min-w-0', form.clientIdMode === 'hex' && 'font-mono')}
                         autoComplete="off"
                         spellCheck={false}
                         placeholder={form.clientIdMode === 'text' ? 'aabbcc123456@skydsl|aabbccdd' : '61:62:63'}
@@ -260,7 +357,11 @@ export function InternetPage(): ReactElement {
                           set('clientId', e.target.value);
                         }}
                       />
-                      <div role="group" aria-label="Client ID format" className="inline-flex shrink-0 gap-0.5 rounded-md border p-0.5">
+                      <div
+                        role="group"
+                        aria-label="Client ID format"
+                        className="inline-flex shrink-0 gap-0.5 rounded-md border p-0.5"
+                      >
                         {(['text', 'hex'] as const).map((mode) => (
                           <Button
                             key={mode}
@@ -270,7 +371,12 @@ export function InternetPage(): ReactElement {
                             className="h-7 px-2.5"
                             aria-pressed={form.clientIdMode === mode}
                             // hex that isn't printable can't be shown as text
-                            disabled={mode === 'text' && form.clientIdMode === 'hex' && form.clientId !== '' && hexToText(form.clientId) === undefined}
+                            disabled={
+                              mode === 'text' &&
+                              form.clientIdMode === 'hex' &&
+                              form.clientId !== '' &&
+                              hexToText(form.clientId) === undefined
+                            }
                             onClick={() => {
                               setClientIdMode(mode);
                             }}
@@ -285,12 +391,15 @@ export function InternetPage(): ReactElement {
                 <Field
                   id="vlan"
                   label="VLAN ID"
-                  hint="Only if your provider asks for one, e.g. 911 or 101. Leave it empty otherwise."
+                  {...explain(
+                    'Only if your provider asks for one, e.g. 911 or 101; leave it empty otherwise. The connection then runs on an 802.1q VLAN device on the WAN port, which wan (and wan6) use instead of the port itself.',
+                    ['network.wan.device', `network.${data?.vlanSection ?? 'wan_vlan'}.vid`],
+                  )}
                   error={errors.vlan}
                 >
                   <Input
                     id="vlan"
-                    className="max-w-32 font-mono"
+                    className="max-w-32 tabular"
                     inputMode="numeric"
                     placeholder="None"
                     value={form.vlan}
@@ -300,50 +409,9 @@ export function InternetPage(): ReactElement {
                     }}
                   />
                 </Field>
-                {form.proto === 'static' ? (
-                  <Field
-                    id="staticDns"
-                    label="DNS servers"
-                    hint={
-                      <>
-                        Your provider&apos;s. To use others, see <a href="#/dns" className="underline underline-offset-2">DNS</a>.
-                      </>
-                    }
-                    error={errors.staticDns}
-                  >
-                    <Input
-                      id="staticDns"
-                      className="font-mono"
-                      placeholder="203.0.113.53, 203.0.113.54"
-                      value={form.staticDns}
-                      aria-invalid={errors.staticDns !== undefined}
-                      onChange={(e) => {
-                        set('staticDns', e.target.value);
-                      }}
-                    />
-                  </Field>
-                ) : (
-                  <p className="py-3 text-sm text-muted-foreground">
-                    DNS servers come from your provider, unless you choose others on the{' '}
-                    <a href="#/dns" className="text-foreground underline underline-offset-2">
-                      DNS page
-                    </a>
-                    .
-                  </p>
-                )}
-                <Field id="ipv6" label="IPv6" hint="Gets IPv6 from your provider automatically when it offers it.">
-                  <Switch
-                    id="ipv6"
-                    checked={form.ipv6}
-                    onCheckedChange={(v) => {
-                      set('ipv6', v);
-                    }}
-                  />
-                </Field>
-              </CardContent>
-            </Card>
-            <StatusCard proto={data?.proto ?? form.proto} />
-          </div>
+              </div>
+            </CardContent>
+          </Card>
         )}
       </div>
       <SaveBar

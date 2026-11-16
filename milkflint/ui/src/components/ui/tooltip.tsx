@@ -18,7 +18,7 @@ export function TooltipContent({
         data-slot="tooltip-content"
         sideOffset={sideOffset}
         className={cn(
-          'z-50 max-w-xs rounded-md bg-foreground px-3 py-1.5 text-xs text-balance text-background shadow-md',
+          'z-50 max-w-xs rounded-md bg-foreground px-2.5 py-1.5 text-xs text-balance text-background shadow-md data-[state=delayed-open]:animate-[mf-fade-in_var(--mf-duration-fast)_var(--mf-ease-standard)]',
           className,
         )}
         {...props}

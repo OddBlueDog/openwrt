@@ -4,11 +4,14 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'data-statistics',
-  title: 'Data Statistics',
+  title: 'Data usage',
   description: 'How much each device downloads and uploads, and on what.',
   icon: ChartColumnIcon,
-  group: 'flow-control',
-  order: 15,
+  group: 'devices',
+  order: 20,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.DataStatisticsPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.DataStatisticsPage,
+  ),
 } satisfies Feature;

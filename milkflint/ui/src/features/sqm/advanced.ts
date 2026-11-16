@@ -14,6 +14,7 @@
 // The fq_codel-only options (limits, targets, ECN) don't apply to CAKE.
 import { bool, type Change, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { takesWhole, type Whole, wholeOf, wholeValue, words } from './gso';
+import { type MultiQueue, multiQueueOf, multiQueueValue, usesMultiQueue } from './multi-queue';
 
 export type Direction = 'down' | 'up';
 
@@ -40,7 +41,16 @@ const TAKES_VALUE = new Set(['rtt', 'memlimit', 'fwmark', 'mpu', 'overhead']);
 /** keywords sqm-scripts writes itself: not for Other options */
 const SQM_OWN = new Set(['bandwidth', 'unlimited']);
 
-export const RTT_PRESETS = ['datacentre', 'lan', 'metro', 'regional', 'internet', 'oceanic', 'satellite', 'interplanetary'] as const;
+export const RTT_PRESETS = [
+  'datacentre',
+  'lan',
+  'metro',
+  'regional',
+  'internet',
+  'oceanic',
+  'satellite',
+  'interplanetary',
+] as const;
 
 export interface DirectionForm {
   /** '': the script's (see scriptTins) */
@@ -72,6 +82,8 @@ export interface AdvancedForm {
   up: DirectionForm;
   /** whether the download's CAKE takes GRO packets whole (./gso.ts); manages its gso group */
   whole: Whole;
+  /** multi-queue CAKE for the download (./multi-queue.ts): sqm's use_mq and milkflint.cake.multi_queue */
+  multiQueue: MultiQueue;
   script: string;
   /** squash_dscp: the download's CAKE clears DSCP marks (sqm's default) */
   squashDscp: boolean;
@@ -102,6 +114,7 @@ export interface AdvancedData {
   milkflint: Section[];
   downloadKbit: number;
   uploadKbit: number;
+  /** use_mq as saved; the form's multiQueue gives the same at this speed until it's changed */
   useMq: boolean;
   /** Keep devices' priorities on downloads sets squash_dscp and squash_ingress */
   dscpRestore: boolean;
@@ -208,7 +221,15 @@ export function advancedData(queue: Section, milkflint: Section[]): AdvancedData
     form: {
       down: directionOf(iq),
       up: directionOf(str(queue, 'eqdisc_opts')),
-      whole: wholeOf(str(milkflint.find((s) => s['.name'] === 'gro'), 'whole'), iq, downloadKbit),
+      whole: wholeOf(
+        str(
+          milkflint.find((s) => s['.name'] === 'gro'),
+          'whole',
+        ),
+        iq,
+        downloadKbit,
+      ),
+      multiQueue: multiQueueOf(str(cake, 'multi_queue'), bool(queue, 'use_mq'), downloadKbit),
       script: str(queue, 'script') ?? '',
       squashDscp: str(queue, 'squash_dscp') !== '0',
       squashIngress: str(queue, 'squash_ingress') !== '0',
@@ -235,6 +256,11 @@ export function advancedData(queue: Section, milkflint: Section[]): AdvancedData
 
 export type AdvancedErrors = Partial<Record<string, string>>;
 
+/** Whether the download runs multi-queue CAKE with these settings. */
+export function downloadMq(f: AdvancedForm, data: AdvancedData): boolean {
+  return usesMultiQueue(data.downloadKbit, f.multiQueue);
+}
+
 const TIME = /^\d+(?:\.\d+)?(?:us|ms|s)$/;
 const SIZE = /^\d+(?:\.\d+)?(?:b|k|kb|kbit|m|mb|mbit|g|gb|gbit)?$/i;
 const MARK = /^(?:0x[0-9a-f]{1,8}|\d{1,10})$/i;
@@ -244,18 +270,22 @@ const int = (v: string, min: number, max: number): boolean => /^-?\d+$/.test(v) 
 export function validateAdvanced(f: AdvancedForm, data: AdvancedData): AdvancedErrors {
   const e: AdvancedErrors = {};
   // the kernel refuses it with multi-queue CAKE, and the download then goes unshaped
-  if (f.down.autorate && data.useMq) e['down.autorate'] = 'Not with multi-queue CAKE, which can’t: turn Multi-queue off on the page first.';
+  if (f.down.autorate && downloadMq(f, data))
+    e['down.autorate'] = 'Not with multi-queue CAKE, which can’t: turn Multi-queue off first.';
   for (const dir of ['down', 'up'] as const) {
     const d = f[dir];
-    if (d.rtt !== '' && !(RTT_PRESETS as readonly string[]).includes(d.rtt) && !TIME.test(d.rtt)) e[`${dir}.rtt`] = 'A time such as 50ms, 1s or 500us.';
+    if (d.rtt !== '' && !(RTT_PRESETS as readonly string[]).includes(d.rtt) && !TIME.test(d.rtt))
+      e[`${dir}.rtt`] = 'A time such as 50ms, 1s or 500us.';
     if (d.memlimit !== '' && !SIZE.test(d.memlimit)) e[`${dir}.memlimit`] = 'Bytes, or with a unit: 4mb, 512kb.';
     if (d.fwmark !== '' && !MARK.test(d.fwmark)) e[`${dir}.fwmark`] = 'A mask such as 0xff.';
     const extra = words(d.extra);
     const taken = extra.find((w) => groupOf(w) !== undefined || SQM_OWN.has(w));
     const last = extra.at(-1);
-    if (taken !== undefined) e[`${dir}.extra`] = SQM_OWN.has(taken) ? `sqm sets ${taken} itself.` : `${taken} has its own setting above.`;
+    if (taken !== undefined)
+      e[`${dir}.extra`] = SQM_OWN.has(taken) ? `sqm sets ${taken} itself.` : `${taken} has its own setting above.`;
     else if (last !== undefined && TAKES_VALUE.has(last)) e[`${dir}.extra`] = `${last} needs a value after it.`;
-    else if (extra.some((w) => !/^[\w.:-]+$/.test(w))) e[`${dir}.extra`] = 'CAKE keywords only: letters, digits, dots, colons and dashes.';
+    else if (extra.some((w) => !/^[\w.:-]+$/.test(w)))
+      e[`${dir}.extra`] = 'CAKE keywords only: letters, digits, dots, colons and dashes.';
   }
   if (!int(f.overhead, -64, 256)) e['overhead'] = 'Bytes, -64 to 256.';
   if (f.mpu !== '' && !int(f.mpu, 0, 256)) e['mpu'] = 'Bytes, 0 to 256.';
@@ -287,7 +317,8 @@ export function advancedChanges(f: AdvancedForm, data: AdvancedData): Change[] {
     if (f.squashDscp !== was.squashDscp) values['squash_dscp'] = f.squashDscp ? '1' : '0';
     if (f.squashIngress !== was.squashIngress) values['squash_ingress'] = f.squashIngress ? '1' : '0';
     // LuCI keeps these only in its advanced mode: without it, its next save drops them
-    if (('squash_dscp' in values || 'squash_ingress' in values) && str(data.queue, 'qdisc_advanced') !== '1') values['qdisc_advanced'] = '1';
+    if (('squash_dscp' in values || 'squash_ingress' in values) && str(data.queue, 'qdisc_advanced') !== '1')
+      values['qdisc_advanced'] = '1';
   }
   put('linklayer', f.linklayer, was.linklayer);
   put('overhead', f.overhead, was.overhead);
@@ -296,7 +327,10 @@ export function advancedChanges(f: AdvancedForm, data: AdvancedData): Change[] {
   put('tcMTU', f.mtu, was.mtu);
   put('tcTSIZE', f.tsize, was.tsize);
   // LuCI shows these only in its advanced link-layer mode
-  if (Object.keys(values).some((k) => ['tcMPU', 'linklayer_adaptation_mechanism', 'tcMTU', 'tcTSIZE'].includes(k))) values['linklayer_advanced'] = '1';
+  if (Object.keys(values).some((k) => ['tcMPU', 'linklayer_adaptation_mechanism', 'tcMTU', 'tcTSIZE'].includes(k)))
+    values['linklayer_advanced'] = '1';
+  // as the page wrote it: use_mq for what the choice gives at this speed, the choice itself in milkflint
+  if (f.multiQueue !== was.multiQueue) values['use_mq'] = downloadMq(f, data) ? '1' : '0';
   put('use_mq_egress', f.mqEgress, was.mqEgress);
   if (f.debug !== was.debug) values['debug_logging'] = f.debug ? '1' : '0';
   put('verbosity', f.verbosity, was.verbosity);
@@ -310,7 +344,8 @@ export function advancedChanges(f: AdvancedForm, data: AdvancedData): Change[] {
     if (opts !== '') {
       values[key] = opts;
       // LuCI shows these options only in its advanced mode
-      for (const mode of ['qdisc_advanced', 'qdisc_really_really_advanced']) if (str(data.queue, mode) !== '1') values[mode] = '1';
+      for (const mode of ['qdisc_advanced', 'qdisc_really_really_advanced'])
+        if (str(data.queue, mode) !== '1') values[mode] = '1';
     } else if (str(data.queue, key) !== undefined) {
       unset.push(key);
     }
@@ -320,6 +355,8 @@ export function advancedChanges(f: AdvancedForm, data: AdvancedData): Change[] {
   if (Object.keys(values).length > 0) changes.push({ op: 'set', config: 'sqm', section: data.section, values });
   if (unset.length > 0) changes.push({ op: 'unset', config: 'sqm', section: data.section, options: unset });
   if (f.whole !== was.whole) changes.push(...sectionChanges('milkflint', data.milkflint, 'gro', { whole: wholeValue(f.whole) }));
+  if (f.multiQueue !== was.multiQueue)
+    changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', { multi_queue: multiQueueValue(f.multiQueue) }));
   return changes;
 }
 
@@ -345,14 +382,29 @@ const or = (value: string, fallback: string): string => (value === '' ? fallback
 /** cakeArgs in two parts: what sqm-scripts puts first, then the direction's opts */
 export function cakeCommand(f: AdvancedForm, data: AdvancedData, dir: Direction): { sqm: string[]; opts: string[] } {
   const down = dir === 'down';
-  const mq = down ? data.useMq : f.mqEgress === '' ? data.useMq : f.mqEgress === '1';
+  const mq = down || f.mqEgress === '' ? downloadMq(f, data) : f.mqEgress === '1';
   const kbit = down ? data.downloadKbit : data.uploadKbit;
   const llam = f.llam === '' || f.llam === 'default' ? 'cake' : f.llam;
   const stab =
     llam === 'tc_stab' && f.linklayer !== 'none'
-      ? ['stab', 'mtu', or(f.mtu, '2047'), 'tsize', or(f.tsize, '512'), 'mpu', or(f.mpu, '0'), 'overhead', f.overhead, 'linklayer', f.linklayer]
+      ? [
+          'stab',
+          'mtu',
+          or(f.mtu, '2047'),
+          'tsize',
+          or(f.tsize, '512'),
+          'mpu',
+          or(f.mpu, '0'),
+          'overhead',
+          f.overhead,
+          'linklayer',
+          f.linklayer,
+        ]
       : [];
-  const lla = llam === 'cake' && f.linklayer !== 'none' ? [...(f.linklayer === 'atm' ? ['atm'] : []), 'overhead', f.overhead, 'mpu', or(f.mpu, '0')] : [];
+  const lla =
+    llam === 'cake' && f.linklayer !== 'none'
+      ? [...(f.linklayer === 'atm' ? ['atm'] : []), 'overhead', f.overhead, 'mpu', or(f.mpu, '0')]
+      : [];
   const script = ['diffserv3', 'nat'];
   if (f.script !== 'layer_cake.qos') script.push('besteffort');
   else if (down && f.squashIngress) script.push('besteffort');
@@ -364,7 +416,8 @@ export function cakeCommand(f: AdvancedForm, data: AdvancedData, dir: Direction)
 
 /** What CAKE does with these arguments: the last of each group, or CAKE's default */
 export function cakeEffect(args: readonly string[]): Record<Exclude<Group, 'memlimit' | 'fwmark' | 'ptm' | 'autorate'>, string> {
-  const last = (g: Group, fallback: string): string => args.findLast((w) => (GROUPS[g] as readonly string[]).includes(w)) ?? fallback;
+  const last = (g: Group, fallback: string): string =>
+    args.findLast((w) => (GROUPS[g] as readonly string[]).includes(w)) ?? fallback;
   const rttAt = args.findLastIndex((w) => (GROUPS.rtt as readonly string[]).includes(w));
   const rttWord = args[rttAt];
   return {

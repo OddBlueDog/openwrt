@@ -8,6 +8,9 @@ export const feature = {
   description: 'The system, kernel, Wi-Fi and debug logs.',
   icon: ScrollTextIcon,
   group: 'system',
-  order: 70,
-  page: lazyPage(() => import('./page'), (m) => m.LogsPage),
+  order: 60,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.LogsPage,
+  ),
 } satisfies Feature;

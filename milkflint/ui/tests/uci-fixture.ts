@@ -12,15 +12,22 @@ export function section(type: string, name: string, values: Record<string, strin
 export function presentOf(wanted: readonly Wanted[]): Record<string, Section[]> {
   const out: Record<string, Section[]> = {};
   for (const w of wanted) {
-    const values = Object.fromEntries(Object.entries(w.values).filter((e): e is [string, string | string[]] => e[1] !== undefined));
+    const values = Object.fromEntries(
+      Object.entries(w.values).filter((e): e is [string, string | string[]] => e[1] !== undefined),
+    );
     (out[w.config] ??= []).push(section(w.type, w.name, values));
   }
   return out;
 }
 
 /** `changes` applied to `before` as uci would: what a page's next load sees. */
-export function applied(before: Readonly<Record<string, readonly Section[]>>, changes: readonly Change[]): Record<string, Section[]> {
-  const out: Record<string, Section[]> = Object.fromEntries(Object.entries(before).map(([k, v]) => [k, v.map((s) => ({ ...s }))]));
+export function applied(
+  before: Readonly<Record<string, readonly Section[]>>,
+  changes: readonly Change[],
+): Record<string, Section[]> {
+  const out: Record<string, Section[]> = Object.fromEntries(
+    Object.entries(before).map(([k, v]) => [k, v.map((s) => ({ ...s }))]),
+  );
   for (const c of changes) {
     const sections = (out[c.config] ??= []);
     if (c.op === 'add') {

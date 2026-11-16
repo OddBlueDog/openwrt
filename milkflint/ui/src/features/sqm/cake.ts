@@ -50,7 +50,10 @@ export function summarize(d: Direction): DirectionSummary {
   const tins = d.queues.flatMap((q) => q.tins ?? []);
   const sum = (key: 'drops' | 'ecn_mark' | 'sparse_flows' | 'bulk_flows'): number => tins.reduce((n, t) => n + (t[key] ?? 0), 0);
   const busiest = d.queues.map((q) =>
-    (q.tins ?? []).reduce<CakeTin | undefined>((best, t) => ((t.sent_bytes ?? 0) > (best?.sent_bytes ?? -1) ? t : best), undefined),
+    (q.tins ?? []).reduce<CakeTin | undefined>(
+      (best, t) => ((t.sent_bytes ?? 0) > (best?.sent_bytes ?? -1) ? t : best),
+      undefined,
+    ),
   );
   const worst = (key: 'avg_delay_us' | 'peak_delay_us'): number | undefined =>
     busiest.reduce<number | undefined>((m, t) => (t?.[key] === undefined ? m : Math.max(m ?? 0, t[key])), undefined);

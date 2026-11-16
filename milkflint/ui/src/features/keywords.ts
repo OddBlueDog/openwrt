@@ -1,0 +1,40 @@
+// Other words people use for what each page does, so the menu's search finds
+// "QoS" on Smart Queue and "SSID" on Networks & radios. Lower case.
+import type { FeatureId } from './ids';
+
+export const keywords: Partial<Readonly<Record<FeatureId, string>>> = {
+  dashboard: 'overview status dashboard home',
+  internet: 'wan pppoe dhcp vlan provider isp connection',
+  dns: 'resolver nameserver doh dot quad9 cloudflare pi-hole encrypted',
+  mode: 'access point ap bridge router mode',
+  wifi: 'wireless ssid password network name channel band 2.4 5 ghz radio country transmit power dfs',
+  'wifi-guest': 'guest visitors smart home iot qr isolation',
+  'wifi-scan': 'scan neighbours nearby interference channel survey radar dfs weather',
+  'radar-scan': 'dfs radar weather channel check',
+  clients: 'devices dhcp leases reserve block rename hostname mac',
+  lan: 'lan dhcp range subnet router address ip',
+  ipv6: 'ipv6 slaac dhcpv6 prefix delegation ula',
+  'remote-access': 'wireguard vpn server phone laptop away from home',
+  'vpn-client': 'wireguard vpn client provider privacy',
+  'network-quality': 'ping jitter loss latency monitor quality',
+  'test-bench': 'test speed devices together benchmark',
+  'data-statistics': 'bandwidth usage traffic data totals nlbwmon',
+  sqm: 'qos sqm cake bufferbloat shaping latency speed limit',
+  tuning: 'performance rss rps gro offload steering irq cores',
+  firewall: 'rules ports zones nat block forward allow drop reject',
+  adguardhome: 'ads adblock filtering dns blocklist trackers',
+  banip: 'blocklist ban ip country asn threats',
+  upnp: 'upnp nat-pmp ports games console',
+  'port-forwards': 'port forward nat dmz open ports games console camera server',
+  'wifi-driver':
+    'airtime fairness twt target wake time spatial reuse bss colour mu edca multicast dscp qos map beamforming driver',
+  'system-overview': 'hardware model firmware memory storage about',
+  'admin-password': 'root login password ssh luci https certificate tls ssl router access',
+  https: 'certificate tls ssl https redirect',
+  upgrade: 'firmware update sysupgrade flash image',
+  time: 'hostname name time zone ntp clock',
+  schedules: 'cron reboot restart schedule wifi off',
+  themes: 'theme appearance look colour color colours colors palette dark light mode honey plain custom accent contrast',
+  logs: 'syslog kernel log crash kfence debug',
+  'backup-reset': 'backup restore factory reset restart reboot',
+};

@@ -7,8 +7,11 @@ export const feature = {
   title: 'Smart Queue',
   description: 'Keep latency low when the line is busy (SQM with CAKE).',
   icon: GaugeIcon,
-  group: 'flow-control',
-  order: 20,
+  group: 'speed',
+  order: 10,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.SqmPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.SqmPage,
+  ),
 } satisfies Feature;

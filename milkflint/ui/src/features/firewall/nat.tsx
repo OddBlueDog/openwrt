@@ -6,16 +6,27 @@ import { type ReactElement, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { Change } from '@/lib/api/uci';
 import { cn } from '@/lib/utils';
 import type { Counters, FirewallData } from './api';
-import { type Actions, hitsText, splitList } from './forms';
-import { editSection, enabledChange, type Family, isAddress, isIpv4, isShortName, type NatRule, portError, zoneTitle } from './model';
+import { type Actions, hitsText, rowClick, splitList } from './forms';
+import {
+  editSection,
+  enabledChange,
+  type Family,
+  isAddress,
+  isIpv4,
+  isShortName,
+  type NatRule,
+  portError,
+  zoneTitle,
+} from './model';
 import { DialogField, Segmented } from './parts';
-import { GroupHeader, HeadRow, HeaderButton, PowerButton, RowButton, Who } from './table-parts';
+import { UciPreview } from './sheet-parts';
+import { GroupHeader, HeadRow, HeaderButton, OffBadge, OnSwitch, RowButton, Who } from './table-parts';
+import { EditorSheet } from '@/components/editor-sheet';
 
 type NatTarget = 'MASQUERADE' | 'SNAT' | 'ACCEPT';
 type NatProto = 'all' | 'tcp udp' | 'tcp' | 'udp';
@@ -42,7 +53,20 @@ function natProto(p: readonly string[]): NatProto {
   return j === 'tcp' || j === 'udp' || j === 'tcp udp' ? j : 'all';
 }
 
-export function NatDialog({ nat, data, onClose, onSave }: { nat: NatRule | undefined; data: FirewallData; onClose: () => void; onSave: (c: Change[]) => void }): ReactElement {
+export function NatSheet({
+  nat,
+  data,
+  onClose,
+  onSave,
+  onDelete,
+}: {
+  nat: NatRule | undefined;
+  data: FirewallData;
+  onClose: () => void;
+  onSave: (c: Change[]) => void;
+  /** asks first, then deletes the rule (an existing one only) */
+  onDelete?: (() => void) | undefined;
+}): ReactElement {
   const [f, setF] = useState<NatForm>(() => ({
     name: nat?.name ?? '',
     target: natTarget(nat?.target ?? 'SNAT'),
@@ -78,195 +102,199 @@ export function NatDialog({ nat, data, onClose, onSave }: { nat: NatRule | undef
   if (snatPortProblem !== undefined) e.snatPort = snatPortProblem;
   const section = nat === undefined ? undefined : data.sections.find((s) => s['.name'] === nat.section);
 
-  const save = (): void => {
-    onSave(
-      editSection('nat', section, {
-        name: f.name.trim(),
-        target: f.target,
-        src: f.src,
-        src_ip: f.srcIp.trim() === '' ? undefined : f.srcIp.trim(),
-        dest_ip: f.destIp.trim() === '' ? undefined : f.destIp.trim(),
-        proto: f.proto,
-        dest_port: ports && f.destPort !== '' ? f.destPort : undefined,
-        snat_ip: f.target === 'SNAT' ? f.snatIp : undefined,
-        snat_port: f.target === 'SNAT' && ports && f.snatPort !== '' ? f.snatPort : undefined,
-        family: f.family === 'any' ? undefined : f.family,
-      }),
-    );
-  };
+  const changes = editSection('nat', section, {
+    name: f.name.trim(),
+    target: f.target,
+    src: f.src,
+    src_ip: f.srcIp.trim() === '' ? undefined : f.srcIp.trim(),
+    dest_ip: f.destIp.trim() === '' ? undefined : f.destIp.trim(),
+    proto: f.proto,
+    dest_port: ports && f.destPort !== '' ? f.destPort : undefined,
+    snat_ip: f.target === 'SNAT' ? f.snatIp : undefined,
+    snat_port: f.target === 'SNAT' && ports && f.snatPort !== '' ? f.snatPort : undefined,
+    family: f.family === 'any' ? undefined : f.family,
+  });
 
   return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
+    <EditorSheet
+      title={nat === undefined ? 'New NAT rule' : (nat.name ?? 'Edit NAT rule')}
+      description="Which address traffic leaves with. Rarely needed: zones that share the router’s address already do it for everything."
+      onClose={onClose}
+      status={
+        nat !== undefined &&
+        onDelete !== undefined && (
+          <Button variant="ghost" className="-ml-2 text-destructive hover:text-destructive" onClick={onDelete}>
+            <Trash2Icon /> Delete
+          </Button>
+        )
+      }
+      actions={
+        <>
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            disabled={Object.keys(e).length > 0 || changes.length === 0}
+            onClick={() => {
+              onSave(changes);
+            }}
+          >
+            Save NAT rule
+          </Button>
+        </>
+      }
     >
-      <DialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{nat === undefined ? 'New NAT rule' : 'Edit NAT rule'}</DialogTitle>
-          <DialogDescription>
-            Which address traffic leaves with. Rarely needed: zones that share the router’s address already do it for everything.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-4">
-          <DialogField id="nat-name" label="Name" error={f.name === '' ? undefined : e.name}>
+      <div className="flex flex-col gap-5 px-6 py-5">
+        <DialogField id="nat-name" label="Name" error={f.name === '' ? undefined : e.name}>
+          <Input
+            id="nat-name"
+            value={f.name}
+            onChange={(ev) => {
+              set('name', ev.target.value);
+            }}
+          />
+        </DialogField>
+        <div className="grid gap-1.5">
+          <span className="text-sm font-medium">Action</span>
+          <Segmented<NatTarget>
+            label="Action"
+            value={f.target}
+            onChange={(v) => {
+              set('target', v);
+            }}
+            options={[
+              { value: 'SNAT', label: 'Send from an address' },
+              { value: 'MASQUERADE', label: 'Share the router’s' },
+              { value: 'ACCEPT', label: 'No NAT' },
+            ]}
+          />
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <DialogField id="nat-zone" label="Leaving through">
+            <Select
+              value={f.src}
+              onValueChange={(v) => {
+                set('src', v);
+              }}
+            >
+              <SelectTrigger id="nat-zone">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {data.cfg.zones.map((z) => (
+                  <SelectItem key={z.name} value={z.name}>
+                    {zoneTitle(z.name, data.cfg)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </DialogField>
+          <DialogField id="nat-proto" label="Protocol">
+            <Select
+              value={f.proto}
+              onValueChange={(v) => {
+                set('proto', natProto(v.split(' ')));
+              }}
+            >
+              <SelectTrigger id="nat-proto">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">Everything</SelectItem>
+                <SelectItem value="tcp udp">TCP and UDP</SelectItem>
+                <SelectItem value="tcp">TCP</SelectItem>
+                <SelectItem value="udp">UDP</SelectItem>
+              </SelectContent>
+            </Select>
+          </DialogField>
+          <DialogField id="nat-src-ip" label="From address" hint="Or network. Empty: any." error={e.srcIp}>
             <Input
-              id="nat-name"
-              value={f.name}
+              id="nat-src-ip"
+              className="font-mono"
+              value={f.srcIp}
+              placeholder="Any"
               onChange={(ev) => {
-                set('name', ev.target.value);
+                set('srcIp', ev.target.value);
               }}
             />
           </DialogField>
-          <div className="grid gap-1.5">
-            <span className="text-sm font-medium">Action</span>
-            <Segmented<NatTarget>
-              label="Action"
-              value={f.target}
-              onChange={(v) => {
-                set('target', v);
+          <DialogField id="nat-dest-ip" label="To address" hint="Or network. Empty: any." error={e.destIp}>
+            <Input
+              id="nat-dest-ip"
+              className="font-mono"
+              value={f.destIp}
+              placeholder="Any"
+              onChange={(ev) => {
+                set('destIp', ev.target.value);
               }}
-              options={[
-                { value: 'SNAT', label: 'Send from an address' },
-                { value: 'MASQUERADE', label: 'Share the router’s' },
-                { value: 'ACCEPT', label: 'No NAT' },
-              ]}
             />
-          </div>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <DialogField id="nat-zone" label="Leaving through">
-              <Select
-                value={f.src}
-                onValueChange={(v) => {
-                  set('src', v);
-                }}
-              >
-                <SelectTrigger id="nat-zone">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {data.cfg.zones.map((z) => (
-                    <SelectItem key={z.name} value={z.name}>
-                      {zoneTitle(z.name, data.cfg)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </DialogField>
-            <DialogField id="nat-proto" label="Protocol">
-              <Select
-                value={f.proto}
-                onValueChange={(v) => {
-                  set('proto', natProto(v.split(' ')));
-                }}
-              >
-                <SelectTrigger id="nat-proto">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">Everything</SelectItem>
-                  <SelectItem value="tcp udp">TCP and UDP</SelectItem>
-                  <SelectItem value="tcp">TCP</SelectItem>
-                  <SelectItem value="udp">UDP</SelectItem>
-                </SelectContent>
-              </Select>
-            </DialogField>
-            <DialogField id="nat-src-ip" label="From address" hint="Or network. Empty: any." error={e.srcIp}>
+          </DialogField>
+          {ports && (
+            <DialogField id="nat-port" label="To port" hint="Empty: any." error={e.destPort}>
               <Input
-                id="nat-src-ip"
-                className="font-mono"
-                value={f.srcIp}
+                id="nat-port"
+                className="tabular"
+                value={f.destPort}
                 placeholder="Any"
                 onChange={(ev) => {
-                  set('srcIp', ev.target.value);
+                  set('destPort', ev.target.value.trim());
                 }}
               />
             </DialogField>
-            <DialogField id="nat-dest-ip" label="To address" hint="Or network. Empty: any." error={e.destIp}>
+          )}
+        </div>
+        {f.target === 'SNAT' && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <DialogField id="nat-snat-ip" label="Send from address" error={f.snatIp === '' ? undefined : e.snatIp}>
               <Input
-                id="nat-dest-ip"
+                id="nat-snat-ip"
                 className="font-mono"
-                value={f.destIp}
-                placeholder="Any"
+                value={f.snatIp}
                 onChange={(ev) => {
-                  set('destIp', ev.target.value);
+                  set('snatIp', ev.target.value.trim());
                 }}
               />
             </DialogField>
             {ports && (
-              <DialogField id="nat-port" label="To port" hint="Empty: any." error={e.destPort}>
+              <DialogField id="nat-snat-port" label="Send from port" hint="Empty: keep it." error={e.snatPort}>
                 <Input
-                  id="nat-port"
-                  className="font-mono"
-                  value={f.destPort}
-                  placeholder="Any"
+                  id="nat-snat-port"
+                  className="tabular"
+                  value={f.snatPort}
                   onChange={(ev) => {
-                    set('destPort', ev.target.value.trim());
+                    set('snatPort', ev.target.value.trim());
                   }}
                 />
               </DialogField>
             )}
           </div>
-          {f.target === 'SNAT' && (
-            <div className="grid gap-3 sm:grid-cols-2">
-              <DialogField id="nat-snat-ip" label="Send from address" error={f.snatIp === '' ? undefined : e.snatIp}>
-                <Input
-                  id="nat-snat-ip"
-                  className="font-mono"
-                  value={f.snatIp}
-                  onChange={(ev) => {
-                    set('snatIp', ev.target.value.trim());
-                  }}
-                />
-              </DialogField>
-              {ports && (
-                <DialogField id="nat-snat-port" label="Send from port" hint="Empty: keep it." error={e.snatPort}>
-                  <Input
-                    id="nat-snat-port"
-                    className="font-mono"
-                    value={f.snatPort}
-                    onChange={(ev) => {
-                      set('snatPort', ev.target.value.trim());
-                    }}
-                  />
-                </DialogField>
-              )}
-            </div>
-          )}
-          <div className="grid gap-1.5">
-            <span className="text-sm font-medium">IP version</span>
-            <Segmented<Family>
-              label="IP version"
-              value={f.family}
-              onChange={(v) => {
-                set('family', v);
-              }}
-              options={[
-                { value: 'ipv4', label: 'IPv4' },
-                { value: 'ipv6', label: 'IPv6' },
-                { value: 'any', label: 'Both' },
-              ]}
-            />
-          </div>
+        )}
+        <div className="grid gap-1.5">
+          <span className="text-sm font-medium">IP version</span>
+          <Segmented<Family>
+            label="IP version"
+            value={f.family}
+            onChange={(v) => {
+              set('family', v);
+            }}
+            options={[
+              { value: 'ipv4', label: 'IPv4' },
+              { value: 'ipv6', label: 'IPv6' },
+              { value: 'any', label: 'Both' },
+            ]}
+          />
         </div>
-        <DialogFooter>
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button disabled={Object.keys(e).length > 0} onClick={save}>
-            Save &amp; apply
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+      </div>
+      <div className="border-t px-6 py-5">
+        <UciPreview type="nat" original={section} changes={changes} />
+      </div>
+    </EditorSheet>
   );
 }
 
 const natLabels: Record<string, string> = { MASQUERADE: 'masquerade', SNAT: 'snat', ACCEPT: 'no nat' };
 
 const columns = [
-  { label: '#', className: 'w-12' },
   { label: 'Name' },
   { label: 'Leaves via' },
   { label: 'From' },
@@ -275,47 +303,39 @@ const columns = [
   { label: 'Action' },
   { label: 'Sent as' },
   { label: 'Hits', className: 'text-right' },
-  { label: 'Actions', className: 'w-28', hidden: true },
+  { label: 'On', className: 'w-14' },
+  { label: 'Edit', className: 'w-12', hidden: true },
 ] as const;
 
-function NatActions({ r, actions }: { r: NatRule; actions: Actions }): ReactElement {
-  const title = r.name ?? r.label;
+/** Where a NAT rule's traffic goes: addresses and the port in mono, "anywhere" in words. */
+function To({ r }: { r: NatRule }): ReactElement {
+  const port = r.destPort === undefined ? '' : `:${r.destPort}`;
+  if (r.destIp.length > 0) return <span className="font-mono">{`${r.destIp.join(' ')}${port}`}</span>;
   return (
-    <span className="flex items-center justify-end">
-      <PowerButton
-        on={r.enabled}
-        name={title}
-        disabled={actions.applying}
-        onToggle={() => {
-          actions.apply([enabledChange(r.section, !r.enabled)]);
-        }}
-      />
-      <RowButton
-        label={`Edit ${title}`}
-        icon={SquarePenIcon}
-        onClick={() => {
-          actions.editNat(r);
-        }}
-      />
-      <RowButton
-        label={`Delete ${title}`}
-        icon={Trash2Icon}
-        disabled={actions.applying}
-        onClick={() => {
-          actions.confirm({ title: `Delete ${title}?`, body: 'The NAT rule is gone for good; turning it off keeps it for later.', action: 'Delete', changes: [{ op: 'delete', config: 'firewall', section: r.section }] });
-        }}
-      />
-    </span>
+    <>
+      anywhere
+      {port !== '' && <span className="font-mono">{port}</span>}
+    </>
   );
 }
 
-const to = (r: NatRule): string => `${r.destIp.length === 0 ? 'anywhere' : r.destIp.join(' ')}${r.destPort === undefined ? '' : `:${r.destPort}`}`;
-const sentAs = (r: NatRule): string =>
-  r.target === 'SNAT' ? `${r.snatIp ?? '?'}${r.snatPort === undefined ? '' : `:${r.snatPort}`}` : r.target === 'MASQUERADE' ? 'the router’s address' : 'its own address';
+/** The address a NAT rule sends traffic from: in mono when the rule names one. */
+function SentAs({ r }: { r: NatRule }): ReactElement {
+  if (r.target === 'SNAT')
+    return <span className="font-mono">{`${r.snatIp ?? '?'}${r.snatPort === undefined ? '' : `:${r.snatPort}`}`}</span>;
+  return <>{r.target === 'MASQUERADE' ? 'the router’s address' : 'its own address'}</>;
+}
 
-export function NatTable({ data, counters, actions }: { data: FirewallData; counters: Counters | undefined; actions: Actions }): ReactElement {
+export function NatTable({
+  data,
+  counters,
+  actions,
+}: {
+  data: FirewallData;
+  counters: Counters | undefined;
+  actions: Actions;
+}): ReactElement {
   const nats = data.cfg.nats;
-  const number = new Map(nats.map((r, i) => [r.section, i + 1]));
   const masq = data.cfg.zones.filter((z) => z.masq).map((z) => z.name);
   const header = (colSpan?: number): ReactElement => (
     <GroupHeader
@@ -333,6 +353,25 @@ export function NatTable({ data, counters, actions }: { data: FirewallData; coun
           <PlusIcon /> Add NAT rule
         </HeaderButton>
       }
+    />
+  );
+  const toggle = (r: NatRule): ReactElement => (
+    <OnSwitch
+      on={r.enabled}
+      name={r.name ?? r.label}
+      disabled={actions.applying}
+      onToggle={() => {
+        actions.apply([enabledChange(r.section, !r.enabled)]);
+      }}
+    />
+  );
+  const edit = (r: NatRule): ReactElement => (
+    <RowButton
+      label={`Edit ${r.name ?? r.label}`}
+      icon={SquarePenIcon}
+      onClick={() => {
+        actions.editNat(r);
+      }}
     />
   );
   const empty = `None: ${masq.length === 0 ? 'no zone shares the router’s address' : `${masq.join(', ')} share${masq.length === 1 ? 's' : ''} the router’s address (masquerading)`}, which covers ordinary use.`;
@@ -353,29 +392,44 @@ export function NatTable({ data, counters, actions }: { data: FirewallData; coun
               </tr>
             )}
             {nats.map((r) => (
-              <tr key={r.section} className={cn('border-b last:border-b-0 hover:bg-accent/30', !r.enabled && 'text-muted-foreground [&_td:not(:last-child)]:opacity-60')}>
-                <td className="px-3 py-1.5 text-xs text-muted-foreground tabular">{number.get(r.section)}</td>
-                <td className="max-w-48 truncate px-3 py-1.5 font-medium">{r.name ?? r.label}</td>
+              <tr
+                key={r.section}
+                onClick={rowClick(() => {
+                  actions.editNat(r);
+                })}
+                className={cn('cursor-pointer border-b last:border-b-0 hover:bg-muted/60', !r.enabled && 'text-muted-foreground')}
+              >
+                <td className="max-w-48 px-3 py-1.5">
+                  <span className="flex items-center gap-2">
+                    <span className={cn('truncate font-medium', r.enabled && 'text-foreground')}>{r.name ?? r.label}</span>
+                    {!r.enabled && <OffBadge />}
+                  </span>
+                </td>
                 <td className="px-3 py-1.5 font-mono text-xs">{r.src ?? '—'}</td>
                 <td className="px-3 py-1.5">
                   {r.srcIp.length === 0 ? (
                     <span className="text-muted-foreground">anyone</span>
                   ) : (
-                    <Who icon={MonitorIcon}>{r.srcIp.map((ip) => data.names.byIp.get(ip) ?? ip).join(' ')}</Who>
+                    <Who icon={MonitorIcon} mono={r.srcIp.some((ip) => !data.names.byIp.has(ip))}>
+                      {r.srcIp.map((ip) => data.names.byIp.get(ip) ?? ip).join(' ')}
+                    </Who>
                   )}
                 </td>
-                <td className="px-3 py-1.5 font-mono text-xs">{to(r)}</td>
-                <td className="px-3 py-1.5 font-mono text-xs">{r.proto.includes('all') ? 'any' : r.proto.join('/')}</td>
+                <td className="px-3 py-1.5 text-xs">
+                  <To r={r} />
+                </td>
+                <td className="px-3 py-1.5 text-xs">{r.proto.includes('all') ? 'any' : r.proto.join('/')}</td>
                 <td className="px-3 py-1.5">
-                  <Badge variant="secondary" className="font-mono font-normal">
+                  <Badge variant="secondary" className="font-normal">
                     {natLabels[r.target] ?? r.target.toLowerCase()}
                   </Badge>
                 </td>
-                <td className="px-3 py-1.5 font-mono text-xs">{sentAs(r)}</td>
-                <td className="px-3 py-1.5 text-right text-xs tabular">{hitsText(counters?.nat.get(r.label))}</td>
-                <td className="px-2 py-0.5">
-                  <NatActions r={r} actions={actions} />
+                <td className="px-3 py-1.5 text-xs">
+                  <SentAs r={r} />
                 </td>
+                <td className="px-3 py-1.5 text-right text-xs tabular">{hitsText(counters?.nat.get(r.label))}</td>
+                <td className="px-3 py-1.5">{toggle(r)}</td>
+                <td className="px-2 py-0.5 text-right">{edit(r)}</td>
               </tr>
             ))}
           </tbody>
@@ -386,17 +440,27 @@ export function NatTable({ data, counters, actions }: { data: FirewallData; coun
         {nats.length === 0 && <p className="px-4 py-3 text-sm text-muted-foreground">{empty}</p>}
         <ul className="divide-y">
           {nats.map((r) => (
-            <li key={r.section} className={cn('flex flex-col gap-1 px-4 py-3', !r.enabled && 'text-muted-foreground')}>
-              <span className="flex items-center justify-between gap-2 text-sm font-medium">
-                {r.name ?? r.label}
-                <Badge variant="secondary" className="font-mono font-normal">
+            <li key={r.section} className="flex flex-col gap-1.5 px-4 py-3">
+              <span className="flex items-center justify-between gap-2 text-sm">
+                <span className="flex min-w-0 items-center gap-2">
+                  <span className="truncate font-medium">{r.name ?? r.label}</span>
+                  {!r.enabled && <OffBadge />}
+                </span>
+                <Badge variant="secondary" className="font-normal">
                   {natLabels[r.target] ?? r.target.toLowerCase()}
                 </Badge>
               </span>
-              <span className="font-mono text-xs text-muted-foreground">
-                {r.srcIp.length === 0 ? 'anyone' : r.srcIp.join(' ')} → {to(r)} via {zoneTitle(r.src ?? '', data.cfg)}, sent as {sentAs(r)}
+              <span className="text-xs break-words text-muted-foreground">
+                {r.srcIp.length === 0 ? 'anyone' : <span className="font-mono">{r.srcIp.join(' ')}</span>} → <To r={r} /> via{' '}
+                {zoneTitle(r.src ?? '', data.cfg)}, sent as <SentAs r={r} />
               </span>
-              <NatActions r={r} actions={actions} />
+              <span className="flex items-center justify-between gap-2">
+                <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                  {toggle(r)}
+                  {r.enabled ? 'On' : 'Off'}
+                </span>
+                {edit(r)}
+              </span>
             </li>
           ))}
         </ul>

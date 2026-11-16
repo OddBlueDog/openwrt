@@ -174,8 +174,33 @@ const RULE_OPTIONS = [
   'stop_time',
   'weekdays',
 ];
-const REDIRECT_OPTIONS = ['name', 'enabled', 'target', 'src', 'dest', 'src_ip', 'src_dport', 'dest_ip', 'dest_port', 'proto', 'reflection', 'family'];
-const NAT_OPTIONS = ['name', 'enabled', 'target', 'src', 'src_ip', 'dest_ip', 'dest_port', 'proto', 'snat_ip', 'snat_port', 'family'];
+const REDIRECT_OPTIONS = [
+  'name',
+  'enabled',
+  'target',
+  'src',
+  'dest',
+  'src_ip',
+  'src_dport',
+  'dest_ip',
+  'dest_port',
+  'proto',
+  'reflection',
+  'family',
+];
+const NAT_OPTIONS = [
+  'name',
+  'enabled',
+  'target',
+  'src',
+  'src_ip',
+  'dest_ip',
+  'dest_port',
+  'proto',
+  'snat_ip',
+  'snat_port',
+  'family',
+];
 
 function extraOptions(s: Section, known: readonly string[]): string[] {
   return Object.keys(s).filter((k) => !k.startsWith('.') && !known.includes(k));
@@ -376,8 +401,10 @@ export const builtInRules: Record<string, string> = {
   'Allow-IGMP': 'Lets the router join multicast streams on the internet side, which some providers use for TV.',
   'Allow-DHCPv6': 'Lets your provider give the router its IPv6 address and your network’s IPv6 prefix (DHCPv6).',
   'Allow-MLD': 'IPv6 multicast listening on the internet side (MLD), from the provider’s link only.',
-  'Allow-ICMPv6-Input': 'The control messages IPv6 needs to work (neighbour discovery, “packet too big”, errors), rate-limited. Pings only with echo-request listed: MilkFlint takes it out.',
-  'Allow-ICMPv6-Forward': 'The same IPv6 control messages on to your devices, rate-limited. Pings only with echo-request listed: MilkFlint takes it out.',
+  'Allow-ICMPv6-Input':
+    'The control messages IPv6 needs to work (neighbour discovery, “packet too big”, errors), rate-limited. Pings only with echo-request listed: MilkFlint takes it out.',
+  'Allow-ICMPv6-Forward':
+    'The same IPv6 control messages on to your devices, rate-limited. Pings only with echo-request listed: MilkFlint takes it out.',
   'Allow-IPSec-ESP': 'Lets IPsec VPN traffic from the internet reach a VPN server on your home network.',
   'Allow-ISAKMP': 'Lets IPsec VPNs from the internet set up their connection to your home network (UDP 500).',
 };
@@ -389,7 +416,9 @@ export function isBuiltIn(r: Rule): boolean {
 /** Sections another MilkFlint page made and keeps up. */
 export const managedBy: Record<string, { page: FeatureId; title: string }> = {
   // every guest network's zone, forwarding and rules
-  ...Object.fromEntries(GUEST_IDS.flatMap(guestFirewallSections).map((section) => [section, { page: 'wifi-guest', title: 'Guest Wi-Fi' }])),
+  ...Object.fromEntries(
+    GUEST_IDS.flatMap(guestFirewallSections).map((section) => [section, { page: 'wifi-guest', title: 'Guest Wi-Fi' }]),
+  ),
   // the DNS page's intercept, one per zone
   ...Object.fromEntries(INTERCEPT_SECTIONS.map((section) => [section, { page: 'dns', title: 'DNS' }])),
   // the VPN pages' zones, open port, forwardings, marks and kill switch
@@ -424,7 +453,16 @@ export function ruleVerb(target: string): { verb: string; tone: 'allow' | 'block
   }
 }
 
-const protoNames: Record<string, string> = { tcp: 'TCP', udp: 'UDP', icmp: 'ICMP', icmpv6: 'ICMPv6', esp: 'ESP', ah: 'AH', gre: 'GRE', igmp: 'IGMP' };
+const protoNames: Record<string, string> = {
+  tcp: 'TCP',
+  udp: 'UDP',
+  icmp: 'ICMP',
+  icmpv6: 'ICMPv6',
+  esp: 'ESP',
+  ah: 'AH',
+  gre: 'GRE',
+  igmp: 'IGMP',
+};
 
 export function protoText(proto: readonly string[]): string {
   if (proto.includes('all')) return 'all traffic';
@@ -598,7 +636,9 @@ export function synRateValues(text: string): Values {
 
 /** Enabled is fw4's default: unset rather than "1", as LuCI does. */
 export function enabledChange(section: string, on: boolean): Change {
-  return on ? { op: 'unset', config: 'firewall', section, options: ['enabled'] } : { op: 'set', config: 'firewall', section, values: { enabled: '0' } };
+  return on
+    ? { op: 'unset', config: 'firewall', section, options: ['enabled'] }
+    : { op: 'set', config: 'firewall', section, values: { enabled: '0' } };
 }
 
 /** What still names a zone, which fw4 skips once the zone is gone (the user is told before deleting). */
@@ -687,8 +727,15 @@ export function isLocalName(name: string): boolean {
  */
 export function logPrefixError(log: string, name: string): string | undefined {
   const v = log.trim();
-  const prefix = ['1', 'on', 'true', 'yes'].includes(v) ? `${name.trim()}: ` : ['', '0', 'off', 'false', 'no'].includes(v) ? '' : v;
-  if (prefix.includes('$')) return prefix === v ? 'No “$”: nftables can’t log with one.' : 'The name has a “$”, which nftables can’t log with: type a prefix instead.';
+  const prefix = ['1', 'on', 'true', 'yes'].includes(v)
+    ? `${name.trim()}: `
+    : ['', '0', 'off', 'false', 'no'].includes(v)
+      ? ''
+      : v;
+  if (prefix.includes('$'))
+    return prefix === v
+      ? 'No “$”: nftables can’t log with one.'
+      : 'The name has a “$”, which nftables can’t log with: type a prefix instead.';
   if (/\p{Cc}/u.test(prefix) || bytes(prefix) > 127) return 'Up to 127 characters (accents and symbols count as two or more).';
   return undefined;
 }

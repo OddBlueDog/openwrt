@@ -1,6 +1,6 @@
 // Small pieces the Firewall page's tabs and dialogs share.
-import type { LucideIcon } from 'lucide-react';
-import { type ReactElement, type ReactNode, useId } from 'react';
+import { ChevronDownIcon, type LucideIcon } from 'lucide-react';
+import { type ReactElement, type ReactNode, useId, useState } from 'react';
 import { SearchSelect } from '@/components/search-select';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -11,8 +11,9 @@ import { cn } from '@/lib/utils';
 import type { Device } from './api';
 import { deviceLabel, type ScheduleForm, scheduleError } from './forms';
 import { WEEKDAYS } from './model';
+import { ChoiceCards } from '@/components/page-kit';
 
-/** Cards to pick one of, each with a line on what it means (a radio group). */
+/** Cards to pick one of, each with a line on what it means: the shared ChoiceCards. */
 export function Choice<T extends string>({
   label,
   value,
@@ -26,103 +27,92 @@ export function Choice<T extends string>({
   onChange: (value: T) => void;
   columns?: 1 | 2 | 3;
 }): ReactElement {
+  return (
+    <ChoiceCards
+      label={label}
+      value={value}
+      onChange={onChange}
+      columns={columns}
+      options={options.map((o) => ({
+        value: o.value,
+        label: o.label,
+        ...(o.hint !== undefined ? { hint: o.hint } : {}),
+        ...(o.icon !== undefined ? { icon: o.icon } : {}),
+        ...(o.tone !== undefined ? { tone: o.tone === 'allow' ? ('success' as const) : ('destructive' as const) } : {}),
+      }))}
+    />
+  );
+}
+
+/** The shared segmented control (components/ui/segmented.tsx). */
+export { Segmented } from '@/components/ui/segmented';
+
+/** "Why?" after a one-line hint, and the longer explanation it opens (the mechanism, its cost, the UCI option). */
+function useWhy(why: ReactNode | undefined): { button: ReactNode; panel: ReactNode } {
+  const [open, setOpen] = useState(false);
   const id = useId();
-  return (
-    <div role="radiogroup" aria-label={label} className={cn('grid gap-2', columns === 2 && 'sm:grid-cols-2', columns === 3 && 'sm:grid-cols-3')}>
-      {options.map((o) => {
-        const selected = o.value === value;
-        const Icon = o.icon;
-        return (
-          <button
-            key={o.value}
-            type="button"
-            role="radio"
-            aria-checked={selected}
-            aria-labelledby={`${id}-${o.value}`}
-            aria-describedby={o.hint === undefined ? undefined : `${id}-${o.value}-hint`}
-            onClick={() => {
-              onChange(o.value);
-            }}
-            className={cn(
-              'flex flex-col gap-1 rounded-lg border p-3 text-left transition-colors hover:bg-accent/50',
-              selected && 'border-primary bg-primary/5 ring-1 ring-primary',
-            )}
-          >
-            <span id={`${id}-${o.value}`} className="flex items-center gap-2 text-sm font-medium">
-              {Icon !== undefined && (
-                <Icon className={cn('size-4', o.tone === 'allow' ? 'text-success' : o.tone === 'block' ? 'text-destructive' : 'text-muted-foreground')} />
-              )}
-              {o.label}
-            </span>
-            {o.hint !== undefined && (
-              <span id={`${id}-${o.value}-hint`} className="text-xs text-muted-foreground">
-                {o.hint}
-              </span>
-            )}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-/** A small segmented control, for short choices. */
-export function Segmented<T extends string>({
-  label,
-  value,
-  options,
-  onChange,
-}: {
-  label: string;
-  value: T;
-  options: readonly { value: T; label: string }[];
-  onChange: (value: T) => void;
-}): ReactElement {
-  return (
-    <div role="radiogroup" aria-label={label} className="flex w-fit flex-wrap rounded-md border bg-muted/50 p-0.5 text-xs">
-      {options.map((o) => (
+  if (why === undefined) return { button: null, panel: null };
+  return {
+    button: (
+      <>
+        {' '}
         <button
-          key={o.value}
           type="button"
-          role="radio"
-          aria-checked={value === o.value}
+          aria-expanded={open}
+          aria-controls={id}
           onClick={() => {
-            onChange(o.value);
+            setOpen((o) => !o);
           }}
-          className={cn('rounded-sm px-2.5 py-1 text-muted-foreground', value === o.value && 'bg-card text-foreground shadow-xs')}
+          className="inline-flex cursor-pointer items-center gap-0.5 rounded-sm font-medium link"
         >
-          {o.label}
+          Why?
+          <ChevronDownIcon className={cn('size-3 transition-transform duration-fast', open && 'rotate-180')} />
         </button>
-      ))}
-    </div>
-  );
+      </>
+    ),
+    panel: (
+      <div id={id} hidden={!open} className="max-w-prose rounded-md bg-muted px-3 py-2 text-xs text-foreground">
+        {why}
+      </div>
+    ),
+  };
 }
 
-/** A labelled field in a dialog: label, control, then a hint or the error. */
+/** A labelled field in a dialog or sheet: label, control, then a one-line hint (with an optional "Why?") or the error. */
 export function DialogField({
   id,
   label,
   hint,
+  why,
   error,
   children,
 }: {
   id: string;
   label: string;
   hint?: ReactNode;
+  /** the longer explanation, behind "Why?" after the hint */
+  why?: ReactNode;
   error?: string | undefined;
   children: ReactNode;
 }): ReactElement {
+  const more = useWhy(why);
   return (
     <div className="grid content-start gap-1.5">
       <Label htmlFor={id}>{label}</Label>
       {children}
       {error !== undefined ? (
-        <p id={`${id}-error`} className="text-xs text-destructive">
+        <p id={`${id}-error`} className="text-xs font-medium text-destructive">
           {error}
         </p>
       ) : (
-        hint !== undefined && <p className="text-xs text-muted-foreground">{hint}</p>
+        hint !== undefined && (
+          <p className="text-xs text-muted-foreground">
+            {hint}
+            {more.button}
+          </p>
+        )
       )}
+      {more.panel}
     </div>
   );
 }
@@ -155,7 +145,15 @@ export function DeviceSelect({
 }
 
 /** From, to and days: what fw4's start_time, stop_time and weekdays hold. */
-export function ScheduleFields({ id, value, onChange }: { id: string; value: ScheduleForm; onChange: (s: ScheduleForm) => void }): ReactElement {
+export function ScheduleFields({
+  id,
+  value,
+  onChange,
+}: {
+  id: string;
+  value: ScheduleForm;
+  onChange: (s: ScheduleForm) => void;
+}): ReactElement {
   const error = scheduleError(value);
   return (
     <div className="grid gap-3 rounded-lg border border-dashed p-3">
@@ -165,7 +163,7 @@ export function ScheduleFields({ id, value, onChange }: { id: string; value: Sch
           <Input
             id={`${id}-start`}
             type="time"
-            className="w-32 font-mono"
+            className="w-32 tabular"
             value={value.start}
             onChange={(e) => {
               onChange({ ...value, start: e.target.value });
@@ -177,7 +175,7 @@ export function ScheduleFields({ id, value, onChange }: { id: string; value: Sch
           <Input
             id={`${id}-stop`}
             type="time"
-            className="w-32 font-mono"
+            className="w-32 tabular"
             value={value.stop}
             onChange={(e) => {
               onChange({ ...value, stop: e.target.value });
@@ -194,7 +192,10 @@ export function ScheduleFields({ id, value, onChange }: { id: string; value: Sch
               type="button"
               aria-pressed={on}
               onClick={() => {
-                onChange({ ...value, days: on ? value.days.filter((x) => x !== d) : WEEKDAYS.filter((w) => w === d || value.days.includes(w)) });
+                onChange({
+                  ...value,
+                  days: on ? value.days.filter((x) => x !== d) : WEEKDAYS.filter((w) => w === d || value.days.includes(w)),
+                });
               }}
               className={cn(
                 'h-8 w-11 rounded-md border text-xs transition-colors',
@@ -207,7 +208,8 @@ export function ScheduleFields({ id, value, onChange }: { id: string; value: Sch
         })}
       </div>
       <p className={cn('text-xs', error === undefined ? 'text-muted-foreground' : 'text-destructive')}>
-        {error ?? 'By the router’s clock. Over midnight (22:00 until 07:00) it covers both ends of each day ticked: its early morning and its evening.'}
+        {error ??
+          'By the router’s clock. Over midnight (22:00 until 07:00) it covers both ends of each day ticked: its early morning and its evening.'}
       </p>
     </div>
   );
@@ -256,13 +258,14 @@ export function ConfirmDialog({
   );
 }
 
-/** A switch with its label and an optional line under it. */
+/** A switch with its label and an optional line under it (with an optional "Why?"). */
 export function SwitchRow({
   id,
   checked,
   onChange,
   title,
   hint,
+  why,
   boxed = false,
   disabled = false,
 }: {
@@ -271,17 +274,26 @@ export function SwitchRow({
   onChange: (on: boolean) => void;
   title: ReactNode;
   hint?: ReactNode;
+  why?: ReactNode;
   boxed?: boolean;
   disabled?: boolean;
 }): ReactElement {
+  const more = useWhy(why);
   return (
-    <div className={cn('flex items-start gap-3 text-sm', boxed && 'rounded-lg border border-dashed p-3', disabled && 'opacity-60')}>
+    <div className={cn('flex items-start gap-3 text-sm', boxed && 'rounded-lg border border-dashed p-3')}>
       <Switch id={id} className="mt-0.5" checked={checked} disabled={disabled} onCheckedChange={onChange} />
-      <label htmlFor={id} className="flex flex-col gap-0.5">
-        <span className="font-medium">{title}</span>
-        {hint !== undefined && <span className="text-xs text-muted-foreground">{hint}</span>}
-      </label>
+      <div className="flex min-w-0 flex-col gap-1">
+        <label htmlFor={id} className={cn('flex flex-col gap-0.5', disabled && 'text-muted-foreground')}>
+          <span className="font-medium">{title}</span>
+        </label>
+        {hint !== undefined && (
+          <p className="text-xs text-muted-foreground">
+            {hint}
+            {more.button}
+          </p>
+        )}
+        {more.panel}
+      </div>
     </div>
   );
 }
-

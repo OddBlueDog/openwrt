@@ -3,9 +3,9 @@
 // on the same channel line up and the ones on this router's channels fall in
 // its shaded wedge. Closer to the middle is louder here. Each network is a
 // dot on its main channel and an arc over every channel its air covers.
-// Rust is only ever this router's own (its channels, and the networks on
-// them); everything else, the sweep included, stays in ink. It moves only
-// while a scan runs.
+// The accent colour is only ever this router's own (its channels, and the
+// networks on them); everything else, the sweep included, stays in the text
+// colour. It moves only while a scan runs.
 import { type ReactElement, useId } from 'react';
 import { Logo } from '@/components/layout/sidebar';
 import { cn } from '@/lib/utils';
@@ -117,8 +117,12 @@ function SectorFrame({
             dominantBaseline="central"
             fontSize={sector.band === '2g' ? 7.5 : 6.6}
             className={cn(
-              'font-mono transition-colors',
-              covered.has(ch) ? 'fill-foreground font-semibold' : own.has(ch) ? 'fill-primary font-medium' : 'fill-muted-foreground',
+              'tabular transition-colors',
+              covered.has(ch)
+                ? 'fill-foreground font-semibold'
+                : own.has(ch)
+                  ? 'fill-primary font-medium'
+                  : 'fill-muted-foreground',
               !key.includes(ch) && !covered.has(ch) && 'max-sm:hidden',
             )}
           >
@@ -127,7 +131,12 @@ function SectorFrame({
         );
       })}
       <path id={labelPath} d={d} fill="none" />
-      <text className="fill-muted-foreground font-medium" fontSize={8.5} letterSpacing={1.6} dominantBaseline={flipped ? 'hanging' : 'auto'}>
+      <text
+        className="fill-muted-foreground font-medium"
+        fontSize={8.5}
+        letterSpacing={1.6}
+        dominantBaseline={flipped ? 'hanging' : 'auto'}
+      >
         <textPath href={`#${labelPath}`} startOffset="50%" textAnchor="middle">
           {sector.label.toUpperCase()}
         </textPath>
@@ -178,7 +187,9 @@ export function Radar({
   const covered = new Set(tip === undefined ? [] : coveredChannels(tip.network));
   const ownChannels = (band: BandId): Set<number> => {
     const o = own.find((x) => x.band === band);
-    return new Set(o === undefined ? [] : coveredChannels({ band, center: (o.span[0] + o.span[1]) / 2, width: o.span[1] - o.span[0] }));
+    return new Set(
+      o === undefined ? [] : coveredChannels({ band, center: (o.span[0] + o.span[1]) / 2, width: o.span[1] - o.span[0] }),
+    );
   };
 
   return (
@@ -240,7 +251,7 @@ export function Radar({
             y={f(-radiusOf(dbm))}
             textAnchor="middle"
             dominantBaseline="central"
-            className="fill-muted-foreground stroke-card font-mono"
+            className="fill-muted-foreground stroke-card tabular"
             fontSize={6.5}
             strokeWidth={3}
             paintOrder="stroke"
@@ -286,7 +297,7 @@ export function Radar({
               <g
                 key={p.network.bssid}
                 className={cn(
-                  'cursor-pointer outline-none transition-opacity duration-200',
+                  'cursor-pointer transition-opacity duration-200 outline-none',
                   p.shares ? 'text-primary' : 'text-foreground/60',
                   dim ? 'opacity-25' : stale && !isFocused && 'opacity-45',
                 )}
@@ -348,10 +359,21 @@ export function Radar({
         </g>
 
         {/* the router */}
-        <circle r={RADAR.inner - 6} className={cn('fill-card', scanning ? 'stroke-foreground/50' : 'stroke-foreground/20')} strokeWidth={1} />
+        <circle
+          r={RADAR.inner - 6}
+          className={cn('fill-card', scanning ? 'stroke-foreground/50' : 'stroke-foreground/20')}
+          strokeWidth={1}
+        />
         <Logo x={-16} y={-17} width={32} height={32} />
         {status !== undefined && (
-          <text y={RADAR.inner + 14} textAnchor="middle" className="fill-muted-foreground stroke-card" fontSize={9} strokeWidth={4} paintOrder="stroke">
+          <text
+            y={RADAR.inner + 14}
+            textAnchor="middle"
+            className="fill-muted-foreground stroke-card"
+            fontSize={9}
+            strokeWidth={4}
+            paintOrder="stroke"
+          >
             {status}
           </text>
         )}
@@ -383,8 +405,10 @@ export function Radar({
             Channel {tip.network.channel} · {tip.network.width} MHz · covers {coverLabel(tip.network)}
           </div>
           <div className="tabular opacity-80">
-            {tip.network.signal === null ? 'Signal unknown' : `${String(tip.network.signal)} dBm, ${signalWord(tip.network.signal).toLowerCase()}`} ·{' '}
-            {securityOf(tip.network).label}
+            {tip.network.signal === null
+              ? 'Signal unknown'
+              : `${String(tip.network.signal)} dBm, ${signalWord(tip.network.signal).toLowerCase()}`}{' '}
+            · {securityOf(tip.network).label}
           </div>
           {tip.shares && (
             <div className="mt-0.5 flex items-center gap-1.5">

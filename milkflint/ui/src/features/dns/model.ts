@@ -6,7 +6,16 @@ import type { Change, Section } from '@/lib/api/uci';
 import { type DeviceDns, deviceDnsChanges, validateDeviceDns } from './device-dns';
 import { addIntercept, type InterceptZone, interceptSection } from './intercept';
 import { protoOf, type Proto, type ProviderId } from './providers';
-import { type BackupUse, type Pair, plainServers, type ProxyServers, proxyServers, type ServerPick, serverOf, TIMEOUT_S } from './upstreams';
+import {
+  type BackupUse,
+  type Pair,
+  plainServers,
+  type ProxyServers,
+  proxyServers,
+  type ServerPick,
+  serverOf,
+  TIMEOUT_S,
+} from './upstreams';
 
 /** How lookups are sent: 'static' is plain DNS (the stock firmware's name for it, kept in milkflint.dns.mode). */
 export type Mode = 'auto' | 'static' | 'encrypted';
@@ -103,7 +112,8 @@ const isAddressList = (v: string): boolean => {
 /** What dnsmasq forwards to (plain: the servers; encrypted: dnsproxy), and what dnsproxy uses. */
 export function plan(f: DnsForm): { dnsmasq: string[]; proxy: ProxyServers | undefined } {
   if (f.mode === 'static') return { dnsmasq: plainServers(mainPick(f), backupPick(f)), proxy: undefined };
-  if (f.mode === 'encrypted') return { dnsmasq: [PROXY], proxy: proxyServers(mainPick(f), f.proto, backupPick(f), backupUseOf(f.pair)) };
+  if (f.mode === 'encrypted')
+    return { dnsmasq: [PROXY], proxy: proxyServers(mainPick(f), f.proto, backupPick(f), backupUseOf(f.pair)) };
   return { dnsmasq: [], proxy: undefined };
 }
 
@@ -116,7 +126,10 @@ const ENCRYPTED_URL = 'An address starting https://, tls://, quic:// or sdns://.
 
 export function validate(f: DnsForm, data: DnsData): { form: FormErrors; records: Record<string, string> } {
   const own = validateDeviceDns(f.devices, data.routerIp, data.prefix);
-  const form: FormErrors = { ...(own.ipv4 === undefined ? {} : { ownIpv4: own.ipv4 }), ...(own.ipv6 === undefined ? {} : { ownIpv6: own.ipv6 }) };
+  const form: FormErrors = {
+    ...(own.ipv4 === undefined ? {} : { ownIpv4: own.ipv4 }),
+    ...(own.ipv6 === undefined ? {} : { ownIpv6: own.ipv6 }),
+  };
   const records: Record<string, string> = {};
   if (f.mode !== 'auto') {
     const ok = f.mode === 'static' ? isAddressList : isEncryptedUrl;
@@ -130,7 +143,11 @@ export function validate(f: DnsForm, data: DnsData): { form: FormErrors; records
     }
   }
   if (!/^[A-Za-z0-9-]{1,63}$/.test(f.domain)) form.domain = 'One word: letters, digits and hyphens.';
-  if (f.cacheOn && f.cacheSize !== '' && (!/^\d+$/.test(f.cacheSize) || Number(f.cacheSize) < 1 || Number(f.cacheSize) > MAX_CACHE_SIZE)) {
+  if (
+    f.cacheOn &&
+    f.cacheSize !== '' &&
+    (!/^\d+$/.test(f.cacheSize) || Number(f.cacheSize) < 1 || Number(f.cacheSize) > MAX_CACHE_SIZE)
+  ) {
     form.cacheSize = `A whole number from 1 to ${String(MAX_CACHE_SIZE)}, or empty for ${DEFAULT_CACHE_SIZE}.`;
   }
   for (const r of f.records) {
@@ -150,7 +167,8 @@ export function toChanges(f: DnsForm, data: DnsData): Change[] {
     proto: f.proto,
     custom: f.custom.trim(),
     backup: f.pair === 'one' ? 'none' : f.backup,
-    backup_server: f.backup === 'custom' ? '' : (serverOf({ provider: f.backup, server: f.backupServer, custom: '' })?.name ?? ''),
+    backup_server:
+      f.backup === 'custom' ? '' : (serverOf({ provider: f.backup, server: f.backupServer, custom: '' })?.name ?? ''),
     backup_custom: f.backupCustom.trim(),
     backup_use: backupUseOf(f.pair),
     // the dnsmasq servers this page added, so it can take them out again
@@ -216,15 +234,21 @@ export function toChanges(f: DnsForm, data: DnsData): Change[] {
           ...(proxy.mode === undefined ? {} : { upstream_mode: proxy.mode }),
         },
       });
-      if (proxy.mode === undefined) changes.push({ op: 'unset', config: 'dnsproxy', section: 'global', options: ['upstream_mode'] });
+      if (proxy.mode === undefined)
+        changes.push({ op: 'unset', config: 'dnsproxy', section: 'global', options: ['upstream_mode'] });
       changes.push({
         op: 'set',
         config: 'dnsproxy',
         section: 'servers',
-        values: { upstream: proxy.upstream, bootstrap: proxy.bootstrap, ...(proxy.fallback.length > 0 ? { fallback: proxy.fallback } : {}) },
+        values: {
+          upstream: proxy.upstream,
+          bootstrap: proxy.bootstrap,
+          ...(proxy.fallback.length > 0 ? { fallback: proxy.fallback } : {}),
+        },
       });
       // a fallback only when the backup is set to be one (any other, say from LuCI, would send lookups elsewhere)
-      if (proxy.fallback.length === 0) changes.push({ op: 'unset', config: 'dnsproxy', section: 'servers', options: ['fallback'] });
+      if (proxy.fallback.length === 0)
+        changes.push({ op: 'unset', config: 'dnsproxy', section: 'servers', options: ['fallback'] });
       const quick = f.cacheOn && f.quick;
       const cache = {
         enabled: quick ? '1' : '0',
@@ -253,10 +277,12 @@ export function toChanges(f: DnsForm, data: DnsData): Change[] {
   }
   // turned off, or its guest network is gone
   const keep = new Set(wanted.map(interceptSection));
-  for (const s of data.intercepts) if (!keep.has(s.section)) changes.push({ op: 'delete', config: 'firewall', section: s.section });
+  for (const s of data.intercepts)
+    if (!keep.has(s.section)) changes.push({ op: 'delete', config: 'firewall', section: s.section });
 
   const kept = new Set(f.records.flatMap((r) => (r.section === undefined ? [] : [r.section])));
-  for (const r of data.form.records) if (r.section !== undefined && !kept.has(r.section)) changes.push({ op: 'delete', config: 'dhcp', section: r.section });
+  for (const r of data.form.records)
+    if (r.section !== undefined && !kept.has(r.section)) changes.push({ op: 'delete', config: 'dhcp', section: r.section });
   for (const r of f.records) {
     changes.push(
       r.section === undefined

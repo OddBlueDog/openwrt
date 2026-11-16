@@ -7,7 +7,11 @@ export const feature = {
   title: 'DNS',
   description: 'Encrypted DNS, protection, and names on your network.',
   icon: ServerIcon,
-  order: 15,
+  group: 'network',
+  order: 10,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.DnsPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.DnsPage,
+  ),
 } satisfies Feature;

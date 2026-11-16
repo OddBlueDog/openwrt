@@ -43,7 +43,11 @@ export function parseDns(lines: readonly string[]): RouterDns {
   return { upstream, via, lookups: parseLines(lines, dnsLine) };
 }
 
-const median = (v: readonly number[]): number | undefined => percentile([...v].sort((a, b) => a - b), 0.5);
+const median = (v: readonly number[]): number | undefined =>
+  percentile(
+    [...v].sort((a, b) => a - b),
+    0.5,
+  );
 
 export interface Timed {
   /** median ms of the answered ones */
@@ -75,7 +79,8 @@ export interface RouterSite {
   errors: number;
 }
 
-const inWindow = (t: number, w: { from: number; to: number } | undefined): boolean => w === undefined || (t >= w.from && t < w.to);
+const inWindow = (t: number, w: { from: number; to: number } | undefined): boolean =>
+  w === undefined || (t >= w.from && t < w.to);
 
 /** The router's lookups per site, in the order first looked up. */
 export function routerSites(lookups: readonly DnsLookup[], w?: { from: number; to: number }): RouterSite[] {

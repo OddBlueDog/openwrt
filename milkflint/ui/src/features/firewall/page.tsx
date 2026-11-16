@@ -1,36 +1,41 @@
-// The Firewall page: OpenWrt's firewall (fw4) in three tabs, traffic rules,
-// port forwards and zones, covering what LuCI's firewall pages do.
-// Everything is read and written through UCI, as LuCI does; the hit counts
-// come from the running ruleset and the warnings from fw4's own check. The
-// tab is in the URL (#/firewall/zones), so links and the back button land
-// on it.
-import { TriangleAlertIcon } from 'lucide-react';
-import { type ReactElement, useCallback, useSyncExternalStore } from 'react';
+// The Firewall page: OpenWrt's firewall (fw4) as traffic rules and zones,
+// covering what LuCI's firewall pages do apart from port forwards, which
+// have a page of their own. It opens on the answer (what the internet can
+// reach, whose rules there are), from the live config. Everything is read
+// and written through UCI, as LuCI does; the hit counts come from the
+// running ruleset and the warnings from fw4's own check. The tab is in the
+// URL (#/firewall/zones), so links and the back button land on it; the old
+// #/firewall/forwards goes to the Port forwards page.
+import { ChevronRightIcon } from 'lucide-react';
+import { type ReactElement, useCallback, useEffect, useSyncExternalStore } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
-import { cn } from '@/lib/utils';
+import { href } from '@/lib/router';
+import { FirewallAnswer } from './answer';
 import { getCounters, getUpnpMappings, getWarnings, loadFirewall } from './api';
 import { FirewallDialogs } from './dialogs';
-import { BehindNatAlert } from './forwards';
-import { ForwardsTable } from './forwards-table';
 import { RulesTable } from './rules-table';
 import { useFirewallActions } from './use-actions';
+import { CheckWarnings } from './warnings';
 import { ZonesTab } from './zones';
+import { TabPanel, Tabs } from '@/components/ui/tabs';
 
-type Tab = 'rules' | 'forwards' | 'zones';
+type Tab = 'rules' | 'zones';
 
 const tabs: readonly { id: Tab; label: string }[] = [
   { id: 'rules', label: 'Rules' },
-  { id: 'forwards', label: 'Port forwards' },
   { id: 'zones', label: 'Zones' },
 ];
 
+function subPath(): string {
+  return window.location.hash.replace(/^#\/?/, '').split('/')[1] ?? '';
+}
+
 function currentTab(): Tab {
-  const name = window.location.hash.replace(/^#\/?/, '').split('/')[1] ?? '';
+  const name = subPath();
   return tabs.find((t) => t.id === name)?.id ?? 'rules';
 }
 
@@ -45,31 +50,19 @@ function goTo(tab: Tab): void {
   window.location.hash = tab === 'rules' ? '#/firewall' : `#/firewall/${tab}`;
 }
 
-/** What fw4 leaves out of the firewall, so it does nothing: fix it here or in LuCI. */
-function Warnings({ warnings }: { warnings: readonly string[] | undefined }): ReactElement | null {
-  if (warnings === undefined || warnings.length === 0) return null;
-  // fw4 can say several things about one section: count the sections
-  const sections = new Set(warnings.map((w) => /^Section (\S+)/.exec(w)?.[1] ?? w)).size;
-  return (
-    <Alert variant="warning">
-      <TriangleAlertIcon />
-      <AlertTitle>{sections === 1 ? 'The firewall skips a setting it can’t use' : `The firewall skips ${String(sections)} settings it can’t use`}</AlertTitle>
-      <AlertDescription>
-        OpenWrt’s firewall leaves these out, so they do nothing. Edit or delete them here or in LuCI. What it says:
-        <ul className="mt-1 flex flex-col gap-0.5 font-mono text-xs break-words">
-          {warnings.map((w) => (
-            <li key={w}>{w}</li>
-          ))}
-        </ul>
-      </AlertDescription>
-    </Alert>
-  );
-}
-
 export function FirewallPage(): ReactElement {
   const tab = useSyncExternalStore(subscribe, currentTab);
+  const sub = useSyncExternalStore(subscribe, subPath);
+  // port forwards were a tab here: old links and bookmarks land on their page
+  useEffect(() => {
+    if (sub === 'forwards') window.location.replace(href('port-forwards'));
+  }, [sub]);
   const { data, error, loading, reload } = useLoad(loadFirewall);
-  const counters = usePoll(async () => (data === undefined ? undefined : getCounters()), 10_000, data === undefined ? '' : 'loaded');
+  const counters = usePoll(
+    async () => (data === undefined ? undefined : getCounters()),
+    10_000,
+    data === undefined ? '' : 'loaded',
+  );
   const mappings = usePoll(getUpnpMappings, 15_000);
   const warnings = usePoll(getWarnings, 60_000);
   const refreshCounters = counters.refresh;
@@ -85,29 +78,8 @@ export function FirewallPage(): ReactElement {
     <>
       <PageHeader title="Firewall" description="What may reach the router and your devices, and what they may reach." />
       <div className="flex flex-col gap-4">
-        <div role="tablist" aria-label="Firewall" className="flex w-full overflow-x-auto rounded-lg border bg-muted/50 p-1 sm:w-fit">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              id={`fw-tab-${t.id}`}
-              type="button"
-              role="tab"
-              aria-selected={tab === t.id}
-              aria-controls={`fw-panel-${t.id}`}
-              onClick={() => {
-                goTo(t.id);
-              }}
-              className={cn(
-                'flex-1 rounded-md px-3 py-1.5 text-sm whitespace-nowrap text-muted-foreground transition-colors sm:flex-none',
-                tab === t.id ? 'bg-card font-medium text-foreground shadow-xs' : 'hover:text-foreground',
-              )}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
         <ApplyStatus state={state} />
-        <Warnings warnings={warnings.data} />
+        <CheckWarnings warnings={warnings.data} />
         {error !== undefined && data === undefined ? (
           <LoadError error={error} retry={reload} />
         ) : loading && data === undefined ? (
@@ -115,20 +87,26 @@ export function FirewallPage(): ReactElement {
         ) : (
           data !== undefined && (
             <>
+              <FirewallAnswer data={data} upnp={mappings.data?.length ?? 0} />
+              <p className="text-sm text-muted-foreground">
+                Opening a port for a game or a camera?{' '}
+                <a href={href('port-forwards')} className="inline-flex items-center gap-0.5 font-medium link underline-offset-4">
+                  Port forwards
+                  <ChevronRightIcon className="size-4" />
+                </a>
+              </p>
+              <Tabs label="Firewall" prefix="fw" items={tabs} value={tab} onChange={goTo} className="mt-2" />
               {/* every tab stays mounted, so unsaved zone edits survive a look at another tab */}
-              <div id="fw-panel-rules" role="tabpanel" aria-labelledby="fw-tab-rules" hidden={tab !== 'rules'}>
+              <TabPanel prefix="fw" id="rules" value={tab}>
                 <RulesTable data={data} counters={counters.data} actions={actions} />
-              </div>
-              <div id="fw-panel-forwards" role="tabpanel" aria-labelledby="fw-tab-forwards" hidden={tab !== 'forwards'} className="flex flex-col gap-4">
-                <BehindNatAlert data={data} />
-                <ForwardsTable data={data} counters={counters.data} mappings={mappings.data} actions={actions} />
-              </div>
-              <div id="fw-panel-zones" role="tabpanel" aria-labelledby="fw-tab-zones" hidden={tab !== 'zones'}>
+              </TabPanel>
+              <TabPanel prefix="fw" id="zones" value={tab}>
                 <ZonesTab data={data} counters={counters.data} actions={actions} />
-              </div>
+              </TabPanel>
               <FirewallDialogs
                 dialog={dialog}
                 data={data}
+                confirm={actions.confirm}
                 onClose={() => {
                   setDialog(undefined);
                 }}

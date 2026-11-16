@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'wifi',
-  title: 'Radios & SSIDs',
+  title: 'Networks & radios',
   description: 'Networks, passwords and radio settings for each band.',
   icon: RadioTowerIcon,
   group: 'wifi',
   order: 10,
-  page: lazyPage(() => import('./page'), (m) => m.WifiPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.WifiPage,
+  ),
 } satisfies Feature;

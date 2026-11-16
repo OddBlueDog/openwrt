@@ -193,7 +193,12 @@ export async function call<S extends z.ZodType>(
 }
 
 /** Like `call`, for methods that return nothing useful. */
-export async function exec(object: string, method: string, params: Record<string, unknown> = {}, options: CallOptions = {}): Promise<void> {
+export async function exec(
+  object: string,
+  method: string,
+  params: Record<string, unknown> = {},
+  options: CallOptions = {},
+): Promise<void> {
   await enqueue(object, method, params, options.session ?? sessionId);
 }
 

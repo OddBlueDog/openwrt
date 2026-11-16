@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { getHostHints, getInterfaces, getLeases } from '@/lib/api/network';
+import { getConfig, list, str } from '@/lib/api/uci';
 import { call } from '@/lib/ubus';
+import { deviceName } from '../clients/model';
 
 const periodsSchema = z.object({
   installed: z.boolean(),
@@ -48,12 +50,25 @@ export async function getUsage(period: string, group: 'mac' | 'layer7'): Promise
   return [...rows.values()].sort((a, b) => b.rx + b.tx - (a.rx + a.tx));
 }
 
-/** Device names by MAC (lower case): DHCP host names first, then the router's host hints. */
+/** Device names by MAC (lower case), as All devices finds them (clients/model.ts, deviceName). */
 export async function loadNames(): Promise<Map<string, string>> {
-  const [leases, hints] = await Promise.all([getLeases().catch(() => []), getHostHints().catch(() => ({}))]);
+  const [leases, hints, dhcp] = await Promise.all([
+    getLeases().catch(() => []),
+    getHostHints().catch(() => ({})),
+    getConfig('dhcp').catch(() => []),
+  ]);
+  const given = new Map(
+    dhcp
+      .filter((s) => s['.type'] === 'host')
+      .flatMap((h) => list(h, 'mac').map((mac) => [mac.toLowerCase(), str(h, 'name')] as const)),
+  );
+  const leased = new Map(leases.map((l) => [l.macaddr.toLowerCase(), l.hostname] as const));
+  const hinted = new Map(Object.entries(hints).map(([mac, h]) => [mac.toLowerCase(), h.name] as const));
   const names = new Map<string, string>();
-  for (const [mac, h] of Object.entries(hints)) if (h.name !== undefined) names.set(mac.toLowerCase(), h.name);
-  for (const l of leases) if (l.hostname !== undefined) names.set(l.macaddr.toLowerCase(), l.hostname);
+  for (const mac of new Set([...given.keys(), ...leased.keys(), ...hinted.keys()])) {
+    const name = deviceName(given.get(mac), leased.get(mac), hinted.get(mac));
+    if (name !== undefined) names.set(mac, name);
+  }
   return names;
 }
 

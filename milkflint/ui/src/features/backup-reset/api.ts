@@ -11,6 +11,16 @@ export async function downloadBackup(): Promise<Blob> {
   return res.blob();
 }
 
+/** Download a backup and hand it to the browser as router-backup-<date>.tar.gz. */
+export async function saveBackup(): Promise<void> {
+  const url = URL.createObjectURL(await downloadBackup());
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `router-backup-${new Date().toISOString().slice(0, 10)}.tar.gz`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 /**
  * Erase all settings and restart. The router replies first, then resets
  * (milkflint.maintenance in this feature's rpcd plugin).

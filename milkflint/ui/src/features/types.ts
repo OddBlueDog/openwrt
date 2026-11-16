@@ -2,8 +2,11 @@ import type { LucideIcon } from 'lucide-react';
 import type { ComponentType, LazyExoticComponent } from 'react';
 import type { FeatureId } from './ids';
 
-/** Sidebar groups. A group with no pages is hidden. */
-export type GroupId = 'wifi' | 'network' | 'vpn' | 'flow-control' | 'security' | 'system';
+/** Menu groups, by task. A group with no pages is hidden. */
+export type GroupId = 'devices' | 'wifi' | 'speed' | 'network' | 'security' | 'vpn' | 'system' | 'advanced';
+
+/** The menu's three bands: everyday tasks, things set up once, the router itself. */
+export type Band = 'everyday' | 'setup' | 'router';
 
 export interface Group {
   id: GroupId;
@@ -11,6 +14,7 @@ export interface Group {
   icon: LucideIcon;
   /** Position in the menu, on the same scale as top-level pages' order. */
   order: number;
+  band: Band;
 }
 
 /**
@@ -30,5 +34,7 @@ export interface Feature {
   order: number;
   /** Only for the main router: out of the menu in access point mode, where another router does it. */
   routerOnly?: true;
+  /** Out of the menu (and its search) but still reachable at its route: a page folded into another. */
+  inMenu?: false;
   page: LazyExoticComponent<ComponentType>;
 }

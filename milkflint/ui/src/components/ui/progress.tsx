@@ -13,12 +13,15 @@ export function Progress({
     <ProgressPrimitive.Root
       data-slot="progress"
       value={pct}
-      className={cn('relative h-2 w-full overflow-hidden rounded-full bg-muted', className)}
+      className={cn('relative h-2 w-full overflow-hidden rounded-full bg-muted forced-colors:border', className)}
       {...props}
     >
       <ProgressPrimitive.Indicator
         data-slot="progress-indicator"
-        className={cn('h-full w-full flex-1 bg-primary transition-transform duration-500', indicatorClassName)}
+        className={cn(
+          'h-full w-full flex-1 rounded-full bg-primary transition-transform duration-slow ease-standard forced-colors:bg-[Highlight]',
+          indicatorClassName,
+        )}
         style={{ transform: `translateX(-${100 - pct}%)` }}
       />
     </ProgressPrimitive.Root>

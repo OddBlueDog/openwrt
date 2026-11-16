@@ -38,9 +38,12 @@ export interface InternetForm {
  */
 export function wanPort(sections: Section[], device: string): Pick<InternetForm, 'port' | 'vlan' | 'vlanSection'> {
   const vlanDev = sections.find((s) => s['.type'] === 'device' && str(s, 'type') === '8021q' && str(s, 'name') === device);
-  if (vlanDev !== undefined) return { port: str(vlanDev, 'ifname') ?? device, vlan: str(vlanDev, 'vid') ?? '', vlanSection: vlanDev['.name'] };
+  if (vlanDev !== undefined)
+    return { port: str(vlanDev, 'ifname') ?? device, vlan: str(vlanDev, 'vid') ?? '', vlanSection: vlanDev['.name'] };
   const m = /^(.+)\.(\d+)$/.exec(device);
-  return m?.[1] !== undefined && m[2] !== undefined ? { port: m[1], vlan: m[2], vlanSection: undefined } : { port: device, vlan: '', vlanSection: undefined };
+  return m?.[1] !== undefined && m[2] !== undefined
+    ? { port: m[1], vlan: m[2], vlanSection: undefined }
+    : { port: device, vlan: '', vlanSection: undefined };
 }
 
 export function clientIdForm(raw: string): Pick<InternetForm, 'clientIdMode' | 'clientId'> {
@@ -147,7 +150,8 @@ export function toChanges(f: InternetForm, before: InternetForm): Change[] {
 
   const queue = before.sqmQueue;
   const to = sqmQueueTo(f, before);
-  if (queue !== undefined && to !== undefined) changes.push({ op: 'set', config: 'sqm', section: queue['.name'], values: queueMove(queue, to) });
+  if (queue !== undefined && to !== undefined)
+    changes.push({ op: 'set', config: 'sqm', section: queue['.name'], values: queueMove(queue, to) });
   return changes;
 }
 

@@ -71,7 +71,12 @@ config_load() {
 /** one config file, as uci export prints it */
 export function uciExport(config: string, type: string, sections: Record<string, Record<string, string>>): string {
   const text = Object.entries(sections)
-    .map(([name, options]) => `config ${type} '${name}'\n${Object.entries(options).map(([o, v]) => `\toption ${o} '${v}'\n`).join('')}`)
+    .map(
+      ([name, options]) =>
+        `config ${type} '${name}'\n${Object.entries(options)
+          .map(([o, v]) => `\toption ${o} '${v}'\n`)
+          .join('')}`,
+    )
     .join('\n');
   return `package ${config}\n\n${text}`;
 }

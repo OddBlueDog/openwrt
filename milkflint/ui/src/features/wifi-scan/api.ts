@@ -1,5 +1,9 @@
 import { z } from 'zod';
+import { getIwinfo, getWirelessStatus } from '@/lib/api/wireless';
 import { call } from '@/lib/ubus';
+import { widthOf } from '../wifi/channels';
+import type { Radio } from './model';
+import { bandOrder, channelMhz } from './spectrum';
 
 const suites = z.object({ ciphers: z.array(z.string()), akm: z.array(z.string()) });
 
@@ -62,11 +66,47 @@ export type ScanState = z.output<typeof scanState>;
 
 /** Scan these radios (phys) for nearby networks, in the background on the router. */
 export async function startScan(phys: readonly string[]): Promise<void> {
-  const res = await call('milkflint.wifiscan', 'start', { phys }, z.object({ started: z.boolean().optional(), error: z.string().optional() }));
-  if (res.error !== undefined) throw new Error(res.error === 'busy' ? 'A scan is already running.' : `The router refused the scan (${res.error}).`);
+  const res = await call(
+    'milkflint.wifiscan',
+    'start',
+    { phys },
+    z.object({ started: z.boolean().optional(), error: z.string().optional() }),
+  );
+  if (res.error !== undefined)
+    throw new Error(res.error === 'busy' ? 'A scan is already running.' : `The router refused the scan (${res.error}).`);
 }
 
 /** The last scan: running, or what it found. */
 export function getScan(): Promise<ScanState> {
   return call('milkflint.wifiscan', 'results', {}, scanState);
+}
+
+/** This router's radios as they run now: their channel, width and whether they can scan. */
+export async function loadRadios(): Promise<Radio[]> {
+  const status = await getWirelessStatus();
+  const radios = await Promise.all(
+    Object.entries(status).map(async ([radio, r]): Promise<Radio | undefined> => {
+      const band = r.config?.band;
+      if (band !== '2g' && band !== '5g' && band !== '6g') return undefined;
+      const aps = (r.interfaces ?? []).filter((i) => (i.config?.mode ?? 'ap') === 'ap' && i.ifname !== undefined);
+      // radios that are off with no access point aren't Wi-Fi networks here (as on Networks & radios)
+      if (r.disabled === true && aps.length === 0) return undefined;
+      const ifname = aps[0]?.ifname;
+      const info = r.disabled === true || ifname === undefined ? undefined : await getIwinfo(ifname).catch(() => undefined);
+      const width = widthOf(info?.htmode ?? r.config?.htmode);
+      const center = info?.center_chan1 !== undefined ? channelMhz(band, info.center_chan1) : info?.frequency;
+      return {
+        radio,
+        band,
+        phy: r.iwinfo?.phy,
+        online: info?.frequency !== undefined,
+        auto: String(r.config?.channel ?? 'auto') === 'auto',
+        channel: info?.channel,
+        span: center === undefined ? undefined : [center - width / 2, center + width / 2],
+        width,
+        country: r.config?.country,
+      };
+    }),
+  );
+  return radios.filter((r): r is Radio => r !== undefined).sort((a, b) => bandOrder.indexOf(a.band) - bandOrder.indexOf(b.band));
 }

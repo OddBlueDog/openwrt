@@ -92,7 +92,13 @@ test('signal keys name the run, the pair (lower id first) and the attempt, withi
 });
 
 test('a member connects with every partner a phase pairs it with', () => {
-  const phases: { pair?: [string, string] }[] = [{ pair: ['m1', 'm2'] }, { pair: ['m2', 'm1'] }, { pair: ['m3', 'm2'] }, {}, { pair: ['m3', 'm4'] }];
+  const phases: { pair?: [string, string] }[] = [
+    { pair: ['m1', 'm2'] },
+    { pair: ['m2', 'm1'] },
+    { pair: ['m3', 'm2'] },
+    {},
+    { pair: ['m3', 'm4'] },
+  ];
   assert.deepEqual(partnersOf(phases, 'm2'), ['m1', 'm3']);
   assert.deepEqual(partnersOf(phases, 'm5'), []);
   assert.deepEqual(schedulePairs(phases), [
@@ -122,13 +128,19 @@ test('one connect phase, before the first pair, for everyone any later phase pai
   for (const id of h?.pair ?? []) assert.equal(schedule.phases[connect]?.roles[id], 'rtc');
 });
 
-test("a custom busy household connects its pair first, even without device-to-device phases", () => {
+test('a custom busy household connects its pair first, even without device-to-device phases', () => {
   const { schedule } = buildPlan('custom', [mac, phone, pc, tablet], false, { ...defaultCustom, d2d: false, household: true });
   const kinds = schedule.phases.map((p) => p.kind);
   assert.ok(kinds.includes('connect') && kinds.indexOf('connect') < kinds.indexOf('household'));
   assert.deepEqual(schedule.phases[kinds.indexOf('connect')]?.roles, { m3: 'rtc', m4: 'rtc' });
   assert.ok(usesInternet(schedule));
-  const d2dOnly = buildPlan('custom', [mac, phone], false, { ...defaultCustom, download: false, upload: false, dns: false, d2d: true });
+  const d2dOnly = buildPlan('custom', [mac, phone], false, {
+    ...defaultCustom,
+    download: false,
+    upload: false,
+    dns: false,
+    d2d: true,
+  });
   assert.ok(!usesInternet(d2dOnly.schedule));
   // three devices make no pair: no connect phase
   const three = buildPlan('custom', [mac, phone, pc], false, { ...defaultCustom, d2d: false, household: true });
@@ -156,19 +168,38 @@ const diag = (over: Partial<LinkDiag> = {}): LinkDiag => ({
   ms: 15000,
   ...over,
 });
-const sideOf = (name: string, d: LinkDiag | undefined, over: Partial<Side> = {}): Side => ({ name, wifi: false, browser: 'Safari', os: 'macOS', diag: d, ...over });
+const sideOf = (name: string, d: LinkDiag | undefined, over: Partial<Side> = {}): Side => ({
+  name,
+  wifi: false,
+  browser: 'Safari',
+  os: 'macOS',
+  diag: d,
+  ...over,
+});
 
 test('no reports at all, or from one side', () => {
   assert.match(noPathCauses(sideOf('Mac', undefined), sideOf('iPhone', undefined))[0] ?? '', /Neither device/);
-  assert.match(noPathCauses(sideOf('Mac', diag({ offerer: true })), sideOf('iPhone', undefined))[0] ?? '', /iPhone never reported/);
+  assert.match(
+    noPathCauses(sideOf('Mac', diag({ offerer: true })), sideOf('iPhone', undefined))[0] ?? '',
+    /iPhone never reported/,
+  );
 });
 
 test('signalling that stopped short: the offer, its delivery, the answer', () => {
-  const unsent = noPathCauses(sideOf('Mac', diag({ offerer: true, sent: false, got: false, error: 'mailbox full' })), sideOf('iPhone', diag({ got: false, sent: false })));
+  const unsent = noPathCauses(
+    sideOf('Mac', diag({ offerer: true, sent: false, got: false, error: 'mailbox full' })),
+    sideOf('iPhone', diag({ got: false, sent: false })),
+  );
   assert.deepEqual(unsent, ["Mac's offer never reached the router (mailbox full)."]);
-  const undelivered = noPathCauses(sideOf('Mac', diag({ offerer: true, got: false })), sideOf('iPhone', diag({ got: false, sent: false })));
+  const undelivered = noPathCauses(
+    sideOf('Mac', diag({ offerer: true, got: false })),
+    sideOf('iPhone', diag({ got: false, sent: false })),
+  );
   assert.match(undelivered[0] ?? '', /didn't reach iPhone/);
-  const unanswered = noPathCauses(sideOf('Mac', diag({ offerer: true, got: false })), sideOf('iPhone', diag({ sent: false, error: 'boom' })));
+  const unanswered = noPathCauses(
+    sideOf('Mac', diag({ offerer: true, got: false })),
+    sideOf('iPhone', diag({ sent: false, error: 'boom' })),
+  );
   assert.match(unanswered[0] ?? '', /iPhone never answered \(boom\)/);
 });
 
@@ -184,7 +215,11 @@ test('only .local names and no checks at all point at mDNS', () => {
 
 test('checks that went out and none arrived point at something dropping them; Wi-Fi, Windows and Chrome hints follow', () => {
   const c = noPathCauses(
-    sideOf('PC', diag({ offerer: true, requestsSent: 12, remote: { 'host/udp/lan': 1 } }), { os: 'Windows', browser: 'Chrome', wifi: true }),
+    sideOf('PC', diag({ offerer: true, requestsSent: 12, remote: { 'host/udp/lan': 1 } }), {
+      os: 'Windows',
+      browser: 'Chrome',
+      wifi: true,
+    }),
     sideOf('iPhone', diag({ requestsSent: 9, remote: { 'host/udp/lan': 1 } }), { wifi: true }),
   );
   assert.match(c[0] ?? '', /none arrived/);
@@ -203,13 +238,17 @@ test('one-way checks name the side whose replies were lost', () => {
 });
 
 test('ICE connected but DTLS failed', () => {
-  const c = noPathCauses(sideOf('Mac', diag({ offerer: true, ice: 'connected', dtls: 'failed' })), sideOf('iPhone', diag({ ice: 'connected', dtls: 'failed' })));
+  const c = noPathCauses(
+    sideOf('Mac', diag({ offerer: true, ice: 'connected', dtls: 'failed' })),
+    sideOf('iPhone', diag({ ice: 'connected', dtls: 'failed' })),
+  );
   assert.deepEqual(c, ['ICE found a path, but the DTLS handshake on it failed.']);
 });
 
 // ---- A pair's figures ----
 
-const open = (offerer: boolean, path: LinkDiag['path'], ms = 900): LinkDiag => diag({ offerer, pc: 'connected', ice: 'connected', dtls: 'connected', path, ms });
+const open = (offerer: boolean, path: LinkDiag['path'], ms = 900): LinkDiag =>
+  diag({ offerer, pc: 'connected', ice: 'connected', dtls: 'connected', path, ms });
 const lan = { local: 'host/udp/lan', remote: 'prflx/udp/lan', rtt: 1 };
 
 test('loss each way needs both ends: what arrived there, and the echoes back', () => {
@@ -263,17 +302,28 @@ test('a pair’s throughput per direction, its RTT under load and at rest', () =
     { kind: 'd2d', start: 20_000, dur: 10_000, roles: { m1: 'a', m2: 'b' }, pair: ['m1', 'm2'], dir: 'ba' },
   ];
   const t0 = 100_000;
-  const a: RunRecord[] = [['peer', t0 + 1000, 'm2', 'p', 'open', open(true, lan)], ['peer', t0 + 1000, 'm2', 'b', 'open', open(true, lan)]];
-  const b: RunRecord[] = [['peer', t0 + 1000, 'm1', 'p', 'open', open(false, lan)], ['peer', t0 + 1000, 'm1', 'b', 'open', open(false, lan)]];
+  const a: RunRecord[] = [
+    ['peer', t0 + 1000, 'm2', 'p', 'open', open(true, lan)],
+    ['peer', t0 + 1000, 'm2', 'b', 'open', open(true, lan)],
+  ];
+  const b: RunRecord[] = [
+    ['peer', t0 + 1000, 'm1', 'p', 'open', open(false, lan)],
+    ['peer', t0 + 1000, 'm1', 'b', 'open', open(false, lan)],
+  ];
   // at rest (the connect phase) 1 ms; under load 5 ms
   for (let t = t0 + 2000; t < t0 + 30_000; t += 100) a.push(['pp', 'm2', t, t, t < t0 + 10_000 ? 1 : 5]);
   // m2 receives 12.5 MB/s from m1 in the first d2d phase; m1 gets half that back in the second
   for (let t = t0 + 10_000; t < t0 + 20_000; t += 250) b.push(['pb', 'm1', t, 3_125_000]);
   for (let t = t0 + 20_000; t < t0 + 30_000; t += 250) a.push(['pb', 'm2', t, 1_562_500]);
-  const [r] = pairResults(t0, t0 + 30_000, phases, new Map([
-    ['m1', a],
-    ['m2', b],
-  ]));
+  const [r] = pairResults(
+    t0,
+    t0 + 30_000,
+    phases,
+    new Map([
+      ['m1', a],
+      ['m2', b],
+    ]),
+  );
   assert.ok(r !== undefined);
   assert.equal(r.ab.phases, 1);
   assert.equal(Math.round(r.ab.throughput?.mbit ?? 0), 100);

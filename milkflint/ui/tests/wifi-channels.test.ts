@@ -58,8 +58,19 @@ test('in words', () => {
   assert.equal(describeChannels([36, 44, 44, 52]), 'channels 36, 44 and 52');
 });
 
-const net = (band: ScannedNetwork['band'], center: number, width: number, signal: number | null = -60): ScannedNetwork =>
-  ({ band, center, width, signal, channel: 0, mhz: center, bssid: 'aa:bb:cc:dd:ee:ff', ssid: 'n', standard: 'ax', security: { privacy: true }, radio: 'phy0' });
+const net = (band: ScannedNetwork['band'], center: number, width: number, signal: number | null = -60): ScannedNetwork => ({
+  band,
+  center,
+  width,
+  signal,
+  channel: 0,
+  mhz: center,
+  bssid: 'aa:bb:cc:dd:ee:ff',
+  ssid: 'n',
+  standard: 'ax',
+  security: { privacy: true },
+  radio: 'phy0',
+});
 
 test('the quietest place: nothing there, the first block', () => {
   assert.deepEqual(quietest('5g', 80, [], undefined), { channels: [36, 40, 44, 48], load: 0 });
@@ -80,7 +91,10 @@ test('only the channels the radio may use; none allowed, no place', () => {
 });
 
 test('another band’s networks don’t count', () => {
-  assert.deepEqual(quietest('5g', 80, [net('2g', 2437, 20), net('6g', 6115, 80)], undefined), { channels: [36, 40, 44, 48], load: 0 });
+  assert.deepEqual(quietest('5g', 80, [net('2g', 2437, 20), net('6g', 6115, 80)], undefined), {
+    channels: [36, 40, 44, 48],
+    load: 0,
+  });
 });
 
 test('a loud neighbour counts for more than a quiet one', () => {
@@ -109,7 +123,11 @@ test('no block of this width is free: the widest narrower one with empty blocks'
   assert.deepEqual(r.blocks, [[44, 48]]);
   assert.equal(emptyNarrower('5g', 80, [], allowed), undefined, 'one is free already');
   assert.equal(emptyNarrower('2g', 40, [net('2g', 2412, 20)], undefined), undefined);
-  assert.equal(emptyNarrower('5g', 40, [net('5g', 5190, 40), net('5g', 5230, 40)], allowed), undefined, 'nothing empty at any width');
+  assert.equal(
+    emptyNarrower('5g', 40, [net('5g', 5190, 40), net('5g', 5230, 40)], allowed),
+    undefined,
+    'nothing empty at any width',
+  );
 });
 
 test('a network’s channels', () => {

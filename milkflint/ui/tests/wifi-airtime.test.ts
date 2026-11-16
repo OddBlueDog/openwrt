@@ -68,7 +68,8 @@ test('airtime: each band has its own option', () => {
 test('airtime: only 1 is on, as the service reads it', () => {
   assert.equal(airtimeOf('1'), true);
   assert.equal(airtimeOf(undefined), false);
-  for (const value of ['0', '', 'on', 'true', 'yes', 'enabled', ' 1', '1 ', '01', '2']) assert.equal(airtimeOf(value), false, JSON.stringify(value));
+  for (const value of ['0', '', 'on', 'true', 'yes', 'enabled', ' 1', '1 ', '01', '2'])
+    assert.equal(airtimeOf(value), false, JSON.stringify(value));
 });
 
 test('airtime: on writes 1, off leaves the option unset', () => {
@@ -101,7 +102,10 @@ test('airtime: what is done besides the share, and what would be where the polic
   assert.equal(airtimeDoing('slow', true), undefined);
   assert.equal(airtimeDoing('weak', true), 'Kept to a frame or two in the radio at a time.');
   // with a driver that takes a number of sends per device, that's said too
-  assert.equal(airtimeDoing('weak', true, { tries: 6 }), 'Kept to a frame or two in the radio at a time. Each frame is sent at most 6 times.');
+  assert.equal(
+    airtimeDoing('weak', true, { tries: 6 }),
+    'Kept to a frame or two in the radio at a time. Each frame is sent at most 6 times.',
+  );
   assert.match(airtimeDoing('lost', true, { tries: 2 }) ?? '', /until it answers\. Each frame is sent at most 2 times\.$/);
   assert.match(airtimeDoing('lost', true, { tries: 1 }) ?? '', /Each frame is sent once\.$/);
   // not where the policy is off, whatever the reply says
@@ -125,13 +129,22 @@ test('airtime: a paced device says its part of the time, and how long it was hel
     airtimeDoing('weak', true, { tries: 6, pace: 238 }),
     'Kept to a frame or two in the radio at a time. Held to 24% of the time while a device with a good link is waiting. Each frame is sent at most 6 times.',
   );
-  assert.match(airtimeDoing('lost', true, { tries: 2, pace: 111 }) ?? '', /until it answers\. Held to 11% of the time .* Each frame is sent at most 2 times\.$/);
+  assert.match(
+    airtimeDoing('lost', true, { tries: 2, pace: 111 }) ?? '',
+    /until it answers\. Held to 11% of the time .* Each frame is sent at most 2 times\.$/,
+  );
   // a good link is never paced, whatever the reply says
   assert.equal(airtimeDoing('full', true, { pace: 500 }), undefined);
   // off: only that it would be, where the driver can and the policy would
   assert.equal(airtimeDoing('slow', false), 'With the policy on: a reduced share.');
-  assert.equal(airtimeDoing('slow', false, { wouldPace: true }), 'With the policy on: a reduced share, and held back while a device with a good link is waiting.');
-  assert.match(airtimeDoing('weak', false, { wouldPace: true }) ?? '', /a frame or two in the radio at a time, and held back while/);
+  assert.equal(
+    airtimeDoing('slow', false, { wouldPace: true }),
+    'With the policy on: a reduced share, and held back while a device with a good link is waiting.',
+  );
+  assert.match(
+    airtimeDoing('weak', false, { wouldPace: true }) ?? '',
+    /a frame or two in the radio at a time, and held back while/,
+  );
   assert.match(airtimeDoing('lost', false, { wouldPace: true }) ?? '', /until it answers, and held back while/);
   assert.doesNotMatch(airtimeDoing('weak', false, { wouldPace: true, pace: 238 }) ?? '', /Held to/);
   // how long it was held: nothing for under half a percent of the second
@@ -226,7 +239,13 @@ test('airtime: a device on two of a radio’s networks for a moment is two segme
   assert.equal(airtimeKey({ mac: 'aa' }), 'aa');
   assert.equal(airtimeKey({ mac: 'aa', dev: '' }), 'aa');
   assert.equal(airtimeKey({ mac: 'aa', dev: 'phy1-ap0' }), 'phy1-ap0 aa');
-  const segments = airtimeSegments([{ ...device('aa', 'phone', 'full', 0.1), dev: 'phy1-ap0' }, { ...device('aa', 'phone', 'full', 0), dev: 'phy1-ap1' }], null);
+  const segments = airtimeSegments(
+    [
+      { ...device('aa', 'phone', 'full', 0.1), dev: 'phy1-ap0' },
+      { ...device('aa', 'phone', 'full', 0), dev: 'phy1-ap1' },
+    ],
+    null,
+  );
   assert.deepEqual(
     segments.map((s) => s.key),
     ['phy1-ap0 aa', 'phy1-ap1 aa', 'free'],
@@ -306,12 +325,24 @@ test('airtime: the bar keeps devices in class order, then by name, whatever air 
 test('airtime: the list has the most airtime first, then by name', () => {
   const order = (devices: AirtimeUse[]): string[] => airtimeSorted(devices).map((d) => d.name ?? d.mac);
   assert.deepEqual(
-    order([device('01', 'phone', 'full', 0.05), device('02', 'tv', 'full', 0.2, 0.2), device('03', 'camera', 'weak', 0.1), device('04', 'laptop', 'slow', 0.05)]),
+    order([
+      device('01', 'phone', 'full', 0.05),
+      device('02', 'tv', 'full', 0.2, 0.2),
+      device('03', 'camera', 'weak', 0.1),
+      device('04', 'laptop', 'slow', 0.05),
+    ]),
     ['tv', 'camera', 'laptop', 'phone'],
   );
   // names without regard to case, numbers in them by value, unnamed devices last by address
   assert.deepEqual(
-    order([device('0b', null, 'full', 0), device('01', 'zed', 'full', 0), device('0a', null, 'full', 0), device('02', 'Amy', 'full', 0), device('03', 'tv 10', 'full', 0), device('04', 'tv 2', 'full', 0)]),
+    order([
+      device('0b', null, 'full', 0),
+      device('01', 'zed', 'full', 0),
+      device('0a', null, 'full', 0),
+      device('02', 'Amy', 'full', 0),
+      device('03', 'tv 10', 'full', 0),
+      device('04', 'tv 2', 'full', 0),
+    ]),
     ['Amy', 'tv 2', 'tv 10', 'zed', '0a', '0b'],
   );
 });
@@ -319,7 +350,9 @@ test('airtime: the list has the most airtime first, then by name', () => {
 test('airtime: devices showing the same percent keep their order by name', () => {
   // 0.1% and 0.4% both show as 0%: the smaller one doesn't move down for it
   assert.deepEqual(
-    airtimeSorted([device('01', 'b', 'full', 0.004), device('02', 'a', 'full', 0.001), device('03', 'c', 'full', 0.006)]).map((d) => d.name),
+    airtimeSorted([device('01', 'b', 'full', 0.004), device('02', 'a', 'full', 0.001), device('03', 'c', 'full', 0.006)]).map(
+      (d) => d.name,
+    ),
     ['c', 'a', 'b'],
   );
 });
@@ -425,9 +458,15 @@ test('airtime: a second’s total and its breakdown, on a scale that is always a
     assert.equal(unread.find((p) => p.key === 'free')?.share, null);
   }
   // more than the whole second leaves nothing free; a figure below zero is none
-  assert.equal(airtimeSecondParts({ t: 1, full: 0.9, slow: 0, weak: 0, lost: 0, other: 0.4 }).find((p) => p.key === 'free')?.share, 0);
+  assert.equal(
+    airtimeSecondParts({ t: 1, full: 0.9, slow: 0, weak: 0, lost: 0, other: 0.4 }).find((p) => p.key === 'free')?.share,
+    0,
+  );
   assert.equal(airtimeSecondParts({ t: 1, full: -0.3, slow: 0.5, weak: 0, lost: 0, other: -1 })[0]?.share, 0);
-  assert.equal(airtimeSecondParts({ t: 1, full: 0, slow: 0, weak: 0, lost: 0, other: -1 }).find((p) => p.key === 'other')?.share, 0);
+  assert.equal(
+    airtimeSecondParts({ t: 1, full: 0, slow: 0, weak: 0, lost: 0, other: -1 }).find((p) => p.key === 'other')?.share,
+    0,
+  );
   // and when it was
   assert.equal(airtimeAgo(0), 'The last second');
   assert.equal(airtimeAgo(1), '1 s ago');
@@ -451,7 +490,10 @@ test('airtime: the router\u2019s own figure for other networks is used where it 
   near(other?.share ?? -1, 0.05);
   near(free?.share ?? -1, 0.75);
   // without a busy figure there is no such segment, whatever else is said
-  assert.equal(airtimeSegments([device('aa', 'tv', 'full', 0.2)], null, 0.05).find((s) => s.kind === 'other'), undefined);
+  assert.equal(
+    airtimeSegments([device('aa', 'tv', 'full', 0.2)], null, 0.05).find((s) => s.kind === 'other'),
+    undefined,
+  );
 });
 
 test('airtime: a slow link the policy paces is called very slow', () => {
@@ -465,15 +507,40 @@ test('airtime: a slow link the policy paces is called very slow', () => {
 
 test('airtime: a band’s settings as saved, the defaults for what is unset', () => {
   // the service's own defaults: lower rates on 2.4 GHz, the same goals
-  assert.deepEqual(airtimeBandDefaults('5g'), { full: '60', pace: '30', weak: '12', goal_slow: '17', goal_weak: '12', goal_lost: '5', auto: 'manual' });
+  assert.deepEqual(airtimeBandDefaults('5g'), {
+    full: '60',
+    pace: '30',
+    weak: '12',
+    goal_slow: '17',
+    goal_weak: '12',
+    goal_lost: '5',
+    auto: 'manual',
+  });
   assert.deepEqual(airtimeBandDefaults('6g'), airtimeBandDefaults('5g'));
-  assert.deepEqual(airtimeBandDefaults('2g'), { full: '15', pace: '8', weak: '4', goal_slow: '17', goal_weak: '12', goal_lost: '5', auto: 'manual' });
+  assert.deepEqual(airtimeBandDefaults('2g'), {
+    full: '15',
+    pace: '8',
+    weak: '4',
+    goal_slow: '17',
+    goal_weak: '12',
+    goal_lost: '5',
+    auto: 'manual',
+  });
   assert.equal(airtimeBandOption('5g', 'goal_weak'), 'airtime_5g_goal_weak');
   const saved: Record<string, string> = { airtime_5g_pace: '45', airtime_5g_goal_lost: '3', airtime_2g_pace: '6' };
-  assert.deepEqual(airtimeBandsOf((o) => saved[o], '5g'), { ...airtimeBandDefaults('5g'), pace: '45', goal_lost: '3' });
+  assert.deepEqual(
+    airtimeBandsOf((o) => saved[o], '5g'),
+    { ...airtimeBandDefaults('5g'), pace: '45', goal_lost: '3' },
+  );
   // another band's settings are its own
-  assert.deepEqual(airtimeBandsOf((o) => saved[o], '2g'), { ...airtimeBandDefaults('2g'), pace: '6' });
-  assert.deepEqual(airtimeBandsOf(() => undefined, '6g'), airtimeBandDefaults('6g'));
+  assert.deepEqual(
+    airtimeBandsOf((o) => saved[o], '2g'),
+    { ...airtimeBandDefaults('2g'), pace: '6' },
+  );
+  assert.deepEqual(
+    airtimeBandsOf(() => undefined, '6g'),
+    airtimeBandDefaults('6g'),
+  );
 });
 
 test('airtime: what is wrong with a band’s settings', () => {
@@ -488,7 +555,8 @@ test('airtime: what is wrong with a band’s settings', () => {
     assert.match(airtimeBandsErrors(with_({ full: bad })).full ?? '', /1 to 10000 Mbit\/s/, bad);
   }
   // a goal is 1 to 100%
-  for (const bad of ['', '0', '101', 'x', '-1']) assert.equal(airtimeBandsErrors(with_({ goal_weak: bad })).goal_weak, 'Use 1 to 100%.', bad);
+  for (const bad of ['', '0', '101', 'x', '-1'])
+    assert.equal(airtimeBandsErrors(with_({ goal_weak: bad })).goal_weak, 'Use 1 to 100%.', bad);
   assert.equal(airtimeBandsErrors(with_({ goal_lost: '100' })).goal_lost, undefined);
   // out of order: said at the lower one, and only there
   assert.deepEqual(airtimeBandsErrors(with_({ pace: '80' })), { pace: 'A slow link can’t start above a good one.' });
@@ -520,7 +588,10 @@ test('airtime: what a band’s settings save, and the reset', () => {
   });
   // what is saved reads back as typed numbers
   const saved = airtimeBandValues('5g', { ...defaults, full: '80', weak: '10' });
-  assert.deepEqual(airtimeBandsOf((o) => saved[o], '5g'), { ...defaults, full: '80', weak: '10' });
+  assert.deepEqual(
+    airtimeBandsOf((o) => saved[o], '5g'),
+    { ...defaults, full: '80', weak: '10' },
+  );
   // settings with something wrong in them aren't saved at all
   assert.deepEqual(airtimeBandValues('5g', { ...defaults, weak: '40' }), {});
 });
@@ -552,10 +623,7 @@ test('airtime: a device’s signal in words, its strength and each antenna', () 
   assert.equal(airtimeSignalWords(-67, Number.NaN), '-67 dBm');
   assert.equal(airtimeSignalWords(null, -92), undefined);
   // the icon's level: a step for each 10 dB
-  assert.deepEqual(
-    [-40, -55, -56, -65, -66, -75, -76, -85, -86, -100].map(airtimeSignalLevel),
-    [4, 4, 3, 3, 2, 2, 1, 1, 0, 0],
-  );
+  assert.deepEqual([-40, -55, -56, -65, -66, -75, -76, -85, -86, -100].map(airtimeSignalLevel), [4, 4, 3, 3, 2, 2, 1, 1, 0, 0]);
   // each antenna, where there are several
   assert.equal(airtimeChainsWords([-68.2, -73, -78, -74]), 'By antenna: -68, -73, -78, -74 dBm');
   assert.equal(airtimeChainsWords([-60]), undefined);
@@ -566,7 +634,8 @@ test('airtime: how a band’s shares are set, as saved and as the service reads 
   assert.equal(airtimeAutoOption('5g'), 'airtime_5g_auto');
   for (const name of ['gentle', 'balanced', 'strict'] as const) assert.equal(airtimeStrengthOf(name), name);
   // anything else is the goals set by hand
-  for (const other of [undefined, null, '', 'manual', 'auto', 'Balanced', ' strict', '1']) assert.equal(airtimeStrengthOf(other), undefined, String(other));
+  for (const other of [undefined, null, '', 'manual', 'auto', 'Balanced', ' strict', '1'])
+    assert.equal(airtimeStrengthOf(other), undefined, String(other));
   const saved: Record<string, string> = { airtime_5g_auto: 'strict', airtime_2g_auto: 'loud' };
   assert.equal(airtimeBandsOf((o) => saved[o], '5g').auto, 'strict');
   assert.equal(airtimeBandsOf((o) => saved[o], '2g').auto, 'manual');
@@ -592,7 +661,11 @@ test('airtime: with auto, only the settings it uses are checked and saved', () =
   // the hidden goals don't count against the defaults, and the reset keeps them and the strength
   assert.equal(airtimeBandsAreDefault('5g', { ...auto, pace: '45', goal_weak: '9', goal_lost: '3' }), true);
   assert.equal(airtimeBandsAreDefault('5g', { ...auto, full: '80' }), false);
-  assert.deepEqual(airtimeBandsReset('5g', { ...auto, full: '80', goal_lost: '3', pace: '45' }), { ...auto, pace: '45', goal_lost: '3' });
+  assert.deepEqual(airtimeBandsReset('5g', { ...auto, full: '80', goal_lost: '3', pace: '45' }), {
+    ...auto,
+    pace: '45',
+    goal_lost: '3',
+  });
   // by hand, the reset is the defaults
   assert.deepEqual(airtimeBandsReset('5g', { ...airtimeBandDefaults('5g'), pace: '45' }), airtimeBandDefaults('5g'));
 });
@@ -632,9 +705,15 @@ test('airtime: with auto, a held-back device says its share of the air and who i
     airtimeDoing('weak', true, { pace: 100, aim: 125, competing: 1 }),
     'Kept to a frame or two in the radio at a time. Held to about 13% of the air while a device with a better link is waiting.',
   );
-  assert.equal(airtimeDoing('slow', true, { pace: 40, aim: 46, competing: 3 }), 'Held to about 5% of the air while 3 devices with better links are waiting.');
+  assert.equal(
+    airtimeDoing('slow', true, { pace: 40, aim: 46, competing: 3 }),
+    'Held to about 5% of the air while 3 devices with better links are waiting.',
+  );
   // none wanting the air counts as one
-  assert.match(airtimeDoing('slow', true, { pace: 40, aim: 46, competing: 0 }) ?? '', /while a device with a better link is waiting/);
+  assert.match(
+    airtimeDoing('slow', true, { pace: 40, aim: 46, competing: 0 }) ?? '',
+    /while a device with a better link is waiting/,
+  );
   // without auto, the goal's part of the time as before
   assert.equal(airtimeDoing('slow', true, { pace: 170 }), 'Held to 17% of the time while a device with a good link is waiting.');
   // and with the policy off, nothing of it

@@ -6,7 +6,10 @@ import { afterEach, test } from 'node:test';
 import { z } from 'zod';
 import { stage } from '../src/lib/api/uci.ts';
 
-const request = z.object({ id: z.number(), params: z.tuple([z.string(), z.string(), z.string(), z.record(z.string(), z.unknown())]) });
+const request = z.object({
+  id: z.number(),
+  params: z.tuple([z.string(), z.string(), z.string(), z.record(z.string(), z.unknown())]),
+});
 const realFetch = globalThis.fetch;
 
 // rpcd as far as stage() sees it: `staged` is what this session has staged
@@ -50,7 +53,10 @@ test('with nothing staged, it reverts only the configs it changes', async () => 
     'uci.revert {"config":"dhcp"}',
     'uci.revert {"config":"firewall"}',
   ]);
-  assert.deepEqual(calls.slice(-2), ['uci.set {"config":"dhcp","section":"lan","values":{"start":"100"}}', 'uci.delete {"config":"firewall","section":"old"}']);
+  assert.deepEqual(calls.slice(-2), [
+    'uci.set {"config":"dhcp","section":"lan","values":{"start":"100"}}',
+    'uci.delete {"config":"firewall","section":"old"}',
+  ]);
 });
 
 test('the reverts come before the first change', async () => {

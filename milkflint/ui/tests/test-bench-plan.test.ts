@@ -63,7 +63,11 @@ test('every preset builds a schedule the router takes: phases in order, within i
       for (const ph of schedule.phases) {
         assert.ok(ph.start >= at, `${p.id}: ${ph.kind} starts before the one before it ends`);
         assert.ok(ph.dur >= MIN_PHASE_S * 1000 && ph.dur <= MAX_PHASE_S * 1000, `${p.id}: ${ph.kind} lasts ${String(ph.dur)}`);
-        for (const id of Object.keys(ph.roles)) assert.ok(members.some((m) => m.id === id), `${p.id}: role for ${id}`);
+        for (const id of Object.keys(ph.roles))
+          assert.ok(
+            members.some((m) => m.id === id),
+            `${p.id}: role for ${id}`,
+          );
         assert.ok(new TextEncoder().encode(ph.label ?? '').length <= 48);
         at = ph.start + ph.dur;
       }
@@ -144,7 +148,12 @@ test('labels are cut to what the router takes, at a character', () => {
 });
 
 test('the phase at a time: none before the start or after the end', () => {
-  const s = { phases: [{ start: 0, dur: 1000 }, { start: 1000, dur: 2000 }] };
+  const s = {
+    phases: [
+      { start: 0, dur: 1000 },
+      { start: 1000, dur: 2000 },
+    ],
+  };
   assert.equal(phaseAt(s, -1), -1);
   assert.equal(phaseAt(s, 0), 0);
   assert.equal(phaseAt(s, 1500), 1);
@@ -185,7 +194,12 @@ test('user agents name the device and browser', () => {
       'Windows PC',
       'Edge 141 on Windows',
     ],
-    ['Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0', false, 'Windows PC', 'Firefox 144 on Windows'],
+    [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0',
+      false,
+      'Windows PC',
+      'Firefox 144 on Windows',
+    ],
     [
       'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36',
       true,
@@ -208,10 +222,16 @@ const line = (seq: number, records: unknown[]): string => JSON.stringify({ m: 'm
 test("a member's records: each report once, in order, broken lines and unknown records skipped", () => {
   const lines = [
     line(1, [['mark', 1, 2000, 2003, 1.5]]),
-    line(0, [['mark', 0, 1000, 1001, 1], ['bogus', 1]]),
+    line(0, [
+      ['mark', 0, 1000, 1001, 1],
+      ['bogus', 1],
+    ]),
     line(1, [['mark', 1, 2000, 9999, 1.5]]),
     '{not json',
-    line(2, [['end', 3000, 'completed'], ['mark', 'x', 1, 2, 3]]),
+    line(2, [
+      ['end', 3000, 'completed'],
+      ['mark', 'x', 1, 2, 3],
+    ]),
   ];
   assert.deepEqual(memberRecords(lines), [
     ['mark', 0, 1000, 1001, 1],

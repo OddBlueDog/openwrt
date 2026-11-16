@@ -44,7 +44,11 @@ export function leakSection(zone: SourceZone): string {
 /** The home network's devices that don't use it ("everyone except"). */
 export const CLIENT_SKIP = `${CLIENT}_skip`;
 
-export const CLIENT_FIREWALL: readonly string[] = [CLIENT, CLIENT_SKIP, ...SOURCE_ZONES.flatMap((z) => [forwardSection(z), markSection(z), leakSection(z)])];
+export const CLIENT_FIREWALL: readonly string[] = [
+  CLIENT,
+  CLIENT_SKIP,
+  ...SOURCE_ZONES.flatMap((z) => [forwardSection(z), markSection(z), leakSection(z)]),
+];
 
 /** netifd's rule and rule6 sections: past the main table's own routes, into the tunnel's table, and the kill switch. */
 export const CLIENT_RULES = [`${CLIENT}_main`, `${CLIENT}_via`, `${CLIENT}_kill`] as const;

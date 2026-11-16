@@ -45,20 +45,45 @@ export function describeState(s: BanipStatus): StateWords {
     case 'off':
       return { tone: 'muted', label: 'Off', text: 'Nothing is blocked. Choose how much to block below, then turn it on.' };
     case 'ap':
-      return { tone: 'muted', label: 'Not used', text: 'In access point mode the main router faces the internet, so banIP stays off here.' };
+      return {
+        tone: 'muted',
+        label: 'Not used',
+        text: 'In access point mode the main router faces the internet, so banIP stays off here.',
+      };
     case 'updating': {
       const r = s.run;
       const stage = STAGES[r?.stage ?? ''] ?? 'starting';
-      const n = r?.expected !== null && r?.expected !== undefined && r.expected > 0 ? ` (${String(r.done ?? 0)} of ${String(r.expected)})` : '';
+      const n =
+        r?.expected !== null && r?.expected !== undefined && r.expected > 0
+          ? ` (${String(r.done ?? 0)} of ${String(r.expected)})`
+          : '';
       return { tone: 'info', label: 'Updating lists', text: `banIP is ${stage}${r?.stage === 'lists' ? n : ''}.` };
     }
     case 'protecting':
-      return { tone: 'success', label: 'Protecting', text: 'Connections from the listed addresses, and to them where a list says so, are blocked.' };
+      return {
+        tone: 'success',
+        label: 'Protecting',
+        text: 'Connections from the listed addresses, and to them where a list says so, are blocked.',
+      };
     case 'error':
       return { tone: 'destructive', label: 'Error', text: errorWords(s.reason) };
     case 'stopped':
-      return { tone: 'warning', label: 'Stopped', text: 'It’s on, but its service isn’t running: nothing is blocked until it starts.' };
+      return {
+        tone: 'warning',
+        label: 'Stopped',
+        text: 'It’s on, but its service isn’t running: nothing is blocked until it starts.',
+      };
   }
+}
+
+/**
+ * What turning banIP on does and costs, said while it's off: with nothing
+ * chosen yet the switch starts the Recommended lists (the page's toggle).
+ */
+export function turnOnText(nothingChosen: boolean): string {
+  return nothingChosen
+    ? 'Turning it on downloads the Recommended lists and loads them into the router’s firewall. They use some of the router’s memory (Protection shows how much) and are downloaded again on a schedule, early in the morning by default.'
+    : 'Turning it on downloads the lists chosen under Protection and loads them into the router’s firewall. They use some of the router’s memory (shown there) and are downloaded again on the schedule under Updates.';
 }
 
 // ---- a feed's direction and port limit ---------------------------------------------------
@@ -112,7 +137,7 @@ export function portLimit(flag: string | null | undefined): PortLimit | null {
 export function limitText(l: PortLimit): string {
   const names: Record<string, string> = { '53': 'DNS', '80': 'web', '443': 'web', '853': 'DNS over TLS' };
   const known = [...new Set(l.ports.map((p) => names[p]).filter((x) => x !== undefined))];
-  return `${l.protocols.join(' and ').toUpperCase()} ports ${l.ports.join(', ')}${known.length > 0 ? ` (${known.join(', ')})` : ''}`;
+  return `${l.protocols.map((p) => p.toUpperCase()).join(' and ')} ports ${l.ports.join(', ')}${known.length > 0 ? ` (${known.join(', ')})` : ''}`;
 }
 
 // ---- presets --------------------------------------------------------------------------
@@ -129,7 +154,9 @@ export function presetOf(o: Options, enabled: boolean): PresetId {
   if (!enabled) return 'off';
   const feeds = plainFeeds(o);
   const special = listOf(o, 'ban_feed').some((f) => (SPECIAL_FEEDS as readonly string[]).includes(f));
-  const overrides = ['ban_feedin', 'ban_feedout', 'ban_feedinout', 'ban_feedreset'].some((k) => listOf(o, k as OptionName).length > 0);
+  const overrides = ['ban_feedin', 'ban_feedout', 'ban_feedinout', 'ban_feedreset'].some(
+    (k) => listOf(o, k as OptionName).length > 0,
+  );
   if (!special && !overrides) {
     for (const p of PRESETS) if (p.feeds.length > 0 && sameSet(p.feeds, feeds)) return p.id;
   }
@@ -232,9 +259,17 @@ export function estimate(sel: Selection, meta: Meta, known: Readonly<Record<stri
   const cores = Math.max(1, sel.cores ?? cpus);
   const chunk = sel.split >= 512 ? sel.split : 0;
   let load = 0;
-  for (let i = 0; i < Math.min(cores, sizes.length); i++) load += (chunk > 0 ? Math.min(sizes[i] ?? 0, chunk) : (sizes[i] ?? 0)) * bytes.load + bytes.load_base;
+  for (let i = 0; i < Math.min(cores, sizes.length); i++)
+    load += (chunk > 0 ? Math.min(sizes[i] ?? 0, chunk) : (sizes[i] ?? 0)) * bytes.load + bytes.load_base;
   load += bytes.run;
-  return { entries, perEntry: per, keptKb: Math.floor((entries * per) / 1024), loadKb: Math.floor(load / 1024), sizes: byFeed, downloadKb };
+  return {
+    entries,
+    perEntry: per,
+    keptKb: Math.floor((entries * per) / 1024),
+    loadKb: Math.floor(load / 1024),
+    sizes: byFeed,
+    downloadKb,
+  };
 }
 
 export interface MemoryCheck {
@@ -247,7 +282,12 @@ export interface MemoryCheck {
 }
 
 /** What stays free while banIP loads a selection (its lists now are dropped first), against the reserve: 15 % of memory, 96 MB at least. */
-export function memoryCheck(est: Estimate, mem: { total_kb: number; available_kb: number }, nowEntries: number, nowPerEntry: number): MemoryCheck {
+export function memoryCheck(
+  est: Estimate,
+  mem: { total_kb: number; available_kb: number },
+  nowEntries: number,
+  nowPerEntry: number,
+): MemoryCheck {
   const reserveKb = Math.max(98304, Math.floor(mem.total_kb * 0.15));
   const freedKb = Math.floor((nowEntries * nowPerEntry) / 1024);
   const leftKb = mem.available_kb + freedKb - est.keptKb - est.loadKb;
@@ -269,7 +309,8 @@ export interface Entry {
   reason?: string;
 }
 
-const V4 = /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}(\/([0-9]|[12][0-9]|3[0-2]))?$/;
+const V4 =
+  /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}(\/([0-9]|[12][0-9]|3[0-2]))?$/;
 const MAC = /^([0-9a-f]{2}(:[0-9a-f]{2}){5})(\/([0-9]|[1-3][0-9]|4[0-8]))?$/;
 const DOMAIN = /^([a-z0-9_-]{1,63}\.)+[a-z]+$/;
 
@@ -312,7 +353,8 @@ export function parseEntry(raw: string): Entry {
     if (v6Ok(ip)) return { kind: 'mac', value: `${first} ${ip}`, mac: m, ip4: null, ip6: ip, comment };
     return { kind: 'invalid', reason: 'address' };
   }
-  if (DOMAIN.test(first) && first.length <= 253) return words.length === 1 ? { kind: 'domain', value: first, comment } : { kind: 'invalid', reason: 'extra' };
+  if (DOMAIN.test(first) && first.length <= 253)
+    return words.length === 1 ? { kind: 'domain', value: first, comment } : { kind: 'invalid', reason: 'extra' };
   if (/^[0-9./]+$/.test(first)) return { kind: 'invalid', reason: 'address' };
   return { kind: 'invalid', reason: 'unknown' };
 }
@@ -339,7 +381,7 @@ export function summarize(entries: readonly Entry[]): ListSummary {
     if (e.kind === 'v4' || e.kind === 'v6') {
       if ((e.value ?? '').includes('/')) s.networks++;
       else s.addresses++;
-      if ((e.comment ?? '').startsWith('milkflint: ') || (e.comment ?? '').startsWith("uplink added on ")) s.managed++;
+      if ((e.comment ?? '').startsWith('milkflint: ') || (e.comment ?? '').startsWith('uplink added on ')) s.managed++;
     } else if (e.kind === 'mac') s.devices++;
     else if (e.kind === 'domain') s.names++;
     else if (e.kind === 'invalid') s.problems++;
@@ -356,9 +398,9 @@ export function formatEntry(value: string, comment?: string | null): string {
 export function lineOwner(comment: string | null | undefined): 'milkflint' | 'uplink' | 'lookup' | 'monitor' | 'you' {
   const c = comment ?? '';
   if (c.startsWith('milkflint: ')) return 'milkflint';
-  if (c.startsWith("uplink added on ")) return 'uplink';
+  if (c.startsWith('uplink added on ')) return 'uplink';
   if (/^'[^']+' added on /.test(c)) return 'lookup';
-  if (c.startsWith("added on ")) return 'monitor';
+  if (c.startsWith('added on ')) return 'monitor';
   return 'you';
 }
 
@@ -413,7 +455,10 @@ export function overlaps(a: Net | null, z: Net | null): boolean {
 }
 
 /** Blocklist entries that would reach one of the router's inside networks (the router refuses them; said as you type). */
-export function insideConflicts(entries: readonly Entry[], inside: readonly { iface: string; net: string }[]): { value: string; iface: string }[] {
+export function insideConflicts(
+  entries: readonly Entry[],
+  inside: readonly { iface: string; net: string }[],
+): { value: string; iface: string }[] {
   const out: { value: string; iface: string }[] = [];
   const nets = inside.map((n) => ({ ...n, parsed: parseNet(n.net) }));
   for (const e of entries) {
@@ -472,10 +517,21 @@ export interface DropWords {
 export function describeDrop(d: Drop): DropWords {
   if (d.dir === 'out') return { direction: 'From your network', outside: d.dst, inside: d.src, service: serviceOf(d) };
   if (d.dir === 'pre') {
-    const kinds: Record<string, string> = { icmp: 'ICMP flood', syn: 'SYN flood', udp: 'UDP flood', tcp: 'odd TCP flags', ct: 'out-of-state' };
+    const kinds: Record<string, string> = {
+      icmp: 'ICMP flood',
+      syn: 'SYN flood',
+      udp: 'UDP flood',
+      tcp: 'odd TCP flags',
+      ct: 'out-of-state',
+    };
     return { direction: kinds[d.kind] ?? 'Before the lists', outside: d.src, inside: null, service: serviceOf(d) };
   }
-  return { direction: d.out === '' ? 'To the router' : 'To a device', outside: d.src, inside: d.out === '' ? null : d.dst, service: serviceOf(d) };
+  return {
+    direction: d.out === '' ? 'To the router' : 'To a device',
+    outside: d.src,
+    inside: d.out === '' ? null : d.dst,
+    service: serviceOf(d),
+  };
 }
 
 export interface LogLine {
@@ -507,7 +563,13 @@ export function parseLogLine(line: string): LogLine | null {
         const i = w.indexOf('=');
         if (i > 0 && !(w.slice(0, i) in fields)) fields[w.slice(0, i)] = w.slice(i + 1);
       }
-      return { time, level, kind: 'drop', message: msg.replace(/^\[\s*\d+\.\d+\] /, ''), drop: { dir: d[1] ?? '', policy: d[2] ?? '', set: d[3] ?? null, fields } };
+      return {
+        time,
+        level,
+        kind: 'drop',
+        message: msg.replace(/^\[\s*\d+\.\d+\] /, ''),
+        drop: { dir: d[1] ?? '', policy: d[2] ?? '', set: d[3] ?? null, fields },
+      };
     }
   }
   if (/^banIP-[^ ]*\[\d+\]$/.test(tag)) return { time, level, kind: 'banip', message: msg };

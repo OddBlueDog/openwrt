@@ -41,7 +41,7 @@ function tlv(b: Uint8Array, at: number, limit: number): Tlv {
 /** The elements inside a constructed one, in order. */
 function children(b: Uint8Array, parent: Tlv): Tlv[] {
   const out: Tlv[] = [];
-  for (let at = parent.start; at < parent.end; ) {
+  for (let at = parent.start; at < parent.end;) {
     const t = tlv(b, at, parent.end);
     out.push(t);
     at = t.end;
@@ -63,7 +63,8 @@ const GENERALIZED_TIME = 0x18;
 const CN = '550403';
 const SAN = '551d11';
 
-const hex = (b: Uint8Array, t: Tlv): string => Array.from(b.subarray(t.start, t.end), (x) => x.toString(16).padStart(2, '0')).join('');
+const hex = (b: Uint8Array, t: Tlv): string =>
+  Array.from(b.subarray(t.start, t.end), (x) => x.toString(16).padStart(2, '0')).join('');
 const ascii = (b: Uint8Array, t: Tlv): string => String.fromCharCode(...b.subarray(t.start, t.end));
 
 function text(b: Uint8Array, t: Tlv): string {
@@ -80,7 +81,12 @@ function text(b: Uint8Array, t: Tlv): string {
 function time(b: Uint8Array, t: Tlv): Date {
   const s = ascii(b, t);
   // UTCTime YYMMDDHHMMSSZ (years 1950-2049), GeneralizedTime YYYYMMDDHHMMSSZ
-  const m = t.tag === UTC_TIME ? /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s) : t.tag === GENERALIZED_TIME ? /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s) : null;
+  const m =
+    t.tag === UTC_TIME
+      ? /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s)
+      : t.tag === GENERALIZED_TIME
+        ? /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(s)
+        : null;
   if (m === null) throw new DerError(`bad time ${s}`);
   const [, y = '', mo = '', d = '', h = '', mi = '', sec = ''] = m;
   const year = t.tag === UTC_TIME ? (Number(y) >= 50 ? 1900 : 2000) + Number(y) : Number(y);
@@ -104,7 +110,7 @@ function ipAddress(bytes: Uint8Array): string {
   for (let i = 0; i + 1 < bytes.length; i += 2) groups.push(((bytes[i] ?? 0) << 8) | (bytes[i + 1] ?? 0));
   // the longest run of two or more zero groups becomes "::" (RFC 5952)
   let best = { at: -1, len: 1 };
-  for (let i = 0; i < groups.length; ) {
+  for (let i = 0; i < groups.length;) {
     let j = i;
     while (groups[j] === 0) j++;
     if (j - i > best.len) best = { at: i, len: j - i };

@@ -8,7 +8,17 @@
 // on one queue.
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, test } from 'node:test';
@@ -379,7 +389,9 @@ class Router {
     writeFileSync(join(r, 'proc/cpuinfo'), [0, 1, 2, 3].map((n) => `processor\t: ${n}\n`).join(''));
     writeFileSync(
       join(r, 'etc/sqm/sqm.conf'),
-      readFileSync(join(tree, 'platform/openwrt/sqm.conf'), 'utf8').replaceAll('/usr/lib/sqm', this.lib).replaceAll('/var/run/sqm', this.state),
+      readFileSync(join(tree, 'platform/openwrt/sqm.conf'), 'utf8')
+        .replaceAll('/usr/lib/sqm', this.lib)
+        .replaceAll('/var/run/sqm', this.state),
     );
     // the qdiscs found usable at the first run since boot, as a router has them
     for (const q of ['fq_codel', 'codel', 'pie', 'sfq', 'cake']) {
@@ -445,7 +457,8 @@ class Router {
 
   qdiscs(dev: string): Qdiscs {
     const tc = join(this.net, dev, '.tc');
-    const read = (f: string): string | undefined => (existsSync(join(tc, f)) ? readFileSync(join(tc, f), 'utf8').trim() : undefined);
+    const read = (f: string): string | undefined =>
+      existsSync(join(tc, f)) ? readFileSync(join(tc, f), 'utf8').trim() : undefined;
     const root = read('root')?.split(' ');
     return {
       root: root === undefined ? undefined : { kind: root[0] ?? '', handle: root[1] ?? '', args: root.slice(2).join(' ') },
@@ -466,12 +479,21 @@ class Router {
   /** the tc and ip commands run since <mark> (calls().length before) */
   calls(mark = 0): string[] {
     const f = join(this.root, 'calls.log');
-    return existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter((l) => l !== '').slice(mark) : [];
+    return existsSync(f)
+      ? readFileSync(f, 'utf8')
+          .split('\n')
+          .filter((l) => l !== '')
+          .slice(mark)
+      : [];
   }
 
   syslog(): string[] {
     const f = join(this.root, 'syslog');
-    return existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter((l) => l !== '') : [];
+    return existsSync(f)
+      ? readFileSync(f, 'utf8')
+          .split('\n')
+          .filter((l) => l !== '')
+      : [];
   }
 
   /** the pretend tc and ip themselves, as someone at the router's shell */
@@ -541,7 +563,10 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     ['layer_cake, a word tc does not know', { script: 'layer_cake.qos', iqdisc_opts: 'bogus' }],
     ['simple.qos with cake, a word tc does not know', { script: 'simple.qos', iqdisc_opts: 'bogus' }],
     ['simple.qos with fq_codel, a word tc does not know', { script: 'simple.qos', qdisc: 'fq_codel', iqdisc_opts: 'bogus' }],
-    ['simple.qos with fq_codel, DSCP kept on the download', { script: 'simple.qos', qdisc: 'fq_codel', squash_ingress: '0', iqdisc_opts: 'bogus' }],
+    [
+      'simple.qos with fq_codel, DSCP kept on the download',
+      { script: 'simple.qos', qdisc: 'fq_codel', squash_ingress: '0', iqdisc_opts: 'bogus' },
+    ],
     ['simplest.qos with fq_codel, a word tc does not know', { script: 'simplest.qos', qdisc: 'fq_codel', iqdisc_opts: 'bogus' }],
     ['simplest.qos with cake, a word tc does not know', { script: 'simplest.qos', iqdisc_opts: 'bogus' }],
     ['simplest_tbf.qos, a word tc does not know', { script: 'simplest_tbf.qos', qdisc: 'fq_codel', iqdisc_opts: 'bogus' }],
@@ -614,15 +639,19 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     assert.ok(!r.syslog().some((l) => l.includes('NOT useable')), r.syslog().join('\n'));
   });
 
-  test('download multi-queue on, upload off: one CAKE on the port, cake_mq on the ifb; both off: one CAKE each', { skip }, async () => {
-    const r = new Router();
-    r.sqm({ eth1: WAN });
-    await r.run('start');
-    assertShaping(r, 'eth1', 'cake', 'cake_mq');
-    r.sqm({ eth1: { ...WAN, use_mq: '0' } });
-    await r.run('reload');
-    assertShaping(r, 'eth1', 'cake', 'cake');
-  });
+  test(
+    'download multi-queue on, upload off: one CAKE on the port, cake_mq on the ifb; both off: one CAKE each',
+    { skip },
+    async () => {
+      const r = new Router();
+      r.sqm({ eth1: WAN });
+      await r.run('start');
+      assertShaping(r, 'eth1', 'cake', 'cake_mq');
+      r.sqm({ eth1: { ...WAN, use_mq: '0' } });
+      await r.run('reload');
+      assertShaping(r, 'eth1', 'cake', 'cake');
+    },
+  );
 
   test('an ifup with nothing changed leaves the queue as it is (wan6 coming up on wan’s device)', { skip }, async () => {
     const r = new Router();
@@ -630,7 +659,8 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     await r.run('start');
     const before = [r.qdiscs('eth1'), r.qdiscs('ifb4eth1')];
     const mark = r.calls().length;
-    for (const iface of ['wan', 'wan6']) assert.equal((await r.hotplug({ ACTION: 'ifup', INTERFACE: iface, DEVICE: 'eth1' })).status, 0);
+    for (const iface of ['wan', 'wan6'])
+      assert.equal((await r.hotplug({ ACTION: 'ifup', INTERFACE: iface, DEVICE: 'eth1' })).status, 0);
     assert.deepEqual(touched(r, mark, 'eth1'), []);
     assert.deepEqual([r.qdiscs('eth1'), r.qdiscs('ifb4eth1')], before);
     assert.equal(r.syslog().filter((l) => l.includes('SQM on eth1 runs as set')).length, 2);
@@ -697,30 +727,40 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     verbosity: '5',
   };
 
-  test('every option a start reads stops and starts its queue again when it changes, never leaves it running as it was', { skip }, async () => {
-    const options = readFileSync(join(tree, 'src/run-openwrt.sh'), 'utf8').matchAll(/config_get "\$section" (\w+)\)/g);
-    const read = [...new Set([...options].map((m) => m[1] ?? ''))].filter((o) => o !== 'interface' && o !== 'enabled');
-    assert.ok(read.length >= 24 && read.includes('use_mq_egress'), read.join(' '));
-    const r = new Router();
-    r.sqm({ eth1: WAN });
-    await r.run('start');
-    for (const option of read) {
-      const value = ALTERNATIVE[option];
-      assert.notEqual(value, undefined, `a value to try for ${option}`);
-      r.sqm({ eth1: { ...WAN, [option]: value ?? '' } });
-      const mark = r.calls().length;
-      const lines = r.syslog().length;
-      await r.run('reload');
-      assert.ok(
-        touched(r, mark, 'eth1').some((c) => c.startsWith('tc qdisc del dev eth1')),
-        `${option}: stopped and started again`,
-      );
-      assert.ok(!r.syslog().slice(lines).some((l) => l.includes('runs as set')), option);
-      // back as it was, for the next
+  test(
+    'every option a start reads stops and starts its queue again when it changes, never leaves it running as it was',
+    { skip },
+    async () => {
+      const options = readFileSync(join(tree, 'src/run-openwrt.sh'), 'utf8').matchAll(/config_get "\$section" (\w+)\)/g);
+      const read = [...new Set([...options].map((m) => m[1] ?? ''))].filter((o) => o !== 'interface' && o !== 'enabled');
+      assert.ok(read.length >= 24 && read.includes('use_mq_egress'), read.join(' '));
+      const r = new Router();
       r.sqm({ eth1: WAN });
-      await r.run('reload');
-    }
-  });
+      await r.run('start');
+      for (const option of read) {
+        const value = ALTERNATIVE[option];
+        assert.notEqual(value, undefined, `a value to try for ${option}`);
+        r.sqm({ eth1: { ...WAN, [option]: value ?? '' } });
+        const mark = r.calls().length;
+        const lines = r.syslog().length;
+        await r.run('reload');
+        assert.ok(
+          touched(r, mark, 'eth1').some((c) => c.startsWith('tc qdisc del dev eth1')),
+          `${option}: stopped and started again`,
+        );
+        assert.ok(
+          !r
+            .syslog()
+            .slice(lines)
+            .some((l) => l.includes('runs as set')),
+          option,
+        );
+        // back as it was, for the next
+        r.sqm({ eth1: WAN });
+        await r.run('reload');
+      }
+    },
+  );
 
   test('an option nothing reads (LuCI’s) restarts it too: what counts is the whole section', { skip }, async () => {
     const r = new Router();
@@ -858,7 +898,10 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
       change(r);
       const mark = r.calls().length;
       assert.equal((await r.hotplug({ ACTION: 'ifup', INTERFACE: 'wan', DEVICE: 'eth1' })).status, 0);
-      assert.ok(touched(r, mark, 'eth1').some((c) => c.startsWith('tc qdisc add dev eth1 root')), 'started again');
+      assert.ok(
+        touched(r, mark, 'eth1').some((c) => c.startsWith('tc qdisc add dev eth1 root')),
+        'started again',
+      );
       assertShaping(r, 'eth1', 'cake', 'cake_mq');
       // and then it holds
       const again = r.calls().length;
@@ -878,22 +921,26 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     assert.deepEqual(touched(r, mark, 'eth1'), []);
   });
 
-  test('ifdown (netifd names no device): a queue whose device went with it is stopped, its ifb and state with it', { skip }, async () => {
-    const r = new Router();
-    r.dev('pppoe-wan', 1, 1492);
-    r.sqm({ wan: { ...WAN, interface: 'pppoe-wan', use_mq: '0' }, guest: GUEST });
-    await r.run('start');
-    assertShaping(r, 'pppoe-wan');
-    r.gone('pppoe-wan');
-    const mark = r.calls().length;
-    assert.equal((await r.hotplug({ ACTION: 'ifdown', INTERFACE: 'wan' })).status, 0);
-    assert.equal(r.exists('ifb4pppoe-wan'), false);
-    assert.equal(r.stateFile('pppoe-wan'), undefined);
-    // the guest network's queue is on a device that's still there
-    assert.deepEqual(touched(r, mark, 'br-guest'), []);
-    assertShaping(r, 'br-guest');
-    assert.ok(!r.syslog().some((l) => l.startsWith('ERROR')), r.syslog().join('\n'));
-  });
+  test(
+    'ifdown (netifd names no device): a queue whose device went with it is stopped, its ifb and state with it',
+    { skip },
+    async () => {
+      const r = new Router();
+      r.dev('pppoe-wan', 1, 1492);
+      r.sqm({ wan: { ...WAN, interface: 'pppoe-wan', use_mq: '0' }, guest: GUEST });
+      await r.run('start');
+      assertShaping(r, 'pppoe-wan');
+      r.gone('pppoe-wan');
+      const mark = r.calls().length;
+      assert.equal((await r.hotplug({ ACTION: 'ifdown', INTERFACE: 'wan' })).status, 0);
+      assert.equal(r.exists('ifb4pppoe-wan'), false);
+      assert.equal(r.stateFile('pppoe-wan'), undefined);
+      // the guest network's queue is on a device that's still there
+      assert.deepEqual(touched(r, mark, 'br-guest'), []);
+      assertShaping(r, 'br-guest');
+      assert.ok(!r.syslog().some((l) => l.startsWith('ERROR')), r.syslog().join('\n'));
+    },
+  );
 
   test('ifdown of an interface whose device stays (wan6 on eth1): the queue keeps running', { skip }, async () => {
     const r = new Router();
@@ -918,7 +965,10 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
       if (gone) r.gone('eth1');
       const lines = r.syslog().length;
       assert.equal((await r.run('stop')).status, 0);
-      const errors = r.syslog().slice(lines).filter((l) => l.startsWith('ERROR'));
+      const errors = r
+        .syslog()
+        .slice(lines)
+        .filter((l) => l.startsWith('ERROR'));
       assert.deepEqual(errors, []);
       if (!gone) assertNothing(r, 'eth1');
       assert.equal(r.exists('ifb4eth1'), false);
@@ -939,14 +989,22 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     const r = new Router();
     r.sqm({ eth1: WAN });
     mkdirSync(r.state, { recursive: true });
-    const holder = spawn('perl', ['-e', 'use Fcntl qw(:flock); $| = 1; open(F, ">", $ARGV[0]) or die; flock(F, LOCK_EX) or die; print "held\\n"; sleep 60', join(r.state, 'run.lock')]);
-    await new Promise<void>((resolve) => holder.stdout.once('data', () => {
+    const holder = spawn('perl', [
+      '-e',
+      'use Fcntl qw(:flock); $| = 1; open(F, ">", $ARGV[0]) or die; flock(F, LOCK_EX) or die; print "held\\n"; sleep 60',
+      join(r.state, 'run.lock'),
+    ]);
+    await new Promise<void>((resolve) =>
+      holder.stdout.once('data', () => {
         resolve();
-      }));
+      }),
+    );
     holder.kill('SIGKILL');
-    await new Promise<void>((resolve) => holder.once('exit', () => {
+    await new Promise<void>((resolve) =>
+      holder.once('exit', () => {
         resolve();
-      }));
+      }),
+    );
     const t0 = Date.now();
     assert.equal((await r.run('start')).status, 0);
     // the lock's 10 tries, had it stayed taken, would take 10 s and fail
@@ -960,12 +1018,19 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     r.sqm({ eth1: WAN });
     mkdirSync(r.state, { recursive: true });
     // holds the lock until told to let go (a line on its stdin)
-    const holder = spawn('perl', ['-e', 'use Fcntl qw(:flock); $| = 1; open(F, ">", $ARGV[0]) or die; flock(F, LOCK_EX) or die; print "held\\n"; <STDIN>', join(r.state, 'run.lock')]);
-    await new Promise<void>((resolve) => holder.stdout.once('data', () => {
+    const holder = spawn('perl', [
+      '-e',
+      'use Fcntl qw(:flock); $| = 1; open(F, ">", $ARGV[0]) or die; flock(F, LOCK_EX) or die; print "held\\n"; <STDIN>',
+      join(r.state, 'run.lock'),
+    ]);
+    await new Promise<void>((resolve) =>
+      holder.stdout.once('data', () => {
         resolve();
-      }));
+      }),
+    );
     const run = r.run('start');
-    while (!r.syslog().some((l) => l.includes('Unable to get run lock'))) await new Promise((resolve) => setTimeout(resolve, 100));
+    while (!r.syslog().some((l) => l.includes('Unable to get run lock')))
+      await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(r.stateFile('eth1'), undefined, 'nothing started while the lock was held');
     holder.stdin.end('\n');
     assert.equal((await run).status, 0);

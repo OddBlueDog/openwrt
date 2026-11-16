@@ -2,13 +2,33 @@
 // the worst answer where a point stands for several probes, red marks where
 // probes were lost, grey where nothing was recorded. The table under it is
 // also the legend: a name shows or hides a line, and the scale fits the
-// lines left, from their lowest to their highest typical time.
-import { DownloadIcon, LoaderCircleIcon } from 'lucide-react';
+// lines left, from their lowest to their highest typical time, short of a
+// spike far above a line's typical (drawn at the top, marked and said).
+import { ChevronUpIcon, DownloadIcon, LoaderCircleIcon } from 'lucide-react';
 import { type PointerEvent, type ReactElement, useEffect, useRef, useState } from 'react';
 import { ChartHover } from '@/components/charts/chart-hover';
 import { Button } from '@/components/ui/button';
+import { formatNumber } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
-import { type ChartLine, formatLoss, formatSliceTime, type LineStats, lineStats, lossBins, lossSliceAt, niceRange, pointStep, runs, slotValues, timeTicks, unrecorded } from './chart-data';
+import {
+  type ChartLine,
+  chartScale,
+  formatLoss,
+  formatSliceTime,
+  type LineStats,
+  lineStats,
+  lossBins,
+  lossSliceAt,
+  offScale,
+  pointStep,
+  runs,
+  slotValues,
+  timeTicks,
+  unrecorded,
+} from './chart-data';
+import { seriesDash } from '@/components/charts/series';
+import { SeriesSwatch } from '@/components/charts/series-swatch';
+import { useTheme } from '@/lib/theme';
 
 function linePaths(line: ChartLine, start: number, end: number, min: number, max: number): { line: string; band: string } {
   const x = (t: number): string => (((t - start) / (end - start)) * 100).toFixed(2);
@@ -19,7 +39,10 @@ function linePaths(line: ChartLine, start: number, end: number, min: number, max
     d += `${run.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.t)} ${y(p.v)}`).join(' ')} `;
     if (run.some((p) => p.worst !== undefined && p.worst > p.v)) {
       const top = run.map((p, i) => `${i === 0 ? 'M' : 'L'}${x(p.t)} ${y(p.worst ?? p.v)}`).join(' ');
-      const back = [...run].reverse().map((p) => `L${x(p.t)} ${y(p.v)}`).join(' ');
+      const back = [...run]
+        .reverse()
+        .map((p) => `L${x(p.t)} ${y(p.v)}`)
+        .join(' ');
       band += `${top} ${back} Z `;
     }
   }
@@ -56,14 +79,22 @@ function LossStrip({ lines, start, end }: { lines: readonly ChartLine[]; start: 
       className="relative mt-1.5 h-1.5 rounded-sm bg-muted/60"
       data-testid="loss-strip"
       role="img"
-      aria-label={bins.length === 0 ? 'No probes lost' : `Probes lost at ${String(bins.length)} points in this span; the table has each line's share`}
+      aria-label={
+        bins.length === 0
+          ? 'No probes lost'
+          : `Probes lost at ${String(bins.length)} points in this span; the table has each line's share`
+      }
     >
-      <span className="absolute top-1/2 right-full -translate-y-1/2 pr-2 font-mono text-[10px] text-muted-foreground">lost</span>
+      <span className="absolute top-1/2 right-full -translate-y-1/2 pr-2 text-xs text-muted-foreground">lost</span>
       {bins.map((b) => (
         <div
           key={b.from}
           className="absolute inset-y-0 min-w-px bg-destructive"
-          style={{ left: `${String(xPct(b.from))}%`, width: `${String(xPct(b.to) - xPct(b.from))}%`, opacity: 0.45 + 0.55 * b.share }}
+          style={{
+            left: `${String(xPct(b.from))}%`,
+            width: `${String(xPct(b.to) - xPct(b.from))}%`,
+            opacity: 0.45 + 0.55 * b.share,
+          }}
         />
       ))}
       {slice !== undefined && (
@@ -78,7 +109,7 @@ function LossStrip({ lines, start, end }: { lines: readonly ChartLine[]; start: 
             // centred on the pointer, kept within the strip so it stays on a phone's screen
             style={{ left: `clamp(0px, calc(${String(x)}% - 7.5rem), calc(100% - min(15rem, 100%)))` }}
           >
-            <span className="font-mono text-[10px] text-muted-foreground">{formatSliceTime(slice.from, slice.to, span)}</span>
+            <span className="text-xs text-muted-foreground tabular">{formatSliceTime(slice.from, slice.to, span)}</span>
             {slice.lines.length === 0 ? (
               <span className="font-medium">{slice.rounds === 0 ? 'Nothing measured' : 'Every probe answered'}</span>
             ) : (
@@ -92,8 +123,9 @@ function LossStrip({ lines, start, end }: { lines: readonly ChartLine[]; start: 
                 </span>
               ))
             )}
-            <span className="border-t pt-1 text-[11px] text-muted-foreground">
-              Red marks are probes that got no answer; a darker mark means a bigger share of them. A mark can be a single lost probe, not an outage.
+            <span className="border-t pt-1 text-xs text-muted-foreground">
+              Red marks are probes that got no answer; a darker mark means a bigger share of them. A mark can be a single lost
+              probe, not an outage.
             </span>
           </div>
         </>
@@ -101,7 +133,7 @@ function LossStrip({ lines, start, end }: { lines: readonly ChartLine[]; start: 
       {/* easier to find than the thin strip itself */}
       <div
         ref={target}
-        className="absolute -inset-y-1.5 inset-x-0 touch-pan-y"
+        className="absolute inset-x-0 -inset-y-1.5 touch-pan-y"
         onPointerMove={onPointer}
         onPointerDown={onPointer}
         onPointerLeave={(e) => {
@@ -135,11 +167,12 @@ function Plot({
   format: (v: number) => string;
   hoverFormat: (v: number) => string;
 }): ReactElement {
-  // the typical times set the scale; a worst answer far above them is cut off at the top
-  const values = lines.flatMap((l) => l.points.flatMap((p) => (p.v === undefined ? [] : [p.v])));
-  const { min, max, ticks } = niceRange(Math.min(...values), Math.max(...values), minSpan);
+  // the typical times set the scale, short of a spike far above a line's
+  // typical; a worst answer far above them is cut off at the top
+  const { min, max, ticks, above } = chartScale(lines, minSpan);
   const yPct = (v: number): number => 100 - ((v - min) / (max - min)) * 100;
   const xPct = (t: number): number => ((t - start) / (end - start)) * 100;
+  const over = offScale(lines, start, end, max);
 
   const steps = lines.filter((l) => l.points.length > 1).map((l) => pointStep(l.points));
   const step = Math.max(1, Math.min(...steps, 900));
@@ -147,8 +180,8 @@ function Plot({
   const hover = lines.map((l) => ({ label: l.label, color: l.color, ...slotValues(l, start, step, slots, hoverFormat) }));
 
   return (
-    <div className="flex flex-col gap-1.5 pl-12" data-testid="latency-plot">
-      <div className="relative mt-2 h-52">
+    <div className="flex flex-col gap-1.5 pl-14" data-testid="latency-plot">
+      <div className="relative mt-3 h-52">
         {/* nothing recorded */}
         {unrecorded(allLines, start, end).map((g) => (
           <div
@@ -160,13 +193,19 @@ function Plot({
         {/* the scale */}
         {ticks.map((v) => (
           <div key={v} className="pointer-events-none absolute inset-x-0" style={{ top: `${String(yPct(v))}%` }}>
-            <span className="absolute right-full w-12 -translate-y-1/2 pr-2 text-right font-mono text-[10px] text-muted-foreground tabular">{format(v)}</span>
+            <span className="absolute right-full w-14 -translate-y-1/2 pr-2 text-right text-xs whitespace-nowrap text-muted-foreground tabular">
+              {format(v)}
+            </span>
             <div className={cn('h-px border-t', v === 0 ? 'border-border' : 'border-dashed border-border/70')} />
           </div>
         ))}
         {/* clock marks */}
         {timeTicks(start, end).map((tick) => (
-          <div key={tick.t} className="pointer-events-none absolute inset-y-0 w-px border-l border-dashed border-border/50" style={{ left: `${String(xPct(tick.t))}%` }} />
+          <div
+            key={tick.t}
+            className="pointer-events-none absolute inset-y-0 w-px border-l border-dashed border-border/50"
+            style={{ left: `${String(xPct(tick.t))}%` }}
+          />
         ))}
         <svg
           viewBox="0 0 100 100"
@@ -180,17 +219,43 @@ function Plot({
             return (
               <g key={l.key}>
                 {p.band !== '' && <path d={p.band} fill={l.color} fillOpacity="0.12" />}
-                <path d={p.line} fill="none" stroke={l.color} strokeWidth="1.6" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+                <path
+                  d={p.line}
+                  fill="none"
+                  stroke={l.color}
+                  style={{ strokeDasharray: seriesDash(l.color, lines.length) }}
+                  strokeWidth="1.6"
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                  vectorEffect="non-scaling-stroke"
+                />
               </g>
             );
           })}
         </svg>
+        {/* points above the top: drawn at it, with a mark in the line's colour */}
+        {over.map((o) => (
+          <ChevronUpIcon
+            key={o.key}
+            aria-hidden="true"
+            strokeWidth={3}
+            className="pointer-events-none absolute top-0 size-3 -translate-x-1/2 -translate-y-full"
+            style={{ left: `${String(xPct(o.t))}%`, color: o.color }}
+          />
+        ))}
         <div className="absolute inset-0">
-          <ChartHover series={hover} slots={slots} min={min} max={max} format={hoverFormat} timeOf={(slot) => start + slot * step} />
+          <ChartHover
+            series={hover}
+            slots={slots}
+            min={min}
+            max={max}
+            format={hoverFormat}
+            timeOf={(slot) => start + slot * step}
+          />
         </div>
       </div>
       <LossStrip lines={lines} start={start} end={end} />
-      <div className="relative h-3.5 font-mono text-[10px] text-muted-foreground">
+      <div className="relative h-4 text-xs text-muted-foreground">
         {timeTicks(start, end).map((tick) => (
           <span key={tick.t} className="absolute -translate-x-1/2 tabular" style={{ left: `${String(xPct(tick.t))}%` }}>
             {tick.label}
@@ -198,12 +263,33 @@ function Plot({
         ))}
         <span className="absolute right-0">now</span>
       </div>
+      {above !== undefined && (
+        <p className="flex items-start gap-1 text-xs text-muted-foreground">
+          <ChevronUpIcon aria-hidden="true" strokeWidth={3} className="mt-0.5 size-3 shrink-0" />
+          <span>
+            The scale stops at {format(max)}: {above.count === 1 ? 'one point is' : `${formatNumber(above.count)} points are`}{' '}
+            above it, drawn at the top; the highest was {hoverFormat(above.highest)}.
+          </span>
+        </p>
+      )}
     </div>
   );
 }
 
-function Value({ v, format, className }: { v: number | undefined; format: (v: number) => string; className?: string }): ReactElement {
-  return <td className={cn('py-1.5 pl-2 text-right whitespace-nowrap tabular sm:pl-3', className)}>{v === undefined ? '—' : format(v)}</td>;
+function Value({
+  v,
+  format,
+  className,
+}: {
+  v: number | undefined;
+  format: (v: number) => string;
+  className?: string;
+}): ReactElement {
+  return (
+    <td className={cn('py-1.5 pl-2 text-right whitespace-nowrap tabular sm:pl-3', className)}>
+      {v === undefined ? '—' : format(v)}
+    </td>
+  );
 }
 
 function StatsRow({
@@ -212,12 +298,15 @@ function StatsRow({
   hidden,
   onToggle,
   format,
+  dash,
 }: {
   line: ChartLine;
   stats: LineStats;
   hidden: boolean;
   onToggle: () => void;
   format: (v: number) => string;
+  /** the line's dash, where the theme dashes lines drawn together: the key shows it */
+  dash?: string | undefined;
 }): ReactElement {
   return (
     <tr className={cn('border-t', hidden && 'text-muted-foreground')}>
@@ -229,16 +318,36 @@ function StatsRow({
           className="flex w-full min-w-0 items-center gap-2 rounded-sm py-0.5 text-left outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           onClick={onToggle}
         >
-          <span className="size-2.5 shrink-0 rounded-full border-2" style={{ borderColor: line.color, background: hidden ? 'transparent' : line.color }} />
+          {dash === undefined ? (
+            <span
+              className="size-2.5 shrink-0 rounded-full border-2"
+              style={{ borderColor: line.color, background: hidden ? 'transparent' : line.color }}
+            />
+          ) : (
+            <SeriesSwatch color={line.color} dash={dash} className={cn(hidden && 'opacity-40')} />
+          )}
           <span className={cn('min-w-0 font-medium sm:truncate', hidden && 'font-normal line-through')}>{line.label}</span>
-          {line.detail !== undefined && <span className="hidden truncate font-mono text-[11px] font-normal text-muted-foreground lg:inline">{line.detail}</span>}
+          {line.detail !== undefined && (
+            <span className="hidden truncate font-mono text-xs font-normal text-muted-foreground lg:inline">{line.detail}</span>
+          )}
         </button>
       </td>
-      {stats.now === null ? <td className="py-1.5 pl-2 text-right whitespace-nowrap text-destructive sm:pl-3">{line.countLoss ? 'lost' : '—'}</td> : <Value v={stats.now} format={format} className="font-medium" />}
+      {stats.now === null ? (
+        <td className="py-1.5 pl-2 text-right whitespace-nowrap text-destructive sm:pl-3">{line.countLoss ? 'lost' : '—'}</td>
+      ) : (
+        <Value v={stats.now} format={format} className="font-medium" />
+      )}
       <Value v={stats.typical} format={format} />
       <Value v={stats.best} format={format} className="hidden sm:table-cell" />
       <Value v={stats.worst} format={format} />
-      <td className={cn('py-1.5 pl-2 text-right whitespace-nowrap tabular sm:pl-3', line.countLoss && stats.loss > 0 && 'text-warning')}>{line.countLoss ? formatLoss(stats.loss) : '—'}</td>
+      <td
+        className={cn(
+          'py-1.5 pl-2 text-right whitespace-nowrap tabular sm:pl-3',
+          line.countLoss && stats.loss > 0 && 'text-warning',
+        )}
+      >
+        {line.countLoss ? formatLoss(stats.loss) : '—'}
+      </td>
     </tr>
   );
 }
@@ -305,6 +414,10 @@ export function LatencyChart({
   hoverFormat: (v: number) => string;
   csv: () => Promise<{ name: string; text: string }>;
 }): ReactElement {
+  // the keys show a line only for series the theme dashes; otherwise the round dot as always
+  const dashes = useTheme().theme.chart.dash;
+  // a chart the theme dashes keys every line as a line (solid ones too), so the keys read alike
+  const dashing = lines.some((l) => seriesDash(l.color, lines.length, false, dashes) !== undefined);
   const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set());
   const shown = lines.filter((l) => !hidden.has(l.key));
   const toggle = (key: string): void => {
@@ -316,18 +429,46 @@ export function LatencyChart({
   };
   return (
     <div className="flex flex-col gap-3">
-      <Plot label={label} lines={shown} allLines={lines} start={start} end={end} spanLabel={spanLabel} minSpan={minSpan} format={format} hoverFormat={hoverFormat} />
+      <Plot
+        label={label}
+        lines={shown}
+        allLines={lines}
+        start={start}
+        end={end}
+        spanLabel={spanLabel}
+        minSpan={minSpan}
+        format={format}
+        hoverFormat={hoverFormat}
+      />
       <table className="w-full table-fixed text-xs sm:text-sm">
         <thead>
           <tr className="text-xs text-muted-foreground">
             <th scope="col" className="w-[31%] py-1.5 text-left font-normal sm:w-auto">
               Last {spanLabel}
             </th>
-            <th scope="col" className="w-[17%] py-1.5 pl-2 text-right font-normal sm:pl-3 sm:w-[4.75rem]">Now</th>
-            <th scope="col" className="w-[18%] py-1.5 pl-2 text-right font-normal sm:pl-3 sm:w-[4.75rem]" title="The median">Typical</th>
-            <th scope="col" className="hidden py-1.5 pl-2 text-right font-normal sm:table-cell sm:pl-3 sm:w-[4.75rem]" title="The fastest answer">Best</th>
-            <th scope="col" className="w-[17%] py-1.5 pl-2 text-right font-normal sm:pl-3 sm:w-[4.75rem]" title="95th percentile">Worst</th>
-            <th scope="col" className="w-[17%] py-1.5 pl-2 text-right font-normal sm:pl-3 sm:w-[4.75rem]" title="Probes without an answer">Lost</th>
+            <th scope="col" className="w-[17%] py-1.5 pl-2 text-right font-normal sm:w-[4.75rem] sm:pl-3">
+              Now
+            </th>
+            <th scope="col" className="w-[18%] py-1.5 pl-2 text-right font-normal sm:w-[4.75rem] sm:pl-3" title="The median">
+              Typical
+            </th>
+            <th
+              scope="col"
+              className="hidden py-1.5 pl-2 text-right font-normal sm:table-cell sm:w-[4.75rem] sm:pl-3"
+              title="The fastest answer"
+            >
+              Best
+            </th>
+            <th scope="col" className="w-[17%] py-1.5 pl-2 text-right font-normal sm:w-[4.75rem] sm:pl-3" title="95th percentile">
+              Worst
+            </th>
+            <th
+              scope="col"
+              className="w-[17%] py-1.5 pl-2 text-right font-normal sm:w-[4.75rem] sm:pl-3"
+              title="Probes without an answer"
+            >
+              Lost
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -336,6 +477,7 @@ export function LatencyChart({
               key={l.key}
               line={l}
               stats={lineStats(l)}
+              dash={dashing ? (seriesDash(l.color, lines.length) ?? 'none') : undefined}
               hidden={hidden.has(l.key)}
               format={hoverFormat}
               onToggle={() => {
@@ -347,7 +489,8 @@ export function LatencyChart({
       </table>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="min-w-0 flex-1 basis-64 text-xs text-muted-foreground">
-          The scale fits the lines shown, so it may not start at 0. Select a name to hide its line and the scale fits the rest. Hover over or tap the “lost” strip to see what was lost when; grey is time with nothing recorded.
+          The scale fits the lines shown, so it may not start at 0. Select a name to hide its line and the scale fits the rest.
+          Hover over or tap the “lost” strip to see what was lost when; grey is time with nothing recorded.
         </p>
         <DownloadButton csv={csv} />
       </div>

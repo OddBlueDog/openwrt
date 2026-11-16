@@ -12,7 +12,14 @@ test('suggested only above 15 to 1', () => {
 });
 
 test('not while a speed is empty or unfinished', () => {
-  for (const [d, u] of [['900', ''], ['900', '0'], ['', '50'], ['0', '0'], ['900', 'x'], ['x', '50']] as const) {
+  for (const [d, u] of [
+    ['900', ''],
+    ['900', '0'],
+    ['', '50'],
+    ['0', '0'],
+    ['900', 'x'],
+    ['x', '50'],
+  ] as const) {
     assert.equal(suggestsAckFilter(d, u), false, `${d}:${u}`);
   }
 });

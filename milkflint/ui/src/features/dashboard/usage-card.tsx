@@ -1,88 +1,131 @@
-import { ArrowDownIcon, ArrowUpIcon } from 'lucide-react';
+import { ChartColumnIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { usePoll } from '@/hooks/use-poll';
 import { formatBytes } from '@/lib/format';
 import { href } from '@/lib/router';
+import { cn } from '@/lib/utils';
+import { deviceLabel } from '../clients/model';
 import { getPeriods, getUsage, loadNames, loadRouterIps, periodStart } from '../data-statistics/api';
+import { OffNote, StateBadge, Widget, WidgetLink } from './widget';
 
 interface Usage {
   /** the current accounting period's start (YYYY-MM-DD) */
   start: string | undefined;
   rx: number;
   tx: number;
-  top: { key: string; name: string; rx: number; tx: number }[];
+  /** `name` undefined when it has none; `address` its IPv4 address, else its MAC */
+  top: { key: string; name: string | undefined; address: string; rx: number; tx: number }[];
 }
 
-/** The current period's totals and busiest devices; null while Data Statistics is off. */
-async function loadUsage(): Promise<Usage | null> {
+/** The current period's totals and busiest devices; 'off' while Data usage is off, 'missing' without it. */
+async function loadUsage(): Promise<Usage | 'off' | 'missing'> {
   const periods = await getPeriods();
-  if (!periods.installed || periods.enabled === false) return null;
+  if (!periods.installed) return 'missing';
+  if (periods.enabled === false) return 'off';
   const [rows, names, routerIps] = await Promise.all([getUsage('', 'mac'), loadNames(), loadRouterIps()]);
   const devices = rows.filter((r) => r.ip === undefined || !routerIps.has(r.ip));
   return {
     start: periods.periods[0],
     rx: devices.reduce((n, r) => n + r.rx, 0),
     tx: devices.reduce((n, r) => n + r.tx, 0),
-    top: devices.slice(0, 4).map((r) => ({ key: r.key, name: names.get(r.key.toLowerCase()) ?? r.ip ?? r.key, rx: r.rx, tx: r.tx })),
+    top: devices
+      .slice(0, 4)
+      .map((r) => ({ key: r.key, name: names.get(r.key.toLowerCase()), address: r.ip ?? r.key, rx: r.rx, tx: r.tx })),
   };
 }
 
-function Total({ icon: Icon, color, label, bytes }: { icon: typeof ArrowDownIcon; color: string; label: string; bytes: number }): ReactElement {
+// download and upload keep the colours they have on every page
+function Total({ swatch, label, bytes }: { swatch: string; label: string; bytes: number }): ReactElement {
   return (
     <div className="flex flex-col gap-0.5">
-      <span className="flex items-center gap-1 text-xs text-muted-foreground">
-        <Icon className={`size-3 ${color}`} />
+      <dt className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <span className={`size-2 rounded-full ${swatch}`} aria-hidden="true" />
         {label}
-      </span>
-      <span className="text-xl font-semibold tracking-tight tabular">{formatBytes(bytes)}</span>
+      </dt>
+      <dd className="text-xl font-semibold tracking-tight tabular">{formatBytes(bytes)}</dd>
     </div>
   );
 }
 
-/** Data Statistics' current period, while it's on. */
-export function UsageCard(): ReactElement | null {
-  const { data } = usePoll(loadUsage, 60_000);
-  if (data === undefined || data === null) return null;
-  const most = Math.max(1, ...data.top.map((r) => r.rx + r.tx));
+/** Data usage's current period: totals and the busiest devices. */
+export function UsageCard({ ap }: { ap: boolean }): ReactElement {
+  const { data, error } = usePoll(loadUsage, 60_000);
+  const link = <WidgetLink href={href('data-statistics')}>Details</WidgetLink>;
 
+  if (ap) {
+    return (
+      <Widget icon={ChartColumnIcon} title="Data usage">
+        <OffNote action={<WidgetLink href={href('mode')}>Operating mode</WidgetLink>}>
+          In access point mode your main router counts the traffic.
+        </OffNote>
+      </Widget>
+    );
+  }
+  if (data === undefined) {
+    return (
+      <Widget icon={ChartColumnIcon} title="Data usage">
+        {error === undefined ? (
+          <p className="px-5 text-sm text-muted-foreground">Loading…</p>
+        ) : (
+          <OffNote action={link}>The router didn’t say how much was used.</OffNote>
+        )}
+      </Widget>
+    );
+  }
+  if (data === 'off' || data === 'missing') {
+    return (
+      <Widget icon={ChartColumnIcon} title="Data usage" aside={<StateBadge tone="off">Off</StateBadge>}>
+        <OffNote
+          action={<WidgetLink href={href('data-statistics')}>{data === 'off' ? 'Turn on Data usage' : 'Data usage'}</WidgetLink>}
+        >
+          {data === 'off'
+            ? 'It counts how much each device downloads and uploads.'
+            : 'This firmware doesn’t count how much each device downloads and uploads.'}
+        </OffNote>
+      </Widget>
+    );
+  }
+
+  const most = Math.max(1, ...data.top.map((r) => r.rx + r.tx));
   return (
-    <Card className="gap-3">
-      <CardHeader>
-        <div className="flex flex-col gap-1.5">
-          <CardTitle>Data usage</CardTitle>
-          <CardDescription>{data.start === undefined ? 'This period' : `Since ${periodStart(data.start)}`}</CardDescription>
-        </div>
-        <CardAction>
-          <a href={href('data-statistics')} className="text-xs text-primary hover:underline">
-            Details
-          </a>
-        </CardAction>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <div className="flex gap-8">
-          <Total icon={ArrowDownIcon} color="text-chart-2" label="Downloaded" bytes={data.rx} />
-          <Total icon={ArrowUpIcon} color="text-chart-1" label="Uploaded" bytes={data.tx} />
-        </div>
+    <Widget
+      icon={ChartColumnIcon}
+      title="Data usage"
+      status={data.start === undefined ? 'This period' : `Since ${periodStart(data.start)}`}
+      aside={link}
+    >
+      <div className="flex flex-col gap-4 px-5">
+        <dl className="flex gap-8">
+          <Total swatch="bg-chart-2" label="Downloaded" bytes={data.rx} />
+          <Total swatch="bg-chart-1" label="Uploaded" bytes={data.tx} />
+        </dl>
         {data.top.length === 0 ? (
           <p className="text-sm text-muted-foreground">No traffic counted yet in this period.</p>
         ) : (
-          <ul className="flex flex-col gap-2.5" aria-label="Busiest devices">
+          <ul className="flex flex-col gap-2.5" aria-label="Busiest devices this period">
             {data.top.map((r) => (
               <li key={r.key} className="flex flex-col gap-1">
                 <div className="flex items-baseline justify-between gap-3 text-sm">
-                  <span className="min-w-0 truncate">{r.name}</span>
-                  <span className="shrink-0 text-xs text-muted-foreground tabular">{formatBytes(r.rx + r.tx)}</span>
+                  {/* an unnamed device as on Data usage and All devices: so called, its address under it */}
+                  <span className="flex min-w-0 flex-col">
+                    <span className={cn('truncate', r.name === undefined && 'text-muted-foreground')}>{deviceLabel(r.name)}</span>
+                    {r.name === undefined && (
+                      <span className="font-mono text-xs break-all text-muted-foreground">{r.address}</span>
+                    )}
+                  </span>
+                  <span className="shrink-0 text-xs text-muted-foreground tabular">
+                    {formatBytes(r.rx)} down · {formatBytes(r.tx)} up
+                  </span>
                 </div>
-                <div className="flex h-1.5 overflow-hidden rounded-full bg-muted">
-                  <div className="bg-chart-2" style={{ width: `${String((r.rx / most) * 100)}%` }} />
-                  <div className="bg-chart-1" style={{ width: `${String((r.tx / most) * 100)}%` }} />
+                <div className="flex h-1.5 gap-0.5 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+                  <div className="rounded-full bg-chart-2" style={{ width: `${String((r.rx / most) * 100)}%` }} />
+                  <div className="rounded-full bg-chart-1" style={{ width: `${String((r.tx / most) * 100)}%` }} />
                 </div>
               </li>
             ))}
           </ul>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </Widget>
   );
 }

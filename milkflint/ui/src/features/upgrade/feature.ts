@@ -8,6 +8,9 @@ export const feature = {
   description: 'Install a new firmware image.',
   icon: CloudUploadIcon,
   group: 'system',
-  order: 18,
-  page: lazyPage(() => import('./page'), (m) => m.UpgradePage),
+  order: 20,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.UpgradePage,
+  ),
 } satisfies Feature;

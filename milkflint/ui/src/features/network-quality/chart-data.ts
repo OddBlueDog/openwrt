@@ -105,7 +105,12 @@ export interface LineStats {
 
 export function lineStats(line: ChartLine): LineStats {
   const typical = line.points.flatMap((p) => (p.v === undefined ? [] : [p.v])).sort((a, b) => a - b);
-  const slow = line.points.flatMap((p) => { const w = p.worst ?? p.v; return w === undefined ? [] : [w]; }).sort((a, b) => a - b);
+  const slow = line.points
+    .flatMap((p) => {
+      const w = p.worst ?? p.v;
+      return w === undefined ? [] : [w];
+    })
+    .sort((a, b) => a - b);
   const rounds = line.points.reduce((n, p) => n + p.rounds, 0);
   const lost = line.points.reduce((n, p) => n + p.lost, 0);
   const last = line.points[line.points.length - 1];
@@ -160,6 +165,52 @@ export function niceRange(lo: number, hi: number, minSpan = 1): { min: number; m
   return { min, max, ticks: Array.from({ length: count + 1 }, (_, i) => round(min + i * step)) };
 }
 
+/** A line reaches no higher on the scale than this many times its typical value… */
+const SPIKE_TIMES = 8;
+/** …or than this (ms), whichever is more: Home's ping chart does the same. */
+const SPIKE_FLOOR = 20;
+
+export interface Scale {
+  min: number;
+  max: number;
+  ticks: number[];
+  /** Points above the top (drawn at the top and marked): how many, and the highest. */
+  above: { count: number; highest: number } | undefined;
+}
+
+/**
+ * The scale for the lines shown: from their lowest value to their highest,
+ * except that each line reaches no higher than eight times its typical
+ * (median) value, or 20 ms, so one spike doesn't flatten every other point;
+ * a stretch of at least 1% of its points (its 99th percentile) is always on
+ * the scale. Points above the top are drawn at it, marked and counted.
+ */
+export function chartScale(lines: readonly ChartLine[], minSpan: number): Scale {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const l of lines) {
+    const values = l.points.flatMap((p) => (p.v === undefined ? [] : [p.v])).sort((a, b) => a - b);
+    const lowest = values[0];
+    const highest = values[values.length - 1];
+    if (lowest === undefined || highest === undefined) continue;
+    const typical = values[Math.floor((values.length - 1) / 2)] ?? lowest;
+    const p99 = values[Math.floor((values.length - 1) * 0.99)] ?? highest;
+    lo = Math.min(lo, lowest);
+    hi = Math.max(hi, Math.min(highest, Math.max(SPIKE_TIMES * typical, SPIKE_FLOOR, p99)));
+  }
+  const range = niceRange(lo, hi, minSpan);
+  let count = 0;
+  let highest = -Infinity;
+  for (const l of lines) {
+    for (const p of l.points) {
+      if (p.v === undefined || p.v <= range.max) continue;
+      count++;
+      highest = Math.max(highest, p.v);
+    }
+  }
+  return { ...range, above: count === 0 ? undefined : { count, highest } };
+}
+
 /** Clock times on round marks between `start` and `end`, in the browser's time zone. */
 export function timeTicks(start: number, end: number): { t: number; label: string }[] {
   const span = end - start;
@@ -205,7 +256,12 @@ export function unrecorded(lines: readonly ChartLine[], start: number, end: numb
 const LOSS_BINS = 240;
 
 /** The share of probes lost, in `bins` slices of the span; only the slices with loss. */
-export function lossBins(lines: readonly ChartLine[], start: number, end: number, bins = LOSS_BINS): { from: number; to: number; share: number }[] {
+export function lossBins(
+  lines: readonly ChartLine[],
+  start: number,
+  end: number,
+  bins = LOSS_BINS,
+): { from: number; to: number; share: number }[] {
   const lost = new Array<number>(bins).fill(0);
   const rounds = new Array<number>(bins).fill(0);
   const width = (end - start) / bins;
@@ -226,6 +282,31 @@ export function lossBins(lines: readonly ChartLine[], start: number, end: number
   return out;
 }
 
+/**
+ * Where the chart marks points above its top: for each line, the highest such
+ * point in each of `bins` slices of the span, so a long stretch above it
+ * doesn't stack hundreds of marks.
+ */
+export function offScale(
+  lines: readonly ChartLine[],
+  start: number,
+  end: number,
+  max: number,
+  bins = LOSS_BINS,
+): { key: string; t: number; v: number; color: string; label: string }[] {
+  const width = (end - start) / bins;
+  const out = new Map<string, { key: string; t: number; v: number; color: string; label: string }>();
+  for (const l of lines) {
+    for (const p of l.points) {
+      if (p.v === undefined || p.v <= max || p.t < start || p.t > end) continue;
+      const key = `${l.key}:${String(Math.min(bins - 1, Math.floor((p.t - start) / width)))}`;
+      const had = out.get(key);
+      if (had === undefined || p.v > had.v) out.set(key, { key, t: p.t, v: p.v, color: l.color, label: l.label });
+    }
+  }
+  return [...out.values()];
+}
+
 export interface LossSlice {
   from: number;
   to: number;
@@ -236,7 +317,13 @@ export interface LossSlice {
 }
 
 /** The slice of the loss strip at `fraction` (0..1) of the span, and what was lost in it. */
-export function lossSliceAt(lines: readonly ChartLine[], start: number, end: number, fraction: number, bins = LOSS_BINS): LossSlice {
+export function lossSliceAt(
+  lines: readonly ChartLine[],
+  start: number,
+  end: number,
+  fraction: number,
+  bins = LOSS_BINS,
+): LossSlice {
   const width = (end - start) / bins;
   const i = Math.min(bins - 1, Math.max(0, Math.floor(fraction * bins)));
   const from = start + i * width;
@@ -244,7 +331,9 @@ export function lossSliceAt(lines: readonly ChartLine[], start: number, end: num
   const slice: LossSlice = { from, to, lines: [], lost: 0, rounds: 0 };
   for (const l of lines) {
     if (!l.countLoss) continue;
-    const inSlice = l.points.filter((p) => Math.min(bins - 1, Math.floor((p.t - start) / width)) === i && p.t >= start && p.t <= end);
+    const inSlice = l.points.filter(
+      (p) => Math.min(bins - 1, Math.floor((p.t - start) / width)) === i && p.t >= start && p.t <= end,
+    );
     const lost = inSlice.reduce((n, p) => n + p.lost, 0);
     const rounds = inSlice.reduce((n, p) => n + p.rounds, 0);
     slice.lost += lost;
@@ -282,13 +371,21 @@ export function slotValues(
   let i = 0;
   for (let slot = 0; slot < slots; slot++) {
     const t = start + slot * step;
-    while (i + 1 < line.points.length && Math.abs((line.points[i + 1]?.t ?? 0) - t) <= Math.abs((line.points[i]?.t ?? 0) - t)) i++;
+    while (i + 1 < line.points.length && Math.abs((line.points[i + 1]?.t ?? 0) - t) <= Math.abs((line.points[i]?.t ?? 0) - t))
+      i++;
     const p = line.points[i];
     const near = p !== undefined && Math.abs(p.t - t) <= reach ? p : undefined;
-    const worst = near?.v !== undefined && near.worst !== undefined && near.rounds > 1 && near.worst > near.v ? near.worst : undefined;
+    const worst =
+      near?.v !== undefined && near.worst !== undefined && near.rounds > 1 && near.worst > near.v ? near.worst : undefined;
     values.push(near?.v);
     upper.push(worst);
-    notes.push(worst !== undefined ? `worst ${format(worst)}` : near !== undefined && near.v === undefined && line.countLoss ? 'lost' : undefined);
+    notes.push(
+      worst !== undefined
+        ? `worst ${format(worst)}`
+        : near !== undefined && near.v === undefined && line.countLoss
+          ? 'lost'
+          : undefined,
+    );
   }
   return { values, upper, notes };
 }

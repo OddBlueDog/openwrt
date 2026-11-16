@@ -41,9 +41,10 @@ export function DropRibbon({
     setAt(Math.min(SLOTS - 1, Math.max(0, i)));
   };
   const count = at === undefined ? undefined : at < pad ? 0 : (v[at - pad] ?? 0);
-  const time = at === undefined || end === null || end === undefined ? undefined : new Date((end - (SLOTS - 1 - at) * step) * 1000);
+  const time =
+    at === undefined || end === null || end === undefined ? undefined : new Date((end - (SLOTS - 1 - at) * step) * 1000);
   return (
-    <div className="border-t bg-muted/40 px-6 pt-3 pb-2">
+    <div className="border-t bg-muted/40 px-5 pt-3 pb-2 sm:px-6">
       <div className="relative">
         <div
           role="img"
@@ -55,20 +56,49 @@ export function DropRibbon({
             setAt(undefined);
           }}
         >
-          <svg viewBox={`0 0 ${String(SLOTS)} 100`} preserveAspectRatio="none" aria-hidden="true" className="absolute inset-0 h-full w-full">
+          <svg
+            viewBox={`0 0 ${String(SLOTS)} 100`}
+            preserveAspectRatio="none"
+            aria-hidden="true"
+            className="absolute inset-0 h-full w-full"
+          >
             {/* the baseline: the day goes on whether anything knocked or not */}
             <line x1="0" x2={SLOTS} y1="99.5" y2="99.5" stroke="var(--rule)" strokeWidth="1" vectorEffect="non-scaling-stroke" />
             {!muted &&
               v.map((x, i) => {
                 const height = h(x);
                 if (height === 0) return null;
-                return <rect key={i} x={pad + i + 0.15} width="0.7" y={100 - height} height={height} fill="var(--primary)" fillOpacity={at === pad + i ? 1 : 0.78} />;
+                return (
+                  <rect
+                    key={i}
+                    x={pad + i + 0.15}
+                    width="0.7"
+                    y={100 - height}
+                    height={height}
+                    fill="var(--primary)"
+                    fillOpacity={at === pad + i ? 1 : 0.78}
+                  />
+                );
               })}
-            {at !== undefined && <line x1={at + 0.5} x2={at + 0.5} y1="0" y2="100" stroke="var(--foreground)" strokeOpacity="0.35" strokeWidth="1" vectorEffect="non-scaling-stroke" />}
+            {at !== undefined && (
+              <line
+                x1={at + 0.5}
+                x2={at + 0.5}
+                y1="0"
+                y2="100"
+                stroke="var(--foreground)"
+                strokeOpacity="0.35"
+                strokeWidth="1"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
           </svg>
           {at !== undefined && time !== undefined && (
             <div
-              className={cn('pointer-events-none absolute -top-7 rounded-md border bg-popover px-2 py-0.5 text-xs whitespace-nowrap shadow-sm', at > SLOTS / 2 ? '-translate-x-full' : '')}
+              className={cn(
+                'pointer-events-none absolute -top-7 rounded-md border bg-popover px-2 py-0.5 text-xs whitespace-nowrap shadow-sm',
+                at > SLOTS / 2 ? '-translate-x-full' : '',
+              )}
               style={{ left: `${String((at / SLOTS) * 100)}%` }}
             >
               <span className="tabular">{time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
@@ -78,7 +108,7 @@ export function DropRibbon({
             </div>
           )}
         </div>
-        <div aria-hidden="true" className="relative mt-1 h-4 text-[11px] text-muted-foreground">
+        <div aria-hidden="true" className="relative mt-1 h-4 text-xs text-muted-foreground">
           {MARKS.map((m) => (
             <span key={m.at} className="absolute" style={{ left: `${String((m.at / SLOTS) * 100)}%` }}>
               {m.label}

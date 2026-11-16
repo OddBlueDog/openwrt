@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'mode',
-  title: 'Operating Mode',
+  title: 'Operating mode',
   description: "MilkFlint as your main router, or as an access point on another router's network.",
   icon: RouterIcon,
   group: 'network',
-  order: 5,
-  page: lazyPage(() => import('./page'), (m) => m.ModePage),
+  order: 40,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.ModePage,
+  ),
 } satisfies Feature;

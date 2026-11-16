@@ -96,13 +96,20 @@ export function AirtimeBandsTable({
   const defaults = airtimeBandDefaults(band);
   const strength = value.auto === 'manual' ? undefined : value.auto;
   // with auto the not-answering goal isn't shown, but no share goes under it: as saved, or its default
-  const lost = /^\d+(\.\d+)?$/.test(value.goal_lost.trim()) && Number(value.goal_lost) >= 1 && Number(value.goal_lost) <= 100 ? Number(value.goal_lost) : Number(defaults.goal_lost);
+  const lost =
+    /^\d+(\.\d+)?$/.test(value.goal_lost.trim()) && Number(value.goal_lost) >= 1 && Number(value.goal_lost) <= 100
+      ? Number(value.goal_lost)
+      : Number(defaults.goal_lost);
   const example = strength === undefined ? undefined : autoExample(value, strength, lost / 100);
   // with auto, where slow links start being held back, from the rates as typed
   const fullN = Number(value.full);
   const weakN = Number(value.weak);
   const autoPace =
-    strength !== undefined && errors.full === undefined && errors.weak === undefined && Number.isFinite(fullN) && Number.isFinite(weakN)
+    strength !== undefined &&
+    errors.full === undefined &&
+    errors.weak === undefined &&
+    Number.isFinite(fullN) &&
+    Number.isFinite(weakN)
       ? airtimeAutoPaceRate(fullN, weakN, strength)
       : undefined;
   const input = (key: AirtimeBandKey, label: string, unit: string): ReactElement => (
@@ -128,19 +135,25 @@ export function AirtimeBandsTable({
   const below = value.weak.trim() === '' ? '…' : value.weak.trim();
 
   return (
-    // a container, so the table can tighten in a narrow card instead of pushing past it
-    <div className="@container my-3 flex flex-col gap-2 rounded-lg border bg-background/60 p-3">
+    // a container, so the table can tighten in a narrow card instead of pushing past it; a section of the
+    // band's column, under a hairline, not a box
+    <div className="@container flex flex-col gap-2 py-3.5">
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-0.5">
-          <h4 className="text-sm font-medium">{strength === undefined ? 'Link classes and airtime goals' : 'Link classes'}</h4>
+          <h4 className="text-sm font-semibold">{strength === undefined ? 'Link classes and airtime goals' : 'Link classes'}</h4>
           <p className="text-xs text-muted-foreground">
-            A device’s class goes by its useful rate: the rate the router sends to it at, times the share of its frames that get through.{' '}
+            A device’s class goes by its useful rate: the rate the router sends to it at, times the share of its frames that get
+            through.{' '}
             {strength === undefined ? (
-              <>A goal is the most of the time that class is sent to while a device with a good link is waiting. Alone, it gets all of it.</>
+              <>
+                A goal is the most of the time that class is sent to while a device with a good link is waiting. Alone, it gets
+                all of it.
+              </>
             ) : (
               <>
-                Held back, its share of the air goes {STRENGTH_WORDS[strength]}, against the devices wanting the air at that moment (a good link counts as{' '}
-                {rate(fullN)} Mbit/s), never under {rate(lost)}%, and its pacing is trimmed to what it’s measured taking.
+                Held back, its share of the air goes {STRENGTH_WORDS[strength]}, against the devices wanting the air at that
+                moment (a good link counts as {rate(fullN)} Mbit/s), never under {rate(lost)}%, and its pacing is trimmed to what
+                it’s measured taking.
               </>
             )}
           </p>
@@ -181,83 +194,87 @@ export function AirtimeBandsTable({
         </Select>
       </div>
       <div className="overflow-x-auto">
-      <table className="w-full border-collapse text-sm">
-        <thead>
-          <tr className="text-left text-[11px] tracking-wide text-muted-foreground uppercase">
-            <th scope="col" className="py-1 pr-2 font-medium @min-[24rem]:pr-3">
-              Link
-            </th>
-            <th scope="col" className="py-1 pr-2 font-medium @min-[24rem]:pr-3">
-              Useful rate<span className="@min-[24rem]:hidden">, Mbit/s</span>
-            </th>
-            {/* with auto, the shares are worked out: no column for them */}
-            {strength === undefined && (
-              <th scope="col" className="py-1 font-medium">
-                Airtime goal<span className="@min-[24rem]:hidden">, %</span>
+        <table className="w-full border-collapse text-sm">
+          <thead>
+            <tr className="text-left text-xs text-muted-foreground">
+              <th scope="col" className="py-1 pr-2 font-medium @min-[24rem]:pr-3">
+                Link
               </th>
-            )}
-          </tr>
-        </thead>
-        <tbody>
-          {ROWS.map((row) => {
-            // with auto the slow row's start is worked out, and no goal is shown
-            const workedOut = strength !== undefined && row.from === 'pace';
-            const goal = strength === undefined ? row.goal : undefined;
-            const from = workedOut ? undefined : row.from;
-            const wrong = [from, goal].flatMap((key) => (key !== undefined && errors[key] !== undefined ? [{ key, text: errors[key] }] : []));
-            return (
-              <Fragment key={row.name}>
-                <tr className="border-t align-middle">
-                  <th scope="row" className="py-1.5 pr-2 text-left font-normal @min-[24rem]:pr-3">
-                    <span className="flex items-center gap-2">
-                      <span className={cn('size-2 shrink-0 rounded-full', airtimeFill[row.cls])} aria-hidden />
-                      {row.name}
-                    </span>
-                  </th>
-                  <td className="py-1.5 pr-2 @min-[24rem]:pr-3">
-                    {workedOut ? (
-                      <span
-                        className="text-xs whitespace-nowrap text-muted-foreground tabular"
-                        title="Worked out from the good-link rate and the strength: below it, a device’s share beside one good link would be under four fifths of an even split"
-                      >
-                        {autoPace === undefined ? '…' : `from ${rate(autoPace)} Mbit/s`}
+              <th scope="col" className="py-1 pr-2 font-medium @min-[24rem]:pr-3">
+                Useful rate<span className="@min-[24rem]:hidden">, Mbit/s</span>
+              </th>
+              {/* with auto, the shares are worked out: no column for them */}
+              {strength === undefined && (
+                <th scope="col" className="py-1 font-medium">
+                  Airtime goal<span className="@min-[24rem]:hidden">, %</span>
+                </th>
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            {ROWS.map((row) => {
+              // with auto the slow row's start is worked out, and no goal is shown
+              const workedOut = strength !== undefined && row.from === 'pace';
+              const goal = strength === undefined ? row.goal : undefined;
+              const from = workedOut ? undefined : row.from;
+              const wrong = [from, goal].flatMap((key) =>
+                key !== undefined && errors[key] !== undefined ? [{ key, text: errors[key] }] : [],
+              );
+              return (
+                <Fragment key={row.name}>
+                  <tr className="border-t align-middle">
+                    <th scope="row" className="py-1.5 pr-2 text-left font-normal @min-[24rem]:pr-3">
+                      <span className="flex items-center gap-2">
+                        <span className={cn('size-2 shrink-0 rounded-full', airtimeFill[row.cls])} aria-hidden />
+                        {row.name}
                       </span>
-                    ) : from !== undefined ? (
-                      <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-                        <span className="hidden text-xs text-muted-foreground @min-[24rem]:inline">from</span>
-                        {input(from, `${row.name} from, in Mbit/s`, 'Mbit/s')}
-                      </span>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">{row.cls === 'weak' ? `under ${below} Mbit/s` : 'frames keep failing'}</span>
-                    )}
-                  </td>
-                  {strength === undefined && (
-                    <td className="py-1.5">
-                      {goal !== undefined ? (
-                        input(goal, `${row.name}: airtime goal, in percent`, '%')
+                    </th>
+                    <td className="py-1.5 pr-2 @min-[24rem]:pr-3">
+                      {workedOut ? (
+                        <span
+                          className="text-xs whitespace-nowrap text-muted-foreground tabular"
+                          title="Worked out from the good-link rate and the strength: below it, a device’s share beside one good link would be under four fifths of an even split"
+                        >
+                          {autoPace === undefined ? '…' : `from ${rate(autoPace)} Mbit/s`}
+                        </span>
+                      ) : from !== undefined ? (
+                        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                          <span className="hidden text-xs text-muted-foreground @min-[24rem]:inline">from</span>
+                          {input(from, `${row.name} from, in Mbit/s`, 'Mbit/s')}
+                        </span>
                       ) : (
-                        <span className="text-xs text-muted-foreground">{row.share}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {row.cls === 'weak' ? `under ${below} Mbit/s` : 'frames keep failing'}
+                        </span>
                       )}
                     </td>
-                  )}
-                </tr>
-                {wrong.length > 0 && (
-                  // under its row, across the table: in the first column it would wrap to a word a line
-                  <tr>
-                    <td colSpan={strength === undefined ? 3 : 2} className="pb-1.5 pl-4 text-xs text-destructive">
-                      {wrong.map((e) => (
-                        <span key={e.key} id={`${idPrefix}-${e.key}-error`} className="block">
-                          {e.text}
-                        </span>
-                      ))}
-                    </td>
+                    {strength === undefined && (
+                      <td className="py-1.5">
+                        {goal !== undefined ? (
+                          input(goal, `${row.name}: airtime goal, in percent`, '%')
+                        ) : (
+                          <span className="text-xs text-muted-foreground">{row.share}</span>
+                        )}
+                      </td>
+                    )}
                   </tr>
-                )}
-              </Fragment>
-            );
-          })}
-        </tbody>
-      </table>
+                  {wrong.length > 0 && (
+                    // under its row, across the table: in the first column it would wrap to a word a line
+                    <tr>
+                      <td colSpan={strength === undefined ? 3 : 2} className="pb-1.5 pl-4 text-xs text-destructive">
+                        {wrong.map((e) => (
+                          <span key={e.key} id={`${idPrefix}-${e.key}-error`} className="block">
+                            {e.text}
+                          </span>
+                        ))}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );

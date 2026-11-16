@@ -1,4 +1,4 @@
-import { FileUpIcon, HistoryIcon, LoaderCircleIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { FileUpIcon, LoaderCircleIcon, Trash2Icon, XIcon } from 'lucide-react';
 import { type ChangeEvent, type ReactElement, useRef, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Badge } from '@/components/ui/badge';
@@ -14,7 +14,8 @@ import { clockText } from './phases';
 import { type RunData, type RunReader, useRunData } from './run-data';
 import { RunReport } from './run-report';
 
-const when = (epoch: number): string => new Date(epoch * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+const when = (epoch: number): string =>
+  new Date(epoch * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
 function DeleteButton({ run, onDeleted }: { run: RunSummary; onDeleted: () => void }): ReactElement {
   const [open, setOpen] = useState(false);
@@ -39,7 +40,8 @@ function DeleteButton({ run, onDeleted }: { run: RunSummary; onDeleted: () => vo
           <DialogHeader>
             <DialogTitle>Delete this run?</DialogTitle>
             <DialogDescription>
-              {run.plan ?? 'The run'} of {when(run.created_wall)} goes from the router, for every device. A file you downloaded of it stays as it is.
+              {run.plan ?? 'The run'} of {when(run.created_wall)} goes from the router, for every device. A file you downloaded of
+              it stays as it is.
             </DialogDescription>
           </DialogHeader>
           {error !== undefined && <p className="text-sm text-destructive">{error}</p>}
@@ -116,7 +118,6 @@ export function HistoryCard({ reader }: { reader: RunReader }): ReactElement {
   return (
     <Card>
       <CardHeading
-        icon={HistoryIcon}
         title="Past runs"
         description="The router keeps the last few until it restarts: download a run’s report to keep it"
         action={
@@ -141,22 +142,23 @@ export function HistoryCard({ reader }: { reader: RunReader }): ReactElement {
         ) : list.length === 0 ? (
           <p className="text-sm text-muted-foreground">No runs yet.</p>
         ) : (
-          <ul className="flex flex-col divide-y rounded-lg border">
+          <ul className="-mx-5 flex flex-col divide-y border-t">
             {list.map((r) => {
               const on = r.ended === undefined || r.ended === null;
               const shown = openId === r.id;
               return (
-                <li key={r.id} className={cn('flex flex-wrap items-center gap-x-4 gap-y-1 px-3 py-2', shown && 'bg-muted/40')}>
+                <li key={r.id} className={cn('flex flex-wrap items-center gap-x-4 gap-y-2 px-5 py-2.5', shown && 'bg-muted/40')}>
                   <div className="flex min-w-0 flex-1 flex-col">
                     <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
                       {r.plan ?? 'Run'}
-                      {r.dry === true && <Badge variant="outline">Rehearsal</Badge>}
+                      {r.dry === true && <Badge variant="secondary">Rehearsal</Badge>}
                       {on && <Badge variant="success">On now</Badge>}
                       {!on && r.ended !== 'completed' && <Badge variant="warning">Ended early</Badge>}
                     </span>
-                    <span className="truncate text-xs text-muted-foreground">
+                    <span className="text-xs break-words text-muted-foreground">
                       {when(r.created_wall)}
-                      {r.length !== undefined && r.length !== null && ` · ${clockText(r.length)}`} · {r.members.join(', ')} · {formatBytes(r.bytes)}
+                      {r.length !== undefined && r.length !== null && ` · ${clockText(r.length)}`} · {r.members.join(', ')} ·{' '}
+                      {formatBytes(r.bytes)}
                     </span>
                   </div>
                   <div className="flex items-center gap-1">
@@ -199,7 +201,7 @@ export function HistoryCard({ reader }: { reader: RunReader }): ReactElement {
           ))}
         {file !== undefined && (
           <div className="flex flex-col gap-3">
-            <div className="flex items-center justify-between gap-2 rounded-lg border bg-muted/30 px-3 py-2 text-sm">
+            <div className="-mx-5 flex items-center justify-between gap-2 border-y bg-muted/40 px-5 py-2 text-sm">
               <span className="min-w-0 truncate">
                 <span className="font-medium">{file.data.meta.schedule.name ?? 'Run'}</span>{' '}
                 <span className="text-muted-foreground">
@@ -219,7 +221,10 @@ export function HistoryCard({ reader }: { reader: RunReader }): ReactElement {
                 <XIcon />
               </Button>
             </div>
-            <RunReport data={file.data} note={`From a file saved ${new Date(file.exported).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}; the checks use this browser’s thresholds.`} />
+            <RunReport
+              data={file.data}
+              note={`From a file saved ${new Date(file.exported).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}; the checks use this browser’s thresholds.`}
+            />
           </div>
         )}
       </CardContent>

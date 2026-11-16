@@ -69,7 +69,11 @@ test('spatial reuse: every choice reads back as itself', () => {
   for (const threshold of SPR_THRESHOLDS) {
     for (const mode of ['auto', 'devices', 'fixed', 'off'] as SprMode[]) {
       const opts = sprRadioOptions({ mode, threshold });
-      const back = sprOf(opts['he_spr_sr_control'], opts['he_spr_non_srg_obss_pd_max_offset'], sprDriverMode({ mode, threshold }));
+      const back = sprOf(
+        opts['he_spr_sr_control'],
+        opts['he_spr_non_srg_obss_pd_max_offset'],
+        sprDriverMode({ mode, threshold }),
+      );
       assert.equal(back.mode, mode, `${mode} ${String(threshold)}`);
       if (mode === 'devices' || mode === 'fixed') assert.equal(back.threshold, threshold);
     }
@@ -163,7 +167,9 @@ test('TWT: each preset writes what reads back as that preset', () => {
   for (const preset of ['balanced', 'responsive', 'battery'] as const) {
     const s = twtWithPreset(twtFrom({}), preset);
     assert.equal(s.preset, preset);
-    const options = Object.fromEntries(Object.entries(twtDriverOptions('5g', s)).filter((e): e is [string, string] => e[1] !== undefined));
+    const options = Object.fromEntries(
+      Object.entries(twtDriverOptions('5g', s)).filter((e): e is [string, string] => e[1] !== undefined),
+    );
     assert.equal(twtFrom(options).preset, preset);
     assert.equal(twtFrom(options).maxIntervalMs, TWT_PRESETS[preset].maxIntervalMs);
   }
@@ -190,10 +196,7 @@ test('TWT: limits of their own read back as custom, every option', () => {
   };
   const s = twtFrom(options);
   assert.equal(s.preset, 'custom');
-  assert.deepEqual(
-    Object.fromEntries(Object.entries(twtDriverOptions('5g', s)).filter((e) => e[1] !== undefined)),
-    options,
-  );
+  assert.deepEqual(Object.fromEntries(Object.entries(twtDriverOptions('5g', s)).filter((e) => e[1] !== undefined)), options);
 });
 
 test('TWT: 0 is no limit, not the default', () => {

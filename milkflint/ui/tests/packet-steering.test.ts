@@ -72,7 +72,8 @@ function run(setup: Setup = {}): Result {
     const bin = join(root, 'bin');
     const log = join(root, 'log');
     mkdirSync(bin);
-    for (const name of ['proc', 'sys/class/net', 'usr/libexec/milkflint', 'usr/libexec/network']) mkdirSync(join(root, name), { recursive: true });
+    for (const name of ['proc', 'sys/class/net', 'usr/libexec/milkflint', 'usr/libexec/network'])
+      mkdirSync(join(root, name), { recursive: true });
     const exe = (path: string, text: string): void => {
       writeFileSync(path, `#!/bin/sh\n${text}\n`);
       chmodSync(path, 0o755);
@@ -90,7 +91,12 @@ function run(setup: Setup = {}): Result {
     // eth1: the MAC with RSS; lan1: the switch's; phy1-ap0: Wi-Fi, no driver link
     const driver = join(root, 'drivers/mtk_soc_eth');
     mkdirSync(driver, { recursive: true });
-    for (const [dev, queues, isEth] of [['eth0', 1, true], ['eth1', 4, true], ['lan1', 1, false], ['phy1-ap0', 1, false]] as const) {
+    for (const [dev, queues, isEth] of [
+      ['eth0', 1, true],
+      ['eth1', 4, true],
+      ['lan1', 1, false],
+      ['phy1-ap0', 1, false],
+    ] as const) {
       for (let q = 0; q < queues; q++) {
         mkdirSync(join(root, 'sys/class/net', dev, 'queues', `rx-${String(q)}`), { recursive: true });
         writeFileSync(join(root, 'sys/class/net', dev, 'queues', `rx-${String(q)}`, 'rps_cpus'), 'unset\n');
@@ -100,7 +106,9 @@ function run(setup: Setup = {}): Result {
         symlinkSync(driver, join(root, 'sys/class/net', dev, 'device/driver'));
       }
     }
-    const uci = Object.entries(setup.uci ?? {}).map(([k, v]) => `[ "$3" = "${k}" ] && { echo "${v}"; exit 0; }`).join('\n');
+    const uci = Object.entries(setup.uci ?? {})
+      .map(([k, v]) => `[ "$3" = "${k}" ] && { echo "${v}"; exit 0; }`)
+      .join('\n');
     exe(join(bin, 'uci'), `${uci}\nexit 1`);
     if (setup.noEthtool !== true) {
       exe(
@@ -123,23 +131,40 @@ esac`,
     const scriptCopy = join(root, 'steer.sh');
     writeFileSync(scriptCopy, text);
     writeFileSync(log, '');
-    execFileSync('/bin/sh', [scriptCopy, ...(setup.arg === undefined ? [] : [setup.arg])], { env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('/bin/sh', [scriptCopy, ...(setup.arg === undefined ? [] : [setup.arg])], {
+      env: { PATH: `${bin}:/usr/bin:/bin` },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
-    const lines = readFileSync(log, 'utf8').split('\n').filter((l) => l !== '');
+    const lines = readFileSync(log, 'utf8')
+      .split('\n')
+      .filter((l) => l !== '');
     const mask: Record<string, string> = {};
     for (const l of lines) {
       const m = /^taskset -p (\S+) (\d+)$/.exec(l);
       if (m?.[1] !== undefined && m[2] !== undefined) mask[m[2]] = m[1];
     }
     const rps: Record<string, string> = {};
-    for (const [dev, q] of [['eth0', 0], ['eth1', 0], ['eth1', 3], ['lan1', 0], ['phy1-ap0', 0]] as const) {
-      rps[`${dev}/${String(q)}`] = readFileSync(join(root, 'sys/class/net', dev, 'queues', `rx-${String(q)}`, 'rps_cpus'), 'utf8').trim();
+    for (const [dev, q] of [
+      ['eth0', 0],
+      ['eth1', 0],
+      ['eth1', 3],
+      ['lan1', 0],
+      ['phy1-ap0', 0],
+    ] as const) {
+      rps[`${dev}/${String(q)}`] = readFileSync(
+        join(root, 'sys/class/net', dev, 'queues', `rx-${String(q)}`, 'rps_cpus'),
+        'utf8',
+      ).trim();
     }
     return {
       mask,
       rtprio: lines.filter((l) => l.startsWith('rtprio ')).map((l) => l.slice(7)),
       rss: lines.filter((l) => l.startsWith('ethtool ')).map((l) => l.slice(8)),
-      affinity: Object.fromEntries(IRQS.map((irq) => [irq, readFileSync(join(root, 'proc/irq', irq, 'smp_affinity'), 'utf8').trim()])),
+      affinity: Object.fromEntries(
+        IRQS.map((irq) => [irq, readFileSync(join(root, 'proc/irq', irq, 'smp_affinity'), 'utf8').trim()]),
+      ),
       rps,
       openwrt: lines.find((l) => l.startsWith('openwrt '))?.slice(8),
     };
@@ -212,7 +237,9 @@ test('too few NAPI threads, or no fourth ring’s interrupt: no RSS', () => {
   const threads = { ...THREADS };
   Reflect.deleteProperty(threads, RING3);
   assert.ok(!run({ threads }).rss.includes('-X eth1 weight 0 1 1 1'));
-  const interrupts = INTERRUPTS.split('\n').filter((l) => !l.includes(' 224 ')).join('\n');
+  const interrupts = INTERRUPTS.split('\n')
+    .filter((l) => !l.includes(' 224 '))
+    .join('\n');
   assert.ok(!run({ interrupts }).rss.includes('-X eth1 weight 0 1 1 1'));
 });
 
@@ -237,5 +264,8 @@ test('OpenWrt’s layout: handed over, one ring, normal priority', () => {
   assert.deepEqual(r.rss, ['-X eth1 equal 1']);
   assert.deepEqual(r.mask, {}, 'nothing of ours moved');
   assert.deepEqual(r.rtprio, [`${RING1} other`, `${RING2} other`, `${RING3} other`]);
-  assert.deepEqual(run({ uci: { 'milkflint.steering.layout': 'openwrt', 'network.@globals[0].steering_flows': '128' }, arg: '2' }).openwrt, '-l 128 2');
+  assert.deepEqual(
+    run({ uci: { 'milkflint.steering.layout': 'openwrt', 'network.@globals[0].steering_flows': '128' }, arg: '2' }).openwrt,
+    '-l 128 2',
+  );
 });

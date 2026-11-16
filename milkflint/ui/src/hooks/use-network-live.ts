@@ -95,7 +95,14 @@ const single = (cpus: readonly number[]): number | undefined => (cpus.length ===
 // GHz), the two firmware event rings, band 1's data (5 GHz), band 1's
 // send-done ring (unused on the MT7986) and the send-done ring both bands
 // use. Other chips have other rings: their threads keep their names.
-const MT7986_RINGS = ['2.4 GHz receive', 'firmware messages', 'firmware messages (WA)', '5 GHz receive', 'idle ring', 'send-done, both bands'];
+const MT7986_RINGS = [
+  '2.4 GHz receive',
+  'firmware messages',
+  'firmware messages (WA)',
+  '5 GHz receive',
+  'idle ring',
+  'send-done, both bands',
+];
 
 /** Words for each network thread, by its kernel name. */
 function threadRoles(p: Pipeline): Map<string, string> {
@@ -106,7 +113,8 @@ function threadRoles(p: Pipeline): Map<string, string> {
   const napi = new Map<string, { id: number; name: string }[]>();
   for (const t of p.wifi.threads) {
     const m = /^(napi\/phy\d+)-(\d+)$/.exec(t.name);
-    if (m?.[1] !== undefined && m[2] !== undefined) napi.set(m[1], [...(napi.get(m[1]) ?? []), { id: Number(m[2]), name: t.name }]);
+    if (m?.[1] !== undefined && m[2] !== undefined)
+      napi.set(m[1], [...(napi.get(m[1]) ?? []), { id: Number(m[2]), name: t.name }]);
     else if (t.name.startsWith('mt76-tx')) roles.set(t.name, 'Wi-Fi transmit');
   }
   for (const list of napi.values()) {
@@ -121,7 +129,10 @@ export const queueKey = (q: CakeQdisc): string => `${q.dev} ${q.parent ?? q.hand
 
 /** the busiest tin of a cake: its delays are the queue's */
 function busiest(q: CakeQdisc): CakeTin | undefined {
-  return (q.tins ?? []).reduce<CakeTin | undefined>((best, t) => ((t.sent_bytes ?? 0) > (best?.sent_bytes ?? -1) ? t : best), undefined);
+  return (q.tins ?? []).reduce<CakeTin | undefined>(
+    (best, t) => ((t.sent_bytes ?? 0) > (best?.sent_bytes ?? -1) ? t : best),
+    undefined,
+  );
 }
 
 function compute(now: Sample, before: Sample | undefined, qdiscs: CakeQdisc[]): NetworkLive {
@@ -195,15 +206,22 @@ function compute(now: Sample, before: Sample | undefined, qdiscs: CakeQdisc[]): 
         load: threadLoad(t, was),
         waiting: waited === undefined ? undefined : Math.min(1, waited / 1e9),
         // a thread that waited all along without getting a CPU has no average yet
-        waitPerRunUs: was === undefined ? undefined : runs > 0 ? Math.max(0, waitedNs) / runs / 1000 : waitedNs > 0 ? undefined : 0,
+        waitPerRunUs:
+          was === undefined ? undefined : runs > 0 ? Math.max(0, waitedNs) / runs / 1000 : waitedNs > 0 ? undefined : 0,
       };
     });
 
   const wifiCpus = [...new Set(p.wifi.threads.flatMap((t) => t.cpus))].sort((a, b) => a - b);
-  const wifiLoads = p.wifi.threads.map((t) => threadLoad(t, old?.wifi.threads.find((x) => x.name === t.name)));
+  const wifiLoads = p.wifi.threads.map((t) =>
+    threadLoad(
+      t,
+      old?.wifi.threads.find((x) => x.name === t.name),
+    ),
+  );
 
   const rss = p.rss === null ? undefined : { table, hash: p.rss.hash ?? undefined, spreading };
-  const ringCpu = (txq: number): number | undefined => (rss?.spreading === true ? rings.find((r) => r.ring === txq)?.cpu : undefined);
+  const ringCpu = (txq: number): number | undefined =>
+    rss?.spreading === true ? rings.find((r) => r.ring === txq)?.cpu : undefined;
   const queues: QueueNow[] = [];
   // the internet's queues: Guest Wi-Fi's speed limit is a CAKE too
   for (const root of qdiscs.filter((q) => !isGuestShaper(q.dev) && !isVpnShaper(q.dev))) {

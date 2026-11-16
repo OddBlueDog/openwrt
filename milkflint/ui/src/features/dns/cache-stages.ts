@@ -18,11 +18,16 @@ export interface CacheStage {
   text: string;
 }
 
-export const keepLabel = (hours: string): string => (hours === '1' ? '1 hour' : hours === '24' ? '1 day' : hours === '48' ? '2 days' : `${hours} hours`);
+export const keepLabel = (hours: string): string =>
+  hours === '1' ? '1 hour' : hours === '24' ? '1 day' : hours === '48' ? '2 days' : `${hours} hours`;
 
 /** The size setting's hint: expired answers only share its room when dnsmasq is the one keeping them. */
 export function sizeHint(f: Pick<DnsForm, 'mode' | 'quick'>): string {
-  const room = !f.quick ? '' : f.mode === 'encrypted' ? ' Expired answers are kept separately, so they don’t use this room.' : ' Fresh and expired answers share this room, so a bigger number helps.';
+  const room = !f.quick
+    ? ''
+    : f.mode === 'encrypted'
+      ? ' Expired answers are kept separately, so they don’t use this room.'
+      : ' Fresh and expired answers share this room, so a bigger number helps.';
   return `One site usually takes a few.${room} When there’s no room left, the oldest make way. Default ${DEFAULT_CACHE_SIZE}.`;
 }
 
@@ -46,7 +51,11 @@ export function cacheStages(f: Pick<DnsForm, 'cacheOn' | 'quick' | 'keepHours'>)
     instant: true,
     text: 'Devices get the answer from the router straight away. Each site sets its own limit, often a few minutes, sometimes a day.',
   };
-  if (!f.quick) return [fresh, { id: 'expired', title: 'Expired', lasts: 'Not kept', instant: false, text: `The answer is dropped. ${WAITS}` }];
+  if (!f.quick)
+    return [
+      fresh,
+      { id: 'expired', title: 'Expired', lasts: 'Not kept', instant: false, text: `The answer is dropped. ${WAITS}` },
+    ];
   return [
     fresh,
     {

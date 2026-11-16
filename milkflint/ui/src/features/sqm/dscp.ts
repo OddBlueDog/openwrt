@@ -16,7 +16,9 @@ export interface SqmDscpOptions {
 /** sqm's options for it. Going from on to off takes back only what on set; with it off all along, nothing is touched. */
 export function sqmDscpOptions(restore: boolean, prioritise: boolean, wasRestore: boolean): SqmDscpOptions {
   if (restore) {
-    return prioritise ? { set: { squash_ingress: '0' }, unset: ['squash_dscp'] } : { set: {}, unset: ['squash_dscp', 'squash_ingress'] };
+    return prioritise
+      ? { set: { squash_ingress: '0' }, unset: ['squash_dscp'] }
+      : { set: {}, unset: ['squash_dscp', 'squash_ingress'] };
   }
   return { set: {}, unset: wasRestore ? ['squash_ingress'] : [] };
 }

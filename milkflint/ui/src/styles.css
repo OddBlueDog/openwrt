@@ -1,10 +1,25 @@
 @import 'tailwindcss';
-@import '@fontsource-variable/ibm-plex-sans/wght.css';
-@import '@fontsource/ibm-plex-mono/400.css';
-@import '@fontsource/ibm-plex-mono/500.css';
-@import './styles/tokens.css';
 
+/*
+ * Every colour, size, radius, shadow and duration comes from the theme
+ * (src/theme: the values are written as custom properties by css.ts and served
+ * as virtual:milkflint-themes.css, imported in main.tsx). Tailwind's own
+ * palette and scales are switched off below, so a class like bg-red-500 or
+ * rounded-2xl simply doesn't exist: only the theme's names do.
+ */
+
+/* dark: follows the theme's dark scheme (LuCI's attribute), not the OS alone */
 @custom-variant dark (&:where([data-darkmode='true'], [data-darkmode='true'] *));
+
+@theme {
+  --color-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+  --text-*: initial;
+  /* QR codes stay black on white whatever the theme: scanners need it */
+  --color-white: #fff;
+  --color-black: #000;
+}
 
 @theme inline {
   --color-background: var(--background);
@@ -20,29 +35,88 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-primary: var(--primary);
+  --color-primary-hover: var(--primary-hover);
   --color-primary-foreground: var(--primary-foreground);
-  --color-destructive: var(--destructive);
-  --color-destructive-foreground: var(--destructive-foreground);
+  --color-primary-subtle: var(--primary-subtle);
+  --color-primary-subtle-foreground: var(--primary-subtle-foreground);
   --color-success: var(--success);
   --color-success-foreground: var(--success-foreground);
+  --color-success-subtle: var(--success-subtle);
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
+  --color-warning-subtle: var(--warning-subtle);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive-subtle: var(--destructive-subtle);
   --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-info-subtle: var(--info-subtle);
   --color-border: var(--border);
   --color-rule: var(--rule);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-selection: var(--selection);
+  --color-scrim: var(--scrim);
   --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-muted-foreground: var(--sidebar-muted-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
   --color-chart-4: var(--chart-4);
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-chart-grid: var(--chart-grid);
+  --color-chart-axis: var(--chart-axis);
+  --color-ramp-1: var(--ramp-1);
+  --color-ramp-2: var(--ramp-2);
+  --color-ramp-3: var(--ramp-3);
+  --color-ramp-4: var(--ramp-4);
+  --color-ramp-5: var(--ramp-5);
+  --color-brand-stone: var(--brand-stone);
+  --color-brand-milk: var(--brand-milk);
+
   --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
+  --text-xs: var(--mf-text-xs);
+  --text-xs--line-height: var(--mf-text-xs-leading);
+  --text-sm: var(--mf-text-sm);
+  --text-sm--line-height: var(--mf-text-sm-leading);
+  --text-base: var(--mf-text-base);
+  --text-base--line-height: var(--mf-text-base-leading);
+  --text-lg: var(--mf-text-lg);
+  --text-lg--line-height: var(--mf-text-lg-leading);
+  --text-xl: var(--mf-text-xl);
+  --text-xl--line-height: var(--mf-text-xl-leading);
+  --text-2xl: var(--mf-text-2xl);
+  --text-2xl--line-height: var(--mf-text-2xl-leading);
+  --text-3xl: var(--mf-text-3xl);
+  --text-3xl--line-height: var(--mf-text-3xl-leading);
+  --text-4xl: var(--mf-text-4xl);
+  --text-4xl--line-height: var(--mf-text-4xl-leading);
+
+  --radius-sm: var(--mf-radius-sm);
+  --radius-md: var(--mf-radius-md);
+  --radius-lg: var(--mf-radius-lg);
+  --radius-xl: var(--mf-radius-xl);
+
+  --shadow-xs: var(--mf-shadow-xs);
+  --shadow-sm: var(--mf-shadow-sm);
+  --shadow-md: var(--mf-shadow-md);
+  --shadow-lg: var(--mf-shadow-lg);
+  --shadow-xl: var(--mf-shadow-lg);
+
+  /* density: every p-*, gap-*, h-*, size-* is a multiple of this */
+  --spacing: var(--mf-space);
+
+  --ease-standard: var(--mf-ease-standard);
+  --ease-enter: var(--mf-ease-enter);
 }
 
 @layer base {
@@ -51,23 +125,102 @@
   }
   html {
     -webkit-text-size-adjust: 100%;
+    /* a focused control scrolls clear of a sticky bar (sticky-offset.ts) */
+    scroll-padding-top: calc(var(--mf-sticky-top, 0px) + 0.5rem);
+    scrollbar-color: var(--rule) transparent;
+    accent-color: var(--primary);
   }
   body {
-    @apply bg-background text-foreground font-sans antialiased;
-    font-feature-settings: 'ss02';
+    @apply bg-background font-sans text-foreground antialiased;
+    caret-color: var(--primary);
   }
   :focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
+  [data-slot='sidebar'] :focus-visible {
+    outline-color: var(--sidebar-ring);
+  }
   ::selection {
-    background: color-mix(in srgb, var(--primary) 25%, transparent);
+    background: var(--selection);
+    color: var(--foreground);
+  }
+  a {
+    text-underline-offset: 0.2em;
+  }
+  /* no paragraph ends on one stranded word */
+  p {
+    text-wrap: pretty;
+  }
+  /* figures in tables and readouts line up */
+  table,
+  output,
+  data {
+    font-variant-numeric: tabular-nums;
+  }
+  @media (forced-colors: active) {
+    :focus-visible {
+      outline-color: Highlight;
+    }
+  }
+}
+
+/* A text link: the action colour, underlined always or on hover as the theme says (--mf-link-underline).
+   Hover only where there is hover, as Tailwind's hover: does, so a tap doesn't leave it underlined. */
+@utility link {
+  color: var(--primary);
+  text-decoration-line: var(--mf-link-underline);
+  @media (hover: hover) {
+    &:hover {
+      text-decoration-line: underline;
+    }
   }
 }
 
 /* Numbers that update live keep their width. */
 @utility tabular {
   font-variant-numeric: tabular-nums;
+}
+
+/* Theme durations: zero under prefers-reduced-motion (see css.ts). */
+@utility duration-fast {
+  transition-duration: var(--mf-duration-fast);
+}
+@utility duration-base {
+  transition-duration: var(--mf-duration-base);
+}
+@utility duration-slow {
+  transition-duration: var(--mf-duration-slow);
+}
+
+/* Overlays arriving: menus and dialogs grow in from 98%, sheets slide in.
+   Durations are theme tokens, zero under reduced motion. */
+@keyframes mf-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes mf-pop-in {
+  from {
+    opacity: 0;
+    scale: 0.98;
+  }
+}
+@keyframes mf-sheet-in {
+  from {
+    translate: 100% 0;
+  }
+}
+@keyframes mf-drawer-in {
+  from {
+    translate: -100% 0;
+  }
+}
+@keyframes mf-toast-in {
+  from {
+    opacity: 0;
+    translate: 0 0.75rem;
+  }
 }
 
 /* Nearby Networks' radar (features/wifi-scan/radar.tsx): the sweep, each

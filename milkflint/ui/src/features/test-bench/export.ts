@@ -34,7 +34,14 @@ export const EXPORT_FORMAT = 'milkflint-bench/1';
 
 function privateV4(parts: readonly number[]): boolean {
   const [a = 0, b = 0] = parts;
-  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || parts.every((p) => p === 0);
+  return (
+    a === 10 ||
+    a === 127 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 169 && b === 254) ||
+    parts.every((p) => p === 0)
+  );
 }
 
 /** An IPv6 address, written in full or with "::" once. */
@@ -71,7 +78,8 @@ export function hideAddresses(s: string): string {
 export function hideAll(v: unknown): unknown {
   if (typeof v === 'string') return hideAddresses(v);
   if (Array.isArray(v)) return v.map(hideAll);
-  if (typeof v === 'object' && v !== null) return Object.fromEntries(Object.entries(v).map(([k, x]) => [hideAddresses(k), hideAll(x)]));
+  if (typeof v === 'object' && v !== null)
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [hideAddresses(k), hideAll(x)]));
   return v;
 }
 
@@ -98,7 +106,14 @@ export interface Summary {
     members: Record<string, MemberPhase>;
   }[];
   /** idle against loaded, per device and target (latency.ts) */
-  latency: { member: string | null; target: LatencyTarget; idle: RttStats; loaded: RttStats; added: number | undefined; silent: boolean }[];
+  latency: {
+    member: string | null;
+    target: LatencyTarget;
+    idle: RttStats;
+    loaded: RttStats;
+    added: number | undefined;
+    silent: boolean;
+  }[];
 }
 
 export function summary(data: RunData): Summary {
@@ -128,7 +143,14 @@ export function summary(data: RunData): Summary {
         }),
       ),
     })),
-    latency: latencyRows(data).map((r) => ({ member: r.member, target: r.target, idle: r.idle, loaded: r.loaded, added: r.added, silent: r.silent })),
+    latency: latencyRows(data).map((r) => ({
+      member: r.member,
+      target: r.target,
+      idle: r.idle,
+      loaded: r.loaded,
+      added: r.added,
+      silent: r.silent,
+    })),
   };
 }
 
@@ -153,7 +175,12 @@ export interface BenchExport {
   thresholds: Thresholds;
 }
 
-export function buildExport(data: RunData, checks: readonly Check[], thresholds: Thresholds, now: Date = new Date()): BenchExport {
+export function buildExport(
+  data: RunData,
+  checks: readonly Check[],
+  thresholds: Thresholds,
+  now: Date = new Date(),
+): BenchExport {
   const out: BenchExport = {
     format: EXPORT_FORMAT,
     exported: now.toISOString(),

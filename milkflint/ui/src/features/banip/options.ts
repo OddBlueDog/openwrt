@@ -24,8 +24,19 @@ export interface OptionSpec {
 }
 
 const b = (d: string, apply: Apply = 'restart'): OptionSpec => ({ type: 'bool', default: d, apply });
-const n = (min: number, max: number, d?: string): OptionSpec => ({ type: 'int', min, max, apply: 'restart', ...(d === undefined ? {} : { default: d }) });
-const list = (item: ItemKind, refetch?: OptionSpec['refetch']): OptionSpec => ({ type: 'list', item, apply: 'restart', ...(refetch === undefined ? {} : { refetch }) });
+const n = (min: number, max: number, d?: string): OptionSpec => ({
+  type: 'int',
+  min,
+  max,
+  apply: 'restart',
+  ...(d === undefined ? {} : { default: d }),
+});
+const list = (item: ItemKind, refetch?: OptionSpec['refetch']): OptionSpec => ({
+  type: 'list',
+  item,
+  apply: 'restart',
+  ...(refetch === undefined ? {} : { refetch }),
+});
 const path = (d?: string): OptionSpec => ({ type: 'path', apply: 'restart', ...(d === undefined ? {} : { default: d }) });
 
 export const OPTIONS = {
@@ -74,7 +85,12 @@ export const OPTIONS = {
   ban_feedinout: list('feed'),
   ban_feedreset: list('feed'),
   ban_feedcomplete: list('feed'),
-  ban_nftloglevel: { type: 'enum', default: 'warn', values: ['emerg', 'alert', 'crit', 'err', 'warn', 'notice', 'info', 'debug'], apply: 'restart' },
+  ban_nftloglevel: {
+    type: 'enum',
+    default: 'warn',
+    values: ['emerg', 'alert', 'crit', 'err', 'warn', 'notice', 'info', 'debug'],
+    apply: 'restart',
+  },
   ban_logprerouting: b('0'),
   ban_loginbound: b('0'),
   ban_logoutbound: b('0'),
@@ -103,7 +119,12 @@ export const OPTIONS = {
   ban_resolver: { type: 'string', pattern: '^[0-9A-Fa-f:.]{2,45}$', check: 'address', apply: 'restart' },
   ban_mailnotification: b('0', 'none'),
   ban_mailreceiver: { type: 'string', pattern: '^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\\.[A-Za-z]{2,24}$', apply: 'none' },
-  ban_mailsender: { type: 'string', default: 'no-reply@banIP', pattern: '^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}$', apply: 'none' },
+  ban_mailsender: {
+    type: 'string',
+    default: 'no-reply@banIP',
+    pattern: '^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}$',
+    apply: 'none',
+  },
   ban_mailtopic: { type: 'string', default: 'banIP notification', pattern: '^[ -~]{1,100}$', apply: 'none' },
   ban_mailprofile: { type: 'string', default: 'ban_notify', pattern: '^[A-Za-z0-9_]{1,32}$', apply: 'none' },
 } as const satisfies Record<string, OptionSpec>;
@@ -157,7 +178,9 @@ function regexOk(term: string): boolean {
 }
 
 function addressOk(v: string): boolean {
-  return /^(\d{1,3}\.){3}\d{1,3}$/.test(v) ? v.split('.').every((o) => Number(o) <= 255) : /^[0-9a-f:]+$/i.test(v) && v.includes(':');
+  return /^(\d{1,3}\.){3}\d{1,3}$/.test(v)
+    ? v.split('.').every((o) => Number(o) <= 255)
+    : /^[0-9a-f:]+$/i.test(v) && v.includes(':');
 }
 
 /**
@@ -165,7 +188,11 @@ function addressOk(v: string): boolean {
  * fine), or the reason code milkflint.banip uses. `feeds`: the catalogue's
  * names; `countries`: banIP's country codes.
  */
-export function checkValue(name: OptionName, value: OptionValue, ctx?: { feeds?: ReadonlySet<string>; countries?: ReadonlySet<string> }): string | null {
+export function checkValue(
+  name: OptionName,
+  value: OptionValue,
+  ctx?: { feeds?: ReadonlySet<string>; countries?: ReadonlySet<string> },
+): string | null {
   const o: OptionSpec = OPTIONS[name];
   if (value === null) return null;
   if (o.type === 'list') {
@@ -177,7 +204,8 @@ export function checkValue(name: OptionName, value: OptionValue, ctx?: { feeds?:
       if (re?.test(v) !== true) return 'item';
       if (seen.has(v)) return 'duplicate';
       seen.add(v);
-      if (o.item === 'feed' && ctx?.feeds !== undefined && v !== 'allowlist' && v !== 'blocklist' && !ctx.feeds.has(v)) return 'feed';
+      if (o.item === 'feed' && ctx?.feeds !== undefined && v !== 'allowlist' && v !== 'blocklist' && !ctx.feeds.has(v))
+        return 'feed';
       if (o.item === 'country' && ctx?.countries !== undefined && !ctx.countries.has(v)) return 'country';
       if (o.item === 'asn' && Number(v) > 4294967295) return 'item';
       if (o.item === 'logterm' && !regexOk(v)) return 'regex';
@@ -218,7 +246,8 @@ export function isOn(options: Options, name: OptionName): boolean {
 }
 
 const same = (a: OptionValue | undefined, z: OptionValue | undefined): boolean => {
-  const norm = (v: OptionValue | undefined): string => (v === undefined || v === null ? '' : typeof v === 'string' ? v : v.length === 0 ? '' : JSON.stringify(v));
+  const norm = (v: OptionValue | undefined): string =>
+    v === undefined || v === null ? '' : typeof v === 'string' ? v : v.length === 0 ? '' : JSON.stringify(v);
   return norm(a) === norm(z);
 };
 

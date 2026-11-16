@@ -23,9 +23,7 @@ const interfaceSchema = z.object({
 export type NetworkInterface = z.output<typeof interfaceSchema>;
 
 export function getInterfaces(): Promise<NetworkInterface[]> {
-  return call('network.interface', 'dump', {}, z.object({ interface: z.array(interfaceSchema) })).then(
-    (r) => r.interface,
-  );
+  return call('network.interface', 'dump', {}, z.object({ interface: z.array(interfaceSchema) })).then((r) => r.interface);
 }
 
 const deviceSchema = z.object({
@@ -61,12 +59,9 @@ export type Lease = z.output<typeof leaseSchema>;
 
 /** DHCPv4 leases (dnsmasq), with the hostnames devices sent. */
 export function getLeases(): Promise<Lease[]> {
-  return call(
-    'luci-rpc',
-    'getDHCPLeases',
-    {},
-    z.object({ dhcp_leases: z.array(leaseSchema).optional() }).loose(),
-  ).then((r) => r.dhcp_leases ?? []);
+  return call('luci-rpc', 'getDHCPLeases', {}, z.object({ dhcp_leases: z.array(leaseSchema).optional() }).loose()).then(
+    (r) => r.dhcp_leases ?? [],
+  );
 }
 
 /** Interface name -> its IPv4 address with prefix, e.g. "192.168.1.1/24". */
@@ -131,7 +126,13 @@ export function prefixLength(netmask: string | undefined): number {
   if (/^\d+$/.test(netmask)) return Number(netmask);
   return netmask
     .split('.')
-    .map((o) => Number(o).toString(2).split('').filter((b) => b === '1').length)
+    .map(
+      (o) =>
+        Number(o)
+          .toString(2)
+          .split('')
+          .filter((b) => b === '1').length,
+    )
     .reduce((a, b) => a + b, 0);
 }
 

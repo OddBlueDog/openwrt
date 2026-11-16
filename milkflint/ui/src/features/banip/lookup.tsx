@@ -8,7 +8,17 @@ import { type ReactElement, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { errorMessage } from '@/lib/utils';
-import { allowAddress, endConnections, listEntry, type Registry, registryOf, type Search, search, type SetHit, unblock } from './api';
+import {
+  allowAddress,
+  endConnections,
+  listEntry,
+  type Registry,
+  registryOf,
+  type Search,
+  search,
+  type SetHit,
+  unblock,
+} from './api';
 import { infoOf } from './feeds';
 import { lineOwner } from './model';
 
@@ -31,8 +41,12 @@ function HitLine({ h }: { h: SetHit }): ReactElement {
         {h.element.includes('/') || h.element.includes('-') ? ', as part of ' : ''}
       </span>
       {(h.element.includes('/') || h.element.includes('-')) && <span className="font-mono text-xs">{h.element}</span>}
-      {h.packets !== null && h.packets !== undefined && h.packets > 0 && <span className="text-xs text-muted-foreground tabular">({h.packets} packets so far)</span>}
-      {h.expires !== null && h.expires !== undefined && <span className="text-xs text-muted-foreground">expires in {h.expires}</span>}
+      {h.packets !== null && h.packets !== undefined && h.packets > 0 && (
+        <span className="text-xs text-muted-foreground tabular">({h.packets} packets so far)</span>
+      )}
+      {h.expires !== null && h.expires !== undefined && (
+        <span className="text-xs text-muted-foreground">expires in {h.expires}</span>
+      )}
       {info !== undefined && <span className="w-full text-xs text-muted-foreground">{info.text}</span>}
     </li>
   );
@@ -79,12 +93,28 @@ function AddressResult({
     );
   };
   const spin = (what: string): ReactElement | null => (busy === what ? <LoaderCircleIcon className="animate-spin" /> : null);
-  const verdict = allowed ? (blocks.length > 0 ? 'Allowed: your allowlist overrides the lists below' : 'Allowed') : blocks.length > 0 ? 'Blocked' : 'Not blocked';
+  const verdict = allowed
+    ? blocks.length > 0
+      ? 'Allowed: your allowlist overrides the lists below'
+      : 'Allowed'
+    : blocks.length > 0
+      ? 'Blocked'
+      : 'Not blocked';
   return (
-    <div className="flex flex-col gap-2 rounded-lg border bg-card px-4 py-3">
+    <div className="flex flex-col gap-2 border-t pt-3">
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className="font-mono text-sm">{r.address}</span>
-        <span className={allowed ? 'text-sm font-medium text-success' : blocks.length > 0 ? 'text-sm font-medium text-primary' : 'text-sm text-muted-foreground'}>{verdict}</span>
+        <span
+          className={
+            allowed
+              ? 'text-sm font-medium text-success'
+              : blocks.length > 0
+                ? 'text-sm font-medium text-primary'
+                : 'text-sm text-muted-foreground'
+          }
+        >
+          {verdict}
+        </span>
       </div>
       {(blocks.length > 0 || r.allowlist.length > 0) && (
         <ul className="flex flex-col gap-1.5">
@@ -105,7 +135,10 @@ function AddressResult({
       )}
       {who !== undefined && (
         <p className="text-sm text-muted-foreground">
-          {[who.org ?? who.name, who.country, who.network].filter((x) => x !== null && x !== undefined && x !== '').join(', ').replace(/^$/, 'The registry has no details.')}
+          {[who.org ?? who.name, who.country, who.network]
+            .filter((x) => x !== null && x !== undefined && x !== '')
+            .join(', ')
+            .replace(/^$/, 'The registry has no details.')}
           {who.registry !== null && who.registry !== undefined && <span className="text-xs"> (from {who.registry})</span>}
         </p>
       )}
@@ -119,7 +152,9 @@ function AddressResult({
             onClick={() => {
               run('unblock', async () => {
                 const x = await unblock(r.address);
-                return x.still !== undefined && x.still.length > 0 ? `Out of your blocklist. Still on ${x.still.join(', ')}: Always allow overrides them.` : 'Out of your blocklist.';
+                return x.still !== undefined && x.still.length > 0
+                  ? `Out of your blocklist. Still on ${x.still.join(', ')}: Always allow overrides them.`
+                  : 'Out of your blocklist.';
               });
             }}
           >
@@ -179,7 +214,9 @@ function AddressResult({
             onClick={() => {
               run('flush', async () => {
                 const x = await endConnections(r.address);
-                return x.ended === 0 ? 'It had no open connections.' : `Ended ${String(x.ended)} open connection${x.ended === 1 ? '' : 's'}.`;
+                return x.ended === 0
+                  ? 'It had no open connections.'
+                  : `Ended ${String(x.ended)} open connection${x.ended === 1 ? '' : 's'}.`;
               });
             }}
           >
@@ -214,18 +251,37 @@ function AddressResult({
 }
 
 /** The answer to a lookup. */
-export function LookupResult({ result, conntrack, onChanged, redo }: { result: Search; conntrack: boolean; onChanged: () => void; redo: () => void }): ReactElement {
+export function LookupResult({
+  result,
+  conntrack,
+  onChanged,
+  redo,
+}: {
+  result: Search;
+  conntrack: boolean;
+  onChanged: () => void;
+  redo: () => void;
+}): ReactElement {
   const results = result.results ?? [];
   return (
     <div className="flex flex-col gap-2">
       {result.kind === 'domain' && (
         <p className="text-sm text-muted-foreground">
-          {result.query} is {results.length === 0 ? 'not found in DNS.' : `at ${results.map((r) => r.address).join(', ')}. banIP blocks addresses, so each is looked up:`}
+          {result.query} is{' '}
+          {results.length === 0
+            ? 'not found in DNS.'
+            : `at ${results.map((r) => r.address).join(', ')}. banIP blocks addresses, so each is looked up:`}
         </p>
       )}
-      {result.loaded === false && <p className="text-sm text-muted-foreground">No lists are loaded now (banIP is off or starting), so only your own lists were searched.</p>}
+      {result.loaded === false && (
+        <p className="text-sm text-muted-foreground">
+          No lists are loaded now (banIP is off or starting), so only your own lists were searched.
+        </p>
+      )}
       {result.stale === true && (
-        <p className="text-sm text-muted-foreground">banIP’s lists changed in their last update and are being read again: look again in a moment to be sure.</p>
+        <p className="text-sm text-muted-foreground">
+          banIP’s lists changed in their last update and are being read again: look again in a moment to be sure.
+        </p>
       )}
       {results.map((r) => (
         <AddressResult key={r.address} r={r} conntrack={conntrack} onChanged={onChanged} redo={redo} />
@@ -245,7 +301,15 @@ export function LookupResult({ result, conntrack, onChanged, redo }: { result: S
 }
 
 /** The box, and its answer below it. */
-export function LookupBox({ conntrack, onChanged, initial }: { conntrack: boolean; onChanged: () => void; initial?: string }): ReactElement {
+export function LookupBox({
+  conntrack,
+  onChanged,
+  initial,
+}: {
+  conntrack: boolean;
+  onChanged: () => void;
+  initial?: string;
+}): ReactElement {
   const [query, setQuery] = useState(initial ?? '');
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<Search>();

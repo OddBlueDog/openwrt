@@ -19,7 +19,7 @@ import { cn } from '@/lib/utils';
 import { useWed } from '../tuning/use-wed';
 import { WedNotice } from '../tuning/wed-notice';
 import type { Counters, FirewallData } from './api';
-import type { Actions } from './forms';
+import { type Actions, rowClick } from './forms';
 import {
   editSection,
   enabledChange,
@@ -55,7 +55,19 @@ const policyHints: Record<Policy, string> = {
 };
 
 /** A policy as three choices, with what the chosen one does under it. */
-function PolicyField({ label, opt, hint, value, onChange }: { label: string; opt: string; hint: string; value: Policy; onChange: (p: Policy) => void }): ReactElement {
+function PolicyField({
+  label,
+  opt,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string;
+  opt: string;
+  hint: string;
+  value: Policy;
+  onChange: (p: Policy) => void;
+}): ReactElement {
   return (
     <div className="grid gap-1.5">
       <FieldLabel label={label} opt={opt} />
@@ -78,17 +90,26 @@ function forwardingsOn(data: FirewallData): Set<string> {
  * deleted, one that's wanted is turned back on if it's there but off, or
  * added.
  */
-function forwardingChanges(data: FirewallData, want: ReadonlySet<string>, scope: (src: string, dest: string) => boolean): Change[] {
+function forwardingChanges(
+  data: FirewallData,
+  want: ReadonlySet<string>,
+  scope: (src: string, dest: string) => boolean,
+): Change[] {
   const on = forwardingsOn(data);
   const changes: Change[] = [];
   for (const f of data.cfg.forwardings) {
-    if (scope(f.src, f.dest) && f.enabled && !want.has(pairKey(f.src, f.dest))) changes.push({ op: 'delete', config: 'firewall', section: f.section });
+    if (scope(f.src, f.dest) && f.enabled && !want.has(pairKey(f.src, f.dest)))
+      changes.push({ op: 'delete', config: 'firewall', section: f.section });
   }
   for (const p of want) {
     if (on.has(p)) continue;
     const [src = '', dest = ''] = p.split('>');
     const off = data.cfg.forwardings.find((f) => f.src === src && f.dest === dest);
-    changes.push(off === undefined ? { op: 'add', config: 'firewall', type: 'forwarding', values: { src, dest } } : enabledChange(off.section, true));
+    changes.push(
+      off === undefined
+        ? { op: 'add', config: 'firewall', type: 'forwarding', values: { src, dest } }
+        : enabledChange(off.section, true),
+    );
   }
   return changes;
 }
@@ -110,7 +131,17 @@ interface ZoneForm {
 function zoneForm(zone: Zone | undefined, data: FirewallData): ZoneForm {
   const wan = data.cfg.zones.find(isInternetZone)?.name;
   if (zone === undefined) {
-    return { name: '', networks: [], input: 'REJECT', output: 'ACCEPT', forward: 'REJECT', masq: false, mtuFix: false, to: wan === undefined ? [] : [wan], from: [] };
+    return {
+      name: '',
+      networks: [],
+      input: 'REJECT',
+      output: 'ACCEPT',
+      forward: 'REJECT',
+      masq: false,
+      mtuFix: false,
+      to: wan === undefined ? [] : [wan],
+      from: [],
+    };
   }
   const on = data.cfg.forwardings.filter((f) => f.enabled);
   return {
@@ -145,7 +176,19 @@ function zoneChanges(f: ZoneForm, zone: Zone | undefined, data: FirewallData): C
 }
 
 /** Zone chips to pick from: other zones, each on or off. */
-function ZoneChips({ id, zones, value, onChange, label }: { id: string; zones: readonly string[]; value: readonly string[]; onChange: (v: string[]) => void; label: string }): ReactElement {
+function ZoneChips({
+  id,
+  zones,
+  value,
+  onChange,
+  label,
+}: {
+  id: string;
+  zones: readonly string[];
+  value: readonly string[];
+  onChange: (v: string[]) => void;
+  label: string;
+}): ReactElement {
   if (zones.length === 0) return <p className="text-xs text-muted-foreground">No other zones.</p>;
   return (
     <div id={id} className="flex flex-wrap gap-1.5" role="group" aria-label={label}>
@@ -173,7 +216,17 @@ function ZoneChips({ id, zones, value, onChange, label }: { id: string; zones: r
   );
 }
 
-function ZoneSheet({ zone, data, onClose, onSave }: { zone: Zone | undefined; data: FirewallData; onClose: () => void; onSave: (c: Change[]) => void }): ReactElement {
+function ZoneSheet({
+  zone,
+  data,
+  onClose,
+  onSave,
+}: {
+  zone: Zone | undefined;
+  data: FirewallData;
+  onClose: () => void;
+  onSave: (c: Change[]) => void;
+}): ReactElement {
   const id = useId();
   const [f, setF] = useState(() => zoneForm(zone, data));
   const set = <K extends keyof ZoneForm>(key: K, value: ZoneForm[K]): void => {
@@ -243,8 +296,14 @@ function ZoneSheet({ zone, data, onClose, onSave }: { zone: Zone | undefined; da
                   set('name', e.target.value.trim());
                 }}
               />
-              <p className={cn('text-xs', f.name !== '' && nameError !== undefined ? 'text-destructive' : 'text-muted-foreground')}>
-                {f.name !== '' && nameError !== undefined ? nameError : zone === undefined ? 'Rules and forwards refer to zones by name.' : 'Rules and forwards refer to it by name, so it stays.'}
+              <p
+                className={cn('text-xs', f.name !== '' && nameError !== undefined ? 'text-destructive' : 'text-muted-foreground')}
+              >
+                {f.name !== '' && nameError !== undefined
+                  ? nameError
+                  : zone === undefined
+                    ? 'Rules and forwards refer to zones by name.'
+                    : 'Rules and forwards refer to it by name, so it stays.'}
               </p>
             </div>
             <div className="grid gap-1.5">
@@ -269,7 +328,9 @@ function ZoneSheet({ zone, data, onClose, onSave }: { zone: Zone | undefined; da
                         on && other !== undefined && 'border-warning/60 bg-warning/10 text-warning',
                       )}
                     >
-                      <span className={cn('size-1.5 rounded-full', live?.up === true ? 'bg-success' : 'bg-muted-foreground/40')} />
+                      <span
+                        className={cn('size-1.5 rounded-full', live?.up === true ? 'bg-success' : 'bg-muted-foreground/40')}
+                      />
                       {n}
                       {live?.device !== undefined && <span className="opacity-60">{live.device}</span>}
                     </button>
@@ -296,7 +357,9 @@ function ZoneSheet({ zone, data, onClose, onSave }: { zone: Zone | undefined; da
             />
             {internet && f.input === 'ACCEPT' && (
               <Alert variant="destructive">
-                <AlertDescription>Anyone on the internet could reach the router’s login and every service on it.</AlertDescription>
+                <AlertDescription>
+                  Anyone on the internet could reach the router’s login and every service on it.
+                </AlertDescription>
               </Alert>
             )}
             {f.name === 'lan' && f.input !== 'ACCEPT' && (
@@ -353,7 +416,9 @@ function ZoneSheet({ zone, data, onClose, onSave }: { zone: Zone | undefined; da
                 <h3 className="flex items-center gap-2 text-sm font-semibold">
                   Forwarding <Opt>forwarding</Opt>
                 </h3>
-                <p className="text-xs text-muted-foreground">Between zones, one way each: replies always come back. Anything else falls to the defaults.</p>
+                <p className="text-xs text-muted-foreground">
+                  Between zones, one way each: replies always come back. Anything else falls to the defaults.
+                </p>
               </div>
               <div className="grid gap-1.5">
                 <span className="text-sm">May start connections to</span>
@@ -383,12 +448,18 @@ function ZoneSheet({ zone, data, onClose, onSave }: { zone: Zone | undefined; da
           </div>
           <div className="border-t px-6 py-5">
             <UciPreview type="zone" original={section} changes={changes} />
-            {forwardNotes.length > 0 && <p className="mt-2 text-xs text-muted-foreground">Forwarding: {forwardNotes.join('; ')}.</p>}
+            {forwardNotes.length > 0 && (
+              <p className="mt-2 text-xs text-muted-foreground">Forwarding: {forwardNotes.join('; ')}.</p>
+            )}
           </div>
         </div>
         <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
           <p className="text-xs text-muted-foreground">
-            {nameError !== undefined ? 'Give it a name to save.' : changes.length === 0 ? 'No changes yet.' : `${String(changes.length)} change${changes.length === 1 ? '' : 's'} to apply.`}
+            {nameError !== undefined
+              ? 'Give it a name to save.'
+              : changes.length === 0
+                ? 'No changes yet.'
+                : `${String(changes.length)} change${changes.length === 1 ? '' : 's'} to apply.`}
           </p>
           <div className="flex gap-2">
             <Button variant="ghost" onClick={onClose}>
@@ -421,7 +492,15 @@ interface DefaultsForm {
   offloadHw: boolean;
 }
 
-function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose: () => void; onSave: (c: Change[]) => void }): ReactElement {
+function DefaultsSheet({
+  data,
+  onClose,
+  onSave,
+}: {
+  data: FirewallData;
+  onClose: () => void;
+  onSave: (c: Change[]) => void;
+}): ReactElement {
   const id = useId();
   const d = data.cfg.defaults;
   const was: DefaultsForm = {
@@ -455,7 +534,13 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
   const wed = useWed();
   const wedOff = wed.on && (!f.offload || !f.offloadHw);
   const changes = Object.keys(values).length === 0 ? [] : editSection('defaults', section, values);
-  const toggle = (key: 'synFlood' | 'dropInvalid' | 'offload' | 'offloadHw', label: string, opt: string, hint: string, disabled = false): ReactElement => (
+  const toggle = (
+    key: 'synFlood' | 'dropInvalid' | 'offload' | 'offloadHw',
+    label: string,
+    opt: string,
+    hint: string,
+    disabled = false,
+  ): ReactElement => (
     <SwitchRow
       id={`${id}-${key}`}
       checked={f[key]}
@@ -531,7 +616,7 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
               <Input
                 id={`${id}-synrate`}
                 inputMode="numeric"
-                className="font-mono"
+                className="tabular"
                 value={f.synRate}
                 placeholder={String(SYN_RATE_FW4)}
                 disabled={!f.synFlood}
@@ -545,7 +630,12 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
                   `Each device, and each address on the internet, may open this many to the router (its pages, SSH, DNS over TCP), and twice as many at once (synflood_burst); more wait a second to be sent again. Empty is OpenWrt’s ${String(SYN_RATE_FW4)}; MilkFlint sets ${String(SYN_RATE_MILKFLINT)}.`}
               </p>
             </div>
-            {toggle('dropInvalid', 'Drop invalid packets', 'drop_invalid', 'Packets that belong to no known connection. Off is OpenWrt’s default.')}
+            {toggle(
+              'dropInvalid',
+              'Drop invalid packets',
+              'drop_invalid',
+              'Packets that belong to no known connection. Off is OpenWrt’s default.',
+            )}
             {toggle(
               'offload',
               'Software flow offloading',
@@ -583,7 +673,9 @@ function DefaultsSheet({ data, onClose, onSave }: { data: FirewallData; onClose:
           </div>
         </div>
         <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
-          <p className="text-xs text-muted-foreground">{changes.length === 0 ? 'No changes yet.' : 'Applies to the whole firewall.'}</p>
+          <p className="text-xs text-muted-foreground">
+            {changes.length === 0 ? 'No changes yet.' : 'Applies to the whole firewall.'}
+          </p>
           <div className="flex gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
@@ -634,7 +726,15 @@ function Chips({ items }: { items: readonly string[] }): ReactElement {
 
 type Open = { kind: 'zone'; zone: Zone | undefined } | { kind: 'defaults' };
 
-export function ZonesTab({ data, counters, actions }: { data: FirewallData; counters: Counters | undefined; actions: Actions }): ReactElement {
+export function ZonesTab({
+  data,
+  counters,
+  actions,
+}: {
+  data: FirewallData;
+  counters: Counters | undefined;
+  actions: Actions;
+}): ReactElement {
   const [open, setOpen] = useState<Open>();
   const { cfg } = data;
   const on = cfg.forwardings.filter((f) => f.enabled);
@@ -655,7 +755,9 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
       action: 'Delete zone',
       changes: [
         { op: 'delete', config: 'firewall', section: z.section },
-        ...cfg.forwardings.filter((f) => f.src === z.name || f.dest === z.name).map((f): Change => ({ op: 'delete', config: 'firewall', section: f.section })),
+        ...cfg.forwardings
+          .filter((f) => f.src === z.name || f.dest === z.name)
+          .map((f): Change => ({ op: 'delete', config: 'firewall', section: f.section })),
       ],
     });
   };
@@ -668,9 +770,11 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
       <SettingsIcon /> Edit
     </HeaderButton>
   );
-  const defaultsNotes = [cfg.defaults.synFlood ? `SYN flood protection ${synRateLabel(cfg.defaults.synRate)}` : 'no SYN flood protection', cfg.defaults.dropInvalid && 'drops invalid', cfg.defaults.offloadHw ? 'hardware offloading' : cfg.defaults.offload && 'software offloading'].filter(
-    (x): x is string => typeof x === 'string',
-  );
+  const defaultsNotes = [
+    cfg.defaults.synFlood ? `SYN flood protection ${synRateLabel(cfg.defaults.synRate)}` : 'no SYN flood protection',
+    cfg.defaults.dropInvalid && 'drops invalid',
+    cfg.defaults.offloadHw ? 'hardware offloading' : cfg.defaults.offload && 'software offloading',
+  ].filter((x): x is string => typeof x === 'string');
   const zoneActions = (z: Zone): ReactElement => (
     <span className="flex items-center justify-end">
       <RowButton
@@ -699,7 +803,9 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
           <ShieldIcon className="size-3.5 text-muted-foreground" />
           <span className="font-mono text-xs font-medium">{z.name}</span>
         </span>
-        <span className="text-xs text-muted-foreground">{managed === undefined ? title : `${zoneTitle(z.name, cfg)} · ${managed.title} page`}</span>
+        <span className="text-xs text-muted-foreground">
+          {managed === undefined ? title : `${zoneTitle(z.name, cfg)} · ${managed.title} page`}
+        </span>
       </span>
     );
   };
@@ -728,9 +834,20 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
                 <HeadRow columns={columns} />
               </thead>
               <tbody>
-                <GroupHeader title={<span className="font-medium">Zones</span>} count={cfg.zones.length} noun={['zone', 'zones']} colSpan={columns.length} />
+                <GroupHeader
+                  title={<span className="font-medium">Zones</span>}
+                  count={cfg.zones.length}
+                  noun={['zone', 'zones']}
+                  colSpan={columns.length}
+                />
                 {cfg.zones.map((z) => (
-                  <tr key={z.section} className="border-b last:border-b-0 hover:bg-accent/30">
+                  <tr
+                    key={z.section}
+                    onClick={rowClick(() => {
+                      setOpen({ kind: 'zone', zone: z });
+                    })}
+                    className="cursor-pointer border-b last:border-b-0 hover:bg-muted/60"
+                  >
                     <td className="px-3 py-2">{zoneName(z)}</td>
                     <td className="px-3 py-2">
                       <Chips items={z.networks} />
@@ -803,22 +920,27 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
                     {zoneName(z)}
                     {zoneActions(z)}
                   </span>
-                  <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+                  <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-1.5 text-xs">
                     <dt className="text-muted-foreground">Networks</dt>
                     <dd>
                       <Chips items={z.networks} />
                     </dd>
-                    <dt className="text-muted-foreground">Input · output · forward</dt>
-                    <dd className="flex flex-wrap gap-1">
+                    <dt className="text-muted-foreground">To the router (input)</dt>
+                    <dd>
                       <VerdictBadge verdict={z.input} />
+                    </dd>
+                    <dt className="text-muted-foreground">From the router (output)</dt>
+                    <dd>
                       <VerdictBadge verdict={z.output} />
+                    </dd>
+                    <dt className="text-muted-foreground">Within the zone (forward)</dt>
+                    <dd>
                       <VerdictBadge verdict={z.forward} />
                     </dd>
-                    <dt className="text-muted-foreground">Masq · MSS</dt>
-                    <dd className="flex gap-2">
-                      <Flag on={z.masq} />
-                      <Flag on={z.mtuFix} />
-                    </dd>
+                    <dt className="text-muted-foreground">Masquerading</dt>
+                    <dd>{z.masq ? 'On' : 'Off'}</dd>
+                    <dt className="text-muted-foreground">MSS clamping</dt>
+                    <dd>{z.mtuFix ? 'On' : 'Off'}</dd>
                     <dt className="text-muted-foreground">Forwards to</dt>
                     <dd>
                       <Chips items={on.filter((f) => f.src === z.name).map((f) => f.dest)} />
@@ -828,18 +950,37 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
               ))}
             </ul>
             <GroupHeader title={<span className="font-medium">Defaults</span>} action={editDefaults} />
-            <div className="flex flex-wrap items-center gap-2 px-4 py-3 text-xs">
-              <span className="text-muted-foreground">Input · output · forward</span>
-              <VerdictBadge verdict={cfg.defaults.input} />
-              <VerdictBadge verdict={cfg.defaults.output} />
-              <VerdictBadge verdict={cfg.defaults.forward} />
-              {defaultsNotes.length > 0 && <span className="text-muted-foreground">· {defaultsNotes.join(' · ')}</span>}
+            <div className="flex flex-col gap-2 px-4 py-3">
+              <span className="flex flex-col">
+                <span className="font-mono text-xs font-medium">defaults</span>
+                <span className="text-xs text-muted-foreground">what no zone covers</span>
+              </span>
+              <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-1.5 text-xs">
+                <dt className="text-muted-foreground">To the router (input)</dt>
+                <dd>
+                  <VerdictBadge verdict={cfg.defaults.input} />
+                </dd>
+                <dt className="text-muted-foreground">From the router (output)</dt>
+                <dd>
+                  <VerdictBadge verdict={cfg.defaults.output} />
+                </dd>
+                <dt className="text-muted-foreground">Between zones (forward)</dt>
+                <dd>
+                  <VerdictBadge verdict={cfg.defaults.forward} />
+                </dd>
+                {defaultsNotes.length > 0 && (
+                  <>
+                    <dt className="text-muted-foreground">Also</dt>
+                    <dd>{defaultsNotes.join(' · ')}</dd>
+                  </>
+                )}
+              </dl>
             </div>
           </div>
         </Card>
-        <p className="text-right text-xs text-muted-foreground">
-          Input: connections to the router · Output: from the router · Forward: between a zone’s own networks · Forwards to: zones it may start
-          connections to, one way; replies always come back.
+        <p className="text-xs text-muted-foreground lg:text-right">
+          Input: connections to the router · Output: from the router · Forward: between a zone’s own networks · Forwards to: zones
+          it may start connections to, one way; replies always come back.
         </p>
       </div>
       <NatTable data={data} counters={counters} actions={actions} />
@@ -848,7 +989,7 @@ export function ZonesTab({ data, counters, actions }: { data: FirewallData; coun
           Your firewall also has {cfg.ipsets > 0 && `${String(cfg.ipsets)} IP set${cfg.ipsets === 1 ? '' : 's'}`}
           {cfg.ipsets > 0 && cfg.includes > 0 && ' and '}
           {cfg.includes > 0 && `${String(cfg.includes)} custom include${cfg.includes === 1 ? '' : 's'}`}; they keep working.
-          <a href="/cgi-bin/luci/admin/network/firewall" className="inline-flex items-center gap-1 text-primary underline-offset-4 hover:underline">
+          <a href="/cgi-bin/luci/admin/network/firewall" className="inline-flex items-center gap-1 link underline-offset-4">
             Edit in LuCI <ExternalLinkIcon className="size-3" />
           </a>
         </p>

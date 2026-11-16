@@ -1,6 +1,6 @@
-// What the side sheets share (the Firewall page's, Smart Queue's advanced
-// one): labels that name the UCI option a field sets, and the section as
-// the file will hold it.
+// What the side sheets share (the Firewall and Port forwards pages', Smart
+// Queue's advanced one): the sheet's frame, labels that name the UCI option
+// a field sets, and the section as the file will hold it.
 import { CheckIcon, CopyIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { Button } from '@/components/ui/button';
@@ -8,7 +8,11 @@ import type { Change, Section } from '@/lib/api/uci';
 
 /** The UCI option a field sets, as LuCI's advanced users know it. */
 export function Opt({ children }: { children: ReactNode }): ReactElement {
-  return <code className="rounded border bg-muted px-1 py-px font-mono text-[10px] font-normal text-muted-foreground">{children}</code>;
+  return (
+    <code className="rounded border bg-muted px-1 py-px font-mono text-xs leading-4 font-normal text-muted-foreground">
+      {children}
+    </code>
+  );
 }
 
 export function FieldLabel({ htmlFor, label, opt }: { htmlFor?: string; label: string; opt: string }): ReactElement {
@@ -25,7 +29,8 @@ const quote = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
 /** The section as /etc/config/<config> will hold it once the changes are applied. */
 function previewLines(config: string, type: string, original: Section | undefined, changes: readonly Change[]): string[] {
   const merged = new Map<string, string | string[]>();
-  for (const [k, v] of Object.entries(original ?? {})) if (!k.startsWith('.') && v !== undefined && typeof v !== 'boolean' && typeof v !== 'number') merged.set(k, v);
+  for (const [k, v] of Object.entries(original ?? {}))
+    if (!k.startsWith('.') && v !== undefined && typeof v !== 'boolean' && typeof v !== 'number') merged.set(k, v);
   // only this section's: a sheet's changes can touch others (a zone's forwardings)
   const name = original?.['.name'];
   for (const c of changes) {
@@ -112,4 +117,3 @@ export function UciPreview({
     </div>
   );
 }
-

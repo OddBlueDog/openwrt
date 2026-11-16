@@ -1,4 +1,4 @@
-import { CableIcon, TriangleAlertIcon } from 'lucide-react';
+import { TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -9,6 +9,7 @@ import type { ReportRun } from './analysis';
 import type { RunMember, Schedule } from './api';
 import { type DirectionResult, type Loss, type PairResult, pairResults } from './pairs';
 import { candidateText, type LinkDiag, noPathCauses, pathNotes, pathText, type Side } from './rtc-diag';
+import { Dir } from './dir';
 import type { RunData } from './run-data';
 import { parseAgent } from './ua';
 
@@ -48,7 +49,8 @@ function Cell({ d, pair, onWhy }: { d: DirectionResult; pair: PairResult; onWhy:
   return (
     <span className="flex flex-col gap-0.5">
       <span className="text-base font-semibold tracking-tight tabular">
-        {tp === undefined ? (pair.bulk.opened ? '0' : '—') : formatNumber(tp.mbit, tp.mbit < 10 ? 1 : 0)} <span className="text-xs font-normal text-muted-foreground">Mbit/s</span>
+        {tp === undefined ? (pair.bulk.opened ? '0' : '—') : formatNumber(tp.mbit, tp.mbit < 10 ? 1 : 0)}{' '}
+        <span className="text-xs font-normal text-muted-foreground">Mbit/s</span>
       </span>
       {d.rtt.sent > 0 && (
         <span className="text-xs text-muted-foreground tabular">
@@ -56,11 +58,16 @@ function Cell({ d, pair, onWhy }: { d: DirectionResult; pair: PairResult; onWhy:
         </span>
       )}
       {(d.loss !== undefined || d.lossBack !== undefined) && (
-        <span className={cn('text-xs tabular', (d.loss?.lost ?? 0) + (d.lossBack?.lost ?? 0) > 0 ? 'text-warning' : 'text-muted-foreground')}>
+        <span
+          className={cn(
+            'text-xs tabular',
+            (d.loss?.lost ?? 0) + (d.lossBack?.lost ?? 0) > 0 ? 'text-warning' : 'text-muted-foreground',
+          )}
+        >
           lost {lossText(d.loss)} there, {lossText(d.lossBack)} back
         </span>
       )}
-      {!pair.bulk.opened && <span className="text-[11px] text-warning">the bulk connection didn&apos;t open</span>}
+      {!pair.bulk.opened && <span className="text-xs text-warning">the bulk connection didn&apos;t open</span>}
     </span>
   );
 }
@@ -74,7 +81,7 @@ function candidatesText(r: Record<string, number>): string {
 function DiagColumn({ s }: { s: Side }): ReactElement {
   const d = s.diag;
   return (
-    <div className="flex min-w-0 flex-col gap-1.5 rounded-lg border p-3 text-xs">
+    <div className="flex min-w-0 flex-col gap-1.5 border-t pt-3 text-xs">
       <span className="text-sm font-medium">{s.name}</span>
       {d === undefined ? (
         <span className="text-muted-foreground">Sent nothing about this pair.</span>
@@ -82,8 +89,8 @@ function DiagColumn({ s }: { s: Side }): ReactElement {
         <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
           <dt className="text-muted-foreground">Signalling</dt>
           <dd>
-            {d.offerer ? 'made the offer' : 'answers'}; {d.offerer ? 'offer' : 'answer'} {d.sent ? 'sent' : 'not sent'}; {d.offerer ? 'answer' : 'offer'}{' '}
-            {d.got ? 'arrived' : 'never came'}
+            {d.offerer ? 'made the offer' : 'answers'}; {d.offerer ? 'offer' : 'answer'} {d.sent ? 'sent' : 'not sent'};{' '}
+            {d.offerer ? 'answer' : 'offer'} {d.got ? 'arrived' : 'never came'}
           </dd>
           <dt className="text-muted-foreground">States</dt>
           <dd>
@@ -97,7 +104,10 @@ function DiagColumn({ s }: { s: Side }): ReactElement {
           <dt className="text-muted-foreground">Checks</dt>
           <dd className="tabular">
             {String(d.requestsSent)} sent, {String(d.requestsReceived)} received, {String(d.responsesReceived)} answered
-            {Object.keys(d.pairs).length > 0 && ` (pairs: ${Object.entries(d.pairs).map(([k, n]) => `${String(n)} ${k}`).join(', ')})`}
+            {Object.keys(d.pairs).length > 0 &&
+              ` (pairs: ${Object.entries(d.pairs)
+                .map(([k, n]) => `${String(n)} ${k}`)
+                .join(', ')})`}
           </dd>
           {d.error !== null && (
             <>
@@ -112,9 +122,22 @@ function DiagColumn({ s }: { s: Side }): ReactElement {
 }
 
 /** Device to device: a matrix of what each planned pair measured, from (rows) to (columns), and why a pair found no path. */
-export function PairMatrix({ data, run, schedule, members }: { data: RunData; run: ReportRun; schedule: Schedule; members: readonly RunMember[] }): ReactElement | null {
+export function PairMatrix({
+  data,
+  run,
+  schedule,
+  members,
+}: {
+  data: RunData;
+  run: ReportRun;
+  schedule: Schedule;
+  members: readonly RunMember[];
+}): ReactElement | null {
   const end = run.ended?.at ?? run.end;
-  const pairs = useMemo(() => pairResults(run.t0, end, schedule.phases, data.records), [run.t0, end, schedule.phases, data.records]);
+  const pairs = useMemo(
+    () => pairResults(run.t0, end, schedule.phases, data.records),
+    [run.t0, end, schedule.phases, data.records],
+  );
   const [why, setWhy] = useState<PairResult>();
   if (pairs.length === 0) return null;
   const byId = new Map(members.map((m) => [m.id, m]));
@@ -129,25 +152,32 @@ export function PairMatrix({ data, run, schedule, members }: { data: RunData; ru
   };
   const linkKind = (id: string): string => {
     const l = byId.get(id)?.link;
-    return l === undefined || l === null ? '' : l.kind === 'wired' ? 'wired' : `Wi-Fi${l.band === undefined || l.band === null ? '' : ` ${l.band} GHz`}`;
+    return l === undefined || l === null
+      ? ''
+      : l.kind === 'wired'
+        ? 'wired'
+        : `Wi-Fi${l.band === undefined || l.band === null ? '' : ` ${l.band} GHz`}`;
   };
   const whyA = why === undefined ? undefined : side(byId.get(why.a), why.a, why.probe.a ?? why.bulk.a);
   const whyB = why === undefined ? undefined : side(byId.get(why.b), why.b, why.probe.b ?? why.bulk.b);
   return (
     <section className="flex flex-col gap-3">
-      <h3 className="flex items-center gap-2 text-sm font-semibold">
-        <CableIcon className="size-4 text-muted-foreground" /> Device to device
-      </h3>
-      <div className="overflow-x-auto">
+      <h3 className="text-sm font-semibold">Device to device</h3>
+      <div className="hidden overflow-x-auto lg:block">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="w-32">From ↓ To →</TableHead>
+              <TableHead className="w-32">
+                <span className="flex flex-col">
+                  <span>From (rows)</span>
+                  <span className="text-xs font-normal text-muted-foreground">to (columns)</span>
+                </span>
+              </TableHead>
               {ids.map((id) => (
                 <TableHead key={id}>
                   <span className="flex flex-col">
                     <span>{name(id)}</span>
-                    <span className="text-[11px] font-normal text-muted-foreground">{linkKind(id)}</span>
+                    <span className="text-xs font-normal text-muted-foreground">{linkKind(id)}</span>
                   </span>
                 </TableHead>
               ))}
@@ -180,6 +210,28 @@ export function PairMatrix({ data, run, schedule, members }: { data: RunData; ru
           </TableBody>
         </Table>
       </div>
+      <ul className="divide-y border-y lg:hidden">
+        {ids.flatMap((x) =>
+          ids.flatMap((y) => {
+            const f = x === y ? undefined : find(x, y);
+            if (f === undefined) return [];
+            return [
+              <li key={`${x}-${y}`} className="flex flex-col gap-1.5 px-3 py-3">
+                <span className="inline-flex flex-wrap items-center gap-1 text-sm font-medium">
+                  {name(x)} <Dir d="to" /> {name(y)}
+                </span>
+                <Cell
+                  d={f.d}
+                  pair={f.pair}
+                  onWhy={() => {
+                    setWhy(f.pair);
+                  }}
+                />
+              </li>,
+            ];
+          }),
+        )}
+      </ul>
       <ul className="flex flex-col gap-1.5 text-xs text-muted-foreground">
         {pairs.map((p) => {
           const opened = p.probe.opened || p.bulk.opened;
@@ -187,16 +239,19 @@ export function PairMatrix({ data, run, schedule, members }: { data: RunData; ru
           return (
             <li key={`${p.a}-${p.b}`} className="flex flex-col gap-0.5">
               <span className="tabular">
-                <span className="font-medium text-foreground">
-                  {name(p.a)} ↔ {name(p.b)}
+                <span className="inline-flex items-center gap-1 font-medium text-foreground">
+                  {name(p.a)} <Dir d="between" /> {name(p.b)}
                 </span>
                 {opened ? (
                   <>
                     {(p.probe.path ?? p.bulk.path) !== null && ` · ${pathText(p.probe.path ?? p.bulk.path)}`}
                     {p.probe.ms !== undefined && ` · connected in ${formatNumber(p.probe.ms / 1000, 1)} s`}
                     {p.quiet.sent > 0 && ` · RTT at rest ${ms(p.quiet.median)} / ${ms(p.quiet.p95)} ms`}
-                    {(p.loss.ab !== undefined || p.loss.ba !== undefined) && ` · lost over the run ${lossText(p.loss.ab)} → ${lossText(p.loss.ba)} ←`}
-                    {(p.probe.dropped || p.bulk.dropped) && <span className="text-warning"> · the connection dropped during the run</span>}
+                    {(p.loss.ab !== undefined || p.loss.ba !== undefined) &&
+                      ` · lost over the run ${lossText(p.loss.ab)} from ${name(p.a)}, ${lossText(p.loss.ba)} from ${name(p.b)}`}
+                    {(p.probe.dropped || p.bulk.dropped) && (
+                      <span className="text-warning"> · the connection dropped during the run</span>
+                    )}
                   </>
                 ) : (
                   ' · no direct path'
@@ -211,9 +266,10 @@ export function PairMatrix({ data, run, schedule, members }: { data: RunData; ru
           );
         })}
       </ul>
-      <p className="text-[11px] text-muted-foreground">
-        Over browsers&apos; data channels: throughput is bounded by each browser&apos;s SCTP stack and CPU, so it can be below what the link carries. RTT and loss come
-        from ten numbered probes a second each way, on a connection of their own that nothing resends.
+      <p className="max-w-prose text-xs text-muted-foreground">
+        Over browsers&apos; data channels: throughput is bounded by each browser&apos;s SCTP stack and CPU, so it can be below
+        what the link carries. RTT and loss come from ten numbered probes a second each way, on a connection of their own that
+        nothing resends.
       </p>
       <Dialog
         open={why !== undefined}
@@ -227,8 +283,8 @@ export function PairMatrix({ data, run, schedule, members }: { data: RunData; ru
               No direct path: {whyA?.name ?? ''} and {whyB?.name ?? ''}
             </DialogTitle>
             <DialogDescription>
-              The two browsers looked for a path between them on the home network, with no server in between, and found none. Nothing was relayed through the
-              router.
+              The two browsers looked for a path between them on the home network, with no server in between, and found none.
+              Nothing was relayed through the router.
             </DialogDescription>
           </DialogHeader>
           {whyA !== undefined && whyB !== undefined && (
@@ -245,9 +301,9 @@ export function PairMatrix({ data, run, schedule, members }: { data: RunData; ru
                 <DiagColumn s={whyA} />
                 <DiagColumn s={whyB} />
               </div>
-              <p className="text-[11px] text-muted-foreground">
-                Candidates are listed by type, protocol and the kind of address (an mDNS name is a browser hiding the device&apos;s address); the addresses
-                themselves aren&apos;t kept.
+              <p className="text-xs text-muted-foreground">
+                Candidates are listed by type, protocol and the kind of address (an mDNS name is a browser hiding the
+                device&apos;s address); the addresses themselves aren&apos;t kept.
               </p>
             </div>
           )}

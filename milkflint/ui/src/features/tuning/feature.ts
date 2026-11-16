@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'tuning',
-  title: 'Performance Tuning',
-  description: 'Packet steering and the Wi-Fi queue.',
+  title: 'Performance tuning',
+  description: 'Packet steering, flow offloading, the Wi-Fi queue and diagnostics.',
   icon: ZapIcon,
-  group: 'flow-control',
-  order: 30,
-  page: lazyPage(() => import('./page'), (m) => m.TuningPage),
+  group: 'advanced',
+  order: 10,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.TuningPage,
+  ),
 } satisfies Feature;

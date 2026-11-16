@@ -8,7 +8,10 @@ export const feature = {
   description: 'Let games and apps open ports themselves (UPnP and NAT-PMP).',
   icon: PlugZapIcon,
   group: 'security',
-  order: 40,
+  order: 30,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.UpnpPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.UpnpPage,
+  ),
 } satisfies Feature;

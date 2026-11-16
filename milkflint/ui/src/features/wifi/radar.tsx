@@ -4,15 +4,16 @@
 // it leaves those channels for 30 minutes. What it has heard and done, from
 // hostapd's radar events (the router's radar-log service keeps them on its
 // storage), and the radar channels' state now.
-import { CheckCircle2Icon, LoaderCircleIcon, SatelliteDishIcon, TriangleAlertIcon } from 'lucide-react';
+import { CheckCircle2Icon, LoaderCircleIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, useEffect, useState } from 'react';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { CardHeading } from '@/components/card-heading';
+import { Card, CardContent } from '@/components/ui/card';
 import { usePoll } from '@/hooks/use-poll';
 import { getRadar, getWirelessStatus, type Radar, type RadarEvent } from '@/lib/api/wireless';
 import { cn } from '@/lib/utils';
 import { blockAround, describeChannels } from './channels';
+import { Note } from '@/components/note';
 
 /** How long a channel stays off limits after radar (the kernel's non-occupancy period). */
 const NOP_S = 1800;
@@ -38,7 +39,6 @@ async function loadBands(): Promise<Band[]> {
 
 const channelOf = (mhz: number): number => (mhz - 5000) / 5;
 
-
 /** The channels an event is about, and their width. */
 function blockOfEvent(ev: RadarEvent): { block: number[]; width: number } | undefined {
   const f = ev.fields;
@@ -46,7 +46,8 @@ function blockOfEvent(ev: RadarEvent): { block: number[]; width: number } | unde
   if (f.sec_chan !== undefined && f.width !== undefined && f.seg0 !== undefined) {
     const chan = Number(f.chan);
     const sec = Number(f.sec_chan);
-    if (f.width === '0') return sec === 0 ? { block: [chan], width: 20 } : { block: [chan, chan + 4 * sec].sort((a, b) => a - b), width: 40 };
+    if (f.width === '0')
+      return sec === 0 ? { block: [chan], width: 20 } : { block: [chan, chan + 4 * sec].sort((a, b) => a - b), width: 40 };
     const width = f.width === '2' ? 160 : 80;
     return { block: blockAround(Number(f.seg0), width), width };
   }
@@ -100,16 +101,25 @@ function rowsOf(events: readonly RadarEvent[], dfs: ReadonlySet<number>): Row[] 
     if (ev.event !== 'NOP-FINISHED') nop = undefined;
     switch (ev.event) {
       case 'CAC-START':
-        rows.push({ ms: ev.ms, kind: 'info', text: `Radar check started on ${where(ev)}${f.cac_time === undefined ? '' : `, ${f.cac_time.replace(/s$/, ' s')}`}` });
+        rows.push({
+          ms: ev.ms,
+          kind: 'info',
+          text: `Radar check started on ${where(ev)}${f.cac_time === undefined ? '' : `, ${f.cac_time.replace(/s$/, ' s')}`}`,
+        });
         break;
       case 'CAC-COMPLETED':
         if (f.success === '1') rows.push({ ms: ev.ms, kind: 'ok', text: `No radar heard: ${where(ev)} in use` });
-        else if (f.radar_detected === '1') rows.push({ ms: ev.ms, kind: 'radar', text: `Radar heard during the check of ${where(ev)}` });
+        else if (f.radar_detected === '1')
+          rows.push({ ms: ev.ms, kind: 'radar', text: `Radar heard during the check of ${where(ev)}` });
         else rows.push({ ms: ev.ms, kind: 'stopped', text: `The radar check of ${where(ev)} didn’t finish` });
         break;
       case 'LEFT':
         if (f.state !== 'ENABLED' && prev === 'CAC-START')
-          rows.push({ ms: ev.ms, kind: 'stopped', text: 'The radar check stopped before it finished: the settings were reloaded, or the network stopped' });
+          rows.push({
+            ms: ev.ms,
+            kind: 'stopped',
+            text: 'The radar check stopped before it finished: the settings were reloaded, or the network stopped',
+          });
         break;
       case 'RADAR-DETECTED':
         rows.push({
@@ -122,12 +132,19 @@ function rowsOf(events: readonly RadarEvent[], dfs: ReadonlySet<number>): Row[] 
         });
         break;
       case 'SCAN-START':
-        rows.push({ ms: ev.ms, kind: 'info', text: `Radar scan of ${where(ev)} started, ${f.seconds ?? '?'} s (5 GHz off meanwhile)` });
+        rows.push({
+          ms: ev.ms,
+          kind: 'info',
+          text: `Radar scan of ${where(ev)} started, ${f.seconds ?? '?'} s (5 GHz off meanwhile)`,
+        });
         break;
       case 'SCAN-END':
-        if (f.reason === 'watchdog') rows.push({ ms: ev.ms, kind: 'stopped', text: 'The radar scan stopped unexpectedly; its watchdog brought 5 GHz back' });
-        else if (f.result === 'clear') rows.push({ ms: ev.ms, kind: 'ok', text: `Radar scan of ${where(ev)}: no radar heard in ${f.listened ?? '?'} s` });
-        else if (f.result === 'stopped') rows.push({ ms: ev.ms, kind: 'stopped', text: `Radar scan of ${where(ev)} stopped after ${f.listened ?? '?'} s` });
+        if (f.reason === 'watchdog')
+          rows.push({ ms: ev.ms, kind: 'stopped', text: 'The radar scan stopped unexpectedly; its watchdog brought 5 GHz back' });
+        else if (f.result === 'clear')
+          rows.push({ ms: ev.ms, kind: 'ok', text: `Radar scan of ${where(ev)}: no radar heard in ${f.listened ?? '?'} s` });
+        else if (f.result === 'stopped')
+          rows.push({ ms: ev.ms, kind: 'stopped', text: `Radar scan of ${where(ev)} stopped after ${f.listened ?? '?'} s` });
         break;
       case 'NEW-CHANNEL':
         rows.push({ ms: ev.ms, kind: 'info', text: `Moved the network to channel ${f.chan ?? '?'}` });
@@ -157,7 +174,13 @@ function rowsOf(events: readonly RadarEvent[], dfs: ReadonlySet<number>): Row[] 
 }
 
 function time(ms: number): string {
-  return new Date(ms).toLocaleString(undefined, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return new Date(ms).toLocaleString(undefined, {
+    day: 'numeric',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
 }
 
 function capitalize(s: string): string {
@@ -185,41 +208,33 @@ function Status({ radar }: { radar: Radar }): ReactElement {
   const heard = radar.events.findLast((e) => e.event === 'RADAR-DETECTED');
   const first = radar.events[0];
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-3">
       {blocked.length > 0 && (
-        <Alert variant="warning">
-          <TriangleAlertIcon />
-          <AlertTitle>Radar heard{heard === undefined ? '' : ` ${time(heard.ms)}`}</AlertTitle>
-          <AlertDescription>
-            {capitalize(describeChannels(blocked.map((c) => c.channel)))} {blocked.length === 1 ? 'is' : 'are'} off limits for about{' '}
-            {String(Math.max(1, Math.ceil(left / 60)))} more minutes.
-          </AlertDescription>
-        </Alert>
+        <Note tone="warning" icon={<TriangleAlertIcon />} title={`Radar heard${heard === undefined ? '' : ` ${time(heard.ms)}`}`}>
+          {capitalize(describeChannels(blocked.map((c) => c.channel)))} {blocked.length === 1 ? 'is' : 'are'} off limits for about{' '}
+          {String(Math.max(1, Math.ceil(left / 60)))} more minutes.
+        </Note>
       )}
       {checking !== undefined && (
-        <Alert variant="info">
-          <LoaderCircleIcon className="animate-spin" />
-          <AlertTitle>Listening for radar</AlertTitle>
-          <AlertDescription>
-            Checking {where(checking)}: about {String(Math.max(1, Math.ceil((checking.ms + cacS * 1000 - now) / 1000)))} s left. The 5 GHz
-            network is off until it&apos;s done.
-          </AlertDescription>
-        </Alert>
+        <Note tone="info" icon={<LoaderCircleIcon className="motion-safe:animate-spin" />} title="Listening for radar">
+          Checking {where(checking)}: about {String(Math.max(1, Math.ceil((checking.ms + cacS * 1000 - now) / 1000)))} s left. The
+          5 GHz network is off until it&apos;s done.
+        </Note>
       )}
       {blocked.length === 0 && checking === undefined && (
-        <Alert variant="success">
-          <CheckCircle2Icon />
-          <AlertTitle>{heard === undefined ? 'No radar heard' : `Last radar heard ${time(heard.ms)}`}</AlertTitle>
-          <AlertDescription>
-            {heard === undefined
-              ? first === undefined
-                ? radar.logging === false
-                  ? 'Nothing logged: the radar log is off.'
-                  : 'Nothing logged yet: the router keeps its radar events from now on.'
-                : `Since ${time(first.ms)}, when the log starts.`
-              : `While on ${where(heard)}. Its radar channels were off limits for 30 minutes and are usable again.`}
-          </AlertDescription>
-        </Alert>
+        <Note
+          tone="success"
+          icon={<CheckCircle2Icon />}
+          title={heard === undefined ? 'No radar heard' : `Last radar heard ${time(heard.ms)}`}
+        >
+          {heard === undefined
+            ? first === undefined
+              ? radar.logging === false
+                ? 'Nothing logged: the radar log is off.'
+                : 'Nothing logged yet: the router keeps its radar events from now on.'
+              : `Since ${time(first.ms)}, when the log starts.`
+            : `While on ${where(heard)}. Its radar channels were off limits for 30 minutes and are usable again.`}
+        </Note>
       )}
     </div>
   );
@@ -276,8 +291,8 @@ function Log({ radar }: { radar: Radar }): ReactElement {
         {shown.map((r) => (
           <li key={`${String(r.ms)}-${r.text}`} className="flex items-start gap-2 text-sm">
             <span className={cn('mt-1.5 size-2 shrink-0 rounded-full', dot[r.kind])} aria-hidden />
-            <span className="w-36 shrink-0 font-mono text-xs leading-5 text-muted-foreground">{time(r.ms)}</span>
-            <span>{r.text}</span>
+            <span className="w-32 shrink-0 text-xs leading-5 text-muted-foreground tabular sm:w-36">{time(r.ms)}</span>
+            <span className="min-w-0">{r.text}</span>
           </li>
         ))}
       </ol>
@@ -297,24 +312,16 @@ function Log({ radar }: { radar: Radar }): ReactElement {
   );
 }
 
-export function RadarCard({ className }: { className?: string }): ReactElement | null {
+export function RadarCard({ id, className }: { id?: string; className?: string }): ReactElement | null {
   const bands = usePoll(loadBands, 15_000).data;
   if (bands === undefined || bands.length === 0) return null;
 
   return (
-    <Card className={className}>
-      <CardHeader className="items-center">
-        <div className="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-          <SatelliteDishIcon className="size-4" />
-        </div>
-        <div className="flex flex-col gap-1">
-          <CardTitle className="text-base">Radar detection</CardTitle>
-          <CardDescription>
-            Some 5 GHz channels are shared with weather and military radar. Before using them the router listens for radar (about a minute,
-            with 5 GHz off), and if it hears any it leaves them for 30 minutes. What it has heard and done, kept on the router.
-          </CardDescription>
-        </div>
-      </CardHeader>
+    <Card id={id} className={cn('scroll-mt-20', className)}>
+      <CardHeading
+        title="Radar detection"
+        description="Some 5 GHz channels are shared with weather and military radar. Before using them the router listens for radar (about a minute, with 5 GHz off), and if it hears any it leaves them for 30 minutes. What it has heard and done, kept on the router."
+      />
       <CardContent className="flex flex-col gap-4">
         {bands.map((b) =>
           b.radar === undefined ? (

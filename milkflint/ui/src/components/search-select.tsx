@@ -75,7 +75,12 @@ export function SearchSelect({
         value={query ?? selected?.label ?? ''}
         onFocus={(e) => {
           setQuery('');
-          setActive(Math.max(options.findIndex((o) => o.value === value), 0));
+          setActive(
+            Math.max(
+              options.findIndex((o) => o.value === value),
+              0,
+            ),
+          );
           e.target.select();
         }}
         onChange={(e) => {
@@ -93,7 +98,7 @@ export function SearchSelect({
           ref={list}
           id={`${id}-list`}
           role="listbox"
-          className="absolute z-50 mt-1 max-h-64 w-full overflow-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+          className="absolute z-50 mt-1 max-h-64 w-full overflow-auto rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
         >
           {shown.length === 0 ? (
             <div className="px-2 py-1.5 text-sm text-muted-foreground">No match</div>
@@ -115,10 +120,13 @@ export function SearchSelect({
                 onMouseEnter={() => {
                   setActive(i);
                 }}
-                className={cn('flex cursor-pointer items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-sm', i === active && 'bg-accent text-accent-foreground')}
+                className={cn(
+                  'flex cursor-pointer items-center justify-between gap-2 rounded-md px-2.5 py-2 text-sm',
+                  i === active && 'bg-accent text-accent-foreground',
+                )}
               >
                 {o.label}
-                {o.value === value && <CheckIcon className="size-4" />}
+                {o.value === value && <CheckIcon className="size-4 text-primary" />}
               </div>
             ))
           )}

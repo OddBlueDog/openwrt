@@ -38,6 +38,13 @@ export function addIntercept(zone: InterceptZone): Change {
     config: 'firewall',
     type: 'redirect',
     name: interceptSection(zone),
-    values: { name: `Intercept DNS${which} (MilkFlint)`, src: zone, src_dport: '53', proto: 'tcp udp', target: 'DNAT', family: 'any' },
+    values: {
+      name: `Intercept DNS${which} (MilkFlint)`,
+      src: zone,
+      src_dport: '53',
+      proto: 'tcp udp',
+      target: 'DNAT',
+      family: 'any',
+    },
   };
 }

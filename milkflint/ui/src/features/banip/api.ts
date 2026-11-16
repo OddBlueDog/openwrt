@@ -25,6 +25,8 @@ export type State = (typeof STATES)[number];
 const statusSchema = z.object({
   installed: z.boolean(),
   version: z.string().nullish(),
+  /** the license texts this image carries, as links (none on images before they were added) */
+  licenses: z.object({ banip: z.string().nullish(), gawk: z.string().nullish() }).nullish(),
   enabled: z.boolean().optional(),
   mode: z.enum(['router', 'ap']).optional(),
   state: z.enum(STATES).optional(),
@@ -121,7 +123,14 @@ const runtimeSchema = z
 export type Runtime = z.output<typeof runtimeSchema>;
 
 const installSchema = z
-  .object({ busy: z.boolean(), package: z.string().nullish(), ok: z.boolean().nullish(), log: z.string().nullish(), started: nullableNumber, finished: nullableNumber })
+  .object({
+    busy: z.boolean(),
+    package: z.string().nullish(),
+    ok: z.boolean().nullish(),
+    log: z.string().nullish(),
+    started: nullableNumber,
+    finished: nullableNumber,
+  })
   .nullish();
 
 const configSchema = z.object({
@@ -155,8 +164,19 @@ export function getConfig(): Promise<BanipConfig> {
 
 // ---- answers and their errors ----------------------------------------------------
 
-const problemSchema = z.object({ field: z.string().optional(), reason: z.string().optional(), line: z.number().nullish(), text: z.string().optional() });
-const lockoutSchema = z.object({ entry: z.string(), line: z.number().nullish(), what: z.string(), name: z.string().nullish(), address: z.string().nullish() });
+const problemSchema = z.object({
+  field: z.string().optional(),
+  reason: z.string().optional(),
+  line: z.number().nullish(),
+  text: z.string().optional(),
+});
+const lockoutSchema = z.object({
+  entry: z.string(),
+  line: z.number().nullish(),
+  what: z.string(),
+  name: z.string().nullish(),
+  address: z.string().nullish(),
+});
 export type Lockout = z.output<typeof lockoutSchema>;
 
 const memorySchema = z.object({
@@ -214,7 +234,8 @@ const REASONS: Record<string, string> = {
   access_point: 'In access point mode the main router faces the internet, so banIP stays off here.',
   off: 'Turn banIP on first.',
   allowlist_empty: 'Add what devices may reach to the allowlist first: allowlist-only mode blocks everything else.',
-  edited: 'The custom feed file was changed outside this page. Take it over or go back to banIP’s catalogue first (Advanced, Downloads).',
+  edited:
+    'The custom feed file was changed outside this page. Take it over or go back to banIP’s catalogue first (Advanced, Downloads).',
   no_conntrack: 'Ending open connections needs conntrack, which isn’t installed.',
   no_msmtp: 'Mail needs msmtp, which isn’t installed.',
   no_receiver: 'Set the address to send to first.',
@@ -255,7 +276,13 @@ export function errorText(r: Result): string {
     return `Refused: these lists need about ${String(need)} MB while they load, and the router can spare about ${String(Math.max(0, free))} MB. Choose fewer, or a smaller split size (Advanced, Firewall).`;
   }
   if (r.error === 'invalid' && r.problems !== undefined) {
-    const p = r.problems.slice(0, 3).map((x) => (x.line !== undefined && x.line !== null ? `line ${String(x.line)} (${x.text ?? ''})` : `${x.field ?? ''}: ${FIELD_REASONS[x.reason ?? ''] ?? x.reason ?? ''}`));
+    const p = r.problems
+      .slice(0, 3)
+      .map((x) =>
+        x.line !== undefined && x.line !== null
+          ? `line ${String(x.line)} (${x.text ?? ''})`
+          : `${x.field ?? ''}: ${FIELD_REASONS[x.reason ?? ''] ?? x.reason ?? ''}`,
+      );
     return `Not saved: ${p.join('; ')}${r.problems.length > 3 ? '…' : ''}.`;
   }
   return REASONS[r.error ?? ''] ?? `The router couldn’t: ${r.error ?? 'unknown error'}.`;
@@ -283,7 +310,13 @@ export function runAction(name: 'reload' | 'restart' | 'report'): Promise<Result
 
 export type ListName = 'allowlist' | 'blocklist';
 
-const listSchema = z.object({ ok: z.boolean().optional(), error: z.string().optional(), text: z.string().optional(), size: z.number().optional(), too_big: z.boolean().optional() });
+const listSchema = z.object({
+  ok: z.boolean().optional(),
+  error: z.string().optional(),
+  text: z.string().optional(),
+  size: z.number().optional(),
+  too_big: z.boolean().optional(),
+});
 
 export async function getList(list: ListName): Promise<{ text: string; size: number; tooBig: boolean }> {
   const r = await call('milkflint.banip', 'list_get', { list }, listSchema);
@@ -333,7 +366,11 @@ const searchSchema = z.object({
   query: z.string().optional(),
   kind: z.string().optional(),
   resolved: z.array(z.string()).nullish(),
-  results: z.array(z.object({ address: z.string(), sets: z.array(hitSchema), allowlist: z.array(lineSchema), blocklist: z.array(lineSchema) })).optional(),
+  results: z
+    .array(
+      z.object({ address: z.string(), sets: z.array(hitSchema), allowlist: z.array(lineSchema), blocklist: z.array(lineSchema) }),
+    )
+    .optional(),
   allowlist: z.array(lineSchema).optional(),
   blocklist: z.array(lineSchema).optional(),
   loaded: z.boolean().optional(),
@@ -344,7 +381,10 @@ export type Search = z.output<typeof searchSchema>;
 
 export async function search(query: string): Promise<Search> {
   const r = await call('milkflint.banip', 'search', { query }, searchSchema);
-  if (r.error !== undefined) throw new Error(r.error === 'query' ? 'Type an address (IPv4 or IPv6), a network, a MAC address or a domain name.' : errorText(r));
+  if (r.error !== undefined)
+    throw new Error(
+      r.error === 'query' ? 'Type an address (IPv4 or IPv6), a network, a MAC address or a domain name.' : errorText(r),
+    );
   return r;
 }
 
@@ -435,7 +475,13 @@ const dropsSchema = z.object({
   total: z.number(),
   offset: z.number(),
   rows: z.array(dropSchema),
-  top: z.object({ sources: topSchema, devices: topSchema, ports: topSchema, sets: topSchema, directions: z.record(z.string(), z.number()) }),
+  top: z.object({
+    sources: topSchema,
+    devices: topSchema,
+    ports: topSchema,
+    sets: topSchema,
+    directions: z.record(z.string(), z.number()),
+  }),
   first: nullableNumber,
   events: z.array(z.object({ t: z.number(), kind: z.string(), address: z.string(), set: z.string(), detail: z.string() })),
 });

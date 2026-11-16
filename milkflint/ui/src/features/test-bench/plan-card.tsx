@@ -1,7 +1,7 @@
-import { ListChecksIcon, LoaderCircleIcon, PlayIcon } from 'lucide-react';
+import { InfoIcon, LoaderCircleIcon, PlayIcon } from 'lucide-react';
 import { type ReactElement, useMemo, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
-import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Note } from '@/components/note';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -12,6 +12,7 @@ import { Switch } from '@/components/ui/switch';
 import { formatNumber } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
 import type { Member, Options, Phase, Poll, ScheduleRequest } from './api';
+import { Arrowed } from './dir';
 import { clockText, phaseRoles, phaseStyle } from './phases';
 import {
   buildPlan,
@@ -42,9 +43,17 @@ export function PhaseStrip({ phases, className }: { phases: readonly Phase[]; cl
   );
 }
 
+// a setting as a row with a hairline under it, two to a line on a wider screen
+const gridClass = 'grid border-t sm:grid-cols-2 sm:gap-x-8';
+const rowClass = 'flex min-h-11 items-center justify-between gap-3 border-b py-1.5';
+
 function PresetPicker({ value, onChange }: { value: PresetId; onChange: (p: PresetId) => void }): ReactElement {
   return (
-    <div role="group" aria-label="Plan" className="grid grid-cols-2 gap-0.5 rounded-md border p-0.5 sm:inline-grid sm:w-fit sm:grid-cols-4">
+    <div
+      role="group"
+      aria-label="Plan"
+      className="grid grid-cols-2 gap-0.5 rounded-md border p-0.5 sm:inline-grid sm:w-fit sm:grid-cols-4"
+    >
       {presets.map((p) => (
         <Button
           key={p.id}
@@ -64,9 +73,19 @@ function PresetPicker({ value, onChange }: { value: PresetId; onChange: (p: Pres
   );
 }
 
-function Toggle({ id, label, checked, onChange }: { id: string; label: string; checked: boolean; onChange: (v: boolean) => void }): ReactElement {
+function Toggle({
+  id,
+  label,
+  checked,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}): ReactElement {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
+    <div className={rowClass}>
       <Label htmlFor={id} className="font-normal">
         {label}
       </Label>
@@ -75,9 +94,21 @@ function Toggle({ id, label, checked, onChange }: { id: string; label: string; c
   );
 }
 
-function Seconds({ id, label, value, min, onChange }: { id: string; label: string; value: number; min: number; onChange: (v: number) => void }): ReactElement {
+function Seconds({
+  id,
+  label,
+  value,
+  min,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: number;
+  min: number;
+  onChange: (v: number) => void;
+}): ReactElement {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-1.5">
+    <div className={rowClass}>
       <Label htmlFor={id} className="font-normal">
         {label}
       </Label>
@@ -106,16 +137,81 @@ function CustomOptions({ c, onChange }: { c: CustomPlan; onChange: (c: CustomPla
     onChange({ ...c, [k]: v });
   };
   return (
-    <div className="grid gap-2 sm:grid-cols-2">
-      <Seconds id="tb-idle" label="Idle first" value={c.idleS} min={0} onChange={(v) => { set('idleS', v); }} />
-      <Seconds id="tb-load" label="Each load" value={c.loadS} min={MIN_PHASE_S} onChange={(v) => { set('loadS', v); }} />
-      <Toggle id="tb-down" label="Download" checked={c.download} onChange={(v) => { set('download', v); }} />
-      <Toggle id="tb-up" label="Upload" checked={c.upload} onChange={(v) => { set('upload', v); }} />
-      <Toggle id="tb-both" label="Both ways at once" checked={c.both} onChange={(v) => { set('both', v); }} />
-      <Toggle id="tb-everyone" label="Everyone downloads" checked={c.everyone} onChange={(v) => { set('everyone', v); }} />
-      <Toggle id="tb-d2d" label="Device to device" checked={c.d2d} onChange={(v) => { set('d2d', v); }} />
-      <Toggle id="tb-dns" label="DNS and pages" checked={c.dns} onChange={(v) => { set('dns', v); }} />
-      <Toggle id="tb-household" label="Busy household" checked={c.household} onChange={(v) => { set('household', v); }} />
+    <div className={gridClass}>
+      <Seconds
+        id="tb-idle"
+        label="Idle first"
+        value={c.idleS}
+        min={0}
+        onChange={(v) => {
+          set('idleS', v);
+        }}
+      />
+      <Seconds
+        id="tb-load"
+        label="Each load"
+        value={c.loadS}
+        min={MIN_PHASE_S}
+        onChange={(v) => {
+          set('loadS', v);
+        }}
+      />
+      <Toggle
+        id="tb-down"
+        label="Download"
+        checked={c.download}
+        onChange={(v) => {
+          set('download', v);
+        }}
+      />
+      <Toggle
+        id="tb-up"
+        label="Upload"
+        checked={c.upload}
+        onChange={(v) => {
+          set('upload', v);
+        }}
+      />
+      <Toggle
+        id="tb-both"
+        label="Both ways at once"
+        checked={c.both}
+        onChange={(v) => {
+          set('both', v);
+        }}
+      />
+      <Toggle
+        id="tb-everyone"
+        label="Everyone downloads"
+        checked={c.everyone}
+        onChange={(v) => {
+          set('everyone', v);
+        }}
+      />
+      <Toggle
+        id="tb-d2d"
+        label="Device to device"
+        checked={c.d2d}
+        onChange={(v) => {
+          set('d2d', v);
+        }}
+      />
+      <Toggle
+        id="tb-dns"
+        label="DNS and pages"
+        checked={c.dns}
+        onChange={(v) => {
+          set('dns', v);
+        }}
+      />
+      <Toggle
+        id="tb-household"
+        label="Busy household"
+        checked={c.household}
+        onChange={(v) => {
+          set('household', v);
+        }}
+      />
     </div>
   );
 }
@@ -133,7 +229,7 @@ function SitesField({ sites, onSites }: { sites: readonly string[]; onSites: (s:
   const parsed = parseSites(text);
   const over = parsed.sites.length > MAX_CUSTOM_SITES;
   return (
-    <div className="flex flex-col gap-1.5 rounded-lg border px-3 py-2 sm:col-span-2">
+    <div className="flex flex-col gap-1.5 border-b py-2.5 sm:col-span-2">
       <Label htmlFor="tb-sites" className="font-normal">
         More sites for DNS and pages
       </Label>
@@ -180,15 +276,17 @@ function Settings({
   onOptions: (o: Options) => void;
 }): ReactElement {
   return (
-    <div className="grid gap-2 sm:grid-cols-2">
-      <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2 sm:col-span-2">
+    <div className={gridClass}>
+      <div className={cn(rowClass, 'sm:col-span-2')}>
         <div className="flex flex-col">
           <Label htmlFor="tb-dry">Rehearsal</Label>
-          <span className="text-xs text-muted-foreground">No traffic: every device only marks when each phase starts, a check of the timing.</span>
+          <span className="text-xs text-muted-foreground">
+            No traffic: every device only marks when each phase starts, a check of the timing.
+          </span>
         </div>
         <Switch id="tb-dry" checked={dry} onCheckedChange={onDry} />
       </div>
-      <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-1.5">
+      <div className={rowClass}>
         <Label htmlFor="tb-latency" className="font-normal">
           Internet latency to
         </Label>
@@ -210,7 +308,7 @@ function Settings({
           </SelectContent>
         </Select>
       </div>
-      <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-1.5">
+      <div className={rowClass}>
         <Label htmlFor="tb-budget" className="font-normal">
           Data, each device
         </Label>
@@ -240,7 +338,7 @@ function Settings({
         />
       )}
       {import.meta.env.DEV && (
-        <div className="flex items-center justify-between gap-3 rounded-lg border border-dashed px-3 py-1.5 sm:col-span-2">
+        <div className={cn(rowClass, 'sm:col-span-2')}>
           <Label htmlFor="tb-endpoint" className="font-normal">
             Loads go to (development)
           </Label>
@@ -261,7 +359,7 @@ function Settings({
         </div>
       )}
       {!dry && (
-        <p className="text-xs text-muted-foreground sm:col-span-2">
+        <p className="pt-2.5 text-xs text-muted-foreground sm:col-span-2">
           {!wan
             ? 'This plan sends nothing through your internet line.'
             : estimate === undefined
@@ -295,11 +393,19 @@ export function PlanCard({
   const [error, setError] = useState<string>();
   const [dry, setDry] = useState(false);
   // in development, loads stay on the dev server unless asked otherwise; a budget of 0 follows the plan
-  const [options, setOptions] = useState<Options>({ endpoint: import.meta.env.DEV ? 'dev' : 'cloudflare', latency: 'uk', budget_mb: 0, custom_sites: [] });
+  const [options, setOptions] = useState<Options>({
+    endpoint: import.meta.env.DEV ? 'dev' : 'cloudflare',
+    latency: 'uk',
+    budget_mb: 0,
+    custom_sites: [],
+  });
   const pm = useMemo(() => planMembers(members), [members]);
   const estimate = dataEstimate(buildPlan(preset, pm, dry, custom).schedule, shaper);
   const budget = options.budget_mb > 0 ? options.budget_mb : defaultBudget(estimate);
-  const built = useMemo(() => buildPlan(preset, pm, dry, custom, { ...options, budget_mb: budget }), [preset, pm, dry, custom, options, budget]);
+  const built = useMemo(
+    () => buildPlan(preset, pm, dry, custom, { ...options, budget_mb: budget }),
+    [preset, pm, dry, custom, options, budget],
+  );
   const names = useMemo(() => new Map(members.map((m) => [m.id, m.name])), [members]);
   const length = scheduleLength(built.schedule);
   const wan = usesInternet(built.schedule);
@@ -318,26 +424,34 @@ export function PlanCard({
   };
   return (
     <Card>
-      <CardHeading icon={ListChecksIcon} title="Plan" description={presets.find((p) => p.id === preset)?.description} />
+      <CardHeading title="Plan" description={presets.find((p) => p.id === preset)?.description} />
       <CardContent className="flex flex-col gap-4">
         <PresetPicker value={preset} onChange={setPreset} />
         {preset === 'custom' && <CustomOptions c={custom} onChange={setCustom} />}
-        <Settings dry={dry} options={{ ...options, budget_mb: budget }} estimate={estimate} wan={wan} pages={pages} onDry={setDry} onOptions={setOptions} />
+        <Settings
+          dry={dry}
+          options={{ ...options, budget_mb: budget }}
+          estimate={estimate}
+          wan={wan}
+          pages={pages}
+          onDry={setDry}
+          onOptions={setOptions}
+        />
         <div className="flex flex-col gap-2">
           <PhaseStrip phases={built.schedule.phases} />
-          <ol className="flex flex-col divide-y rounded-lg border">
+          <ol className="-mx-5 flex flex-col divide-y border-t">
             {built.schedule.phases.map((p, i) => {
               const s = phaseStyle[p.kind];
               const Icon = s.icon;
               const roles = phaseRoles(p, names);
               return (
-                <li key={i} className="flex items-center gap-3 px-3 py-2 text-sm">
+                <li key={i} className="flex items-center gap-3 px-5 py-2 text-sm">
                   <span className="w-10 shrink-0 text-xs text-muted-foreground tabular">{clockText(p.start)}</span>
-                  <span className={cn('flex size-6 shrink-0 items-center justify-center rounded-md border', s.chip)}>
-                    <Icon className="size-3.5" />
-                  </span>
+                  <Icon className={cn('size-4 shrink-0', s.tone)} aria-hidden="true" />
                   <span className="flex min-w-0 flex-1 flex-col">
-                    <span className="truncate font-medium">{p.label ?? s.name}</span>
+                    <span className="truncate font-medium">
+                      <Arrowed text={p.label ?? s.name} />
+                    </span>
                     {roles !== '' && <span className="truncate text-xs text-muted-foreground">{roles}</span>}
                   </span>
                   <span className="shrink-0 text-xs text-muted-foreground tabular">{String(Math.round(p.dur / 1000))} s</span>
@@ -347,13 +461,11 @@ export function PlanCard({
           </ol>
         </div>
         {built.notes.length > 0 && (
-          <Alert variant="info">
-            <AlertDescription>
-              {built.notes.map((n) => (
-                <p key={n}>{n}</p>
-              ))}
-            </AlertDescription>
-          </Alert>
+          <Note tone="info" icon={<InfoIcon />}>
+            {built.notes.map((n) => (
+              <p key={n}>{n}</p>
+            ))}
+          </Note>
         )}
       </CardContent>
       <CardFooter className="flex flex-wrap items-center justify-between gap-3 border-t">
@@ -376,8 +488,8 @@ export function PlanCard({
           <DialogHeader>
             <DialogTitle>Start {dry ? 'a rehearsal' : 'the run'}?</DialogTitle>
             <DialogDescription>
-              {built.schedule.name} on {String(members.length)} {members.length === 1 ? 'device' : 'devices'}, {clockText(length)} long, starting a few seconds
-              after you press Start. Any device can stop it, and it stops by itself at the end.
+              {built.schedule.name} on {String(members.length)} {members.length === 1 ? 'device' : 'devices'}, {clockText(length)}{' '}
+              long, starting a few seconds after you press Start. Any device can stop it, and it stops by itself at the end.
               {!dry &&
                 wan &&
                 (estimate === undefined

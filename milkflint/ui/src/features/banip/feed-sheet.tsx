@@ -21,7 +21,17 @@ const RULES = [
   { value: 'suricata 1', label: 'Suricata or Snort rules' },
 ];
 
-export function FeedSheet({ feed, names, onClose, onSaved }: { feed: Feed | undefined; names: readonly string[]; onClose: () => void; onSaved: () => void }): ReactElement {
+export function FeedSheet({
+  feed,
+  names,
+  onClose,
+  onSaved,
+}: {
+  feed: Feed | undefined;
+  names: readonly string[];
+  onClose: () => void;
+  onSaved: () => void;
+}): ReactElement {
   const id = useId();
   const [f, setF] = useState<FeedForm>({
     name: feed?.name ?? '',
@@ -76,7 +86,8 @@ export function FeedSheet({ feed, names, onClose, onSaved }: { feed: Feed | unde
         <div className="border-b px-6 py-4">
           <SheetTitle className="pr-8">{feed === undefined ? 'Add a list' : `Change ${feed.name}`}</SheetTitle>
           <SheetDescription id={`${id}-desc`} className="mt-0.5 text-xs">
-            Any web page with addresses on it, downloaded at each update. It’s kept in banIP’s custom feed file, with banIP’s own lists.
+            Any web page with addresses on it, downloaded at each update. It’s kept in banIP’s custom feed file, with banIP’s own
+            lists.
           </SheetDescription>
         </div>
         <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-6 py-5">
@@ -167,7 +178,8 @@ export function FeedSheet({ feed, names, onClose, onSaved }: { feed: Feed | unde
             />
             {show('rule') !== undefined && <p className="text-xs text-destructive">{show('rule')}</p>}
             <p className="text-xs text-muted-foreground">
-              banIP’s rule: feed or suricata, then optionally a text a line must start with, the column of the address, and a separator.
+              banIP’s rule: feed or suricata, then optionally a text a line must start with, the column of the address, and a
+              separator.
             </p>
           </div>
           <div className="grid gap-1.5">
@@ -209,7 +221,13 @@ export function FeedSheet({ feed, names, onClose, onSaved }: { feed: Feed | unde
               <Button
                 size="sm"
                 variant="outline"
-                disabled={busy !== undefined || (f.url_4 === '' && f.url_6 === '') || errors.url_4 !== undefined || errors.url_6 !== undefined || errors.rule !== undefined}
+                disabled={
+                  busy !== undefined ||
+                  (f.url_4 === '' && f.url_6 === '') ||
+                  errors.url_4 !== undefined ||
+                  errors.url_6 !== undefined ||
+                  errors.rule !== undefined
+                }
                 onClick={() => {
                   setTest(undefined);
                   run('test', async () => {
@@ -221,16 +239,26 @@ export function FeedSheet({ feed, names, onClose, onSaved }: { feed: Feed | unde
               </Button>
             </div>
             {test === undefined ? (
-              <p className="text-xs text-muted-foreground">The router downloads it (up to 2 MB) and counts the addresses the rule finds.</p>
+              <p className="text-xs text-muted-foreground">
+                The router downloads it (up to 2 MB) and counts the addresses the rule finds.
+              </p>
             ) : test.reachable === true ? (
               <p className="text-sm">
                 {formatBytes(test.bytes ?? 0)}
-                {test.truncated === true ? ' (the first 2 MB)' : ''}: {formatNumber(test.v4 ?? 0)} IPv4 and {formatNumber(test.v6 ?? 0)} IPv6 entries
-                {(test.sample ?? []).length > 0 && <span className="block font-mono text-xs text-muted-foreground">{(test.sample ?? []).join(', ')}</span>}
-                {(test.v4 ?? 0) + (test.v6 ?? 0) === 0 && <span className="block text-xs text-warning">Nothing found: check how to read a line.</span>}
+                {test.truncated === true ? ' (the first 2 MB)' : ''}: {formatNumber(test.v4 ?? 0)} IPv4 and{' '}
+                {formatNumber(test.v6 ?? 0)} IPv6 entries
+                {(test.sample ?? []).length > 0 && (
+                  <span className="block font-mono text-xs text-muted-foreground">{(test.sample ?? []).join(', ')}</span>
+                )}
+                {(test.v4 ?? 0) + (test.v6 ?? 0) === 0 && (
+                  <span className="block text-xs text-warning">Nothing found: check how to read a line.</span>
+                )}
               </p>
             ) : (
-              <p className="text-sm text-destructive">Couldn’t fetch it{test.error !== undefined && test.error !== 'empty' ? `: ${test.error}` : ' (nothing came back)'}.</p>
+              <p className="text-sm text-destructive">
+                Couldn’t fetch it{test.error !== undefined && test.error !== 'empty' ? `: ${test.error}` : ' (nothing came back)'}
+                .
+              </p>
             )}
           </div>
           {failed !== undefined && <p className="text-sm text-destructive">{failed}</p>}

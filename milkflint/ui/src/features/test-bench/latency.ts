@@ -3,7 +3,16 @@
 // the router's pings to it, and the router's own pings to the internet.
 // "Idle" is the idle phases, "loaded" those that load the network
 // (LOAD_KINDS); what load added is the loaded p95 less the idle median.
-import { LOAD_KINDS, memberRtts, type PhaseWindow, routerRtts, type RttSample, type RttStats, rttStats, runWindows } from './analysis';
+import {
+  LOAD_KINDS,
+  memberRtts,
+  type PhaseWindow,
+  routerRtts,
+  type RttSample,
+  type RttStats,
+  rttStats,
+  runWindows,
+} from './analysis';
 import { memberPeerRtts } from './pairs';
 import { reportRun, type RunData } from './run-data';
 
@@ -51,7 +60,8 @@ function samples(data: RunData, member: string | null, target: LatencyTarget, w:
   }
 }
 
-const addedTo = (s: RttStats, idle: RttStats): number | undefined => (s.p95 === undefined || idle.median === undefined ? undefined : s.p95 - idle.median);
+const addedTo = (s: RttStats, idle: RttStats): number | undefined =>
+  s.p95 === undefined || idle.median === undefined ? undefined : s.p95 - idle.median;
 
 /** A row per device and target it has figures for, then the router's own. */
 export function latencyRows(data: RunData): LatencyRow[] {

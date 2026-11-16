@@ -1,4 +1,4 @@
-import { ArrowRightIcon, FlaskConicalIcon, LoaderCircleIcon, LogOutIcon, SmartphoneIcon } from 'lucide-react';
+import { ArrowRightIcon, LoaderCircleIcon, LogOutIcon, SmartphoneIcon } from 'lucide-react';
 import { type ReactElement, type SyntheticEvent, useEffect, useRef, useState } from 'react';
 import { Logo } from '@/components/layout/sidebar';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
@@ -16,11 +16,20 @@ const JOIN_PATH = '#/test-bench/join';
 
 /** The code as it's typed: base32 letters and digits, a dash after four. */
 function formatCode(s: string): string {
-  const raw = s.toUpperCase().replace(/[^0-9A-Z]/g, '').slice(0, 8);
+  const raw = s
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, '')
+    .slice(0, 8);
   return raw.length > 4 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : raw;
 }
 
-function JoinForm({ state, onJoin }: { state: MemberState; onJoin: (code: string, name: string) => Promise<void> }): ReactElement {
+function JoinForm({
+  state,
+  onJoin,
+}: {
+  state: MemberState;
+  onJoin: (code: string, name: string) => Promise<void>;
+}): ReactElement {
   const [code, setCode] = useState('');
   const [name, setName] = useState('');
   const [error, setError] = useState<string>();
@@ -38,12 +47,14 @@ function JoinForm({ state, onJoin }: { state: MemberState; onJoin: (code: string
   return (
     <div className="mx-auto w-full max-w-sm">
       <div className="mb-8 flex flex-col items-center gap-3 text-center">
-        <div className="flex size-11 items-center justify-center rounded-xl bg-primary/10 text-primary">
-          <FlaskConicalIcon className="size-5" />
-        </div>
+        <span className="flex items-center gap-2.5">
+          <Logo className="size-9" />
+          <span className="text-base font-semibold">MilkFlint</span>
+        </span>
         <h1 className="text-xl font-semibold tracking-tight">Join a test bench</h1>
         <p className="text-sm text-muted-foreground">
-          Type the code the bench shows, or scan its QR code with this device&apos;s camera. No admin password needed.
+          Someone on this network is testing it from several devices at once. Type the code their bench shows, or scan its QR code
+          with this device&apos;s camera.
         </p>
       </div>
       <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-4 rounded-xl border bg-card p-6 shadow-xs">
@@ -86,8 +97,16 @@ function JoinForm({ state, onJoin }: { state: MemberState; onJoin: (code: string
           {busy ? <LoaderCircleIcon className="animate-spin" /> : <ArrowRightIcon />} Join
         </Button>
       </form>
+      <ul className="mt-6 flex list-disc flex-col gap-1.5 pl-5 text-sm text-muted-foreground">
+        <li>Joining needs no admin password, and lets this device do nothing on the router but take part.</li>
+        <li>
+          In a run it measures latency and, as the plan says, downloads and uploads test data (up to a limit) or loads a few
+          sites&apos; icons.
+        </li>
+        <li>Nothing runs until the person coordinating presses Start, and every run stops by itself.</li>
+      </ul>
       <div className="mt-6 flex items-center justify-between gap-4 text-xs text-muted-foreground">
-        <a href="#/" className="hover:text-foreground">
+        <a href="#/" className="inline-block py-1 hover:text-foreground">
           Sign in as admin
         </a>
         <ThemeToggle className="w-28" />
@@ -139,47 +158,53 @@ export function JoinPage(): ReactElement {
 
   return (
     <TooltipProvider delayDuration={200}>
-      <div className="min-h-dvh">
-        <header className="sticky top-0 z-10 border-b bg-background/90 backdrop-blur">
-          <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3">
-            <Logo className="size-8" />
-            <div className="flex min-w-0 flex-1 flex-col">
-              <span className="truncate text-sm font-semibold">{state.poll?.bench.name ?? 'Test bench'}</span>
-              <span className="truncate text-xs text-muted-foreground">MilkFlint test bench</span>
-            </div>
-            {state.status === 'in' && (
+      {state.status === 'in' ? (
+        <div className="min-h-dvh">
+          <header className="sticky top-0 z-10 border-b bg-background/90 backdrop-blur">
+            <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3">
+              <Logo className="size-8 shrink-0" />
+              <div className="flex min-w-0 flex-1 flex-col">
+                <h1 className="truncate text-sm font-semibold">{state.poll?.bench.name ?? 'Test bench'}</h1>
+                <span className="truncate text-xs text-muted-foreground">MilkFlint test bench</span>
+              </div>
               <Button type="button" size="sm" variant="ghost" onClick={() => void member.leave()}>
                 <LogOutIcon /> Leave
               </Button>
-            )}
-          </div>
-        </header>
-        <main className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-6">
-          {state.status === 'in' ? (
-            <>
-              <Alert variant="info">
-                <SmartphoneIcon />
-                <AlertDescription>
-                  Keep this page open and in front while a run is on. A phone that locks or switches to another app stops its part of the run.
-                </AlertDescription>
-              </Alert>
-              <BenchView member={member} state={state} />
-              {member.session !== undefined && <HistoryCard reader={{ session: member.session }} />}
-            </>
-          ) : state.status === 'joining' && token !== undefined ? (
-            <div className="flex items-center justify-center gap-2 py-24 text-sm text-muted-foreground">
-              <LoaderCircleIcon className="size-4 animate-spin" /> Joining the bench…
+            </div>
+          </header>
+          <main className="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-6">
+            <Alert variant="info">
+              <SmartphoneIcon />
+              <AlertDescription>
+                Keep this page open and in front while a run is on. A phone that locks or switches to another app stops its part
+                of the run.
+              </AlertDescription>
+            </Alert>
+            <BenchView member={member} state={state} />
+            {member.session !== undefined && <HistoryCard reader={{ session: member.session }} />}
+          </main>
+        </div>
+      ) : (
+        <main className="grid min-h-dvh place-items-center px-4 py-10">
+          {state.status === 'joining' && token !== undefined ? (
+            <div className="flex flex-col items-center gap-3 text-center">
+              <span className="flex items-center gap-2.5">
+                <Logo className="size-9" />
+                <span className="text-base font-semibold">MilkFlint</span>
+              </span>
+              <h1 className="text-xl font-semibold tracking-tight">Joining the bench</h1>
+              <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                <LoaderCircleIcon className="size-4 animate-spin" aria-hidden="true" /> A moment…
+              </p>
             </div>
           ) : (
-            <div className="py-6 sm:py-12">
-              <JoinForm
-                state={state}
-                onJoin={(code, name) => member.join({ code: code.replace('-', '') }, name === '' ? undefined : name)}
-              />
-            </div>
+            <JoinForm
+              state={state}
+              onJoin={(code, name) => member.join({ code: code.replace('-', '') }, name === '' ? undefined : name)}
+            />
           )}
         </main>
-      </div>
+      )}
     </TooltipProvider>
   );
 }

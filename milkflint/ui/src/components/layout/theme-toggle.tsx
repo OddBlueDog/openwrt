@@ -12,7 +12,11 @@ const options: readonly { value: ThemeChoice; label: string; icon: typeof SunIco
 export function ThemeToggle({ className }: { className?: string }): ReactElement {
   const { choice } = useTheme();
   return (
-    <div role="radiogroup" aria-label="Colour theme" className={cn('flex rounded-md border bg-card p-0.5', className)}>
+    <div
+      role="radiogroup"
+      aria-label="Light or dark"
+      className={cn('grid grid-cols-3 gap-0.5 rounded-lg bg-sidebar-accent p-0.5', className)}
+    >
       {options.map(({ value, label, icon: Icon }) => (
         <button
           key={value}
@@ -24,8 +28,8 @@ export function ThemeToggle({ className }: { className?: string }): ReactElement
             setTheme(value);
           }}
           className={cn(
-            'flex h-7 flex-1 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground',
-            choice === value && 'bg-accent text-foreground',
+            'flex h-7 cursor-pointer items-center justify-center rounded-md text-sidebar-muted-foreground transition-colors duration-fast hover:text-sidebar-accent-foreground',
+            choice === value && 'bg-sidebar text-sidebar-foreground shadow-xs',
           )}
         >
           <Icon className="size-3.5" />

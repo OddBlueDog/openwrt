@@ -34,7 +34,8 @@ export async function getWgStatus(): Promise<WgStatus> {
     return await call('milkflint.vpn', 'status', {}, statusSchema);
   } catch (err) {
     // an image without the VPN pages' plugin
-    if (err instanceof UbusError && err.code === UbusStatus.notFound) return { installed: false, now: Date.now() / 1000, interfaces: [] };
+    if (err instanceof UbusError && err.code === UbusStatus.notFound)
+      return { installed: false, now: Date.now() / 1000, interfaces: [] };
     throw err;
   }
 }
@@ -51,7 +52,12 @@ export async function newKeys(): Promise<Keys> {
     'milkflint.vpn',
     'keys',
     {},
-    z.object({ private_key: z.string().optional(), public_key: z.string().optional(), preshared_key: z.string().optional(), error: z.string().optional() }),
+    z.object({
+      private_key: z.string().optional(),
+      public_key: z.string().optional(),
+      preshared_key: z.string().optional(),
+      error: z.string().optional(),
+    }),
   );
   if (res.private_key === undefined || res.public_key === undefined || res.preshared_key === undefined) {
     throw new Error(`The router couldn’t make WireGuard keys (${res.error ?? 'no answer'}).`);
@@ -183,7 +189,8 @@ export function parseConf(text: string): WgConf | { error: string } {
   if (peers === 0 || !isKey(conf.peer.publicKey)) return { error: 'It has no [Peer] with a PublicKey.' };
   if (conf.peer.endpointHost === '') return { error: 'Its [Peer] has no Endpoint: the server this router connects to.' };
   if (conf.addresses.length === 0) return { error: 'Its [Interface] has no Address.' };
-  if (conf.peer.presharedKey !== '' && !isKey(conf.peer.presharedKey)) return { error: 'Its PresharedKey isn’t a WireGuard key.' };
+  if (conf.peer.presharedKey !== '' && !isKey(conf.peer.presharedKey))
+    return { error: 'Its PresharedKey isn’t a WireGuard key.' };
   return conf;
 }
 

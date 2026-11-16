@@ -59,13 +59,18 @@ export function shapingProblems(queue: Section | undefined, qdiscs: readonly Cak
     if (want && cake === undefined) {
       problems.push(`${d.name} aren’t shaped: there’s no CAKE on ${d.dev}.`);
     } else if (!want && cake !== undefined) {
-      problems.push(`CAKE still shapes ${d.name.toLowerCase()} on ${d.dev}, though ${on ? 'their speed is 0' : 'Smart Queue is off'}.`);
+      problems.push(
+        `CAKE still shapes ${d.name.toLowerCase()} on ${d.dev}, though ${on ? 'their speed is 0' : 'Smart Queue is off'}.`,
+      );
     } else if (cake !== undefined) {
-      if (d.kind !== undefined && cake.kind !== d.kind) problems.push(`${d.name} run ${kindName(cake.kind)}, not ${kindName(d.kind)} as saved.`);
+      if (d.kind !== undefined && cake.kind !== d.kind)
+        problems.push(`${d.name} run ${kindName(cake.kind)}, not ${kindName(d.kind)} as saved.`);
       const bandwidth = cake.options?.bandwidth;
       const bits = typeof bandwidth === 'number' ? bandwidth * 8 : 0;
       if (!d.autorate && Math.round(bits / 1000) !== d.kbit) {
-        problems.push(`${d.name} are shaped at ${bits === 0 ? 'no limit' : formatBitrate(bits)}, not the ${formatBitrate(d.kbit * 1000)} saved.`);
+        problems.push(
+          `${d.name} are shaped at ${bits === 0 ? 'no limit' : formatBitrate(bits)}, not the ${formatBitrate(d.kbit * 1000)} saved.`,
+        );
       }
     }
   }

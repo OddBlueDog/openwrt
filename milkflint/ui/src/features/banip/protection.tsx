@@ -3,7 +3,20 @@
 // countries and networks (ASNs) to block, and when the lists are updated.
 // The meter shows the memory the choice needs while banIP loads it; the
 // save bar writes only what changed.
-import { BuildingIcon, CalendarClockIcon, ChevronDownIcon, GaugeIcon, GlobeIcon, ListIcon, PencilIcon, PlusIcon, SearchIcon, TriangleAlertIcon, XIcon } from 'lucide-react';
+import {
+  BuildingIcon,
+  CalendarClockIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  GaugeIcon,
+  GlobeIcon,
+  ListIcon,
+  PencilIcon,
+  PlusIcon,
+  SearchIcon,
+  TriangleAlertIcon,
+  XIcon,
+} from 'lucide-react';
 import { type ReactElement, useId, useMemo, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
@@ -37,7 +50,7 @@ import {
   withPreset,
 } from './model';
 import { effective, type OptionName, type Options, optionChanges } from './options';
-import { Segmented } from './segmented';
+import { Segmented } from '@/components/ui/segmented';
 
 const KEYS: readonly OptionName[] = [
   'ban_feed',
@@ -96,7 +109,11 @@ function MemoryMeter({ c, opts }: { c: BanipConfig; opts: Options }): ReactEleme
   const used = total - check.availableKb - check.freedKb;
   return (
     <div className="flex flex-col gap-2" aria-live="polite">
-      <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-muted" role="img" aria-label={`Memory: ${mb(est.keptKb)} kept for the lists, ${mb(est.loadKb)} more while loading, ${mb(check.leftKb)} left of ${mb(total)}`}>
+      <div
+        className="flex h-2.5 w-full overflow-hidden rounded-full bg-muted"
+        role="img"
+        aria-label={`Memory: ${mb(est.keptKb)} kept for the lists, ${mb(est.loadKb)} more while loading, ${mb(check.leftKb)} left of ${mb(total)}`}
+      >
         <div className="h-full bg-muted-foreground/35" style={{ width: w(used) }} />
         <div className={cn('h-full', check.ok ? 'bg-primary' : 'bg-destructive')} style={{ width: w(est.keptKb) }} />
         <div className={cn('h-full', check.ok ? 'bg-primary/40' : 'bg-destructive/50')} style={{ width: w(est.loadKb) }} />
@@ -113,7 +130,15 @@ function MemoryMeter({ c, opts }: { c: BanipConfig; opts: Options }): ReactEleme
   );
 }
 
-function PresetPicker({ value, onChange, c }: { value: PresetId; onChange: (p: PresetId) => void; c: BanipConfig }): ReactElement {
+function PresetPicker({
+  value,
+  onChange,
+  c,
+}: {
+  value: PresetId;
+  onChange: (p: PresetId) => void;
+  c: BanipConfig;
+}): ReactElement {
   const regions = useMemo(() => new Map((c.countries ?? []).map((x) => [x.code, x.region])), [c.countries]);
   const id = useId();
   return (
@@ -126,7 +151,12 @@ function PresetPicker({ value, onChange, c }: { value: PresetId; onChange: (p: P
         const cost =
           c.meta === undefined || p.id === 'off' || p.id === 'custom'
             ? null
-            : estimate(selectionOf({ ...(c.options ?? {}), ban_feed: p.feeds, ban_country: [], ban_asn: [] }, regions), c.meta, c.known ?? {}, c.cpus ?? 1);
+            : estimate(
+                selectionOf({ ...(c.options ?? {}), ban_feed: p.feeds, ban_country: [], ban_asn: [] }, regions),
+                c.meta,
+                c.known ?? {},
+                c.cpus ?? 1,
+              );
         return (
           <button
             key={p.id}
@@ -137,12 +167,18 @@ function PresetPicker({ value, onChange, c }: { value: PresetId; onChange: (p: P
               onChange(p.id);
             }}
             className={cn(
-              'flex flex-col items-start gap-1.5 rounded-lg border bg-card px-4 py-3 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
-              on ? 'border-primary ring-1 ring-primary' : 'hover:border-foreground/30',
+              'flex flex-col items-start gap-1.5 rounded-lg border px-4 py-3 text-left transition-colors',
+              on ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'bg-card hover:bg-accent/50',
             )}
           >
             <span className="flex w-full items-center gap-2">
-              <span className={cn('flex size-4 items-center justify-center rounded-full border', on ? 'border-primary' : 'border-input')} aria-hidden="true">
+              <span
+                className={cn(
+                  'flex size-4 items-center justify-center rounded-full border',
+                  on ? 'border-primary' : 'border-input',
+                )}
+                aria-hidden="true"
+              >
                 {on && <span className="size-2 rounded-full bg-primary" />}
               </span>
               <span className="text-sm font-semibold">{p.title}</span>
@@ -150,8 +186,8 @@ function PresetPicker({ value, onChange, c }: { value: PresetId; onChange: (p: P
             <span className="text-xs text-muted-foreground">{p.text}</span>
             {cost !== null && (
               <span className="mt-auto pt-1 text-xs tabular">
-                {p.feeds.length} lists, about {formatNumber(Math.round(cost.entries / 1000))} thousand addresses: {mb(cost.keptKb)} of memory, {mb(cost.downloadKb)} to download
-                at each update
+                {p.feeds.length} lists, about {formatNumber(Math.round(cost.entries / 1000))} thousand addresses:{' '}
+                {mb(cost.keptKb)} of memory, {mb(cost.downloadKb)} to download at each update
               </span>
             )}
           </button>
@@ -193,9 +229,10 @@ function FeedRow({
   const limit = portLimit(f.flag);
   const id = `banip-feed-${f.name}`;
   return (
-    <li className="flex flex-col gap-2 py-3 sm:flex-row sm:items-start sm:gap-4">
+    // the switch beside the name at every width; the direction under the text on a phone, at the right from sm
+    <li className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 py-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:gap-x-4">
       <Switch id={id} className="mt-0.5 shrink-0" checked={on} onCheckedChange={onToggle} aria-describedby={`${id}-text`} />
-      <div className="flex min-w-0 flex-1 flex-col gap-1">
+      <div className="flex min-w-0 flex-col gap-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <label htmlFor={id} className="text-sm font-medium">
             {f.name}
@@ -209,7 +246,9 @@ function FeedRow({
           {info?.riskText !== undefined && <span className="text-xs"> {info.riskText}</span>}
         </p>
         <p className="text-xs text-muted-foreground tabular">
-          {entries !== undefined && entries > 0 ? `${known ? '' : 'about '}${formatNumber(entries)} addresses` : 'size unknown until it’s loaded'}
+          {entries !== undefined && entries > 0
+            ? `${known ? '' : 'about '}${formatNumber(entries)} addresses`
+            : 'size unknown until it’s loaded'}
           {limit !== null && !reset ? `, on ${limitText(limit)} only` : ''}
           {on && loaded && result === undefined ? ', loaded' : ''}
           {result !== undefined && <span className="text-warning">, last update: {RESULTS[result] ?? result}</span>}
@@ -221,7 +260,7 @@ function FeedRow({
           </label>
         )}
       </div>
-      <div className="flex items-center gap-2 pl-12 sm:pl-0">
+      <div className="col-start-2 flex items-center gap-2 sm:col-start-3 sm:row-start-1">
         <Segmented label={`${f.name}: direction`} value={dir} options={DIRECTIONS} onChange={onDirection} disabled={!on} />
         {onEdit !== undefined && (
           <Button variant="ghost" size="icon" className="size-8" aria-label={`Edit ${f.name}`} onClick={onEdit}>
@@ -251,7 +290,15 @@ function Catalogue({
   const [editing, setEditing] = useState<Feed | 'new'>();
   const regions = useMemo(() => new Map((c.countries ?? []).map((x) => [x.code, x.region])), [c.countries]);
   const all: Options = { ...(c.options ?? {}), ...opts };
-  const est = c.meta === undefined ? undefined : estimate(selectionOf({ ...all, ban_feed: (c.catalogue ?? []).map((f) => f.name) }, regions), c.meta, c.known ?? {}, c.cpus ?? 1);
+  const est =
+    c.meta === undefined
+      ? undefined
+      : estimate(
+          selectionOf({ ...all, ban_feed: (c.catalogue ?? []).map((f) => f.name) }, regions),
+          c.meta,
+          c.known ?? {},
+          c.cpus ?? 1,
+        );
   const feeds = list(opts, 'ban_feed');
   const reset = list(opts, 'ban_feedreset');
   const results = s?.last?.results ?? {};
@@ -260,7 +307,8 @@ function Catalogue({
   const query = q.trim().toLowerCase();
   const shown = (c.catalogue ?? []).filter((f) => f.name !== 'country' && f.name !== 'asn');
   const match = (f: Feed): boolean =>
-    (!onlyOn || feeds.includes(f.name)) && (query === '' || `${f.name} ${f.descr ?? ''} ${infoOf(f.name)?.text ?? ''}`.toLowerCase().includes(query));
+    (!onlyOn || feeds.includes(f.name)) &&
+    (query === '' || `${f.name} ${f.descr ?? ''} ${infoOf(f.name)?.text ?? ''}`.toLowerCase().includes(query));
   const category = (f: Feed): Category => (f.own && !f.builtin ? 'own' : (infoOf(f.name)?.category ?? 'attackers'));
   const toggle = (name: string, v: boolean): void => {
     setOpts({ ...opts, ban_feed: v ? [...feeds.filter((x) => x !== name), name] : feeds.filter((x) => x !== name) });
@@ -305,12 +353,17 @@ function Catalogue({
         {CATEGORIES.map((cat) => {
           const rows = shown
             .filter((f) => category(f) === cat.id && match(f))
-            .sort((a, z) => (RISK_ORDER[infoOf(a.name)?.risk ?? 'low'] - RISK_ORDER[infoOf(z.name)?.risk ?? 'low']) * 100 + a.name.localeCompare(z.name));
+            .sort(
+              (a, z) =>
+                (RISK_ORDER[infoOf(a.name)?.risk ?? 'low'] - RISK_ORDER[infoOf(z.name)?.risk ?? 'low']) * 100 +
+                a.name.localeCompare(z.name),
+            );
           if (rows.length === 0) return null;
           const chosen = rows.filter((f) => feeds.includes(f.name)).length;
           return (
-            <details key={cat.id} className="group flex flex-col" open={query !== '' || onlyOn || chosen > 0 || cat.id === 'attackers'}>
-              <summary className="flex cursor-pointer list-none items-start gap-3 border-b pb-2 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
+            // collapsed unless one of its lists is on (or a search is showing them)
+            <details key={cat.id} className="group flex flex-col" open={query !== '' || onlyOn || chosen > 0}>
+              <summary className="flex cursor-pointer list-none items-start gap-3 border-b pb-2">
                 <div className="min-w-0 flex-1">
                   <h3 className="text-sm font-semibold">
                     {cat.title}
@@ -320,7 +373,10 @@ function Catalogue({
                   </h3>
                   <p className="text-xs text-muted-foreground">{cat.text}</p>
                 </div>
-                <ChevronDownIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+                <ChevronDownIcon
+                  className="mt-0.5 size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180"
+                  aria-hidden="true"
+                />
               </summary>
               <ul className="divide-y">
                 {rows.map((f) => {
@@ -347,7 +403,10 @@ function Catalogue({
                         setOpts(withDirection(opts, f.name, d, f));
                       }}
                       onReset={(v) => {
-                        setOpts({ ...opts, ban_feedreset: v ? [...reset.filter((x) => x !== f.name), f.name] : reset.filter((x) => x !== f.name) });
+                        setOpts({
+                          ...opts,
+                          ban_feedreset: v ? [...reset.filter((x) => x !== f.name), f.name] : reset.filter((x) => x !== f.name),
+                        });
                       }}
                       onEdit={
                         f.own
@@ -363,11 +422,13 @@ function Catalogue({
             </details>
           );
         })}
-        {shown.filter(match).length === 0 && <p className="py-6 text-center text-sm text-muted-foreground">No list matches “{q}”.</p>}
+        {shown.filter(match).length === 0 && (
+          <p className="py-6 text-center text-sm text-muted-foreground">No list matches “{q}”.</p>
+        )}
         {c.custom?.state === 'edited' && (
           <p className="flex items-start gap-2 text-sm text-warning">
-            <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" /> banIP’s custom feed file was changed outside this page, so lists can’t be added here
-            until it’s taken over or reset (Advanced, Downloads).
+            <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" /> banIP’s custom feed file was changed outside this page, so
+            lists can’t be added here until it’s taken over or reset (Advanced, Downloads).
           </p>
         )}
       </CardContent>
@@ -400,7 +461,12 @@ function Countries({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpt
   const warn = countryWarnings([...blocked], c.wifi_country);
   const set = (codes: readonly string[], regs: readonly string[]): void => {
     const any = codes.length > 0 || regs.length > 0;
-    setOpts({ ...opts, ban_country: [...codes], ban_region: [...regs], ban_feed: any ? [...feeds.filter((f) => f !== 'country'), 'country'] : feeds.filter((f) => f !== 'country') });
+    setOpts({
+      ...opts,
+      ban_country: [...codes],
+      ban_region: [...regs],
+      ban_feed: any ? [...feeds.filter((f) => f !== 'country'), 'country'] : feeds.filter((f) => f !== 'country'),
+    });
   };
   return (
     <Card>
@@ -431,9 +497,12 @@ function Countries({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpt
                 <button
                   type="button"
                   aria-label={`Stop blocking ${r}`}
-                  className="rounded p-0.5 hover:bg-foreground/10"
+                  className="-mr-0.5 flex size-6 items-center justify-center rounded-full hover:bg-foreground/10"
                   onClick={() => {
-                    set(chosen, regions.filter((x) => x !== r));
+                    set(
+                      chosen,
+                      regions.filter((x) => x !== r),
+                    );
                   }}
                 >
                   <XIcon className="size-3" />
@@ -446,9 +515,12 @@ function Countries({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpt
                 <button
                   type="button"
                   aria-label={`Stop blocking ${byCode.get(code)?.name ?? code}`}
-                  className="rounded p-0.5 hover:bg-foreground/10"
+                  className="-mr-0.5 flex size-6 items-center justify-center rounded-full hover:bg-foreground/10"
                   onClick={() => {
-                    set(chosen.filter((x) => x !== code), regions);
+                    set(
+                      chosen.filter((x) => x !== code),
+                      regions,
+                    );
                   }}
                 >
                   <XIcon className="size-3" />
@@ -460,8 +532,8 @@ function Countries({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpt
         {warn.length > 0 && (
           <p className="flex items-start gap-2 text-sm text-warning">
             <TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
-            {byCode.get(warn[0] ?? '')?.name ?? warn[0]} is where this router is (its Wi-Fi country): blocking it blocks your own provider’s other
-            customers, and, outbound, most local sites.
+            {byCode.get(warn[0] ?? '')?.name ?? warn[0]} is where this router is (its Wi-Fi country): blocking it blocks your own
+            provider’s other customers, and, outbound, most local sites.
           </p>
         )}
         <Input
@@ -473,57 +545,70 @@ function Countries({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpt
           }}
           className="sm:max-w-xs"
         />
-        <div className="grid gap-x-6 gap-y-4 md:grid-cols-2">
+        <ul className="flex flex-col divide-y border-y">
           {REGIONS.map((r) => {
-            const members = (c.countries ?? []).filter((x) => x.region === r.id && (query === '' || x.name.toLowerCase().includes(query) || x.code === query));
+            const members = (c.countries ?? []).filter(
+              (x) => x.region === r.id && (query === '' || x.name.toLowerCase().includes(query) || x.code === query),
+            );
             if (members.length === 0) return null;
             const whole = regions.includes(r.id);
             return (
-              <details key={r.id} className="group rounded-lg border" open={query !== ''}>
-                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-sm">
-                  <span className="font-medium">{r.title}</span>
-                  <span className="text-xs text-muted-foreground tabular">
-                    {whole ? 'all' : `${String(members.filter((x) => blocked.has(x.code)).length)} of ${String(members.length)}`}
-                  </span>
-                </summary>
-                <div className="flex flex-col gap-2 border-t px-3 py-2">
-                  <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                    <Switch
-                      checked={whole}
-                      aria-label={`The whole region: ${r.title}`}
-                      onCheckedChange={(v) => {
-                        set(chosen, v ? [...regions, r.id] : regions.filter((x) => x !== r.id));
-                      }}
+              <li key={r.id}>
+                <details className="group" open={query !== ''}>
+                  <summary className="flex min-h-11 cursor-pointer list-none items-center gap-2 py-2 text-sm [&::-webkit-details-marker]:hidden">
+                    <ChevronDownIcon
+                      className="size-4 shrink-0 text-muted-foreground transition-transform duration-fast group-open:rotate-180"
+                      aria-hidden="true"
                     />
-                    The whole region ({r.id})
-                  </label>
-                  <div className="flex flex-wrap gap-1">
-                    {members.map((x) => {
-                      const on = blocked.has(x.code);
-                      return (
-                        <button
-                          key={x.code}
-                          type="button"
-                          aria-pressed={on}
-                          disabled={whole}
-                          onClick={() => {
-                            set(on ? chosen.filter((y) => y !== x.code) : [...chosen, x.code], regions);
-                          }}
-                          className={cn(
-                            'rounded-md border px-2 py-0.5 text-xs transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none disabled:opacity-60',
-                            on ? 'border-primary bg-primary/10 text-foreground' : 'text-muted-foreground hover:text-foreground',
-                          )}
-                        >
-                          {x.name}
-                        </button>
-                      );
-                    })}
+                    <span className="min-w-0 flex-1 font-medium">{r.title}</span>
+                    <span className="shrink-0 text-xs text-muted-foreground tabular">
+                      {whole
+                        ? 'all blocked'
+                        : `${String(members.filter((x) => blocked.has(x.code)).length)} of ${String(members.length)}`}
+                    </span>
+                  </summary>
+                  <div className="flex flex-col gap-3 pb-3 pl-6">
+                    <label className="flex w-fit items-center gap-2 text-sm text-muted-foreground">
+                      <Switch
+                        checked={whole}
+                        aria-label={`The whole region: ${r.title}`}
+                        onCheckedChange={(v) => {
+                          set(chosen, v ? [...regions, r.id] : regions.filter((x) => x !== r.id));
+                        }}
+                      />
+                      The whole region ({r.id})
+                    </label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {members.map((x) => {
+                        const on = blocked.has(x.code);
+                        return (
+                          <button
+                            key={x.code}
+                            type="button"
+                            aria-pressed={on}
+                            disabled={whole}
+                            onClick={() => {
+                              set(on ? chosen.filter((y) => y !== x.code) : [...chosen, x.code], regions);
+                            }}
+                            className={cn(
+                              'inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs transition-colors disabled:opacity-60',
+                              on
+                                ? 'border-primary bg-primary/5 font-medium text-foreground ring-1 ring-primary'
+                                : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground',
+                            )}
+                          >
+                            {on && <CheckIcon className="size-3" aria-hidden="true" />}
+                            {x.name}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
-              </details>
+                </details>
+              </li>
             );
           })}
-        </div>
+        </ul>
         <div className="flex w-fit items-center gap-2 text-sm text-muted-foreground">
           <Switch
             checked={effective(opts, 'ban_countrysplit') === '1'}
@@ -547,7 +632,11 @@ function Asns({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpts: (o
   const n = v.trim().replace(/^as/i, '');
   const bad = n !== '' && (!/^[1-9]\d{0,9}$/.test(n) || Number(n) > 4294967295);
   const set = (l: readonly string[]): void => {
-    setOpts({ ...opts, ban_asn: [...l], ban_feed: l.length > 0 ? [...feeds.filter((f) => f !== 'asn'), 'asn'] : feeds.filter((f) => f !== 'asn') });
+    setOpts({
+      ...opts,
+      ban_asn: [...l],
+      ban_feed: l.length > 0 ? [...feeds.filter((f) => f !== 'asn'), 'asn'] : feeds.filter((f) => f !== 'asn'),
+    });
   };
   return (
     <Card>
@@ -581,7 +670,7 @@ function Asns({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpts: (o
           <Input
             aria-label="An AS number"
             placeholder="AS number, e.g. 64496"
-            className="font-mono placeholder:font-sans sm:max-w-xs"
+            className="tabular sm:max-w-xs"
             value={v}
             aria-invalid={bad}
             onChange={(e) => {
@@ -596,12 +685,12 @@ function Asns({ c, opts, setOpts }: { c: BanipConfig; opts: Options; setOpts: (o
         {asns.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {asns.map((a) => (
-              <Badge key={a} variant="secondary" className="gap-1 pr-1 font-mono">
+              <Badge key={a} variant="secondary" className="gap-1 pr-1 tabular">
                 AS{a}
                 <button
                   type="button"
                   aria-label={`Remove AS${a}`}
-                  className="rounded p-0.5 hover:bg-foreground/10"
+                  className="-mr-0.5 flex size-6 items-center justify-center rounded-full hover:bg-foreground/10"
                   onClick={() => {
                     set(asns.filter((x) => x !== a));
                   }}
@@ -642,7 +731,11 @@ function Updates({ m, setM }: { m: Record<string, string>; setM: (m: Record<stri
   const timeOk = /^([01]\d|2[0-3]):[0-5]\d$/.test(time);
   return (
     <Card>
-      <CardHeading icon={CalendarClockIcon} title="Updates" description="The lists change by the hour. banIP downloads them again on this schedule; a failed download keeps the last copy." />
+      <CardHeading
+        icon={CalendarClockIcon}
+        title="Updates"
+        description="The lists change by the hour. banIP downloads them again on this schedule; a failed download keeps the last copy."
+      />
       <CardContent className="divide-y">
         <Field id="banip-schedule" label="Update the lists">
           <Select
@@ -664,7 +757,12 @@ function Updates({ m, setM }: { m: Record<string, string>; setM: (m: Record<stri
           </Select>
         </Field>
         {schedule !== 'off' && (
-          <Field id="banip-time" label={schedule === '6h' || schedule === '12h' ? 'Starting at' : 'At'} hint="The router’s time. Early morning keeps it out of the way." error={timeOk ? undefined : 'A time as 04:30.'}>
+          <Field
+            id="banip-time"
+            label={schedule === '6h' || schedule === '12h' ? 'Starting at' : 'At'}
+            hint="The router’s time. Early morning keeps it out of the way."
+            error={timeOk ? undefined : 'A time as 04:30.'}
+          >
             <Input
               id="banip-time"
               type="time"
@@ -724,14 +822,22 @@ export function ProtectionTab({
   const turnOn = picked !== undefined && picked !== 'off' && !enabled;
   const turnOff = picked === 'off' && enabled;
   const changes = optionChanges(saved.options, draft.options);
-  const milkflint: Record<string, string> = { ...draft.milkflint, ...(enabled || turnOn ? { preset: preset === 'off' ? 'custom' : preset } : {}) };
+  const milkflint: Record<string, string> = {
+    ...draft.milkflint,
+    ...(enabled || turnOn ? { preset: preset === 'off' ? 'custom' : preset } : {}),
+  };
   if (turnOff) milkflint['preset'] = 'off';
   const mchanges: Record<string, string> = {};
   for (const [k, v] of Object.entries(milkflint)) if (saved.milkflint[k] !== v) mchanges[k] = v;
   const dirty = Object.keys(changes).length > 0 || Object.keys(mchanges).length > 0 || turnOn || turnOff;
   const est = c.meta === undefined ? undefined : estimate(selectionOf(all, regions), c.meta, c.known ?? {}, c.cpus ?? 1);
-  const now = c.meta === undefined ? undefined : estimate(selectionOf(c.options ?? {}, regions), c.meta, c.known ?? {}, c.cpus ?? 1);
-  const short = est !== undefined && now !== undefined && c.memory !== undefined && !memoryCheck(est, c.memory, c.runtime?.counts?.elements ?? 0, now.perEntry).ok;
+  const now =
+    c.meta === undefined ? undefined : estimate(selectionOf(c.options ?? {}, regions), c.meta, c.known ?? {}, c.cpus ?? 1);
+  const short =
+    est !== undefined &&
+    now !== undefined &&
+    c.memory !== undefined &&
+    !memoryCheck(est, c.memory, c.runtime?.counts?.elements ?? 0, now.perEntry).ok;
   const timeBad = !/^([01]\d|2[0-3]):[0-5]\d$/.test(draft.milkflint['time'] ?? '04:00');
   const setOpts = (o: Options): void => {
     setDraft((d) => ({ ...d, options: o }));
@@ -775,11 +881,19 @@ export function ProtectionTab({
     <div className="flex flex-col gap-4">
       <ApplyStatus state={state} />
       <Card>
-        <CardHeading icon={GaugeIcon} title="How much to block" description="A starting point: the lists stay yours to change below." />
+        <CardHeading
+          icon={GaugeIcon}
+          title="How much to block"
+          description="A starting point: the lists stay yours to change below."
+        />
         <CardContent className="flex flex-col gap-4">
           <PresetPicker value={ap ? 'off' : preset} onChange={choosePreset} c={c} />
           {!ap && preset !== 'off' && <MemoryMeter c={c} opts={draft.options} />}
-          {ap && <p className="text-sm text-muted-foreground">In access point mode banIP stays off: the main router faces the internet.</p>}
+          {ap && (
+            <p className="text-sm text-muted-foreground">
+              In access point mode banIP stays off: the main router faces the internet.
+            </p>
+          )}
         </CardContent>
       </Card>
       <Catalogue

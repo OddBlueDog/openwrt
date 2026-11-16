@@ -60,7 +60,10 @@ const set = (changes: readonly Change[], config: string, s: string): Record<stri
 
 test('the switch on: a redirect for each zone there is', () => {
   const changes = redirects(toChanges(form({ intercept: true }), data()));
-  assert.deepEqual(changes.map((c) => (c.op === 'add' ? c.name : c.op)), [named('lan'), named('guest'), named('guest2'), named('wg_in')]);
+  assert.deepEqual(
+    changes.map((c) => (c.op === 'add' ? c.name : c.op)),
+    [named('lan'), named('guest'), named('guest2'), named('wg_in')],
+  );
   const lan = changes[0];
   assert.ok(lan?.op === 'add');
   assert.equal(lan.type, 'redirect');
@@ -71,19 +74,27 @@ test('the switch on: a redirect for each zone there is', () => {
 
 test('already there: left alone; turned off in LuCI: on again', () => {
   const d = data(form(), { intercepts: [...on('lan', 'guest', 'wg_in'), { section: named('guest2'), enabled: false }] });
-  assert.deepEqual(redirects(toChanges(form({ intercept: true }), d)), [{ op: 'set', config: 'firewall', section: named('guest2'), values: { enabled: '1' } }]);
+  assert.deepEqual(redirects(toChanges(form({ intercept: true }), d)), [
+    { op: 'set', config: 'firewall', section: named('guest2'), values: { enabled: '1' } },
+  ]);
 });
 
 test('the switch off: every one goes', () => {
   const d = data(form(), { intercepts: on('lan', 'guest', 'wg_in') });
-  assert.deepEqual(redirects(toChanges(form(), d)).map((c) => c.op === 'delete' && c.section), [named('lan'), named('guest'), named('wg_in')]);
+  assert.deepEqual(
+    redirects(toChanges(form(), d)).map((c) => c.op === 'delete' && c.section),
+    [named('lan'), named('guest'), named('wg_in')],
+  );
 });
 
 test('devices told to use a Pi-hole: every redirect goes, or its own lookups come back here', () => {
   const pihole = form({ intercept: true, devices: { own: true, ipv4: '192.168.1.53', ipv6: '' } });
   const d = data(form({ intercept: true }), { intercepts: on('lan', 'guest', 'guest2', 'wg_in') });
   const changes = toChanges(pihole, d);
-  assert.deepEqual(redirects(changes).map((c) => c.op === 'delete' && c.section), [named('lan'), named('guest'), named('guest2'), named('wg_in')]);
+  assert.deepEqual(
+    redirects(changes).map((c) => c.op === 'delete' && c.section),
+    [named('lan'), named('guest'), named('guest2'), named('wg_in')],
+  );
   assert.deepEqual(set(changes, 'dhcp', 'lan')['dhcp_option'], ['6,192.168.1.53']);
   // and none are added, with nothing there yet
   assert.deepEqual(redirects(toChanges(pihole, data())), []);
@@ -97,7 +108,9 @@ test('back from the Pi-hole with the switch on: the redirects return', () => {
 
 test('a redirect whose guest network is gone is taken out', () => {
   const d = data(form(), { intercepts: on('lan', 'guest3'), interceptZones: ['lan'] });
-  assert.deepEqual(redirects(toChanges(form({ intercept: true }), d)), [{ op: 'delete', config: 'firewall', section: named('guest3') }]);
+  assert.deepEqual(redirects(toChanges(form({ intercept: true }), d)), [
+    { op: 'delete', config: 'firewall', section: named('guest3') },
+  ]);
 });
 
 test('automatic: dnsmasq is left to the provider’s servers', () => {
@@ -126,7 +139,11 @@ test('plain DNS, two servers: how dnsmasq uses them, and the other way’s optio
   assert.ok(fallback.some((c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('allservers')));
   // back to one server
   const one = toChanges(form({ mode: 'static' }), data(parallel));
-  assert.ok(one.some((c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('allservers') && c.options.includes('strictorder')));
+  assert.ok(
+    one.some(
+      (c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('allservers') && c.options.includes('strictorder'),
+    ),
+  );
 });
 
 test('encrypted: dnsmasq asks dnsproxy, which is switched on; off again when it’s left', () => {
@@ -137,14 +154,18 @@ test('encrypted: dnsmasq asks dnsproxy, which is switched on; off again when it�
   assert.equal(set(changes, 'dnsproxy', 'global')['enabled'], '1');
   assert.deepEqual(set(changes, 'dnsproxy', 'global')['listen_port'], ['5453']);
   assert.ok((set(changes, 'dnsproxy', 'servers')['upstream']?.length ?? 0) > 0);
-  assert.ok(changes.some((c) => c.op === 'unset' && c.config === 'dnsproxy' && c.section === 'servers' && c.options.includes('fallback')));
+  assert.ok(
+    changes.some((c) => c.op === 'unset' && c.config === 'dnsproxy' && c.section === 'servers' && c.options.includes('fallback')),
+  );
   const off = toChanges(form(), data(f, { proxyEnabled: true, servers: ['127.0.0.1#5453'], managed: ['127.0.0.1#5453'] }));
   assert.deepEqual(set(off, 'dnsproxy', 'global'), { enabled: '0' });
   assert.ok(off.some((c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('server')));
 });
 
 test('dnsproxy isn’t installed: nothing written for it', () => {
-  assert.ok(!toChanges(form({ mode: 'encrypted' }), data(form(), { proxyInstalled: false })).some((c) => c.config === 'dnsproxy'));
+  assert.ok(
+    !toChanges(form({ mode: 'encrypted' }), data(form(), { proxyInstalled: false })).some((c) => c.config === 'dnsproxy'),
+  );
 });
 
 test('instant answers: dnsproxy’s cache, made if it isn’t there', () => {
@@ -158,14 +179,20 @@ test('instant answers: dnsproxy’s cache, made if it isn’t there', () => {
 });
 
 test('no milkflint.dns yet: added rather than set', () => {
-  assert.ok(toChanges(form(), data(form(), { hasMilkflintDns: false })).some((c) => c.op === 'add' && c.config === 'milkflint' && c.name === 'dns'));
+  assert.ok(
+    toChanges(form(), data(form(), { hasMilkflintDns: false })).some(
+      (c) => c.op === 'add' && c.config === 'milkflint' && c.name === 'dns',
+    ),
+  );
 });
 
 test('host records: added, changed and removed', () => {
   const kept = { key: 'a', section: 'cfg1', name: 'nas', ip: '192.168.1.5' };
   const gone = { key: 'b', section: 'cfg2', name: 'old', ip: '192.168.1.6' };
   const fresh = { key: 'c', section: undefined, name: 'printer', ip: '192.168.1.7' };
-  const changes = toChanges(form({ records: [kept, fresh] }), data(form({ records: [kept, gone] }))).filter((c) => c.config === 'dhcp' && (c.op === 'delete' || c.op === 'add' || (c.op === 'set' && c.section === 'cfg1')));
+  const changes = toChanges(form({ records: [kept, fresh] }), data(form({ records: [kept, gone] }))).filter(
+    (c) => c.config === 'dhcp' && (c.op === 'delete' || c.op === 'add' || (c.op === 'set' && c.section === 'cfg1')),
+  );
   assert.deepEqual(changes, [
     { op: 'delete', config: 'dhcp', section: 'cfg2' },
     { op: 'set', config: 'dhcp', section: 'cfg1', values: { name: 'nas', ip: '192.168.1.5' } },
@@ -180,15 +207,22 @@ test('its checks', () => {
   assert.notEqual(errors(form({ mode: 'static', provider: 'custom', custom: 'not an ip' })).form.custom, undefined);
   assert.equal(errors(form({ mode: 'static', provider: 'custom', custom: '1.1.1.1, fd00::1' })).form.custom, undefined);
   assert.notEqual(errors(form({ mode: 'encrypted', provider: 'custom', custom: 'http://x' })).form.custom, undefined);
-  assert.equal(errors(form({ mode: 'encrypted', provider: 'custom', custom: 'https://dns.example/dns-query' })).form.custom, undefined);
+  assert.equal(
+    errors(form({ mode: 'encrypted', provider: 'custom', custom: 'https://dns.example/dns-query' })).form.custom,
+    undefined,
+  );
   assert.notEqual(errors(form({ mode: 'static', pair: 'parallel', provider: 'quad9', backup: 'quad9' })).form.backup, undefined);
   assert.notEqual(errors(form({ devices: { own: true, ipv4: '192.168.1.1', ipv6: '' } })).form.ownIpv4, undefined);
-  assert.notEqual(errors(form({ records: [{ key: 'k', section: undefined, name: 'bad name', ip: '1.2.3.4' }] })).records['k'], undefined);
+  assert.notEqual(
+    errors(form({ records: [{ key: 'k', section: undefined, name: 'bad name', ip: '1.2.3.4' }] })).records['k'],
+    undefined,
+  );
   assert.notEqual(errors(form({ records: [{ key: 'k', section: undefined, name: 'nas', ip: 'x' }] })).records['k'], undefined);
 });
 
 test('the cache: its size, empty for the default, and HTTPS records beside others from LuCI', () => {
-  const values = (f: Partial<DnsForm>, over: Partial<DnsData> = {}): Record<string, string | string[]> => set(toChanges(form(f), data(form(), over)), 'dhcp', 'cfg01');
+  const values = (f: Partial<DnsForm>, over: Partial<DnsData> = {}): Record<string, string | string[]> =>
+    set(toChanges(form(f), data(form(), over)), 'dhcp', 'cfg01');
   assert.equal(values({ cacheSize: '5000' })['cachesize'], '5000');
   assert.equal(values({ cacheSize: '' })['cachesize'], '1000');
   assert.equal(values({ cacheSize: '007' })['cachesize'], '7');
@@ -200,7 +234,9 @@ test('the cache: its size, empty for the default, and HTTPS records beside other
 
 test('the cache: HTTPS records off, the list goes, if there was one', () => {
   const unset = (over: Partial<DnsData>): Change | undefined =>
-    toChanges(form({ cacheHttps: false }), data(form(), over)).find((c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('cache_rr'));
+    toChanges(form({ cacheHttps: false }), data(form(), over)).find(
+      (c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('cache_rr'),
+    );
   assert.ok(unset({ cacheRr: ['HTTPS'] }) !== undefined);
   assert.equal(unset({ cacheRr: [] }), undefined);
 });
@@ -223,13 +259,19 @@ test('reusing expired answers: dnsmasq does it for automatic and plain DNS, in s
   assert.equal(stale({ quick: true, cacheOn: false }), undefined);
   // dnsproxy does it for encrypted DNS: never both
   assert.equal(stale({ ...chosen, mode: 'encrypted', quick: true }), undefined);
-  const proxy = set(toChanges(form({ ...chosen, mode: 'encrypted', quick: true }), data(form(), { proxyInstalled: true })), 'dnsproxy', 'cache');
+  const proxy = set(
+    toChanges(form({ ...chosen, mode: 'encrypted', quick: true }), data(form(), { proxyInstalled: true })),
+    'dnsproxy',
+    'cache',
+  );
   assert.equal(proxy['cache_optimistic'], '1');
 });
 
-test('reusing expired answers: dnsmasq\'s option goes when it no longer applies, if it was there', () => {
+test("reusing expired answers: dnsmasq's option goes when it no longer applies, if it was there", () => {
   const unsets = (f: Partial<DnsForm>, hasStaleCache: boolean): boolean =>
-    toChanges(form(f), data(form(), { hasStaleCache })).some((c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('use_stale_cache'));
+    toChanges(form(f), data(form(), { hasStaleCache })).some(
+      (c) => c.op === 'unset' && c.config === 'dhcp' && c.options.includes('use_stale_cache'),
+    );
   assert.equal(unsets({ quick: false }, true), true);
   assert.equal(unsets({ quick: true, cacheOn: false }, true), true);
   assert.equal(unsets({ ...chosen, mode: 'encrypted', quick: true }, true), true);
@@ -237,7 +279,7 @@ test('reusing expired answers: dnsmasq\'s option goes when it no longer applies,
   assert.equal(unsets({ quick: false }, false), false);
 });
 
-test('caching off stops the encrypted server\'s cache too, whatever its switch says', () => {
+test("caching off stops the encrypted server's cache too, whatever its switch says", () => {
   const encrypted = { mode: 'encrypted', provider: 'cloudflare', server: 'Standard', quick: true } as const;
   const on = set(toChanges(form(encrypted), data(form(), { proxyInstalled: true })), 'dnsproxy', 'cache');
   assert.equal(on['enabled'], '1');

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { call } from '@/lib/ubus';
+import { possibleHistory } from './plausible';
 
 const sampleSchema = z.object({
   /** Epoch seconds. */
@@ -85,9 +86,9 @@ const historySchema = z.object({
 });
 export type History = z.output<typeof historySchema>;
 
-/** The probe's minute history over the last `span` seconds, in `step`-second buckets. */
-export function getHistory(span: number, step: number): Promise<History> {
-  return call('milkflint.netquality', 'history', { span, step }, historySchema);
+/** The probe's minute history over the last `span` seconds, in `step`-second buckets; impossible times left out (plausible.ts). */
+export async function getHistory(span: number, step: number): Promise<History> {
+  return possibleHistory(await call('milkflint.netquality', 'history', { span, step }, historySchema));
 }
 
 /** The probe daemon's state, with the samples newer than `since`. */

@@ -1,36 +1,35 @@
+// The Logs page: one log at a time under its tab, newest at the bottom and
+// followed live every 5 s, with a filter, the number of lines and a
+// download; then what gets logged. The switches that change how the router
+// runs (debug counters and snapshot, the memory error checker) are on
+// Performance tuning, under Diagnostics.
 import {
   BugOffIcon,
   DownloadIcon,
   PauseIcon,
   PlayIcon,
   SatelliteDishIcon,
-  ScrollTextIcon,
   SearchIcon,
   ServerOffIcon,
-  SettingsIcon,
   ShieldCheckIcon,
   ShieldOffIcon,
   WifiOffIcon,
 } from 'lucide-react';
-import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApplyStatus } from '@/components/apply-status';
-import { CardHeading } from '@/components/card-heading';
-import { Field } from '@/components/field';
+import { type ReactElement, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Note } from '@/components/note';
 import { PageHeader } from '@/components/layout/page-header';
 import { LoadError } from '@/components/page-states';
-import { SaveBar } from '@/components/save-bar';
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
-import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
+import { TabPanel, Tabs } from '@/components/ui/tabs';
 import { usePoll } from '@/hooks/use-poll';
 import { formatBytes } from '@/lib/format';
+import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
-import { getLogSettings, getLogStatus, type LogKind, type LogSettings, type LogStatus, logSettingsChanges, readLog } from './api';
+import { getLogStatus, type LogKind, type LogStatus, readLog } from './api';
+import { LogSettingsCard } from './settings';
 
 const kinds: { id: LogKind; label: string; title: string }[] = [
   { id: 'system', label: 'System', title: 'System log' },
@@ -54,6 +53,8 @@ const placeholders: Record<LogKind, string> = {
   crash: 'Filter, e.g. Oops, KFENCE or mt7915',
 };
 
+const DIAGNOSTICS = `${href('tuning')}/diagnostics`;
+
 function severity(line: string): 'error' | 'warning' | undefined {
   if (/\.(err|crit|alert|emerg)\b|\berror\b|\bfailed\b|BUG:|Oops|Kernel panic/i.test(line)) return 'error';
   if (/\.warn\b|\bwarning\b|WARNING:|RADAR-DETECTED/i.test(line)) return 'warning';
@@ -64,7 +65,7 @@ function debugOn(status: LogStatus | undefined): boolean {
   return status?.counters === true || status?.snapshot === true;
 }
 
-// where the log shown comes from, for the card's description
+// where the log shown comes from, for the line above it
 function source(kind: LogKind, status: LogStatus | undefined): string {
   if (status === undefined) return '';
   if (kind === 'wifi' && !status.wifi) return 'off';
@@ -75,7 +76,8 @@ function source(kind: LogKind, status: LogStatus | undefined): string {
     const bytes = status.radar_bytes ?? null;
     return `kept across restarts${bytes === null ? '' : `, ${formatBytes(bytes)} saved`}`;
   }
-  if (kind === 'banip') return `banIP’s runs${status.persist ? ', kept across restarts' : ', since the last restart'}; what it blocked is on the banIP page`;
+  if (kind === 'banip')
+    return `banIP’s runs${status.persist ? ', kept across restarts' : ', since the last restart'}; what it blocked is on the banIP page`;
   if (kind === 'crash') {
     if (status.kfence_active === false) return 'crashes kept until the router loses power; the memory error checker is off';
     return `crashes kept until the router loses power, memory errors ${status.persist ? 'with the saved logs' : 'since the last restart'}`;
@@ -90,6 +92,67 @@ function source(kind: LogKind, status: LogStatus | undefined): string {
           : status.system_bytes;
   if (status.persist) return `kept across restarts${bytes === null ? '' : `, ${formatBytes(bytes)} saved`}`;
   return 'since the last restart';
+}
+
+function Link({ to, children }: { to: string; children: ReactNode }): ReactElement {
+  return (
+    <a href={to} className="font-medium link">
+      {children}
+    </a>
+  );
+}
+
+/** Why the log shown is quiet, and where to turn it on. */
+function OffNote({ kind, status, empty }: { kind: LogKind; status: LogStatus | undefined; empty: boolean }): ReactElement | null {
+  if (kind === 'wifi' && status?.wifi === false) {
+    return (
+      <Note tone="info" icon={<WifiOffIcon />} title="The Wi-Fi log is off">
+        Turn it on under What gets logged, below. Older lines from when it was on are still shown.
+      </Note>
+    );
+  }
+  if (kind === 'radar' && status?.radar === false) {
+    return (
+      <Note tone="info" icon={<SatelliteDishIcon />} title="The radar log is off">
+        Turn it on under What gets logged, below. Older lines from when it was on are still shown.
+      </Note>
+    );
+  }
+  if (kind === 'debug' && status !== undefined && !debugOn(status)) {
+    return (
+      <Note tone="info" icon={<BugOffIcon />} title="The debug log is off">
+        Turn on its counters or its snapshot on <Link to={DIAGNOSTICS}>Performance tuning, under Diagnostics</Link>, while chasing
+        a dropout. Older lines from when it was on are still shown.
+      </Note>
+    );
+  }
+  if (kind === 'dns' && status !== undefined && status.dns !== true) {
+    return (
+      <Note tone="info" icon={<ServerOffIcon />} title="The DNS log is off">
+        Turn it on under What gets logged, below, while chasing slow pages or apps. Older lines from when it was on are still
+        shown.
+      </Note>
+    );
+  }
+  if (kind === 'crash') {
+    return (
+      <div className="flex flex-col gap-3">
+        {empty && (
+          <Note tone="success" icon={<ShieldCheckIcon />} title="No crash reports">
+            If the kernel crashes, its last lines are kept through the restart that follows and show here, until the router loses
+            power. So do the memory errors its checker (KFENCE) catches while it keeps running, when that’s on.
+          </Note>
+        )}
+        {status?.kfence_active === false && (
+          <Note tone="info" icon={<ShieldOffIcon />} title="The memory error checker is off">
+            Turn it on on <Link to={DIAGNOSTICS}>Performance tuning, under Diagnostics</Link>, while chasing a crash: the kernel
+            then reports memory it misuses here, with the code that did it. Crashes are kept either way.
+          </Note>
+        )}
+      </div>
+    );
+  }
+  return null;
 }
 
 export function LogsPage(): ReactElement {
@@ -125,419 +188,124 @@ export function LogsPage(): ReactElement {
     refreshStatus();
     refresh();
   }, [refreshStatus, refresh]);
+  const title = kinds.find((k) => k.id === kind)?.title ?? 'Log';
 
   return (
     <>
-      <PageHeader title="Logs" description="The system, kernel, Wi-Fi, radar, debug and DNS logs, and the kernel's crash and memory error reports, newest at the bottom." />
-      <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_26rem]">
-        <Card>
-          <CardHeading
-            icon={ScrollTextIcon}
-            title={kinds.find((k) => k.id === kind)?.title ?? 'Log'}
-            description={
-              data === undefined
-                ? 'Loading…'
-                : `${String(shown.length)} of ${String(data.lines.length)} lines${data.truncated === true ? ', the newest that fit in one reply' : ''}${where === '' ? '' : `, ${where}`}`
-            }
-          />
-          <CardContent className="flex flex-col gap-3">
-            <div role="radiogroup" aria-label="Log" className="grid grid-cols-4 self-start rounded-md border bg-muted/50 p-0.5 text-xs sm:flex">
-              {kinds.map((k) => (
-                <button
-                  key={k.id}
-                  type="button"
-                  role="radio"
-                  aria-checked={kind === k.id}
-                  onClick={() => {
-                    setKind(k.id);
-                  }}
-                  className={cn('rounded-sm px-2.5 py-1 whitespace-nowrap text-muted-foreground', kind === k.id && 'bg-card text-foreground shadow-xs')}
-                >
-                  {k.label}
-                  {k.id === 'crash' && reports > 0 && <span className="ml-1 tabular text-destructive">{String(reports)}</span>}
-                </button>
-              ))}
-            </div>
-            {kind === 'wifi' && status?.wifi === false && (
-              <Alert variant="info">
-                <WifiOffIcon />
-                <AlertTitle>The Wi-Fi log is off</AlertTitle>
-                <AlertDescription>Turn it on in the settings below. Older lines from when it was on are still shown.</AlertDescription>
-              </Alert>
-            )}
-            {kind === 'radar' && status?.radar === false && (
-              <Alert variant="info">
-                <SatelliteDishIcon />
-                <AlertTitle>The radar log is off</AlertTitle>
-                <AlertDescription>Turn it on in the settings below. Older lines from when it was on are still shown.</AlertDescription>
-              </Alert>
-            )}
-            {kind === 'crash' && data?.lines.length === 0 && (
-              <Alert variant="success">
-                <ShieldCheckIcon />
-                <AlertTitle>No crash reports</AlertTitle>
-                <AlertDescription>
-                  If the kernel crashes, its last lines are kept through the restart that follows and show here, until the router loses power. So do
-                  the memory errors its checker (KFENCE) catches while it keeps running, when that's on.
-                </AlertDescription>
-              </Alert>
-            )}
-            {kind === 'crash' && status?.kfence_active === false && (
-              <Alert variant="info">
-                <ShieldOffIcon />
-                <AlertTitle>The memory error checker is off</AlertTitle>
-                <AlertDescription>
-                  Turn it on in the settings below while chasing a crash: the kernel then reports memory it misuses here, with the code that did it.
-                  Crashes are kept either way.
-                </AlertDescription>
-              </Alert>
-            )}
-            {kind === 'debug' && status !== undefined && !debugOn(status) && (
-              <Alert variant="info">
-                <BugOffIcon />
-                <AlertTitle>The debug log is off</AlertTitle>
-                <AlertDescription>
-                  Turn on the debug counters or the snapshot in the settings below while chasing a dropout. Older lines from when it was on are still shown.
-                </AlertDescription>
-              </Alert>
-            )}
-            {kind === 'dns' && status !== undefined && status.dns !== true && (
-              <Alert variant="info">
-                <ServerOffIcon />
-                <AlertTitle>The DNS log is off</AlertTitle>
-                <AlertDescription>
-                  Turn it on in the settings below while chasing slow pages or apps. Older lines from when it was on are still shown.
-                </AlertDescription>
-              </Alert>
-            )}
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="relative min-w-56 flex-1">
-                <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  aria-label="Filter lines"
-                  placeholder={placeholders[kind]}
-                  className="pl-9"
-                  value={query}
-                  onChange={(e) => {
-                    setQuery(e.target.value);
-                  }}
-                />
+      <PageHeader title="Logs" description="What the router has logged, newest at the bottom, followed live." />
+      <div className="flex flex-col gap-4">
+        <Card className="gap-0 pt-4 pb-5">
+          <div className="px-5">
+            <Tabs
+              label="Log"
+              prefix="logs"
+              value={kind}
+              onChange={setKind}
+              items={kinds.map((k) => ({
+                id: k.id,
+                label:
+                  k.id === 'crash' && reports > 0 ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      {k.label}
+                      <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-destructive-subtle px-1.5 text-xs font-medium text-destructive tabular">
+                        {String(reports)}
+                        <span className="sr-only"> reports</span>
+                      </span>
+                    </span>
+                  ) : (
+                    k.label
+                  ),
+              }))}
+            />
+          </div>
+          <TabPanel prefix="logs" id={kind} value={kind}>
+            <CardContent className="flex flex-col gap-4 pt-4">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                <h2 className="text-base font-semibold">{title}</h2>
+                <p className="text-sm text-muted-foreground tabular">
+                  {data === undefined
+                    ? 'Loading…'
+                    : `${String(shown.length)} of ${String(data.lines.length)} lines${data.truncated === true ? ', the newest that fit in one reply' : ''}${where === '' ? '' : `, ${where}`}`}
+                </p>
               </div>
-              <Select value={lines} onValueChange={setLines}>
-                <SelectTrigger className="w-36" aria-label="Lines">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {['200', '500', '2000', '5000'].map((n) => (
-                    <SelectItem key={n} value={n}>
-                      Last {n} lines
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setFollow((f) => !f);
-                }}
-              >
-                {follow ? <PauseIcon /> : <PlayIcon />}
-                {follow ? 'Pause' : 'Follow'}
-              </Button>
-              <Button variant="outline" onClick={download} disabled={data === undefined}>
-                <DownloadIcon /> Download
-              </Button>
-            </div>
-            {error !== undefined && data === undefined ? (
-              <LoadError error={error} retry={refresh} />
-            ) : (
-              <pre
-                ref={box}
-                className="h-[60vh] overflow-auto rounded-lg border bg-background p-3 font-mono text-[11.5px] leading-relaxed"
-              >
-                {shown.map((l, i) => {
-                  const s = severity(l);
-                  return (
-                    <div key={i} className={cn('whitespace-pre-wrap', s === 'error' && 'text-destructive', s === 'warning' && 'text-warning')}>
-                      {l}
+              <OffNote kind={kind} status={status} empty={data?.lines.length === 0} />
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative min-w-0 flex-1 basis-56">
+                  <SearchIcon
+                    className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+                    aria-hidden
+                  />
+                  <Input
+                    aria-label="Filter lines"
+                    placeholder={placeholders[kind]}
+                    className="pl-9"
+                    value={query}
+                    onChange={(e) => {
+                      setQuery(e.target.value);
+                    }}
+                  />
+                </div>
+                <Select value={lines} onValueChange={setLines}>
+                  <SelectTrigger className="w-40" aria-label="Lines">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {['200', '500', '2000', '5000'].map((n) => (
+                      <SelectItem key={n} value={n}>
+                        Last {n} lines
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="outline"
+                  aria-pressed={!follow}
+                  onClick={() => {
+                    setFollow((f) => !f);
+                  }}
+                >
+                  {follow ? <PauseIcon /> : <PlayIcon />}
+                  {follow ? 'Pause' : 'Follow'}
+                </Button>
+                <Button variant="outline" onClick={download} disabled={data === undefined}>
+                  <DownloadIcon /> Download
+                </Button>
+              </div>
+              {error !== undefined && data === undefined ? (
+                <LoadError error={error} retry={refresh} />
+              ) : (
+                <pre
+                  ref={box}
+                  aria-label={`${title}, ${String(shown.length)} lines`}
+                  className="h-[60vh] overflow-auto rounded-lg border bg-background p-3 font-mono text-xs leading-relaxed"
+                >
+                  {shown.map((l, i) => {
+                    const s = severity(l);
+                    return (
+                      <div
+                        key={i}
+                        className={cn(
+                          'whitespace-pre-wrap',
+                          s === 'error' && 'text-destructive',
+                          s === 'warning' && 'text-warning',
+                        )}
+                      >
+                        {l}
+                      </div>
+                    );
+                  })}
+                  {data !== undefined && shown.length === 0 && (
+                    <div className="text-muted-foreground">
+                      {data.lines.length === 0 ? 'Nothing logged yet.' : 'No lines match the filter.'}
                     </div>
-                  );
-                })}
-                {data !== undefined && shown.length === 0 && (
-                  <div className="text-muted-foreground">{data.lines.length === 0 ? 'Nothing logged yet.' : 'No lines match.'}</div>
-                )}
-              </pre>
-            )}
-          </CardContent>
+                  )}
+                </pre>
+              )}
+            </CardContent>
+          </TabPanel>
         </Card>
-        <SettingsCard onApplied={onApplied} />
+        <LogSettingsCard onApplied={onApplied} />
       </div>
     </>
-  );
-}
-
-// the settings card's rows on wide screens, where it's a side column: the
-// label above its control
-const side = 'xl:grid-cols-1 xl:gap-2';
-
-const sizes = ['1', '3', '10'];
-const intervals = ['5', '10', '30', '60'];
-
-// what the Wi-Fi log adds to its device lines, each with its own switch
-const wifiParts: { key: 'channel' | 'mu' | 'rrm' | 'net'; title: string; hint: string }[] = [
-  {
-    key: 'channel',
-    title: 'Channel use',
-    hint: 'How busy each channel was, and with what: our traffic, our devices, other networks, interference. Asks the Wi-Fi chip each sample.',
-  },
-  {
-    key: 'mu',
-    title: 'MU/OFDMA counters',
-    hint: 'Once a minute, how much went out to several devices at once (OFDMA, MU-MIMO) and beamformed. Turns on the driver\'s statistics for it, which ask the Wi-Fi chip twice a second.',
-  },
-  {
-    key: 'rrm',
-    title: 'Ask devices how they hear the router',
-    hint: 'A device having a hard time is asked how it hears the router (802.11k), at most once a minute, others every 10 minutes: one small frame each.',
-  },
-  {
-    key: 'net',
-    title: 'Network Quality',
-    hint: "The Network Quality probe's response times (gateway, internet, DNS) each sample, beside the Wi-Fi lines of the same moment.",
-  },
-];
-
-function Part({
-  id,
-  title,
-  hint,
-  checked,
-  disabled,
-  onChange,
-}: {
-  id: string;
-  title: string;
-  hint: string;
-  checked: boolean;
-  disabled: boolean;
-  onChange: (on: boolean) => void;
-}): ReactElement {
-  return (
-    <div className={cn('flex items-start gap-3 text-sm', disabled && 'opacity-60')}>
-      <Switch id={id} className="mt-0.5" checked={checked} disabled={disabled} onCheckedChange={onChange} />
-      <label htmlFor={id} className="flex flex-col gap-0.5">
-        <span className="font-medium">{title}</span>
-        <span className="text-xs text-muted-foreground">{hint}</span>
-      </label>
-    </div>
-  );
-}
-
-function SettingsCard({ onApplied }: { onApplied: () => void }): ReactElement | null {
-  const { data, error, loading, reload } = useLoad(getLogSettings);
-  const [edit, setEdit] = useState<LogSettings>();
-  const applied = useCallback(() => {
-    setEdit(undefined);
-    reload();
-    onApplied();
-  }, [reload, onApplied]);
-  const { state, apply } = useApply(applied);
-  const form = edit ?? data;
-  const set = <K extends keyof LogSettings>(key: K, value: LogSettings[K]): void => {
-    setEdit((current) => {
-      const base = current ?? data;
-      return base === undefined ? undefined : { ...base, [key]: value };
-    });
-  };
-  const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data);
-
-  if (error !== undefined && data === undefined) return <LoadError error={error} retry={reload} />;
-  if (loading || form === undefined) return null;
-  return (
-    <div className="flex flex-col gap-4">
-      <ApplyStatus state={state} />
-      <Card>
-        <CardHeading icon={SettingsIcon} title="Settings" description="Where the logs are kept, and what each one records." />
-        <CardContent className="divide-y">
-          <Field
-            className={side}
-            id="logs-persist"
-            label="Keep after a restart"
-            hint="Saves the system log, the kernel's lines included, the Wi-Fi, debug and DNS logs on the router's storage (/root/milkflint-logs). Otherwise they're only in memory, and a restart or crash clears them."
-          >
-            <Switch
-              id="logs-persist"
-              className="mt-2 xl:mt-0"
-              checked={form.persist}
-              onCheckedChange={(v) => {
-                set('persist', v);
-              }}
-            />
-          </Field>
-          <Field className={side} id="logs-size" label="Size per log" hint="When a log reaches this, its older half is deleted.">
-            <Select
-              value={form.size}
-              onValueChange={(v) => {
-                set('size', v);
-              }}
-            >
-              <SelectTrigger id="logs-size">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {sizes.map((s) => (
-                  <SelectItem key={s} value={s}>
-                    {s} MB
-                  </SelectItem>
-                ))}
-                {!sizes.includes(form.size) && <SelectItem value={form.size}>{form.size} MB</SelectItem>}
-              </SelectContent>
-            </Select>
-          </Field>
-          <Field
-            className={side}
-            id="logs-wifi"
-            label="Wi-Fi log"
-            hint="Wi-Fi events from the system log, and a line for each connected device: signal, packets, retries, failures, speeds and queued airtime. NO TX marks a device that sent to the router but got nothing back."
-          >
-            <Switch
-              id="logs-wifi"
-              className="mt-2 xl:mt-0"
-              checked={form.wifi}
-              onCheckedChange={(v) => {
-                set('wifi', v);
-              }}
-            />
-            <div className="mt-2 flex flex-col gap-3 border-l pl-4">
-              {wifiParts.map((p) => (
-                <Part
-                  key={p.key}
-                  id={`logs-${p.key}`}
-                  title={p.title}
-                  hint={p.hint}
-                  checked={form[p.key]}
-                  disabled={!form.wifi}
-                  onChange={(v) => {
-                    set(p.key, v);
-                  }}
-                />
-              ))}
-            </div>
-          </Field>
-          <Field
-            className={side}
-            id="logs-interval"
-            label="Sample every"
-            hint="The Wi-Fi log's devices (idle ones once a minute) and the debug counters."
-          >
-            <Select
-              value={form.interval}
-              disabled={!form.wifi && !form.counters && !form.snapshot}
-              onValueChange={(v) => {
-                set('interval', v);
-              }}
-            >
-              <SelectTrigger id="logs-interval">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {intervals.map((s) => (
-                  <SelectItem key={s} value={s}>
-                    {s} seconds
-                  </SelectItem>
-                ))}
-                {!intervals.includes(form.interval) && <SelectItem value={form.interval}>{form.interval} seconds</SelectItem>}
-              </SelectContent>
-            </Select>
-          </Field>
-          <Field
-            className={side}
-            id="logs-radar"
-            label="Radar log"
-            hint="The 5 GHz radar checks, radar heard and the moves after it, always on the router's storage (/root/milkflint-wifi, 64 KB). Radios & SSIDs shows them too."
-          >
-            <Switch
-              id="logs-radar"
-              className="mt-2 xl:mt-0"
-              checked={form.radar}
-              onCheckedChange={(v) => {
-                set('radar', v);
-              }}
-            />
-          </Field>
-          <Field
-            className={side}
-            id="logs-counters"
-            label="Debug counters"
-            hint="For chasing a dropout: every interval, the load and packets at each hop (CPU, CAKE, the WAN port, Wi-Fi), and once a minute memory, the WAN and service restarts, in the debug log."
-          >
-            <Switch
-              id="logs-counters"
-              className="mt-2 xl:mt-0"
-              checked={form.counters}
-              onCheckedChange={(v) => {
-                set('counters', v);
-              }}
-            />
-          </Field>
-          <Field
-            className={side}
-            id="logs-snapshot"
-            label="Snapshot on trouble"
-            hint="When Network Quality loses the internet or DNS, or a device gets NO TX: every queue, CPU, the Wi-Fi hardware queues and the last kernel lines at once, in the debug log (at most once a minute)."
-          >
-            <Switch
-              id="logs-snapshot"
-              className="mt-2 xl:mt-0"
-              checked={form.snapshot}
-              onCheckedChange={(v) => {
-                set('snapshot', v);
-              }}
-            />
-          </Field>
-          <Field
-            className={side}
-            id="logs-dns"
-            label="DNS log"
-            hint="For chasing slow pages or apps: each lookup that takes over 500 ms, fails or gets no answer, with the site and the device, a summary every minute, and the DNS services' errors. To time them, the router notes every lookup in memory for a moment and keeps only the slow ones. Turning it on or off restarts the DNS service: a second without lookups."
-          >
-            <Switch
-              id="logs-dns"
-              className="mt-2 xl:mt-0"
-              checked={form.dns}
-              onCheckedChange={(v) => {
-                set('dns', v);
-              }}
-            />
-          </Field>
-          <Field
-            className={side}
-            id="logs-kfence"
-            label="Memory error checker"
-            hint="For chasing a crash: the kernel's KFENCE watches a sample of its memory allocations, one every tenth of a second, and reports a use-after-free or out-of-bounds access, with the code that made it, on the Crashes tab. It uses 2 MB of memory and a little CPU while it's on, and turning it on or off needs no restart."
-          >
-            <Switch
-              id="logs-kfence"
-              className="mt-2 xl:mt-0"
-              checked={form.kfence}
-              onCheckedChange={(v) => {
-                set('kfence', v);
-              }}
-            />
-          </Field>
-        </CardContent>
-      </Card>
-      <SaveBar
-        visible={dirty}
-        busy={state.phase === 'applying'}
-        invalid={false}
-        onSave={() => {
-          if (data !== undefined) void apply(logSettingsChanges(form, data));
-        }}
-        onRevert={() => {
-          setEdit(undefined);
-        }}
-      />
-    </div>
   );
 }

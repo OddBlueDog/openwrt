@@ -19,7 +19,9 @@ export const featureIds = [
   'data-statistics',
   'sqm',
   'tuning',
+  'wifi-driver',
   'firewall',
+  'port-forwards',
   'adguardhome',
   'banip',
   'upnp',
@@ -31,6 +33,7 @@ export const featureIds = [
   'schedules',
   'logs',
   'backup-reset',
+  'themes',
 ] as const;
 
 export type FeatureId = (typeof featureIds)[number];

@@ -27,6 +27,9 @@ async function loadWed(): Promise<WedConfig> {
 /** Whether WED is on, and how to turn it off with a page's save. */
 export function useWed(): Wed {
   const { data, reload } = useLoad(loadWed);
-  const offChanges = useCallback((options?: { keepFirewall?: boolean }) => (data === undefined ? [] : wedOffChanges(data, options)), [data]);
+  const offChanges = useCallback(
+    (options?: { keepFirewall?: boolean }) => (data === undefined ? [] : wedOffChanges(data, options)),
+    [data],
+  );
   return { on: data !== undefined && wedOn(data.milkflint), offChanges, reload };
 }

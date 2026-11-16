@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'wifi-scan',
-  title: 'Nearby Networks',
-  description: 'The Wi-Fi around the router: who’s on your channels, and which are quietest.',
+  title: 'Nearby networks',
+  description: 'The Wi-Fi around the router: who’s on your channels and which are quietest, and a radar scan of 5 GHz.',
   icon: RadarIcon,
   group: 'wifi',
   order: 30,
-  page: lazyPage(() => import('./page'), (m) => m.NearbyPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.NearbyPage,
+  ),
 } satisfies Feature;

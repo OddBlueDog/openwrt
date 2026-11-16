@@ -169,6 +169,11 @@ export function twtRestarts(a: TwtSetting, b: TwtSetting): boolean {
 /** "Sleeps 1 s, awake 16 ms" for an agreement */
 export function twtScheduleLabel(intervalUs: number, wakeUs: number): string {
   const sleep = (intervalUs - wakeUs) / 1000;
-  const part = (ms: number): string => (ms < 1000 ? `${String(Math.round(ms))} ms` : ms < 60_000 ? `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s` : `${(ms / 60_000).toFixed(1)} min`);
+  const part = (ms: number): string =>
+    ms < 1000
+      ? `${String(Math.round(ms))} ms`
+      : ms < 60_000
+        ? `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`
+        : `${(ms / 60_000).toFixed(1)} min`;
   return `Sleeps ${part(sleep)}, awake ${part(wakeUs / 1000)}`;
 }

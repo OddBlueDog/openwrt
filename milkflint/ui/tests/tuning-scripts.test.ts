@@ -297,7 +297,15 @@ function twt(settings: Record<string, string>, phy = 'phy1'): string[] {
   return readFileSync(twtFile(phy), 'utf8').trim().split('\n');
 }
 
-const TWT_DEFAULTS = ['min_interval_ms 0', 'max_interval_ms 60000', 'min_interval_ms 0', 'min_wake_dur 64', 'max_flows 16', 'max_sta_flows 8', 'trigger allow'];
+const TWT_DEFAULTS = [
+  'min_interval_ms 0',
+  'max_interval_ms 60000',
+  'min_interval_ms 0',
+  'min_wake_dur 64',
+  'max_flows 16',
+  'max_sta_flows 8',
+  'trigger allow',
+];
 
 test('wifi-twt: nothing set writes the driver’s defaults, so that clearing a setting takes', () => {
   assert.deepEqual(twt({}), TWT_DEFAULTS);
@@ -314,7 +322,15 @@ test('wifi-twt: the radio’s band’s settings, the shortest cleared first as t
       'milkflint.wifi.twt_5g_trigger': 'never',
       'milkflint.wifi.twt_2g_max_interval': '100',
     }),
-    ['min_interval_ms 0', 'max_interval_ms 5000', 'min_interval_ms 100', 'min_wake_dur 128', 'max_flows 4', 'max_sta_flows 2', 'trigger never'],
+    [
+      'min_interval_ms 0',
+      'max_interval_ms 5000',
+      'min_interval_ms 100',
+      'min_wake_dur 128',
+      'max_flows 4',
+      'max_sta_flows 2',
+      'trigger never',
+    ],
   );
   assert.equal(twt({ 'milkflint.wifi.twt_2g_max_interval': '100' }, 'phy0')[1], 'max_interval_ms 100');
 });
@@ -344,7 +360,14 @@ test('wifi-twt: a driver without the file is left alone', () => {
 function groShow(queues: Record<string, Record<string, string>>): string {
   const r = join(root, 'gro');
   rmSync(r, { recursive: true, force: true });
-  for (const d of ['etc/config', 'lib/functions', 'sys/class/net/eth1/device', 'sys/class/net/br-guest', 'sys/class/net/wg_out', 'var/run'])
+  for (const d of [
+    'etc/config',
+    'lib/functions',
+    'sys/class/net/eth1/device',
+    'sys/class/net/br-guest',
+    'sys/class/net/wg_out',
+    'var/run',
+  ])
     mkdirSync(join(r, d), { recursive: true });
   writeFileSync(join(r, 'etc/config/sqm'), uciExport('sqm', 'queue', queues));
   writeFileSync(join(r, 'lib/functions.sh'), functionsSh(join(r, 'etc/config')));
@@ -355,7 +378,10 @@ function groShow(queues: Record<string, Record<string, string>>): string {
     .replaceAll('/sys/class/net', join(r, 'sys/class/net'))
     .replaceAll('/var/run/milkflint-tuning', join(r, 'var/run'));
   writeFileSync(join(r, 'gro'), text);
-  return execFileSync('dash', [join(r, 'gro'), 'show'], { env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin` }, encoding: 'utf8' }).trim();
+  return execFileSync('dash', [join(r, 'gro'), 'show'], {
+    env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin` },
+    encoding: 'utf8',
+  }).trim();
 }
 
 const NO_QUEUE = 'dev=eth1 mode=fraglist auto=fraglist udp=0 max=65536 whole=0 offload=0';

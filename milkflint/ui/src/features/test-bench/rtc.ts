@@ -149,7 +149,10 @@ class Link {
     this.offerer = offerer;
     this.key = key;
     this.attempt = attempt;
-    this.channel = this.pc.createDataChannel(kind === 'p' ? 'probe' : 'bulk', kind === 'p' ? { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 } : { negotiated: true, id: 0 });
+    this.channel = this.pc.createDataChannel(
+      kind === 'p' ? 'probe' : 'bulk',
+      kind === 'p' ? { negotiated: true, id: 0, ordered: false, maxRetransmits: 0 } : { negotiated: true, id: 0 },
+    );
     this.channel.binaryType = 'arraybuffer';
   }
 
@@ -203,7 +206,11 @@ class Link {
     const end = (id: string | undefined): string => {
       const c = id === undefined ? undefined : candidates.get(id);
       if (c === undefined) return 'unknown/udp/hidden';
-      return candidateKey({ type: c.candidateType ?? 'unknown', protocol: c.protocol === 'tcp' ? 'tcp' : 'udp', kind: addressKind(c.address ?? c.ip) });
+      return candidateKey({
+        type: c.candidateType ?? 'unknown',
+        protocol: c.protocol === 'tcp' ? 'tcp' : 'udp',
+        kind: addressKind(c.address ?? c.ip),
+      });
     };
     const rtt = selected?.currentRoundTripTime;
     return {
@@ -223,7 +230,11 @@ class Link {
       path:
         selected === undefined || this.channel.readyState !== 'open'
           ? null
-          : { local: end(selected.localCandidateId), remote: end(selected.remoteCandidateId), rtt: rtt === undefined ? null : Math.round(rtt * 10_000) / 10 },
+          : {
+              local: end(selected.localCandidateId),
+              remote: end(selected.remoteCandidateId),
+              rtt: rtt === undefined ? null : Math.round(rtt * 10_000) / 10,
+            },
       error: this.error,
       ms: Math.round(performance.now() - this.began),
     };
@@ -348,7 +359,10 @@ class Peer {
 
   /** Records this side's view of a connection: open, failed (also after it opened: it dropped), or not open yet when its connect phase ended ('wait'). */
   private async report(link: Link, event: 'open' | 'fail' | 'wait'): Promise<void> {
-    if (event === 'wait' ? link.reported !== undefined : link.reported === event || (event === 'open' && link.reported === 'fail')) return;
+    if (
+      event === 'wait' ? link.reported !== undefined : link.reported === event || (event === 'open' && link.reported === 'fail')
+    )
+      return;
     if (event !== 'wait') link.reported = event;
     const d = await link.diag();
     const t = this.ctx.clock.router();
@@ -476,7 +490,10 @@ class Peer {
   /** The last probes' RTTs, ms, and the bulk data arriving, Mbit/s over the last second. */
   live(): { rtts: number[]; mbit: number } {
     const bytes = this.rxRecent.reduce((a, b) => a + b, 0);
-    return { rtts: this.recent, mbit: this.rxRecent.length === 0 ? 0 : (bytes * 8) / ((this.rxRecent.length * RECORD_MS) / 1000) / 1e6 };
+    return {
+      rtts: this.recent,
+      mbit: this.rxRecent.length === 0 ? 0 : (bytes * 8) / ((this.rxRecent.length * RECORD_MS) / 1000) / 1e6,
+    };
   }
 
   close(): void {

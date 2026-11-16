@@ -13,19 +13,32 @@ export interface PlanMember {
 }
 
 export function planMembers(members: readonly Member[]): PlanMember[] {
-  return members.map((m) => ({ id: m.id, name: m.name, wired: m.link === undefined || m.link === null ? undefined : m.link.kind === 'wired' }));
+  return members.map((m) => ({
+    id: m.id,
+    name: m.name,
+    wired: m.link === undefined || m.link === null ? undefined : m.link.kind === 'wired',
+  }));
 }
 
 export type PresetId = 'quick' | 'full' | 'wifi-wired' | 'custom';
 
 export const presets: readonly { id: PresetId; title: string; description: string }[] = [
-  { id: 'quick', title: 'Quick check', description: 'Idle latency, one download and one upload under load, DNS. About a minute.' },
+  {
+    id: 'quick',
+    title: 'Quick check',
+    description: 'Idle latency, one download and one upload under load, DNS. About a minute.',
+  },
   {
     id: 'full',
     title: 'Full',
-    description: 'Everything: single and shared downloads, uploads, both ways, device to device, DNS and pages, a busy household.',
+    description:
+      'Everything: single and shared downloads, uploads, both ways, device to device, DNS and pages, a busy household.',
   },
-  { id: 'wifi-wired', title: 'Wi-Fi vs wired', description: 'The same loads on a wired device and a Wi-Fi one, then between them.' },
+  {
+    id: 'wifi-wired',
+    title: 'Wi-Fi vs wired',
+    description: 'The same loads on a wired device and a Wi-Fi one, then between them.',
+  },
   { id: 'custom', title: 'Custom', description: 'Pick the tests and how long each load runs.' },
 ];
 
@@ -104,7 +117,13 @@ class Builder {
   phases: ScheduleRequest['phases'] = [];
   private at = 0;
 
-  add(kind: PhaseKind, seconds: number, label: string, roles: Record<string, string> = {}, extra: Partial<ScheduleRequest['phases'][number]> = {}): void {
+  add(
+    kind: PhaseKind,
+    seconds: number,
+    label: string,
+    roles: Record<string, string> = {},
+    extra: Partial<ScheduleRequest['phases'][number]> = {},
+  ): void {
     const dur = Math.round(Math.min(MAX_PHASE_S, Math.max(MIN_PHASE_S, seconds)) * 1000);
     this.phases.push({ kind, start: this.at, dur, label: fitLabel(label), roles, ...extra });
     this.at += dur;
@@ -122,7 +141,11 @@ class Builder {
   }
 }
 
-function loaders(members: readonly PlanMember[]): { wired: PlanMember | undefined; wifi: PlanMember | undefined; any: PlanMember | undefined } {
+function loaders(members: readonly PlanMember[]): {
+  wired: PlanMember | undefined;
+  wifi: PlanMember | undefined;
+  any: PlanMember | undefined;
+} {
   const wired = members.find((m) => m.wired === true);
   const wifi = members.find((m) => m.wired === false);
   return { wired, wifi, any: wired ?? members[0] };
@@ -253,7 +276,13 @@ export function buildPlan(
     if (c.household) {
       const h = householdRoles(members);
       if (h.pair !== undefined) b.connect();
-      b.add('household', Math.max(c.loadS, 20), 'Busy household', h.roles, h.pair === undefined ? {} : { pair: h.pair, dir: 'both' });
+      b.add(
+        'household',
+        Math.max(c.loadS, 20),
+        'Busy household',
+        h.roles,
+        h.pair === undefined ? {} : { pair: h.pair, dir: 'both' },
+      );
     }
     if (b.phases.length === 0) b.add('idle', 10, 'Idle');
     b.add('cooldown', 5, 'Cool down');
@@ -299,7 +328,10 @@ export function phaseAt(s: { readonly phases: readonly Pick<Phase, 'start' | 'du
  * at Smart Queue's shaped rate, downloads and uploads (shared loads share
  * the line, so they count once). Undefined without Smart Queue's rates.
  */
-export function dataEstimate(s: Pick<ScheduleRequest, 'phases' | 'dry'>, shaper: { down_kbit: number; up_kbit: number } | null | undefined): { down: number; up: number } | undefined {
+export function dataEstimate(
+  s: Pick<ScheduleRequest, 'phases' | 'dry'>,
+  shaper: { down_kbit: number; up_kbit: number } | null | undefined,
+): { down: number; up: number } | undefined {
   if (shaper === undefined || shaper === null || shaper.down_kbit <= 0 || s.dry) return s.dry ? { down: 0, up: 0 } : undefined;
   let down = 0;
   let up = 0;

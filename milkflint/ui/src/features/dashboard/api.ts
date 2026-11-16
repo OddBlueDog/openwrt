@@ -18,6 +18,9 @@ const sensorHistory = z.object({
 });
 export type SensorHistory = z.output<typeof sensorHistory>;
 
+/** The name prefix of the sample sensors `pnpm dev` shows when the router (the VM) has none (src/dev/sample-sensors.ts). */
+export const SAMPLE_SENSOR = 'dev-sample-';
+
 /** The router's temperatures over the last hour, recorded on the router whether or not a page is open. */
 export function getSensorHistory(): Promise<SensorHistory> {
   return call('milkflint.sensors', 'history', { since: 0 }, sensorHistory);

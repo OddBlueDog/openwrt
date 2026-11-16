@@ -126,7 +126,12 @@ test('turning WED on: Smart Queue and the guest limit off, the VPN’s queue lef
   assert.equal(after.sqm['spare']?.['enabled'], '0');
   // its speeds and the rest stay, for when it comes back
   assert.equal(after.sqm['eth1']['download'], '600000');
-  assert.deepEqual(after.firewall['cfg01'], { '.type': 'defaults', flow_offloading: '1', syn_flood: '1', flow_offloading_hw: '1' });
+  assert.deepEqual(after.firewall['cfg01'], {
+    '.type': 'defaults',
+    flow_offloading: '1',
+    syn_flood: '1',
+    flow_offloading_hw: '1',
+  });
   assert.deepEqual(after.milkflint['wed'], { '.type': 'wed', sqm: 'eth1 guest', offload: '1', offload_hw: '0' });
 });
 
@@ -149,7 +154,10 @@ test('turning WED off puts back exactly what it turned off, and forgets it', () 
   });
   const off = applied(on, wedOffChanges(configOf(on)));
   // as before, but for hardware offloading set to "0" where it was unset: the firewall reads both as off
-  assert.deepEqual(off, { ...before, firewall: { ...before.firewall, cfg01: { ...sec(before, 'firewall', 'cfg01'), flow_offloading_hw: '0' } } });
+  assert.deepEqual(off, {
+    ...before,
+    firewall: { ...before.firewall, cfg01: { ...sec(before, 'firewall', 'cfg01'), flow_offloading_hw: '0' } },
+  });
   assert.deepEqual(wedOffChanges(configOf(off)), []);
 });
 
@@ -317,7 +325,13 @@ function run(args: string[], state: State): { state: State; calls: string[]; out
   writeFileSync(stateFile, JSON.stringify(state));
   writeFileSync(callsFile, '');
   const out = execFileSync('sh', [script, ...args], {
-    env: { PATH: `${join(root, 'bin')}:${process.env['PATH'] ?? ''}`, UCI_STATE: stateFile, CALLS: callsFile, WED_ROOT: root, WED_SETTLE: '0' },
+    env: {
+      PATH: `${join(root, 'bin')}:${process.env['PATH'] ?? ''}`,
+      UCI_STATE: stateFile,
+      CALLS: callsFile,
+      WED_ROOT: root,
+      WED_SETTLE: '0',
+    },
     encoding: 'utf8',
   });
   return {
@@ -339,7 +353,12 @@ test('wed guard, the setting turned on by hand: the same settings as the page’
   const before = household();
   const r = run(['guard'], withWed(before));
   assert.deepEqual(r.state, applied(before, wedOnChanges(configOf(before))));
-  assert.deepEqual(r.calls.filter((c) => !c.startsWith('log ')).sort(), ['reload_config', 'uci commit firewall', 'uci commit milkflint', 'uci commit sqm']);
+  assert.deepEqual(r.calls.filter((c) => !c.startsWith('log ')).sort(), [
+    'reload_config',
+    'uci commit firewall',
+    'uci commit milkflint',
+    'uci commit sqm',
+  ]);
   const log = r.calls.filter((c) => c.startsWith('log ')).join('\n');
   assert.match(log, /Smart Queue on eth1 \(sqm\.eth1\) turned off: hardware offloading \(WED\) is on/);
   assert.match(log, /Smart Queue on br-guest \(sqm\.guest\) turned off/);
@@ -375,7 +394,12 @@ test('wed guard with the setting off puts back what’s remembered, as the page 
   off.milkflint['wifi'] = unset(sec(off, 'milkflint', 'wifi'), 'wed');
   const r = run(['guard'], off);
   assert.deepEqual(r.state, applied(saved, wedOffChanges(configOf(saved))));
-  assert.deepEqual(r.calls.filter((c) => !c.startsWith('log ')).sort(), ['reload_config', 'uci commit firewall', 'uci commit milkflint', 'uci commit sqm']);
+  assert.deepEqual(r.calls.filter((c) => !c.startsWith('log ')).sort(), [
+    'reload_config',
+    'uci commit firewall',
+    'uci commit milkflint',
+    'uci commit sqm',
+  ]);
   assert.ok(r.calls.some((c) => c.startsWith('log Smart Queue on eth1 (sqm.eth1) turned back on')));
   assert.equal(readFileSync(join(root, 'etc/modules.conf'), 'utf8'), '# mine\n');
   // and once more: nothing
@@ -400,7 +424,12 @@ test('wed guard on an access point turns WED off again and puts back what it had
   assert.equal(r.state.sqm['eth1']?.['enabled'], '1');
   assert.equal(r.state.milkflint['wed'], undefined);
   assert.ok(r.calls.some((c) => c.startsWith('log Hardware offloading (WED) turned off: as an access point')));
-  assert.equal(existsSync(join(root, 'etc/modules.conf')) ? readFileSync(join(root, 'etc/modules.conf'), 'utf8').includes('wed_enable') : false, false);
+  assert.equal(
+    existsSync(join(root, 'etc/modules.conf'))
+      ? readFileSync(join(root, 'etc/modules.conf'), 'utf8').includes('wed_enable')
+      : false,
+    false,
+  );
 });
 
 test('wed conf: the driver’s line follows the setting and leaves the rest of the file alone', () => {
@@ -422,7 +451,10 @@ test('wed conf: the driver’s line follows the setting and leaves the rest of t
   // OpenWrt's own file, and someone's options
   writeFileSync(conf, '# examples:\n# options mod1 option=val\nblacklist mod2\noptions mt76 foo=1\n');
   run(['conf'], on);
-  assert.equal(text(), '# examples:\n# options mod1 option=val\nblacklist mod2\noptions mt76 foo=1\noptions mt7915e wed_enable=Y\n');
+  assert.equal(
+    text(),
+    '# examples:\n# options mod1 option=val\nblacklist mod2\noptions mt76 foo=1\noptions mt7915e wed_enable=Y\n',
+  );
   run(['conf'], off);
   assert.equal(text(), '# examples:\n# options mod1 option=val\nblacklist mod2\noptions mt76 foo=1\n');
 
@@ -436,10 +468,14 @@ test('wed conf: the driver’s line follows the setting and leaves the rest of t
 
 test('wed flowtable: the firewall loads again only when its flow table would list other interfaces', () => {
   const hw = applied(household(), wedOnChanges(configOf(household())));
-  const table = (devices: string): string => `table inet fw4 {\n\tflowtable ft {\n\t\thook ingress priority filter\n\t\tdevices = { ${devices} }\n\t\tflags offload\n\t}\n}\n`;
+  const table = (devices: string): string =>
+    `table inet fw4 {\n\tflowtable ft {\n\t\thook ingress priority filter\n\t\tdevices = { ${devices} }\n\t\tflags offload\n\t}\n}\n`;
   // a Wi-Fi interface made after the firewall loaded
   writeFileSync(join(root, 'nft-flowtable'), table('"eth1", "lan1", "lan2"'));
-  writeFileSync(join(root, 'fw4-print'), `\tflowtable ft {\n\t\thook ingress priority 0;\n\t\tdevices = { "eth1", "lan1", "lan2", "phy1-ap0" };\n\t\tflags offload;\n\t}\n`);
+  writeFileSync(
+    join(root, 'fw4-print'),
+    `\tflowtable ft {\n\t\thook ingress priority 0;\n\t\tdevices = { "eth1", "lan1", "lan2", "phy1-ap0" };\n\t\tflags offload;\n\t}\n`,
+  );
   assert.deepEqual(
     run(['flowtable'], hw).calls.filter((c) => !c.startsWith('log ')),
     ['fw4 -q reload'],

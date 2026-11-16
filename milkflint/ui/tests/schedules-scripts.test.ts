@@ -33,9 +33,7 @@ function start(tasks: Task[], crontab?: string): { crontab: string; restarted: b
       .replace('/etc/crontabs/root', tab)
       .replaceAll('/etc/init.d/cron', join(root, 'cron'));
     // rc.common's config functions, over the tasks given
-    const config = tasks
-      .flatMap((t, i) => Object.entries(t).map(([k, v]) => `CFG_t${String(i)}_${k}='${String(v)}'`))
-      .join('\n');
+    const config = tasks.flatMap((t, i) => Object.entries(t).map(([k, v]) => `CFG_t${String(i)}_${k}='${String(v)}'`)).join('\n');
     const harness = `config_load() { :; }
 config_foreach() { for s in ${tasks.map((_, i) => `t${String(i)}`).join(' ')}; do "$1" "$s"; done; }
 config_get() { eval "$1=\\\${CFG_$2_$3:-}"; }
@@ -45,7 +43,11 @@ ${init}
 start_service
 `;
     writeFileSync(join(root, 'harness.sh'), harness);
-    execFileSync('/bin/sh', [join(root, 'harness.sh')], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('/bin/sh', [join(root, 'harness.sh')], {
+      env: { PATH: '/usr/bin:/bin' },
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
     return { crontab: readFileSync(tab, 'utf8'), restarted: existsSync(log) && readFileSync(log, 'utf8').includes('restart') };
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -99,7 +101,10 @@ test('no tasks left: the block goes, the rest stays', () => {
 });
 
 test('several tasks, one block, in order', () => {
-  const r = start([{ action: 'wifi_off', time: '23:00' }, { action: 'wifi_on', time: '07:00', days: '1 2' }]);
+  const r = start([
+    { action: 'wifi_off', time: '23:00' },
+    { action: 'wifi_on', time: '07:00', days: '1 2' },
+  ]);
   assert.equal(r.crontab, block(line('0 23', '*', 'wifi_off'), line('0 7', '1,2', 'wifi_on')));
 });
 

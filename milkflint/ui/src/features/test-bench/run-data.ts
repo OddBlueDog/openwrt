@@ -3,7 +3,17 @@
 // records, the router's pings, its samples and its DNS lookups.
 import { useEffect, useState } from 'react';
 import { errorMessage } from '@/lib/utils';
-import { BenchError, getRunMeta, getRunPage, memberRunMeta, memberRunPage, type RunEnd, type RunMeta, type RunPage, type StoredRun } from './api';
+import {
+  BenchError,
+  getRunMeta,
+  getRunPage,
+  memberRunMeta,
+  memberRunPage,
+  type RunEnd,
+  type RunMeta,
+  type RunPage,
+  type StoredRun,
+} from './api';
 import { parseProbes, parseRouter, type ProbeLine, type ReportRun, type RouterLine } from './analysis';
 import { parseDns, type RouterDns } from './dns-pages';
 import type { RunRecord } from './member';
@@ -23,9 +33,13 @@ export const reportRun = (d: RunData): ReportRun => ({ t0: d.meta.t0, end: d.met
 /** Who reads a run: the admin (any stored run), or a member with its own session (its bench's runs). */
 export type RunReader = { admin: true } | { session: string };
 
-const readerKey = (r: RunReader | undefined): string | undefined => (r === undefined ? undefined : 'admin' in r ? 'admin' : r.session);
+const readerKey = (r: RunReader | undefined): string | undefined =>
+  r === undefined ? undefined : 'admin' in r ? 'admin' : r.session;
 
-function reading(key: string): { meta: (run: string) => Promise<RunMeta>; page: (run: string, part: string, from: number) => Promise<RunPage> } {
+function reading(key: string): {
+  meta: (run: string) => Promise<RunMeta>;
+  page: (run: string, part: string, from: number) => Promise<RunPage>;
+} {
   return key === 'admin'
     ? { meta: getRunMeta, page: getRunPage }
     : { meta: (run) => memberRunMeta(key, run), page: (run, part, from) => memberRunPage(key, run, part, from) };
@@ -66,7 +80,12 @@ async function load(key: string, run: string): Promise<RunData> {
  * Reads a run once it's over (`ready`). A run that has just ended waits
  * `delayMs` first, while its members send what they still hold.
  */
-export function useRunData(reader: RunReader | undefined, run: string, ready: boolean, delayMs = 0): { data: RunData | undefined; error: string | undefined } {
+export function useRunData(
+  reader: RunReader | undefined,
+  run: string,
+  ready: boolean,
+  delayMs = 0,
+): { data: RunData | undefined; error: string | undefined } {
   const key = readerKey(reader);
   // kept with its run's id: a new run's page mustn't show the last one's figures
   const [loaded, setLoaded] = useState<{ run: string; data: RunData }>();

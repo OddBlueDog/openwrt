@@ -87,7 +87,9 @@ export function sprDriverMode(s: SprSetting): string | undefined {
 }
 
 /** What the radio does now, as the router reports it: '' while its network is off */
-export function sprNow(now: { running: boolean; mode: string | null; control: number | null; offset: number | null } | undefined): string {
+export function sprNow(
+  now: { running: boolean; mode: string | null; control: number | null; offset: number | null } | undefined,
+): string {
   if (now?.running !== true) return '';
   const radio = now.mode === 'fixed' ? 'a fixed threshold' : now.mode === 'off' ? 'off' : 'the firmware’s choice';
   // he_spr_sr_control bit 1: reuse by threshold not allowed; with no element in the beacons at all, it's up to them
@@ -104,6 +106,7 @@ export function sprNow(now: { running: boolean; mode: string | null; control: nu
 
 /** "-72 dBm", with what each end of the choices means */
 export function sprThresholdLabel(dbm: number): string {
-  const note = dbm === SPR_THRESHOLDS[0] ? ' (cautious)' : dbm === SPR_THRESHOLDS[SPR_THRESHOLDS.length - 1] ? ' (most reuse)' : '';
+  const note =
+    dbm === SPR_THRESHOLDS[0] ? ' (cautious)' : dbm === SPR_THRESHOLDS[SPR_THRESHOLDS.length - 1] ? ' (most reuse)' : '';
   return `${String(dbm)} dBm${note}`;
 }

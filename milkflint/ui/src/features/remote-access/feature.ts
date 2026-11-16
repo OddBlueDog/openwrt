@@ -10,5 +10,8 @@ export const feature = {
   group: 'vpn',
   order: 10,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.RemoteAccessPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.RemoteAccessPage,
+  ),
 } satisfies Feature;

@@ -40,6 +40,11 @@ export async function getHttpsConfig(): Promise<HttpsConfig | undefined> {
 
 /** Replace the router's certificate with a new one; uhttpd restarts a second after it answers. */
 export async function renewCertificate(): Promise<void> {
-  const r = await call('milkflint.https', 'renew', {}, z.object({ renewing: z.boolean().optional(), error: z.string().optional() }));
+  const r = await call(
+    'milkflint.https',
+    'renew',
+    {},
+    z.object({ renewing: z.boolean().optional(), error: z.string().optional() }),
+  );
   if (r.error !== undefined) throw new Error(`The router couldn’t: ${r.error}.`);
 }

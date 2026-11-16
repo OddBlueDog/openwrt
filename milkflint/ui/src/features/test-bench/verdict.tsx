@@ -1,16 +1,37 @@
-import { CircleCheckIcon, CircleDashedIcon, CircleXIcon, InfoIcon, type LucideIcon, RotateCcwIcon, SlidersHorizontalIcon, TriangleAlertIcon } from 'lucide-react';
-import { type ReactElement, useState } from 'react';
+import { ChevronDownIcon, RotateCcwIcon, SlidersHorizontalIcon } from 'lucide-react';
+import { type ReactElement, useId, useState } from 'react';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 import { cn } from '@/lib/utils';
-import { type Check, defaultThresholds, type Status, THRESHOLDS, type ThresholdDef, type ThresholdKey, thresholdKeys, type Thresholds } from './checks';
+import {
+  type Check,
+  defaultThresholds,
+  type Status,
+  THRESHOLDS,
+  type ThresholdDef,
+  type ThresholdKey,
+  thresholdKeys,
+  type Thresholds,
+} from './checks';
+import { Arrowed } from './dir';
 import { saveThresholds, useThresholds } from './thresholds';
 
 // ---- The panel ----
 
-function LevelInput({ id, value, step, onChange }: { id: string; value: number; step: number; onChange: (v: number) => void }): ReactElement {
+function LevelInput({
+  id,
+  value,
+  step,
+  onChange,
+}: {
+  id: string;
+  value: number;
+  step: number;
+  onChange: (v: number) => void;
+}): ReactElement {
   const [text, setText] = useState(String(value));
   // another change (Reset) since it was typed
   const [was, setWas] = useState(value);
@@ -81,21 +102,29 @@ function ThresholdRow({ k, t }: { k: ThresholdKey; t: Thresholds }): ReactElemen
           </span>
         )}
       </div>
-      {d.warn === undefined && <span className="text-[11px] text-muted-foreground">Short of it is only noted, not a warning.</span>}
-      {wrongWay && <span className="text-[11px] text-warning">The warning level is on the passing side, so nothing warns: past the pass level fails.</span>}
+      {d.warn === undefined && <span className="text-xs text-muted-foreground">Short of it is only noted, not a warning.</span>}
+      {wrongWay && (
+        <span className="text-xs text-warning">
+          The warning level is on the passing side, so nothing warns: past the pass level fails.
+        </span>
+      )}
     </div>
   );
 }
 
 export function ThresholdsSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }): ReactElement {
   const t = useThresholds();
-  const changed = thresholdKeys.some((k) => t[k].pass !== defaultThresholds()[k].pass || t[k].warn !== defaultThresholds()[k].warn);
+  const changed = thresholdKeys.some(
+    (k) => t[k].pass !== defaultThresholds()[k].pass || t[k].warn !== defaultThresholds()[k].warn,
+  );
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent>
         <div className="flex flex-col gap-1 border-b px-5 py-4 pr-12">
           <SheetTitle>Thresholds</SheetTitle>
-          <SheetDescription>What each check passes and warns at. They’re kept in this browser, and saved with the checks in an export.</SheetDescription>
+          <SheetDescription>
+            What each check passes and warns at. They’re kept in this browser, and saved with the checks in an export.
+          </SheetDescription>
         </div>
         <div className="flex-1 overflow-y-auto px-5">
           {thresholdKeys.map((k) => (
@@ -121,13 +150,22 @@ export function ThresholdsSheet({ open, onOpenChange }: { open: boolean; onOpenC
 
 // ---- The verdicts ----
 
-const statusLook: Record<Status, { icon: LucideIcon; text: string; tone: string }> = {
-  pass: { icon: CircleCheckIcon, text: 'Pass', tone: 'text-success' },
-  warn: { icon: TriangleAlertIcon, text: 'Warning', tone: 'text-warning' },
-  fail: { icon: CircleXIcon, text: 'Fail', tone: 'text-destructive' },
-  info: { icon: InfoIcon, text: 'Note', tone: 'text-info' },
-  skip: { icon: CircleDashedIcon, text: 'Not measured', tone: 'text-muted-foreground' },
+/** A check's outcome in the interface's status words: a badge with a dot, never colour alone. */
+const statusLook: Record<
+  Status,
+  { text: string; variant: 'success' | 'warning' | 'destructive' | 'info' | 'outline'; tone: string }
+> = {
+  pass: { text: 'Pass', variant: 'success', tone: 'text-success' },
+  warn: { text: 'Warning', variant: 'warning', tone: 'text-warning' },
+  fail: { text: 'Fail', variant: 'destructive', tone: 'text-destructive' },
+  info: { text: 'Note', variant: 'info', tone: 'text-info' },
+  skip: { text: 'Not measured', variant: 'outline', tone: 'text-muted-foreground' },
 };
+
+export function StatusBadge({ status, children }: { status: Status; children?: string }): ReactElement {
+  const look = statusLook[status];
+  return <Badge variant={look.variant}>{children ?? look.text}</Badge>;
+}
 
 const countWords: Record<Status, (n: number) => string> = {
   fail: () => 'failed',
@@ -139,29 +177,59 @@ const countWords: Record<Status, (n: number) => string> = {
 
 function CheckRow({ c }: { c: Check }): ReactElement {
   const look = statusLook[c.status];
-  const Icon = look.icon;
+  const [open, setOpen] = useState(false);
   const more = c.notes.length > 0 || c.status !== 'skip';
+  const panel = useId();
   return (
-    <li className="flex gap-3 py-3">
-      <Icon className={cn('mt-0.5 size-4 shrink-0', look.tone)} aria-label={look.text} />
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <div className="flex flex-wrap items-baseline justify-between gap-x-3">
-          <span className="text-sm font-medium">{c.title}</span>
-          {c.value !== undefined && <span className={cn('text-sm font-medium tabular', c.status === 'skip' ? 'text-muted-foreground' : look.tone)}>{c.value}</span>}
-        </div>
-        <span className="text-xs text-muted-foreground">{c.detail}</span>
-        {more && (
-          <details className="group text-xs text-muted-foreground">
-            <summary className="w-fit cursor-pointer text-[11px] text-primary select-none hover:underline">More</summary>
-            <ul className="mt-1.5 flex list-disc flex-col gap-0.5 pl-4">
+    <li className="flex flex-col gap-1 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <span className="text-sm font-medium">{c.title}</span>
+        <StatusBadge status={c.status} />
+      </div>
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-6">
+        <span className="text-xs text-muted-foreground">
+          {c.detail}
+          {more && (
+            <>
+              {' '}
+              <button
+                type="button"
+                aria-expanded={open}
+                aria-controls={panel}
+                onClick={() => {
+                  setOpen((o) => !o);
+                }}
+                className="inline-flex cursor-pointer items-center gap-0.5 rounded-sm font-medium link"
+              >
+                Why?
+                <ChevronDownIcon className={cn('size-3 transition-transform duration-fast', open && 'rotate-180')} />
+              </button>
+            </>
+          )}
+        </span>
+        {c.value !== undefined && (
+          <span
+            className={cn(
+              'text-sm font-medium tabular sm:max-w-[45%] sm:shrink-0 sm:text-right',
+              c.status === 'skip' ? 'text-muted-foreground' : look.tone,
+            )}
+          >
+            <Arrowed text={c.value} />
+          </span>
+        )}
+      </div>
+      {more && (
+        <div id={panel} hidden={!open} className="mt-1 max-w-prose rounded-md bg-muted px-3 py-2 text-xs text-foreground">
+          {c.notes.length > 0 && (
+            <ul className="mb-1.5 flex list-disc flex-col gap-0.5 pl-4">
               {c.notes.map((n) => (
                 <li key={n}>{n}</li>
               ))}
-              <li className="list-none pt-1 -ml-4 italic">{c.why}</li>
             </ul>
-          </details>
-        )}
-      </div>
+          )}
+          <p className="text-muted-foreground">{c.why}</p>
+        </div>
+      )}
     </li>
   );
 }
@@ -169,20 +237,20 @@ function CheckRow({ c }: { c: Check }): ReactElement {
 /** Every check in the report's order, how many came out each way, and the thresholds behind them. */
 export function Verdict({ checks }: { checks: readonly Check[] }): ReactElement {
   const [open, setOpen] = useState(false);
-  const counts = (['fail', 'warn', 'pass', 'info', 'skip'] as const).map((s) => ({ s, n: checks.filter((c) => c.status === s).length })).filter((x) => x.n > 0);
+  const heading = useId();
+  const counts = (['fail', 'warn', 'pass', 'info', 'skip'] as const)
+    .map((s) => ({ s, n: checks.filter((c) => c.status === s).length }))
+    .filter((x) => x.n > 0);
   return (
-    <section className="flex flex-col gap-2">
+    <section className="flex flex-col gap-3" aria-labelledby={heading}>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <h3 className="text-sm font-semibold">Verdict</h3>
-          {counts.map(({ s, n }) => {
-            const Icon = statusLook[s].icon;
-            return (
-              <span key={s} className={cn('inline-flex items-center gap-1 text-xs tabular', statusLook[s].tone)}>
-                <Icon className="size-3.5" /> {String(n)} {countWords[s](n)}
-              </span>
-            );
-          })}
+        <div className="flex flex-wrap items-center gap-2">
+          <h3 id={heading} className="mr-1 text-sm font-semibold">
+            Checks
+          </h3>
+          {counts.map(({ s, n }) => (
+            <StatusBadge key={s} status={s}>{`${String(n)} ${countWords[s](n)}`}</StatusBadge>
+          ))}
         </div>
         <Button
           type="button"
@@ -195,7 +263,7 @@ export function Verdict({ checks }: { checks: readonly Check[] }): ReactElement 
           <SlidersHorizontalIcon /> Thresholds
         </Button>
       </div>
-      <ul className="divide-y rounded-lg border px-3">
+      <ul className="divide-y border-y">
         {checks.map((c) => (
           <CheckRow key={c.id} c={c} />
         ))}

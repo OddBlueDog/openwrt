@@ -8,7 +8,10 @@ export const feature = {
   description: 'Blocks addresses known for attacks, and any you choose, at the router.',
   icon: ShieldXIcon,
   group: 'security',
-  order: 30,
+  order: 50,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.BanipPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.BanipPage,
+  ),
 } satisfies Feature;

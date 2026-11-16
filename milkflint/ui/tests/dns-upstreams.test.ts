@@ -64,7 +64,9 @@ test('a custom main server: the backup follows its address’s type', () => {
 });
 
 test('a backup that comes out the same as the main server is left out', () => {
-  assert.deepEqual(proxyServers(cloudflare, 'dot', pick('custom', '', 'tls://one.one.one.one'), 'parallel').upstream, ['tls://one.one.one.one']);
+  assert.deepEqual(proxyServers(cloudflare, 'dot', pick('custom', '', 'tls://one.one.one.one'), 'parallel').upstream, [
+    'tls://one.one.one.one',
+  ]);
 });
 
 test('a backup provider starts on the server that filters like the main one', () => {
@@ -97,7 +99,10 @@ test('backup only when needed warns only about what the backup lets through', ()
 test('a custom server can’t be checked, so the page says to', () => {
   assert.match(filterWarning(pick('custom', '', 'tls://dns.example'), quad9, 'parallel') ?? '', /^Check that both servers/);
   assert.equal(filterWarning(cloudflare, pick('custom', '', 'tls://dns.example'), 'fallback'), undefined);
-  assert.match(filterWarning(pick('cloudflare', 'Family'), pick('custom', '', 'tls://dns.example'), 'fallback') ?? '', /^Check that the custom server blocks/);
+  assert.match(
+    filterWarning(pick('cloudflare', 'Family'), pick('custom', '', 'tls://dns.example'), 'fallback') ?? '',
+    /^Check that the custom server blocks/,
+  );
 });
 
 test('instant answers’ keep time reads dnsproxy’s duration as hours, else its default', () => {
@@ -113,10 +118,15 @@ test('instant answers’ keep time reads dnsproxy’s duration as hours, else it
 });
 
 test('only CleanBrowsing’s servers don’t check DNSSEC', () => {
-  const unchecked = Object.values(providers).flatMap((p) => p.servers.filter((x) => !x.dnssec).map((x) => `${p.label} ${x.name}`));
+  const unchecked = Object.values(providers).flatMap((p) =>
+    p.servers.filter((x) => !x.dnssec).map((x) => `${p.label} ${x.name}`),
+  );
   assert.deepEqual(unchecked, ['CleanBrowsing Security Filter', 'CleanBrowsing Adult Filter', 'CleanBrowsing Family Filter']);
   assert.equal(serverHint(providers.quad9.servers[2]), 'No malware blocking. Checks DNSSEC.');
-  assert.equal(serverHint(providers.cleanbrowsing.servers[0]), 'Blocks phishing, spam and malware domains. Doesn’t check DNSSEC.');
+  assert.equal(
+    serverHint(providers.cleanbrowsing.servers[0]),
+    'Blocks phishing, spam and malware domains. Doesn’t check DNSSEC.',
+  );
 });
 
 test('a server that doesn’t check DNSSEC is warned about, as the main server or the backup', () => {
@@ -131,8 +141,18 @@ test('a server that doesn’t check DNSSEC is warned about, as the main server o
 
 test('plain DNS: one server is all its addresses, two the first of each, the main one’s first', () => {
   assert.deepEqual(plainServers(cloudflare, undefined), ['1.1.1.1', '1.0.0.1', '2606:4700:4700::1111', '2606:4700:4700::1001']);
-  assert.deepEqual(plainServers(cloudflare, pick('google', 'Default')), ['1.1.1.1', '2606:4700:4700::1111', '8.8.8.8', '2001:4860:4860::8888']);
-  assert.deepEqual(plainServers(pick('custom', '', '192.0.2.1, 192.0.2.2'), quad9), ['192.0.2.1', '192.0.2.2', '9.9.9.9', '2620:fe::fe']);
+  assert.deepEqual(plainServers(cloudflare, pick('google', 'Default')), [
+    '1.1.1.1',
+    '2606:4700:4700::1111',
+    '8.8.8.8',
+    '2001:4860:4860::8888',
+  ]);
+  assert.deepEqual(plainServers(pick('custom', '', '192.0.2.1, 192.0.2.2'), quad9), [
+    '192.0.2.1',
+    '192.0.2.2',
+    '9.9.9.9',
+    '2620:fe::fe',
+  ]);
 });
 
 test('a suggested backup filters like the main server and checks DNSSEC', () => {
@@ -150,9 +170,18 @@ test('short names, and the page’s sentence for each setup', () => {
   const google = pick('google', 'Default');
   assert.equal(describe('auto', cloudflare, google, 'parallel'), 'Lookups go to your internet provider’s DNS servers.');
   assert.equal(describe('encrypted', cloudflare, undefined, 'one'), 'Lookups go encrypted to Cloudflare.');
-  assert.equal(describe('encrypted', cloudflare, google, 'parallel'), 'Each lookup goes encrypted to Cloudflare and Google at once; the first answer is used.');
-  assert.equal(describe('encrypted', cloudflare, google, 'fallback'), 'Lookups go encrypted to Cloudflare, and to Google only when Cloudflare fails or is slow.');
-  assert.equal(describe('static', cloudflare, google, 'fallback'), 'Lookups go unencrypted to Cloudflare, and to Google only when Cloudflare doesn’t answer.');
+  assert.equal(
+    describe('encrypted', cloudflare, google, 'parallel'),
+    'Each lookup goes encrypted to Cloudflare and Google at once; the first answer is used.',
+  );
+  assert.equal(
+    describe('encrypted', cloudflare, google, 'fallback'),
+    'Lookups go encrypted to Cloudflare, and to Google only when Cloudflare fails or is slow.',
+  );
+  assert.equal(
+    describe('static', cloudflare, google, 'fallback'),
+    'Lookups go unencrypted to Cloudflare, and to Google only when Cloudflare doesn’t answer.',
+  );
 });
 
 test('the encryption note names a second server that falls back to DNS over HTTPS, only then', () => {

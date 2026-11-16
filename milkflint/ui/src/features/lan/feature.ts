@@ -8,7 +8,10 @@ export const feature = {
   description: "The router's own address, and the addresses it hands out to your devices.",
   icon: NetworkIcon,
   group: 'network',
-  order: 10,
+  order: 30,
   routerOnly: true,
-  page: lazyPage(() => import('./page'), (m) => m.LanPage),
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.LanPage,
+  ),
 } satisfies Feature;

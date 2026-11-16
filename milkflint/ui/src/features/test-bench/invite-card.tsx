@@ -1,8 +1,8 @@
-import { CheckIcon, CopyIcon, QrCodeIcon, RefreshCwIcon } from 'lucide-react';
+import { CheckIcon, CopyIcon, RefreshCwIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
+import { Note } from '@/components/note';
 import { QrCode } from '@/components/qr-code';
-import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { errorMessage } from '@/lib/utils';
@@ -41,19 +41,25 @@ export function InviteCard({
   };
   return (
     <Card>
-      <CardHeading icon={QrCodeIcon} title="Add a device" description="Scan the code with the device's camera, or type the code on the router's sign-in page" />
+      <CardHeading
+        title="Add a device"
+        description="Scan the QR code with the device’s camera, or type the code on the router’s sign-in page"
+      />
       <CardContent className="flex flex-col items-center gap-4">
         <QrCode text={url} label="QR code to join the bench" className="size-44 rounded-lg border sm:size-52" />
         <div className="flex flex-col items-center gap-1">
           <span className="text-xs text-muted-foreground">Code</span>
-          <span className="font-mono text-2xl font-semibold tracking-[0.2em] tabular" aria-label={`Code ${code.split('').join(' ')}`}>
+          <span
+            className="font-mono text-2xl font-semibold tracking-[0.2em] tabular"
+            aria-label={`Code ${code.split('').join(' ')}`}
+          >
             {codeText(code)}
           </span>
         </div>
         {codeDisabled && (
-          <Alert variant="warning">
-            <AlertDescription>Too many wrong codes were tried, so this code no longer works. The QR code still does.</AlertDescription>
-          </Alert>
+          <Note tone="warning" icon={<TriangleAlertIcon />} className="w-full">
+            Too many wrong codes were tried, so this code no longer works. The QR code still does.
+          </Note>
         )}
         <div className="flex w-full min-w-0 items-center gap-2">
           <input
@@ -63,7 +69,7 @@ export function InviteCard({
             onFocus={(e) => {
               e.target.select();
             }}
-            className="h-8 min-w-0 flex-1 rounded-md border bg-muted/40 px-2 font-mono text-[11px] text-muted-foreground"
+            className="h-8 min-w-0 flex-1 rounded-md border bg-muted/40 px-2 font-mono text-xs text-muted-foreground"
           />
           {canCopy && (
             <Button
@@ -84,7 +90,14 @@ export function InviteCard({
           )}
         </div>
         {onNewCode !== undefined && (
-          <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => void renew()} className="text-muted-foreground">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => void renew()}
+            className="text-muted-foreground"
+          >
             <RefreshCwIcon /> New code
           </Button>
         )}

@@ -68,6 +68,8 @@ export interface Wan {
   ipv6: string | undefined;
   /** its gateway: the upstream router, or the provider's */
   gateway: string | undefined;
+  /** how it gets its address: 'static' is a fixed one; DHCP and PPPoE addresses can change */
+  proto?: string | undefined;
 }
 
 export interface ServerData {
@@ -217,13 +219,15 @@ export function validate(f: ServerForm, d: ServerData): Errors {
   const ip = ipToInt(f.address);
   if (ip === undefined) e['address'] = 'An IPv4 address, like 10.42.17.1.';
   else if (!isPrivate(ip)) e['address'] = 'A private address: 10.x.x.x, 172.16–31.x.x or 192.168.x.x.';
-  else if (ip === networkOf(ip, f.prefix) || ip === lastOf(ip, f.prefix)) e['address'] = `Not the first or last address of its /${String(f.prefix)}.`;
+  else if (ip === networkOf(ip, f.prefix) || ip === lastOf(ip, f.prefix))
+    e['address'] = `Not the first or last address of its /${String(f.prefix)}.`;
   else {
     const c = clashes(ip, f.prefix, d);
     if (c !== undefined) e['address'] = `It overlaps ${c === 'your home network' ? c : `the ${c} network`}: pick another.`;
   }
   const endpoint = f.endpoint.trim();
-  if (endpoint !== '' && ipToInt(endpoint) === undefined && !isIpv6(endpoint) && !HOSTNAME.test(endpoint)) e['endpoint'] = 'A hostname (home.example.com) or an address.';
+  if (endpoint !== '' && ipToInt(endpoint) === undefined && !isIpv6(endpoint) && !HOSTNAME.test(endpoint))
+    e['endpoint'] = 'A hostname (home.example.com) or an address.';
   const names = new Set<string>();
   const ips = new Set<number>();
   for (const p of f.peers) {
@@ -232,10 +236,16 @@ export function validate(f: ServerForm, d: ServerData): Errors {
     if (name !== '' && names.has(name)) e[`${at}-name`] = 'Another device has this name.';
     names.add(name);
     const pip = ipToInt(p.ip);
-    if (pip === undefined || ip === undefined || networkOf(pip, f.prefix) !== networkOf(ip, f.prefix) || pip === ip || pip === networkOf(ip, f.prefix) || pip === lastOf(ip, f.prefix)) {
+    if (
+      pip === undefined ||
+      ip === undefined ||
+      networkOf(pip, f.prefix) !== networkOf(ip, f.prefix) ||
+      pip === ip ||
+      pip === networkOf(ip, f.prefix) ||
+      pip === lastOf(ip, f.prefix)
+    ) {
       e[`${at}-ip`] = 'An address in the tunnel’s network.';
-    }
-    else if (ips.has(pip)) e[`${at}-ip`] = 'Another device has this address.';
+    } else if (ips.has(pip)) e[`${at}-ip`] = 'Another device has this address.';
     if (pip !== undefined) ips.add(pip);
     if (!isKey(p.publicKey)) e[`${at}-key`] = 'Its public key isn’t a WireGuard key.';
   }
@@ -264,23 +274,27 @@ export function wanted(f: ServerForm, d: ServerData): Wanted[] {
       config: 'network',
       type: 'interface',
       name: SERVER,
-      values: { proto: 'wireguard', private_key: f.privateKey, listen_port: f.port, addresses: [`${f.address}/${String(f.prefix)}`, ...f.extraAddresses], disabled: on ? undefined : '1' },
+      values: {
+        proto: 'wireguard',
+        private_key: f.privateKey,
+        listen_port: f.port,
+        addresses: [`${f.address}/${String(f.prefix)}`, ...f.extraAddresses],
+        disabled: on ? undefined : '1',
+      },
     },
-    ...f.peers.map(
-      (p): Wanted => ({
-        config: 'network',
-        type: PEER_TYPE,
-        name: p.section,
-        values: {
-          description: p.name.trim() === '' ? undefined : p.name.trim(),
-          public_key: p.publicKey,
-          private_key: p.privateKey === '' ? undefined : p.privateKey,
-          preshared_key: p.presharedKey === '' ? undefined : p.presharedKey,
-          allowed_ips: [`${p.ip}/32`, ...p.otherIps],
-          disabled: p.enabled ? undefined : '1',
-        },
-      }),
-    ),
+    ...f.peers.map((p): Wanted => ({
+      config: 'network',
+      type: PEER_TYPE,
+      name: p.section,
+      values: {
+        description: p.name.trim() === '' ? undefined : p.name.trim(),
+        public_key: p.publicKey,
+        private_key: p.privateKey === '' ? undefined : p.privateKey,
+        preshared_key: p.presharedKey === '' ? undefined : p.presharedKey,
+        allowed_ips: [`${p.ip}/32`, ...p.otherIps],
+        disabled: p.enabled ? undefined : '1',
+      },
+    })),
     {
       config: 'firewall',
       type: 'zone',
@@ -299,7 +313,14 @@ export function wanted(f: ServerForm, d: ServerData): Wanted[] {
       config: 'firewall',
       type: 'rule',
       name: `${SERVER}_port`,
-      values: { name: 'Allow-WireGuard-Remote-Access', src: d.wanZone, proto: 'udp', dest_port: f.port, target: 'ACCEPT', enabled },
+      values: {
+        name: 'Allow-WireGuard-Remote-Access',
+        src: d.wanZone,
+        proto: 'udp',
+        dest_port: f.port,
+        target: 'ACCEPT',
+        enabled,
+      },
     },
     {
       config: 'firewall',
@@ -308,12 +329,15 @@ export function wanted(f: ServerForm, d: ServerData): Wanted[] {
       values: { name: 'Allow-DNS-Remote-Access', src: SERVER, proto: ['tcp', 'udp'], dest_port: '53', target: 'ACCEPT', enabled },
     },
   ];
-  if (f.internet) w.push({ config: 'firewall', type: 'forwarding', name: `${SERVER}_wan`, values: { src: SERVER, dest: d.wanZone, enabled } });
-  if (f.lan) w.push({ config: 'firewall', type: 'forwarding', name: `${SERVER}_lan`, values: { src: SERVER, dest: d.lanZone, enabled } });
+  if (f.internet)
+    w.push({ config: 'firewall', type: 'forwarding', name: `${SERVER}_wan`, values: { src: SERVER, dest: d.wanZone, enabled } });
+  if (f.lan)
+    w.push({ config: 'firewall', type: 'forwarding', name: `${SERVER}_lan`, values: { src: SERVER, dest: d.lanZone, enabled } });
   // the DNS page's: devices that ask another DNS server get the router's answer, as at home
   if (d.dnsIntercept) {
     const add = addIntercept(SERVER);
-    if (add.op === 'add') w.push({ config: 'firewall', type: add.type, name: interceptSection(SERVER), values: { ...add.values, enabled } });
+    if (add.op === 'add')
+      w.push({ config: 'firewall', type: add.type, name: interceptSection(SERVER), values: { ...add.values, enabled } });
   }
   const endpoint = f.endpoint.trim();
   if (endpoint !== '') w.push({ config: 'milkflint', type: 'remote_access', name: SERVER_META, values: { endpoint } });
@@ -351,10 +375,15 @@ export function describe(f: ServerForm, d: ServerData): Line[] {
     },
     {
       ok: f.internet,
-      text: f.internet ? 'Devices that send all their traffic home use the internet through your connection.' : 'Devices can’t use the internet through home.',
+      text: f.internet
+        ? 'Devices that send all their traffic home use the internet through your connection.'
+        : 'Devices can’t use the internet through home.',
     },
     { ok: f.lan, text: f.lan ? 'Devices can reach your home network.' : 'Devices can’t reach your home network.' },
-    { ok: f.admin, text: f.admin ? 'Devices can open this router’s settings and SSH.' : 'Devices can’t open this router’s settings or SSH.' },
+    {
+      ok: f.admin,
+      text: f.admin ? 'Devices can open this router’s settings and SSH.' : 'Devices can’t open this router’s settings or SSH.',
+    },
     { ok: f.between, text: f.between ? 'Devices can reach each other.' : 'Devices can’t reach each other.' },
     {
       ok: true,
@@ -368,8 +397,10 @@ export function describe(f: ServerForm, d: ServerData): Line[] {
 /** What a save did, compared with before, in the past tense. */
 export function summary(before: ServerForm | undefined, after: ServerForm): string[] {
   const out: string[] = [];
-  if (after.enabled && before?.enabled !== true) out.push(`Opened UDP port ${after.port} on the internet side, to the router only.`);
-  if (before?.enabled === true && !after.enabled) out.push(`Closed UDP port ${before.port}: no device can connect until you turn it back on.`);
+  if (after.enabled && before?.enabled !== true)
+    out.push(`Opened UDP port ${after.port} on the internet side, to the router only.`);
+  if (before?.enabled === true && !after.enabled)
+    out.push(`Closed UDP port ${before.port}: no device can connect until you turn it back on.`);
   if (before?.enabled === true && after.enabled && before.port !== after.port) {
     out.push(`Moved the open port from UDP ${before.port} to ${after.port}: every device needs its config again.`);
   }
@@ -381,14 +412,20 @@ export function summary(before: ServerForm | undefined, after: ServerForm): stri
   };
   flag('internet', 'Devices can now use the internet through home.', 'Devices can no longer use the internet through home.');
   flag('lan', 'Devices can now reach your home network.', 'Devices can no longer reach your home network.');
-  flag('admin', 'Devices can now open this router’s settings and SSH.', 'Devices can no longer open this router’s settings or SSH.');
+  flag(
+    'admin',
+    'Devices can now open this router’s settings and SSH.',
+    'Devices can no longer open this router’s settings or SSH.',
+  );
   flag('between', 'Devices can now reach each other.', 'Devices can no longer reach each other.');
   for (const p of after.peers) {
     const old = before?.peers.find((x) => x.section === p.section);
     if (old === undefined) out.push(`Added ${peerLabel(p)}: show its QR code to connect it.`);
-    else if (old.enabled !== p.enabled) out.push(p.enabled ? `${peerLabel(p)} can connect again.` : `Paused ${peerLabel(p)}: it can’t connect.`);
+    else if (old.enabled !== p.enabled)
+      out.push(p.enabled ? `${peerLabel(p)} can connect again.` : `Paused ${peerLabel(p)}: it can’t connect.`);
   }
-  for (const p of before?.peers ?? []) if (!after.peers.some((x) => x.section === p.section)) out.push(`Removed ${peerLabel(p)}: its key no longer works.`);
+  for (const p of before?.peers ?? [])
+    if (!after.peers.some((x) => x.section === p.section)) out.push(`Removed ${peerLabel(p)}: its key no longer works.`);
   if (out.length === 0) out.push('Saved.');
   return out;
 }
@@ -408,7 +445,10 @@ export function endpointHost(f: ServerForm, d: ServerData): string | undefined {
 export function peerConfig(p: PeerForm, f: ServerForm, d: ServerData, everything: boolean): string | undefined {
   const host = endpointHost(f, d);
   if (p.privateKey === '' || d.publicKey === undefined || host === undefined) return undefined;
-  const home = [subnetOf(f.address, f.prefix), ...(d.lan === undefined ? [] : [`${intToIp(d.lan.ip - (d.lan.ip % 2 ** (32 - d.lan.prefix)))}/${String(d.lan.prefix)}`])];
+  const home = [
+    subnetOf(f.address, f.prefix),
+    ...(d.lan === undefined ? [] : [`${intToIp(d.lan.ip - (d.lan.ip % 2 ** (32 - d.lan.prefix)))}/${String(d.lan.prefix)}`]),
+  ];
   return formatConf({
     privateKey: p.privateKey,
     address: `${p.ip}/32`,
@@ -423,6 +463,9 @@ export function peerConfig(p: PeerForm, f: ServerForm, d: ServerData, everything
 
 /** A file name for the config: its device's name, as the apps show it. */
 export function confFileName(p: PeerForm): string {
-  const base = peerLabel(p).replace(/[^A-Za-z0-9_=+.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 15);
+  const base = peerLabel(p)
+    .replace(/[^A-Za-z0-9_=+.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 15);
   return `${base === '' ? 'home' : base}.conf`;
 }

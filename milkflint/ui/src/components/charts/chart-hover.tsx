@@ -59,7 +59,12 @@ export function ChartHover({
       ? []
       : series.map((s) => {
           const i = slot - (slots - s.values.length);
-          return { s, v: i >= 0 ? s.values[i] : undefined, note: i >= 0 ? s.notes?.[i] : undefined, upper: i >= 0 ? s.upper?.[i] : undefined };
+          return {
+            s,
+            v: i >= 0 ? s.values[i] : undefined,
+            note: i >= 0 ? s.notes?.[i] : undefined,
+            upper: i >= 0 ? s.upper?.[i] : undefined,
+          };
         });
   const shown = slot !== undefined && rows.some((r) => r.v !== undefined || r.note !== undefined);
   const x = slot === undefined || slots <= 1 ? 100 : (slot / (slots - 1)) * 100;
@@ -92,7 +97,12 @@ export function ChartHover({
                     <>
                       <span
                         className="pointer-events-none absolute w-0.5 -translate-x-1/2 opacity-50"
-                        style={{ left: `${String(x)}%`, top: `${String(yPct(upper))}%`, height: `${String(yPct(v) - yPct(upper))}%`, background: s.color }}
+                        style={{
+                          left: `${String(x)}%`,
+                          top: `${String(yPct(upper))}%`,
+                          height: `${String(yPct(v) - yPct(upper))}%`,
+                          background: s.color,
+                        }}
                       />
                       <span
                         className="pointer-events-none absolute size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 bg-background"
@@ -115,8 +125,12 @@ export function ChartHover({
             style={{ left: `${String(x)}%`, transform: x > 55 ? 'translateX(calc(-100% - 10px))' : 'translateX(10px)' }}
           >
             {t !== undefined && (
-              <span className="font-mono text-[10px] text-muted-foreground">
-                {formatTime(t, tEnd !== undefined && tPrev !== undefined ? tEnd - tPrev : 60, t0 !== undefined && tEnd !== undefined ? tEnd - t0 : 0)}
+              <span className="text-xs text-muted-foreground tabular">
+                {formatTime(
+                  t,
+                  tEnd !== undefined && tPrev !== undefined ? tEnd - tPrev : 60,
+                  t0 !== undefined && tEnd !== undefined ? tEnd - t0 : 0,
+                )}
               </span>
             )}
             {rows.map(({ s, v, note }) => (
@@ -125,7 +139,9 @@ export function ChartHover({
                 <span className="text-muted-foreground">{s.label}</span>
                 <span className="ml-auto pl-3 font-medium tabular">
                   {v === undefined ? (note ?? '—') : format(v)}
-                  {v !== undefined && note !== undefined && <span className="pl-1.5 font-normal text-muted-foreground">{note}</span>}
+                  {v !== undefined && note !== undefined && (
+                    <span className="pl-1.5 font-normal text-muted-foreground">{note}</span>
+                  )}
                 </span>
               </span>
             ))}

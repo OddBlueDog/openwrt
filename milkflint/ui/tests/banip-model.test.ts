@@ -19,6 +19,7 @@ import {
   feedDirection,
   formatEntry,
   insideConflicts,
+  limitText,
   ipBytes,
   lineOwner,
   memoryCheck,
@@ -32,28 +33,50 @@ import {
   selectionOf,
   serviceOf,
   summarize,
+  turnOnText,
   withDirection,
   withPreset,
 } from '../src/features/banip/model.ts';
-import { checkValue, ITEMS, MILKFLINT, needsRestart, type OptionName, OPTIONS, type Options, optionChanges } from '../src/features/banip/options.ts';
+import {
+  checkValue,
+  ITEMS,
+  MILKFLINT,
+  needsRestart,
+  type OptionName,
+  OPTIONS,
+  type Options,
+  optionChanges,
+} from '../src/features/banip/options.ts';
 
-const routerSpec = JSON.parse(readFileSync(new URL('../../../package/milkflint/milkflint-ui/files/features/banip/bin/banip-options.json', import.meta.url), 'utf8')) as {
+const routerSpec = JSON.parse(
+  readFileSync(
+    new URL('../../../package/milkflint/milkflint-ui/files/features/banip/bin/banip-options.json', import.meta.url),
+    'utf8',
+  ),
+) as {
   options: Record<string, Record<string, unknown>>;
   items: Record<string, string>;
   milkflint: Record<string, Record<string, unknown>>;
 };
-const routerMeta = JSON.parse(readFileSync(new URL('../../../package/milkflint/milkflint-ui/files/features/banip/bin/banip-meta.json', import.meta.url), 'utf8')) as Meta;
+const routerMeta = JSON.parse(
+  readFileSync(
+    new URL('../../../package/milkflint/milkflint-ui/files/features/banip/bin/banip-meta.json', import.meta.url),
+    'utf8',
+  ),
+) as Meta;
 
 test('the page’s option spec is the router’s, option by option', () => {
   assert.deepEqual(Object.keys(OPTIONS).sort(), Object.keys(routerSpec.options).sort());
   for (const [name, o] of Object.entries(routerSpec.options)) {
     const mine = OPTIONS[name as OptionName] as unknown as Record<string, unknown>;
-    for (const k of ['type', 'default', 'min', 'max', 'values', 'pattern', 'item', 'apply', 'refetch', 'check']) assert.deepEqual(mine[k], o[k], `${name}.${k}`);
+    for (const k of ['type', 'default', 'min', 'max', 'values', 'pattern', 'item', 'apply', 'refetch', 'check'])
+      assert.deepEqual(mine[k], o[k], `${name}.${k}`);
   }
   assert.deepEqual(ITEMS, routerSpec.items);
   for (const [name, o] of Object.entries(routerSpec.milkflint)) {
     const mine = MILKFLINT[name as keyof typeof MILKFLINT] as unknown as Record<string, unknown>;
-    for (const k of ['type', 'default', 'min', 'max', 'values', 'pattern']) assert.deepEqual(mine[k], o[k], `milkflint.${name}.${k}`);
+    for (const k of ['type', 'default', 'min', 'max', 'values', 'pattern'])
+      assert.deepEqual(mine[k], o[k], `milkflint.${name}.${k}`);
   }
 });
 
@@ -171,7 +194,11 @@ test('the memory a selection needs: what’s kept, and the biggest lists loading
   assert.equal(estimate(selectionOf({ ban_feed: ['country'], ban_region: ['RIPE'] }, regions), meta, {}, 1).entries, 20000);
   assert.equal(estimate(selectionOf({ ban_feed: ['asn'], ban_asn: ['1', '2'] }, regions), meta, {}, 1).entries, 2000);
   // IPv4 only: no IPv6 sets
-  assert.equal(estimate(selectionOf({ ban_feed: ['debl'], ban_autodetect: '0', ban_protov4: '1', ban_protov6: '0' }, new Map()), meta, {}, 1).entries, 20000);
+  assert.equal(
+    estimate(selectionOf({ ban_feed: ['debl'], ban_autodetect: '0', ban_protov4: '1', ban_protov6: '0' }, new Map()), meta, {}, 1)
+      .entries,
+    20000,
+  );
 });
 
 test('the memory guard: what stays free while loading, against a reserve of 15 % (96 MB at least)', () => {
@@ -216,7 +243,11 @@ test('list lines as banIP reads them', () => {
     assert.equal(e.kind, 'invalid', bad);
     assert.equal(e.reason, why, bad);
   }
-  const s = summarize(['1.2.3.4', '10.0.0.0/8', 'aa:bb:cc:dd:ee:ff', 'x.org', 'bad!', '192.168.1.0/24  # milkflint: inside network lan'].map(parseEntry));
+  const s = summarize(
+    ['1.2.3.4', '10.0.0.0/8', 'aa:bb:cc:dd:ee:ff', 'x.org', 'bad!', '192.168.1.0/24  # milkflint: inside network lan'].map(
+      parseEntry,
+    ),
+  );
   assert.deepEqual(s, { addresses: 1, networks: 2, devices: 1, names: 1, problems: 1, managed: 1 });
   assert.equal(formatEntry('1.2.3.4', 'why'), `${'1.2.3.4'.padEnd(45)}# why`);
   assert.equal(lineOwner('uplink added on 2026-01-01 00:00:00'), 'uplink');
@@ -241,7 +272,10 @@ test('addresses: bytes, networks and whether they overlap; blocklist lines on yo
     { iface: 'lan', net: '192.168.1.0/24' },
     { iface: 'lan', net: 'fdbe:e6c4:3cc5::/60' },
   ];
-  const hits = insideConflicts(['192.168.1.20', '8.8.8.8', '192.168.0.0/16', 'fdbe:e6c4:3cc5:1::5', 'example.com'].map(parseEntry), inside);
+  const hits = insideConflicts(
+    ['192.168.1.20', '8.8.8.8', '192.168.0.0/16', 'fdbe:e6c4:3cc5:1::5', 'example.com'].map(parseEntry),
+    inside,
+  );
   assert.deepEqual(
     hits.map((h) => h.value),
     ['192.168.1.20', '192.168.0.0/16', 'fdbe:e6c4:3cc5:1::5'],
@@ -293,11 +327,18 @@ const drop = (over: Partial<Drop>): Drop => ({
 });
 
 test('drops in words: which way, the address outside, the service', () => {
-  assert.deepEqual(describeDrop(drop({})), { direction: 'From your network', outside: '1.32.128.1', inside: '192.168.1.159', service: 'web (TCP 80)' });
+  assert.deepEqual(describeDrop(drop({})), {
+    direction: 'From your network',
+    outside: '1.32.128.1',
+    inside: '192.168.1.159',
+    service: 'web (TCP 80)',
+  });
   assert.equal(serviceOf(drop({ proto: 'icmp', sport: '8', dport: '0' })), 'ping');
   assert.equal(serviceOf(drop({ proto: 'udp', dport: '51820' })), 'WireGuard (UDP 51820)');
   assert.equal(serviceOf(drop({ proto: 'tcp', dport: '6000' })), 'TCP 6000');
-  const knock = describeDrop(drop({ dir: 'in', policy: 'drop', in: 'eth1', out: '', src: '203.0.113.9', dst: '10.0.2.15', dport: '22' }));
+  const knock = describeDrop(
+    drop({ dir: 'in', policy: 'drop', in: 'eth1', out: '', src: '203.0.113.9', dst: '10.0.2.15', dport: '22' }),
+  );
   assert.deepEqual(knock, { direction: 'To the router', outside: '203.0.113.9', inside: null, service: 'SSH (TCP 22)' });
   assert.equal(describeDrop(drop({ dir: 'in', out: 'br-lan', src: '203.0.113.9', dst: '192.168.1.5' })).direction, 'To a device');
   assert.equal(describeDrop(drop({ dir: 'pre', kind: 'syn', src: '203.0.113.9' })).direction, 'SYN flood');
@@ -329,7 +370,15 @@ test('countries, the day of drops, the schedule', () => {
 });
 
 test('a list of your own: banIP’s checks of its fields', () => {
-  const f: FeedForm = { name: 'mylist', descr: 'my own list', url_4: 'https://example.org/l.txt', url_6: '', rule: 'feed 1', chain: 'in', flag: '' };
+  const f: FeedForm = {
+    name: 'mylist',
+    descr: 'my own list',
+    url_4: 'https://example.org/l.txt',
+    url_6: '',
+    rule: 'feed 1',
+    chain: 'in',
+    flag: '',
+  };
   assert.deepEqual(checkFeedForm(f, ['debl'], false), {});
   assert.deepEqual(definitionOf(f), { url_4: 'https://example.org/l.txt', rule: 'feed 1', chain: 'in', descr: 'my own list' });
   assert.ok(checkFeedForm({ ...f, name: 'debl' }, ['debl'], false).name !== undefined);
@@ -342,4 +391,24 @@ test('a list of your own: banIP’s checks of its fields', () => {
   assert.ok(checkFeedForm({ ...f, flag: 'gz tcp udp 80 443' }, [], false).flag === undefined);
   assert.ok(checkFeedForm({ ...f, flag: 'gz; reboot' }, [], false).flag !== undefined);
   assert.ok(checkFeedForm({ ...f, descr: 'a "quote"' }, [], false).descr !== undefined);
+});
+
+test('while off, the page says what turning banIP on starts', () => {
+  // nothing chosen: the switch starts the Recommended lists
+  assert.match(turnOnText(true), /Recommended lists/);
+  assert.match(turnOnText(false), /chosen under Protection/);
+  for (const t of [turnOnText(true), turnOnText(false)]) {
+    assert.match(t, /memory/);
+    // no figures in the page's words
+    assert.doesNotMatch(t, /\d/);
+  }
+});
+
+test('a list limited to some ports says so in words', () => {
+  const l = portLimit('tcp udp 5060');
+  assert.ok(l !== null);
+  assert.equal(limitText(l), 'TCP and UDP ports 5060');
+  const web = portLimit('tcp 80 443');
+  assert.ok(web !== null);
+  assert.equal(limitText(web), 'TCP ports 80, 443 (web)');
 });

@@ -72,7 +72,13 @@ function receivedFrom(records: readonly RunRecord[], partner: string): Set<numbe
  * reached x, the echoes x sent that didn't reach y. Undefined unless both
  * ends said which probes they got: without that every probe looks lost.
  */
-export function directionLoss(xRecs: readonly RunRecord[], yRecs: readonly RunRecord[], x: string, y: string, ws?: readonly Window[]): Loss | undefined {
+export function directionLoss(
+  xRecs: readonly RunRecord[],
+  yRecs: readonly RunRecord[],
+  x: string,
+  y: string,
+  ws?: readonly Window[],
+): Loss | undefined {
   const atY = receivedFrom(yRecs, x);
   const atX = receivedFrom(xRecs, y);
   if (atY === undefined || atX === undefined) return undefined;
@@ -105,7 +111,11 @@ export interface LinkStatus {
   b: LinkDiag | undefined;
 }
 
-function lastPeer(records: readonly RunRecord[], partner: string, kind: 'p' | 'b'): { event: string; diag: LinkDiag; open: LinkDiag | undefined } | undefined {
+function lastPeer(
+  records: readonly RunRecord[],
+  partner: string,
+  kind: 'p' | 'b',
+): { event: string; diag: LinkDiag; open: LinkDiag | undefined } | undefined {
   let last: { event: string; diag: LinkDiag; open: LinkDiag | undefined } | undefined;
   let open: LinkDiag | undefined;
   for (const r of records) {
@@ -116,13 +126,28 @@ function lastPeer(records: readonly RunRecord[], partner: string, kind: 'p' | 'b
   return last === undefined ? undefined : { ...last, open };
 }
 
-export function linkStatus(aRecs: readonly RunRecord[], bRecs: readonly RunRecord[], a: string, b: string, kind: 'p' | 'b'): LinkStatus {
+export function linkStatus(
+  aRecs: readonly RunRecord[],
+  bRecs: readonly RunRecord[],
+  a: string,
+  b: string,
+  kind: 'p' | 'b',
+): LinkStatus {
   const la = lastPeer(aRecs, b, kind);
   const lb = lastPeer(bRecs, a, kind);
-  const opens = [la?.open, lb?.open].filter((d): d is LinkDiag => d !== undefined).sort((x, y) => Number(y.offerer) - Number(x.offerer));
+  const opens = [la?.open, lb?.open]
+    .filter((d): d is LinkDiag => d !== undefined)
+    .sort((x, y) => Number(y.offerer) - Number(x.offerer));
   const first = opens[0];
   const dropped = first !== undefined && (la?.event === 'fail' || lb?.event === 'fail');
-  return { opened: first !== undefined, dropped, ms: first?.ms, path: opens.find((d) => d.path !== null)?.path ?? null, a: la?.diag, b: lb?.diag };
+  return {
+    opened: first !== undefined,
+    dropped,
+    ms: first?.ms,
+    path: opens.find((d) => d.path !== null)?.path ?? null,
+    a: la?.diag,
+    b: lb?.diag,
+  };
 }
 
 export interface DirectionResult {
@@ -152,7 +177,12 @@ export interface PairResult {
 }
 
 /** Each planned pair's figures, from both ends' records. */
-export function pairResults(t0: number, end: number, phases: readonly Phase[], records: ReadonlyMap<string, readonly RunRecord[]>): PairResult[] {
+export function pairResults(
+  t0: number,
+  end: number,
+  phases: readonly Phase[],
+  records: ReadonlyMap<string, readonly RunRecord[]>,
+): PairResult[] {
   const windows = phaseWindows(t0, phases)
     .filter((w) => w.from < end)
     .map((w) => ({ ...w, to: Math.min(w.to, end) }));
@@ -165,7 +195,11 @@ export function pairResults(t0: number, end: number, phases: readonly Phase[], r
     };
     const quiet = windows.filter((w) => w.phase.kind === 'idle' || w.phase.kind === 'cooldown' || w.phase.kind === 'connect');
     const direction = (from: string, to: string): DirectionResult => {
-      const ws = windows.filter((w) => between(w) && (w.phase.dir === 'both' || (w.phase.dir === 'ba' ? w.phase.pair?.[1] === from : w.phase.pair?.[0] === from)));
+      const ws = windows.filter(
+        (w) =>
+          between(w) &&
+          (w.phase.dir === 'both' || (w.phase.dir === 'ba' ? w.phase.pair?.[1] === from : w.phase.pair?.[0] === from)),
+      );
       const [rf, rt] = from === a ? [ra, rb] : [rb, ra];
       return {
         from,
@@ -185,7 +219,10 @@ export function pairResults(t0: number, end: number, phases: readonly Phase[], r
       quiet: rttStats(quiet.length === 0 ? [] : [...peerRtts(ra, b, quiet), ...peerRtts(rb, a, quiet)]),
       ab: direction(a, b),
       ba: direction(b, a),
-      loss: { ab: directionLoss(ra, rb, a, b, [{ from: t0, to: end }]), ba: directionLoss(rb, ra, b, a, [{ from: t0, to: end }]) },
+      loss: {
+        ab: directionLoss(ra, rb, a, b, [{ from: t0, to: end }]),
+        ba: directionLoss(rb, ra, b, a, [{ from: t0, to: end }]),
+      },
     };
   });
 }

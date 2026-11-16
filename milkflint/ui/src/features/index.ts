@@ -19,18 +19,21 @@ import { feature as logs } from './logs/feature';
 import { feature as mode } from './mode/feature';
 import { feature as networkQuality } from './network-quality/feature';
 import { feature as radarScan } from './radar-scan/feature';
+import { feature as portForwards } from './port-forwards/feature';
 import { feature as remoteAccess } from './remote-access/feature';
 import { feature as schedules } from './schedules/feature';
 import { feature as sqm } from './sqm/feature';
 import { feature as systemOverview } from './system-overview/feature';
 import { feature as testBench } from './test-bench/feature';
+import { feature as themes } from './themes/feature';
 import { feature as time } from './time/feature';
 import { feature as tuning } from './tuning/feature';
 import type { RouterMode } from '@/lib/router-mode';
-import type { Feature, Group } from './types';
+import type { Band, Feature, Group } from './types';
 import { feature as upgrade } from './upgrade/feature';
 import { feature as upnp } from './upnp/feature';
 import { feature as vpnClient } from './vpn-client/feature';
+import { feature as wifiDriver } from './wifi-driver/feature';
 import { feature as wifiGuest } from './wifi-guest/feature';
 import { feature as wifiScan } from './wifi-scan/feature';
 import { feature as wifi } from './wifi/feature';
@@ -54,7 +57,9 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   'data-statistics': dataStatistics,
   sqm,
   tuning,
+  'wifi-driver': wifiDriver,
   firewall,
+  'port-forwards': portForwards,
   adguardhome,
   banip,
   upnp,
@@ -66,6 +71,7 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   schedules,
   logs,
   'backup-reset': backupReset,
+  themes,
 };
 
 export function featureById(id: FeatureId): Feature {
@@ -75,15 +81,18 @@ export function featureById(id: FeatureId): Feature {
 const all: readonly Feature[] = Object.values(byId);
 
 /** Top-level entries, in menu order. */
-export const topLevel: readonly Feature[] = all.filter((f) => f.group === undefined).sort((a, b) => a.order - b.order);
+const listed = all.filter((f) => f.inMenu !== false);
+
+export const topLevel: readonly Feature[] = listed.filter((f) => f.group === undefined).sort((a, b) => a.order - b.order);
 
 /** Groups that have pages, each with its pages in menu order. */
 export const menuGroups: readonly (Group & { features: readonly Feature[] })[] = groups
-  .map((g) => ({ ...g, features: all.filter((f) => f.group === g.id).sort((a, b) => a.order - b.order) }))
+  .map((g) => ({ ...g, features: listed.filter((f) => f.group === g.id).sort((a, b) => a.order - b.order) }))
   .filter((g) => g.features.length > 0)
   .sort((a, b) => a.order - b.order);
 
-export type MenuEntry = { kind: 'page'; feature: Feature } | { kind: 'group'; group: (typeof menuGroups)[number] };
+export type MenuGroup = (typeof menuGroups)[number];
+export type MenuEntry = { kind: 'page'; feature: Feature } | { kind: 'group'; group: MenuGroup };
 
 /** The whole menu: top-level pages and groups, by their shared order. */
 export const menu: readonly MenuEntry[] = [
@@ -100,4 +109,20 @@ const accessPointMenu: readonly MenuEntry[] = menu.flatMap((entry): MenuEntry[] 
 
 export function menuFor(routerMode: RouterMode | undefined): readonly MenuEntry[] {
   return routerMode === 'ap' ? accessPointMenu : menu;
+}
+
+/** A menu entry's band; top-level pages (Home, Internet) are everyday ones. */
+export function bandOf(entry: MenuEntry): Band {
+  return entry.kind === 'group' ? entry.group.band : 'everyday';
+}
+
+/** The menu split into its bands, in order, empty bands left out. */
+export function menuBands(entries: readonly MenuEntry[]): readonly { band: Band; entries: readonly MenuEntry[] }[] {
+  const order: readonly Band[] = ['everyday', 'setup', 'router'];
+  return order.map((band) => ({ band, entries: entries.filter((e) => bandOf(e) === band) })).filter((b) => b.entries.length > 0);
+}
+
+/** The group a page is in, if any. */
+export function groupOf(feature: Feature): Group | undefined {
+  return groups.find((g) => g.id === feature.group);
 }

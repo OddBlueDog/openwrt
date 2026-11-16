@@ -4,10 +4,13 @@ import type { Feature } from '../types';
 
 export const feature = {
   id: 'admin-password',
-  title: 'Admin Password',
-  description: 'The password for this page, LuCI and SSH.',
+  title: 'Router access',
+  description: 'The admin password for these pages, LuCI and SSH, and HTTPS with its certificate.',
   icon: KeyRoundIcon,
-  group: 'system',
-  order: 15,
-  page: lazyPage(() => import('./page'), (m) => m.AdminPasswordPage),
+  group: 'security',
+  order: 60,
+  page: lazyPage(
+    () => import('./page'),
+    (m) => m.RouterAccessPage,
+  ),
 } satisfies Feature;

@@ -50,7 +50,12 @@ export type Change =
  * Set, or unset (undefined), options of one named section: adds the section
  * if it's missing, and deletes it when nothing would be left in it.
  */
-export function sectionChanges(config: string, sections: Section[], name: string, options: Record<string, string | undefined>): Change[] {
+export function sectionChanges(
+  config: string,
+  sections: Section[],
+  name: string,
+  options: Record<string, string | undefined>,
+): Change[] {
   const s = sections.find((x) => x['.name'] === name);
   const values: Record<string, string> = {};
   const unset: string[] = [];
@@ -63,7 +68,9 @@ export function sectionChanges(config: string, sections: Section[], name: string
   }
   const changes: Change[] = [];
   if (Object.keys(values).length > 0) {
-    changes.push(s === undefined ? { op: 'add', config, type: name, name, values } : { op: 'set', config, section: name, values });
+    changes.push(
+      s === undefined ? { op: 'add', config, type: name, name, values } : { op: 'set', config, section: name, values },
+    );
   }
   if (unset.length > 0) {
     const kept = Object.keys(s ?? {}).filter((k) => !k.startsWith('.') && !unset.includes(k));

@@ -1,13 +1,20 @@
 // Airtime fairness on each band now: who is using the air, what the policy
 // makes of each device's link and the share it gives it, and the last minute.
-// Its switch is in each band's settings.
+// Its switches are above it, on the Wi-Fi driver page's Airtime fairness card.
 import { useWed } from '../tuning/use-wed';
 import { WedNotice } from '../tuning/wed-notice';
-import { HourglassIcon, MoonIcon, ScaleIcon, SignalHighIcon, SignalIcon, SignalLowIcon, SignalMediumIcon, SignalZeroIcon } from 'lucide-react';
+import {
+  HourglassIcon,
+  MoonIcon,
+  SignalHighIcon,
+  SignalIcon,
+  SignalLowIcon,
+  SignalMediumIcon,
+  SignalZeroIcon,
+} from 'lucide-react';
 import { type ReactElement, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { usePoll } from '@/hooks/use-poll';
 import { type AirtimeDevice, type AirtimeRadio, describeRate, getAirtime } from '@/lib/api/wireless';
 import { formatBitrate, formatDuration, formatPercent } from '@/lib/format';
@@ -58,9 +65,9 @@ const fill = airtimeFill;
 
 /** A name on a segment: the lighter of the theme's two text colours on the amber, the page's background on the rest */
 const onFill: Record<AirtimeClass, string> = {
-  full: 'text-background',
-  slow: 'text-background dark:text-foreground',
-  weak: 'text-background',
+  full: 'text-primary-foreground',
+  slow: 'text-warning-foreground',
+  weak: 'text-destructive-foreground',
   lost: 'text-background',
 };
 
@@ -75,7 +82,8 @@ const track: Record<AirtimeClass, string> = {
   lost: 'bg-foreground/15',
 };
 
-const heading = 'text-xs font-medium tracking-wide text-muted-foreground uppercase';
+/** A part of a band's panel: a subhead at body size */
+const heading = 'text-sm font-semibold';
 
 function bandLabel(band: string): string {
   return band === '2g' ? '2.4 GHz' : band === '5g' ? '5 GHz' : band === '6g' ? '6 GHz' : band;
@@ -146,9 +154,19 @@ function AirBar({
             }}
           >
             {/* the 2px to its right is the gap to the next segment */}
-            <div className={cn('mr-0.5 flex h-full items-center rounded-[3px]', s.kind === 'device' ? fill[s.device.class] : otherFill)}>
+            <div
+              className={cn(
+                'mr-0.5 flex h-full items-center rounded-[3px]',
+                s.kind === 'device' ? fill[s.device.class] : otherFill,
+              )}
+            >
               {s.kind === 'device' && (
-                <span className={cn('hidden min-w-0 truncate px-1.5 text-[11px] leading-4 font-medium @min-[6rem]:block', onFill[s.device.class])}>
+                <span
+                  className={cn(
+                    'hidden min-w-0 truncate px-1.5 text-xs leading-4 font-medium @min-[6rem]:block',
+                    onFill[s.device.class],
+                  )}
+                >
                   {s.label}
                 </span>
               )}
@@ -185,14 +203,17 @@ function Legend({
           <li key={cls} className="flex items-center gap-1.5" title={applied ? airtimeClassHint(cls, pacing) : undefined}>
             <span className={cn('size-2.5 shrink-0 rounded-[3px]', fill[cls])} aria-hidden />
             {AIRTIME_CLASS_LABELS[cls]}
-            <span className="tabular text-foreground">{percent(byClass[cls])}</span>
+            <span className="text-foreground tabular">{percent(byClass[cls])}</span>
           </li>
         ))}
       {rest.map((s) => (
         <li key={s.key} className="flex items-center gap-1.5">
-          <span className={cn('size-2.5 shrink-0 rounded-[3px]', s.kind === 'other' ? otherFill : 'border bg-muted')} aria-hidden />
+          <span
+            className={cn('size-2.5 shrink-0 rounded-[3px]', s.kind === 'other' ? otherFill : 'border bg-muted')}
+            aria-hidden
+          />
           {s.label}
-          <span className="tabular text-foreground">{percent(s.share)}</span>
+          <span className="text-foreground tabular">{percent(s.share)}</span>
         </li>
       ))}
     </ul>
@@ -204,7 +225,11 @@ function ClassBadge({ cls, paced, applied }: { cls: AirtimeClass; paced: boolean
   const label = airtimeLabel(cls, paced);
   if (!applied) {
     return (
-      <Badge variant="outline" className="border-dashed font-normal text-muted-foreground" title="What the policy would make of its link. It’s off on this band.">
+      <Badge
+        variant="outline"
+        className="border-dashed font-normal text-muted-foreground"
+        title="What the policy would make of its link. It’s off on this band."
+      >
         {label}
       </Badge>
     );
@@ -268,7 +293,9 @@ function DeviceRow({
   // on, only what the router says it did; off, what the policy would do,
   // where it could do anything
   const applying =
-    d.narrowed || d.pace > 0 ? airtimeDoing(d.class, true, { tries: d.tries, pace: d.pace, aim: d.aim, competing: competing ?? undefined }) : undefined;
+    d.narrowed || d.pace > 0
+      ? airtimeDoing(d.class, true, { tries: d.tries, pace: d.pace, aim: d.aim, competing: competing ?? undefined })
+      : undefined;
   // with auto, how the driver's pacing differs from its share
   const trimmed = applied ? airtimeTrimWords(d.pace, d.aim) : undefined;
   const doing = applied ? applying : possible ? airtimeDoing(d.class, false, { wouldPace: d.paced && pacing }) : undefined;
@@ -309,7 +336,10 @@ function DeviceRow({
             )}
             <ClassBadge cls={d.class} paced={d.paced} applied={applied} />
             {d.asleep > 0.5 && (
-              <span className="flex items-center gap-1 text-xs text-muted-foreground" title="In power save for most of the last second">
+              <span
+                className="flex items-center gap-1 text-xs text-muted-foreground"
+                title="In power save for most of the last second"
+              >
                 <MoonIcon className="size-3" aria-hidden />
                 asleep
               </span>
@@ -372,7 +402,10 @@ function DeviceRow({
           className={cn('h-1.5 overflow-hidden rounded-full', applied ? track[d.class] : 'bg-muted')}
         >
           <div
-            className={cn('h-full rounded-full transition-[width] duration-500 motion-reduce:transition-none', applied ? fill[d.class] : 'bg-muted-foreground/40')}
+            className={cn(
+              'h-full rounded-full transition-[width] duration-500 motion-reduce:transition-none',
+              applied ? fill[d.class] : 'bg-muted-foreground/40',
+            )}
             style={{ width: `${String(airtimeWeightPart(d.weight) * 100)}%` }}
           />
         </div>
@@ -380,7 +413,7 @@ function DeviceRow({
       </div>
       <div className="order-2 flex flex-col items-end @min-[36rem]:order-none">
         <span className="text-sm font-semibold tabular">{percent(airtimeShare(d))}</span>
-        <span className="text-[11px] leading-tight text-muted-foreground">of the air</span>
+        <span className="text-xs leading-tight text-muted-foreground">of the air</span>
       </div>
     </li>
   );
@@ -389,10 +422,20 @@ function DeviceRow({
 /** The strip's scale at one of its sides: all of the air at the top, down to a quarter */
 function StripMarks({ side }: { side: 'left' | 'right' }): ReactElement {
   return (
-    <div aria-hidden className={cn('relative w-8 shrink-0 text-[10px] leading-none text-muted-foreground tabular', side === 'left' ? 'text-right' : 'text-left')}>
+    <div
+      aria-hidden
+      className={cn(
+        'relative w-8 shrink-0 text-xs leading-none text-muted-foreground tabular',
+        side === 'left' ? 'text-right' : 'text-left',
+      )}
+    >
       {AIRTIME_STRIP_MARKS.map((mark) => (
         // the top one hangs from the strip's edge, the others are centred on their line
-        <span key={mark} className={cn('absolute inset-x-0', mark < 1 && '-translate-y-1/2')} style={{ top: `${String((1 - mark) * 100)}%` }}>
+        <span
+          key={mark}
+          className={cn('absolute inset-x-0', mark < 1 && '-translate-y-1/2')}
+          style={{ top: `${String((1 - mark) * 100)}%` }}
+        >
           {formatPercent(mark)}
         </span>
       ))}
@@ -416,15 +459,25 @@ function LastMinute({ band, history, now }: { band: string; history: AirtimeRadi
   const column = pointed === undefined ? undefined : columns[pointed];
   const second = column?.second;
   // a gap within the history: the router didn't measure that second
-  const gap = column !== undefined && second === undefined && history.length > 0 && column.t > Math.round(history[0]?.t ?? Infinity);
+  const gap =
+    column !== undefined && second === undefined && history.length > 0 && column.t > Math.round(history[0]?.t ?? Infinity);
   const parts = second === undefined ? [] : airtimeSecondParts(second);
   // How far along the strip the pointed column is, in percent. The breakdown
   // sits above it and is shifted left by as much of its own width, so it
   // stays within the strip at either end.
   const along = pointed === undefined ? 0 : ((pointed + 0.5) / SECONDS) * 100;
+  // nothing took the air: say so rather than draw an empty frame
+  const idle = peak < 0.005 && !columns.some((c) => (c.second?.other ?? 0) >= 0.005);
+  if (idle)
+    return (
+      <div className="flex flex-col gap-1.5">
+        <h5 className={heading}>The last minute</h5>
+        <p className="text-sm text-muted-foreground">No traffic on this band in the last minute.</p>
+      </div>
+    );
   return (
     <div className="flex flex-col gap-1.5">
-      <h4 className={heading}>The last minute</h4>
+      <h5 className={heading}>The last minute</h5>
       <div className="flex gap-1.5">
         <StripMarks side="left" />
         <div className="relative min-w-0 flex-1">
@@ -437,19 +490,33 @@ function LastMinute({ band, history, now }: { band: string; history: AirtimeRadi
             }}
           >
             {AIRTIME_STRIP_MARKS.filter((mark) => mark < 1).map((mark) => (
-              <div key={mark} aria-hidden className="pointer-events-none absolute inset-x-0 border-t border-foreground/10" style={{ bottom: `${String(mark * 100)}%` }} />
+              <div
+                key={mark}
+                aria-hidden
+                className="pointer-events-none absolute inset-x-0 border-t border-foreground/10"
+                style={{ bottom: `${String(mark * 100)}%` }}
+              />
             ))}
             {columns.map(({ second: s }, i) => (
               <div
                 key={i}
-                className={cn('relative flex h-full min-w-0 flex-1 flex-col-reverse', pointed === i && (s !== undefined || gap) && 'bg-foreground/10')}
+                className={cn(
+                  'relative flex h-full min-w-0 flex-1 flex-col-reverse',
+                  pointed === i && (s !== undefined || gap) && 'bg-foreground/10',
+                )}
                 onPointerEnter={() => {
                   setPointed(i);
                 }}
               >
                 {s !== undefined &&
                   AIRTIME_CLASSES.map((cls) =>
-                    s[cls] > 0 ? <div key={cls} className={cn('shrink-0', fill[cls])} style={{ height: `${String(Math.min(1, s[cls]) * 100)}%` }} /> : null,
+                    s[cls] > 0 ? (
+                      <div
+                        key={cls}
+                        className={cn('shrink-0', fill[cls])}
+                        style={{ height: `${String(Math.min(1, s[cls]) * 100)}%` }}
+                      />
+                    ) : null,
                   )}
                 {/* on top of the band's own devices, as in the bar of the air right now */}
                 {s !== undefined && s.other !== null && s.other > 0 && (
@@ -469,11 +536,21 @@ function LastMinute({ band, history, now }: { band: string; history: AirtimeRadi
                 {parts.map((part) => (
                   <li key={part.key} className="flex items-center gap-1.5">
                     <span
-                      className={cn('size-2 shrink-0 rounded-[2px]', part.key === 'other' ? otherFill : part.key === 'free' ? 'border bg-muted' : fill[part.key])}
+                      className={cn(
+                        'size-2 shrink-0 rounded-[2px]',
+                        part.key === 'other' ? otherFill : part.key === 'free' ? 'border bg-muted' : fill[part.key],
+                      )}
                       aria-hidden
                     />
                     {part.label}
-                    <span className="ml-auto pl-4 tabular" title={part.share === null ? 'The channel wasn’t measured that second: it’s only measured while this page is open.' : undefined}>
+                    <span
+                      className="ml-auto pl-4 tabular"
+                      title={
+                        part.share === null
+                          ? 'The channel wasn’t measured that second: it’s only measured while this page is open.'
+                          : undefined
+                      }
+                    >
                       {part.share === null ? '–' : percent(part.share)}
                     </span>
                   </li>
@@ -485,7 +562,7 @@ function LastMinute({ band, history, now }: { band: string; history: AirtimeRadi
         <StripMarks side="right" />
       </div>
       {/* in line with the strip: past each side's marks and the gap to them */}
-      <div className="flex justify-between px-[2.375rem] text-[11px] text-muted-foreground">
+      <div className="flex justify-between px-[2.375rem] text-xs text-muted-foreground">
         <span>A minute ago</span>
         <span>Now</span>
       </div>
@@ -513,29 +590,32 @@ function RadioPanel({ radio, now }: { radio: AirtimeRadio; now: number }): React
   const strength = airtimeStrengthOf(radio.auto);
 
   return (
-    <div className="@container flex flex-col gap-4 rounded-lg border bg-background/60 p-3">
+    // one band's part of the card, between hairlines: no box of its own
+    <div className="@container flex flex-col gap-4 py-5 first:pt-0 last:pb-0">
       <div className="flex flex-col gap-1.5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
           <div className="flex flex-wrap items-baseline gap-x-2">
-            <h3 className="text-sm font-medium">{band}</h3>
+            <h4 className="text-sm font-semibold">{band}</h4>
             {channels !== undefined && <span className="text-xs text-muted-foreground">{channels}</span>}
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {/* with the policy on and the driver able to pace: how the shares of the devices held back are set */}
-            {applied && radio.pacing && strength !== undefined && <Badge variant="outline">{AIRTIME_AUTO_LABELS[strength]}</Badge>}
+            {applied && radio.pacing && strength !== undefined && (
+              <Badge variant="outline">{AIRTIME_AUTO_LABELS[strength]}</Badge>
+            )}
             <Badge variant={applied ? 'success' : 'outline'}>{AIRTIME_STATE_LABELS[state]}</Badge>
           </div>
         </div>
         {state === 'watching' && (
           <p className="text-xs text-muted-foreground">
-            The policy is off on this band, so the router’s own airtime fairness applies: an equal share for every busy device, however slow its link. Each
-            device’s class is what the policy would make of its link.
+            The policy is off on this band, so the router’s own airtime fairness applies: an equal share for every busy device,
+            however slow its link. Each device’s class is what the policy would make of its link.
           </p>
         )}
         {state === 'unsupported' && (
           <p className="text-xs text-muted-foreground">
-            The policy is on for this band, but this radio’s driver doesn’t share the air by weight, so there is nothing for it to set. Each device’s class is
-            what the policy makes of its link.
+            The policy is on for this band, but this radio’s driver doesn’t share the air by weight, so there is nothing for it to
+            set. Each device’s class is what the policy makes of its link.
           </p>
         )}
       </div>
@@ -545,7 +625,7 @@ function RadioPanel({ radio, now }: { radio: AirtimeRadio; now: number }): React
       {(radio.devices.length > 0 || radio.busy !== null) && (
         <div className="flex flex-col gap-2">
           <div className="flex items-baseline justify-between gap-2">
-            <h4 className={heading}>The air right now</h4>
+            <h5 className={heading}>The air right now</h5>
             <span className="text-xs text-muted-foreground tabular">
               {radio.busy === null ? `${percent(Math.min(1, ours))} used by this band’s devices` : `${percent(1 - free)} in use`}
             </span>
@@ -557,7 +637,7 @@ function RadioPanel({ radio, now }: { radio: AirtimeRadio; now: number }): React
 
       {radio.devices.length > 0 && (
         <div className="flex flex-col gap-1">
-          <h4 className={heading}>Devices, most airtime first</h4>
+          <h5 className={heading}>Devices, most airtime first</h5>
           <ul className="flex flex-col divide-y">
             {listed.map((d) => (
               <DeviceRow
@@ -593,47 +673,42 @@ function RadioPanel({ radio, now }: { radio: AirtimeRadio; now: number }): React
   );
 }
 
-export function AirtimeCard({ className }: { className?: string }): ReactElement | null {
+/**
+ * Who is using the air on each band, second by second: what the policy makes
+ * of each device's link and the share it gives it, and the last minute. For
+ * the Airtime fairness card on the Wi-Fi driver page, under its settings.
+ */
+export function AirtimeLive(): ReactElement {
   const { data } = usePoll(getAirtime, POLL_MS);
   // hardware offloading with WED: what it forwards passes the policy by
   const wed = useWed();
-  if (data === undefined || (data.running && data.radios.length === 0)) return null;
   const order = (band: string): number => ['2g', '5g', '6g'].indexOf(band);
-  const radios = [...data.radios].sort((a, b) => order(a.band) - order(b.band));
+  const radios = [...(data?.radios ?? [])].sort((a, b) => order(a.band) - order(b.band));
 
   return (
-    <Card className={className}>
-      <CardHeader className="items-center">
-        <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-          <ScaleIcon className="size-4" />
+    <div className="@container flex flex-col gap-4">
+      {wed.on && (
+        <WedNotice title="Hardware offloading (WED) passes most of this by">
+          The Wi-Fi chip sends the connections WED forwards its own way: a device’s share, queue limit, tries and pacing reach
+          only what still goes through the router’s software. With WED on the policy also can’t tell delivered frames from failed
+          ones, so it judges a link by its rate alone.
+        </WedNotice>
+      )}
+      {data === undefined ? (
+        <p className="text-sm text-muted-foreground">Reading the air…</p>
+      ) : !data.running ? (
+        <p className="text-sm text-muted-foreground">
+          Nothing to show yet: the measuring has only just started, or the airtime service isn’t running.
+        </p>
+      ) : radios.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No band is on air.</p>
+      ) : (
+        <div className="flex flex-col divide-y">
+          {radios.map((r) => (
+            <RadioPanel key={r.phy} radio={r} now={data.now} />
+          ))}
         </div>
-        <div className="flex flex-col gap-1">
-          <CardTitle className="text-base">Airtime fairness</CardTitle>
-          <CardDescription>
-            Who is using the air on each band, second by second. With a band’s policy on (the switch is in its settings), a device with a poor link gets a
-            smaller share while others want the air, and the slowest are held back for part of the time while a device with a good link has traffic waiting. A
-            link is judged by its useful rate: the rate the router sends to the device at, times the share of its frames that get through.
-          </CardDescription>
-        </div>
-      </CardHeader>
-      <CardContent className="@container flex flex-col gap-4">
-        {wed.on && (
-          <WedNotice title="Hardware offloading (WED) passes most of this by">
-            The Wi-Fi chip sends the connections WED forwards its own way: a device’s share, queue limit, tries and pacing reach only what
-            still goes through the router’s software. With WED on the policy also can’t tell delivered frames from failed ones, so it judges
-            a link by its rate alone.
-          </WedNotice>
-        )}
-        {!data.running ? (
-          <p className="text-sm text-muted-foreground">Nothing to show yet: the measuring has only just started, or the airtime service isn’t running.</p>
-        ) : (
-          <div className={cn('grid gap-4', radios.length > 1 && '@min-[80rem]:grid-cols-2')}>
-            {radios.map((r) => (
-              <RadioPanel key={r.phy} radio={r} now={data.now} />
-            ))}
-          </div>
-        )}
-      </CardContent>
-    </Card>
+      )}
+    </div>
   );
 }

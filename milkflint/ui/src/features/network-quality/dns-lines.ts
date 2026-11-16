@@ -54,7 +54,12 @@ export function dnsLines<P>(
   const seen = (k: string): boolean => points.some((p) => servers(p)?.[k] !== undefined);
   const lines: DnsLine[] = keys
     .filter((k) => order.includes(k) || seen(k))
-    .map((k) => ({ key: k, label: providerName(k) ?? k, current: order.includes(k), values: points.map((p) => servers(p)?.[k] ?? undefined) }));
+    .map((k) => ({
+      key: k,
+      label: providerName(k) ?? k,
+      current: order.includes(k),
+      values: points.map((p) => servers(p)?.[k] ?? undefined),
+    }));
   if (points.some((p) => servers(p) === undefined && single(p) !== null && single(p) !== undefined)) {
     lines.push({
       key: '',

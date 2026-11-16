@@ -147,7 +147,11 @@ function ChipView({ chip }: { chip: Chip }): ReactElement {
   return (
     <div
       title={chip.hint}
-      className={cn('flex min-w-0 items-center gap-2 rounded-md border px-2 py-1 text-xs', toneClass[chip.tone], chip.idle === true && 'opacity-55')}
+      className={cn(
+        'flex min-w-0 items-center gap-2 rounded-md border px-2 py-1 text-xs',
+        toneClass[chip.tone],
+        chip.idle === true && 'opacity-55',
+      )}
     >
       <Icon className="size-3.5 shrink-0" />
       <span className="font-medium whitespace-nowrap">{chip.title}</span>
@@ -160,7 +164,10 @@ function LoadBar({ busy, network }: { busy: number | undefined; network: number 
   return (
     <div className="flex h-2 overflow-hidden rounded-full bg-muted">
       <div className="h-full bg-chart-2 transition-all duration-500" style={{ width: `${String((network ?? 0) * 100)}%` }} />
-      <div className="h-full bg-chart-1/70 transition-all duration-500" style={{ width: `${String(((busy ?? 0) - (network ?? 0)) * 100)}%` }} />
+      <div
+        className="h-full bg-chart-1/70 transition-all duration-500"
+        style={{ width: `${String(((busy ?? 0) - (network ?? 0)) * 100)}%` }}
+      />
     </div>
   );
 }
@@ -183,7 +190,7 @@ export function RssTable({ live }: { live: NetworkLive }): ReactElement | null {
             <div
               key={ring}
               className={cn(
-                'flex min-w-0 items-center justify-center text-[11px] font-medium tabular',
+                'flex min-w-0 items-center justify-center text-xs font-medium tabular',
                 ring === 0 ? 'bg-muted text-muted-foreground' : 'bg-chart-3/20 text-chart-3',
               )}
               style={{ flexGrow: n }}
@@ -204,13 +211,14 @@ export function RssTable({ live }: { live: NetworkLive }): ReactElement | null {
 export function CpuLanes({ live }: { live: NetworkLive }): ReactElement {
   const { perCpu, shared, sharedCpus } = lanes(live);
   return (
-    <div className="flex flex-col gap-2">
+    // a lane per CPU as hairline-divided rows: no boxes inside the card that holds them
+    <div className="flex flex-col divide-y">
       {live.cpus.map((c, i) => (
-        <div key={c.cpu} className="grid gap-2 rounded-lg border bg-background/60 p-2.5 sm:grid-cols-[7.5rem_1fr] sm:items-center">
+        <div key={c.cpu} className="grid gap-2 py-2.5 first:pt-0 sm:grid-cols-[7.5rem_1fr] sm:items-center">
           <div className="flex flex-col gap-1">
             <div className="flex items-baseline justify-between gap-2 text-sm">
               <span className="font-medium">CPU {c.cpu}</span>
-              <span className="text-xs tabular text-muted-foreground">{c.busy === undefined ? '—' : formatPercent(c.busy)}</span>
+              <span className="text-xs text-muted-foreground tabular">{c.busy === undefined ? '—' : formatPercent(c.busy)}</span>
             </div>
             <LoadBar busy={c.busy} network={c.network} />
           </div>
@@ -224,7 +232,7 @@ export function CpuLanes({ live }: { live: NetworkLive }): ReactElement {
         </div>
       ))}
       {shared.length > 0 && (
-        <div className="grid gap-2 rounded-lg border border-dashed p-2.5 sm:grid-cols-[7.5rem_1fr] sm:items-center">
+        <div className="grid gap-2 py-2.5 sm:grid-cols-[7.5rem_1fr] sm:items-center">
           <div className="flex flex-col text-sm">
             <span className="font-medium">Shared</span>
             <span className="text-xs text-muted-foreground">{sharedCpus.length > 0 ? cpuText(sharedCpus) : 'any CPU'}</span>
@@ -236,7 +244,7 @@ export function CpuLanes({ live }: { live: NetworkLive }): ReactElement {
           </div>
         </div>
       )}
-      <div className="flex flex-wrap gap-x-4 gap-y-1 pt-1 text-xs text-muted-foreground">
+      <div className="flex flex-wrap gap-x-4 gap-y-1 pt-2.5 text-xs text-muted-foreground">
         <span className="flex items-center gap-1.5">
           <span className="size-2 rounded-full bg-chart-2" /> Network work (forwarding, NAT, CAKE)
         </span>

@@ -25,6 +25,15 @@ export function useRoute(): Route {
   return useSyncExternalStore(subscribe, current);
 }
 
+/** The first part of the hash as written, route or not (for development-only pages). */
+function rawName(): string {
+  return window.location.hash.replace(/^#\/?/, '').split('/')[0] ?? '';
+}
+
+export function useRawRoute(): string {
+  return useSyncExternalStore(subscribe, rawName);
+}
+
 /** What follows the route's id: "join/abc" for #/test-bench/join/abc. */
 function subPath(): string {
   return window.location.hash.replace(/^#\/?/, '').split('/').slice(1).join('/');

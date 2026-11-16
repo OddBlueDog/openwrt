@@ -137,7 +137,10 @@ export function platformLabel(): string {
 
 /** The session's gone (the bench closed, rpcd restarted, a long sleep): rejoining with the key may still work. */
 function sessionGone(err: unknown): boolean {
-  return (err instanceof UbusError && err.code === UbusStatus.permissionDenied) || (err instanceof BenchError && err.message === 'not a member');
+  return (
+    (err instanceof UbusError && err.code === UbusStatus.permissionDenied) ||
+    (err instanceof BenchError && err.message === 'not a member')
+  );
 }
 
 const visible = (): boolean => typeof document === 'undefined' || document.visibilityState === 'visible';
@@ -362,7 +365,11 @@ export class BenchMember {
     const since = performance.now() - this.lastSync;
     if (this.runActive() ? since > SYNC_RUN_MS : since > SYNC_IDLE_MS) await this.syncBurst(this.runActive() ? SYNC_RUN : 2);
     this.schedule(
-      this.peers?.negotiating === true ? SIGNAL_POLL_MS : visible() || this.runActive() || this.abort !== undefined ? POLL_MS : HIDDEN_POLL_MS,
+      this.peers?.negotiating === true
+        ? SIGNAL_POLL_MS
+        : visible() || this.runActive() || this.abort !== undefined
+          ? POLL_MS
+          : HIDDEN_POLL_MS,
     );
   }
 
@@ -453,15 +460,21 @@ export class BenchMember {
     }
     s.phases.forEach((p, i) => {
       this.phaseTimers.push(
-        setTimeout(() => {
-          this.enterPhase(r, s, i);
-        }, at(r.t0 + p.start)),
+        setTimeout(
+          () => {
+            this.enterPhase(r, s, i);
+          },
+          at(r.t0 + p.start),
+        ),
       );
       // each phase's loads stop at its end, whatever else happens
       this.phaseTimers.push(
-        setTimeout(() => {
-          this.stopLoads();
-        }, at(r.t0 + p.start + p.dur)),
+        setTimeout(
+          () => {
+            this.stopLoads();
+          },
+          at(r.t0 + p.start + p.dur),
+        ),
       );
       // what still isn't connected when a connect phase ends goes on record, with what this side saw
       if (p.kind === 'connect' && this.peers !== undefined) {
@@ -476,9 +489,12 @@ export class BenchMember {
       }
     });
     this.phaseTimers.push(
-      setTimeout(() => {
-        this.endPart('completed');
-      }, at(r.t0 + s.length)),
+      setTimeout(
+        () => {
+          this.endPart('completed');
+        },
+        at(r.t0 + s.length),
+      ),
     );
   }
 

@@ -3,7 +3,7 @@
 // conditions that include or exclude ("!" in fw4), and the section as it
 // will be in /etc/config/firewall before saving. Options it doesn't show
 // stay as they are.
-import { BanIcon, CheckIcon, EarOffIcon, PlusIcon, TriangleAlertIcon, XIcon } from 'lucide-react';
+import { BanIcon, CheckIcon, EarOffIcon, PlusIcon, Trash2Icon, TriangleAlertIcon, XIcon } from 'lucide-react';
 import { type KeyboardEvent, type ReactElement, useId, useState } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -226,14 +226,20 @@ function validate(f: SheetForm, cfg: FirewallConfig): Errors {
     const all = [...v.include, ...v.exclude];
     const bad = all.find((x) => !c.check(x));
     if (bad !== undefined) e[c.key] = `“${bad}” doesn’t fit here.`;
-    else if ((c.key === 'dest_port' || c.key === 'src_port') && all.length > 0 && !portsApply(f.proto)) e[c.key] = 'Ports need TCP or UDP (or SCTP) as the protocol.';
+    else if ((c.key === 'dest_port' || c.key === 'src_port') && all.length > 0 && !portsApply(f.proto))
+      e[c.key] = 'Ports need TCP or UDP (or SCTP) as the protocol.';
     else if (c.key === 'icmp_type' && all.length > 0 && !icmpApplies(f.proto)) e[c.key] = 'ICMP types need icmp as the protocol.';
-    else if (f.family !== 'any' && (c.key === 'src_ip' || c.key === 'dest_ip') && all.some((a) => a.includes(':') !== (f.family === 'ipv6'))) {
+    else if (
+      f.family !== 'any' &&
+      (c.key === 'src_ip' || c.key === 'dest_ip') &&
+      all.some((a) => a.includes(':') !== (f.family === 'ipv6'))
+    ) {
       e[c.key] = `Only ${f.family === 'ipv4' ? 'IPv4' : 'IPv6'} addresses: the rule is for that only.`;
     }
   }
   if (!f.openAll && opensEverything(f, cfg) !== undefined) e.open = 'Add the ports it needs, or tick to open every port.';
-  if (f.limit.trim() !== '' && !/^\d+\/(s|sec|second|m|min|minute|h|hour|d|day)$/i.test(f.limit.trim())) e.limit = 'A rate like 10/second or 100/minute.';
+  if (f.limit.trim() !== '' && !/^\d+\/(s|sec|second|m|min|minute|h|hour|d|day)$/i.test(f.limit.trim()))
+    e.limit = 'A rate like 10/second or 100/minute.';
   else if (f.limitBurst.trim() !== '' && !/^\d+$/.test(f.limitBurst.trim())) e.limit = 'The burst is a number of packets.';
   const log = logPrefixError(f.log, f.name);
   if (log !== undefined) e.log = log;
@@ -289,7 +295,7 @@ function TokenInput({
           <span
             key={v}
             className={cn(
-              'inline-flex items-center gap-1 rounded border bg-muted px-1.5 py-0.5 font-mono text-xs',
+              'rounded inline-flex items-center gap-1 border bg-muted px-1.5 py-0.5 font-mono text-xs',
               bad && 'border-destructive/50 bg-destructive/10 text-destructive',
             )}
           >
@@ -338,7 +344,19 @@ function TokenInput({
   );
 }
 
-function PathSelect({ id, value, onChange, options, label }: { id: string; value: string; onChange: (v: string) => void; options: readonly { value: string; label: string }[]; label: string }): ReactElement {
+function PathSelect({
+  id,
+  value,
+  onChange,
+  options,
+  label,
+}: {
+  id: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: readonly { value: string; label: string }[];
+  label: string;
+}): ReactElement {
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger id={id} aria-label={label} className="w-auto min-w-36">
@@ -391,12 +409,15 @@ export function RuleSheet({
   data,
   onClose,
   onSave,
+  onDelete,
 }: {
   rule: Rule | undefined;
   preset: RulePreset | undefined;
   data: FirewallData;
   onClose: () => void;
   onSave: (changes: Change[]) => void;
+  /** asks first, then deletes the rule (an existing one only) */
+  onDelete?: (() => void) | undefined;
 }): ReactElement {
   const id = useId();
   const section = rule === undefined ? undefined : data.sections.find((s) => s['.name'] === rule.section);
@@ -437,7 +458,9 @@ export function RuleSheet({
         <div className="border-b px-6 pt-4">
           <SheetTitle className="pr-8">{rule === undefined ? 'New rule' : (rule.name ?? rule.label)}</SheetTitle>
           <SheetDescription id={`${id}-desc`} className="mt-0.5 text-xs">
-            {rule !== undefined && isBuiltIn(rule) ? builtInRules[rule.name ?? ''] : 'A traffic rule: the first in its chain that matches decides.'}
+            {rule !== undefined && isBuiltIn(rule)
+              ? builtInRules[rule.name ?? '']
+              : 'A traffic rule: the first in its chain that matches decides.'}
           </SheetDescription>
           <div role="tablist" aria-label="Rule" className="mt-3 flex gap-5">
             {tabs.map((t) => (
@@ -453,7 +476,9 @@ export function RuleSheet({
                 }}
                 className={cn(
                   '-mb-px flex items-center gap-1.5 border-b-2 pb-2 text-sm transition-colors',
-                  tab === t.id ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground',
+                  tab === t.id
+                    ? 'border-primary font-medium text-foreground'
+                    : 'border-transparent text-muted-foreground hover:text-foreground',
                 )}
               >
                 {t.label}
@@ -571,7 +596,9 @@ export function RuleSheet({
                 <div className="flex flex-col gap-3 border-t pt-5">
                   <div>
                     <h3 className="text-sm font-semibold">Conditions</h3>
-                    <p className="text-xs text-muted-foreground">Several values in one condition are alternatives; every condition must hold.</p>
+                    <p className="text-xs text-muted-foreground">
+                      Several values in one condition are alternatives; every condition must hold.
+                    </p>
                   </div>
                   {conditions
                     .filter((c) => f.conds[c.key] !== undefined)
@@ -601,7 +628,13 @@ export function RuleSheet({
                             values={v.include}
                             placeholder={c.placeholder}
                             check={c.check}
-                            suggestions={c.key === 'src_mac' ? deviceSuggestions : c.key === 'icmp_type' ? icmpTypes.map((t) => ({ value: t })) : []}
+                            suggestions={
+                              c.key === 'src_mac'
+                                ? deviceSuggestions
+                                : c.key === 'icmp_type'
+                                  ? icmpTypes.map((t) => ({ value: t }))
+                                  : []
+                            }
                             onChange={(include) => {
                               setCond(c.key, { ...v, include });
                             }}
@@ -624,7 +657,7 @@ export function RuleSheet({
                           ) : (
                             <button
                               type="button"
-                              className="flex w-fit items-center gap-1 text-xs font-medium text-primary hover:underline"
+                              className="flex w-fit items-center gap-1 text-xs font-medium link"
                               onClick={() => {
                                 setCond(c.key, { ...v, excluding: true });
                               }}
@@ -669,9 +702,11 @@ export function RuleSheet({
                 {open !== undefined && (
                   <Alert variant="destructive">
                     <TriangleAlertIcon />
-                    <AlertTitle>Every port is open</AlertTitle>
+                    {/* nothing is open yet: say what saving would do, and ask for a second thought */}
+                    <AlertTitle>Saving this opens every port</AlertTitle>
                     <AlertDescription>
-                      This lets {open.from} reach every port on {open.to}. Add the ports it needs as a condition (or the addresses it comes from).
+                      If you save this rule, {open.from} can reach every port on {open.to}. Please reconsider: add the ports it
+                      needs as a condition (or the addresses it comes from).
                       <label className="mt-1 flex items-center gap-2 text-foreground">
                         <input
                           type="checkbox"
@@ -680,7 +715,7 @@ export function RuleSheet({
                             set('openAll', e.target.checked);
                           }}
                         />
-                        Open every port anyway
+                        Save it with every port open anyway
                       </label>
                     </AlertDescription>
                   </Alert>
@@ -701,8 +736,20 @@ export function RuleSheet({
                       }}
                       options={[
                         { value: 'ACCEPT', label: 'accept', icon: CheckIcon, tone: 'allow', hint: 'Let it through.' },
-                        { value: 'REJECT', label: 'reject', icon: BanIcon, tone: 'block', hint: 'Block it with a reply: the sender knows at once.' },
-                        { value: 'DROP', label: 'drop', icon: EarOffIcon, tone: 'block', hint: 'Block it silently: the sender waits, then gives up.' },
+                        {
+                          value: 'REJECT',
+                          label: 'reject',
+                          icon: BanIcon,
+                          tone: 'block',
+                          hint: 'Block it with a reply: the sender knows at once.',
+                        },
+                        {
+                          value: 'DROP',
+                          label: 'drop',
+                          icon: EarOffIcon,
+                          tone: 'block',
+                          hint: 'Block it silently: the sender waits, then gives up.',
+                        },
                       ]}
                     />
                   ) : (
@@ -716,7 +763,7 @@ export function RuleSheet({
                   <div className="flex flex-wrap items-center gap-2">
                     <Input
                       id={`${id}-limit`}
-                      className="w-40 font-mono"
+                      className="w-40 tabular"
                       value={f.limit}
                       placeholder="No limit"
                       aria-invalid={errors.limit !== undefined}
@@ -727,7 +774,7 @@ export function RuleSheet({
                     <span className="text-xs text-muted-foreground">burst</span>
                     <Input
                       aria-label="Burst"
-                      className="w-24 font-mono"
+                      className="w-24 tabular"
                       value={f.limitBurst}
                       placeholder="5"
                       disabled={f.limit.trim() === ''}
@@ -809,11 +856,22 @@ export function RuleSheet({
             <UciPreview type="rule" original={section} changes={changes} />
           </div>
         </div>
-        <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
-          <p className="text-xs text-muted-foreground">
-            {Object.keys(errors).length > 0 ? 'Fix what’s marked to save.' : changes.length === 0 ? 'No changes yet.' : `${String(changes.length)} change${changes.length === 1 ? '' : 's'} to apply.`}
-          </p>
-          <div className="flex gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t px-6 py-3">
+          <div className="flex items-center gap-3">
+            {rule !== undefined && onDelete !== undefined && (
+              <Button variant="ghost" className="-ml-2 text-destructive hover:text-destructive" onClick={onDelete}>
+                <Trash2Icon /> Delete
+              </Button>
+            )}
+            <p className="text-xs text-muted-foreground">
+              {Object.keys(errors).length > 0
+                ? 'Fix what’s marked to save.'
+                : changes.length === 0
+                  ? 'No changes yet.'
+                  : `${String(changes.length)} change${changes.length === 1 ? '' : 's'} to apply.`}
+            </p>
+          </div>
+          <div className="ml-auto flex gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>

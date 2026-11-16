@@ -52,7 +52,11 @@ export function sectionChanges(w: Wanted, section: Section | undefined): Change[
  * The changes from what `present` (config -> its sections) has to `wanted`;
  * sections in `owned` that aren't wanted any more are deleted.
  */
-export function reconcile(wanted: readonly Wanted[], owned: readonly Owned[], present: Readonly<Record<string, readonly Section[] | undefined>>): Change[] {
+export function reconcile(
+  wanted: readonly Wanted[],
+  owned: readonly Owned[],
+  present: Readonly<Record<string, readonly Section[] | undefined>>,
+): Change[] {
   const find = (config: string, name: string): Section | undefined => present[config]?.find((s) => s['.name'] === name);
   const changes = wanted.flatMap((w) => sectionChanges(w, find(w.config, w.name)));
   for (const o of owned) {
@@ -64,7 +68,10 @@ export function reconcile(wanted: readonly Wanted[], owned: readonly Owned[], pr
 }
 
 /** A wanted section's name already taken by a section of another type (made in LuCI, say). */
-export function nameClashes(wanted: readonly Wanted[], present: Readonly<Record<string, readonly Section[] | undefined>>): Wanted[] {
+export function nameClashes(
+  wanted: readonly Wanted[],
+  present: Readonly<Record<string, readonly Section[] | undefined>>,
+): Wanted[] {
   return wanted.filter((w) => {
     const s = present[w.config]?.find((x) => x['.name'] === w.name);
     return s !== undefined && s['.type'] !== w.type;

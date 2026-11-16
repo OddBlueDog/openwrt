@@ -7,7 +7,18 @@ import { bandOf, getAccessPoints, stationSnr } from '@/lib/api/wireless';
 import { interceptOn } from '../dns/intercept';
 import { type FirewallConfig, lanZone, parseFirewall, wanZone } from '../firewall/model';
 import { defaultGuestLabel, GUEST_IDS, type GuestId, guestBridge, isGuestIface, isGuestNetwork } from './guest';
-import { type Access, type Creds, credsOf, freeAddress, generateKey, type GuestData, type NetData, PREFIX, type Radio, type Range } from './model';
+import {
+  type Access,
+  type Creds,
+  credsOf,
+  freeAddress,
+  generateKey,
+  type GuestData,
+  type NetData,
+  PREFIX,
+  type Radio,
+  type Range,
+} from './model';
 
 function firstAddress(s: Section | undefined): { ip: string; prefix: number } | undefined {
   const raw = list(s, 'ipaddr')[0];
@@ -25,7 +36,8 @@ function accessOf(id: GuestId, cfg: FirewallConfig): Access {
   const zone = cfg.zones.find((z) => z.name === id && z.enabled);
   const lan = lanZone(cfg)?.name ?? 'lan';
   const wan = wanZone(cfg)?.name ?? 'wan';
-  const reaches = (from: string, to: string): boolean => cfg.defaults.forward === 'ACCEPT' || cfg.forwardings.some((f) => f.enabled && f.src === from && f.dest === to);
+  const reaches = (from: string, to: string): boolean =>
+    cfg.defaults.forward === 'ACCEPT' || cfg.forwardings.some((f) => f.enabled && f.src === from && f.dest === to);
   return {
     internet: reaches(id, wan),
     lan: reaches(id, lan),
@@ -37,7 +49,9 @@ function accessOf(id: GuestId, cfg: FirewallConfig): Access {
 }
 
 function sameCreds(a: Creds, b: Creds): boolean {
-  return a.ssid === b.ssid && a.encryption === b.encryption && a.cipher === b.cipher && (a.encryption === 'none' || a.key === b.key);
+  return (
+    a.ssid === b.ssid && a.encryption === b.encryption && a.cipher === b.cipher && (a.encryption === 'none' || a.key === b.key)
+  );
 }
 
 export async function loadGuest(): Promise<GuestData> {
@@ -53,7 +67,11 @@ export async function loadGuest(): Promise<GuestData> {
   const isAp = (s: Section): boolean => s['.type'] === 'wifi-iface' && (str(s, 'mode') ?? 'ap') === 'ap';
   // as on Radios & SSIDs: a radio that's off with no access point (unused, or lent to something else) isn't offered
   const radios = wireless
-    .filter((s) => s['.type'] === 'wifi-device' && (!bool(s, 'disabled') || wireless.some((i) => isAp(i) && str(i, 'device') === s['.name'])))
+    .filter(
+      (s) =>
+        s['.type'] === 'wifi-device' &&
+        (!bool(s, 'disabled') || wireless.some((i) => isAp(i) && str(i, 'device') === s['.name'])),
+    )
     .map((s): Radio => ({ name: s['.name'], band: str(s, 'band') ?? '', on: !bool(s, 'disabled') }))
     .sort((a, b) => ['2g', '5g', '6g'].indexOf(a.band) - ['2g', '5g', '6g'].indexOf(b.band));
   const mainAps = wireless.filter((s) => isAp(s) && !isGuestIface(s));
@@ -85,11 +103,13 @@ export async function loadGuest(): Promise<GuestData> {
     const device = network.find((s) => s['.type'] === 'device' && str(s, 'name') === bridge);
     const pool = dhcp.find((s) => s['.type'] === 'dhcp' && str(s, 'interface') === id);
     const zone = firewall.find((s) => s['.type'] === 'zone' && str(s, 'name') === id);
-    if (guestAps.length === 0 && iface === undefined && device === undefined && pool === undefined && zone === undefined) return [];
+    if (guestAps.length === 0 && iface === undefined && device === undefined && pool === undefined && zone === undefined)
+      return [];
     const meta = milkflint.find((s) => s['.type'] === 'guest_network' && s['.name'] === id);
     const addr = firstAddress(iface);
     // on its bridge the egress is what its devices download, the ingress what they upload
-    const shaper = sqm === undefined ? undefined : (sqm.find((s) => s['.type'] === 'queue' && str(s, 'interface') === bridge) ?? null);
+    const shaper =
+      sqm === undefined ? undefined : (sqm.find((s) => s['.type'] === 'queue' && str(s, 'interface') === bridge) ?? null);
     const limited = shaper !== undefined && shaper !== null && bool(shaper, 'enabled');
     const mbit = (option: string): string => {
       const kbit = Number(str(shaper ?? undefined, option) ?? '0');
@@ -122,7 +142,9 @@ export async function loadGuest(): Promise<GuestData> {
           label: str(meta, 'label') ?? defaultGuestLabel(id),
           enabled,
           // while it's off every access point is, so it goes back on the bands it has one on
-          bands: Object.fromEntries(radios.map((r) => [r.name, aps[r.name] !== undefined && (!enabled || !bool(aps[r.name], 'disabled'))])),
+          bands: Object.fromEntries(
+            radios.map((r) => [r.name, aps[r.name] !== undefined && (!enabled || !bool(aps[r.name], 'disabled'))]),
+          ),
           same: Object.values(aps).every((s) => sameCreds(credsOf(s, shared), shared)),
           shared,
           own,
@@ -130,7 +152,8 @@ export async function loadGuest(): Promise<GuestData> {
           ipaddr: addr?.ip ?? '',
           downMbit: mbit('upload'),
           upMbit: mbit('download'),
-          leasetime: str(pool, 'leasetime') ?? '1h',
+          // a pool without one has OpenWrt's default; a new pool is made with the page's
+          leasetime: pool === undefined ? '1h' : (str(pool, 'leasetime') ?? '12h'),
         },
       },
     ];
@@ -149,7 +172,11 @@ export async function loadGuest(): Promise<GuestData> {
   };
   // one with no address yet (its interface deleted in LuCI) gets a free range again
   for (const n of nets) {
-    if (n.form.ipaddr === '' && !n.addressFixed) n.form.ipaddr = freeAddress(data, nets.filter((o) => o !== n).map((o) => o.form));
+    if (n.form.ipaddr === '' && !n.addressFixed)
+      n.form.ipaddr = freeAddress(
+        data,
+        nets.filter((o) => o !== n).map((o) => o.form),
+      );
   }
   return data;
 }
@@ -167,23 +194,30 @@ export interface Guest {
 
 /** The devices connected to a guest network now, strongest first. */
 export async function loadGuests(id: GuestId): Promise<Guest[]> {
+  return (await loadAllGuests())[id];
+}
+
+/** The devices connected to each guest network now, strongest first: one look at the access points for all of them. */
+export async function loadAllGuests(): Promise<Record<GuestId, Guest[]>> {
   const [aps, leases] = await Promise.all([getAccessPoints(), getLeases().catch(() => [])]);
   const byMac = new Map(leases.map((l) => [l.macaddr.toLowerCase(), l]));
-  return aps
-    .filter((ap) => ap.networks.includes(id))
-    .flatMap((ap) =>
-      ap.stations.map((s): Guest => {
-        const lease = byMac.get(s.mac.toLowerCase());
-        return {
-          mac: s.mac.toLowerCase(),
-          name: lease?.hostname,
-          ip: lease?.ipaddr,
-          band: bandOf(ap.info?.frequency),
-          signal: s.signal_avg ?? s.signal,
-          snr: stationSnr(s, ap.info?.noise),
-          connected: s.connected_time,
-        };
-      }),
-    )
-    .sort((a, b) => (b.signal ?? -200) - (a.signal ?? -200));
+  const of = (id: GuestId): Guest[] =>
+    aps
+      .filter((ap) => ap.networks.includes(id))
+      .flatMap((ap) =>
+        ap.stations.map((s): Guest => {
+          const lease = byMac.get(s.mac.toLowerCase());
+          return {
+            mac: s.mac.toLowerCase(),
+            name: lease?.hostname,
+            ip: lease?.ipaddr,
+            band: bandOf(ap.info?.frequency),
+            signal: s.signal_avg ?? s.signal,
+            snr: stationSnr(s, ap.info?.noise),
+            connected: s.connected_time,
+          };
+        }),
+      )
+      .sort((a, b) => (b.signal ?? -200) - (a.signal ?? -200));
+  return { guest: of('guest'), guest2: of('guest2'), guest3: of('guest3') };
 }
