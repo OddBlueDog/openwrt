@@ -15,6 +15,7 @@
 		"ban_triggerdelay": { "type": "int", "default": "20", "min": 1, "max": 300, "apply": "restart" },
 		"ban_fetchretry": { "type": "int", "default": "5", "min": 1, "max": 99, "apply": "restart" },
 		"ban_fetchinsecure": { "type": "bool", "default": "0", "apply": "restart" },
+		"ban_authkey": { "type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$", "apply": "restart" },
 		"ban_nftcount": { "type": "bool", "default": "0", "apply": "restart" },
 		"ban_nicelimit": { "type": "int", "default": "0", "min": -20, "max": 19, "apply": "restart" },
 		"ban_filelimit": { "type": "int", "default": "1024", "min": 64, "max": 65536, "apply": "restart" },

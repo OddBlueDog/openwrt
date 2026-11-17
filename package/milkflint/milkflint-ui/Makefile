@@ -29,6 +29,7 @@ define Package/milkflint-ui/conffiles
 /etc/config/milkflint
 /etc/milkflint/adguardhome.key
 /etc/milkflint/banip-feeds.json
+/etc/milkflint/home.json
 /etc/milkflint/themes.json
 endef
 

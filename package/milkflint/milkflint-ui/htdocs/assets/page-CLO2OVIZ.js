@@ -1,0 +1,1 @@
+import{i as e,t}from"./react-DB-4Zxce.js";import{S as n}from"./index-BfzJW3aF.js";var r=e(t(),1);function i(){return(0,r.useEffect)(()=>{window.location.replace(`${n(`admin-password`)}/https`)},[]),null}export{i as HttpsPage};

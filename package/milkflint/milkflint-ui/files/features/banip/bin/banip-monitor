@@ -209,6 +209,9 @@ function on_banip(t, level, msg) {
 		run_result(m[1], 'unknown');
 	else if ((m = match(msg, /^skip feed '([^']+)' in allowlistonly mode/)))
 		run_result(m[1], 'skipped');
+	// a list whose address needs a personal key (urlhaus: abuse.ch's) and none is set
+	else if ((m = match(msg, /^skip feed '([^']+)', no valid auth-key set/)))
+		run_result(m[1], 'nokey');
 	else if ((m = match(msg, /^add IP( range)? '([^']+)' \((.*)\) to (blocklist\.v[46])/))) {
 		append('events', join('\t', [ t, m[1] ? 'range' : 'monitor', clean(m[2]), clean(m[4]), clean(m[3]) ]));
 		state.events.autoblocked++;

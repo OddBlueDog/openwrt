@@ -1,8 +1,11 @@
 {
 	"milkflint-dashboard": {
-		"description": "MilkFlint web interface: Dashboard",
+		"description": "MilkFlint web interface: Home",
 		"read": {
-			"ubus": { "milkflint.sensors": [ "history" ] }
+			"ubus": { "milkflint.sensors": [ "history" ], "milkflint.home": [ "get" ] }
+		},
+		"write": {
+			"ubus": { "milkflint.home": [ "set" ] }
 		}
 	}
 }
