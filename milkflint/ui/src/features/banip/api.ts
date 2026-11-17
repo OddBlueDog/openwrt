@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { sharedCall } from '@/lib/shared-call';
 import { call } from '@/lib/ubus';
 import type { Options } from './options';
 
@@ -68,6 +69,9 @@ export type BanipStatus = z.output<typeof statusSchema>;
 export function getStatus(): Promise<BanipStatus> {
   return call('milkflint.banip', 'status', {}, statusSchema);
 }
+
+/** For Home, where the warning and each banIP widget ask at once: one call answers them all. */
+export const getStatusShared = sharedCall(getStatus);
 
 const optionValue = z.union([z.string(), z.array(z.string())]).nullable();
 

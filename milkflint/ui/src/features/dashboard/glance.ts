@@ -1,7 +1,6 @@
 // Home at a glance: one word or number for each thing that matters (the
-// internet, how responsive it is, the Wi-Fi, the devices) and the latest
-// traffic, worked out as the full tiles work them out, so a calm Home and a
-// full one never disagree. Plain data, so the tests check it.
+// internet, how responsive it is, the Wi-Fi, the devices), as the status
+// tiles (tiles.tsx) show them. Plain data, so the tests check it.
 import type { Sample, Status } from '@/features/network-quality/api';
 import { formatNumber } from '@/lib/format';
 import type { Route } from '@/lib/router';
@@ -85,13 +84,4 @@ export function responsivenessGlance(live: LiveInput): Glance {
     detail: r.state.label,
     tone: r.state.tone,
   };
-}
-
-/** The latest download and upload on the WAN; nothing to show in access point mode (no WAN of its own). */
-export function trafficGlance(
-  d: Pick<Dashboard, 'history'>,
-  ap: boolean,
-): { down: number | undefined; up: number | undefined; hidden: boolean } {
-  const last = d.history[d.history.length - 1];
-  return { down: last?.wanDown, up: last?.wanUp, hidden: ap };
 }

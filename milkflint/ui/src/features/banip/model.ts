@@ -585,7 +585,13 @@ export const RESULTS: Record<string, string> = {
   incomplete: 'has no address or rule',
   unknown: 'isn’t in the catalogue any more',
   skipped: 'not needed in allowlist-only mode',
+  nokey: 'was skipped: it needs an Auth-Key',
 };
+
+/** A list whose address needs a personal key (banIP's "{authkey}"): banIP skips it until ban_authkey is set. */
+export function needsKey(f: { url_4?: string | null | undefined; url_6?: string | null | undefined }): boolean {
+  return `${f.url_4 ?? ''} ${f.url_6 ?? ''}`.includes('{authkey}');
+}
 
 // ---- countries ------------------------------------------------------------------------------
 

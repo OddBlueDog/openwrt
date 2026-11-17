@@ -50,6 +50,7 @@ export function TimeChart({
   empty,
   className,
   bare = false,
+  fill = false,
 }: {
   lines: readonly ChartLine[];
   from: number;
@@ -74,6 +75,12 @@ export function TimeChart({
   className?: string;
   /** Lines and their zero line only: no scale, grid or times along the foot (a glance). Hovering still reads the values. */
   bare?: boolean;
+  /**
+   * Grows into the height its card has spare (its parent a flex column), at
+   * least as tall as `className` says (default min-h-28): a widget's chart,
+   * so the widget fills its cell on Home with no blank band at its foot.
+   */
+  fill?: boolean;
 }): ReactElement {
   const id = useId();
   const [hover, setHover] = useState<number>();
@@ -115,8 +122,15 @@ export function TimeChart({
   };
 
   return (
-    <div className="flex min-w-0 flex-col gap-1">
-      <div className={cn('mt-2 grid gap-x-2', bare ? 'grid-cols-1' : 'grid-cols-[auto_minmax(0,1fr)]')}>
+    <div className={cn('flex min-w-0 flex-col gap-1', fill && 'flex-1')}>
+      {/* filling: the plot's row takes the spare height, the time labels' row keeps its own */}
+      <div
+        className={cn(
+          'mt-2 grid gap-x-2',
+          bare ? 'grid-cols-1' : 'grid-cols-[auto_minmax(0,1fr)]',
+          fill && 'flex-1 grid-rows-[1fr_auto]',
+        )}
+      >
         {/* the scale: the widest label, invisible, sets the column's width */}
         {!bare && (
           <div className="relative text-right text-xs text-muted-foreground tabular" aria-hidden="true">
@@ -128,7 +142,7 @@ export function TimeChart({
             ))}
           </div>
         )}
-        <div className={cn('relative h-28', className)}>
+        <div className={cn('relative', fill ? 'min-h-28' : 'h-28', className)}>
           {bands.map((b) => {
             const left = Math.max(0, x(b.from));
             const right = Math.min(100, x(b.to));

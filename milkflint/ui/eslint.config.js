@@ -51,7 +51,7 @@ export default defineConfig([
   },
   // Node code: the Vite config, the packaging scripts and the tests.
   {
-    files: ['vite.config.ts', 'scripts/**/*.ts', 'tests/**/*.ts'],
+    files: ['vite.config.ts', 'vitest.config.ts', 'scripts/**/*.ts', 'tests/**/*.ts'],
     languageOptions: {
       globals: globals.node,
     },
@@ -67,6 +67,13 @@ export default defineConfig([
         'error',
         { allowForKnownSafeCalls: [{ from: 'package', name: 'test', package: 'node:test' }] },
       ],
+    },
+  },
+  // The browser tests run in Chromium (vitest.config.ts): the page's globals.
+  {
+    files: ['tests/browser/**/*.{ts,tsx}'],
+    languageOptions: {
+      globals: globals.browser,
     },
   },
   // This config file itself is plain JavaScript outside the TypeScript projects.

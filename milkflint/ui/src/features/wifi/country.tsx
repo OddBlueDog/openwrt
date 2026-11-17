@@ -9,6 +9,7 @@ import { usePoll } from '@/hooks/use-poll';
 import { type Country, getRegulatory, type RegRule } from '@/lib/api/wireless';
 import { explain } from '@/components/explain';
 import { Note } from '@/components/note';
+import { bandLabel, type RadioCountry } from './model';
 
 /** Names people search by that aren't in the list's own names. */
 const aliases: Record<string, string> = {
@@ -162,14 +163,17 @@ export function CountryCard({
   countries,
   value,
   saved,
+  mixed,
   radios,
   bandsHere,
   onChange,
 }: {
   countries: readonly Country[];
   value: string;
-  /** What's set on the router ('' for nothing). */
+  /** What's set on the router ('' for nothing, or radios with different ones). */
   saved: string;
+  /** Each radio's own country when they differ. */
+  mixed: readonly RadioCountry[];
   /** Every radio section: the country is set on each. */
   radios: readonly string[];
   bandsHere: readonly string[];
@@ -208,9 +212,17 @@ export function CountryCard({
                 the router is in.
               </Note>
             )}
-            {saved === '' && (
+            {saved === '' && mixed.length > 0 && (
               <Note tone="warning" icon={<TriangleAlertIcon />}>
-                The country isn’t set yet, and 5 GHz may not start until it is.
+                The bands have different countries (
+                {mixed.map((r) => `${bandLabel(r.band)}: ${r.code === '' ? 'not set' : r.code}`).join(', ')}
+                ), set outside this page; the router uses one of them for every band. Choose the country the router is in: saving
+                sets it on every band.
+              </Note>
+            )}
+            {saved === '' && mixed.length === 0 && (
+              <Note tone="warning" icon={<TriangleAlertIcon />}>
+                The country isn’t set on every band yet, and 5 GHz may not start until it is.
                 {value === '' ? '' : ` ${value} is filled in: save to use it.`}
               </Note>
             )}

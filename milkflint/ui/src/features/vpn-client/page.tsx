@@ -52,6 +52,7 @@ import {
   drift,
   type Errors,
   fromConf,
+  pickerLabel,
   removal,
   serverText,
   summary,
@@ -231,7 +232,7 @@ function DevicePicker({
         id="vpn-device"
         options={devices
           .filter((d) => !macs.includes(d.mac))
-          .map((d) => ({ value: d.mac, label: d.name ?? d.mac, keywords: `${d.mac} ${d.ip ?? ''}` }))}
+          .map((d) => ({ value: d.mac, label: pickerLabel(d, devices), keywords: `${d.mac} ${d.ip ?? ''}` }))}
         value=""
         placeholder="Add a device the router knows…"
         onChange={add}

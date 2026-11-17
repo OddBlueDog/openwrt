@@ -51,9 +51,10 @@ function stableEntry(): Plugin {
 /**
  * The themes as CSS custom properties, written from src/theme/themes at build
  * time (main.tsx imports virtual:milkflint-themes.css). Editing a theme file
- * restarts the dev server, as the config depends on it.
+ * restarts the dev server, as the config depends on it. The browser tests use
+ * it too (vitest.config.ts).
  */
-function themeStyles(): Plugin {
+export function themeStyles(): Plugin {
   const id = 'virtual:milkflint-themes.css';
   const resolved = `\0${id}`;
   return {

@@ -11,6 +11,10 @@
 /* dark: follows the theme's dark scheme (LuCI's attribute), not the OS alone */
 @custom-variant dark (&:where([data-darkmode='true'], [data-darkmode='true'] *));
 
+/* narrow: inside a Home widget in one narrow column (its card under 17rem wide), where a heading and a row of
+   figures keep to fewer lines (features/dashboard/widget.tsx) */
+@custom-variant narrow (@container (width < 17rem));
+
 @theme {
   --color-*: initial;
   --radius-*: initial;
@@ -193,8 +197,12 @@
   transition-duration: var(--mf-duration-slow);
 }
 
-/* Overlays arriving: menus and dialogs grow in from 98%, sheets slide in.
-   Durations are theme tokens, zero under reduced motion. */
+/* Overlays arriving: menus and dialogs grow in from 98%, sheets slide in,
+   and the dimming behind them fades in. Durations are theme tokens, zero
+   under reduced motion. A menu or dialog doesn't fade: if a browser pauses
+   the animation part-way (it may while it thinks the window is covered),
+   what's left must still be opaque, not a see-through panel on a dimmed
+   page. */
 @keyframes mf-fade-in {
   from {
     opacity: 0;
@@ -202,7 +210,6 @@
 }
 @keyframes mf-pop-in {
   from {
-    opacity: 0;
     scale: 0.98;
   }
 }

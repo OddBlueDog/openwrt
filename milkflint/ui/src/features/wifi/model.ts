@@ -268,7 +268,50 @@ export interface WifiData {
   radios: string[];
   /** The radios' country when they agree on a real one; '' when it isn't set (or is "00", the world rules). */
   country: string;
+  /** What the page fills in while `country` is '' (see radiosCountry). */
+  fill: string;
+  /** Each radio's own country when they differ (see radiosCountry); empty when they don't. */
+  mixed: RadioCountry[];
   countries: Country[];
+}
+
+export interface RadioCountry {
+  band: string;
+  /** '' for none (or "00", the world rules) */
+  code: string;
+}
+
+/**
+ * The country of the radios, which OpenWrt keeps on each radio although
+ * the kernel has one for the whole router (the last radio to start sets
+ * it). `country` is the one they all have; otherwise '' and the page fills
+ * in `fill`: the country the radios that have one agree on (a radio added
+ * since, or one LuCI left out), GB when none has one, nothing when they
+ * differ (LuCI sets each radio's apart), as any choice could undo one made
+ * on purpose. `mixed` lists each radio's country when they differ, for the
+ * page to say so.
+ */
+export function radiosCountry(radios: readonly RadioCountry[]): { country: string; fill: string; mixed: RadioCountry[] } {
+  const norm = radios.map((r) => {
+    const code = r.code.toUpperCase();
+    return { band: r.band, code: code === '00' ? '' : code };
+  });
+  const codes = [...new Set(norm.map((r) => r.code).filter((c) => c !== ''))];
+  const all = codes.length === 1 && norm.every((r) => r.code === codes[0]);
+  if (all) return { country: codes[0] ?? '', fill: '', mixed: [] };
+  if (codes.length === 0) return { country: '', fill: 'GB', mixed: [] };
+  if (codes.length === 1) return { country: '', fill: codes[0] ?? '', mixed: [] };
+  // each band and country once (two radios on one band with the same one are one line)
+  const seen = new Set<string>();
+  const mixed = norm
+    .filter((r) => {
+      const k = `${r.band} ${r.code}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .sort((a, b) => bandOrder(a.band) - bandOrder(b.band));
+  return { country: '', fill: '', mixed };
 }
 
 /** Radios can list channels of every band they support; keep this radio's band. */

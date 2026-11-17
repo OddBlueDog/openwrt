@@ -18,7 +18,7 @@ import {
 import { isGuestIface } from '../wifi-guest/guest';
 import { airtimeBandsOf, airtimeOf, airtimeOption } from './airtime';
 import { HOLD_BACK_OPTIONS, holdBackOf } from './hold-back';
-import { inBand, type RadioForm, type RadioOptions, type WifiData } from './model';
+import { inBand, type RadioForm, type RadioOptions, radiosCountry, type WifiData } from './model';
 import { sprOf, sprOption } from './spatial-reuse';
 import { twtOf, twtOption } from './twt';
 
@@ -124,10 +124,10 @@ export async function loadWifi(part: WifiPart): Promise<WifiData> {
       };
     }),
   );
-  const codes = new Set(radios.map((r) => (str(r, 'country') ?? '').toUpperCase()));
-  const only = codes.size === 1 ? [...codes][0] : undefined;
-  const country = only === undefined || only === '00' ? '' : only;
-  if (!networks) return { forms, milkflint, options, radios: radios.map((r) => r['.name']), country, countries: [] };
+  const { country, fill, mixed } = radiosCountry(
+    radios.map((r) => ({ band: str(r, 'band') ?? '', code: str(r, 'country') ?? '' })),
+  );
+  if (!networks) return { forms, milkflint, options, radios: radios.map((r) => r['.name']), country, fill, mixed, countries: [] };
 
   // countries: ask any radio, by an interface or by its phy (no interface while Wi-Fi is off)
   const device =
@@ -148,6 +148,8 @@ export async function loadWifi(part: WifiPart): Promise<WifiData> {
     options,
     radios: radios.map((r) => r['.name']),
     country,
+    fill,
+    mixed,
     countries: countries.length > 0 ? countries : fallbackCountries,
   };
 }

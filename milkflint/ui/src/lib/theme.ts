@@ -59,7 +59,8 @@ let settings: ThemeSettings = cachedSettings();
 let custom: readonly Theme[] = settings.custom.map((c) => resolveCustom(c, builtIn));
 let version = 0;
 let snapshot = '';
-const media = window.matchMedia('(prefers-color-scheme: dark)');
+// none where there's no page: the tests import modules that import this one
+const media = typeof window === 'undefined' ? undefined : window.matchMedia('(prefers-color-scheme: dark)');
 const listeners = new Set<() => void>();
 
 function fallback(): Theme {
@@ -93,7 +94,7 @@ function apply(): void {
   const theme = themeById(settings.theme ?? DEFAULT_THEME_ID);
   const hasDark = theme.schemes.dark !== undefined;
   const hasLight = theme.schemes.light !== undefined;
-  const wantsDark = scheme === 'dark' || (scheme === 'system' && media.matches);
+  const wantsDark = scheme === 'dark' || (scheme === 'system' && media?.matches === true);
   const dark = hasDark && (wantsDark || !hasLight);
   const root = document.documentElement;
   root.setAttribute('data-theme', theme.id);
@@ -112,9 +113,11 @@ function adopt(next: ThemeSettings): void {
   apply();
 }
 
-writeCustomCss();
-apply();
-media.addEventListener('change', apply);
+if (media !== undefined) {
+  writeCustomCss();
+  apply();
+  media.addEventListener('change', apply);
+}
 
 /** Light, dark or follow the device: this device's own choice. */
 export function setTheme(next: SchemeChoice): void {

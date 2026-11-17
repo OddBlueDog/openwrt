@@ -195,25 +195,26 @@ export const plainMilk = {
   presentation: standardPresentation,
   chart: solidCharts,
   dashboard: {
+    // four columns: each line below is a row of them
     widgets: [
-      // the status tiles stack beside Responsiveness, sharing its height
-      { id: 'responsiveness', span: { base: 12, xl: 8 }, rows: { xl: 3 } },
-      { id: 'internet', span: { base: 12, md: 4, xl: 4 } },
-      { id: 'wifi', span: { base: 12, md: 4, xl: 4 } },
-      { id: 'devices', span: { base: 12, md: 4, xl: 4 } },
-      { id: 'cpu', span: { base: 12, md: 6, xl: 4 } },
-      { id: 'memory', span: { base: 12, md: 6, xl: 4 } },
-      { id: 'system', span: { base: 12, md: 6, xl: 4 } },
-      // a row of its own on a wide screen: every sensor with its graph
-      { id: 'temperatures', span: { base: 12, md: 6, xl: 12 } },
-      { id: 'throughput', span: { base: 12, xl: 8 } },
-      { id: 'radios', span: { base: 12, xl: 4 } },
-      { id: 'busiest-devices', span: { base: 12, xl: 8 } },
-      { id: 'internet-details', span: { base: 12, xl: 4 } },
-      { id: 'usage', span: { base: 12, md: 6, xl: 6 } },
-      { id: 'smart-queue', span: { base: 12, md: 6, xl: 6 } },
+      // the status tiles beside Responsiveness, two rows tall
+      { id: 'responsiveness', size: { w: 2, h: 2 } },
+      { id: 'internet', size: { w: 2, h: 1 } },
+      { id: 'wifi', size: { w: 1, h: 1 } },
+      { id: 'devices', size: { w: 1, h: 1 } },
+      { id: 'cpu', size: { w: 2, h: 1 } },
+      { id: 'memory', size: { w: 1, h: 1 } },
+      { id: 'system', size: { w: 1, h: 1 } },
+      // a row of its own: every sensor with its graph
+      { id: 'temperatures', size: { w: 4, h: 1 } },
+      { id: 'throughput', size: { w: 3, h: 1 } },
+      { id: 'radios', size: { w: 1, h: 1 } },
+      { id: 'busiest-devices', size: { w: 3, h: 2 } },
+      { id: 'internet-details', size: { w: 1, h: 2 } },
+      { id: 'usage', size: { w: 2, h: 1 } },
+      { id: 'smart-queue', size: { w: 2, h: 1 } },
       // the way from the internet to each device, at the foot: the detail behind the figures above
-      { id: 'path', span: { base: 12 } },
+      { id: 'path', size: { w: 4, h: 1 } },
     ],
   },
 } as const satisfies Theme;

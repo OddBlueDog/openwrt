@@ -16,16 +16,30 @@ export function formatBytes(bytes: number): string {
   return `${(unit === 0 ? noDecimals : oneDecimal).format(value)} ${units[unit] ?? 'B'}`;
 }
 
+const BIT_UNITS = ['bit/s', 'kbit/s', 'Mbit/s', 'Gbit/s'];
+
+/** Which of BIT_UNITS a rate is said in: the largest it reaches one of. */
+function bitUnit(bitsPerSecond: number): number {
+  let unit = 0;
+  for (let value = bitsPerSecond; value >= 1000 && unit < BIT_UNITS.length - 1; value /= 1000) unit++;
+  return unit;
+}
+
+function bitFigure(bitsPerSecond: number, unit: number): string {
+  const value = bitsPerSecond / 1000 ** unit;
+  return (value >= 100 || unit === 0 ? noDecimals : oneDecimal).format(value);
+}
+
 /** Bits per second -> "12.3 Mbit/s". */
 export function formatBitrate(bitsPerSecond: number): string {
-  const units = ['bit/s', 'kbit/s', 'Mbit/s', 'Gbit/s'];
-  let value = bitsPerSecond;
-  let unit = 0;
-  while (value >= 1000 && unit < units.length - 1) {
-    value /= 1000;
-    unit++;
-  }
-  return `${(value >= 100 || unit === 0 ? noDecimals : oneDecimal).format(value)} ${units[unit] ?? 'bit/s'}`;
+  const unit = bitUnit(bitsPerSecond);
+  return `${bitFigure(bitsPerSecond, unit)} ${BIT_UNITS[unit] ?? 'bit/s'}`;
+}
+
+/** A rate against its limit, in the limit's unit, said once: "312 of 825 Mbit/s" (where there's little room). */
+export function formatBitrateOf(bitsPerSecond: number, limit: number): string {
+  const unit = bitUnit(limit);
+  return `${bitFigure(bitsPerSecond, unit)} of ${bitFigure(limit, unit)} ${BIT_UNITS[unit] ?? 'bit/s'}`;
 }
 
 /** 93784 -> "1d 2h 3m". */

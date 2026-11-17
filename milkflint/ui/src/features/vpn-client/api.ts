@@ -8,7 +8,7 @@ import { getWgStatus } from '@/lib/api/wireguard';
 import { lanZone, parseFirewall, wanZone } from '../firewall/model';
 import { GUEST_IDS, type GuestId, guestLabels, isGuestShaper } from '../wifi-guest/guest';
 import { type AdGuardStatus, getAdGuardStatus } from '../adguardhome/api';
-import { blankForm, type ClientData, type Device, DEFAULT_KEEPALIVE, DEFAULT_PORT } from './model';
+import { blankForm, type ClientData, DEFAULT_KEEPALIVE, DEFAULT_PORT, homeDevices } from './model';
 
 /** Which way the VPN's devices' lookups go with AdGuard Home on (its monitor sends them through the tunnel when the DNS page has servers of its own). */
 function aghPath(agh: AdGuardStatus | undefined, milkflint: readonly Section[]): ClientData['adguard'] {
@@ -73,13 +73,15 @@ export async function loadClient(): Promise<ClientData> {
         }),
   );
 
-  // devices the router knows: by lease first, then by what it has seen
-  const byMac = new Map<string, Device>();
-  for (const l of leases) byMac.set(l.macaddr.toLowerCase(), { mac: l.macaddr.toLowerCase(), name: l.hostname, ip: l.ipaddr });
-  for (const [mac, h] of Object.entries(hints)) {
-    const m = mac.toLowerCase();
-    if (!byMac.has(m)) byMac.set(m, { mac: m, name: h.name, ip: h.ipaddrs?.[0] });
-  }
+  const lan =
+    lanInt === undefined
+      ? undefined
+      : { ip: lanInt, prefix: lanCidr !== undefined ? Number(lanCidr) : prefixLength(str(lanSection, 'netmask')) };
+  // every address the router has, to leave its own bridges and internet port out of the devices
+  const own = [
+    ...(lanInt === undefined ? [] : [lanInt]),
+    ...interfaces.flatMap((i) => (i['ipv4-address'] ?? []).flatMap((a) => ipToInt(a.address) ?? [])),
+  ];
 
   const data: ClientData = {
     installed: status.installed,
@@ -90,13 +92,10 @@ export async function loadClient(): Promise<ClientData> {
     wanZone: wanZone(cfg)?.name ?? 'wan',
     lanZone: lanZone(cfg)?.name ?? 'lan',
     guestZones,
-    devices: [...byMac.values()].sort((a, b) => (a.name ?? a.mac).localeCompare(b.name ?? b.mac)),
+    devices: homeDevices(leases, hints, lan, own),
     sqm: sqm !== undefined,
     wanRates,
-    lan:
-      lanInt === undefined
-        ? undefined
-        : { ip: lanInt, prefix: lanCidr !== undefined ? Number(lanCidr) : prefixLength(str(lanSection, 'netmask')) },
+    lan,
     taken,
     adguard: aghPath(agh, milkflint),
   };

@@ -62,8 +62,11 @@ nothing):
 - `chart.dash`: each series' line, so lines drawn together can be told apart
   by more than colour (`components/charts/series.ts`).
 - `layout.tools`: the top bar's tools on their own row or compact.
-- `dashboard.reduced`: Home places a chosen few widgets (the glance widgets)
-  rather than every one.
+- `dashboard.widgets`: Home's default layout, widgets by id (the keys of
+  `src/features/dashboard/widgets.tsx`) in order, each `size: { w, h }`:
+  1 to 4 columns by 1 or 2 rows, one the widget offers. It's read through
+  the same parser as the user's own layout (`layout.ts`), which, once saved
+  on the router, is used in every theme until it's reset.
 - `contrast: 'AAA'`: its text is held to 7:1.
 
 ## Custom themes

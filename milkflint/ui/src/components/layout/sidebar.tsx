@@ -29,14 +29,20 @@ export function Logo({ className, ...props }: ComponentProps<'svg'>): ReactEleme
   );
 }
 
-/** The product's name and the router's, as the rail and the top bar show them. */
+/**
+ * The product's name and the router's, as the rail and the top bar show them:
+ * its hostname, or its model while the hostname is the firmware's own name
+ * (the one it comes with), which would say the name twice.
+ */
 export function Brand({ board }: { board: Board | undefined }): ReactElement {
+  const product = board?.release?.distribution ?? 'MilkFlint';
+  const named = board !== undefined && board.hostname.toLowerCase() !== product.toLowerCase() ? board.hostname : undefined;
   return (
     <a href={href('dashboard')} className="flex min-w-0 items-center gap-3 rounded-lg">
       <Logo className="size-8 shrink-0" />
       <span className="min-w-0">
         <span className="block truncate text-sm font-semibold">MilkFlint</span>
-        <span className="block truncate text-xs text-sidebar-muted-foreground">{board?.hostname ?? 'Router'}</span>
+        <span className="block truncate text-xs text-sidebar-muted-foreground">{named ?? board?.model ?? 'Router'}</span>
       </span>
     </a>
   );

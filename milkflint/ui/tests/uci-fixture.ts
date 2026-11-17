@@ -8,13 +8,14 @@ export function section(type: string, name: string, values: Record<string, strin
   return { '.type': type, '.name': name, ...values };
 }
 
+// uci can't keep an empty option: setting one to '' deletes it (libuci's uci_set).
+const kept = (e: [string, string | string[] | undefined]): e is [string, string | string[]] => e[1] !== undefined && e[1] !== '';
+
 /** `wanted` as it would be on the router after a save, by config. */
 export function presentOf(wanted: readonly Wanted[]): Record<string, Section[]> {
   const out: Record<string, Section[]> = {};
   for (const w of wanted) {
-    const values = Object.fromEntries(
-      Object.entries(w.values).filter((e): e is [string, string | string[]] => e[1] !== undefined),
-    );
+    const values = Object.fromEntries(Object.entries(w.values).filter(kept));
     (out[w.config] ??= []).push(section(w.type, w.name, values));
   }
   return out;
@@ -31,7 +32,9 @@ export function applied(
   for (const c of changes) {
     const sections = (out[c.config] ??= []);
     if (c.op === 'add') {
-      sections.push(section(c.type, c.name ?? `cfg${String(sections.length)}`, c.values));
+      sections.push(
+        section(c.type, c.name ?? `cfg${String(sections.length)}`, Object.fromEntries(Object.entries(c.values).filter(kept))),
+      );
     } else if (c.op === 'delete') {
       out[c.config] = sections.filter((s) => s['.name'] !== c.section);
     } else if (c.op === 'order') {
@@ -39,8 +42,12 @@ export function applied(
     } else {
       const s = sections.find((x) => x['.name'] === c.section);
       if (s === undefined) throw new Error(`${c.op} of a section that isn't there: ${c.config}.${c.section}`);
-      if (c.op === 'set') Object.assign(s, c.values);
-      else for (const o of c.options) Reflect.deleteProperty(s, o);
+      if (c.op === 'set') {
+        for (const [o, v] of Object.entries(c.values)) {
+          if (kept([o, v])) s[o] = v;
+          else Reflect.deleteProperty(s, o);
+        }
+      } else for (const o of c.options) Reflect.deleteProperty(s, o);
     }
   }
   return out;

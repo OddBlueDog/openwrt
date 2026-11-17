@@ -9,7 +9,7 @@
 // The router's own traffic isn't marked, so it goes out as before. The
 // zone masquerades, as the internet's does. Everything is read back from
 // those sections, so a change made in LuCI shows here.
-import { intToIp, ipToInt } from '@/lib/api/network';
+import { type HostHint, hintName, intToIp, ipToInt, type Lease } from '@/lib/api/network';
 import { type Owned, reconcile, type Wanted } from '@/lib/api/owned';
 import type { Section } from '@/lib/api/uci';
 import { isKey, joinEndpoint, type WgConf } from '@/lib/api/wireguard';
@@ -67,6 +67,42 @@ export interface Device {
   mac: string;
   name: string | undefined;
   ip: string | undefined;
+}
+
+/**
+ * The home network's devices to pick from, by DHCP lease and the router's
+ * host hints: those with an address on the home network that isn't the
+ * router's own (the hints also hold the router's bridges and internet port,
+ * the internet provider's gateway and Smart Queue's ifb interfaces).
+ * `own` is every IPv4 address the router has.
+ */
+export function homeDevices(
+  leases: readonly Lease[],
+  hints: Readonly<Record<string, HostHint>>,
+  lan: { ip: number; prefix: number } | undefined,
+  own: readonly number[],
+): Device[] {
+  const atHome = (ip: string | undefined): boolean => {
+    const n = ipToInt(ip ?? '');
+    return n !== undefined && !own.includes(n) && (lan === undefined || overlaps(n, 32, lan.ip, lan.prefix));
+  };
+  const hintOf = new Map(Object.entries(hints).map(([mac, h]) => [mac.toLowerCase(), h]));
+  const byMac = new Map<string, Device>();
+  for (const l of leases) {
+    const mac = l.macaddr.toLowerCase();
+    if (atHome(l.ipaddr)) byMac.set(mac, { mac, name: l.hostname ?? hintName(hintOf.get(mac)), ip: l.ipaddr });
+  }
+  for (const [mac, h] of hintOf) {
+    const ip = h.ipaddrs?.find(atHome);
+    if (!byMac.has(mac) && ip !== undefined) byMac.set(mac, { mac, name: hintName(h), ip });
+  }
+  return [...byMac.values()].sort((a, b) => (a.name ?? a.ip ?? a.mac).localeCompare(b.name ?? b.ip ?? b.mac));
+}
+
+/** A device in the picker: its name, with its address when another has the same name. */
+export function pickerLabel(d: Device, all: readonly Device[]): string {
+  if (d.name === undefined) return d.ip ?? d.mac;
+  return all.some((x) => x !== d && x.name === d.name) ? `${d.name} (${d.ip ?? d.mac})` : d.name;
 }
 
 export interface ClientData {

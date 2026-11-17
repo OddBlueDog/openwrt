@@ -29,6 +29,7 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { HomeSpecimen } from '@/dev/home-specimen';
 import { pickableThemes, setThemeId, useTheme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 import { contrast } from '@/theme/color';
@@ -373,6 +374,10 @@ export function SpecimenPage(): ReactElement {
           <SheetSample />
         </div>
         <SaveBar visible busy={false} invalid={false} onSave={() => undefined} onRevert={() => undefined} />
+      </Section>
+
+      <Section title="Home’s widgets, at every size they offer">
+        <HomeSpecimen />
       </Section>
     </div>
   );

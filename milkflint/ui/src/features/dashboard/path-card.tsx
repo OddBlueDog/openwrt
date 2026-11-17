@@ -1,7 +1,7 @@
 // The way from the internet to the devices, one step at a time, each with
 // what the router measures there and a link to its page. Shared steps first,
 // then the last hop (each device uses one of them).
-import { ChevronRightIcon, WaypointsIcon } from 'lucide-react';
+import { ChevronRightIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import type { Poll } from '@/hooks/use-poll';
 import { href } from '@/lib/router';
@@ -11,10 +11,12 @@ import { summarize } from '../network-quality/score';
 import { lineBusyNow, type PathStep, pathSteps, type StepState } from './model';
 import type { Dashboard } from './use-dashboard';
 import { Dot, StateBadge, Widget } from './widget';
+import { useWidgetInfo } from './widget-info';
 
 const tone = { ok: 'success', busy: 'warning', down: 'destructive', off: 'off' } as const satisfies Record<StepState, string>;
 
-function Step({ s, last }: { s: PathStep; last: boolean }): ReactElement {
+/** A step: its name and state, what's there (in full only), and what the router measures. */
+function Step({ s, last, full }: { s: PathStep; last: boolean; full: boolean }): ReactElement {
   return (
     <li className="relative flex min-w-0">
       <a
@@ -28,36 +30,53 @@ function Step({ s, last }: { s: PathStep; last: boolean }): ReactElement {
         )}
       >
         <span className="flex flex-col gap-0.5">
-          <span className="text-sm font-semibold">{s.name}</span>
-          <span className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          <span className="truncate text-sm font-semibold" title={s.name}>
+            {s.name}
+          </span>
+          <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
             <Dot tone={tone[s.state]} />
-            {s.status}
+            <span className="truncate">{s.status}</span>
           </span>
         </span>
-        <span className="flex flex-col gap-0.5 text-xs text-muted-foreground">
-          {s.lines.map((l) => (
-            <span key={l} className="text-pretty">
-              {l}
-            </span>
-          ))}
-        </span>
-        {(s.delays.length > 0 || s.figure !== undefined) && (
-          // each reading's label above its value: the labels run long for a narrow step
-          <span className="mt-auto flex flex-col gap-1.5 border-t pt-2">
-            {s.delays.map((x) => (
-              <span key={x.label} className="flex flex-col">
-                <span className="text-xs text-muted-foreground">{x.label}</span>
-                <span className="text-base font-semibold whitespace-nowrap tabular">{x.value}</span>
+        {full && (
+          // only with four columns' width: below it, the groups are stacked and need the height
+          <span className="hidden flex-col gap-0.5 text-xs text-muted-foreground @4xl:flex">
+            {s.lines.map((l) => (
+              <span key={l} className="text-pretty">
+                {l}
               </span>
             ))}
-            {s.figure !== undefined && (
-              <span className="flex flex-col">
-                <span className="text-xs text-muted-foreground">{s.figure.label}</span>
-                <span className="text-base font-semibold whitespace-nowrap tabular">{s.figure.value}</span>
-              </span>
-            )}
           </span>
         )}
+        {(s.delays.length > 0 || s.figure !== undefined) &&
+          (full ? (
+            // each reading's label above its value: the labels run long for a narrow step; the last steps'
+            // go first where the widget is short of room (its groups stacked, below four columns' width)
+            <span data-fit className="mt-auto flex flex-col gap-1.5 border-t pt-2">
+              {s.delays.map((x) => (
+                <span key={x.label} className="flex flex-col">
+                  <span className="text-xs text-muted-foreground">{x.label}</span>
+                  <span className="text-base font-semibold whitespace-nowrap tabular">{x.value}</span>
+                </span>
+              ))}
+              {s.figure !== undefined && (
+                <span className="flex flex-col">
+                  <span className="text-xs text-muted-foreground">{s.figure.label}</span>
+                  <span className="text-base font-semibold whitespace-nowrap tabular">{s.figure.value}</span>
+                </span>
+              )}
+            </span>
+          ) : (
+            // short: the readings' values on a line, their labels on hover; they go when the widget is short of room
+            <span data-fit className="mt-auto truncate text-sm font-semibold tabular">
+              {[...s.delays, ...(s.figure === undefined ? [] : [s.figure])].map((x, i) => (
+                <span key={x.label} title={x.label}>
+                  {i > 0 && <span className="font-normal text-muted-foreground"> · </span>}
+                  {x.value}
+                </span>
+              ))}
+            </span>
+          ))}
       </a>
       {/* from one shared step to the next, on a wide card */}
       {!last && (
@@ -70,16 +89,38 @@ function Step({ s, last }: { s: PathStep; last: boolean }): ReactElement {
   );
 }
 
-function Group({ title, steps, chain }: { title: string; steps: readonly PathStep[]; chain: boolean }): ReactElement {
+function Group({
+  title,
+  steps,
+  chain,
+  full,
+}: {
+  title: string;
+  steps: readonly PathStep[];
+  chain: boolean;
+  full: boolean;
+}): ReactElement {
   return (
-    <div className="flex min-w-0 flex-col gap-2 @4xl:row-span-2 @4xl:grid @4xl:grid-rows-subgrid">
+    <div
+      className={cn('flex min-w-0 flex-col gap-2', full && '@4xl:row-span-2 @4xl:grid @4xl:grid-rows-subgrid')}
+      // short and side by side: each group as wide as its share of the steps
+      style={full ? undefined : { flex: `${String(steps.length)} 1 0` }}
+    >
       <h3 className="flex items-center gap-3 text-xs font-medium text-muted-foreground">
         {title}
         <span aria-hidden="true" className="h-px flex-1 bg-border" />
       </h3>
-      <ol className="grid grid-cols-2 gap-3 @lg:auto-cols-fr @lg:grid-flow-col @lg:grid-cols-none @4xl:grid-rows-1 @4xl:gap-6">
+      {/* short: a group's steps on one line, however narrow */}
+      <ol
+        className={cn(
+          'grid gap-3',
+          full
+            ? 'grid-cols-2 @lg:auto-cols-fr @lg:grid-flow-col @lg:grid-cols-none @4xl:grid-rows-1 @4xl:gap-6'
+            : 'auto-cols-fr grid-flow-col @4xl:gap-6',
+        )}
+      >
         {steps.map((s, i) => (
-          <Step key={s.key} s={s} last={!chain || i === steps.length - 1} />
+          <Step key={s.key} s={s} last={!chain || i === steps.length - 1} full={full} />
         ))}
       </ol>
     </div>
@@ -87,6 +128,9 @@ function Group({ title, steps, chain }: { title: string; steps: readonly PathSte
 }
 
 export function PathCard({ d, ap, live }: { d: Dashboard; ap: boolean; live: Poll<Live> }): ReactElement {
+  // the whole width and two rows: each step in full; smaller, each its name, state and readings
+  const { size } = useWidgetInfo();
+  const full = size.w === 4 && size.h === 2;
   const latest = d.history[d.history.length - 1];
   const gateway = d.lan?.route?.find((r) => r.target === '0.0.0.0' && r.mask === 0)?.nexthop;
   // Network Quality's last five minutes: the internet ping and the gateway's (the first hop)
@@ -120,8 +164,6 @@ export function PathCard({ d, ap, live }: { d: Dashboard; ap: boolean; live: Pol
 
   return (
     <Widget
-      icon={WaypointsIcon}
-      title="Path"
       description="From the internet to your devices, and what the router measures at each step"
       aside={
         flagged.length === 0 ? (
@@ -134,11 +176,18 @@ export function PathCard({ d, ap, live }: { d: Dashboard; ap: boolean; live: Pol
       }
     >
       {/* at full width the two groups share their rows, so every step ends on one line */}
-      <div className="grid gap-4 px-5 @4xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] @4xl:grid-rows-[auto_1fr] @4xl:gap-x-6 @4xl:gap-y-2">
-        <Group title="Shared by all traffic" steps={shared} chain />
-        <Group title="The last hop: each device uses one" steps={last} chain={false} />
+      <div
+        className={cn(
+          'px-5',
+          full
+            ? 'grid gap-4 @4xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] @4xl:grid-rows-[auto_1fr] @4xl:gap-x-6 @4xl:gap-y-2'
+            : 'flex flex-col gap-4 @xl:flex-row @xl:gap-6',
+        )}
+      >
+        <Group title="Shared by all traffic" steps={shared} chain full={full} />
+        <Group title="The last hop: each device uses one" steps={last} chain={false} full={full} />
       </div>
-      <p className="px-5 text-xs text-muted-foreground">
+      <p data-fit className="px-5 text-xs text-muted-foreground">
         Delays are what the router measures: Network Quality’s pings (typical over the last 5 minutes) and Smart Queue’s own
         queues. It doesn’t measure the delay inside the router, on the Wi-Fi or on the cables.
       </p>

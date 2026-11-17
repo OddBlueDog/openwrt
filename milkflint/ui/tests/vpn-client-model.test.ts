@@ -10,6 +10,8 @@ import {
   describe,
   drift,
   fromConf,
+  homeDevices,
+  pickerLabel,
   removal,
   sources,
   toChanges,
@@ -241,6 +243,18 @@ test('the next save with the same settings changes nothing', () => {
   }
 });
 
+test('a tunnel saved off before any config: the next load sees no drift and nothing to save', () => {
+  // its keys and server are empty; uci drops empty options rather than keeping ''
+  const f = { ...blankForm({ wanRates: undefined, sqm: true }), who: 'only' as const, macs: [MAC] };
+  assert.deepEqual(validate(f, data(f)), {});
+  const empty = { network: [], firewall: [], sqm: [] };
+  const after = applied(empty, toChanges(f, data(f, { present: empty })));
+  const present = { network: after['network'] ?? [], firewall: after['firewall'] ?? [], sqm: after['sqm'] ?? [] };
+  const d = data(f, { present, exists: true });
+  assert.deepEqual(drift(d), []);
+  assert.deepEqual(toChanges(f, d), []);
+});
+
 test('what someone changed in LuCI shows as drift; options the page doesn’t manage stay', () => {
   const f = form();
   const present = onRouter(f);
@@ -385,4 +399,49 @@ test('who uses it, in a few words for the answer', () => {
   assert.equal(whoSummary(form({ who: 'none', guests: ['guest'] }), zones), 'Guest Wi-Fi');
   assert.equal(whoSummary(form({ who: 'only', macs: [MAC], guests: ['guest'] }), zones), 'Only 1 device and Guest Wi-Fi');
   assert.equal(whoSummary(form({ who: 'none' }), zones), 'No one');
+});
+
+test('the devices to pick from: home-network ones, not the router’s own or what’s beyond it', () => {
+  const lan = { ip: ipToInt('192.168.1.1') ?? 0, prefix: 24 };
+  const own = ['192.168.1.1', '192.168.9.1', '192.168.10.1', '203.0.113.30'].map((ip) => ipToInt(ip) ?? 0);
+  const devices = homeDevices(
+    [
+      { macaddr: '02:00:00:00:00:01', hostname: 'Tablet', ipaddr: '192.168.1.120' },
+      { macaddr: '02:00:00:00:00:02', ipaddr: '192.168.1.130' },
+      // on a guest network: “Only these” and “All but these” are home devices
+      { macaddr: '5A:00:00:00:00:03', hostname: 'Visitor', ipaddr: '192.168.9.20' },
+    ],
+    {
+      '02:00:00:00:00:01': { name: 'Tablet.lan', ipaddrs: ['192.168.1.120'] },
+      '02:00:00:00:00:02': { name: 'printer.lan', ipaddrs: ['192.168.1.130'] },
+      '02:00:00:00:00:04': { name: 'tv.lan', ipaddrs: ['192.168.1.140'], ip6addrs: ['fe80::1'] },
+      // the router's own bridges and internet port
+      '02:00:00:00:00:10': { name: 'MilkFlint.lan', ipaddrs: ['192.168.1.1'] },
+      '02:00:00:00:00:11': { name: 'MilkFlint.lan', ipaddrs: ['192.168.9.1'] },
+      '02:00:00:00:00:12': { name: 'MilkFlint.lan', ipaddrs: ['192.168.10.1'] },
+      '02:00:00:00:00:13': { ipaddrs: ['203.0.113.30'] },
+      // the internet provider's gateway, and Smart Queue's ifb interfaces
+      '00:00:5E:00:00:20': { ipaddrs: ['203.0.113.1'], ip6addrs: ['fe80::2'] },
+      '02:00:00:00:00:21': { ipaddrs: [], ip6addrs: ['fe80::ff:fe00:21'] },
+    },
+    lan,
+    own,
+  );
+  assert.deepEqual(devices, [
+    { mac: '02:00:00:00:00:02', name: 'printer', ip: '192.168.1.130' },
+    { mac: '02:00:00:00:00:01', name: 'Tablet', ip: '192.168.1.120' },
+    { mac: '02:00:00:00:00:04', name: 'tv', ip: '192.168.1.140' },
+  ]);
+});
+
+test('two devices with one name: each says which it is', () => {
+  const a = { mac: 'aa:bb:cc:dd:ee:01', name: 'DESKTOP', ip: '192.168.1.60' };
+  const b = { mac: 'aa:bb:cc:dd:ee:02', name: 'DESKTOP', ip: undefined };
+  const c = { mac: 'aa:bb:cc:dd:ee:03', name: 'Tablet', ip: '192.168.1.120' };
+  const d = { mac: 'aa:bb:cc:dd:ee:04', name: undefined, ip: '192.168.1.50' };
+  const all = [a, b, c, d];
+  assert.equal(pickerLabel(a, all), 'DESKTOP (192.168.1.60)');
+  assert.equal(pickerLabel(b, all), 'DESKTOP (aa:bb:cc:dd:ee:02)');
+  assert.equal(pickerLabel(c, all), 'Tablet');
+  assert.equal(pickerLabel(d, all), '192.168.1.50');
 });

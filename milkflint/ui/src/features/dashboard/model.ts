@@ -273,6 +273,11 @@ export const CORE_BUSY = 0.9;
 /** Smart Queue at or above this share of its limit: the line is full and it's shaping. */
 export const SHAPING_BUSY = 0.8;
 
+/** A Smart Queue direction's rate as a share of its limit: 0 without a rate or a limit. */
+export function shapingShare(c: { rate: number | undefined; bandwidth: number | undefined } | undefined): number {
+  return c?.rate === undefined || c.bandwidth === undefined || c.bandwidth <= 0 ? 0 : c.rate / c.bandwidth;
+}
+
 export type StepState = 'ok' | 'busy' | 'off' | 'down';
 
 export interface PathStep {
@@ -383,9 +388,7 @@ export function pathSteps(p: PathInput): { shared: PathStep[]; last: PathStep[] 
 
     const down = p.cake.find((c) => c.download);
     const up = p.cake.find((c) => !c.download);
-    const share = (c: (typeof p.cake)[number] | undefined): number =>
-      c?.rate === undefined || c.bandwidth === undefined || c.bandwidth <= 0 ? 0 : c.rate / c.bandwidth;
-    const busy = Math.max(share(down), share(up)) >= SHAPING_BUSY;
+    const busy = Math.max(shapingShare(down), shapingShare(up)) >= SHAPING_BUSY;
     const limit = (c: (typeof p.cake)[number] | undefined): string =>
       c?.bandwidth === undefined ? 'no limit' : formatBitrate(c.bandwidth);
     const peaks = [down, up].flatMap((c) =>
@@ -417,7 +420,7 @@ export function pathSteps(p: PathInput): { shared: PathStep[]; last: PathStep[] 
             lines: [
               `Limits ${limit(down)} down, ${limit(up)} up`,
               ...(peaks.length > 0 ? [`Peaks ${peaks.join(', ')}`] : []),
-              ...(busy ? [`At ${formatPercent(Math.max(share(down), share(up)))} of its limit`] : []),
+              ...(busy ? [`At ${formatPercent(Math.max(shapingShare(down), shapingShare(up)))} of its limit`] : []),
             ],
           },
     );

@@ -54,6 +54,8 @@ export const OPTIONS = {
   ban_triggerdelay: n(1, 300, '20'),
   ban_fetchretry: n(1, 99, '5'),
   ban_fetchinsecure: b('0'),
+  // the personal key a list with "{authkey}" in its address needs (urlhaus: abuse.ch's)
+  ban_authkey: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,128}$', apply: 'restart' },
   ban_nftcount: b('0'),
   ban_nicelimit: n(-20, 19, '0'),
   ban_filelimit: n(64, 65536, '1024'),

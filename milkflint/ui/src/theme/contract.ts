@@ -161,23 +161,24 @@ export interface LayoutTokens {
   gutter: string;
 }
 
-/**
- * Home's widgets: which show, in what order, how wide. Spans count columns of
- * a 12-column grid, from the narrowest screen up (base, then from md and xl).
- */
-export interface DashboardWidget {
-  id: string;
-  span: { base: number; md?: number; xl?: number };
-  /**
-   * Grid rows it spans, from md or xl up (1 to 4): a tall widget with
-   * shorter ones stacked beside it, sharing its height.
-   */
-  rows?: { md?: number; xl?: number };
+/** A widget's size on Home: columns of four (fewer on a narrower screen) and rows. */
+export interface WidgetSize {
+  readonly w: 1 | 2 | 3 | 4;
+  readonly h: 1 | 2;
 }
+
+/** One of Home's widgets, by id (src/features/dashboard/widgets.tsx), at a size. */
+export interface DashboardWidget {
+  readonly id: string;
+  readonly size: WidgetSize;
+}
+
+/**
+ * Home's widgets until the user arranges their own: which show, in order, at
+ * what size. The user's own layout, once saved, is used in every theme.
+ */
 export interface DashboardLayout {
-  widgets: readonly DashboardWidget[];
-  /** Places a chosen few widgets rather than every one (a calm Home). */
-  reduced?: boolean;
+  readonly widgets: readonly DashboardWidget[];
 }
 
 /**

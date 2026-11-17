@@ -190,13 +190,12 @@ export const minimamilk = {
   contrast: 'AAA',
   // four facts and one traffic line: the calm Home
   dashboard: {
-    reduced: true,
     widgets: [
-      { id: 'glance-internet', span: { base: 12, md: 6, xl: 3 } },
-      { id: 'glance-responsiveness', span: { base: 12, md: 6, xl: 3 } },
-      { id: 'glance-wifi', span: { base: 12, md: 6, xl: 3 } },
-      { id: 'glance-devices', span: { base: 12, md: 6, xl: 3 } },
-      { id: 'glance-traffic', span: { base: 12 } },
+      { id: 'internet', size: { w: 1, h: 1 } },
+      { id: 'responsiveness', size: { w: 1, h: 1 } },
+      { id: 'wifi', size: { w: 1, h: 1 } },
+      { id: 'devices', size: { w: 1, h: 1 } },
+      { id: 'throughput', size: { w: 4, h: 1 } },
     ],
   },
 } as const satisfies Theme;

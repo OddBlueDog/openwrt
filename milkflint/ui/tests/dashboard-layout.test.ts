@@ -1,6 +1,6 @@
-// Home's layout: every widget a theme places exists, spans become the grid
-// classes Tailwind writes, and the figures Home works out rather than reads
-// (wired devices, the responsiveness summary, the busiest devices, the path).
+// The figures Home works out rather than reads: wired devices, the
+// responsiveness summary, the busiest devices, the path. Its layout is
+// tests/home-layout.test.ts.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
@@ -21,43 +21,7 @@ import {
   responsiveness,
   wiredDevices,
 } from '@/features/dashboard/model';
-import {
-  columnsAt,
-  FULL_WIDGET_IDS,
-  GLANCE_WIDGET_IDS,
-  isWidgetId,
-  placeAt,
-  rowClass,
-  rowsAt,
-  spanClass,
-  WIDGET_IDS,
-  withoutHidden,
-} from '@/features/dashboard/widget-ids';
 import type { Sample } from '@/features/network-quality/api';
-import { themes } from '@/theme/themes';
-
-test('every widget a theme places is one Home knows', () => {
-  for (const theme of themes) {
-    for (const w of theme.dashboard.widgets) {
-      assert.ok(isWidgetId(w.id), `${theme.id}: "${w.id}" isn't in features/dashboard/widget-ids.ts`);
-    }
-  }
-  assert.equal(new Set(WIDGET_IDS).size, WIDGET_IDS.length);
-  assert.equal(isWidgetId('speed-test'), false);
-});
-
-test('spans become literal grid classes', () => {
-  assert.equal(spanClass({ base: 12 }), 'col-span-12');
-  assert.equal(spanClass({ base: 12, md: 4, xl: 2 }), 'col-span-12 md:col-span-4 xl:col-span-2');
-  assert.equal(spanClass({ base: 6, xl: 3 }), 'col-span-6 xl:col-span-3');
-  // out of range or fractional: the full width
-  assert.equal(spanClass({ base: 0, md: 13, xl: 2.5 }), 'col-span-12 md:col-span-12 xl:col-span-12');
-  for (const theme of themes) {
-    for (const w of theme.dashboard.widgets) {
-      for (const c of spanClass(w.span).split(' ')) assert.match(c, /^(?:md:|xl:)?col-span-(?:[1-9]|1[0-2])$/);
-    }
-  }
-});
 
 const REACHABLE = 0x02;
 const STALE = 0x04;
@@ -374,70 +338,6 @@ test('at rest against under load, and the stretches the line was busy', () => {
   assert.deepEqual(loadSummary([], step), { paired: 0, busy: 0, atRest: undefined, underLoad: undefined, stretches: [] });
 });
 
-// ---- the grid ----
-
-test('a full theme places every full widget, a reduced one only known ones, every widget is placed somewhere, and rows fill 12 columns', () => {
-  for (const theme of themes) {
-    // a full theme that left a widget out would hide that card from whoever picks it
-    if (theme.dashboard.reduced !== true)
-      assert.deepEqual(new Set(theme.dashboard.widgets.map((w) => w.id)), new Set(FULL_WIDGET_IDS), theme.id);
-    for (const bp of ['md', 'xl'] as const) {
-      for (const row of placeAt(theme.dashboard.widgets, bp)) {
-        assert.equal(row.filled, 12, `${theme.id} ${bp}: ${row.widgets.map((w) => w.id).join(', ')}`);
-      }
-    }
-  }
-  // a widget no built-in theme places is a widget nobody sees
-  const placed = new Set(themes.flatMap((t) => t.dashboard.widgets.map((w) => w.id)));
-  for (const id of WIDGET_IDS) assert.ok(placed.has(id), `no built-in theme places ${id}`);
-  for (const id of GLANCE_WIDGET_IDS) assert.ok((WIDGET_IDS as readonly string[]).includes(id), id);
-});
-
-test('a widget with nothing to show gives its columns to its row', () => {
-  const layout = [
-    { id: 'cpu', span: { base: 12, md: 6, xl: 4 } },
-    { id: 'memory', span: { base: 12, md: 6, xl: 3 } },
-    { id: 'temperatures', span: { base: 12, md: 6, xl: 2 } },
-    { id: 'system', span: { base: 12, md: 6, xl: 3 } },
-    { id: 'path', span: { base: 12 } },
-  ];
-  const out = withoutHidden(layout, new Set(['temperatures']));
-  assert.deepEqual(
-    out.map((w) => w.id),
-    ['cpu', 'memory', 'system', 'path'],
-  );
-  // xl: to the next in its row (system 3 + 2); md: system fills its row alone
-  assert.deepEqual(out[2]?.span, { base: 12, md: 12, xl: 5 });
-  for (const bp of ['base', 'md', 'xl'] as const) {
-    for (const row of rowsAt(out, bp))
-      assert.equal(
-        row.reduce((n, w) => n + columnsAt(w.span, bp), 0),
-        12,
-        bp,
-      );
-  }
-  // the last in its row gives to the one before it
-  const end = withoutHidden(
-    [
-      { id: 'a', span: { base: 12, xl: 8 } },
-      { id: 'b', span: { base: 12, xl: 4 } },
-      { id: 'c', span: { base: 12 } },
-    ],
-    new Set(['b']),
-  );
-  assert.deepEqual(end[0]?.span, { base: 12, md: 12, xl: 12 });
-  // nothing hidden: unchanged
-  assert.deepEqual(withoutHidden(layout, new Set()), layout);
-  // every theme stays full with no temperature sensors
-  for (const theme of themes) {
-    const hidden = withoutHidden(theme.dashboard.widgets, new Set(['temperatures']));
-    for (const bp of ['md', 'xl'] as const) {
-      for (const row of placeAt(hidden, bp))
-        assert.equal(row.filled, 12, `${theme.id} ${bp}: ${row.widgets.map((w) => w.id).join(', ')}`);
-    }
-  }
-});
-
 test('the path flags a busy internet line, by the same rule as Responsiveness', () => {
   const quiet = [
     { wanDown: 2e5, wanUp: 1e5 },
@@ -455,33 +355,6 @@ test('the path flags a busy internet line, by the same rule as Responsiveness', 
   const { shared } = pathSteps({ ...base, lineBusy: true });
   assert.equal(shared[0]?.state, 'busy');
   assert.equal(shared[0].status, 'Busy');
-});
-
-test('a tall widget keeps its columns in the rows below it, and its rows become classes', () => {
-  const layout = [
-    { id: 'responsiveness', span: { base: 12, xl: 8 }, rows: { xl: 3 } },
-    { id: 'internet', span: { base: 12, md: 4, xl: 4 } },
-    { id: 'wifi', span: { base: 12, md: 4, xl: 4 } },
-    { id: 'devices', span: { base: 12, md: 4, xl: 4 } },
-    { id: 'cpu', span: { base: 12, xl: 12 } },
-  ];
-  assert.deepEqual(
-    placeAt(layout, 'xl').map((r) => [r.widgets.map((w) => w.id), r.filled]),
-    [
-      [['responsiveness', 'internet'], 12],
-      [['wifi'], 12],
-      [['devices'], 12],
-      [['cpu'], 12],
-    ],
-  );
-  // at md it's one row each: the tiles share a row, the tall one has its own
-  assert.deepEqual(
-    rowsAt(layout, 'md').map((r) => r.map((w) => w.id)),
-    [['responsiveness'], ['internet', 'wifi', 'devices'], ['cpu']],
-  );
-  assert.equal(rowClass({ xl: 3 }), 'xl:row-span-3');
-  assert.equal(rowClass({ md: 2, xl: 9 }), 'md:row-span-2 xl:row-span-1');
-  assert.equal(rowClass(undefined), '');
 });
 
 test("one bogus sample can't set the bar for a busy line", () => {

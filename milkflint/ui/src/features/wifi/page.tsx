@@ -71,7 +71,9 @@ export function WifiPage(): ReactElement {
   const { data, error, loading, reload } = useLoad(loadNetworks);
   const live = useWifiLive();
   const [edits, setEdits] = useState<Record<string, RadioForm>>({});
-  // not set yet: GB is filled in, so saving sets it (Discard leaves it unset)
+  // not set on every radio: the radios' own country (GB if none has one) is
+  // filled in, so saving sets it everywhere (Discard leaves it as it is);
+  // nothing when the radios have different ones
   const [countryEdit, setCountryEdit] = useState<string>();
   const onApplied = useCallback(() => {
     setEdits({});
@@ -82,7 +84,7 @@ export function WifiPage(): ReactElement {
 
   const saved = useMemo(() => [...(data?.forms ?? [])].sort((a, b) => bandOrder(a.band) - bandOrder(b.band)), [data]);
   const forms = useMemo(() => saved.map((f) => edits[f.radio] ?? f), [saved, edits]);
-  const country = countryEdit ?? (data === undefined ? '' : data.country === '' ? 'GB' : data.country);
+  const country = countryEdit ?? (data === undefined ? '' : data.country === '' ? data.fill : data.country);
   const countryDirty = data !== undefined && country !== data.country;
   const rules = usePoll(() => getRegulatory(country), 3_600_000, country).data?.rules;
   const dirty = countryDirty || forms.some((f, i) => networkChanged(f, saved[i]));
@@ -167,6 +169,7 @@ export function WifiPage(): ReactElement {
               countries={data?.countries ?? []}
               value={country}
               saved={data?.country ?? ''}
+              mixed={data?.mixed ?? []}
               radios={data?.radios ?? []}
               bandsHere={[...new Set(forms.map((f) => f.band))]}
               onChange={setCountryEdit}

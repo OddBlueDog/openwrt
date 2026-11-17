@@ -17,84 +17,16 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
-import { bool, type Change, getConfig, list, str } from '@/lib/api/uci';
+import { type Change, getConfig } from '@/lib/api/uci';
 import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
-
-const actions = {
-  reboot: { label: 'Restart the router', done: 'restarts the router' },
-  wifi_off: { label: 'Turn Wi-Fi off', done: 'turns Wi-Fi off' },
-  wifi_on: { label: 'Turn Wi-Fi on', done: 'turns Wi-Fi on' },
-} as const;
-type Action = keyof typeof actions;
-
-// cron numbering: 0 = Sunday
-const days = [
-  { n: 1, label: 'Mon', name: 'Monday' },
-  { n: 2, label: 'Tue', name: 'Tuesday' },
-  { n: 3, label: 'Wed', name: 'Wednesday' },
-  { n: 4, label: 'Thu', name: 'Thursday' },
-  { n: 5, label: 'Fri', name: 'Friday' },
-  { n: 6, label: 'Sat', name: 'Saturday' },
-  { n: 0, label: 'Sun', name: 'Sunday' },
-] as const;
-
-interface Task {
-  /** Stable key in this form. */
-  key: string;
-  /** UCI section name for tasks already saved. */
-  section: string | undefined;
-  action: Action;
-  time: string;
-  /** Empty: every day. */
-  days: number[];
-  enabled: boolean;
-}
+import { actions, days, isAction, sentence, type Task, tasksFrom } from './model';
 
 let nextKey = 0;
 const newKey = (): string => `new-${String(nextKey++)}`;
 
-function isAction(v: string | undefined): v is Action {
-  return v !== undefined && v in actions;
-}
-
 async function loadTasks(): Promise<Task[]> {
-  const sections = await getConfig('milkflint').catch(() => []);
-  return sections
-    .filter((s) => s['.type'] === 'schedule')
-    .flatMap((s): Task[] => {
-      const action = str(s, 'action');
-      if (!isAction(action)) return [];
-      return [
-        {
-          key: s['.name'],
-          section: s['.name'],
-          action,
-          time: str(s, 'time') ?? '04:00',
-          days: list(s, 'days')
-            .map(Number)
-            .filter((n) => n >= 0 && n <= 6),
-          enabled: bool(s, 'enabled', true),
-        },
-      ];
-    });
-}
-
-function describeDays(d: readonly number[]): string {
-  if (d.length === 0 || d.length === 7) return 'every day';
-  const set = new Set(d);
-  if (set.size === 5 && [1, 2, 3, 4, 5].every((n) => set.has(n))) return 'on weekdays';
-  if (set.size === 2 && set.has(0) && set.has(6)) return 'at weekends';
-  return `on ${days
-    .filter((x) => set.has(x.n))
-    .map((x) => x.label)
-    .join(', ')}`;
-}
-
-/** "Restarts the router at 04:00 every day" */
-function sentence(t: Task): string {
-  const s = `${actions[t.action].done} at ${t.time} ${describeDays(t.days)}`;
-  return s.charAt(0).toUpperCase() + s.slice(1);
+  return tasksFrom(await getConfig('milkflint').catch(() => []));
 }
 
 function toChanges(tasks: readonly Task[], before: readonly Task[]): Change[] {

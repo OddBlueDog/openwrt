@@ -30,12 +30,16 @@ function same(a: string | string[] | undefined, b: string | string[]): boolean {
   return x.length === y.length && x.every((v, i) => v === y[i]);
 }
 
-/** Changes that make `section` hold `values` (an add when it's missing). */
+/**
+ * Changes that make `section` hold `values` (an add when it's missing). An
+ * empty string is no value: uci deletes an option set to '' rather than
+ * keeping it, so wanting one would show as a change after every save.
+ */
 export function sectionChanges(w: Wanted, section: Section | undefined): Change[] {
   const set: Record<string, string | string[]> = {};
   const unset: string[] = [];
   for (const [option, value] of Object.entries(w.values)) {
-    if (value === undefined || (Array.isArray(value) && value.length === 0)) {
+    if (value === undefined || value === '' || (Array.isArray(value) && value.length === 0)) {
       if (section?.[option] !== undefined) unset.push(option);
     } else if (!same(section?.[option], value)) {
       set[option] = value;

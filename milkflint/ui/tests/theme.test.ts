@@ -44,16 +44,9 @@ test('themes: every scheme defines exactly the contract’s tokens', () => {
     }
     assert.deepEqual(Object.keys(theme.type.scale).sort(), [...TEXT_SIZES].sort());
     assert.deepEqual(Object.keys(theme.shape.radius).sort(), [...RADII].sort());
+    // Home's layout: tests/home-layout.test.ts checks each theme's against the widgets
     const widgetIds = theme.dashboard.widgets.map((w) => w.id);
     assert.equal(new Set(widgetIds).size, widgetIds.length, `${theme.id}: a widget placed twice`);
-    for (const w of theme.dashboard.widgets) {
-      for (const n of [w.span.base, w.span.md, w.span.xl]) {
-        if (n !== undefined) assert.ok(Number.isInteger(n) && n >= 1 && n <= 12, `${theme.id} ${w.id}: span ${n}`);
-      }
-      for (const n of [w.rows?.md, w.rows?.xl]) {
-        if (n !== undefined) assert.ok(Number.isInteger(n) && n >= 1 && n <= 4, `${theme.id} ${w.id}: rows ${n}`);
-      }
-    }
   }
 });
 
@@ -189,7 +182,6 @@ test('themes: the existing themes keep their look', () => {
     assert.deepEqual(theme.chart, solidCharts, id);
     assert.equal(theme.layout.tools, 'full', id);
     assert.equal(theme.contrast, undefined, id);
-    assert.equal(theme.dashboard.reduced, undefined, id);
   }
 });
 

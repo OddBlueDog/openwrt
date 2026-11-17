@@ -50,6 +50,8 @@ export interface FeedInfo {
   risk: Risk;
   /** why, when it's more than low */
   riskText?: string;
+  /** where a list that needs an Auth-Key (see needsKey) gets one */
+  keyFrom?: { name: string; url: string };
 }
 
 export const FEED_INFO: Readonly<Record<string, FeedInfo>> = {
@@ -146,7 +148,12 @@ export const FEED_INFO: Readonly<Record<string, FeedInfo>> = {
     text: 'The servers that control banking malware (Emotet, Dridex and others), from abuse.ch.',
     risk: 'low',
   },
-  urlhaus: { category: 'malware', text: 'Servers abuse.ch’s URLhaus saw spreading malware, on web ports.', risk: 'low' },
+  urlhaus: {
+    category: 'malware',
+    text: 'Servers abuse.ch’s URLhaus saw spreading malware, on web ports.',
+    risk: 'low',
+    keyFrom: { name: 'abuse.ch', url: 'https://auth.abuse.ch/' },
+  },
   urlvir: { category: 'malware', text: 'Hosts serving malware, on web ports.', risk: 'low' },
   webclient: {
     category: 'malware',

@@ -3,7 +3,6 @@
 // with the line's traffic while Home is open, load-store.ts), the hour's
 // typical, worst, lost, jitter, DNS lookup and gateway, and the hour as a
 // chart with the busy stretches Home saw shaded.
-import { ActivityIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { Skeleton } from '@/components/ui/skeleton';
 import type { Poll } from '@/hooks/use-poll';
@@ -44,7 +43,7 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
 
   if (live.data === undefined) {
     return (
-      <Widget icon={ActivityIcon} title="Responsiveness" aside={live.error === undefined ? undefined : link}>
+      <Widget aside={live.error === undefined ? undefined : link}>
         {live.error === undefined ? (
           <div className="flex flex-col gap-3 px-5">
             <Skeleton className="h-10 w-32" />
@@ -60,7 +59,7 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
   const { status, samples } = live.data;
   if (!status.enabled) {
     return (
-      <Widget icon={ActivityIcon} title="Responsiveness" aside={<StateBadge tone="off">Not measured</StateBadge>}>
+      <Widget aside={<StateBadge tone="off">Not measured</StateBadge>}>
         <OffNote action={<WidgetLink href={href('network-quality')}>Turn on Network Quality</WidgetLink>}>
           Network Quality pings the internet every few seconds to show how quickly it answers.
         </OffNote>
@@ -94,8 +93,6 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
 
   return (
     <Widget
-      icon={ActivityIcon}
-      title="Responsiveness"
       status={target === undefined ? undefined : `Ping to ${target}`}
       aside={
         <>
@@ -104,7 +101,8 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
         </>
       }
     >
-      <div className="grid gap-x-6 gap-y-4 px-5 @lg:grid-cols-[13rem_minmax(0,1fr)]">
+      {/* the chart takes the height the widget has spare */}
+      <div className="grid flex-1 grid-rows-[auto_1fr] gap-x-6 gap-y-4 px-5 @lg:grid-cols-[13rem_minmax(0,1fr)] @lg:grid-rows-1">
         <dl className="grid grid-cols-3 content-start gap-x-4 gap-y-3 @lg:grid-cols-2">
           <div className="col-span-2 flex flex-col @lg:col-span-1">
             <dt className="text-xs text-muted-foreground">Ping now</dt>
@@ -143,12 +141,14 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
           <Figure label="Typical" value={r.hour.typical === undefined ? '—' : ms(r.hour.typical)} />
           <Figure label="Worst" value={r.hour.worst === undefined ? '—' : ms(r.hour.worst)} />
           <Figure label="Lost" value={formatPercent(r.hour.loss)} tone={r.hour.loss > 0.02 ? 'warning' : undefined} />
-          <Figure label="Jitter" value={time(hourly.jitter)} />
-          <Figure label="DNS lookup" value={time(hourly.probes.dns.typical)} />
-          {!hourly.gatewaySilent && <Figure label="Gateway" value={time(hourly.probes.gateway.typical)} />}
+          {/* these go before the graph does, when the widget is short of room */}
+          <Figure fit={1} label="Jitter" value={time(hourly.jitter)} />
+          <Figure fit={1} label="DNS lookup" value={time(hourly.probes.dns.typical)} />
+          {!hourly.gatewaySilent && <Figure fit={1} label="Gateway" value={time(hourly.probes.gateway.typical)} />}
         </dl>
         <div className="flex min-w-0 flex-col gap-1">
           <TimeChart
+            fill
             lines={[
               { label: 'Ping', color: 'var(--chart-1)', points: hourSamples.map((s) => [s.t, s.internet] as const), area: true },
             ]}
@@ -170,10 +170,9 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
               // the newest stretch is labelled; older ones would crowd it
               label: i === load.stretches.length - 1 ? `Busy line ${hhmm(b.from)}` : undefined,
             }))}
-            // taller in a wide card, beside the status tiles and their graphs
-            className="h-32 @xl:h-44"
+            className="min-h-24"
           />
-          <p className="text-xs text-muted-foreground">
+          <p data-fit className="text-xs text-muted-foreground">
             {since === undefined
               ? 'At rest and under load: measuring while Home is open.'
               : load.busy === 0

@@ -23,12 +23,14 @@ import {
   ipBytes,
   lineOwner,
   memoryCheck,
+  needsKey,
   overlaps,
   parseEntry,
   parseLogLine,
   parseNet,
   portLimit,
   presetOf,
+  RESULTS,
   scheduleText,
   selectionOf,
   serviceOf,
@@ -411,4 +413,24 @@ test('a list limited to some ports says so in words', () => {
   const web = portLimit('tcp 80 443');
   assert.ok(web !== null);
   assert.equal(limitText(web), 'TCP ports 80, 443 (web)');
+});
+
+test('a list that needs a personal key (urlhaus since banIP 1.9.1-r3): found by its address, the key checked as banIP takes it', () => {
+  const feeds = JSON.parse(
+    readFileSync(new URL('../../../package/milkflint/banip/files/banip.feeds', import.meta.url), 'utf8'),
+  ) as Record<string, { url_4?: string; url_6?: string }>;
+  const keyed = Object.entries(feeds)
+    .filter(([, f]) => needsKey(f))
+    .map(([name]) => name);
+  assert.deepEqual(keyed, ['urlhaus']);
+  assert.equal(needsKey({ url_4: 'https://example.org/list.txt', url_6: null }), false);
+  assert.equal(needsKey({ url_6: 'https://example.org/{authkey}/v6.txt' }), true);
+  // banIP skips the list unless the key is letters, digits, - and _ (banip-service.sh)
+  assert.equal(checkValue('ban_authkey', 'a1B2-c3_D4'), null);
+  assert.equal(checkValue('ban_authkey', 'abc def'), 'format');
+  assert.equal(checkValue('ban_authkey', 'abc/../x'), 'format');
+  assert.equal(checkValue('ban_authkey', "abc'; reboot"), 'format');
+  assert.equal(checkValue('ban_authkey', ''), 'format');
+  assert.equal(needsRestart({ ban_authkey: 'abc' }), true);
+  assert.match(RESULTS['nokey'] ?? '', /Auth-Key/);
 });

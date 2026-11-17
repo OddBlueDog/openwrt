@@ -1,12 +1,13 @@
-import { ArrowDownUpIcon } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
 import { niceCeil } from '@/components/charts/path';
 import { formatBitrate } from '@/lib/format';
 import { Segmented } from '@/components/ui/segmented';
+import { cn } from '@/lib/utils';
 import { agoLabels } from './model';
 import { TimeChart } from './time-chart';
 import { type Dashboard, HISTORY, POLL_MS } from './use-dashboard';
 import { Widget } from './widget';
+import { useWidgetInfo } from './widget-info';
 import { SeriesSwatch } from '@/components/charts/series-swatch';
 import { seriesDash } from '@/components/charts/series';
 
@@ -22,6 +23,7 @@ const UP = 'var(--chart-1)';
 
 export function TrafficCard({ d }: { d: Dashboard }): ReactElement {
   const [view, setView] = useState<View>('internet');
+  const tall = useWidgetInfo().size.h === 2;
   const v = views[view];
   const last = d.history[d.history.length - 1];
   const seconds = (HISTORY * POLL_MS) / 1000;
@@ -34,8 +36,6 @@ export function TrafficCard({ d }: { d: Dashboard }): ReactElement {
 
   return (
     <Widget
-      icon={ArrowDownUpIcon}
-      title="Throughput"
       description={v.hint}
       aside={
         <Segmented
@@ -46,12 +46,14 @@ export function TrafficCard({ d }: { d: Dashboard }): ReactElement {
         />
       }
     >
-      <div className="flex flex-col gap-3 px-5">
-        <dl className="flex gap-8">
+      {/* one row tall and wide enough: the figures beside the graph, so the graph has the height */}
+      <div className={cn('flex flex-1 flex-col gap-3 px-5', !tall && '@sm:flex-row @sm:gap-6')}>
+        <dl className={cn('flex gap-8', !tall && '@sm:flex-col @sm:justify-center @sm:gap-1')}>
           <Legend color={DOWN} label="Download" value={last?.[v.down]} />
           <Legend color={UP} label="Upload" value={last?.[v.up]} />
         </dl>
         <TimeChart
+          fill
           lines={[
             { label: 'Download', color: DOWN, points: d.history.map((s) => [s.t, s[v.down] ?? null] as const), area: true },
             { label: 'Upload', color: UP, points: d.history.map((s) => [s.t, s[v.up] ?? null] as const), area: true },
@@ -63,7 +65,7 @@ export function TrafficCard({ d }: { d: Dashboard }): ReactElement {
           format={formatBitrate}
           label={`${v.label} download and upload over the last ${String(seconds / 60)} minutes`}
           xLabels={agoLabels(from, to, `${String(seconds / 60)} min`)}
-          className="h-36 @2xl:h-44"
+          className={tall ? 'min-h-24' : 'min-h-6'}
           empty={
             peak === 0
               ? `No traffic in the last ${String(seconds / 60)} minutes`

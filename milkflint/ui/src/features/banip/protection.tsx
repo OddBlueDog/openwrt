@@ -41,6 +41,7 @@ import {
   feedDirection,
   limitText,
   memoryCheck,
+  needsKey,
   portLimit,
   presetOf,
   REGIONS,
@@ -49,7 +50,7 @@ import {
   withDirection,
   withPreset,
 } from './model';
-import { effective, type OptionName, type Options, optionChanges } from './options';
+import { checkValue, effective, type OptionName, type Options, optionChanges } from './options';
 import { Segmented } from '@/components/ui/segmented';
 
 const KEYS: readonly OptionName[] = [
@@ -63,6 +64,8 @@ const KEYS: readonly OptionName[] = [
   'ban_countrysplit',
   'ban_asn',
   'ban_asnsplit',
+  // set in a list's row (urlhaus): the lists that need one
+  'ban_authkey',
 ];
 
 const DIRECTIONS: readonly { value: Direction; label: string; title: string }[] = [
@@ -210,6 +213,7 @@ function FeedRow({
   onDirection,
   onReset,
   onEdit,
+  authKey,
 }: {
   f: Feed;
   on: boolean;
@@ -223,6 +227,8 @@ function FeedRow({
   onDirection: (d: Direction) => void;
   onReset: (v: boolean) => void;
   onEdit: (() => void) | undefined;
+  /** the Auth-Key, for a list that needs one (banIP has one for all of them) */
+  authKey: { value: string; onChange: (v: string) => void } | undefined;
 }): ReactElement {
   const info = infoOf(f.name);
   const risk = RISK[info?.risk ?? 'low'];
@@ -244,6 +250,23 @@ function FeedRow({
         <p id={`${id}-text`} className="text-sm text-muted-foreground">
           {info?.text ?? f.descr ?? ''}
           {info?.riskText !== undefined && <span className="text-xs"> {info.riskText}</span>}
+          {authKey !== undefined && (
+            <span className="text-xs">
+              {' '}
+              It needs an Auth-Key
+              {info?.keyFrom === undefined ? (
+                ' from the list’s provider'
+              ) : (
+                <>
+                  , free from{' '}
+                  <a href={info.keyFrom.url} target="_blank" rel="noreferrer" className="underline underline-offset-2">
+                    {info.keyFrom.name}
+                  </a>
+                </>
+              )}
+              : banIP skips it until one is set.
+            </span>
+          )}
         </p>
         <p className="text-xs text-muted-foreground tabular">
           {entries !== undefined && entries > 0
@@ -253,6 +276,7 @@ function FeedRow({
           {on && loaded && result === undefined ? ', loaded' : ''}
           {result !== undefined && <span className="text-warning">, last update: {RESULTS[result] ?? result}</span>}
         </p>
+        {authKey !== undefined && on && <AuthKeyField name={f.name} {...authKey} />}
         {limit !== null && on && (
           <label className="flex w-fit items-center gap-2 text-xs text-muted-foreground">
             <Switch checked={reset} onCheckedChange={onReset} className="scale-90" aria-label={`${f.name}: every port`} />
@@ -269,6 +293,34 @@ function FeedRow({
         )}
       </div>
     </li>
+  );
+}
+
+// The key a list with "{authkey}" in its address needs: banIP has one for
+// all of them (ban_authkey), as luci-app-banip's Feed Auth-Key. Hidden as
+// it's typed, like a password: it's a personal account's.
+function AuthKeyField({ name, value, onChange }: { name: string; value: string; onChange: (v: string) => void }): ReactElement {
+  const id = useId();
+  const bad = value !== '' && checkValue('ban_authkey', value) !== null;
+  return (
+    <div className="flex max-w-sm flex-col gap-1">
+      <label htmlFor={id} className="text-xs text-muted-foreground">
+        Auth-Key {value === '' && <span className="text-warning">(not set: {name} is skipped)</span>}
+      </label>
+      <Input
+        id={id}
+        type="password"
+        autoComplete="off"
+        spellCheck={false}
+        className="h-8"
+        value={value}
+        aria-invalid={bad}
+        onChange={(e) => {
+          onChange(e.target.value.trim());
+        }}
+      />
+      {bad && <p className="text-xs text-destructive">Letters, digits, - and _ only.</p>}
+    </div>
   );
 }
 
@@ -412,6 +464,16 @@ function Catalogue({
                         f.own
                           ? () => {
                               setEditing(f);
+                            }
+                          : undefined
+                      }
+                      authKey={
+                        needsKey(f)
+                          ? {
+                              value: typeof opts.ban_authkey === 'string' ? opts.ban_authkey : '',
+                              onChange: (v) => {
+                                setOpts({ ...opts, ban_authkey: v === '' ? null : v });
+                              },
                             }
                           : undefined
                       }
@@ -839,6 +901,7 @@ export function ProtectionTab({
     c.memory !== undefined &&
     !memoryCheck(est, c.memory, c.runtime?.counts?.elements ?? 0, now.perEntry).ok;
   const timeBad = !/^([01]\d|2[0-3]):[0-5]\d$/.test(draft.milkflint['time'] ?? '04:00');
+  const keyBad = checkValue('ban_authkey', draft.options.ban_authkey ?? null) !== null;
   const setOpts = (o: Options): void => {
     setDraft((d) => ({ ...d, options: o }));
     // a list changed by hand: no preset card stands for it any more
@@ -920,7 +983,7 @@ export function ProtectionTab({
       <SaveBar
         visible={dirty}
         busy={state.phase === 'applying'}
-        invalid={short || timeBad}
+        invalid={short || timeBad || keyBad}
         onSave={save}
         onRevert={() => {
           setDraft(initialDraft(c));

@@ -1,7 +1,7 @@
 // The Wi-Fi devices, busiest first: what each is downloading and uploading
 // now, its signal, its link speeds and how long it's been connected. A table
 // on a wide card, a list of cards on a narrow one, with the same figures.
-import { ChartBarDecreasingIcon, MonitorSmartphoneIcon } from 'lucide-react';
+import { MonitorSmartphoneIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { SignalBars, SNR_HINT } from '@/components/charts/signal-bars';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -11,9 +11,11 @@ import { cn } from '@/lib/utils';
 import { deviceLabel } from '../clients/model';
 import { busiestFirst } from './model';
 import type { Client, Dashboard } from './use-dashboard';
+import { useFit } from './fit';
 import { OffNote, Way, Widget, WidgetLink } from './widget';
 
-const SHOWN = 8;
+/** At most how many devices it lists at one row tall, and at two (fewer where they don’t fit). */
+const SHOWN = { 1: 4, 2: 8 } as const;
 
 /** Its name, or "Unnamed device" as on every page that lists devices (its address is under it). */
 const label = (c: Client): string => deviceLabel(c.name);
@@ -197,17 +199,15 @@ function perBand(clients: Dashboard['clients']): [string, number][] {
   return [...bands].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
-export function ClientsCard({ d }: { d: Dashboard }): ReactElement {
-  const shown = busiestFirst(d.clients).slice(0, SHOWN);
+export function ClientsCard({ d, rows }: { d: Dashboard; rows: 1 | 2 }): ReactElement {
+  const shown = busiestFirst(d.clients).slice(0, SHOWN[rows]);
   const most = Math.max(1, ...shown.map((c) => c.down ?? 0));
   const count = d.clients.length;
+  // the list is as long as the widget has room for, above the total
+  const list = useFit<HTMLDivElement>();
   return (
     <Widget
-      icon={ChartBarDecreasingIcon}
-      title="Busiest Wi-Fi devices"
-      status={
-        count === 0 ? undefined : count > SHOWN ? `${String(SHOWN)} of ${formatNumber(count)}, busiest first` : 'Busiest first'
-      }
+      status={count === 0 ? undefined : 'Busiest first'}
       aside={<WidgetLink href={href('clients')}>All devices</WidgetLink>}
     >
       {count === 0 ? (
@@ -216,83 +216,85 @@ export function ClientsCard({ d }: { d: Dashboard }): ReactElement {
         </OffNote>
       ) : (
         <>
-          {/* a wide card: a table */}
-          <div className="hidden @2xl:block">
-            {/* the device column takes what the figures leave (and truncates); the figures never wrap */}
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-y bg-muted/50 text-left text-xs text-muted-foreground">
-                  <th scope="col" className="h-9 w-full py-0 pr-3 pl-5 font-medium">
-                    Device
-                  </th>
-                  <th scope="col" className="px-3 font-medium whitespace-nowrap">
-                    Now
-                  </th>
-                  <th scope="col" className="px-3 font-medium whitespace-nowrap">
-                    Signal
-                  </th>
-                  <th scope="col" className="px-3 font-medium whitespace-nowrap">
-                    <span title="The link speeds the radios negotiated, to the device and from it">
-                      Link <Way dir="down" /> / <Way dir="up" />
-                    </span>
-                  </th>
-                  <th scope="col" className="py-0 pr-5 pl-3 text-right font-medium whitespace-nowrap">
-                    Connected
-                  </th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {shown.map((c) => (
-                  <tr key={c.mac}>
-                    <td className="max-w-0 py-2.5 pr-3 pl-5">
-                      <Name c={c} />
-                    </td>
-                    <td className="w-32 min-w-32 px-3 py-2.5">
-                      <Traffic c={c} most={most} />
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <Signal c={c} />
-                    </td>
-                    <td className="px-3 py-2.5">
-                      <Link c={c} />
-                    </td>
-                    <td className="py-2.5 pr-5 pl-3 text-right text-xs whitespace-nowrap text-muted-foreground tabular">
-                      {connected(c)}
-                    </td>
+          <div {...list} className="flex min-h-0 flex-1 flex-col">
+            {/* a wide card: a table */}
+            <div className="hidden @min-[38rem]:block">
+              {/* the device column takes what the figures leave (and truncates); the figures never wrap */}
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-y bg-muted/50 text-left text-xs text-muted-foreground">
+                    <th scope="col" className="h-9 w-full py-0 pr-3 pl-5 font-medium">
+                      Device
+                    </th>
+                    <th scope="col" className="px-3 font-medium whitespace-nowrap">
+                      Now
+                    </th>
+                    <th scope="col" className="px-3 font-medium whitespace-nowrap">
+                      Signal
+                    </th>
+                    <th scope="col" className="px-3 font-medium whitespace-nowrap">
+                      <span title="The link speeds the radios negotiated, to the device and from it">
+                        Link <Way dir="down" /> / <Way dir="up" />
+                      </span>
+                    </th>
+                    <th scope="col" className="py-0 pr-5 pl-3 text-right font-medium whitespace-nowrap">
+                      Connected
+                    </th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y">
+                  {shown.map((c) => (
+                    <tr key={c.mac} data-fit>
+                      <td className="max-w-0 py-2.5 pr-3 pl-5">
+                        <Name c={c} />
+                      </td>
+                      <td className="w-32 min-w-32 px-3 py-2.5">
+                        <Traffic c={c} most={most} />
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <Signal c={c} />
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <Link c={c} />
+                      </td>
+                      <td className="py-2.5 pr-5 pl-3 text-right text-xs whitespace-nowrap text-muted-foreground tabular">
+                        {connected(c)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {/* a narrow card (a phone): one card per device, every figure kept */}
+            <ul className="flex flex-col divide-y border-t @min-[38rem]:hidden">
+              {shown.map((c) => (
+                <li key={c.mac} data-fit className="flex flex-col gap-3 px-5 py-3">
+                  <Name c={c} />
+                  <Traffic c={c} most={most} />
+                  <dl className="grid grid-cols-3 gap-x-3 gap-y-1">
+                    <div className="flex min-w-0 flex-col gap-0.5">
+                      <dt className="text-xs text-muted-foreground">Signal</dt>
+                      <dd>
+                        <Signal c={c} />
+                      </dd>
+                    </div>
+                    <div className="flex min-w-0 flex-col gap-0.5">
+                      <dt className="text-xs text-muted-foreground">Link</dt>
+                      <dd className="leading-tight">
+                        <Link c={c} stacked />
+                      </dd>
+                    </div>
+                    <div className="flex min-w-0 flex-col gap-0.5">
+                      <dt className="text-xs text-muted-foreground">Connected</dt>
+                      <dd className="text-xs tabular">{connected(c)}</dd>
+                    </div>
+                  </dl>
+                </li>
+              ))}
+            </ul>
           </div>
-          {/* a narrow card (a phone): one card per device, every figure kept */}
-          <ul className="flex flex-col divide-y border-t @2xl:hidden">
-            {shown.map((c) => (
-              <li key={c.mac} className="flex flex-col gap-3 px-5 py-3">
-                <Name c={c} />
-                <Traffic c={c} most={most} />
-                <dl className="grid grid-cols-3 gap-x-3 gap-y-1">
-                  <div className="flex min-w-0 flex-col gap-0.5">
-                    <dt className="text-xs text-muted-foreground">Signal</dt>
-                    <dd>
-                      <Signal c={c} />
-                    </dd>
-                  </div>
-                  <div className="flex min-w-0 flex-col gap-0.5">
-                    <dt className="text-xs text-muted-foreground">Link</dt>
-                    <dd className="leading-tight">
-                      <Link c={c} stacked />
-                    </dd>
-                  </div>
-                  <div className="flex min-w-0 flex-col gap-0.5">
-                    <dt className="text-xs text-muted-foreground">Connected</dt>
-                    <dd className="text-xs tabular">{connected(c)}</dd>
-                  </div>
-                </dl>
-              </li>
-            ))}
-          </ul>
           {/* the bottom of the card: how many are on Wi-Fi and where, however tall its row is */}
-          <p className="mt-auto flex flex-wrap gap-x-3 gap-y-1 border-t px-5 pt-4 text-sm text-muted-foreground">
+          <p className="flex flex-wrap gap-x-3 gap-y-1 border-t px-5 pt-4 text-sm text-muted-foreground">
             <span className="font-medium text-foreground">{onWifi(count)}</span>
             {perBand(d.clients).map(([band, n]) => (
               <span key={band}>
