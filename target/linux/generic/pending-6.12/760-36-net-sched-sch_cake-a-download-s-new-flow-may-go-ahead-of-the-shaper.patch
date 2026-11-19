@@ -1,0 +1,425 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 19 Nov 2026 17:20:00 +0000
+Subject: [PATCH] net/sched: sch_cake: a download's new flow may go ahead of the shaper
+
+On a download, CAKE's queue comes after the line's bottleneck: a packet
+in it has already crossed the line, and holding it back for the shaper
+changes nothing its sender sees. A sparse flow's packet (a DNS answer, a
+game's or a call's) arriving just after a bulk packet still waits for
+that packet's time at the shaper's rate, and the timer's slack.
+
+sparse_ahead_us, a module parameter, 0 (off, as upstream) by default.
+With it set, while the shaper holds packets back, the new flow a tin
+would serve next goes at once if it has deficit left, its packet came in
+through a device's ingress (an ifb), and the shaper is due to let the
+next packet go within sparse_ahead_us. The packet is charged to the
+shaper as any other, so the ones held back wait that much longer and the
+rate holds over time: over any span of time, no more goes than the rate
+allows in it and sparse_ahead_us's worth. Bulk flows, and uploads (whose
+queue is before the bottleneck), wait for the shaper as before. Under
+cake_mq the sub-queue still counts as held back, and the packet as sent,
+and as its sparse flows'.
+
+KUnit: a new flow's packet goes at once with it set and waits with it 0;
+a bulk packet and an upload's wait either way; a train of them goes
+early only until the shaper is sparse_ahead_us ahead; as many bytes go
+over a while either way; cake_mq's accounts.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2322,6 +2322,22 @@ static bool cake_redirected_from_ingress(const struct sk_buff *skb)
+ #endif
+ }
+ 
++/* On a download, CAKE's queue comes after the line's bottleneck: a packet
++ * in it has already crossed the line, and holding it back for the shaper
++ * changes nothing its sender sees. With this set, while the shaper holds
++ * packets back, a new flow's packet that came in through a device's
++ * ingress (an ifb) goes at once if the shaper is due to let the next one
++ * go within this long: the next new flow a tin would serve, with deficit
++ * left (cake_sparse_ahead()). It's charged to the shaper as any packet is,
++ * so the ones held back wait that much longer and the rate holds over
++ * time; at any moment, no more than this much (and a packet) has gone
++ * ahead of it. Bulk flows, and uploads, wait for the shaper as before.
++ * 0: off, as upstream.
++ */
++static unsigned int sparse_ahead_us __read_mostly;
++module_param(sparse_ahead_us, uint, 0644);
++MODULE_PARM_DESC(sparse_ahead_us, "How far ahead of the shaper a new flow's packet may go on a download (us, 0: never)");
++
+ /* The DSCP to choose the tin by, for a CAKE that washes */
+ static u8 cake_wash_diffserv(struct sk_buff *skb)
+ {
+@@ -3122,6 +3138,43 @@ static void cake_mq_drained(struct cake_sched_data *q, ktime_t now)
+ 		cake_mq_retire_tin(q, &q->tins[tin], now);
+ }
+ 
++/* How far down a tin's new flows cake_sparse_ahead() looks */
++#define CAKE_AHEAD_LOOK 8
++
++/* sparse_ahead_us: the flow whose packet goes now, with the shaper due to
++ * let one go in @left ns. From the highest tin, the new flow it would serve
++ * next: past those on their way out of the new flows, out of packets or of
++ * deficit, which its next look at them would let go (a few at most). Only
++ * if its packet came in through a device's ingress. Selects it for
++ * cake_dequeue_one().
++ */
++static struct cake_flow *cake_sparse_ahead(struct cake_sched_data *q, u64 left)
++{
++	u32 ahead = READ_ONCE(sparse_ahead_us);
++	int tin;
++
++	if (likely(!ahead) || left > (u64)ahead * NSEC_PER_USEC)
++		return NULL;
++	for (tin = q->tin_cnt - 1; tin >= 0; tin--) {
++		struct cake_tin_data *b = &q->tins[tin];
++		struct cake_flow *flow;
++		int n = 0;
++
++		list_for_each_entry(flow, &b->new_flows, flowchain) {
++			if (++n > CAKE_AHEAD_LOOK)
++				break;
++			if (!flow->head || flow->deficit <= 0)
++				continue;
++			if (!cake_redirected_from_ingress(flow->head))
++				break;
++			q->cur_tin = tin;
++			q->cur_flow = flow - b->flows;
++			return flow;
++		}
++	}
++	return NULL;
++}
++
+ /* The L4S ramp (l4s_ramp) for @skb, leaving its flow. @last: no packet of the
+  * flow is left behind it.
+  */
+@@ -3156,7 +3209,7 @@ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ 	struct cake_tin_data *b = &q->tins[q->cur_tin];
+ 	struct cake_flow *flow;
+ 	struct list_head *head;
+-	bool first_flow = true;
++	bool first_flow = true, ahead = false;
+ 	struct sk_buff *skb;
+ 	ktime_t now;
+ 	u64 delay;
+@@ -3201,9 +3254,15 @@ begin:
+ 		u64 next = min(ktime_to_ns(q->time_next_packet),
+ 			       ktime_to_ns(q->failsafe_next_packet));
+ 
+-		sch->qstats.overlimits++;
+ 		if (q->config->is_shared)
+ 			q->mq_held_at = ktime_to_ns(now);
++		flow = cake_sparse_ahead(q, next - ktime_to_ns(now));
++		if (flow) {
++			b = &q->tins[q->cur_tin];
++			ahead = true;
++			goto ahead;
++		}
++		sch->qstats.overlimits++;
+ 		cake_watchdog(q, cake_mq_wake_by(q, next, now));
+ 		return NULL;
+ 	}
+@@ -3324,6 +3383,7 @@ found:
+ 		goto retry;
+ 	}
+ 
++ahead:
+ 	/* Retrieve a packet via the AQM */
+ 	while (1) {
+ 		skb = cake_dequeue_one(sch);
+@@ -3354,8 +3414,12 @@ found:
+ 		qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
+ 		qdisc_qstats_drop(sch);
+ 		kfree_skb(skb);
+-		if (q->config->rate_flags & CAKE_FLAG_INGRESS)
++		if (q->config->rate_flags & CAKE_FLAG_INGRESS) {
++			/* the shaper again, before anything else goes early */
++			if (ahead)
++				goto begin;
+ 			goto retry;
++		}
+ 	}
+ 
+ 	if (cake_l4s_mark(b, skb, now, !flow->head))
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -445,6 +445,10 @@ static struct cake_test_mq *cake_test_mq_alloc(struct kunit *test)
+ 		sch->dev_queue = txq;
+ 		q->config = mq->cfg;
+ 		rcu_assign_pointer(txq->qdisc_sleeping, sch);
++		/* as on a device that's down: a shaper's watchdog that goes off
++		 * while a test runs schedules nothing
++		 */
++		rcu_assign_pointer(txq->qdisc, &noop_qdisc);
+ 		mq->sch[i] = sch;
+ 	}
+ 	return mq;
+@@ -4586,6 +4590,253 @@ static void cake_test_mq_last_active(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, q->last_active, now);
+ }
+ 
++/* sparse_ahead_us acts only on what came in through a device's ingress */
++#ifdef CONFIG_NET_REDIRECT
++static void cake_test_ahead_back(void *old)
++{
++	WRITE_ONCE(sparse_ahead_us, (unsigned long)old);
++}
++
++/* sparse_ahead_us at @us for the test, as it was after it */
++static void cake_test_ahead_set(struct kunit *test, unsigned int us)
++{
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_ahead_back,
++							   (void *)(unsigned long)READ_ONCE(sparse_ahead_us)));
++	WRITE_ONCE(sparse_ahead_us, us);
++}
++
++/* @n packets as cake_test_pkts() makes them, in through a device's
++ * ingress (an ifb) when @ingress
++ */
++static void cake_test_dl_pkts(struct kunit *test, struct sk_buff **skb, int n, u8 host,
++			      u32 len, bool ingress)
++{
++	int i;
++
++	cake_test_pkts(test, skb, n, host, len);
++	for (i = 0; i < n; i++) {
++		skb[i]->redirected = ingress;
++		skb[i]->from_ingress = ingress;
++	}
++}
++
++/* At 1 Mbit/s, so that an MTU-sized packet holds the shaper 12 ms: while it
++ * holds a download's bulk flow back, a new flow's packet goes at once with
++ * sparse_ahead_us set (20 ms here), and waits with it 0. A bulk packet
++ * waits either way, as does an upload's packet (not in through an ifb).
++ * The packet that goes is charged to the shaper as any packet is.
++ */
++static void cake_test_sparse_ahead(struct kunit *test)
++{
++	int on;
++
++	for (on = 0; on < 2; on++) {
++		struct cake_test_mq *mq = cake_test_mq_alloc(test);
++		struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 125000,
++								CAKE_DIFFSERV_BESTEFFORT);
++		struct Qdisc *sch = mq->sch[0];
++		struct sk_buff *bulk[3], *s, *e;
++		bool ok = true, held[3], early, charged;
++		u64 tn, dur = (100 * q->rate_ns) >> q->rate_shft;
++		int i;
++
++		cake_test_ahead_set(test, on ? 20000 : 0);
++		cake_test_dl_pkts(test, bulk, 3, 5, 1514, true);
++		cake_test_dl_pkts(test, &s, 1, 6, 100, true);
++		cake_test_dl_pkts(test, &e, 1, 7, 100, false);
++		KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
++
++		rcu_read_lock_bh();
++		for (i = 0; i < 3; i++)
++			ok &= cake_test_in(sch, bulk[i]);
++		ok &= cake_test_out(sch, bulk[0]);
++		/* the bulk flow waits */
++		held[0] = !cake_dequeue(sch);
++		ok &= cake_test_in(sch, s);
++		tn = ktime_to_ns(q->time_next_packet);
++		early = cake_test_out(sch, s);
++		charged = ktime_to_ns(q->time_next_packet) == tn + dur;
++		/* an upload's packet waits */
++		ok &= cake_test_in(sch, e);
++		held[1] = !cake_dequeue(sch);
++		/* the bulk packets and the upload's still queued */
++		held[2] = sch->q.qlen == (early ? 3 : 4);
++		rcu_read_unlock_bh();
++
++		KUNIT_EXPECT_TRUE(test, ok);
++		KUNIT_EXPECT_TRUE_MSG(test, held[0], "on %d", on);
++		KUNIT_EXPECT_TRUE_MSG(test, held[1], "on %d", on);
++		KUNIT_EXPECT_TRUE_MSG(test, held[2], "on %d", on);
++		KUNIT_EXPECT_EQ_MSG(test, early, (bool)on, "on %d", on);
++		if (on)
++			KUNIT_EXPECT_TRUE(test, charged);
++	}
++}
++
++/* A train of new flows' packets, each 4 ms at the rate, while the shaper
++ * holds for 12 ms with 20 ms allowed: they go early only until the shaper
++ * is 20 ms ahead, and then wait like the rest
++ */
++static void cake_test_sparse_ahead_train(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 125000,
++							CAKE_DIFFSERV_BESTEFFORT);
++	struct Qdisc *sch = mq->sch[0];
++	u64 dur = (500 * q->rate_ns) >> q->rate_shft, left0 = 0, left = 0;
++	struct sk_buff *bulk[2], *s[6];
++	u32 early = 0;
++	bool ok = true;
++	int i;
++
++	cake_test_ahead_set(test, 20000);
++	cake_test_dl_pkts(test, bulk, 2, 5, 1514, true);
++	for (i = 0; i < 6; i++)
++		cake_test_dl_pkts(test, &s[i], 1, 10 + i, 500, true);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
++
++	rcu_read_lock_bh();
++	for (i = 0; i < 2; i++)
++		ok &= cake_test_in(sch, bulk[i]);
++	ok &= cake_test_out(sch, bulk[0]);
++	for (i = 0; i < 6; i++)
++		ok &= cake_test_in(sch, s[i]);
++	left0 = ktime_to_ns(q->time_next_packet) - ktime_get_ns();
++	for (i = 0; i < 6; i++) {
++		struct sk_buff *out = cake_dequeue(sch);
++
++		if (!out)
++			break;
++		ok &= out == s[i];
++		kfree_skb(out);
++		early++;
++	}
++	left = ktime_to_ns(q->time_next_packet) - ktime_get_ns();
++	rcu_read_unlock_bh();
++
++	KUNIT_EXPECT_TRUE(test, ok);
++	kunit_info(test, "shaper %llu us ahead, %u went early, then %llu us ahead",
++		   div_u64(left0, 1000), early, div_u64(left, 1000));
++	KUNIT_EXPECT_GE(test, early, 1);
++	KUNIT_EXPECT_LT(test, early, 6);
++	/* never more than the allowance and a packet ahead */
++	KUNIT_EXPECT_LE(test, left, 20 * NSEC_PER_MSEC + dur);
++	/* and stopped only when the next would have gone past it */
++	KUNIT_EXPECT_GT(test, left, 20 * NSEC_PER_MSEC - dur);
++}
++
++/* 10 ms at 50 Mbit/s of a download's bulk flow, a new flow's small packet
++ * every 1 ms, sparse_ahead_us 0 then 1000: as many bytes go either way, to
++ * within what the allowance and a packet let through early, and what each
++ * run's longest pause between dequeues held back at its end. Short: the
++ * suite runs each time the module loads.
++ */
++static void cake_test_sparse_ahead_rate(struct kunit *test)
++{
++	const u64 rate = 6250000;	/* bytes/s */
++	u64 sent[2] = {}, gap[2] = {};
++	int on;
++
++	for (on = 0; on < 2; on++) {
++		struct cake_test_mq *mq = cake_test_mq_alloc(test);
++		struct Qdisc *sch = mq->sch[0];
++		u64 start, next_sparse, end, last;
++		int host = 0;
++
++		cake_test_cake_live(test, mq, 0, rate, CAKE_DIFFSERV_BESTEFFORT);
++		cake_test_ahead_set(test, on ? 1000 : 0);
++		KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
++		start = ktime_get_ns();
++		next_sparse = start;
++		end = start + 10 * NSEC_PER_MSEC;
++		last = start;
++		while (ktime_get_ns() < end) {
++			struct sk_buff *in[2], *out;
++			int n = 0;
++			u64 now;
++
++			/* the bulk flow never runs out; a sparse packet every 1 ms */
++			if (sch->q.qlen < 4)
++				cake_test_dl_pkts(test, &in[n++], 1, 5, 1514, true);
++			if (ktime_get_ns() >= next_sparse) {
++				cake_test_dl_pkts(test, &in[n++], 1, 20 + host++ % 40, 200, true);
++				next_sparse += NSEC_PER_MSEC;
++			}
++			rcu_read_lock_bh();
++			while (n)
++				cake_test_in(sch, in[--n]);
++			out = cake_dequeue(sch);
++			if (out)
++				sent[on] += qdisc_pkt_len(out);
++			kfree_skb(out);
++			rcu_read_unlock_bh();
++			now = ktime_get_ns();
++			gap[on] = max(gap[on], now - last);
++			last = now;
++			udelay(10);
++		}
++		kunit_info(test, "sparse_ahead_us %d: %llu bytes in 10 ms, longest pause %llu us",
++			   on ? 1000 : 0, sent[on], div_u64(gap[on], 1000));
++	}
++	/* 1 ms at the rate, a packet either way at the end, and the pauses */
++	KUNIT_EXPECT_LE(test, abs_diff(sent[0], sent[1]),
++			div_u64(rate, 1000) + 2 * 1514 +
++			div_u64(rate * (gap[0] + gap[1]), NSEC_PER_SEC));
++}
++
++/* cake_mq: a sub-cake whose packet goes ahead of its shaper still counts as
++ * held back, and the packet counts as sent, and as a sparse flow's
++ */
++static void cake_test_sparse_ahead_mq(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_mq_live(test, mq, 1);
++	struct Qdisc *sch = mq->sch[1];
++	struct sk_buff *bulk[2], *s;
++	u64 before, held_at, bytes, sparse;
++	bool ok = true, early;
++	int i;
++
++	cake_test_ahead_set(test, 20000);
++	mq->cfg->rate_bps = 125000;
++	mq->cfg->sync_time = 200 * NSEC_PER_USEC;
++	cake_configure_rates(sch, 125000, true);
++	q->synced_rate = 125000;
++	cake_test_dl_pkts(test, bulk, 2, 5, 1514, true);
++	cake_test_dl_pkts(test, &s, 1, 6, 100, true);
++
++	before = ktime_get_ns();
++	/* as net_tx_action() runs a qdisc: the resync reads the other
++	 * sub-cakes under rcu_read_lock()
++	 */
++	rcu_read_lock();
++	rcu_read_lock_bh();
++	for (i = 0; i < 2; i++)
++		ok &= cake_test_in(sch, bulk[i]);
++	ok &= cake_test_out(sch, bulk[0]);
++	ok &= cake_test_in(sch, s);
++	q->mq_bytes = 0;
++	q->mq_sparse_bytes = 0;
++	q->mq_held_at = 0;
++	early = cake_test_out(sch, s);
++	held_at = q->mq_held_at;
++	bytes = q->mq_bytes;
++	sparse = q->mq_sparse_bytes;
++	rcu_read_unlock_bh();
++	rcu_read_unlock();
++
++	KUNIT_EXPECT_TRUE(test, ok);
++	KUNIT_EXPECT_TRUE(test, early);
++	KUNIT_EXPECT_GE(test, held_at, before);
++	KUNIT_EXPECT_EQ(test, bytes, 100);
++	KUNIT_EXPECT_EQ(test, sparse, 100);
++	/* the bulk packet left, as the test ends */
++	rcu_read_lock_bh();
++	cake_clear_tin(sch, 0);
++	rcu_read_unlock_bh();
++}
++#endif
++
+ static int cake_test_init(struct kunit *test)
+ {
+ 	int i;
+@@ -4633,6 +4884,12 @@ static struct kunit_case cake_test_cases[] = {
+ #endif
+ 	KUNIT_CASE(cake_test_wake_slack),
+ 	KUNIT_CASE(cake_test_wake_slack_batches),
++#ifdef CONFIG_NET_REDIRECT
++	KUNIT_CASE(cake_test_sparse_ahead),
++	KUNIT_CASE(cake_test_sparse_ahead_train),
++	KUNIT_CASE(cake_test_sparse_ahead_rate),
++	KUNIT_CASE(cake_test_sparse_ahead_mq),
++#endif
+ 	KUNIT_CASE(cake_test_ecn_ignored_switches),
+ 	KUNIT_CASE(cake_test_ecn_ignored_ipv4),
+ 	KUNIT_CASE(cake_test_ecn_l4s_marked),
