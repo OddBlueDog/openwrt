@@ -1,0 +1,219 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 19 Nov 2026 17:00:00 +0000
+Subject: [PATCH] net/sched: sch_cake: the overflow heap holds only the tins in use
+
+The first drop at the memory limit built a max-heap of every queue of all
+eight tins, though only the tins in use ever hold packets, and
+besteffort, the default, uses one: eight times the queues to read, under
+the qdisc lock. The heap is now built over the queues of the tins in use,
+tin by tin, and every walk of it stops at its end. A change to another
+tin count leaves the next drop to build it again.
+
+KUnit: with 1, 3, 4 and 8 tins, packets in and out at random and drops
+between them, each drop takes from a longest queue and the heap stays
+whole; a change to another tin count in the middle of a spell has it
+built again, over the new tins.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -264,6 +264,7 @@ struct cake_sched_data {
+ 	u64		rate_ns;
+ 	u16		rate_shft;
+ 	u16		overflow_timeout;
++	u16		overflow_heap_len;	/* cake_heap_build() */
+ 	u16		tin_cnt;
+ 
+ 	/* resource tracking */
+@@ -2063,7 +2064,7 @@ static u32 cake_heap_get_backlog(const struct cake_sched_data *q, u16 i)
+ /* Sift the queue at @i down the overflow heap, past every queue longer */
+ static void cake_heapify(struct cake_sched_data *q, u16 i)
+ {
+-	static const u32 a = CAKE_MAX_TINS * CAKE_QUEUES;
++	u32 a = q->overflow_heap_len;
+ 	u32 mb = cake_heap_get_backlog(q, i);
+ 	u32 ib = mb, m = i;
+ 
+@@ -2104,7 +2105,7 @@ static void cake_heapify(struct cake_sched_data *q, u16 i)
+ 
+ static void cake_heapify_up(struct cake_sched_data *q, u16 i)
+ {
+-	while (i > 0 && i < CAKE_MAX_TINS * CAKE_QUEUES) {
++	while (i > 0 && i < q->overflow_heap_len) {
+ 		u16 p = (i - 1) >> 1;
+ 		u32 ib = cake_heap_get_backlog(q, i);
+ 		u32 pb = cake_heap_get_backlog(q, p);
+@@ -2118,6 +2119,26 @@ static void cake_heapify_up(struct cake_sched_data *q, u16 i)
+ 	}
+ }
+ 
++/* The overflow heap, built at the first drop of a spell over the queues of
++ * the tins in use, tin by tin; nothing is ever queued in the others.
++ * Besteffort, the default, uses one tin of eight. The heap is kept from
++ * then on while the spell lasts, as packets come and go.
++ */
++static void cake_heap_build(struct cake_sched_data *q)
++{
++	u32 n = q->tin_cnt * CAKE_QUEUES, k;
++	int i;
++
++	for (k = 0; k < n; k++) {
++		q->overflow_heap[k].t = k / CAKE_QUEUES;
++		q->overflow_heap[k].b = k % CAKE_QUEUES;
++		q->tins[k / CAKE_QUEUES].overflow_idx[k % CAKE_QUEUES] = k;
++	}
++	q->overflow_heap_len = n;
++	for (i = n / 2 - 1; i >= 0; i--)
++		cake_heapify(q, i);
++}
++
+ static int cake_advance_shaper(struct cake_sched_data *q,
+ 			       struct cake_tin_data *b,
+ 			       struct sk_buff *skb,
+@@ -2165,12 +2186,8 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free,
+ 	struct cake_flow *flow;
+ 	struct sk_buff *skb;
+ 
+-	if (!q->overflow_timeout) {
+-		int i;
+-		/* Build fresh max-heap */
+-		for (i = CAKE_MAX_TINS * CAKE_QUEUES / 2 - 1; i >= 0; i--)
+-			cake_heapify(q, i);
+-	}
++	if (!q->overflow_timeout)
++		cake_heap_build(q);
+ 	q->overflow_timeout = 65535;
+ 
+ 	/* select longest queue for pruning */
+@@ -3755,6 +3772,9 @@ static void cake_reconfigure(struct Qdisc *sch)
+ 
+ 	cake_configure_rates(sch, rate_bps, false);
+ 	qd->synced_rate = rate_bps;
++	/* another tin count: the next drop builds the heap over the new tins */
++	if (qd->overflow_heap_len != qd->tin_cnt * CAKE_QUEUES)
++		qd->overflow_timeout = 0;
+ 
+ 	if (q->buffer_config_limit) {
+ 		qd->buffer_limit = q->buffer_config_limit;
+@@ -4016,14 +4036,9 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 
+ 		for (j = 0; j < CAKE_QUEUES; j++) {
+ 			struct cake_flow *flow = b->flows + j;
+-			u32 k = j * CAKE_MAX_TINS + i;
+ 
+ 			INIT_LIST_HEAD(&flow->flowchain);
+ 			cobalt_vars_init(&flow->cvars);
+-
+-			qd->overflow_heap[k].t = i;
+-			qd->overflow_heap[k].b = j;
+-			b->overflow_idx[j] = k;
+ 		}
+ 	}
+ 
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -2753,13 +2753,8 @@ static struct cake_sched_data *cake_test_cake_live(struct kunit *test, struct ca
+ 
+ 		cake_init_flowchains(b);
+ 		for (j = 0; j < CAKE_QUEUES; j++) {
+-			u32 k = j * CAKE_MAX_TINS + t;
+-
+ 			INIT_LIST_HEAD(&b->flows[j].flowchain);
+ 			cobalt_vars_init(&b->flows[j].cvars);
+-			q->overflow_heap[k].t = t;
+-			q->overflow_heap[k].b = j;
+-			b->overflow_idx[j] = k;
+ 		}
+ 	}
+ 	qdisc_watchdog_init(&q->watchdog, sch);
+@@ -4397,6 +4392,26 @@ static void cake_test_autorate_starts_afresh(struct kunit *test)
+ 	KUNIT_EXPECT_GE(test, q->last_packet_time, before);
+ }
+ 
++/* The overflow heap holds each queue of the tins in use once, its index
++ * right, none longer than its parent
++ */
++static bool cake_test_heap_whole(struct cake_sched_data *q)
++{
++	u32 n = q->overflow_heap_len, k;
++
++	if (n != q->tin_cnt * CAKE_QUEUES)
++		return false;
++	for (k = 0; k < n; k++) {
++		struct cake_heap_entry e = q->overflow_heap[k];
++
++		if (e.t >= q->tin_cnt || q->tins[e.t].overflow_idx[e.b] != k)
++			return false;
++		if (k && cake_heap_get_backlog(q, k) > cake_heap_get_backlog(q, (k - 1) / 2))
++			return false;
++	}
++	return true;
++}
++
+ /* The longest queue of the tins in use */
+ static u32 cake_test_longest(struct cake_sched_data *q)
+ {
+@@ -4414,6 +4429,10 @@ static u32 cake_test_longest(struct cake_sched_data *q)
+  * one spell, so the heap the first drop builds is kept up to date from
+  * then on. A queue shortened at the top of the heap has to sift down past
+  * every queue that's now longer, not just its children.
++ *
++ * The heap holds only the tins in use, and stays whole while the spell
++ * lasts; a change to another tin count in the middle of a spell has the
++ * next drop build it again, over the new tins.
+  */
+ static void cake_test_overflow_heap(struct kunit *test)
+ {
+@@ -4425,7 +4444,8 @@ static void cake_test_overflow_heap(struct kunit *test)
+ 	struct Qdisc *sch = mq->sch[0];
+ 	const int n = 2500;
+ 	struct sk_buff **skb = cake_test_alloc(test, n * sizeof(*skb));
+-	u32 victims = 0, wrong = 0;
++	u32 victims = 0, wrong = 0, broken = 0, built[ARRAY_SIZE(modes)] = {};
++	bool reset[ARRAY_SIZE(modes)] = {};
+ 	struct rnd_state rnd;
+ 	int i, m, next = 0;
+ 
+@@ -4443,12 +4463,18 @@ static void cake_test_overflow_heap(struct kunit *test)
+ 		int op;
+ 
+ 		if (m) {
++			u16 tins = q->tin_cnt;
++
++			/* in the middle of a spell */
++			KUNIT_EXPECT_NE(test, q->overflow_timeout, 0);
+ 			rtnl_lock();
+ 			KUNIT_EXPECT_EQ(test, 0, cake_change(sch, cake_test_opts(test, 0, modes[m],
+ 										   false), NULL));
+ 			rtnl_unlock();
++			reset[m] = !q->overflow_timeout && q->tin_cnt != tins;
+ 		}
+-		for (op = 0; op < 500 && next < n; op++) {
++		/* short: the suite runs each time the module loads */
++		for (op = 0; op < 120 && next < n; op++) {
+ 			u32 r = prandom_u32_state(&rnd) % 10, id, most, len;
+ 			struct sk_buff *to_free = NULL;
+ 
+@@ -4466,12 +4492,21 @@ static void cake_test_overflow_heap(struct kunit *test)
+ 				kfree_skb_list(to_free);
+ 				victims++;
+ 				wrong += q->tins[id >> 16].backlogs[id & 0xffff] + len != most;
++				built[m] += q->overflow_heap_len == q->tin_cnt * CAKE_QUEUES;
+ 			}
++			if (q->overflow_timeout && ((r >= 9 && victims % 4 == 0) || op % 60 == 0))
++				broken += !cake_test_heap_whole(q);
+ 			rcu_read_unlock_bh();
+ 		}
+ 	}
+ 	KUNIT_EXPECT_EQ(test, wrong, 0);
+-	KUNIT_EXPECT_GT(test, victims, 100);
++	KUNIT_EXPECT_EQ(test, broken, 0);
++	KUNIT_EXPECT_GT(test, victims, 25);
++	for (m = 0; m < ARRAY_SIZE(modes); m++)
++		KUNIT_EXPECT_GT_MSG(test, built[m], 0, "mode %d", m);
++	/* 1 to 3 to 4 to 8 tins and back to 1: built again each time */
++	for (m = 1; m < ARRAY_SIZE(modes); m++)
++		KUNIT_EXPECT_TRUE_MSG(test, reset[m], "mode %d", m);
+ }
+ 
+ static int cake_test_init(struct kunit *test)
