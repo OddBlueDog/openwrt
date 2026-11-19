@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 10:58:34 +0000
+Subject: [PATCH] wifi: mt76: a held station's probes at the lowest basic rate
+
+The probe of a station held for its silence (mt76_tx_silent_probe()) is a QoS null, a data frame, and it set no IEEE80211_TX_CTL_USE_MINRATE. So mt76_connac2_mac_write_txwi() gave it no fixed rate and the data frames' count of tries: it went out at the firmware's own rate, and every try of a probe nobody answers reached the firmware's rate control, a probe a second for as long as the station stays silent. The probe that was answered could also carry the station's sampled TX status, which then set the station's reported rate, and the rate AQL budgets its frames at, to where the probe's retry chain ended, until the next sample.
+
+The probe now asks for the minimum rate, as mac80211 does for the frames it sends at a fixed rate: the lowest basic rate with a fixed width, no block ack and no hardware A-MSDU. Its status is then a fixed-rate one, which doesn't set the station's rate, and tx-free still tells mt76_tx_result() whether it was acked. An answer at that rate is still the station listening, which is all the probe asks.
+
+KUnit: mt76-ps-sim counts probes that reach the hardware without the flag, checked after every run and in the silent test; it fails without this. mt76-connac-mac already checks that a unicast data frame at the minimum rate gets the fixed basic rate.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/ps-sim-test.c | 15 +++++++++++++++
+ tx.c                |  9 +++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index 46d949e9..e47ad2e9 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -226,6 +226,8 @@ struct psim {
+ 	unsigned int n_vanished, n_order, n_stall, n_tim, n_ps_burst;
+ 	/* data handed to the hardware for a station held for its silence */
+ 	unsigned int n_silent_fed;
++	/* the driver's probes sent at the firmware's own rate, not a fixed one */
++	unsigned int n_probe_autorate;
+ 	/* more than one frame while held, after a former station's frames
+ 	 * completed on this one's wcid and released its airtime
+ 	 */
+@@ -404,6 +406,13 @@ static int psim_queue_skb(struct mt76_phy *phy, struct mt76_queue *q,
+ 		f->poll = true;
+ 		f->silent = true;
+ 		s->sta[i].silent_probes++;
++		/* at the lowest basic rate: its unanswered tries stay out of
++		 * the firmware's rate control (mt76_connac2_mac_write_txwi()
++		 * gives a min-rate frame a fixed rate)
++		 */
++		if (!(IEEE80211_SKB_CB(skb)->flags &
++		      IEEE80211_TX_CTL_USE_MINRATE))
++			s->n_probe_autorate++;
+ 		skb->mark = id + 1;
+ 		skb->destructor = psim_skb_destructor;
+ 	}
+@@ -1804,6 +1813,8 @@ static struct psim *psim_run_totals(struct kunit *test,
+ 			    "hostapd polls missed: stations disassociated");
+ 	KUNIT_EXPECT_EQ_MSG(test, s->n_silent_fed, 0,
+ 			    "frames handed to the hardware for a station held for its silence");
++	KUNIT_EXPECT_EQ_MSG(test, s->n_probe_autorate, 0,
++			    "probes of a held station sent at the firmware's rate");
+ 	KUNIT_EXPECT_FALSE_MSG(test, psim_busy(s), "still busy after %u steps",
+ 			       n);
+ 
+@@ -2378,6 +2389,10 @@ static void mt76_psim_test_silent(struct kunit *test)
+ 	KUNIT_EXPECT_GE(test, phone->silent_probes, 5);
+ 	KUNIT_EXPECT_LE(test, phone->silent_probes, 7);
+ 	KUNIT_EXPECT_EQ(test, wcid->silent_probes, phone->silent_probes);
++	/* each at a fixed rate: none of them taught the firmware's rate
++	 * control that the phone takes nothing
++	 */
++	KUNIT_EXPECT_EQ(test, s->n_probe_autorate, 0);
+ 	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
+ 	/* the laptop beside it isn't touched */
+ 	psim_silent_send(s, laptop, 10);
+diff --git a/tx.c b/tx.c
+index 34dce473..37533d2b 100644
+--- a/tx.c
++++ b/tx.c
+@@ -825,6 +825,14 @@ EXPORT_SYMBOL_GPL(mt76_tx_result);
+ /* A null frame for a held station, as hostapd's inactivity poll is one:
+  * its tx-free report says whether the station answers (mt76_tx_result()).
+  * It isn't a frame anything waits for, so losing it costs nothing.
++ *
++ * It goes at the lowest basic rate, as a fixed-rate frame: one sent at the
++ * firmware's own rate would feed every unanswered try (up to the station's
++ * full count, a probe a second for as long as it is held) to the firmware's
++ * rate control, which would then start the station low once it is back,
++ * and the status of the probe that is answered would set the station's
++ * reported and AQL rate to that low rate. A fixed-rate frame's status
++ * touches neither.
+  */
+ static void mt76_tx_silent_probe(struct mt76_dev *dev, struct mt76_wcid *wcid)
+ {
+@@ -863,6 +871,7 @@ static void mt76_tx_silent_probe(struct mt76_dev *dev, struct mt76_wcid *wcid)
+ 
+ 	info = IEEE80211_SKB_CB(skb);
+ 	memset(info, 0, sizeof(*info));
++	info->flags = IEEE80211_TX_CTL_USE_MINRATE;
+ 	info->band = phy->chandef.chan->band;
+ 	info->hw_queue = vif->hw_queue[IEEE80211_AC_VO];
+ 	info->control.vif = vif;

@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 10:58:34 +0000
+Subject: [PATCH] wifi: mt76: mt7915: a station with a TWT agreement isn't held
+ for its silence
+
+A station with a TWT agreement is kept out of the power-save hold (mt7915_mcu_sta_ps_hold()): the firmware reports it as dozing for as long as the agreement lasts and sends to it only in its wake periods. It wasn't kept out of the hold for a station that stops answering: mt76_tx_result() only passes over stations marked dozing, which a TWT station never is. Between its wake periods it isn't heard from, often for longer than the hold's 100 ms, so one lost frame had it held, its frames kept from the firmware until a probe got through in a wake period and released them for the next one.
+
+mt7915_mac_tx_free_mpdu() no longer passes on a lost frame of a station with a TWT agreement. An acked one still counts as hearing from it, and a hold from before the agreement still ends that way.
+
+KUnit: mt7915_test_tx_free_twt (mt7915-mac-tx): a lost frame doesn't count towards a hold while the agreement lasts, an acked one is heard, and once the agreement ends a lost frame counts again. It fails without this.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 14 +++++++--
+ mt7915/tests/mac-test.c | 63 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 74 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 92c9fc77..39b228e0 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -916,10 +916,18 @@ mt7915_mac_tx_free_mpdu(struct mt76_dev *mdev, struct mt76_wcid *wcid,
+ 	}
+ 
+ 	/* acked: the station answers; given up on: it may have stopped
+-	 * listening
++	 * listening. Not a station with a TWT agreement: it isn't held when
++	 * dozing either (mt7915_mcu_sta_ps_hold()), the firmware knows when it
++	 * listens and sends to it only then, and it isn't heard from between
++	 * its wake periods, so one lost frame would have it held, its frames
++	 * kept from the firmware until a probe got through in a wake period.
+ 	 */
+-	if (wcid->sta)
+-		mt76_tx_result(mdev, wcid, !failed);
++	if (!wcid->sta)
++		return;
++	if (failed &&
++	    READ_ONCE(container_of(wcid, struct mt7915_sta, wcid)->twt.flowid_mask))
++		return;
++	mt76_tx_result(mdev, wcid, !failed);
+ }
+ 
+ static void
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 60f672f8..592fc1cd 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -2847,6 +2847,68 @@ static void mt7915_test_tx_free_null(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, time_after(msta->wcid.heard, before));
+ }
+ 
++/* A station with a TWT agreement isn't heard from between its wake periods,
++ * and the firmware sends to it only in them: a frame of it given up on is
++ * no sign it stopped listening, so it doesn't count towards holding it
++ * (mt76_tx_result()), as its dozing doesn't hold it either. An acked one is
++ * still it answering. Once the agreement ends, a lost frame counts again.
++ */
++static void mt7915_test_tx_free_twt(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *msta = mt7915_test_sta(test, dev, 9, mvif);
++	unsigned long before = jiffies - HZ;
++	struct sk_buff *skb;
++	u32 info[3];
++	__le32 *ev;
++	int i;
++
++	mt7915_test_band1(test, env);
++	msta->wcid.heard = before;
++	msta->twt.flowid_mask = BIT(0);
++
++	/* given up on, acked, then given up on after the agreement ended */
++	for (i = 0; i < 3; i++) {
++		bool failed = i != 1;
++
++		if (i == 2)
++			msta->twt.flowid_mask = 0;
++
++		info[0] = MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 9);
++		info[1] = MT_TX_FREE_MPDU_HEADER_V3 |
++			  FIELD_PREP(MT_TX_FREE_COUNT_V3, failed ? 15 : 1) |
++			  FIELD_PREP(MT_TX_FREE_STAT_V3, failed);
++		info[2] = mt7915_test_token(test, dev, 9, &skb) |
++			  (MT_TX_FREE_MSDU_ID_V3 << 15);
++		ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 3,
++				       FIELD_PREP(MT_TX_FREE_VER, 4), info, 3);
++		KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 5 * 4));
++		KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb));
++		kfree_skb(skb);
++
++		switch (i) {
++		case 0:
++			/* in its statistics, but not a silence */
++			KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 1);
++			KUNIT_EXPECT_EQ(test, msta->wcid.silent_fails, 0);
++			KUNIT_EXPECT_EQ(test, msta->wcid.heard, before);
++			break;
++		case 1:
++			KUNIT_EXPECT_TRUE(test,
++					  time_after(msta->wcid.heard, before));
++			break;
++		case 2:
++			KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 2);
++			KUNIT_EXPECT_EQ(test, msta->wcid.silent_fails, 1);
++			break;
++		}
++	}
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT,
++					  &msta->wcid.flags));
++}
++
+ /* Words before any wcid pair, for an entry that's no station, or for
+  * unknown tokens are skipped; the rest of the event is still handled.
+  */
+@@ -5871,6 +5933,7 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_tx_free_v3_odd),
+ 	KUNIT_CASE(mt7915_test_tx_free_attempts),
+ 	KUNIT_CASE(mt7915_test_tx_free_null),
++	KUNIT_CASE(mt7915_test_tx_free_twt),
+ 	KUNIT_CASE(mt7915_test_tx_free_unknown),
+ 	KUNIT_CASE(mt7915_test_tx_free_v0),
+ 	KUNIT_CASE(mt7915_test_tx_free_still_full),
