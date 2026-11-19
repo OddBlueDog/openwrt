@@ -113,7 +113,7 @@ export function CpuCard({
           </>
         ) : (
           <p className="py-3.5 text-sm text-muted-foreground">
-            The Wi-Fi and receive thread settings are for RSS packet steering, which isn’t chosen above.
+            The Wi-Fi and receive thread settings are for RSS packet steering, which isn’t in use.
           </p>
         )}
         <Field

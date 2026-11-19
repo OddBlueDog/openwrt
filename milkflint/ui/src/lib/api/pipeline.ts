@@ -51,6 +51,12 @@ export const pipelineSchema = z.object({
   }),
   /** RPS: the CPUs each wired port's receive queues are spread over */
   rps: z.array(z.object({ dev: z.string(), queues: z.array(z.array(z.number())) })),
+  /**
+   * XPS of each multi-queue ifb: the CPUs whose packets each transmit queue
+   * takes (empty: no map, the kernel picks by the receive queue). A PPPoE
+   * line's download ifb has one per CPU. Missing on older routers.
+   */
+  xps: z.array(z.object({ dev: z.string(), queues: z.array(z.array(z.number())) })).default([]),
 });
 export type Pipeline = z.output<typeof pipelineSchema>;
 

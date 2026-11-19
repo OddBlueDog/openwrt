@@ -264,8 +264,8 @@ sec=\${p%%.*}
 opt=\${p#*.}
 [ -f "$SQM_ROOT/etc/config/$cfg" ] || exit 1
 awk -v sec="$sec" -v opt="$opt" '
-$1 == "config" { s = $3; gsub(/\\047/, "", s); next }
-$1 == "option" && s == sec && $2 == opt { v = $3; gsub(/\\047/, "", v); print v; found = 1 }
+$1 == "config" { s = $3; gsub(/\\047/, "", s); a = "@" $2 "[" (n[$2]++) "]"; next }
+$1 == "option" && (s == sec || a == sec) && $2 == opt { v = $3; gsub(/\\047/, "", v); print v; found = 1 }
 END { exit !found }' "$SQM_ROOT/etc/config/$cfg"
 `;
 
@@ -428,6 +428,18 @@ class Router {
     return existsSync(join(this.net, name));
   }
 
+  /** a file of a device in the pretend /sys (e.g. queues/tx-0/xps_cpus), undefined if it has none */
+  sys(name: string, path: string): string | undefined {
+    const f = join(this.net, name, path);
+    return existsSync(f) ? readFileSync(f, 'utf8').trim() : undefined;
+  }
+
+  /** a PPP device (ARPHRD_PPP), as pppd's pppoe-wan is */
+  ppp(name: string): void {
+    this.dev(name, 1, 1492);
+    writeFileSync(join(this.net, name, 'type'), '512\n');
+  }
+
   write(config: string, sections: Record<string, Section>, type: string): void {
     writeFileSync(join(this.root, 'etc/config', config), uciExport(config, type, sections));
   }
@@ -436,8 +448,14 @@ class Router {
     this.write('sqm', sections, 'queue');
   }
 
-  network(sections: Record<string, Section>): void {
+  network(sections: Record<string, Section>, globals?: Section): void {
     this.write('network', sections, 'interface');
+    // network.@globals[0], as netifd's config has it (packet_steering)
+    if (globals !== undefined)
+      appendFileSync(
+        join(this.root, 'etc/config/network'),
+        `\n${uciExport('network', 'globals', { globals }).replace(/^package .*\n\n/, '')}`,
+      );
   }
 
   /** run.sh <action> [iface] */
@@ -629,6 +647,52 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     assert.equal(throwaway(second), 0);
     assert.ok(second.length < first.length, `${String(second.length)} commands, the first time ${String(first.length)}`);
     assertShaping(r, 'eth1', 'cake', 'cake_mq');
+  });
+
+  // A PPPoE session's packets all come in on its port's first queue (RSS
+  // can't hash PPPoE), and the kernel picks an ifb's queue by that: every CPU
+  // would feed sub-queue 1. Each sub-queue goes with a CPU instead (XPS).
+  test('a PPP device’s download: each cake_mq sub-queue takes one CPU’s packets', { skip }, async () => {
+    const r = new Router();
+    r.ppp('pppoe-wan');
+    r.sqm({ wan: { ...WAN, interface: 'pppoe-wan' } });
+    const run = await r.run('start');
+    assert.equal(run.status, 0, run.out);
+    assertShaping(r, 'pppoe-wan', 'cake', 'cake_mq');
+    assert.deepEqual(
+      [0, 1, 2, 3].map((n) => r.sys('ifb4pppoe-wan', `queues/tx-${String(n)}/xps_cpus`)),
+      ['1', '2', '4', '8'],
+    );
+  });
+
+  // with packet steering off a flow's packets may come from any CPU, and a
+  // sub-queue per CPU would split it over two CAKEs
+  test('a PPP device’s download with packet steering off: the ifb’s queues left to the kernel', { skip }, async () => {
+    const r = new Router();
+    r.ppp('pppoe-wan');
+    r.network({ wan: { device: 'eth1', proto: 'pppoe' } }, { packet_steering: '0' });
+    r.sqm({ wan: { ...WAN, interface: 'pppoe-wan' } });
+    assert.equal((await r.run('start')).status, 0);
+    assertShaping(r, 'pppoe-wan', 'cake', 'cake_mq');
+    assert.equal(r.sys('ifb4pppoe-wan', 'queues/tx-0/xps_cpus'), undefined);
+  });
+
+  test('a PPP device’s download with multi-queue off: one queue, nothing to choose', { skip }, async () => {
+    const r = new Router();
+    r.ppp('pppoe-wan');
+    r.sqm({ wan: { ...WAN, interface: 'pppoe-wan', use_mq: '0' } });
+    assert.equal((await r.run('start')).status, 0);
+    assertShaping(r, 'pppoe-wan', 'cake', 'cake');
+    assert.equal(r.sys('ifb4pppoe-wan', 'queues/tx-0/xps_cpus'), undefined);
+    assert.ok(!r.syslog().some((l) => l.includes('XPS')), r.syslog().join('\n'));
+  });
+
+  test('an Ethernet port’s download: the ifb’s queues left to the kernel (an RSS ring’s, by the ring)', { skip }, async () => {
+    const r = new Router();
+    r.sqm({ eth1: WAN });
+    assert.equal((await r.run('start')).status, 0);
+    assertShaping(r, 'eth1', 'cake', 'cake_mq');
+    assert.equal(r.sys('ifb4eth1', 'queues/tx-0/xps_cpus'), undefined);
   });
 
   test('upload multi-queue on with download multi-queue off: cake_mq on the port, one CAKE on the ifb', { skip }, async () => {

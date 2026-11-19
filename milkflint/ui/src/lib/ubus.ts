@@ -23,11 +23,18 @@ const statusNames = new Map<number, string>(Object.entries(UbusStatus).map(([nam
 
 export class UbusError extends Error {
   readonly code: number;
+  /**
+   * uhttpd's own JSON-RPC error (-32000 object not found, -32002 access
+   * denied...) when the call never got an answer from the object: `code` is
+   * then permissionDenied. Undefined when the object itself answered `code`.
+   */
+  readonly rpcError: number | undefined;
 
-  constructor(object: string, method: string, code: number) {
+  constructor(object: string, method: string, code: number, rpcError?: number) {
     super(`${object}.${method}: ${statusNames.get(code) ?? `status ${code}`}`);
     this.name = 'UbusError';
     this.code = code;
+    this.rpcError = rpcError;
   }
 }
 
@@ -126,7 +133,7 @@ async function flush(): Promise<void> {
       // session, or a call its permissions (ACL) don't allow: checked below.
       // Another session's (a test bench member's) is its caller's to handle.
       if (reply.error.code === -32002 && p.session !== NULL_SESSION && p.session === sessionId) denied.push(p);
-      else p.reject(new UbusError(p.object, p.method, UbusStatus.permissionDenied));
+      else p.reject(new UbusError(p.object, p.method, UbusStatus.permissionDenied, reply.error.code));
     } else if (reply.result === undefined) {
       p.reject(new UbusError(p.object, p.method, UbusStatus.unknownError));
     } else {

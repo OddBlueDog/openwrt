@@ -25,7 +25,11 @@ export function LoginPage({ reason }: { reason: 'expired' | 'logged-out' | undef
     try {
       await login('root', password);
     } catch (err) {
-      if (err instanceof UbusError && err.code === UbusStatus.permissionDenied) setError('Wrong password.');
+      // a wrong password is rpcd's answer; uhttpd's own error means rpcd
+      // (its session object) isn't there to ask
+      if (err instanceof UbusError && err.rpcError !== undefined)
+        setError("The router's login service isn't answering. Restart the router, then try again.");
+      else if (err instanceof UbusError && err.code === UbusStatus.permissionDenied) setError('Wrong password.');
       else if (err instanceof UnreachableError) setError('The router is not responding. Check the connection.');
       else setError(errorMessage(err));
       setBusy(false);

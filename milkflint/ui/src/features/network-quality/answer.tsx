@@ -11,7 +11,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type { DnsTarget, Sample, Status } from './api';
-import { providerName } from './dns-lines';
+import { dnsNotes, providerName } from './dns-lines';
 import { ms } from './format';
 import { type Probe, type ProbeSummary, rating, type Summary, summarizeDnsServer } from './score';
 import { ScoreRing } from './score-ring';
@@ -162,7 +162,7 @@ export function QualityNow({
           <div className="divide-y">
             {probes.map((p) =>
               p.key === 'dns' && dnsTargets.length > 0 && recent.some((s) => s.dns_servers !== undefined) ? (
-                // a row per DNS server the DNS page uses
+                // a row per DNS server devices’ lookups go to
                 dnsTargets.map((d) => (
                   <ProbeBar
                     key={`dns:${d.key}`}
@@ -192,12 +192,11 @@ export function QualityNow({
               ),
             )}
           </div>
-          {dnsTargets.length > 1 && (
-            <p className="pt-2 text-xs text-muted-foreground">
-              Each DNS server is asked over plain DNS at its address, the same server your encrypted lookups reach; the score uses
-              the first.
+          {dnsNotes(dnsTargets.map((d) => d.key)).map((n) => (
+            <p key={n} className="pt-2 text-xs text-muted-foreground">
+              {n}
             </p>
-          )}
+          ))}
           {summary.gatewaySilent && (
             <p className="pt-2 text-xs text-muted-foreground">
               The gateway doesn’t answer pings (common with providers), so it’s left out of the score.

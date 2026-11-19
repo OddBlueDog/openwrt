@@ -313,10 +313,10 @@ function DirectionTab({
             hint={
               <>
                 One CAKE per network-card queue, sharing the speed by what each needs, so more than one CPU can shape at once
-                (cake_mq). With RSS (Performance Tuning), each receive ring feeds its own queue on its own CPU. Each queue holds
-                its packets to its share of the speed, so a packet can wait a little longer than in one CAKE, more so on a slower
-                line, which one CPU shapes easily: Automatic uses it from {MULTI_QUEUE_KBIT / 1000} Mbit/s. Saved as
-                milkflint.cake.multi_queue too.
+                (cake_mq). With RSS (Performance Tuning), each receive ring feeds its own queue on its own CPU; on a PPPoE line,
+                each CPU packet steering hands a connection to has its own queue. Each queue holds its packets to its share of the
+                speed, so a packet can wait a little longer than in one CAKE, more so on a slower line, which one CPU shapes
+                easily: Automatic uses it from {MULTI_QUEUE_KBIT / 1000} Mbit/s. Saved as milkflint.cake.multi_queue too.
                 {rssNote !== undefined && mq && <span className="mt-1 block text-warning">{rssNote}</span>}
               </>
             }

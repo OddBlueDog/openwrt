@@ -150,8 +150,10 @@ export function SqmPage(): ReactElement {
           ? 'On'
           : 'Off';
   const net = live.data?.net;
+  // a PPPoE line's download queues each have their CPU even without RSS (packet steering, XPS)
+  const perCpu = net?.queues.some((q) => q.download && q.cpu !== undefined) === true;
   const rssNote =
-    net !== undefined && net.rss?.spreading !== true
+    net !== undefined && net.rss?.spreading !== true && !perCpu
       ? `RSS isn’t spreading downloads now, so they all use one queue${net.rps.length > 0 ? `, and packet steering spreads the rest over ${cpuText(net.rps)}` : ''}.`
       : undefined;
 

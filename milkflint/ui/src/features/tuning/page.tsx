@@ -29,7 +29,7 @@ import { RestoreDialog, WedDialog } from './dialogs';
 import { OffloadCard, SteeringCard } from './essentials';
 import { AqlCard, CpuCard, EcnCard, GroCard } from './expert';
 import { WaitsCard, WorkCard } from './live';
-import { changedSettings, defaults, loadTuning, meaning, toChanges, type TuningForm, validate } from './model';
+import { changedSettings, defaults, loadTuning, meaning, steeringInUse, toChanges, type TuningForm, validate } from './model';
 import { InEffectNow } from './now';
 import { WedNotice } from './wed-notice';
 
@@ -150,7 +150,12 @@ export function TuningPage(): ReactElement {
 
   // folded unless opened, or holding a field to fix
   const expertShown = expertOpen || Object.keys(errors).length > 0;
-  const rss = form?.steering === 'rss' && !(live.data !== undefined && live.data.rss === undefined);
+  // the RSS settings apply where RSS runs: not on a PPPoE line with Automatic, nor without the rings
+  const rss =
+    form !== undefined &&
+    data !== undefined &&
+    steeringInUse(form.steering, { pppoe: data.pppoe, rssMissing: live.data !== undefined && live.data.rss === undefined }) ===
+      'rss';
 
   return (
     <>

@@ -2,6 +2,7 @@ import { ArrowDownIcon, ArrowUpIcon, EthernetPortIcon, type LucideIcon, SendIcon
 import type { ReactElement } from 'react';
 import type { NetworkLive, QueueNow } from '@/hooks/use-network-live';
 import { formatBitrate, formatNumber, formatPercent } from '@/lib/format';
+import { load, perSecond, ringSummary } from '@/lib/network-lanes';
 import { cpuText } from '@/lib/network-text';
 import { cn } from '@/lib/utils';
 
@@ -28,17 +29,6 @@ interface Chip {
   /** nothing flows through it right now */
   idle?: boolean;
   hint?: string;
-}
-
-/** 5,700 -> "5.7k/s" */
-function perSecond(n: number | undefined): string {
-  if (n === undefined) return '—/s';
-  return n >= 1000 ? `${formatNumber(n / 1000, 1)}k/s` : `${formatNumber(n)}/s`;
-}
-
-/** a thread's CPU use: 0.13 -> "13% CPU" */
-function load(n: number | undefined): string {
-  return n === undefined ? '— CPU' : `${formatPercent(n)} CPU`;
 }
 
 function queueChip(q: QueueNow): Chip {
@@ -79,15 +69,13 @@ function lanes(live: NetworkLive): { perCpu: Chip[][]; shared: Chip[]; sharedCpu
   const shared: Chip[] = [];
 
   for (const r of live.rings) {
-    const flows = r.share;
     const chip: Chip = {
       key: `ring ${String(r.ring)}`,
       icon: EthernetPortIcon,
       tone: 'ring',
       title: `Ring ${String(r.ring)}`,
-      detail: flows > 0 ? `${formatPercent(flows)} of flows · ${perSecond(r.irqRate)} · ${load(r.load)}` : 'no flows',
-      idle: flows === 0,
-      hint: 'An Ethernet receive ring: its interrupt and NAPI thread, the share of flows the RSS table sends it, interrupts a second and its thread’s CPU use.',
+      ...ringSummary(r),
+      hint: 'An Ethernet receive ring: its interrupt and NAPI thread, the share of flows the RSS table sends it, interrupts a second and its thread’s CPU use. Ring 0 also gets what the hash can’t spread: the switch’s ports, and PPPoE.',
     };
     (at(r.cpu) ?? shared).push(chip);
   }

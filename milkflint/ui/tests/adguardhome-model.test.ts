@@ -31,22 +31,29 @@ const status = (over: Partial<AdGuardStatus> = {}): AdGuardStatus => ({
 
 const setting = (key: string, breaks: boolean): Setting => ({ key, have: null, want: null, breaks, what: key });
 
-test('its state: filtering, starting, round it (stopped or silent), off, an access point', () => {
+test('its state: filtering, starting, round it or failing (stopped or silent), off, an access point', () => {
   assert.equal(describeState(status()).label, 'Filtering');
   assert.equal(describeState(status()).tone, 'success');
   assert.equal(describeState(status({ state: 'starting' })).label, 'Starting');
   assert.equal(describeState(status({ state: 'fallback', reason: 'stopped' })).label, 'Stopped');
   assert.equal(describeState(status({ state: 'fallback', reason: 'not answering' })).label, 'Not answering');
   assert.match(describeState(status({ state: 'fallback' })).text, /unfiltered/);
+  // left to fail (the default): it says so, and that nothing gets through unfiltered
+  assert.equal(describeState(status({ state: 'blocking', reason: 'stopped' })).label, 'Stopped');
+  assert.equal(describeState(status({ state: 'blocking', reason: 'not answering' })).label, 'Not answering');
+  assert.equal(describeState(status({ state: 'blocking' })).tone, 'warning');
+  assert.match(describeState(status({ state: 'blocking' })).text, /fail .*nothing gets through unfiltered/);
   assert.equal(describeState(status({ enabled: false })).label, 'Off');
   // turned off, whatever the monitor said last
   assert.equal(describeState(status({ enabled: false, state: 'fallback' })).label, 'Off');
   assert.equal(describeState(status({ mode: 'ap' })).label, 'Not used');
 });
 
-test('the Dashboard warns while lookups go round it, or a setting breaks the chain; not for a note, off, or an access point', () => {
-  assert.deepEqual(needsAttention(status()), { fallback: false, broken: [] });
+test('the Dashboard warns while lookups go round it or fail, or a setting breaks the chain; not for a note, off, or an access point', () => {
+  assert.deepEqual(needsAttention(status()), { fallback: false, blocking: false, broken: [] });
   assert.equal(needsAttention(status({ state: 'fallback' })).fallback, true);
+  assert.deepEqual(needsAttention(status({ state: 'blocking' })), { fallback: false, blocking: true, broken: [] });
+  assert.equal(needsAttention(status({ enabled: false, state: 'blocking' })).blocking, false);
   assert.deepEqual(
     needsAttention(status({ settings: [setting('dns.port', true), setting('dns.cache_enabled', false)] })).broken.map(
       (s) => s.key,
@@ -55,11 +62,12 @@ test('the Dashboard warns while lookups go round it, or a setting breaks the cha
   );
   assert.deepEqual(needsAttention(status({ enabled: false, state: 'fallback', settings: [setting('dns.port', true)] })), {
     fallback: false,
+    blocking: false,
     broken: [],
   });
-  assert.deepEqual(needsAttention(status({ mode: 'ap', state: 'fallback' })), { fallback: false, broken: [] });
-  assert.deepEqual(needsAttention(undefined), { fallback: false, broken: [] });
-  assert.deepEqual(needsAttention({ installed: false }), { fallback: false, broken: [] });
+  assert.deepEqual(needsAttention(status({ mode: 'ap', state: 'fallback' })), { fallback: false, blocking: false, broken: [] });
+  assert.deepEqual(needsAttention(undefined), { fallback: false, blocking: false, broken: [] });
+  assert.deepEqual(needsAttention({ installed: false }), { fallback: false, blocking: false, broken: [] });
 });
 
 test('sign-in: a user name AdGuard Home takes, not MilkFlint’s own; a password bcrypt takes whole, typed twice', () => {

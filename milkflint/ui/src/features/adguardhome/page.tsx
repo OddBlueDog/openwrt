@@ -46,6 +46,7 @@ import {
   installVersion,
   repairAdGuard,
   setCredentials,
+  setFallback,
   setupAdGuard,
 } from './api';
 import {
@@ -309,6 +310,57 @@ function UpdatesCard({
   );
 }
 
+/** What devices' lookups do while it's down, once it has started: fail (the default) or answered unfiltered. */
+function FallbackCard({
+  s,
+  busy,
+  run,
+}: {
+  s: AdGuardStatus;
+  busy: Busy;
+  run: (what: string, fn: () => Promise<unknown>, done?: string) => void;
+}): ReactElement {
+  const on = s.fallback === true;
+  return (
+    <Card>
+      <CardHeading
+        title="If it stops answering"
+        description="When AdGuard Home crashes or hangs after it has started. While it starts (after a reboot, or a change made here), the router answers your devices’ lookups itself, unfiltered, either way."
+        action={
+          <Switch
+            aria-label="Answer them unfiltered"
+            checked={on}
+            disabled={busy !== undefined}
+            onCheckedChange={(v) => {
+              run(
+                'fallback',
+                () => setFallback(v),
+                v ? 'Saved: the router answers lookups itself while it’s down.' : 'Saved: lookups fail while it’s down.',
+              );
+            }}
+          />
+        }
+      />
+      <CardContent className="border-t pt-4">
+        <p className="max-w-prose text-sm">
+          {on ? (
+            <>
+              <span className="font-medium">Answer them unfiltered.</span> The router answers your devices’ lookups itself until
+              AdGuard Home is back: the internet keeps working, but ads and trackers get through meanwhile.
+            </>
+          ) : (
+            <>
+              <span className="font-medium">Let them fail.</span> Your devices’ lookups keep going to AdGuard Home and fail until
+              it’s back, so nothing gets through unfiltered, but nothing new loads either. A stopped AdGuard Home is started again
+              every 30 seconds. Turn this on to have the router answer them meanwhile.
+            </>
+          )}
+        </p>
+      </CardContent>
+    </Card>
+  );
+}
+
 /** What it's doing now, in one line over the state's sentence. */
 function headline(s: AdGuardStatus): string {
   if (s.mode === 'ap') return 'Not used in access point mode';
@@ -322,6 +374,8 @@ function headline(s: AdGuardStatus): string {
       return 'Starting up';
     case 'fallback':
       return 'Not filtering right now';
+    case 'blocking':
+      return 'Your devices’ lookups are failing';
     case 'off':
       return 'Lookups aren’t filtered';
   }
@@ -410,7 +464,8 @@ function Answer({
             Choose the user name and password for its web interface. Turning it on writes its first settings (no lists yet: you
             choose them there), so its setup wizard never runs. Your devices keep asking the router, which sends their lookups
             through AdGuard Home, then on to the DNS page’s servers. It runs as a program of its own, using some of the router’s
-            memory.
+            memory. If it stops answering once it has started, their lookups fail until it’s back, so nothing gets through
+            unfiltered: you can have the router answer them meanwhile instead, once it’s on.
           </p>
           <CredentialsForm
             initialUser="admin"
@@ -555,6 +610,23 @@ export function AdGuardHomePage(): ReactElement {
             .
           </Problem>
         )}
+        {!ap && on && s.state === 'blocking' && (
+          <Problem
+            title={
+              s.reason === 'stopped'
+                ? 'AdGuard Home has stopped: your devices’ lookups fail'
+                : 'AdGuard Home isn’t answering: your devices’ lookups fail'
+            }
+          >
+            Nothing gets through unfiltered: their lookups keep going to AdGuard Home
+            {s.reason === 'stopped' ? ', which is started again every 30 seconds' : ''}, and work again once it answers. To keep
+            DNS working meanwhile, turn on “Answer them unfiltered” below. Its messages are on the{' '}
+            <a href={href('logs')} className={link}>
+              Logs page
+            </a>
+            .
+          </Problem>
+        )}
         {!ap && on && broken.length > 0 && (
           <Problem title="A setting changed in AdGuard Home breaks the DNS chain" action={repair}>
             <ul className="mt-1 list-disc pl-4">
@@ -587,6 +659,8 @@ export function AdGuardHomePage(): ReactElement {
             </a>
           </Problem>
         )}
+
+        {s.configured === true && !ap && <FallbackCard s={s} busy={busy} run={run} />}
 
         {s.configured === true && (
           <div className="grid items-start gap-4 xl:grid-cols-2">

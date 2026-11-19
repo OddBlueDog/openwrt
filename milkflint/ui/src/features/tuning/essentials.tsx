@@ -16,7 +16,17 @@ import { splitHint } from '@/lib/hint';
 import { RotateCwIcon } from 'lucide-react';
 import { explain } from '@/components/explain';
 import type { TuningStatus } from './api';
-import { defaults, queueSwitch, type Steering, steeringIds, steeringOptions, type TuningData, type TuningForm } from './model';
+import {
+  defaults,
+  queueSwitch,
+  type Steering,
+  steeringIds,
+  type SteeringInUse,
+  steeringInUse,
+  steeringOptions,
+  type TuningData,
+  type TuningForm,
+} from './model';
 import { NowRow } from './now-row';
 import { wedNeedsRestart, wedNow } from './wed';
 
@@ -24,6 +34,14 @@ export type SetForm = <K extends keyof TuningForm>(key: K, value: TuningForm[K])
 
 const RSS_MISSING =
   'Needs an image whose Ethernet has its four receive rings (MilkFlint’s RSS patches). This one doesn’t, so the RPS layout is used.';
+const PPPOE_RSS =
+  'Your internet connection is PPPoE, which RSS can’t spread: its downloads all arrive on ring 0, and only that ring is spread, in software. Automatic uses the RPS layout for it.';
+
+/** What Automatic runs, and why when it isn't RSS */
+function autoText(inUse: SteeringInUse, line: { pppoe: boolean; rssMissing: boolean }): string {
+  if (inUse === 'rss') return 'RSS';
+  return line.pppoe ? 'RPS, as your internet connection is PPPoE, which RSS can’t spread' : 'RPS, as this image has no RSS rings';
+}
 
 function isSteering(v: string): v is Steering {
   return (steeringIds as readonly string[]).includes(v);
@@ -43,8 +61,11 @@ export function SteeringCard({
   // RSS needs an image whose Ethernet has the four rings; without them the
   // script keeps the RPS layout
   const rssMissing = live !== undefined && live.rss === undefined;
+  const line = { pppoe: data.pppoe, rssMissing };
   const queue = queueSwitch(form, data);
   const chosen = steeringOptions[form.steering].description;
+  // RSS chosen where it can't be, or can't spread the internet connection
+  const status = form.steering !== 'rss' ? undefined : rssMissing ? RSS_MISSING : data.pppoe ? PPPOE_RSS : undefined;
   return (
     <Card>
       <CardHeading title="Packet steering" description="How what the ports receive is spread over the CPUs." />
@@ -53,8 +74,8 @@ export function SteeringCard({
           id="steering"
           label="Layout"
           hint={splitHint(chosen).lead}
-          // the choice isn't in effect: say so in every theme
-          status={form.steering === 'rss' && rssMissing ? RSS_MISSING : undefined}
+          // the choice isn't in effect, or does little here: say so in every theme
+          status={status}
           why={
             <div className="flex flex-col gap-2">
               <ul className="flex flex-col gap-1.5">
@@ -95,14 +116,15 @@ export function SteeringCard({
             </SelectContent>
           </Select>
         </Field>
+        {form.steering === 'auto' && <NowRow label="Automatic uses">{autoText(steeringInUse('auto', line), line)}</NowRow>}
         {queue !== undefined && (
           <Field
             id="followQueue"
             label={queue ? 'Also turn on multi-queue CAKE' : 'Also switch Smart Queue to single-queue CAKE'}
             {...explain(
               queue
-                ? 'Smart Queue then runs one CAKE queue per ring, each on its ring’s CPU, sharing your speed (cake_mq). It restarts for a moment.'
-                : 'Without RSS every download arrives on one ring, so multi-queue CAKE would run as one queue anyway. Smart Queue restarts for a moment.',
+                ? 'Smart Queue then runs one CAKE queue per CPU that receives downloads, each on its own CPU, sharing your speed (cake_mq). It restarts for a moment.'
+                : 'This layout sends every download through one queue, so multi-queue CAKE would run as one queue anyway. Smart Queue restarts for a moment.',
               [`sqm.${data.sqm?.section ?? '<queue>'}.use_mq`, 'milkflint.cake.multi_queue'],
             )}
           >

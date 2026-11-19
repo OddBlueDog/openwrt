@@ -46,7 +46,7 @@ import { SERVER } from '../remote-access/sections';
 import { explain } from '@/components/explain';
 import { MoreSettings } from '@/components/more-settings';
 import { type GuestId, isGuestNetwork } from '../wifi-guest/guest';
-import { dnsAnswer, moreSummary } from './answer';
+import { dnsAnswer, moreSummary, outsideNote } from './answer';
 import { getDnsStatus } from './api';
 import { CacheCard } from './cache-card';
 import { homeDhcp, loops, readDeviceDns } from './device-dns';
@@ -429,7 +429,10 @@ export function DnsPage(): ReactElement {
             const ids = Object.keys(providers) as ProviderId[];
             const [mainTitle, backupTitle] = slotTitles(form.pair);
             const [mainHint, backupHint] = slotHints(form.pair, form.mode, shortName(main));
-            const now = dnsAnswer(data.form, data.routerIp, aghOn);
+            // a DNS program set up outside MilkFlint (ctrld, ...) that devices' lookups reach
+            const outside = status?.outside;
+            const now = dnsAnswer(data.form, data.routerIp, aghOn, outside);
+            const outsideWarning = outside === undefined ? undefined : outsideNote(outside, data.form.mode);
             const notRunning = data.form.mode === 'encrypted' && status?.running === false;
             const lan = data.lanDhcp?.['.name'] ?? 'lan';
             const foldErrors = errors.form.domain !== undefined || Object.keys(errors.records).length > 0;
@@ -448,7 +451,9 @@ export function DnsPage(): ReactElement {
                     value={
                       <>
                         <Figure>{now.upstream.value}</Figure>
-                        {notRunning ? (
+                        {now.upstream.outside === true ? (
+                          <Badge variant="outline">Set up outside MilkFlint</Badge>
+                        ) : notRunning ? (
                           <Badge variant="warning">Not running</Badge>
                         ) : now.upstream.encrypted ? (
                           <Badge variant="success">Encrypted</Badge>
@@ -457,9 +462,15 @@ export function DnsPage(): ReactElement {
                         )}
                       </>
                     }
-                    action={notRunning ? <GoLink href={href('logs')}>The system log</GoLink> : undefined}
+                    action={
+                      notRunning && now.upstream.outside !== true ? (
+                        <GoLink href={href('logs')}>The system log</GoLink>
+                      ) : undefined
+                    }
                   >
-                    {notRunning ? 'Encrypted DNS is set up, but its service (dnsproxy) isn’t running.' : now.upstream.text}
+                    {notRunning && now.upstream.outside !== true
+                      ? 'Encrypted DNS is set up, but its service (dnsproxy) isn’t running.'
+                      : now.upstream.text}
                   </AnswerCell>
                   <AnswerCell title="Cache and protection" value={<Figure>{now.protection.value}</Figure>}>
                     {now.protection.text}
@@ -467,8 +478,16 @@ export function DnsPage(): ReactElement {
                 </Answer>
 
                 <Card>
-                  <CardHeading title="DNS servers" status={describe(form.mode, main, backup, form.pair)} />
+                  <CardHeading
+                    title="DNS servers"
+                    status={outsideWarning?.status ?? describe(form.mode, main, backup, form.pair)}
+                  />
                   <CardContent className="flex flex-col gap-5">
+                    {outsideWarning !== undefined && (
+                      <Note tone="warning" icon={warn} title={outsideWarning.title}>
+                        {outsideWarning.text}
+                      </Note>
+                    )}
                     {aghOn && (
                       <Note tone="info" icon={<ShieldBanIcon />}>
                         <a href={href('adguardhome')} className="font-medium link underline-offset-4">

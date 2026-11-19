@@ -6,6 +6,7 @@ import { useRef } from 'react';
 import { usePoll } from '@/hooks/use-poll';
 import { getPipeline, type NetThread, type Pipeline } from '@/lib/api/pipeline';
 import { type CakeQdisc, type CakeTin, getSqmStatus } from '@/lib/api/stats';
+import { queueCpu } from '@/lib/network-lanes';
 import { isVpnShaper } from '@/features/vpn-client/sections';
 import { isGuestShaper } from '@/features/wifi-guest/guest';
 
@@ -40,7 +41,7 @@ export interface QueueNow {
   bits: number | undefined;
   avgDelayUs: number | undefined;
   flows: number;
-  /** the CPU it runs on, when the RSS ring that feeds it is pinned to one */
+  /** the CPU it runs on: its XPS CPU, else the CPU of the RSS ring that feeds it, when either is one */
   cpu: number | undefined;
 }
 
@@ -222,6 +223,7 @@ function compute(now: Sample, before: Sample | undefined, qdiscs: CakeQdisc[]): 
   const rss = p.rss === null ? undefined : { table, hash: p.rss.hash ?? undefined, spreading };
   const ringCpu = (txq: number): number | undefined =>
     rss?.spreading === true ? rings.find((r) => r.ring === txq)?.cpu : undefined;
+  const xps = new Map(p.xps.map((d) => [d.dev, d.queues]));
   const queues: QueueNow[] = [];
   // the internet's queues: Guest Wi-Fi's speed limit is a CAKE too
   for (const root of qdiscs.filter((q) => !isGuestShaper(q.dev) && !isVpnShaper(q.dev))) {
@@ -239,8 +241,9 @@ function compute(now: Sample, before: Sample | undefined, qdiscs: CakeQdisc[]): 
           bits: ((r) => (r === undefined ? undefined : r * 8))(rate(now.bytes.get(key), before?.bytes.get(key))),
           avgDelayUs: busiest(q)?.avg_delay_us,
           flows: (q.tins ?? []).reduce((n, t) => n + (t.sparse_flows ?? 0) + (t.bulk_flows ?? 0), 0),
-          // the ifb's transmit queue N carries what ring N received
-          cpu: download ? ringCpu(number - 1) : undefined,
+          // the ifb's transmit queue N carries what CPU N hands it (XPS, a PPPoE
+          // line's), else what ring N received
+          cpu: download ? queueCpu(xps.get(q.dev)?.[number - 1], ringCpu(number - 1)) : undefined,
         });
       }
     } else if (root.parent === undefined) {

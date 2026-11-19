@@ -32,7 +32,9 @@ import { type WedConfig, wedOffChanges, wedOn, wedOnChanges } from './wed';
 //   their low limit; unset follows the high limit (knobs.ts);
 // - milkflint.steering.layout: "openwrt" for OpenWrt's packet steering
 //   instead of MilkFlint's; milkflint.steering.rss "0" for MilkFlint's RPS
-//   layout instead of RSS; network.globals.packet_steering "0" turns
+//   layout, "1" for RSS whatever the line, unset Automatic: RSS, but the
+//   RPS layout when an interface is PPPoE, which RSS can't spread
+//   (packet-steering.sh); network.globals.packet_steering "0" turns
 //   steering off (LuCI's Packet Steering option);
 // - milkflint.gro.mode ("fraglist", "plain", "off"), .udp_fwd ("1", "0"),
 //   .max_size (bytes): the internet port's GRO, read by
@@ -54,13 +56,17 @@ import { type WedConfig, wedOffChanges, wedOn, wedOnChanges } from './wed';
 //   says what a save will change before it's made, and the Wi-Fi driver takes
 //   the setting when the router restarts, which the save offers.
 // Unset everywhere is what the image does: Restore defaults unsets them.
-// Moving to or from RSS can also switch Smart Queue's multi-queue CAKE
-// (sqm's use_mq), which only spreads over CPUs when RSS does: to RSS it
-// goes back to following the download speed (milkflint.cake.multi_queue
-// unset, ../sqm/multi-queue.ts), away from it off ("0").
+// A change of layout can also switch Smart Queue's multi-queue CAKE (sqm's
+// use_mq), which only spreads over CPUs where each CPU feeds its own
+// sub-queue: with RSS, and on a PPPoE line in the RPS layout too (sqm-scripts
+// gives pppoe-wan's ifb a sub-queue per CPU). To such a layout it goes back
+// to following the download speed (milkflint.cake.multi_queue unset,
+// ../sqm/multi-queue.ts), away from it off ("0").
 
 export type Aql = 'default' | 'off' | 'custom';
-export type Steering = 'rss' | 'rps' | 'openwrt' | 'off';
+export type Steering = 'auto' | 'rss' | 'rps' | 'openwrt' | 'off';
+/** A layout as it runs: Automatic resolves to one of these */
+export type SteeringInUse = Exclude<Steering, 'auto'>;
 export type Gro = 'auto' | 'fraglist' | 'plain' | 'off';
 export type UdpFwd = 'auto' | 'on' | 'off';
 
@@ -102,6 +108,8 @@ export interface TuningData {
   wed: WedConfig;
   /** the router is an access point (the Operating Mode page), which forwards nothing WED could take over */
   accessPoint: boolean;
+  /** an interface is PPPoE: Automatic steering is then the RPS layout */
+  pppoe: boolean;
 }
 
 export const defaults: TuningForm = {
@@ -111,7 +119,7 @@ export const defaults: TuningForm = {
   aqlHigh: '5000',
   aqlTotal: 'auto',
   aqlTotalCustom: '',
-  steering: 'rss',
+  steering: 'auto',
   followQueue: true,
   gro: 'auto',
   udpFwd: 'auto',
@@ -135,17 +143,22 @@ export function sizeLabel(bytes: string | number): string {
   return n % 1024 === 0 ? `${String(n / 1024)} KB` : `${formatNumber(n)} bytes`;
 }
 
-export const steeringIds = ['rss', 'rps', 'openwrt', 'off'] as const;
+export const steeringIds = ['auto', 'rss', 'rps', 'openwrt', 'off'] as const;
 export const steeringOptions: Record<Steering, { label: string; description: string }> = {
+  auto: {
+    label: 'Automatic',
+    description:
+      'RSS, or RPS when the internet connection is PPPoE: the Ethernet hardware can’t spread PPPoE, so with RSS it would all stay on one ring and one CPU.',
+  },
   rss: {
     label: 'RSS: hardware receive rings',
     description:
-      'The Ethernet hardware spreads flows over three receive rings, each with its own CPU (1–3), and nothing is handed between CPUs in software. With multi-queue Smart Queue, each ring feeds its own CAKE queue on the same CPU. The lightest on the CPUs.',
+      'The Ethernet hardware spreads flows over three receive rings, each with its own CPU (1–3), and nothing is handed between CPUs in software. With multi-queue Smart Queue, each ring feeds its own CAKE queue on the same CPU. The lightest on the CPUs. It can’t spread PPPoE, which all arrives on ring 0.',
   },
   rps: {
     label: 'RPS: software steering',
     description:
-      'Everything arrives on one ring on CPU 0, which hands each flow on to CPUs 1–3. Uses more CPU than RSS for the handing on.',
+      'Everything arrives on one ring on CPU 0, which hands each flow on to CPUs 1–3. Uses more CPU than RSS for the handing on. Spreads PPPoE, which RSS can’t.',
   },
   openwrt: {
     label: 'OpenWrt’s layout',
@@ -157,6 +170,34 @@ export const steeringOptions: Record<Steering, { label: string; description: str
     description: 'No steering: packets are handled on the CPU that received them, and the drivers’ threads run on any CPU.',
   },
 };
+
+/** The choice from its settings: network.globals.packet_steering, milkflint.steering.layout and .rss */
+export function readSteering(packetSteering: string | undefined, layout: string | undefined, rss: string | undefined): Steering {
+  if (packetSteering === '0') return 'off';
+  if (layout === 'openwrt') return 'openwrt';
+  return rss === '0' ? 'rps' : rss === '1' ? 'rss' : 'auto';
+}
+
+/** milkflint.steering's layout and rss for a choice (off is network.globals.packet_steering) */
+export function steeringValues(s: Steering): { layout: string | undefined; rss: string | undefined } {
+  return { layout: s === 'openwrt' ? 'openwrt' : undefined, rss: s === 'rps' ? '0' : s === 'rss' ? '1' : undefined };
+}
+
+/** An interface is PPPoE, as packet-steering.sh counts it: proto pppoe, with a device */
+export function hasPppoe(network: Section[]): boolean {
+  return network.some((s) => s['.type'] === 'interface' && str(s, 'proto') === 'pppoe' && (str(s, 'device') ?? '') !== '');
+}
+
+/** The layout a choice runs: Automatic is RSS, but RPS on a PPPoE line; RSS without the rings is RPS too */
+export function steeringInUse(s: Steering, line: { pppoe: boolean; rssMissing: boolean }): SteeringInUse {
+  if (s === 'auto') return line.pppoe || line.rssMissing ? 'rps' : 'rss';
+  return s === 'rss' && line.rssMissing ? 'rps' : s;
+}
+
+/** Whether multi-queue CAKE's download spreads over the CPUs in a layout: each CPU feeding its own sub-queue */
+function multiQueueSpreads(s: SteeringInUse, pppoe: boolean): boolean {
+  return s === 'rss' || (s === 'rps' && pppoe);
+}
 
 export async function loadTuning(): Promise<TuningData> {
   const [milkflint, network, sqm, firewall] = await Promise.all([
@@ -187,14 +228,7 @@ export async function loadTuning(): Promise<TuningData> {
       aqlLow: custom?.[1] ?? defaults.aqlLow,
       aqlHigh: custom?.[2] ?? defaults.aqlHigh,
       ...aqlTotalOf(str(section('wifi'), 'aql_threshold')),
-      steering:
-        packetSteering === '0'
-          ? 'off'
-          : str(steering, 'layout') === 'openwrt'
-            ? 'openwrt'
-            : str(steering, 'rss') === '0'
-              ? 'rps'
-              : 'rss',
+      steering: readSteering(packetSteering, str(steering, 'layout'), str(steering, 'rss')),
       followQueue: true,
       gro: groMode === 'fraglist' || groMode === 'plain' || groMode === 'off' ? groMode : 'auto',
       udpFwd: udpFwd === '1' ? 'on' : udpFwd === '0' ? 'off' : 'auto',
@@ -214,6 +248,7 @@ export async function loadTuning(): Promise<TuningData> {
     packetSteering,
     wed: { milkflint, sqm, firewall },
     accessPoint: str(section('mode'), 'mode') === 'ap',
+    pppoe: hasPppoe(network),
     firewall:
       fwDefaults === undefined ? undefined : { section: fwDefaults['.name'], hardware: bool(fwDefaults, 'flow_offloading_hw') },
     sqm:
@@ -252,12 +287,13 @@ export function aqlValue(f: TuningForm): string | undefined {
 
 /**
  * Smart Queue's multi-queue setting the new steering asks for, when it should
- * change: on with RSS where the download speed asks for it (../sqm/multi-queue.ts),
- * off without RSS.
+ * change: on where the layout gives each CPU its own sub-queue and the
+ * download speed asks for it (../sqm/multi-queue.ts), off where it doesn't.
  */
 export function queueSwitch(f: TuningForm, data: TuningData): boolean | undefined {
   if (data.sqm === undefined || f.steering === data.form.steering) return undefined;
-  const want = f.steering === 'rss' && (data.sqm.multiQueue || usesMultiQueue(data.sqm.download, 'auto'));
+  const spreads = multiQueueSpreads(steeringInUse(f.steering, { pppoe: data.pppoe, rssMissing: false }), data.pppoe);
+  const want = spreads && (data.sqm.multiQueue || usesMultiQueue(data.sqm.download, 'auto'));
   return want === data.sqm.multiQueue ? undefined : want;
 }
 
@@ -319,11 +355,7 @@ export function toChanges(f: TuningForm, data: TuningData): Change[] {
   }
   if (f.steering !== was.steering || knobsChanged.has('steering')) {
     changes.push(
-      ...sectionChanges('milkflint', data.milkflint, 'steering', {
-        layout: f.steering === 'openwrt' ? 'openwrt' : undefined,
-        rss: f.steering === 'rps' ? '0' : undefined,
-        ...knobs.steering,
-      }),
+      ...sectionChanges('milkflint', data.milkflint, 'steering', { ...steeringValues(f.steering), ...knobs.steering }),
     );
   }
   // Smart Queue's multi-queue CAKE goes with the steering: back to following

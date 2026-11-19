@@ -27,7 +27,9 @@ export function pathSentence(live: NetworkLive): string {
     return `RSS spreads downloads over ${String(rings.length)} rings on ${where}; Smart Queue then shapes them in one CAKE, on one CPU at a time.`;
   }
   if (live.rps.length > 0) {
-    return `What the Ethernet receives arrives on one ring, and packet steering (RPS) hands it on to ${cpuText(live.rps)} by flow.`;
+    const handed = `What the Ethernet receives arrives on one ring, and packet steering (RPS) hands it on to ${cpuText(live.rps)} by flow`;
+    // a PPPoE line's download ifb has a sub-queue per CPU (sqm-scripts' XPS)
+    return multi && pinned ? `${handed}; each CPU then feeds its own Smart Queue queue.` : `${handed}.`;
   }
   return 'What the Ethernet receives is handled on the CPU it arrives on.';
 }

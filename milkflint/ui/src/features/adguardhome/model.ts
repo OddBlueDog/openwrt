@@ -58,15 +58,31 @@ export function describeState(s: AdGuardStatus): { tone: Tone; label: string; te
             ? 'AdGuard Home stopped. Your devices still get answers, unfiltered, from the router itself; it’s started again every few minutes.'
             : 'AdGuard Home isn’t answering. Your devices still get answers, unfiltered, from the router itself, until it does again.',
       };
+    case 'blocking':
+      return {
+        tone: 'warning',
+        label: s.reason === 'stopped' ? 'Stopped' : 'Not answering',
+        text:
+          s.reason === 'stopped'
+            ? 'AdGuard Home stopped. Your devices’ lookups fail until it’s back, so nothing gets through unfiltered; it’s started again every 30 seconds.'
+            : 'AdGuard Home isn’t answering. Your devices’ lookups fail until it does again, so nothing gets through unfiltered.',
+      };
     case 'off':
       return { tone: 'muted', label: 'Off', text: 'Your devices’ lookups go straight to the DNS page’s servers, unfiltered.' };
   }
 }
 
-/** Whether to warn: on, and lookups are going round it, or a setting breaks the chain. */
-export function needsAttention(s: AdGuardStatus | undefined): { fallback: boolean; broken: Setting[] } {
-  if (s?.installed !== true || s.enabled !== true || s.mode === 'ap') return { fallback: false, broken: [] };
-  return { fallback: s.state === 'fallback', broken: (s.settings ?? []).filter((x) => x.breaks) };
+/**
+ * Whether to warn: on, and lookups are going round it (fallback) or failing
+ * until it's back (blocking), or a setting breaks the chain.
+ */
+export function needsAttention(s: AdGuardStatus | undefined): { fallback: boolean; blocking: boolean; broken: Setting[] } {
+  if (s?.installed !== true || s.enabled !== true || s.mode === 'ap') return { fallback: false, blocking: false, broken: [] };
+  return {
+    fallback: s.state === 'fallback',
+    blocking: s.state === 'blocking',
+    broken: (s.settings ?? []).filter((x) => x.breaks),
+  };
 }
 
 /** "v0.107.80" from the package's 0.107.80-r1 (its release number is MilkFlint's). */

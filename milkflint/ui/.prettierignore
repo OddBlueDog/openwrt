@@ -6,3 +6,5 @@ node_modules
 pnpm-lock.yaml
 # copied as they are
 public
+# a design plugin's cache (git-ignored locally), rewritten as it runs
+.impeccable

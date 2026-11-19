@@ -32,7 +32,7 @@ export type UpdateInfo = z.output<typeof updateSchema>;
 const networkSchema = z.object({ interface: z.string(), zone: z.string(), ipv4: z.array(z.string()), ipv6: z.array(z.string()) });
 export type Network = z.output<typeof networkSchema>;
 
-export const STATES = ['off', 'starting', 'active', 'fallback'] as const;
+export const STATES = ['off', 'starting', 'active', 'fallback', 'blocking'] as const;
 export type State = (typeof STATES)[number];
 
 const statusSchema = z.object({
@@ -49,11 +49,16 @@ const statusSchema = z.object({
   user: z.string().nullish(),
   url: z.string().optional(),
   dns_port: z.number().optional(),
-  /** The monitor's: active (devices' lookups go to it), starting, fallback (dnsmasq answers them, unfiltered), off. */
+  /**
+   * The monitor's: active (devices' lookups go to it), starting, fallback
+   * (dnsmasq answers them, unfiltered), blocking (they fail until it's back), off.
+   */
   state: z.enum(STATES).optional(),
   reason: z.string().nullish(),
   since: z.number().nullish(),
   checked: z.number().nullish(),
+  /** Once it has answered, lookups while it doesn't: answered unfiltered (true) or left to fail (false, the default). */
+  fallback: z.boolean().optional(),
   /** The interfaces whose lookups to the router, and whose caught lookups, go to it. */
   redirect: z.object({ home: z.array(z.string()), intercept: z.array(z.string()) }).optional(),
   /** Its own statistics: lookups and blocked ones in its window (hours). */
@@ -96,6 +101,11 @@ export async function setupAdGuard(user: string, password: string): Promise<void
 
 export async function enableAdGuard(on: boolean): Promise<void> {
   await act('enable', { on });
+}
+
+/** What devices' lookups do while it isn't answering: answered unfiltered (true), or left to fail. */
+export async function setFallback(on: boolean): Promise<void> {
+  await act('fallback', { on });
 }
 
 export async function setCredentials(user: string, password: string): Promise<void> {

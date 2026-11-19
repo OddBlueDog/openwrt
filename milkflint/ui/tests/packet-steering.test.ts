@@ -52,6 +52,8 @@ interface Result {
   rps: Record<string, string>;
   /** packet-steering.uc's arguments, when it was handed over to */
   openwrt: string | undefined;
+  /** xps_cpus of ifb4pppoe-wan's queues 0-3 and ifb4eth1's queue 0, with pppIfb */
+  xps: Record<string, string>;
 }
 
 interface Setup {
@@ -64,6 +66,10 @@ interface Setup {
   noEthtool?: boolean;
   threads?: Record<string, string>;
   interrupts?: string;
+  /** devices on top of another (802.1Q VLANs, as netifd names them): name → the device under it */
+  vlans?: Record<string, string>;
+  /** a PPPoE session up with Smart Queue on it: pppoe-wan (a PPP device) and its four-queue ifb, plus eth1's ifb */
+  pppIfb?: boolean;
 }
 
 function run(setup: Setup = {}): Result {
@@ -106,10 +112,32 @@ function run(setup: Setup = {}): Result {
         symlinkSync(driver, join(root, 'sys/class/net', dev, 'device/driver'));
       }
     }
+    for (const [vlan, under] of Object.entries(setup.vlans ?? {})) {
+      mkdirSync(join(root, 'sys/class/net', vlan, 'queues/rx-0'), { recursive: true });
+      writeFileSync(join(root, 'sys/class/net', vlan, 'queues/rx-0/rps_cpus'), 'unset\n');
+      symlinkSync(join(root, 'sys/class/net', under), join(root, 'sys/class/net', vlan, `lower_${under}`));
+    }
+    if (setup.pppIfb === true) {
+      mkdirSync(join(root, 'sys/class/net/pppoe-wan/queues/rx-0'), { recursive: true });
+      writeFileSync(join(root, 'sys/class/net/pppoe-wan/type'), '512\n');
+      for (const [ifb, queues] of [
+        ['ifb4pppoe-wan', 4],
+        ['ifb4eth1', 4],
+      ] as const)
+        for (let q = 0; q < queues; q++) {
+          mkdirSync(join(root, 'sys/class/net', ifb, 'queues', `tx-${String(q)}`), { recursive: true });
+          writeFileSync(join(root, 'sys/class/net', ifb, 'queues', `tx-${String(q)}`, 'xps_cpus'), 'unset\n');
+        }
+      writeFileSync(join(root, 'sys/class/net/ifb4eth1/type'), '1\n');
+    }
+    // uci -q get <key>, and uci -q show <config> (each key='value')
     const uci = Object.entries(setup.uci ?? {})
       .map(([k, v]) => `[ "$3" = "${k}" ] && { echo "${v}"; exit 0; }`)
       .join('\n');
-    exe(join(bin, 'uci'), `${uci}\nexit 1`);
+    const show = Object.entries(setup.uci ?? {})
+      .map(([k, v]) => `[ "$3" = "${k.split('.')[0] ?? ''}" ] && echo "${k}='${v}'"`)
+      .join('\n');
+    exe(join(bin, 'uci'), `if [ "$2" = show ]; then\n${show}\nexit 0\nfi\n${uci}\nexit 1`);
     if (setup.noEthtool !== true) {
       exe(
         join(bin, 'ethtool'),
@@ -167,6 +195,15 @@ esac`,
       ),
       rps,
       openwrt: lines.find((l) => l.startsWith('openwrt '))?.slice(8),
+      xps:
+        setup.pppIfb === true
+          ? Object.fromEntries(
+              [...[0, 1, 2, 3].map((q) => `ifb4pppoe-wan/${String(q)}`), 'ifb4eth1/0'].map((k) => {
+                const [ifb = '', q = ''] = k.split('/');
+                return [k, readFileSync(join(root, 'sys/class/net', ifb, 'queues', `tx-${q}`, 'xps_cpus'), 'utf8').trim()];
+              }),
+            )
+          : {},
     };
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -256,6 +293,85 @@ test('off: every thread on every CPU, no RPS, one ring', () => {
   for (const pid of [TX, RING0, RING1, RING2, RING3, ...WIFI]) assert.equal(r.mask[pid], 'f', pid);
   assert.deepEqual(r.rps, NO_RPS);
   assert.deepEqual(r.rtprio, [`${RING1} other`, `${RING2} other`, `${RING3} other`]);
+});
+
+// RSS can't hash inside PPPoE: a PPPoE session's packets all arrive on its
+// port's ring 0, on CPU0, as the switch's (eth0's) do anyway
+const PPPOE = { 'network.wan.proto': 'pppoe', 'network.wan.device': 'eth1' };
+// RSS chosen on the page, whatever the line
+const RSS = { 'milkflint.steering.rss': '1' };
+
+test('a PPPoE WAN, automatic: the RPS layout, as RSS would spread nothing', () => {
+  assertRpsLayout(run({ uci: PPPOE }));
+});
+
+test('a PPPoE interface by another name than wan, or on a VLAN device: the RPS layout too', () => {
+  assertRpsLayout(run({ uci: { 'network.fttp.proto': 'pppoe', 'network.fttp.device': 'eth1', 'network.wan.proto': 'dhcp' } }));
+  assertRpsLayout(run({ uci: { ...PPPOE, 'network.wan.device': 'wan_vlan' }, vlans: { wan_vlan: 'eth1' } }));
+});
+
+test('a DHCP WAN, automatic or RSS chosen: RSS', () => {
+  for (const uci of [{ 'network.wan.proto': 'dhcp', 'network.wan.device': 'eth1' }, RSS]) {
+    const r = run({ uci });
+    assert.deepEqual(r.rss, ['-X eth1 weight 0 1 1 1']);
+    assert.deepEqual(r.rps, NO_RPS);
+  }
+});
+
+test('RSS chosen on a PPPoE WAN: RSS, with its port’s ring 0 spread over CPUs 1-3, rings 1-3 still without RPS', () => {
+  const r = run({ uci: { ...PPPOE, ...RSS } });
+  assert.deepEqual(r.rss, ['-X eth1 weight 0 1 1 1']);
+  assert.deepEqual(r.affinity, { '119': '1', '120': '2', '121': '4', '122': '8' });
+  assert.deepEqual(r.rps, { ...NO_RPS, 'eth1/0': 'e' });
+});
+
+test('RSS chosen on a PPPoE WAN on a VLAN: the port under the VLAN', () => {
+  assert.equal(run({ uci: { ...PPPOE, ...RSS, 'network.wan.device': 'eth1.101' } }).rps['eth1/0'], 'e');
+});
+
+test('RSS chosen on a PPPoE WAN on a VLAN device with a name of its own: the port under it', () => {
+  const r = run({ uci: { ...PPPOE, ...RSS, 'network.wan.device': 'wan_vlan' }, vlans: { wan_vlan: 'eth1' } });
+  assert.deepEqual(r.rps, { ...NO_RPS, 'eth1/0': 'e' });
+});
+
+test('RSS chosen, a PPPoE interface by another name than wan: its port too', () => {
+  const r = run({
+    uci: { 'network.fttp.proto': 'pppoe', 'network.fttp.device': 'eth1', 'network.wan.proto': 'dhcp', ...RSS },
+  });
+  assert.deepEqual(r.rps, { ...NO_RPS, 'eth1/0': 'e' });
+});
+
+// sqm-scripts' 109 gives a PPP device's ifb a sub-queue per CPU, which holds
+// only while each flow stays on one CPU
+test('a PPPoE session’s ifb: a sub-queue per CPU while steering is on; others’ ifbs left alone', () => {
+  const r = run({ uci: PPPOE, pppIfb: true });
+  assert.deepEqual(r.xps, {
+    'ifb4pppoe-wan/0': '1',
+    'ifb4pppoe-wan/1': '2',
+    'ifb4pppoe-wan/2': '4',
+    'ifb4pppoe-wan/3': '8',
+    'ifb4eth1/0': 'unset',
+  });
+});
+
+test('a PPPoE session’s ifb with steering off: no sub-queue per CPU (the threads move between CPUs)', () => {
+  const off = {
+    'ifb4pppoe-wan/0': '0',
+    'ifb4pppoe-wan/1': '0',
+    'ifb4pppoe-wan/2': '0',
+    'ifb4pppoe-wan/3': '0',
+    'ifb4eth1/0': 'unset',
+  };
+  assert.deepEqual(run({ uci: PPPOE, pppIfb: true, arg: '0' }).xps, off);
+  assert.deepEqual(run({ uci: { ...PPPOE, 'milkflint.steering.layout': 'openwrt' }, pppIfb: true, arg: '0' }).xps, off);
+});
+
+test('a PPPoE WAN in the RPS layout: as every Ethernet queue', () => {
+  assertRpsLayout(run({ uci: { ...PPPOE, 'milkflint.steering.rss': '0' } }));
+});
+
+test('a PPPoE WAN, steering off: no RPS', () => {
+  assert.deepEqual(run({ uci: PPPOE, arg: '0' }).rps, NO_RPS);
 });
 
 test('OpenWrt’s layout: handed over, one ring, normal priority', () => {

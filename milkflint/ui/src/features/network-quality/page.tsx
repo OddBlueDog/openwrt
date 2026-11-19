@@ -318,6 +318,8 @@ interface QualityForm {
   pingTarget: string;
   customTarget: string;
   dnsDomain: string;
+  /** A DNS server to time instead of the ones devices use; '' for those. */
+  dnsServer: string;
   routes: boolean;
 }
 
@@ -331,11 +333,14 @@ async function loadForm(): Promise<QualityForm> {
     pingTarget: preset ? target : 'custom',
     customTarget: preset ? '' : target,
     dnsDomain: str(s, 'dns_domain') ?? 'openwrt.org',
+    dnsServer: str(s, 'dns_server') ?? '',
     routes: bool(s, 'routes', true),
   };
 }
 
 const HOST = /^[A-Za-z0-9.:-]+$/;
+// an IPv4 address, #port optional (the probe's dns-path.uc takes the same)
+const DNS_SERVER = /^(\d{1,3}\.){3}\d{1,3}(#\d{1,5})?$/;
 
 export function NetworkQualityPage(): ReactElement {
   const live = useLive(2000);
@@ -358,6 +363,8 @@ export function NetworkQualityPage(): ReactElement {
   if (form?.pingTarget === 'custom' && !HOST.test(form.customTarget)) errors.customTarget = 'An IP address or host name.';
   if (form !== undefined && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(form.dnsDomain))
     errors.dnsDomain = 'A domain name, e.g. openwrt.org.';
+  if (form !== undefined && form.dnsServer !== '' && !DNS_SERVER.test(form.dnsServer))
+    errors.dnsServer = 'An IPv4 address, with #port when it isn’t 53, e.g. 127.0.0.1#5354.';
   const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data);
 
   const toChanges = (f: QualityForm): Change[] => [
@@ -370,9 +377,13 @@ export function NetworkQualityPage(): ReactElement {
         interval: f.interval,
         ping_target: f.pingTarget === 'custom' ? f.customTarget : f.pingTarget,
         dns_domain: f.dnsDomain,
+        ...(f.dnsServer === '' ? {} : { dns_server: f.dnsServer }),
         routes: f.routes ? '1' : '0',
       },
     },
+    ...(f.dnsServer === '' && data?.dnsServer !== undefined && data.dnsServer !== ''
+      ? [{ op: 'unset' as const, config: 'milkflint', section: 'netquality', options: ['dns_server'] }]
+      : []),
   ];
 
   return (
@@ -454,8 +465,8 @@ export function NetworkQualityPage(): ReactElement {
               <Field
                 id="nq-dns"
                 label="DNS test domain"
-                hint="Looked up at each DNS server the DNS page uses."
-                why="Or at your internet provider’s DNS server when DNS is Automatic. Saved as milkflint.netquality.dns_domain."
+                hint="Looked up at each DNS server your devices’ lookups go to."
+                why="The DNS page’s servers, your internet provider’s when DNS is Automatic, or a DNS program on the router set up outside MilkFlint (ctrld, AdGuard Home, Unbound…). Saved as milkflint.netquality.dns_domain."
                 error={errors.dnsDomain}
               >
                 <Input
@@ -465,6 +476,24 @@ export function NetworkQualityPage(): ReactElement {
                   aria-invalid={errors.dnsDomain !== undefined}
                   onChange={(e) => {
                     set('dnsDomain', e.target.value.trim());
+                  }}
+                />
+              </Field>
+              <Field
+                id="nq-dns-server"
+                label="DNS server to test"
+                hint="Leave empty to test the servers your devices’ lookups go to."
+                why="For a setup the router can’t follow by itself. An IPv4 address, with #port when it isn’t 53: 127.0.0.1#5354 for a program on the router. Saved as milkflint.netquality.dns_server."
+                error={errors.dnsServer}
+              >
+                <Input
+                  id="nq-dns-server"
+                  className="font-mono"
+                  placeholder="Automatic"
+                  value={form.dnsServer}
+                  aria-invalid={errors.dnsServer !== undefined}
+                  onChange={(e) => {
+                    set('dnsServer', e.target.value.trim());
                   }}
                 />
               </Field>
