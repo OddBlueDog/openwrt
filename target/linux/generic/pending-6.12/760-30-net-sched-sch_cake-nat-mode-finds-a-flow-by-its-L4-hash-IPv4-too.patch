@@ -1,0 +1,125 @@
+From: MilkFlint <milkflint@localhost>
+Date: Thu, 19 Nov 2026 16:20:00 +0000
+Subject: [PATCH] net/sched: sch_cake: nat mode finds a flow by its L4 hash, IPv4 too
+
+With nat, every IPv4 packet was dissected, its tuple looked up in
+conntrack (a whole lookup on a download, shaped before conntrack has
+seen it) and hashed, so that its flow was the one of its tuple from
+before NAT. Since 760-01 only the host hashes need those addresses, and
+they are worked out when a queue is given to a flow; 760-10 skipped all
+this for IPv6.
+
+A packet with an L4 hash (the NIC's, or RPS's) is now found by it in nat
+mode as without: a connection's packets before and after NAT are one to
+one, so its hash tells them from other connections' as well as the tuple
+does. The host hashes are still worked out from the packet, un-NATed,
+when a queue is allocated. The host-only modes are unchanged.
+
+As already for IPv6: a flow whose hash changes in the middle of a
+connection changes queue once.
+
+KUnit: a masqueraded packet with an L4 hash and its conntrack entry gets
+its hash as its flow's tag, and the host queues it would have had before
+NAT.
+
+---
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -1176,39 +1176,31 @@ static u32 cake_hash(struct cake_tin_data *q, const struct sk_buff *skb,
+ 	if (unlikely(flow_mode == CAKE_FLOW_NONE))
+ 		return 0;
+ 
+-	/* If both overrides are set, or we can use the SKB hash and nat mode is
+-	 * disabled, we can skip packet dissection entirely. If nat mode is
+-	 * enabled there's another check below after doing the conntrack lookup.
++	/* If both overrides are set, or we can use the SKB hash, we can skip
++	 * packet dissection entirely. With nat too: the packets of a
++	 * connection before and after NAT are one to one, so its L4 hash tells
++	 * its packets from other connections' as well as the tuple from before
++	 * NAT would, without a dissection and a conntrack lookup for each. The
++	 * host hashes, which do need the addresses from before NAT, are worked
++	 * out when a queue is allocated (cake_host_hashes()).
+ 	 */
+-	if ((!hash_flows || (use_skbhash && !nat_enabled)) && !hosts_now)
+-		goto skip_hash;
+-
+-	/* nat mode only rewrites IPv4 keys (cake_update_flowkeys()): anything
+-	 * else with an L4 hash keeps it, and its keys would go unused
+-	 */
+-	if (use_skbhash && !hosts_now && skb_protocol(skb, true) != htons(ETH_P_IP))
++	if ((!hash_flows || use_skbhash) && !hosts_now)
+ 		goto skip_hash;
+ 
+ 	skb_flow_dissect_flow_keys(skb, &keys,
+ 				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
+ 
+-	/* Don't use the SKB hash if we change the lookup keys from conntrack */
+-	if (nat_enabled && cake_update_flowkeys(&keys, skb))
+-		use_skbhash = false;
+-
+-	/* If we can still use the SKB hash and don't need the host hash, we can
+-	 * skip the rest of the hashing procedure
+-	 */
+-	if (use_skbhash && !hosts_now)
+-		goto skip_hash;
++	if (nat_enabled)
++		cake_update_flowkeys(&keys, skb);
+ 
+ 	if (hosts_now)
+ 		cake_keys_host_hashes(&keys, &srchost_hash, &dsthost_hash);
+ 
+ 	/* This *must* be after cake_keys_host_hashes(), since as a
+-	 * side-effect it sorts the src and dst addresses.
++	 * side-effect it sorts the src and dst addresses. Only per-flow
++	 * modes hash flows, so hosts_now is false here.
+ 	 */
+-	if (hash_flows && !use_skbhash)
++	if (hash_flows)
+ 		flow_hash = flow_hash_from_keys(&keys);
+ 
+ skip_hash:
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -175,8 +175,8 @@ static void cake_test_check_flow(struct kunit *test, struct cake_tin_data *q,
+ static const int cake_test_modes[] = {
+ 	CAKE_FLOW_SRC_IP, CAKE_FLOW_DST_IP, CAKE_FLOW_HOSTS, CAKE_FLOW_FLOWS,
+ 	CAKE_FLOW_DUAL_SRC, CAKE_FLOW_DUAL_DST, CAKE_FLOW_TRIPLE,
+-	/* nat: no conntrack here, so the keys stay the packet's; IPv6 (and
+-	 * IPv4 without a conntrack entry) with an L4 hash keeps the hash
++	/* nat: no conntrack here, so the keys stay the packet's; with an L4
++	 * hash, the flow tag is the hash
+ 	 */
+ 	CAKE_FLOW_FLOWS | CAKE_FLOW_NAT_FLAG,
+ 	CAKE_FLOW_DUAL_DST | CAKE_FLOW_NAT_FLAG,
+@@ -1871,7 +1871,9 @@ static u32 cake_test_src_tag(struct cake_tin_data *q, u32 idx, int flow_mode)
+ }
+ 
+ /* nat mode, upload: a masqueraded packet with its conntrack entry gets the
+- * flow and host queues it would have had before NAT, whatever its RPS hash.
++ * host queues it would have had before NAT, and with no L4 hash its flow
++ * queue too. With one (RPS's), its flow is found by the hash, NAT or not,
++ * as the packets of a connection before and after NAT are one to one.
+  * Without the entry (the flowtable's fast path before 707) the packet's own
+  * tuple isn't in conntrack, and every LAN host is the router's address.
+  */
+@@ -1897,14 +1899,17 @@ static void cake_test_nat_conntrack(struct kunit *test)
+ 		for (host = 2; host < 4; host++)
+ 		for (l4 = 0; l4 < 2; l4++) {
+ 			u16 wan_port = 61000 + host;
++			u32 rps = l4 ? 0x5eed0000 | host : 0;
+ 			struct sk_buff *orig = cake_test_skb(test, false, IPPROTO_TCP,
+ 							     host, 40000, 0);
+-			struct sk_buff *nat = cake_test_nat_skb(test, host, wan_port, true,
+-								l4 ? 0x5eed0000 | host : 0);
++			struct sk_buff *nat = cake_test_nat_skb(test, host, wan_port, true, rps);
+ 			u32 a = cake_hash(pre, orig, mode, 0, 0);
+ 			u32 b = cake_hash(post, nat, mode, 0, 0);
+ 
+-			KUNIT_EXPECT_EQ(test, post->tags[b], pre->tags[a]);
++			if (rps && (mode & CAKE_FLOW_FLOWS))
++				KUNIT_EXPECT_EQ(test, post->tags[b], rps);
++			else
++				KUNIT_EXPECT_EQ(test, post->tags[b], pre->tags[a]);
+ 			KUNIT_EXPECT_EQ(test, cake_test_src_tag(post, b, mode),
+ 					cake_test_src_tag(pre, a, mode));
+ 			pre_src[host - 2] = cake_test_src_tag(pre, a, mode);
