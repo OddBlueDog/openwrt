@@ -1,0 +1,54 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] functions: the ifb of a PPP device gets a queue per CPU
+
+The kernel picks an ifb's transmit queue by the receive queue a packet
+came in on. On an Ethernet port whose hardware spreads flows over its
+receive queues (RSS), that spreads cake_mq's sub-queues the same way. RSS
+can't hash inside PPPoE, though: on the GL-MT6000 every packet of a PPPoE
+session arrives on its port's first ring, so the whole download went
+through cake_mq's first sub-queue, and with RPS spreading the session over
+the CPUs, every CPU fed that one CAKE.
+
+A PPP device's ifb now gives queue N to CPU N (XPS), which the kernel
+checks before the receive queue. With packet steering's RPS on the PPPoE
+port, each CPU has a sub-queue of its own, as an RSS ring's CPU has on an
+Ethernet line. Not with packet steering off: its threads move between
+CPUs, so one flow's packets could reach two sub-queues and be reordered.
+Other devices' ifbs are left as they were: a Wi-Fi thread or a WireGuard
+peer's packets can come from any CPU too.
+
+--- a/src/functions.sh
++++ b/src/functions.sh
+@@ -272,8 +272,32 @@
+     NEW_IFB=$(ifb_name $1)
+     create_ifb ${NEW_IFB}
+     RET=$?
++    [ $RET -eq 0 ] && ifb_queue_per_cpu $1 ${NEW_IFB}
+     echo $NEW_IFB
+     return $RET
++}
++
++# MilkFlint: the ifb of a PPP device (pppoe-wan) gets a queue per CPU (XPS).
++# The kernel picks an ifb's queue by the receive queue a packet came in on.
++# On an Ethernet port that spreads flows like RSS does, but RSS can't hash
++# PPPoE, so a PPPoE session's packets all arrive on its port's first queue,
++# and every CPU would feed one cake_mq sub-queue. Queue N takes what CPU N
++# hands it instead: with RPS spreading the session by flow (packet
++# steering), each CPU has a sub-queue of its own, as an RSS ring's CPU has.
++# That needs each flow to stay on one CPU: not with packet steering off,
++# whose threads move between CPUs (packet-steering.sh also puts this right
++# for the ifbs already there when steering is switched).
++ifb_queue_per_cpu() {
++    local q
++    [ "$(cat /sys/class/net/$1/type 2> /dev/null)" = 512 ] || return 0
++    [ "$(uci -q get network.@globals[0].packet_steering)" != 0 ] || return 0
++    # one queue (multi-queue off): nothing to choose
++    [ -d /sys/class/net/$2/queues/tx-1 ] || return 0
++    for q in /sys/class/net/$2/queues/tx-*; do
++        [ -d "$q" ] || continue
++        printf '%x\n' $((1 << ${q##*tx-})) > $q/xps_cpus 2> /dev/null ||
++            sqm_warn "${2}: couldn't give ${q##*/} to its CPU (XPS)"
++    done
+ }
+ 
+ 

@@ -14,7 +14,6 @@
 'use strict';
 
 import { readfile, writefile, access, mkdir, unlink, lsdir, stat, popen, open } from 'fs';
-import { connect } from 'ubus';
 import { cursor } from 'uci';
 import * as b from '/usr/libexec/milkflint/banip.uc';
 
@@ -46,7 +45,7 @@ function background(action) {
 }
 
 function service_running() {
-	const svc = connect()?.call('service', 'list', { name: 'banip' });
+	const svc = b.ubus_call('service', 'list', { name: 'banip' });
 	for (let name, inst in svc?.banip?.instances ?? {})
 		if (inst.running)
 			return true;
@@ -54,7 +53,7 @@ function service_running() {
 }
 
 function monitor_running() {
-	const svc = connect()?.call('service', 'list', { name: 'milkflint-banip' });
+	const svc = b.ubus_call('service', 'list', { name: 'milkflint-banip' });
 	return svc?.['milkflint-banip']?.instances?.monitor?.running == true;
 }
 

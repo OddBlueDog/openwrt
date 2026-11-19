@@ -20,6 +20,7 @@
 
 import { readfile, writefile, rename, open, access, mkdir, unlink, stat, popen } from 'fs';
 import * as socket from 'socket';
+import { connect } from 'ubus';
 import { cursor } from 'uci';
 
 export const CONFIG = '/etc/adguardhome/AdGuardHome.yaml';
@@ -39,6 +40,18 @@ export const QUERYLOG_DIR = '/tmp/adguardhome';
 export const RATELIMIT = 300;
 
 // ---- small helpers ---------------------------------------------------------
+
+// One ubus call on a connection of its own, closed straight after. A
+// connection only dropped stays open until garbage collection, which a
+// long-running ucode script (the monitor) never runs: each would hold a
+// socket in ubusd until it ran out of files and refused every client
+// (LuCI, the login, procd's services).
+export function ubus_call(object, method, args) {
+	const bus = connect();
+	const r = bus?.call(object, method, args ?? {});
+	bus?.disconnect();
+	return r;
+};
 
 export function sh_quote(s) {
 	return "'" + replace(`${s}`, "'", "'\\''") + "'";
@@ -530,6 +543,15 @@ export function mono_ms() {
 	return c[0] * 1000 + c[1] / 1000000.0;
 };
 
+// Whether `s` has something to read (or an error) within `ms`. ucode's
+// poll() lists every socket it's given, with the events that came (0: none
+// in time), so the list is never empty; and its recv() ignores SO_RCVTIMEO,
+// so a read without this waits for as long as AdGuard Home hangs.
+function ready(s, ms) {
+	const r = socket.poll(max(1, int(ms)), [ s, socket.POLLIN ]);
+	return (r?.[0]?.[1] ?? 0) != 0;
+}
+
 // true: it answered; 'refused': nothing listens on its port (it's gone: the
 // kernel says so at once, on a connected socket); false: no answer in `ms`
 export function dns_alive(ms) {
@@ -550,7 +572,7 @@ export function dns_alive(ms) {
 		const left = until - mono_ms();
 		if (left <= 0)
 			break;
-		if (!length(socket.poll(max(1, int(left)), [ s, socket.POLLIN ]) ?? []))
+		if (!ready(s, left))
 			continue;
 		const d = s.recv(1500);
 		if (d == null) {
@@ -570,14 +592,19 @@ export function dns_alive(ms) {
 // ---- its HTTP API ---------------------------------------------------------------
 
 // One HTTP/1.0 request to its web interface (HTTP/1.0: no chunked replies);
-// { status, headers, body } or null.
-function http(method, path, body, cookie) {
+// { status, headers, body } or null if the whole reply hasn't come within
+// `secs` (5). A hung AdGuard Home still gets its connections (the kernel
+// answers), so each read waits (ready) for what's left of the time: else
+// the monitor, and rpcd (this runs inside it), would wait for as long as
+// AdGuard Home hangs.
+function http(method, path, body, cookie, secs) {
+	secs ??= 5;
+	const until = mono_ms() + secs * 1000;
 	const addr = split(web_address(), ':');
-	const s = socket.connect(addr[0], addr[1], { socktype: socket.SOCK_STREAM }, 3000);
+	const s = socket.connect(addr[0], addr[1], { socktype: socket.SOCK_STREAM }, min(3000, secs * 1000));
 	if (!s)
 		return null;
-	s.setopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, { tv_sec: 5, tv_usec: 0 });
-	s.setopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, { tv_sec: 5, tv_usec: 0 });
+	s.setopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, { tv_sec: secs, tv_usec: 0 });
 	const data = (body == null) ? '' : sprintf('%J', body);
 	let req = `${method} ${path} HTTP/1.0\r\nHost: ${web_address()}\r\nAccept: application/json\r\n`;
 	if (cookie)
@@ -585,16 +612,28 @@ function http(method, path, body, cookie) {
 	if (body != null)
 		req += `Content-Type: application/json\r\nContent-Length: ${length(data)}\r\n`;
 	s.send(`${req}\r\n${data}`);
-	let resp = '';
+	let resp = '', whole = false;
 	for (let n = 0; n < 4096; n++) {
+		const left = until - mono_ms();
+		if (left <= 0)
+			break;
+		if (!ready(s, left))
+			continue;
 		const chunk = s.recv(65536);
-		if (chunk == null || chunk == '')
+		if (chunk == null || chunk == '') {
+			whole = (chunk == '');
 			break;
+		}
 		resp += chunk;
-		if (length(resp) > 4194304)
+		// more than enough: what's there is read as it is
+		if (length(resp) > 4194304) {
+			whole = true;
 			break;
+		}
 	}
 	s.close();
+	if (!whole)
+		return null;
 	const at = index(resp, '\r\n\r\n');
 	if (at < 0)
 		return null;
@@ -609,11 +648,11 @@ function http(method, path, body, cookie) {
 	return { status: st ? +st[1] : 0, headers, body: substr(resp, at + 4) };
 }
 
-function login() {
+function login(secs) {
 	const key = trim(readfile(KEY) ?? '');
 	if (key == '')
 		return null;
-	const r = http('POST', '/control/login', { name: API_USER, password: key });
+	const r = http('POST', '/control/login', { name: API_USER, password: key }, null, secs);
 	if (r?.status != 200)
 		return null;
 	for (let c in split(r.headers['set-cookie'] ?? '', '\n')) {
@@ -628,15 +667,18 @@ function login() {
 }
 
 // a call to its API as MilkFlint's account: the reply's JSON (true for an
-// empty 200), or null
-export function api(method, path, body) {
+// empty 200), or null. Each read waits up to `secs` (5).
+export function api(method, path, body, secs) {
 	let cookie = trim(readfile(COOKIE) ?? '');
-	let r = (cookie != '') ? http(method, path, body, cookie) : null;
+	let r = (cookie != '') ? http(method, path, body, cookie, secs) : null;
+	// no reply at all: it's down or hung, not signed out
+	if (cookie != '' && r == null)
+		return null;
 	if (r == null || r.status == 401 || r.status == 403) {
-		cookie = login();
+		cookie = login(secs);
 		if (!cookie)
 			return null;
-		r = http(method, path, body, cookie);
+		r = http(method, path, body, cookie, secs);
 	}
 	if (r?.status != 200)
 		return null;
@@ -814,6 +856,16 @@ export function read_state() {
 	catch (e) {
 		return null;
 	}
+};
+
+// While AdGuard Home isn't answering, once it has answered since it started
+// (milkflint.adguardhome.fallback): true, the router answers devices'
+// lookups itself, unfiltered; false (unset: a new install), they go on to
+// AdGuard Home and fail until it's back, so nothing gets through unfiltered.
+// While it starts (a boot, its lists loading after a restart) the router
+// answers either way.
+export function falls_back(c) {
+	return (c ?? cursor()).get('milkflint', 'adguardhome', 'fallback') == '1';
 };
 
 export function router_mode() {

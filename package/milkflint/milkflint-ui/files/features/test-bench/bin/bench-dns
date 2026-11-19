@@ -25,7 +25,7 @@
 import { open, readfile, readlink, rename, stat, writefile } from 'fs';
 import * as socket from 'socket';
 import { connect } from 'ubus';
-import { cursor } from 'uci';
+import * as dnspath from '/usr/libexec/milkflint/dns-path.uc';
 
 const DIR = '/tmp/milkflint-bench';
 const REQUEST = DIR + '/request.json';
@@ -102,32 +102,9 @@ for (let i, p in req.schedule?.phases ?? [])
 if (!length(windows))
 	exit(0);
 
-// dnsmasq's upstream: the first server it's set to forward to (not one for a
-// domain of its own), or else the first in the resolv file it reads
-function upstream() {
-	const c = cursor();
-	let s = null;
-	c.foreach('dhcp', 'dnsmasq', (x) => {
-		s ??= x;
-	});
-	const servers = s?.server == null ? [] : type(s.server) == 'array' ? s.server : [ s.server ];
-	for (let v in servers) {
-		const m = match(v, /^([0-9.]+|[0-9a-fA-F:]+)(#([0-9]{1,5}))?$/);
-		if (m)
-			return { address: m[1], port: m[3] ? +m[3] : 53, kind: (m[1] == '127.0.0.1' && m[3] == '5453') ? 'dnsproxy' : 'server' };
-	}
-	if (s?.noresolv == '1')
-		return null;
-	const file = readfile(s?.resolvfile ?? '/tmp/resolv.conf.d/resolv.conf.auto') ?? '';
-	for (let line in split(file, '\n')) {
-		const m = match(line, /^nameserver[ \t]+([0-9.]+|[0-9a-fA-F:]+)[ \t]*$/);
-		if (m)
-			return { address: m[1], port: 53, kind: 'server' };
-	}
-	return null;
-}
-
-const up = upstream();
+// dnsmasq's upstream (dns-path.uc: from its running config, with the files
+// it includes, such as ctrld's)
+const up = dnspath.upstream();
 const socks = {};
 function sock_for(address) {
 	const fam = index(address, ':') >= 0 ? socket.AF_INET6 : socket.AF_INET;

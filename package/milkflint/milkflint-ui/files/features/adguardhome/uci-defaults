@@ -24,6 +24,21 @@ if grep -q '^@milkflint ' "$list" 2> /dev/null && grep -q '^adguardhome\(><.*\)\
 	sed -i 's/^adguardhome\(><.*\)\{0,1\}$/adguardhome@milkflint/' /etc/apk/world
 fi
 
+# what devices' lookups do while it's down, once it has started (the
+# page's "If it stops answering", milkflint.adguardhome.fallback): a new
+# install lets them fail; a router that had it on before the setting
+# existed keeps having the router answer them, unfiltered, as it did
+if [ -z "$(uci -q get milkflint.adguardhome.fallback)" ]; then
+	touch /etc/config/milkflint
+	uci -q get milkflint.adguardhome > /dev/null || uci set milkflint.adguardhome=adguardhome
+	if [ "$(uci -q get adguardhome.config.enabled)" = 1 ]; then
+		uci set milkflint.adguardhome.fallback=1
+	else
+		uci set milkflint.adguardhome.fallback=0
+	fi
+	uci commit milkflint
+fi
+
 # the service stays off until the page turns it on (its own init checks
 # adguardhome.config.enabled), and the monitor runs once it's on
 /etc/init.d/milkflint-adguardhome enable

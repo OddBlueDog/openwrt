@@ -36,6 +36,18 @@ export const MANAGED = 'milkflint: ';
 
 // ---- small helpers ---------------------------------------------------------------
 
+// One ubus call on a connection of its own, closed straight after. A
+// connection only dropped stays open until garbage collection, which a
+// long-running ucode script (the monitor) never runs: each would hold a
+// socket in ubusd until it ran out of files and refused every client
+// (LuCI, the login, procd's services).
+export function ubus_call(object, method, args) {
+	const bus = connect();
+	const r = bus?.call(object, method, args ?? {});
+	bus?.disconnect();
+	return r;
+};
+
 export function sh_quote(s) {
 	return "'" + replace(`${s}`, "'", "'\\''") + "'";
 };
@@ -919,7 +931,7 @@ function inside_zones(c) {
 }
 
 function dump() {
-	return connect()?.call('network.interface', 'dump')?.interface ?? [];
+	return ubus_call('network.interface', 'dump')?.interface ?? [];
 }
 
 // The router's inside networks (every interface of a zone without

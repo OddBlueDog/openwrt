@@ -6,7 +6,6 @@
 'use strict';
 
 import { readfile, writefile, access, mkdir, unlink, lsdir, stat } from 'fs';
-import { connect } from 'ubus';
 import { cursor } from 'uci';
 import * as agh from '/usr/libexec/milkflint/adguardhome.uc';
 
@@ -35,7 +34,7 @@ function memory_kb(pid) {
 }
 
 function procd_running() {
-	const svc = connect()?.call('service', 'list', { name: 'adguardhome' });
+	const svc = agh.ubus_call('service', 'list', { name: 'adguardhome' });
 	for (let name, inst in svc?.adguardhome?.instances ?? {})
 		if (inst.running)
 			return true;
@@ -76,7 +75,7 @@ function networks() {
 			inside[n] = z.name;
 	});
 	const out = [];
-	for (let i in connect()?.call('network.interface', 'dump')?.interface ?? []) {
+	for (let i in agh.ubus_call('network.interface', 'dump')?.interface ?? []) {
 		if (!inside[i.interface] || !i.up)
 			continue;
 		const v4 = map(i['ipv4-address'] ?? [], (a) => `${a.address}/${a.mask}`);
@@ -202,6 +201,9 @@ return {
 					since: monitor?.since ?? null,
 					checked: monitor?.checked ?? null,
 					redirect: { home: monitor?.home ?? [], intercept: monitor?.intercept ?? [] },
+					// once it has answered, lookups while it doesn't: answered
+					// unfiltered (true) or left to fail (false)
+					fallback: agh.falls_back(),
 					stats: st,
 					settings: text ? agh.check_settings(tree, agh.web_address()) : [],
 					networks: networks(),
@@ -233,6 +235,23 @@ return {
 						return { error: 'write' };
 				}
 				set_enabled(true);
+				return { ok: true };
+			}
+		},
+
+		// What devices' lookups do while it isn't answering (agh.falls_back):
+		// the monitor reads it again at once (its init's reload: SIGHUP)
+		fallback: {
+			args: { on: false },
+			call: function(req) {
+				if (type(req.args.on) != 'bool')
+					return { error: 'on' };
+				const c = cursor();
+				if (c.get('milkflint', 'adguardhome') == null)
+					c.set('milkflint', 'adguardhome', 'adguardhome');
+				c.set('milkflint', 'adguardhome', 'fallback', req.args.on ? '1' : '0');
+				c.commit('milkflint');
+				system('/etc/init.d/milkflint-adguardhome reload');
 				return { ok: true };
 			}
 		},

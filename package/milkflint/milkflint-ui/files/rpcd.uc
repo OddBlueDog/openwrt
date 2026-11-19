@@ -54,9 +54,31 @@ function cpu_mask(s) {
 	return out;
 }
 
+// The port a PPPoE device's session runs over (pppoe-wan: network.wan's
+// device, under its VLAN if any), where its packets arrive and RPS is set;
+// any other device as it is.
+function session_port(dev) {
+	if (!dev || trim(readfile(`/sys/class/net/${dev}/type`) ?? '') != '512' || !match(dev, /^pppoe-[A-Za-z0-9_]+$/))
+		return dev;
+	const fd = popen(`uci -q get network.${substr(dev, 6)}.device 2>/dev/null`, 'r');
+	let port = trim(fd?.read('all') ?? '');
+	fd?.close();
+	if (!match(port, /^[A-Za-z0-9._-]+$/))
+		return dev;
+	for (let i = 0; i < 4; i++) {
+		const lower = filter(lsdir(`/sys/class/net/${port}`) ?? [], (f) => match(f, /^lower_/));
+		if (length(lower) != 1)
+			break;
+		port = substr(lower[0], 6);
+	}
+	// a VLAN netifd hasn't made yet: its name's part before the ".N"
+	return lsdir(`/sys/class/net/${port}`) == null ? split(port, '.')[0] : port;
+}
+
 // Which CPUs do the network work (MilkFlint's packet steering): the CPUs
 // the Ethernet receive (mtk_eth NAPI) threads may run on, and the CPUs the
-// packets a port receives are spread over (RPS). `dev` is SQM's WAN device.
+// packets a port receives are spread over (RPS). `dev` is SQM's WAN device
+// (on a PPPoE line, the port under it).
 function steering(dev) {
 	let napi = [];
 	for (let pid in lsdir('/proc') ?? []) {
@@ -199,6 +221,17 @@ function pipeline() {
 			push(queues, cpu_mask(readfile(`/sys/class/net/${dev}/queues/${q}/rps_cpus`)));
 		push(rps, { dev, queues });
 	}
+	// each multi-queue ifb's XPS: on a PPPoE line sqm-scripts gives the
+	// download's one transmit queue per CPU (its patch 109)
+	const xps = [];
+	for (let dev in lsdir('/sys/class/net') ?? []) {
+		if (!match(dev, /^ifb/))
+			continue;
+		const tx = sort(filter(lsdir(`/sys/class/net/${dev}/queues`) ?? [], (q) => match(q, /^tx-[0-9]+$/)),
+			(a, b) => +substr(a, 3) - +substr(b, 3));
+		if (length(tx) > 1)
+			push(xps, { dev, queues: map(tx, (q) => cpu_mask(readfile(`/sys/class/net/${dev}/queues/${q}/xps_cpus`))) });
+	}
 	return {
 		cpu: cpu_times(),
 		rss: length(rings) == length(RING_GIC) ? rss_table() : null,
@@ -213,7 +246,8 @@ function pipeline() {
 			irqs: map(filter(irqs, (x) => match(x.name, /^mt79|^mt76/)), (i) => ({ name: i.name, ...irq(i) })),
 			threads: map(filter(threads, (t) => !match(t.name, /^napi\/mtk_eth-/)), thread)
 		},
-		rps
+		rps,
+		xps
 	};
 }
 
@@ -410,7 +444,7 @@ const methods = {
 			fd.close();
 			const qdiscs = filter(parsed ?? [], (q) => q?.kind == 'cake' || q?.kind == 'cake_mq');
 			const wan = filter(qdiscs, (q) => !match(q.dev ?? '', /^ifb/))[0]?.dev;
-			return { qdiscs, steering: steering(wan) };
+			return { qdiscs, steering: steering(session_port(wan)) };
 		}
 	},
 

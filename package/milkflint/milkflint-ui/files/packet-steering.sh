@@ -34,6 +34,14 @@
 # milkflint.steering.rss=0 keeps every flow on ring 0 with the RPS layout
 # above. Without the rings (an older image), that layout is all there is.
 #
+# A PPPoE internet connection spreads nothing with RSS: the hash can't read
+# inside PPPoE, so its downloads all arrive on its port's ring 0, as what
+# the switch receives does anyway (the switch's tag keeps it from the hash).
+# Unset (Automatic on the page) is RSS, but the RPS layout when any
+# interface is PPPoE; milkflint.steering.rss=1 is RSS whatever the line,
+# and then the PPPoE port's ring 0 alone gets RPS. Either way sqm-scripts
+# gives the PPP device's download ifb a sub-queue per CPU (its patch 109).
+#
 # milkflint.steering.layout=openwrt (the Performance Tuning page) hands it
 # all to OpenWrt's packet-steering.uc instead, with the arguments
 # /etc/init.d/packet_steering gives that when there's no platform script, so
@@ -41,7 +49,10 @@
 # "off" put every flow back on ring 0.
 
 NAPI_CPUS=1
-WORK_CPUS=e
+# every CPU but CPU0: e on the MT7986's four (a mask with CPUs the kernel
+# doesn't have is refused, as in a 2-CPU VM)
+ncpu=$(grep -c ^processor /proc/cpuinfo)
+WORK_CPUS=$(printf %x $((((1 << ncpu) - 1) & ~1)))
 # the RSS table is the frame engine's, shared by its two MACs; it's set on
 # the one that isn't the switch's (eth1 on the GL-MT6000, wan on the EX5601)
 RSS_DEV=$(/usr/libexec/milkflint/ports rss 2> /dev/null)
@@ -91,6 +102,23 @@ rss_off() {
 	done
 }
 
+# The ifbs sqm-scripts gives a sub-queue per CPU (a PPP device's, its patch
+# 109: queue N takes what CPU N hands it). That holds while each flow stays
+# on one CPU, as RPS and the pinned rings keep it, in every layout but off,
+# whose threads move between CPUs: there a flow's packets would reach two
+# sub-queues and be reordered, so the kernel's choice (by the receive queue)
+# again. For the ifbs already there: sqm-scripts sets new ones the same way.
+ppp_ifbs() {
+	local d q
+	for d in /sys/class/net/ifb4*; do
+		[ "$(cat "/sys/class/net/${d##*/ifb4}/type" 2> /dev/null)" = 512 ] && [ -d "$d/queues/tx-1" ] || continue
+		for q in "$d"/queues/tx-*; do
+			if [ "$1" = on ]; then printf '%x\n' $((1 << ${q##*tx-})); else echo 0; fi > "$q/xps_cpus"
+		done
+	done
+}
+if [ "$1" = 0 ]; then ppp_ifbs off; else ppp_ifbs on; fi
+
 if [ "$(uci -q get milkflint.steering.layout)" = openwrt ] && [ -x /usr/libexec/network/packet-steering.uc ]; then
 	rss_off
 	ring_policy other
@@ -101,7 +129,35 @@ fi
 
 [ "$1" = 0 ] && off=1
 
-if [ -z "$off" ] && [ "$(uci -q get milkflint.steering.rss)" != 0 ] && has_rss &&
+# The ports under the PPPoE interfaces (wan, or any other), through VLAN
+# devices whatever their names: RSS spreads nothing a session receives
+port_of() {
+	local dev=$1 lower i=0
+	while [ $i -lt 4 ]; do
+		lower=$(ls -d /sys/class/net/$dev/lower_* 2> /dev/null)
+		[ -n "$lower" ] && [ "$(echo "$lower" | wc -l)" -eq 1 ] || break
+		dev=${lower##*/lower_}
+		i=$((i + 1))
+	done
+	# a VLAN netifd hasn't made yet: its name's part before the ".N"
+	[ -d "/sys/class/net/$dev" ] || dev=${dev%%.*}
+	echo "$dev"
+}
+pppoe_ports=
+for i in $(uci -q show network | sed -n "s/^network\.\([^.]*\)\.proto='pppoe'$/\1/p"); do
+	d=$(uci -q get "network.$i.device")
+	[ -n "$d" ] && pppoe_ports="$pppoe_ports $(port_of "$d")"
+done
+
+# RSS: "1" whatever the line, "0" never (the RPS layout), unset unless the
+# internet connection is PPPoE
+case "$(uci -q get milkflint.steering.rss)" in
+1) want_rss=1 ;;
+0) want_rss= ;;
+*) [ -z "$pppoe_ports" ] && want_rss=1 || want_rss= ;;
+esac
+
+if [ -z "$off" ] && [ -n "$want_rss" ] && has_rss &&
 	ethtool -X $RSS_DEV weight 0 1 1 1 > /dev/null 2>&1; then
 	rss=1
 	for n in 0 1 2 3; do
@@ -121,7 +177,7 @@ else
 	ring_policy other
 fi
 
-all=$(printf %x $(((1 << $(grep -c ^processor /proc/cpuinfo)) - 1)))
+all=$(printf %x $(((1 << ncpu) - 1)))
 # the Wi-Fi threads: every CPU with RSS, unless asked to keep to CPUs 1-3
 wifi=$WORK_CPUS
 [ -n "$rss" ] && [ "$(uci -q get milkflint.steering.wifi_all)" != 0 ] && wifi=$all
@@ -136,6 +192,10 @@ for p in /proc/[0-9]*; do
 	taskset -p "$m" "${p#/proc/}" > /dev/null
 done
 
+# RPS: the Ethernet's ports in the RPS layout, nothing with RSS, and with
+# RSS chosen on a PPPoE line, the PPPoE port's ring 0, where the session's
+# packets arrive (the kernel's own flow hash reads PPPoE); rings 1-3 stay as
+# RSS has them. Other drivers' ports (a VM's) get it as a PPPoE port only.
 for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
 	dev=${q#/sys/class/net/}
 	dev=${dev%%/*}
@@ -144,5 +204,10 @@ for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
 	*) m=0 ;;
 	esac
 	[ -n "$off" ] || [ -n "$rss" ] && m=0
+	if [ -z "$off" ]; then
+		for p in $pppoe_ports; do
+			[ "$q" = "/sys/class/net/$p/queues/rx-0/rps_cpus" ] && m=$WORK_CPUS
+		done
+	fi
 	echo "$m" > "$q"
 done

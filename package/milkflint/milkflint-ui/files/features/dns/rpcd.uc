@@ -1,9 +1,11 @@
 // rpcd plugin for the "dns" feature: whether the encrypted-DNS proxy
-// (AdGuard's dnsproxy) is installed and running.
+// (AdGuard's dnsproxy) is installed and running, and a DNS program set up
+// outside MilkFlint that devices' lookups reach (bin/dns-path.uc).
 'use strict';
 
 import { access } from 'fs';
 import { connect } from 'ubus';
+import * as dnspath from '/usr/libexec/milkflint/dns-path.uc';
 
 return {
 	'milkflint.dns': {
@@ -12,12 +14,16 @@ return {
 				const installed = access('/etc/init.d/dnsproxy', 'x') == true;
 				let running = false;
 				if (installed) {
-					const svc = connect()?.call('service', 'list', { name: 'dnsproxy' });
+					const bus = connect();
+					const svc = bus?.call('service', 'list', { name: 'dnsproxy' });
+					bus?.disconnect();
 					for (let name, inst in svc?.dnsproxy?.instances ?? {})
 						if (inst.running)
 							running = true;
 				}
-				return { installed, running };
+				// { how: 'front' | 'forward', program, addr, port, file }, or none
+				const outside = dnspath.lookups().outside;
+				return outside ? { installed, running, outside } : { installed, running };
 			}
 		}
 	}

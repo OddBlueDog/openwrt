@@ -6,7 +6,7 @@
 			"uci": [ "adguardhome", "firewall", "milkflint" ]
 		},
 		"write": {
-			"ubus": { "milkflint.adguardhome": [ "setup", "enable", "credentials", "repair", "update_check", "update" ] },
+			"ubus": { "milkflint.adguardhome": [ "setup", "enable", "fallback", "credentials", "repair", "update_check", "update" ] },
 			"uci": [ "firewall" ]
 		}
 	}
