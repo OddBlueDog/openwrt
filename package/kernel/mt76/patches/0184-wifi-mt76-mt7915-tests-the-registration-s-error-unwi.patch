@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:09:38 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: the registration's error unwind
+
+mt7915_register_device()'s error labels after the hardware is up had no
+test: they need a step to fail that only fails without memory. Two
+KUnit static stub seams, mt7915_thermal_init() and mt7915_init_debugfs()
+(no-ops without KUnit, as mt7915_spr_apply()'s), let a test fail them.
+
+mt7915_replay_test_register_thermal_fails, _band1_fails, _debugfs_fails:
+band 0's thermal setup, band 1's (its own registration unwinding), and
+debugfs failing: no wiphy left registered, band 1's phy gone, WFDMA off,
+the firmware given back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/debugfs.c           |  4 +++
+ mt7915/init.c              |  4 +++
+ mt7915/tests/replay-test.c | 68 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 76 insertions(+)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 732bb3c9..7fa566cc 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ /* Copyright (C) 2020 MediaTek Inc. */
+ 
++#include <kunit/static_stub.h>
+ #include <linux/relay.h>
+ #include "mt7915.h"
+ #include "eeprom.h"
+@@ -1663,6 +1664,9 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 	bool ext_phy = phy != &dev->phy;
+ 	struct dentry *dir;
+ 
++	/* a seam for the KUnit tests of the registration's error paths */
++	KUNIT_STATIC_STUB_REDIRECT(mt7915_init_debugfs, phy);
++
+ 	dir = mt76_register_debugfs_fops(phy->mt76, NULL);
+ 
+ 	debugfs_create_file("muru_debug", 0600, dir, dev, &fops_muru_debug);
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 1912e776..6db1bd7e 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ /* Copyright (C) 2020 MediaTek Inc. */
+ 
++#include <kunit/static_stub.h>
+ #include <linux/etherdevice.h>
+ #include <linux/hwmon.h>
+ #include <linux/hwmon-sysfs.h>
+@@ -220,6 +221,9 @@ static int mt7915_thermal_init(struct mt7915_phy *phy)
+ 	struct device *hwmon;
+ 	const char *name;
+ 
++	/* a seam for the KUnit tests of the registration's error paths */
++	KUNIT_STATIC_STUB_REDIRECT(mt7915_thermal_init, phy);
++
+ 	name = devm_kasprintf(&wiphy->dev, GFP_KERNEL, "mt7915_%s",
+ 			      wiphy_name(wiphy));
+ 	if (!name)
+diff --git a/mt7915/tests/replay-test.c b/mt7915/tests/replay-test.c
+index 2c1f6088..cfa056ec 100644
+--- a/mt7915/tests/replay-test.c
++++ b/mt7915/tests/replay-test.c
+@@ -551,6 +551,71 @@ static void mt7915_replay_test_init_hardware_no_wcid0(struct kunit *test)
+ 	ieee80211_free_hw(phy2->mt76->hw);
+ }
+ 
++/* the registration's later steps: thermal set up for a band (the Nth call
++ * fails), debugfs (fails)
++ */
++static int mt7915_replay_test_thermal_calls, mt7915_replay_test_thermal_fail;
++
++static int mt7915_replay_test_thermal_stub(struct mt7915_phy *phy)
++{
++	return ++mt7915_replay_test_thermal_calls ==
++	       mt7915_replay_test_thermal_fail ? -ENOMEM : 0;
++}
++
++static int mt7915_replay_test_debugfs_stub(struct mt7915_phy *phy)
++{
++	return -ENOMEM;
++}
++
++/* mt7915_register_device() failing after both bands' hardware is up:
++ * band 0's thermal setup (thermal_fail 1), band 1's (2), or debugfs (0).
++ * What was registered is unregistered again and the hardware stopped:
++ * no wiphy left, band 1's phy gone, WFDMA off, the firmware given back.
++ */
++static void mt7915_replay_test_register_fails(struct kunit *test,
++					      int thermal_fail)
++{
++	struct mt7915_dev *dev;
++
++	mt7915_replay_test_firmware(test);
++	rcu_expedite_gp();
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_init_test_unexpedite, NULL), 0);
++	dev = mt7915_replay_test_model(test, true);
++
++	mt7915_replay_test_thermal_calls = 0;
++	mt7915_replay_test_thermal_fail = thermal_fail;
++	kunit_activate_static_stub(test, mt7915_thermal_init,
++				   mt7915_replay_test_thermal_stub);
++	if (!thermal_fail)
++		kunit_activate_static_stub(test, mt7915_init_debugfs,
++					   mt7915_replay_test_debugfs_stub);
++
++	KUNIT_EXPECT_EQ(test, mt7915_register_device(dev), -ENOMEM);
++	KUNIT_EXPECT_FALSE(test, dev->mt76.hw->wiphy->registered);
++	KUNIT_EXPECT_NULL(test, mt7915_ext_phy(dev));
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
++			(MT_WFDMA0_GLO_CFG_TX_DMA_EN |
++			 MT_WFDMA0_GLO_CFG_RX_DMA_EN), 0);
++	KUNIT_EXPECT_NE(test, mt76_rr(dev, MT_TOP_LPCR_HOST_BAND(0)) &
++			MT_TOP_LPCR_HOST_FW_OWN, 0);
++}
++
++static void mt7915_replay_test_register_thermal_fails(struct kunit *test)
++{
++	mt7915_replay_test_register_fails(test, 1);
++}
++
++static void mt7915_replay_test_register_band1_fails(struct kunit *test)
++{
++	mt7915_replay_test_register_fails(test, 2);
++}
++
++static void mt7915_replay_test_register_debugfs_fails(struct kunit *test)
++{
++	mt7915_replay_test_register_fails(test, 0);
++}
++
+ /* All of mt7915_register_device(), the init work it queues and
+  * mt7915_unregister_device(), replayed: both bands registered with
+  * mac80211, the init work's commands answered, the debugfs and coredump
+@@ -668,6 +733,9 @@ static struct kunit_case mt7915_replay_test_cases[] = {
+ 	KUNIT_CASE(mt7915_replay_test_init_hardware),
+ 	KUNIT_CASE(mt7915_replay_test_init_hardware_no_wcid0),
+ 	KUNIT_CASE(mt7915_replay_test_register_device),
++	KUNIT_CASE(mt7915_replay_test_register_thermal_fails),
++	KUNIT_CASE(mt7915_replay_test_register_band1_fails),
++	KUNIT_CASE(mt7915_replay_test_register_debugfs_fails),
+ 	KUNIT_CASE(mt7915_replay_test_capture),
+ 	{}
+ };

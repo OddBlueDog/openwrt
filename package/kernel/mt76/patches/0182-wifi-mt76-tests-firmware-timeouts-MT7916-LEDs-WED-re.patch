@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:05:28 +0000
+Subject: [PATCH] wifi: mt76: tests: firmware timeouts, MT7916 LEDs, WED
+ reorder ring; staged firmware removed
+
+- mt7915_mcu2_fw_handshake_timeouts (slow): the driver never getting
+  the device, the firmware never entering its download state at a load
+  or at the exit (the device then not handed back).
+- mt7915_mcu2_dpd_freq_idx_mt7915: the MT7915's DPD channel list.
+- mt7915_init_test_led_mux: the MT7916's single-band LED pins.
+- mt76_wed_test_dma_setup_rro_ind: WED v3's reorder indication ring.
+- mt76_wed_test_dma_reset_timeout (slow): WED never finishing its reset.
+
+tests/fw-files.h removes each firmware file it wrote when the test ends:
+the MT7975 images the restart tests stage made mt7915-mcu-fw-misc skip
+its tests of missing firmware.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/fw-files.h  | 27 ++++++++++++++++++--
+ mt7915/tests/init-test.c |  4 +++
+ mt7915/tests/mcu2-test.c | 54 ++++++++++++++++++++++++++++++++++++++++
+ tests/wed-test.c         | 40 +++++++++++++++++++++++++++++
+ 4 files changed, 123 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/tests/fw-files.h b/mt7915/tests/fw-files.h
+index 07c8a68d..4783c995 100644
+--- a/mt7915/tests/fw-files.h
++++ b/mt7915/tests/fw-files.h
+@@ -35,18 +35,41 @@ static void __maybe_unused mt7915_replay_test_mkdir(struct kunit *test, const ch
+ /* /lib/firmware/@name, for request_firmware() (the VM's root file system
+  * is a throwaway copy)
+  */
++/* the file at @data (a path) removed again, so that the next tests find
++ * the firmware directory as the VM ships it (some test what happens
++ * without a file)
++ */
++static void mt7915_replay_test_unlink(void *data)
++{
++	struct dentry *parent;
++	struct path path;
++
++	if (kern_path(data, 0, &path))
++		return;
++	parent = dget_parent(path.dentry);
++	inode_lock_nested(d_inode(parent), I_MUTEX_PARENT);
++	vfs_unlink(mnt_idmap(path.mnt), d_inode(parent), path.dentry, NULL);
++	inode_unlock(d_inode(parent));
++	dput(parent);
++	path_put(&path);
++}
++
+ static void __maybe_unused mt7915_replay_test_write(struct kunit *test, const char *name,
+ 				     const void *data, size_t len)
+ {
+-	char path[96];
+ 	struct file *f;
+ 	loff_t pos = 0;
+ 	ssize_t n;
++	char *path;
+ 
+-	snprintf(path, sizeof(path), "/lib/firmware/%s", name);
++	path = kunit_kmalloc(test, 96, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, path);
++	snprintf(path, 96, "/lib/firmware/%s", name);
+ 	f = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+ 	if (IS_ERR(f))
+ 		kunit_skip(test, "can't create %s: %ld", path, PTR_ERR(f));
++	if (kunit_add_action_or_reset(test, mt7915_replay_test_unlink, path))
++		kunit_skip(test, "can't remove %s after the test", path);
+ 	n = kernel_write(f, data, len, &pos);
+ 	filp_close(f, NULL);
+ 	/* until the deferred fput() runs, the file is still being written
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 1a717fd8..18a322c9 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -1117,6 +1117,10 @@ static void mt7915_init_test_led_mux(struct kunit *test)
+ 		{ 0x79150000, true, 0, MT_LED_GPIO_MUX2, GENMASK(11, 8), 0x400 },
+ 		{ 0x79150000, false, 1, MT_LED_GPIO_MUX3, GENMASK(11, 8), 0x400 },
+ 		{ 0x79150000, false, 0, MT_LED_GPIO_MUX2, GENMASK(11, 8), 0x400 },
++		{ 0x79060000, false, 1, MT_LED_GPIO_MUX1, GENMASK(31, 24),
++		  0x30000000 },
++		{ 0x79060000, false, 0, MT_LED_GPIO_MUX1, GENMASK(31, 24),
++		  0x03000000 },
+ 	};
+ 	struct mt7915_dev *dev = mt7915_init_test_chip(test, 0);
+ 	int i;
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 8b4fa9bf..84481433 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -3648,6 +3648,58 @@ static void mt7915_mcu2_wa_tx_stats(struct kunit *test)
+ 	synchronize_rcu();
+ }
+ 
++/* The handshakes with the firmware's ownership and state registers give
++ * up when they never change: the driver doesn't get the device, the
++ * firmware never enters its download state at a load, or at the driver's
++ * exit (which then doesn't hand the device back).
++ */
++static u32 mt7915_mcu2_fw_own_addr;	/* LPCR, as the fake sees it */
++
++/* the firmware keeps the device: its own status never clears */
++static u32 mt7915_mcu2_fw_owns(struct mt76_test_fake *fake, u32 addr, u32 val)
++{
++	return addr == mt7915_mcu2_fw_own_addr ? val | MT_TOP_LPCR_HOST_FW_OWN_STAT :
++					  val;
++}
++
++static void mt7915_mcu2_fw_handshake_timeouts(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++
++	mt76_wr(dev, MT_TOP_LPCR_HOST_BAND(0), 0);
++	mt7915_mcu2_fw_own_addr = fake->last_addr;
++	fake->rr_hook = mt7915_mcu2_fw_owns;
++	KUNIT_EXPECT_EQ(test, mt7915_driver_own(dev, 0), -EIO);
++	fake->rr_hook = NULL;
++
++	mt76_wr(dev, MT_TOP_MISC, FIELD_PREP(MT_TOP_MISC_FW_STATE,
++					     FW_STATE_RDY));
++	KUNIT_EXPECT_EQ(test, mt7915_load_firmware(dev), -EIO);
++
++	mt76_wr(dev, MT_TOP_LPCR_HOST_BAND(0), 0);
++	mt7915_mcu_exit(dev);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_TOP_LPCR_HOST_BAND(0)) &
++			MT_TOP_LPCR_HOST_FW_OWN, 0);
++}
++
++/* The MT7915's DPD calibration channels are its own list: a channel only
++ * it has gets an index, one only the others have doesn't.
++ */
++static void mt7915_mcu2_dpd_freq_idx_mt7915(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	u32 rev = dev->mt76.rev;
++	int v2;
++
++	v2 = mt7915_dpd_freq_idx(dev, 5180, 0);
++	dev->mt76.rev = 0x79150000;
++	KUNIT_EXPECT_GE(test, mt7915_dpd_freq_idx(dev, 5180, 0), 0);
++	KUNIT_EXPECT_GE(test, mt7915_dpd_freq_idx(dev, 2412, 0), 0);
++	dev->mt76.rev = rev;
++	KUNIT_EXPECT_GE(test, v2, 0);
++}
++
+ /* A channel switch with no memory for the message fails cleanly. */
+ static void mt7915_mcu2_update_bss_rfch_nomem(struct kunit *test)
+ {
+@@ -4473,6 +4525,8 @@ static struct kunit_case mt7915_mcu2_misc_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_rf_regval_set),
+ 	KUNIT_CASE(mt7915_mcu2_wa_tx_stats),
+ 	KUNIT_CASE(mt7915_mcu2_update_bss_rfch_nomem),
++	KUNIT_CASE_SLOW(mt7915_mcu2_fw_handshake_timeouts),
++	KUNIT_CASE(mt7915_mcu2_dpd_freq_idx_mt7915),
+ 	KUNIT_CASE(mt7915_mcu2_set_tx),
+ 	KUNIT_CASE(mt7915_mcu2_set_red),
+ 	KUNIT_CASE(mt7915_mcu2_set_red_errors),
+diff --git a/tests/wed-test.c b/tests/wed-test.c
+index 8da482ea..916eaefe 100644
+--- a/tests/wed-test.c
++++ b/tests/wed-test.c
+@@ -253,6 +253,8 @@ static struct mt76_queue *mt76_wed_test_queue(struct kunit *test,
+ 	KUNIT_ASSERT_NOT_NULL(test, (void __force *)q->regs);
+ 	q->flags = flags;
+ 	q->wed = &dev->mmio.wed;
++	spin_lock_init(&q->lock);
++	spin_lock_init(&q->cleanup_lock);
+ 	return q;
+ }
+ 
+@@ -351,6 +353,28 @@ static void mt76_wed_test_dma_setup_rro(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, q->flags, flags);
+ }
+ 
++/* WED version 3's reorder indication ring: reset with its indexes and
++ * handed to the hardware full (its descriptors are the hardware's to
++ * write, no buffers of the host's), then WED is told where it is.
++ */
++static void mt76_wed_test_dma_setup_rro_ind(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_test_wed *w = mt76_test_wed_init(test, &dev->mmio.wed);
++	struct mt76_queue *q;
++
++	q = mt76_wed_test_queue(test, dev, MT_WED_RRO_Q_IND);
++	q->desc = kunit_kcalloc(test, q->ndesc,
++				sizeof(struct mt76_wed_rro_desc), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, q->desc);
++	writel(2, &q->regs->dma_idx);
++
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), 0);
++	KUNIT_EXPECT_EQ(test, w->n_ind, 1);
++	KUNIT_EXPECT_EQ(test, readl(&q->regs->dma_idx), 0);
++	KUNIT_EXPECT_EQ(test, q->flags, MT_WED_RRO_Q_IND);
++}
++
+ /* --- reset, offload ----------------------------------------------------------- */
+ 
+ /* The DMA reset handshake with the Ethernet driver's WED reset: only while
+@@ -377,6 +401,20 @@ static void mt76_wed_test_dma_reset(struct kunit *test)
+ 	clear_bit(MT76_STATE_WED_RESET, &dev->phy.state);
+ }
+ 
++/* WED never saying its reset is done: the host gives up after 3 s. */
++static void mt76_wed_test_dma_reset_timeout(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_mmio *mmio = &dev->mmio;
++
++	init_completion(&mmio->wed_reset);
++	init_completion(&mmio->wed_reset_complete);
++	set_bit(MT76_STATE_WED_RESET, &dev->phy.state);
++	mt76_wed_dma_reset(dev);
++	KUNIT_EXPECT_TRUE(test, completion_done(&mmio->wed_reset));
++	clear_bit(MT76_STATE_WED_RESET, &dev->phy.state);
++}
++
+ /* A traffic control (flow offload) setup goes to WED, or is refused when
+  * there's none.
+  */
+@@ -486,6 +524,8 @@ static struct kunit_case mt76_wed_test_cases[] = {
+ 	KUNIT_CASE(mt76_wed_test_dma_setup_none),
+ 	KUNIT_CASE(mt76_wed_test_dma_setup_rings),
+ 	KUNIT_CASE(mt76_wed_test_dma_setup_rro),
++	KUNIT_CASE(mt76_wed_test_dma_setup_rro_ind),
++	KUNIT_CASE_SLOW(mt76_wed_test_dma_reset_timeout),
+ 	KUNIT_CASE(mt76_wed_test_dma_reset),
+ 	KUNIT_CASE(mt76_wed_test_setup_tc),
+ 	KUNIT_CASE(mt76_wed_test_tokens),

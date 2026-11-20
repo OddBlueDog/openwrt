@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:36:54 +0000
+Subject: [PATCH] wifi: mt76: tests: frames released to a dozing station, the
+ silent hold's work
+
+mt76_release_buffered_frames() is mt7915's release_buffered_frames op:
+mac80211 calls it for a PS-Poll or U-APSD trigger the driver reports
+(ieee80211_sta_pspoll(), _uapsd_trigger(), from mt76_check_sta() for a
+wcid with MT_WCID_FLAG_CHECK_PS). Only mt76x02 sets that flag; mt7915's
+firmware answers both itself, so the MT7986 never runs it, but the
+coverage scope counts it through the ops table, and no test ran it.
+
+On the power save simulation's real mac80211 stations (dozing, frames in
+two TIDs), under the RCU read lock as mac80211's rx path calls it: the
+TIDs asked for, lowest first, up to the number asked for, on the PS
+queue as PS responses, the last with EOSP and a status request; nothing
+in them ends the service period at once; a TID not asked for keeps its
+frames. mt76_ps_tids_pending() on its own. And the silent hold's work on
+the kernel's clock (every other test runs it on its own): armed on the
+device's workqueue, an earlier deadline moves it, a later one doesn't,
+with nobody held it stops.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/ps-sim-test.c | 168 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 168 insertions(+)
+
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index e47ad2e9..7ad7dba0 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -2601,6 +2601,171 @@ static void mt76_psim_test_silent_on(struct kunit *test)
+ 			off->mute_lost * on.mutes);
+ }
+ 
++/* --- releasing frames to a dozing station ----------------------------------- */
++
++/* the skb of frame @id, still with the firmware model */
++static struct sk_buff *psim_peek_skb(u32 id)
++{
++	struct sk_buff *skb;
++
++	skb_queue_walk(&psim_skbs, skb)
++		if (psim_skb_id(skb) == id)
++			return skb;
++	return NULL;
++}
++
++/* the frames handed to the hardware since frame @from, in order */
++static int psim_hw_frames(struct psim *s, u32 from, u32 *ids, int n)
++{
++	int i, k = 0;
++
++	for (i = from; i < s->n_frames && k < n; i++)
++		if (s->frames[i].state == PF_HW)
++			ids[k++] = i;
++	return k;
++}
++
++/* A dozing station's frames: queued in mac80211, not sent */
++static struct psim *psim_release_init(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 5, .ps_sync = true,
++		.kinds = { PSIM_SENSOR }, .n_sta = 1,
++	};
++	struct psim *s;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	s->sta[0].dozing = true;
++	mt76_sta_ps_transition(s->dev, psim_wcid(&s->sta[0]), true);
++	return s;
++}
++
++/* mac80211 asks for a PS-Poll's or U-APSD trigger's frames (the station
++ * sent one; from the rx path, under the RCU read lock). mt76x02 has
++ * mac80211 do that; mt7915's firmware answers both itself, so the MT7986
++ * never gets here. Taken from the TIDs asked for, lowest first, up to the
++ * number asked for, all on the PS queue as PS responses, the last one
++ * ending the service period (with a status, for mac80211 to know it went).
++ * The last one says more data when any of those TIDs still has frames:
++ * only an 802.11 frame carries the bit, these are 802.3 (the hardware
++ * writes the header).
++ */
++static void mt76_psim_test_release(struct kunit *test)
++{
++	struct psim *s = psim_release_init(test);
++	struct psim_sta *ps = &s->sta[0];
++	struct ieee80211_sta *sta = &ps->si->sta;
++	u32 ids[8], from;
++	int i, n;
++
++	for (i = 0; i < 3; i++)
++		psim_enqueue(s, ps, 0);
++	for (i = 0; i < 2; i++)
++		psim_enqueue(s, ps, 5);
++	/* (the tx worker, parked, would hand the firmware one per AC) */
++	KUNIT_ASSERT_EQ(test, psim_txq_depth(ps, 0), 3);
++	KUNIT_ASSERT_EQ(test, psim_txq_depth(ps, 5), 2);
++
++	from = s->n_frames - 5;
++	rcu_read_lock();
++	mt76_release_buffered_frames(s->hw, sta, BIT(0) | BIT(5), 4,
++				     IEEE80211_FRAME_RELEASE_PSPOLL, false);
++	rcu_read_unlock();
++	n = psim_hw_frames(s, from, ids, ARRAY_SIZE(ids));
++	KUNIT_ASSERT_EQ(test, n, 4);
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 0), 0);
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 5), 1);
++	for (i = 0; i < n; i++) {
++		struct sk_buff *skb = psim_peek_skb(ids[i]);
++		struct ieee80211_tx_info *info;
++
++		KUNIT_ASSERT_NOT_NULL(test, skb);
++		info = IEEE80211_SKB_CB(skb);
++		KUNIT_EXPECT_EQ(test, s->frames[ids[i]].tid, i < 3 ? 0 : 5);
++		KUNIT_EXPECT_TRUE(test, info->control.flags &
++				  IEEE80211_TX_CTRL_PS_RESPONSE);
++		KUNIT_EXPECT_EQ_MSG(test, !!(info->flags &
++				    IEEE80211_TX_STATUS_EOSP), i == n - 1,
++				    "frame %d", i);
++		KUNIT_EXPECT_EQ(test, !!(info->flags &
++				IEEE80211_TX_CTL_REQ_TX_STATUS), i == n - 1);
++	}
++
++	/* nothing left in the TIDs asked for: the service period just ends */
++	from = s->n_frames;
++	rcu_read_lock();
++	mt76_release_buffered_frames(s->hw, sta, BIT(0), 2,
++				     IEEE80211_FRAME_RELEASE_UAPSD, false);
++	rcu_read_unlock();
++	KUNIT_EXPECT_EQ(test, psim_hw_frames(s, 0, ids, ARRAY_SIZE(ids)), 4);
++
++	/* a TID not asked for keeps its frames */
++	rcu_read_lock();
++	mt76_release_buffered_frames(s->hw, sta, BIT(1), 2,
++				     IEEE80211_FRAME_RELEASE_UAPSD, true);
++	rcu_read_unlock();
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 5), 1);
++
++	rcu_read_lock();
++	mt76_release_buffered_frames(s->hw, sta, BIT(5), 8,
++				     IEEE80211_FRAME_RELEASE_UAPSD, false);
++	rcu_read_unlock();
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 5), 0);
++	KUNIT_EXPECT_EQ(test, psim_hw_frames(s, 0, ids, ARRAY_SIZE(ids)), 5);
++}
++
++/* What the release tells mac80211 about TIDs it didn't empty: pending,
++ * whether or not the frames are on a TID it took from.
++ */
++static void mt76_psim_test_release_pending(struct kunit *test)
++{
++	struct psim *s = psim_release_init(test);
++	struct psim_sta *ps = &s->sta[0];
++	struct ieee80211_sta *sta = &ps->si->sta;
++
++	KUNIT_EXPECT_FALSE(test, mt76_ps_tids_pending(sta, 0xffff));
++	psim_enqueue(s, ps, 6);
++	KUNIT_EXPECT_TRUE(test, mt76_ps_tids_pending(sta, BIT(6)));
++	KUNIT_EXPECT_TRUE(test, mt76_ps_tids_pending(sta, BIT(0) | BIT(6)));
++	KUNIT_EXPECT_FALSE(test, mt76_ps_tids_pending(sta, BIT(0) | BIT(7)));
++	KUNIT_EXPECT_FALSE(test, mt76_ps_tids_pending(sta, 0));
++}
++
++/* The silent hold's work on the kernel's clock (the other tests run it on
++ * theirs): armed, it runs on the device's workqueue, a later deadline
++ * doesn't push it back, and with nobody held it doesn't arm itself again.
++ */
++static void mt76_psim_test_silent_work(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 3, .silent = true,
++		.kinds = { PSIM_LAPTOP }, .n_sta = 1,
++	};
++	struct mt76_dev *dev;
++	unsigned long expires;
++	struct psim *s;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	dev = s->dev;
++	KUNIT_ASSERT_TRUE(test, dev->silent_work_set);
++	mt76_tx_silent_test_now = 0;
++
++	mt76_tx_silent_arm(dev, HZ);
++	KUNIT_ASSERT_TRUE(test, delayed_work_pending(&dev->silent_work));
++	expires = dev->silent_work.timer.expires;
++	mt76_tx_silent_arm(dev, 10 * HZ);
++	KUNIT_EXPECT_EQ(test, dev->silent_work.timer.expires, expires);
++	mt76_tx_silent_arm(dev, 1);
++	KUNIT_EXPECT_TRUE(test, time_before(dev->silent_work.timer.expires,
++					    expires));
++
++	flush_delayed_work(&dev->silent_work);
++	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dev->silent_work));
++	mt76_tx_silent_stop(dev);
++}
++
+ static struct kunit_case mt76_psim_test_cases[] = {
+ 	KUNIT_CASE_PARAM(mt76_psim_test_run, psim_gen_params),
+ 	KUNIT_CASE_PARAM(mt76_psim_test_run, psim_seed_params),
+@@ -2608,6 +2773,9 @@ static struct kunit_case mt76_psim_test_cases[] = {
+ 	KUNIT_CASE(mt76_psim_test_silent),
+ 	KUNIT_CASE(mt76_psim_test_silent_off),
+ 	KUNIT_CASE(mt76_psim_test_silent_on),
++	KUNIT_CASE(mt76_psim_test_release),
++	KUNIT_CASE(mt76_psim_test_release_pending),
++	KUNIT_CASE(mt76_psim_test_silent_work),
+ 	{}
+ };
+ 

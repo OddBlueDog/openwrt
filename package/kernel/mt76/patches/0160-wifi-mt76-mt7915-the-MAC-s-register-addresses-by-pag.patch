@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:43:30 +0000
+Subject: [PATCH] wifi: mt76: mt7915: the MAC's register addresses by page, not
+ by scanning the map
+
+Every access to a bus address goes through __mt7915_reg_addr(), which scanned the chip's register map in order (about fifty entries on the MT7986) until one held the address. The blocks the driver reads at runtime come late in it: the WTBL that mt7915_mac_sta_poll() reads for every polled station after two dozen entries, band 1's MIB after nearly forty.
+
+Those blocks (PLE, PSE, the WTBL, both bands' LMAC and MIB) all sit in 0x820c0000-0x820fffff, 64 pages of 4 KiB. mt7915_mmio_init() now resolves each page against the map once: a page one entry holds from its start maps that entry's bytes, and nothing past the entry's end, as before; a page no entry touches maps nothing; any other page (an entry starting inside it, two entries in it) keeps the scan. So a lookup always gives the scan's answer, whatever the map. The pages are used only while dev->reg.map is the map they were resolved from. Other addresses are scanned as before.
+
+KUnit (mt7915-mmio): mt7915_mmio_test_reg_pages compares every 4-byte address of the range with the scan for the MT7915's, MT7916's and MT7986's maps, and checks that none of their pages needs the scan; mt7915_mmio_test_reg_pages_odd does the same for a map with an entry inside a page, two entries in a page and overlapping entries, and for a map swapped in without its pages resolved.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mmio.c            |  70 +++++++++++++++++++++++----
+ mt7915/regs.h            |  16 +++++++
+ mt7915/tests/mmio-test.c | 101 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 178 insertions(+), 9 deletions(-)
+
+diff --git a/mt7915/mmio.c b/mt7915/mmio.c
+index ea4624af..9b3fd47d 100644
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -467,18 +467,11 @@ static u32 mt7915_reg_map_l2(struct mt7915_dev *dev, u32 addr)
+ 	return offset;
+ }
+ 
+-static u32 __mt7915_reg_addr(struct mt7915_dev *dev, u32 addr)
++/* The map's answer for @addr: the first entry that holds it, 0 for none */
++static u32 mt7915_reg_map_scan(struct mt7915_dev *dev, u32 addr)
+ {
+ 	int i;
+ 
+-	if (addr < 0x100000)
+-		return addr;
+-
+-	if (!dev->reg.map) {
+-		dev_err(dev->mt76.dev, "err: reg_map is null\n");
+-		return addr;
+-	}
+-
+ 	for (i = 0; i < dev->reg.map_size; i++) {
+ 		u32 ofs;
+ 
+@@ -495,6 +488,64 @@ static u32 __mt7915_reg_addr(struct mt7915_dev *dev, u32 addr)
+ 	return 0;
+ }
+ 
++/* Resolves the pages from MT7915_REG_PAGE_BASE against the map: a page no
++ * entry touches maps nothing, a page one entry holds from its start maps
++ * that entry's bytes, and any other page (an entry starting inside it, two
++ * entries in it) keeps the scan, so a lookup always gives the scan's answer.
++ */
++static void mt7915_reg_pages_init(struct mt7915_dev *dev)
++{
++	const struct mt76_connac_reg_map *map = dev->reg.map;
++	int p, i;
++
++	for (p = 0; p < MT7915_REG_PAGES; p++) {
++		struct mt7915_reg_page *page = &dev->reg.page[p];
++		u64 start = MT7915_REG_PAGE_BASE + p * SZ_4K;
++		int n = 0;
++
++		memset(page, 0, sizeof(*page));
++		for (i = 0; map && i < dev->reg.map_size; i++) {
++			u64 phys = map[i].phys, end = phys + map[i].size;
++
++			if (phys == end || phys >= start + SZ_4K || end <= start)
++				continue;
++
++			if (++n > 1 || phys > start) {
++				page->scan = true;
++				continue;
++			}
++
++			page->maps = map[i].maps + (start - phys);
++			page->size = min_t(u64, end - start, SZ_4K);
++		}
++	}
++
++	dev->reg.page_map = map;
++}
++
++static u32 __mt7915_reg_addr(struct mt7915_dev *dev, u32 addr)
++{
++	u32 p = (addr - MT7915_REG_PAGE_BASE) / SZ_4K;
++
++	if (addr < 0x100000)
++		return addr;
++
++	if (!dev->reg.map) {
++		dev_err(dev->mt76.dev, "err: reg_map is null\n");
++		return addr;
++	}
++
++	if (p < MT7915_REG_PAGES && dev->reg.page_map == dev->reg.map &&
++	    !dev->reg.page[p].scan) {
++		const struct mt7915_reg_page *page = &dev->reg.page[p];
++		u32 ofs = addr % SZ_4K;
++
++		return ofs < page->size ? page->maps + ofs : 0;
++	}
++
++	return mt7915_reg_map_scan(dev, addr);
++}
++
+ static u32 __mt7915_reg_remap_addr(struct mt7915_dev *dev, u32 addr)
+ {
+ 	if ((addr >= MT_INFRA_BASE && addr < MT_WFSYS0_PHY_START) ||
+@@ -778,6 +829,7 @@ static int mt7915_mmio_init(struct mt76_dev *mdev,
+ 	default:
+ 		return -EINVAL;
+ 	}
++	mt7915_reg_pages_init(dev);
+ 
+ 	dev->bus_ops = dev->mt76.bus;
+ 	bus_ops = devm_kmemdup(dev->mt76.dev, dev->bus_ops, sizeof(*bus_ops),
+diff --git a/mt7915/regs.h b/mt7915/regs.h
+index 92c2e0d2..eed733dd 100644
+--- a/mt7915/regs.h
++++ b/mt7915/regs.h
+@@ -4,12 +4,28 @@
+ #ifndef __MT7915_REGS_H
+ #define __MT7915_REGS_H
+ 
++/* The MAC's blocks (PLE, PSE, WTBL, both bands' LMAC) sit in these 64 pages
++ * of 4 KiB on every chip: mt7915_reg_pages_init() resolves each page's
++ * place in the register map once, so their accesses skip the map's scan.
++ */
++#define MT7915_REG_PAGE_BASE	0x820c0000
++#define MT7915_REG_PAGES	64
++
++struct mt7915_reg_page {
++	u32 maps;	/* window offset of the page's first byte */
++	u16 size;	/* bytes mapped from the page's start; past them: none */
++	bool scan;	/* the page needs the map's scan */
++};
++
+ /* used to differentiate between generations */
+ struct mt7915_reg_desc {
+ 	const u32 *reg_rev;
+ 	const u32 *offs_rev;
+ 	const struct mt76_connac_reg_map *map;
+ 	u32 map_size;
++	/* @page as resolved from @page_map; used while that is @map */
++	const struct mt76_connac_reg_map *page_map;
++	struct mt7915_reg_page page[MT7915_REG_PAGES];
+ };
+ 
+ enum reg_rev {
+diff --git a/mt7915/tests/mmio-test.c b/mt7915/tests/mmio-test.c
+index a35d6b7c..f0cb986b 100644
+--- a/mt7915/tests/mmio-test.c
++++ b/mt7915/tests/mmio-test.c
+@@ -82,6 +82,105 @@ static void mt7915_mmio_test_no_map(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, 0x420010), 0);
+ }
+ 
++/* Every 4-byte address of the pages gets the map scan's answer */
++static void mt7915_mmio_test_pages_match_scan(struct kunit *test,
++					      struct mt7915_dev *dev)
++{
++	u32 addr, bad = 0;
++
++	for (addr = MT7915_REG_PAGE_BASE;
++	     addr < MT7915_REG_PAGE_BASE + MT7915_REG_PAGES * SZ_4K; addr += 4) {
++		if (__mt7915_reg_addr(dev, addr) == mt7915_reg_map_scan(dev, addr))
++			continue;
++		if (!bad++)
++			KUNIT_FAIL(test, "%#x: %#x, the scan says %#x", addr,
++				   __mt7915_reg_addr(dev, addr),
++				   mt7915_reg_map_scan(dev, addr));
++	}
++	KUNIT_EXPECT_EQ(test, bad, 0);
++}
++
++/* The three chips' maps: no page of the MAC's blocks needs the scan, and
++ * every address there translates as the scan would, including the parts
++ * of a page past a small block's end (no translation: the remap windows).
++ */
++static void mt7915_mmio_test_reg_pages(struct kunit *test)
++{
++	static const struct {
++		const struct mt76_connac_reg_map *map;
++		u32 size;
++	} maps[] = {
++		{ mt7915_reg_map, ARRAY_SIZE(mt7915_reg_map) },
++		{ mt7916_reg_map, ARRAY_SIZE(mt7916_reg_map) },
++		{ mt7986_reg_map, ARRAY_SIZE(mt7986_reg_map) },
++	};
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	int i, p;
++
++	for (i = 0; i < ARRAY_SIZE(maps); i++) {
++		dev->reg.map = maps[i].map;
++		dev->reg.map_size = maps[i].size;
++		mt7915_reg_pages_init(dev);
++
++		for (p = 0; p < MT7915_REG_PAGES; p++)
++			KUNIT_EXPECT_FALSE_MSG(test, dev->reg.page[p].scan,
++					       "map %d page %d", i, p);
++		mt7915_mmio_test_pages_match_scan(test, dev);
++	}
++
++	/* the MT7986's: WTBL on a station's dword 20, band 0's WF_CFG past
++	 * its 1 KiB, band 1's MIB
++	 */
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_addr(dev, MT_WTBL_LMAC_OFFS(5, 20)),
++			0x430000 + MT_WTBL_LMAC_OFFS(5, 20) - 0x820d0000);
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_addr(dev, 0x820e0400), 0);
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_addr(dev, 0x820fd7fc), 0x4a4ffc);
++}
++
++/* Maps the chips don't have: a block starting inside a page, two blocks
++ * in one page, and overlapping blocks (the first listed wins) keep the
++ * scan for their pages; the rest of the map still resolves by page. A
++ * map swapped in without resolving its pages is scanned.
++ */
++static void mt7915_mmio_test_reg_pages_odd(struct kunit *test)
++{
++	static const struct mt76_connac_reg_map odd[] = {
++		{ 0x820c0800, 0x10000, 0x00100 },	/* inside page 0 */
++		{ 0x820c1000, 0x11000, 0x00100 },	/* two in page 1 */
++		{ 0x820c1800, 0x12000, 0x00100 },
++		{ 0x820c2000, 0x20000, 0x02000 },	/* pages 2 and 3 */
++		{ 0x820c3000, 0x30000, 0x01000 },	/* under it, page 3 */
++		{ 0x820c4000, 0x40000, 0x03800 },	/* pages 4-7 */
++		{ 0x820ff000, 0x50000, 0x02000 },	/* the last page, on */
++		{ 0x0, 0x0, 0x0 },
++	};
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	const struct mt76_connac_reg_map *probed = dev->reg.map;
++	u32 probed_size = dev->reg.map_size;
++
++	dev->reg.map = odd;
++	dev->reg.map_size = ARRAY_SIZE(odd);
++	mt7915_mmio_test_pages_match_scan(test, dev);	/* not resolved yet */
++
++	mt7915_reg_pages_init(dev);
++	KUNIT_EXPECT_TRUE(test, dev->reg.page[0].scan);
++	KUNIT_EXPECT_TRUE(test, dev->reg.page[1].scan);
++	KUNIT_EXPECT_FALSE(test, dev->reg.page[2].scan);
++	KUNIT_EXPECT_TRUE(test, dev->reg.page[3].scan);
++	KUNIT_EXPECT_FALSE(test, dev->reg.page[7].scan);
++	KUNIT_EXPECT_EQ(test, dev->reg.page[7].size, 0x800);
++	KUNIT_EXPECT_FALSE(test, dev->reg.page[63].scan);
++	mt7915_mmio_test_pages_match_scan(test, dev);
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_addr(dev, 0x820c3004), 0x21004);
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_addr(dev, 0x820c7800), 0);
++
++	/* the probed map again, its pages not resolved for it */
++	dev->reg.map = probed;
++	dev->reg.map_size = probed_size;
++	mt7915_mmio_test_pages_match_scan(test, dev);
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_addr(dev, 0x820e0010), 0x420010);
++}
++
+ /* --- probing each chip ---------------------------------------------------- */
+ 
+ /* A zeroed 8 MiB window that @test frees */
+@@ -584,6 +683,8 @@ static struct kunit_case mt7915_mmio_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_reg_conn_infra),
+ 	KUNIT_CASE(mt7915_mmio_test_infra_mcu),
+ 	KUNIT_CASE(mt7915_mmio_test_no_map),
++	KUNIT_CASE(mt7915_mmio_test_reg_pages),
++	KUNIT_CASE(mt7915_mmio_test_reg_pages_odd),
+ 	KUNIT_CASE(mt7915_mmio_test_probe_chips),
+ 	KUNIT_CASE(mt7915_mmio_test_probe_rev),
+ 	KUNIT_CASE(mt7915_mmio_test_probe_unknown),

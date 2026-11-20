@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:09:38 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: the PCIe chips' full restart
+
+mt7915_test_mac_restart_mt7915, _mt7916: a restart on PCIe with a second
+interface and a WED: its PCIe and second interface's interrupts off for
+the reset and back on, the second interface's driver own taken, and the
+WED's WA told what it has (the MT7915's capability, the MT7916's WED
+version). tests/fw-files.h stages their firmware names too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/fw-files.h |  8 +++-
+ mt7915/tests/mac-test.c | 86 ++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 91 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/tests/fw-files.h b/mt7915/tests/fw-files.h
+index 4783c995..1e93a7e3 100644
+--- a/mt7915/tests/fw-files.h
++++ b/mt7915/tests/fw-files.h
+@@ -116,8 +116,10 @@ static void __maybe_unused mt7915_replay_test_firmware(struct kunit *test)
+ 	sec->info.addr = cpu_to_be32(0x200000);	/* MCU_PATCH_ADDRESS */
+ 	sec->info.len = cpu_to_be32(MT7915_REPLAY_PATCH_LEN);
+ 	mt7915_replay_test_write(test, MT7986_ROM_PATCH, patch, plen);
+-	/* and for an MT7975 A-die */
++	/* and for an MT7975 A-die, and the PCIe chips */
+ 	mt7915_replay_test_write(test, MT7986_ROM_PATCH_MT7975, patch, plen);
++	mt7915_replay_test_write(test, MT7915_ROM_PATCH, patch, plen);
++	mt7915_replay_test_write(test, MT7916_ROM_PATCH, patch, plen);
+ 
+ 	ram = kunit_kzalloc(test, rlen, GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, ram);
+@@ -132,8 +134,12 @@ static void __maybe_unused mt7915_replay_test_firmware(struct kunit *test)
+ 	memcpy(tr->build_date, "20261019000000r", 15);
+ 	mt7915_replay_test_write(test, MT7986_FIRMWARE_WM, ram, rlen);
+ 	mt7915_replay_test_write(test, MT7986_FIRMWARE_WM_MT7975, ram, rlen);
++	mt7915_replay_test_write(test, MT7915_FIRMWARE_WM, ram, rlen);
++	mt7915_replay_test_write(test, MT7916_FIRMWARE_WM, ram, rlen);
+ 	memcpy(tr->fw_ver, "rf-kunit-2", 10);
+ 	mt7915_replay_test_write(test, MT7986_FIRMWARE_WA, ram, rlen);
++	mt7915_replay_test_write(test, MT7915_FIRMWARE_WA, ram, rlen);
++	mt7915_replay_test_write(test, MT7916_FIRMWARE_WA, ram, rlen);
+ }
+ 
+ #endif
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 9095148d..6565c211 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -16,6 +16,7 @@
+  */
+ #include <kunit/test.h>
+ #include <linux/kthread.h>
++#include <linux/pci.h>
+ #include "fake.h"
+ #include "fw-files.h"
+ #include "../../tests/wed-fake.h"
+@@ -5596,13 +5597,24 @@ static int mt7915_test_boot_hook(struct mt76_test_fake *fake,
+  * bands' tx power set up, beamforming on; the reset flags cleared. Returns
+  * the restart's result.
+  */
+-static int mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
+-					struct mt7915_dev **pdev)
++/* the chip a restart runs on, when not the MT7986 */
++struct mt7915_test_restart_chip {
++	u32 rev;
++	bool pcie, hif2;
++	u8 wed;		/* WED version attached, 0: none */
++};
++
++static int __mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
++					  struct mt7915_dev **pdev,
++					  const struct mt7915_test_restart_chip *c)
+ {
+ 	struct mt7915_test_env *env = mt7915_test_env(test);
+ 	struct mt7915_dev *dev = env->dev;
+ 	struct mt76_test_fake *fake = mt76_test_fake;
+ 	struct mt7915_phy *phy1 = mt7915_test_band1(test, env);
++	const struct bus_type *bus = dev->mt76.dev->bus;
++	struct mt76_test_wed *w = NULL;
++	u32 rev = dev->mt76.rev;
+ 	int ret;
+ 
+ 	mt7915_replay_test_firmware(test);
+@@ -5619,10 +5631,32 @@ static int mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
+ 	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+ 	clear_bit(MT76_STATE_RUNNING, &phy1->mt76->state);
+ 
++	if (c) {
++		dev->mt76.rev = c->rev;
++		if (c->hif2) {
++			dev->hif2 = kunit_kzalloc(test, sizeof(*dev->hif2),
++						  GFP_KERNEL);
++			KUNIT_ASSERT_NOT_NULL(test, dev->hif2);
++		}
++		if (c->wed) {
++			w = mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++			dev->mt76.mmio.wed.version = c->wed;
++		}
++		if (c->pcie)
++			dev->mt76.dev->bus = &pci_bus_type;
++	}
++
+ 	mutex_lock(&dev->mt76.mutex);
+ 	ret = mt7915_mac_restart(dev);
+ 	mutex_unlock(&dev->mt76.mutex);
+ 	fake->mcu_hook = NULL;
++	dev->mt76.dev->bus = bus;
++	dev->mt76.rev = rev;
++	if (w) {
++		w->wed->ops = NULL;
++		w->wed = NULL;
++	}
++	dev->hif2 = NULL;
+ 
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT76_RESET, &dev->mphy.state));
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT76_RESET, &phy1->mt76->state));
+@@ -5632,6 +5666,52 @@ static int mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
+ 	return ret;
+ }
+ 
++static int mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
++					struct mt7915_dev **pdev)
++{
++	return __mt7915_test_mac_restart_boot(test, fail_cmd, pdev, NULL);
++}
++
++/* The PCIe chips' restart: their PCIe and second interface's interrupts
++ * off for the reset and back on after, the second interface's driver own
++ * taken; with a WED, its WA told what it has: the MT7915's capability, the
++ * MT7916's WED version when the WED takes rx.
++ */
++static void
++mt7915_test_mac_restart_pcie(struct kunit *test,
++			     const struct mt7915_test_restart_chip *chip)
++{
++	struct mt7915_dev *dev;
++	struct mt76_test_msg *msg;
++
++	KUNIT_ASSERT_EQ(test, __mt7915_test_mac_restart_boot(test, 0, &dev,
++			chip), 0);
++	msg = mt76_test_find_msg(mt76_test_fake, chip->wed == 1 ?
++				 MCU_WA_PARAM_CMD(CAPABILITY) :
++				 MCU_WA_PARAM_CMD(SET));
++	KUNIT_EXPECT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_INT1_MASK_CSR),
++			dev->mt76.mmio.irqmask);
++}
++
++static void mt7915_test_mac_restart_mt7915(struct kunit *test)
++{
++	static const struct mt7915_test_restart_chip chip = {
++		.rev = 0x79150000, .pcie = true, .hif2 = true, .wed = 1,
++	};
++
++	mt7915_test_mac_restart_pcie(test, &chip);
++}
++
++static void mt7915_test_mac_restart_mt7916(struct kunit *test)
++{
++	static const struct mt7915_test_restart_chip chip = {
++		.rev = 0x79060000, .pcie = true, .hif2 = true, .wed = 2,
++	};
++
++	mt7915_test_mac_restart_pcie(test, &chip);
++}
++
+ static void mt7915_test_mac_restart_ok(struct kunit *test)
+ {
+ 	struct mt76_test_fake *fake;
+@@ -6273,6 +6353,8 @@ static struct kunit_case mt7915_mac_reset_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_mac_restart),
+ 	KUNIT_CASE(mt7915_test_mac_restart_ok),
+ 	KUNIT_CASE(mt7915_test_mac_restart_eeprom_fails),
++	KUNIT_CASE(mt7915_test_mac_restart_mt7915),
++	KUNIT_CASE(mt7915_test_mac_restart_mt7916),
+ 	{}
+ };
+ 

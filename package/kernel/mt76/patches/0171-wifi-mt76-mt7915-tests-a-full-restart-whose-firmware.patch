@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:49:57 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: a full restart whose firmware
+ boots
+
+Every firmware recovery on the router ends in mt7915_mac_restart(), and
+its test stopped where the VM had no firmware files: the reload, the
+EEPROM handed over again, the MAC and tx power set up, beamforming.
+
+The firmware images tests/replay-test.c writes to /lib/firmware move to
+tests/fw-files.h (with the MT7975 A-die's names too), and mac-test.c
+plays the firmware booting as replay-test.c's model does: download mode
+after its restart, ready once WM and WA are started.
+
+mt7915_test_mac_restart_ok: loaded, started twice, running, the EEPROM
+and beamforming sent, the reset flags cleared, tx NAPI back.
+mt7915_test_mac_restart_eeprom_fails: the restart fails there, before
+beamforming.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/fw-files.h    | 116 +++++++++++++++++++++++++++++++++++++
+ mt7915/tests/mac-test.c    | 102 ++++++++++++++++++++++++++++++++
+ mt7915/tests/replay-test.c | 104 +--------------------------------
+ 3 files changed, 220 insertions(+), 102 deletions(-)
+ create mode 100644 mt7915/tests/fw-files.h
+
+diff --git a/mt7915/tests/fw-files.h b/mt7915/tests/fw-files.h
+new file mode 100644
+index 00000000..07c8a68d
+--- /dev/null
++++ b/mt7915/tests/fw-files.h
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Firmware files for the mt7915 KUnit tests (milkflint's QEMU test build
++ * only): written to the VM's /lib/firmware (its root file system is a
++ * throwaway copy) for request_firmware() to find. Used by tests/replay-test.c
++ * and tests/mac-test.c.
++ */
++#ifndef __MT7915_TEST_FW_FILES_H
++#define __MT7915_TEST_FW_FILES_H
++
++#include <linux/file.h>
++#include <linux/mount.h>
++#include <linux/namei.h>
++
++static void __maybe_unused mt7915_replay_test_mkdir(struct kunit *test, const char *path)
++{
++	struct dentry *d;
++	struct path parent;
++	int ret;
++
++	d = kern_path_create(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
++	if (IS_ERR(d)) {
++		if (PTR_ERR(d) != -EEXIST)
++			kunit_skip(test, "can't create %s: %ld", path,
++				   PTR_ERR(d));
++		return;
++	}
++	ret = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), d,
++			0755);
++	done_path_create(&parent, d);
++	if (ret && ret != -EEXIST)
++		kunit_skip(test, "can't create %s: %d", path, ret);
++}
++
++/* /lib/firmware/@name, for request_firmware() (the VM's root file system
++ * is a throwaway copy)
++ */
++static void __maybe_unused mt7915_replay_test_write(struct kunit *test, const char *name,
++				     const void *data, size_t len)
++{
++	char path[96];
++	struct file *f;
++	loff_t pos = 0;
++	ssize_t n;
++
++	snprintf(path, sizeof(path), "/lib/firmware/%s", name);
++	f = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++	if (IS_ERR(f))
++		kunit_skip(test, "can't create %s: %ld", path, PTR_ERR(f));
++	n = kernel_write(f, data, len, &pos);
++	filp_close(f, NULL);
++	/* until the deferred fput() runs, the file is still being written
++	 * and request_firmware() won't read it
++	 */
++	flush_delayed_fput();
++	if (n != len)
++		kunit_skip(test, "can't write %s: %zd", path, n);
++}
++
++#define MT7915_REPLAY_PATCH_DATA	0x100
++#define MT7915_REPLAY_PATCH_LEN		300
++#define MT7915_REPLAY_RAM_LEN		5000	/* two chunks */
++
++/* A ROM patch and WM/WA images the MT7986 loader takes (for either
++ * A-die): a section or region each, of made-up data.
++ */
++static void __maybe_unused mt7915_replay_test_firmware(struct kunit *test)
++{
++	size_t plen = MT7915_REPLAY_PATCH_DATA + MT7915_REPLAY_PATCH_LEN;
++	size_t rlen = MT7915_REPLAY_RAM_LEN +
++		      sizeof(struct mt76_connac2_fw_region) +
++		      sizeof(struct mt76_connac2_fw_trailer);
++	struct mt76_connac2_fw_trailer *tr;
++	struct mt76_connac2_fw_region *reg;
++	struct mt76_connac2_patch_hdr *hdr;
++	struct mt76_connac2_patch_sec *sec;
++	u8 *patch, *ram;
++	int i;
++
++	mt7915_replay_test_mkdir(test, "/lib/firmware/mediatek");
++
++	patch = kunit_kzalloc(test, plen, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, patch);
++	for (i = MT7915_REPLAY_PATCH_DATA; i < plen; i++)
++		patch[i] = i * 3;
++	hdr = (struct mt76_connac2_patch_hdr *)patch;
++	memcpy(hdr->build_date, "20261019000000rf", 16);
++	hdr->hw_sw_ver = cpu_to_be32(0x8a108a10);
++	hdr->desc.n_region = cpu_to_be32(1);
++	sec = (struct mt76_connac2_patch_sec *)(hdr + 1);
++	sec->type = cpu_to_be32(PATCH_SEC_TYPE_INFO);
++	sec->offs = cpu_to_be32(MT7915_REPLAY_PATCH_DATA);
++	sec->info.addr = cpu_to_be32(0x200000);	/* MCU_PATCH_ADDRESS */
++	sec->info.len = cpu_to_be32(MT7915_REPLAY_PATCH_LEN);
++	mt7915_replay_test_write(test, MT7986_ROM_PATCH, patch, plen);
++	/* and for an MT7975 A-die */
++	mt7915_replay_test_write(test, MT7986_ROM_PATCH_MT7975, patch, plen);
++
++	ram = kunit_kzalloc(test, rlen, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ram);
++	for (i = 0; i < MT7915_REPLAY_RAM_LEN; i++)
++		ram[i] = i * 5;
++	reg = (struct mt76_connac2_fw_region *)(ram + MT7915_REPLAY_RAM_LEN);
++	reg->addr = cpu_to_le32(0x900000);
++	reg->len = cpu_to_le32(MT7915_REPLAY_RAM_LEN);
++	tr = (struct mt76_connac2_fw_trailer *)(reg + 1);
++	tr->n_region = 1;
++	memcpy(tr->fw_ver, "rf-kunit-1", 10);
++	memcpy(tr->build_date, "20261019000000r", 15);
++	mt7915_replay_test_write(test, MT7986_FIRMWARE_WM, ram, rlen);
++	mt7915_replay_test_write(test, MT7986_FIRMWARE_WM_MT7975, ram, rlen);
++	memcpy(tr->fw_ver, "rf-kunit-2", 10);
++	mt7915_replay_test_write(test, MT7986_FIRMWARE_WA, ram, rlen);
++}
++
++#endif
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index eeb02719..f6f18fe8 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -17,6 +17,7 @@
+ #include <kunit/test.h>
+ #include <linux/kthread.h>
+ #include "fake.h"
++#include "fw-files.h"
+ 
+ /* --- TWT ------------------------------------------------------------------ */
+ 
+@@ -5454,6 +5455,105 @@ static void mt7915_test_mac_restart(struct kunit *test)
+ 	kfree_skb(skb);
+ }
+ 
++/* The firmware booting, as tests/replay-test.c models it: in download mode
++ * after its restart, ready once WM and WA have both been started. And the
++ * command it refuses, if any.
++ */
++static struct {
++	int starts;
++	int fail_cmd;
++} mt7915_test_boot;
++
++static int mt7915_test_boot_hook(struct mt76_test_fake *fake,
++				 const struct mt76_test_msg *msg)
++{
++	struct mt7915_dev *dev = container_of(fake->dev, struct mt7915_dev,
++					      mt76);
++
++	if (msg->cmd == MCU_CMD(NIC_POWER_CTRL)) {
++		mt7915_test_boot.starts = 0;
++		mt76_wr(dev, MT_TOP_MISC, FIELD_PREP(MT_TOP_MISC_FW_STATE,
++						     FW_STATE_FW_DOWNLOAD));
++	} else if (msg->cmd == MCU_CMD(FW_START_REQ) &&
++		   ++mt7915_test_boot.starts == 2) {
++		mt76_wr(dev, MT_TOP_MISC, FIELD_PREP(MT_TOP_MISC_FW_STATE,
++						     FW_STATE_RDY));
++	}
++	return msg->cmd == mt7915_test_boot.fail_cmd ? -EIO : 0;
++}
++
++/* A full restart whose firmware boots (the images in /lib/firmware): the
++ * RAM firmware loaded and started, the EEPROM handed over, the MAC and both
++ * bands' tx power set up, beamforming on; the reset flags cleared. Returns
++ * the restart's result.
++ */
++static int mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
++					struct mt7915_dev **pdev)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_phy *phy1 = mt7915_test_band1(test, env);
++	int ret;
++
++	mt7915_replay_test_firmware(test);
++	mt7915_test_rings(test, dev);
++	mt7915_test_soc(test, dev, false);
++	fake->reply = mt7915_test_patch_dl_reply;
++	memset(&mt7915_test_boot, 0, sizeof(mt7915_test_boot));
++	mt7915_test_boot.fail_cmd = fail_cmd;
++	fake->mcu_hook = mt7915_test_boot_hook;
++	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
++	/* no band running (mt7915_run() has tests of its own, on a wiphy
++	 * that is registered): none run again
++	 */
++	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++	clear_bit(MT76_STATE_RUNNING, &phy1->mt76->state);
++
++	mutex_lock(&dev->mt76.mutex);
++	ret = mt7915_mac_restart(dev);
++	mutex_unlock(&dev->mt76.mutex);
++	fake->mcu_hook = NULL;
++
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_RESET, &dev->mphy.state));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_RESET, &phy1->mt76->state));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_MCU_RESET, &dev->mphy.state));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_napi_enabled(&dev->mt76.tx_napi));
++	*pdev = dev;
++	return ret;
++}
++
++static void mt7915_test_mac_restart_ok(struct kunit *test)
++{
++	struct mt76_test_fake *fake;
++	struct mt7915_dev *dev;
++
++	KUNIT_ASSERT_EQ(test, mt7915_test_mac_restart_boot(test, 0, &dev), 0);
++	fake = mt76_test_fake;
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_CMD(FW_START_REQ)), 2);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_STATE_MCU_RUNNING,
++					 &dev->mphy.state));
++	KUNIT_EXPECT_NOT_NULL(test, mt76_test_find_msg(fake,
++			      MCU_EXT_CMD(EFUSE_BUFFER_MODE)));
++	KUNIT_EXPECT_GT(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(TXBF_ACTION)), 0);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_RUNNING, &dev->mphy.state));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_RUNNING,
++					  &dev->mt76.phys[MT_BAND1]->state));
++}
++
++/* A restart whose firmware refuses the EEPROM fails, the band not run */
++static void mt7915_test_mac_restart_eeprom_fails(struct kunit *test)
++{
++	struct mt7915_dev *dev;
++
++	KUNIT_EXPECT_EQ(test, mt7915_test_mac_restart_boot(test,
++			MCU_EXT_CMD(EFUSE_BUFFER_MODE), &dev), -EIO);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(mt76_test_fake,
++			MCU_EXT_CMD(TXBF_ACTION)), 0);
++}
++
+ /* Plays the firmware crashing while the driver waits for the last SER
+  * step: once the driver reports RESET_DONE, the WDT bit is set and the
+  * waiter woken.
+@@ -6042,6 +6142,8 @@ static struct kunit_case mt7915_mac_reset_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_reset_work_dma_reset),
+ 	KUNIT_CASE(mt7915_test_reset_work_crash_late),
+ 	KUNIT_CASE(mt7915_test_mac_restart),
++	KUNIT_CASE(mt7915_test_mac_restart_ok),
++	KUNIT_CASE(mt7915_test_mac_restart_eeprom_fails),
+ 	{}
+ };
+ 
+diff --git a/mt7915/tests/replay-test.c b/mt7915/tests/replay-test.c
+index 7eebf12c..910d7106 100644
+--- a/mt7915/tests/replay-test.c
++++ b/mt7915/tests/replay-test.c
+@@ -22,112 +22,12 @@
+  * helpers it uses, when CONFIG_MT76_KUNIT_TEST is defined (milkflint's
+  * QEMU test build only).
+  */
+-#include <linux/file.h>
+-#include <linux/mount.h>
+-#include <linux/namei.h>
+ #include "../../tests/replay.h"
++#include "fw-files.h"
+ 
+ #define MT7915_REPLAY_CAPTURE	"milkflint/mt7986-capture.rec"
+ 
+-/* --- firmware files --------------------------------------------------------- */
+-
+-static void mt7915_replay_test_mkdir(struct kunit *test, const char *path)
+-{
+-	struct dentry *d;
+-	struct path parent;
+-	int ret;
+-
+-	d = kern_path_create(AT_FDCWD, path, &parent, LOOKUP_DIRECTORY);
+-	if (IS_ERR(d)) {
+-		if (PTR_ERR(d) != -EEXIST)
+-			kunit_skip(test, "can't create %s: %ld", path,
+-				   PTR_ERR(d));
+-		return;
+-	}
+-	ret = vfs_mkdir(mnt_idmap(parent.mnt), d_inode(parent.dentry), d,
+-			0755);
+-	done_path_create(&parent, d);
+-	if (ret && ret != -EEXIST)
+-		kunit_skip(test, "can't create %s: %d", path, ret);
+-}
+-
+-/* /lib/firmware/@name, for request_firmware() (the VM's root file system
+- * is a throwaway copy)
+- */
+-static void mt7915_replay_test_write(struct kunit *test, const char *name,
+-				     const void *data, size_t len)
+-{
+-	char path[96];
+-	struct file *f;
+-	loff_t pos = 0;
+-	ssize_t n;
+-
+-	snprintf(path, sizeof(path), "/lib/firmware/%s", name);
+-	f = filp_open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+-	if (IS_ERR(f))
+-		kunit_skip(test, "can't create %s: %ld", path, PTR_ERR(f));
+-	n = kernel_write(f, data, len, &pos);
+-	filp_close(f, NULL);
+-	/* until the deferred fput() runs, the file is still being written
+-	 * and request_firmware() won't read it
+-	 */
+-	flush_delayed_fput();
+-	if (n != len)
+-		kunit_skip(test, "can't write %s: %zd", path, n);
+-}
+-
+-#define MT7915_REPLAY_PATCH_DATA	0x100
+-#define MT7915_REPLAY_PATCH_LEN		300
+-#define MT7915_REPLAY_RAM_LEN		5000	/* two chunks */
+-
+-/* A ROM patch and WM/WA images the MT7986 loader takes: a section or
+- * region each, of made-up data.
+- */
+-static void mt7915_replay_test_firmware(struct kunit *test)
+-{
+-	size_t plen = MT7915_REPLAY_PATCH_DATA + MT7915_REPLAY_PATCH_LEN;
+-	size_t rlen = MT7915_REPLAY_RAM_LEN +
+-		      sizeof(struct mt76_connac2_fw_region) +
+-		      sizeof(struct mt76_connac2_fw_trailer);
+-	struct mt76_connac2_fw_trailer *tr;
+-	struct mt76_connac2_fw_region *reg;
+-	struct mt76_connac2_patch_hdr *hdr;
+-	struct mt76_connac2_patch_sec *sec;
+-	u8 *patch, *ram;
+-	int i;
+-
+-	mt7915_replay_test_mkdir(test, "/lib/firmware/mediatek");
+-
+-	patch = kunit_kzalloc(test, plen, GFP_KERNEL);
+-	KUNIT_ASSERT_NOT_NULL(test, patch);
+-	for (i = MT7915_REPLAY_PATCH_DATA; i < plen; i++)
+-		patch[i] = i * 3;
+-	hdr = (struct mt76_connac2_patch_hdr *)patch;
+-	memcpy(hdr->build_date, "20261019000000rf", 16);
+-	hdr->hw_sw_ver = cpu_to_be32(0x8a108a10);
+-	hdr->desc.n_region = cpu_to_be32(1);
+-	sec = (struct mt76_connac2_patch_sec *)(hdr + 1);
+-	sec->type = cpu_to_be32(PATCH_SEC_TYPE_INFO);
+-	sec->offs = cpu_to_be32(MT7915_REPLAY_PATCH_DATA);
+-	sec->info.addr = cpu_to_be32(0x200000);	/* MCU_PATCH_ADDRESS */
+-	sec->info.len = cpu_to_be32(MT7915_REPLAY_PATCH_LEN);
+-	mt7915_replay_test_write(test, MT7986_ROM_PATCH, patch, plen);
+-
+-	ram = kunit_kzalloc(test, rlen, GFP_KERNEL);
+-	KUNIT_ASSERT_NOT_NULL(test, ram);
+-	for (i = 0; i < MT7915_REPLAY_RAM_LEN; i++)
+-		ram[i] = i * 5;
+-	reg = (struct mt76_connac2_fw_region *)(ram + MT7915_REPLAY_RAM_LEN);
+-	reg->addr = cpu_to_le32(0x900000);
+-	reg->len = cpu_to_le32(MT7915_REPLAY_RAM_LEN);
+-	tr = (struct mt76_connac2_fw_trailer *)(reg + 1);
+-	tr->n_region = 1;
+-	memcpy(tr->fw_ver, "rf-kunit-1", 10);
+-	memcpy(tr->build_date, "20261019000000r", 15);
+-	mt7915_replay_test_write(test, MT7986_FIRMWARE_WM, ram, rlen);
+-	memcpy(tr->fw_ver, "rf-kunit-2", 10);
+-	mt7915_replay_test_write(test, MT7986_FIRMWARE_WA, ram, rlen);
+-}
++/* firmware files: fw-files.h */
+ 
+ /* --- a model of the firmware, for making the recording ----------------------- */
+ 

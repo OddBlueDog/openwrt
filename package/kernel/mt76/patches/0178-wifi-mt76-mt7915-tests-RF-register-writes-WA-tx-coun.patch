@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:37:12 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: RF register writes, WA tx counts,
+ background radar
+
+- mt7915_mcu2_rf_regval_set: a write sends index, offset and value.
+- mt7915_mcu2_wa_tx_stats: the WA's tx count for a station, as the
+  MT7986 asks and answers and as the MT7915 does (8-bit wcid); a short
+  answer, another station's, or a station gone counts nothing.
+- mt7915_mcu2_update_bss_rfch_nomem: no memory for the message, an error.
+- mt7915_mcu2_events_radar_background: the background detector's radar
+  reaches cfg80211 for the channel it watches, and the log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/mcu2-test.c | 108 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 108 insertions(+)
+
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index ec325a16..8b4fa9bf 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -1131,6 +1131,32 @@ static void mt7915_mcu2_events_radar(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->hw_pattern, 4);
+ }
+ 
++struct mt7915_dev *mt7915_init_test_device(struct kunit *test, u32 sku,
++					   struct mt76_test_fake **fake);
++
++/* The background detector's radar (the MT7986's third, scanning a
++ * channel ahead): reported to cfg80211 for the channel it watches, which
++ * marks it and tells userspace, and logged with that channel.
++ */
++static void mt7915_mcu2_events_radar_background(struct kunit *test)
++{
++	struct mt76_test_fake *fake;
++	struct mt7915_dev *dev;
++	struct mt7915_phy *phy2;
++
++	dev = mt7915_init_test_device(test, MT7976_ONE_ADIE_DBDC, &fake);
++	mt76_test_fake = fake;
++	phy2 = mt7915_ext_phy(dev);
++	KUNIT_ASSERT_NOT_NULL(test, phy2);
++	dev->rdd2_phy = phy2;
++	dev->rdd2_chandef = phy2->mt76->chandef;
++
++	KUNIT_EXPECT_TRUE(test, mt7915_mcu2_radar(test, dev,
++						  MT_RDD_IDX_BACKGROUND));
++	KUNIT_EXPECT_EQ(test, dev->rdd_reports.count, 1);
++	dev->rdd2_phy = NULL;
++}
++
+ /* A radar report from detector @rdd_idx with every field set and all 32
+  * entries of each pulse array filled (distinct, non-zero), saying it
+  * carries 3 periodic, 2 long and 4 hardware pulses.
+@@ -1761,6 +1787,7 @@ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_unsolicited),
+ 	KUNIT_CASE(mt7915_mcu2_events_thermal),
+ 	KUNIT_CASE(mt7915_mcu2_events_radar),
++	KUNIT_CASE(mt7915_mcu2_events_radar_background),
+ 	KUNIT_CASE(mt7915_mcu2_events_rdd_report),
+ 	KUNIT_CASE(mt7915_mcu2_events_rdd_report_short),
+ 	KUNIT_CASE(mt7915_mcu2_events_rdd_report_ring),
+@@ -3554,6 +3581,84 @@ static void mt7915_mcu2_rf_regval_short(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, val, 0);
+ }
+ 
++/* An RF register write: the register's index and offset, and the value,
++ * without waiting for an answer.
++ */
++static void mt7915_mcu2_rf_regval_set(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_msg *msg;
++	u32 val = 0xa5a5;
++	__le32 *req;
++
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_rf_regval(dev, 0x02001234, &val, true),
++			0);
++	msg = mt7915_mcu2_msg(test, MCU_EXT_CMD(RF_REG_ACCESS), 12);
++	req = (__le32 *)msg->data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req[0]), 2);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req[1]), 0x1234);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req[2]), 0xa5a5);
++}
++
++/* The WA's tx count for a station, as the MT7986 asks (wcid in arg2) and
++ * the MT7915 (in arg0, an 8-bit wcid back): counted for the station asked
++ * about; a short answer, one for another station, or a station that is
++ * gone counts nothing.
++ */
++static void mt7915_mcu2_wa_tx_stats(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	__le32 reply[4] = { 0, cpu_to_le32(5), 0, cpu_to_le32(7) };
++	u32 rev = dev->mt76.rev;
++	struct mt76_wcid *wcid;
++	struct mt76_test_msg *msg;
++
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	wcid->idx = 5;
++	rcu_assign_pointer(dev->mt76.wcid[5], wcid);
++
++	mt7915_mcu2_reply(test, reply, sizeof(reply));
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_wed_wa_tx_stats(dev, 5), 0);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_packets, 7);
++
++	mt7915_mcu2_reply(test, reply, 8);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_wed_wa_tx_stats(dev, 5), -EINVAL);
++	reply[1] = cpu_to_le32(6);
++	mt7915_mcu2_reply(test, reply, sizeof(reply));
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_wed_wa_tx_stats(dev, 5), -EINVAL);
++	mt7915_mcu2_reply(test, reply, sizeof(reply));
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_wed_wa_tx_stats(dev, 6), -EINVAL);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_packets, 7);
++
++	/* the MT7915: no leading word, the wcid's low byte */
++	dev->mt76.rev = 0x79150000;
++	reply[0] = cpu_to_le32(0x105);
++	reply[2] = cpu_to_le32(3);
++	mt7915_mcu2_reply(test, reply, 12);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_wed_wa_tx_stats(dev, 5), 0);
++	msg = mt76_test_find_msg(mt76_test_fake, MCU_WA_PARAM_CMD(QUERY));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_EQ(test, msg->len, 12);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(msg->data + 4), 5);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_packets, 10);
++	dev->mt76.rev = rev;
++
++	RCU_INIT_POINTER(dev->mt76.wcid[5], NULL);
++	synchronize_rcu();
++}
++
++/* A channel switch with no memory for the message fails cleanly. */
++static void mt7915_mcu2_update_bss_rfch_nomem(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
++
++	mt7915_test_nomem_after(test, dev, 0);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_update_bss_rfch(&dev->phy, vif),
++			-ENOMEM);
++}
++
+ /* WMM parameters go to the firmware's EDCA table per AC: the AC's queue in
+  * the interface's WMM set, AIFS, TXOP, and the contention windows as
+  * exponents (log2(cw + 1)), 15 and 1023 when unset.
+@@ -4365,6 +4470,9 @@ static struct kunit_case mt7915_mcu2_misc_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_get_eeprom_free_block),
+ 	KUNIT_CASE(mt7915_mcu2_get_eeprom_short),
+ 	KUNIT_CASE(mt7915_mcu2_rf_regval_short),
++	KUNIT_CASE(mt7915_mcu2_rf_regval_set),
++	KUNIT_CASE(mt7915_mcu2_wa_tx_stats),
++	KUNIT_CASE(mt7915_mcu2_update_bss_rfch_nomem),
+ 	KUNIT_CASE(mt7915_mcu2_set_tx),
+ 	KUNIT_CASE(mt7915_mcu2_set_red),
+ 	KUNIT_CASE(mt7915_mcu2_set_red_errors),

@@ -1,0 +1,519 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:33:30 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: stations and interfaces mac80211
+ can find
+
+Paths where the driver asks mac80211 for a station or walks its
+interfaces had no test: main-test.c's stations and interfaces were the
+driver's part only. It now has interfaces mac80211 lists and runs, and
+stations that are mac80211's own (sta_info_alloc(), in its station hash
+and list as sta_info_insert() leaves them).
+
+- mt7915_main_test_drop_other_sta_real: a client authorized on one band
+  is disconnected in the firmware on the interface it left; one whose
+  wcid is already unpublished is left alone.
+- mt7915_main_test_et_stats_sta: a station's counters in ethtool -S.
+- mt7915_main_test_offchannel_nullfunc: a station interface's QoS null
+  to its AP going off channel (PM set) and back (mt7996's path: mt7915
+  has no channel contexts of its own; the test gives the interface one).
+- mt7915_main_test_wed_txs: with WED, per-PPDU tx status counted and the
+  BA session's timer refreshed.
+- mt7915_main_test_inband_discov: FILS discovery and unsolicited probe
+  responses to the firmware; none without a template or interval, one
+  too large refused.
+- mt7915_main_test_bss_info_sta: a station interface's BSS names its
+  AP's wcid, found by BSSID.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/main-test.c | 422 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 419 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 91c885df..f4c22f1e 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -19,6 +19,7 @@
+ #include <kunit/static_stub.h>
+ #include "fake.h"
+ #include "../eeprom.h"
++#include "../../mt76_connac2_mac.h"
+ #include "../../tests/wed-fake.h"
+ 
+ struct mt7915_dev *mt7915_init_test_device(struct kunit *test, u32 sku,
+@@ -316,12 +317,18 @@ static void mt7915_main_test_check_group(struct kunit *test,
+ #undef ewma_avg_signal_add
+ #define MT7915_MAIN_TEST_SDATA
+ 
++/* sta_info_alloc() and sta_info_free(), exported for KUnit (as in
++ * tests/ps-sim-test.c: 6.12's MODULE_IMPORT_NS() takes no string)
++ */
++MODULE_INFO(import_ns, "EXPORTED_FOR_KUNIT_TESTING");
++
+ /* An AP interface added on @hw that is mac80211's own (its sub_if_data,
+  * as ieee80211_if_add() leaves it): what mac80211 does with a vif the
+  * driver hands back, ieee80211_tx_prepare_skb() among it, works on it.
+  */
+ static struct ieee80211_vif *
+-mt7915_main_test_sdata_ap(struct kunit *test, struct ieee80211_hw *hw, u8 id)
++mt7915_main_test_sdata(struct kunit *test, struct ieee80211_hw *hw,
++		       enum nl80211_iftype type, u8 id)
+ {
+ 	struct ieee80211_sub_if_data *sdata;
+ 	struct ieee80211_vif *vif;
+@@ -332,7 +339,7 @@ mt7915_main_test_sdata_ap(struct kunit *test, struct ieee80211_hw *hw, u8 id)
+ 	KUNIT_ASSERT_NOT_NULL(test, sdata);
+ 	sdata->local = hw_to_local(hw);
+ 	sdata->wdev.wiphy = hw->wiphy;
+-	sdata->wdev.iftype = NL80211_IFTYPE_AP;
++	sdata->wdev.iftype = type;
+ 	sdata->flags = IEEE80211_SDATA_IN_DRIVER;
+ 	sdata->control_port_protocol = cpu_to_be16(ETH_P_PAE);
+ 	sdata->bss = &sdata->u.ap;
+@@ -349,7 +356,7 @@ mt7915_main_test_sdata_ap(struct kunit *test, struct ieee80211_hw *hw, u8 id)
+ 	}
+ 
+ 	vif = &sdata->vif;
+-	vif->type = NL80211_IFTYPE_AP;
++	vif->type = type;
+ 	vif->addr[0] = 0x02;
+ 	vif->addr[4] = 0x76;
+ 	vif->addr[5] = id;
+@@ -366,6 +373,118 @@ mt7915_main_test_sdata_ap(struct kunit *test, struct ieee80211_hw *hw, u8 id)
+ 	KUNIT_ASSERT_EQ(test, mt7915_add_interface(hw, vif), 0);
+ 	return vif;
+ }
++
++static struct ieee80211_vif *
++mt7915_main_test_sdata_ap(struct kunit *test, struct ieee80211_hw *hw, u8 id)
++{
++	return mt7915_main_test_sdata(test, hw, NL80211_IFTYPE_AP, id);
++}
++
++static void mt7915_main_test_sdata_down(void *data)
++{
++	struct ieee80211_sub_if_data *sdata = data;
++	struct ieee80211_local *local = sdata->local;
++
++	mutex_lock(&local->iflist_mtx);
++	list_del_rcu(&sdata->list);
++	mutex_unlock(&local->iflist_mtx);
++	clear_bit(SDATA_STATE_RUNNING, &sdata->state);
++	synchronize_rcu();
++}
++
++/* @vif up in mac80211: listed among its interfaces and running, as
++ * ieee80211_do_open() leaves it, for mac80211's interface iterators
++ */
++static void mt7915_main_test_sdata_up(struct kunit *test,
++				      struct ieee80211_vif *vif)
++{
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++	struct ieee80211_local *local = sdata->local;
++
++	mutex_lock(&local->iflist_mtx);
++	list_add_tail_rcu(&sdata->list, &local->interfaces);
++	mutex_unlock(&local->iflist_mtx);
++	set_bit(SDATA_STATE_RUNNING, &sdata->state);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_main_test_sdata_down, sdata), 0);
++}
++
++/* mac80211's station hash, keyed as sta_info.c keys it */
++static const struct rhashtable_params mt7915_main_test_sta_rht = {
++	.nelem_hint = 3,
++	.automatic_shrinking = true,
++	.head_offset = offsetof(struct sta_info, hash_node),
++	.key_offset = offsetof(struct sta_info, addr),
++	.key_len = ETH_ALEN,
++};
++
++struct mt7915_main_test_si {
++	struct ieee80211_hw *hw;
++	struct ieee80211_vif *vif;
++	struct sta_info *si;
++};
++
++static void mt7915_main_test_si_free(void *data)
++{
++	struct mt7915_main_test_si *t = data;
++	struct ieee80211_local *local = t->si->local;
++	struct sta_info *si = t->si;
++
++	rhltable_remove(&local->sta_hash, &si->hash_node,
++			mt7915_main_test_sta_rht);
++	wiphy_lock(local->hw.wiphy);
++	list_del_rcu(&si->list);
++	wiphy_unlock(local->hw.wiphy);
++	mt76_sta_pre_rcu_remove(t->hw, t->vif, &si->sta);
++	synchronize_rcu();
++	mt76_sta_state(t->hw, t->vif, &si->sta, IEEE80211_STA_NONE,
++		       IEEE80211_STA_NOTEXIST);
++	wiphy_lock(local->hw.wiphy);
++	sta_info_free(local, si);
++	wiphy_unlock(local->hw.wiphy);
++}
++
++/* A station that is mac80211's own (struct sta_info) on @vif, added to the
++ * driver (NOTEXIST -> NONE), in mac80211's station hash and list as
++ * sta_info_insert() leaves it: mac80211's lookups and iterators find it.
++ */
++static struct sta_info *
++mt7915_main_test_mac80211_sta(struct kunit *test, struct ieee80211_hw *hw,
++			      struct ieee80211_vif *vif, const u8 *addr)
++{
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++	struct ieee80211_local *local = sdata->local;
++	struct mt7915_main_test_si *t;
++	struct sta_info *si;
++	int ret;
++
++	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, t);
++	si = sta_info_alloc(sdata, addr, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, si);
++	si->sta.wme = true;
++	si->sta.deflink.rx_nss = 1;
++	si->sta.deflink.bandwidth = IEEE80211_STA_RX_BW_20;
++	si->sta.deflink.supp_rates[NL80211_BAND_2GHZ] = 0xfff;
++	si->sta.deflink.supp_rates[NL80211_BAND_5GHZ] = 0xff;
++	ret = mt76_sta_state(hw, vif, &si->sta, IEEE80211_STA_NOTEXIST,
++			     IEEE80211_STA_NONE);
++	if (ret)
++		sta_info_free(local, si);
++	KUNIT_ASSERT_EQ(test, ret, 0);
++	si->uploaded = true;
++	KUNIT_ASSERT_EQ(test, rhltable_insert(&local->sta_hash, &si->hash_node,
++			mt7915_main_test_sta_rht), 0);
++	wiphy_lock(local->hw.wiphy);
++	list_add_tail_rcu(&si->list, &local->sta_list);
++	wiphy_unlock(local->hw.wiphy);
++	t->hw = hw;
++	t->vif = vif;
++	t->si = si;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_main_test_si_free, t), 0);
++	return si;
++}
+ #endif
+ 
+ /* --- start / stop ---------------------------------------------------------- */
+@@ -2350,6 +2469,7 @@ static void mt7915_main_test_wed_forward_path(struct kunit *test)
+ #endif
+ 
+ #ifdef MT7915_MAIN_TEST_SDATA
++static int mt7915_main_test_stat_idx(const char *name);
+ static void mt7915_main_test_ba_params(struct ieee80211_ampdu_params *p,
+ 				       struct ieee80211_sta *sta,
+ 				       enum ieee80211_ampdu_mlme_action action);
+@@ -2581,6 +2701,294 @@ static void mt7915_main_test_ampdu_tx_stop_cont(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, ba->ba_en, 0);
+ }
+ 
++/* A client that roams to an AP interface of the other band (or another
++ * BSS) is authorized there: its station on the interface it left, which
++ * mac80211 still has, is disconnected in the firmware and stops being a
++ * station to the driver. A station whose wcid is gone already (being
++ * removed) is left alone.
++ */
++static void mt7915_main_test_drop_other_sta_real(struct kunit *test)
++{
++	static const u8 addr[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct ieee80211_vif *vif, *vif2;
++	struct mt7915_sta *msta;
++	struct sta_info *si, *si2;
++	struct mt76_test_msg *msg;
++	struct sta_rec_basic *basic;
++
++	vif = mt7915_main_test_sdata_ap(test, hw, 1);
++	vif2 = mt7915_main_test_sdata_ap(test, hw2, 2);
++	mt7915_main_test_sdata_up(test, vif);
++	mt7915_main_test_sdata_up(test, vif2);
++	si = mt7915_main_test_mac80211_sta(test, hw, vif, addr);
++	si2 = mt7915_main_test_mac80211_sta(test, hw2, vif2, addr);
++	msta = (struct mt7915_sta *)si->sta.drv_priv;
++	msta->wcid.sta = 1;
++	msta->wcid.tx_info |= MT_WCID_TX_INFO_SET;
++	mt7915_main_test_clear(fake);
++
++	mt7915_drop_other_sta(dev, vif2, &si2->sta);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(STA_REC_UPDATE));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_EQ(test, msg->data[1], (u8)msta->wcid.idx);
++	basic = mt7915_main_test_tlv(msg, STA_REC_BASIC);
++	KUNIT_ASSERT_NOT_NULL(test, basic);
++	KUNIT_EXPECT_EQ(test, basic->conn_state, CONN_STATE_DISCONNECT);
++	KUNIT_EXPECT_EQ(test, (int)msta->wcid.sta, 0);
++	KUNIT_EXPECT_EQ(test, (int)msta->wcid.sta_disabled, 1);
++	KUNIT_EXPECT_FALSE(test, msta->wcid.tx_info & MT_WCID_TX_INFO_SET);
++	/* the station it just joined is untouched */
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(STA_REC_UPDATE)), 1);
++
++	/* unpublished meanwhile: nothing sent */
++	mt7915_main_test_clear(fake);
++	rcu_assign_pointer(dev->mt76.wcid[msta->wcid.idx], NULL);
++	mt7915_drop_other_sta(dev, vif2, &si2->sta);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++	rcu_assign_pointer(dev->mt76.wcid[msta->wcid.idx], &msta->wcid);
++	synchronize_rcu();
++}
++
++/* The per-station counters of the interface's stations follow the
++ * device's, then the page pools' (ethtool -S).
++ */
++static void mt7915_main_test_et_stats_sta(struct kunit *test)
++{
++	static const u8 addr[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x66 };
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	struct mt7915_sta *msta;
++	struct sta_info *si;
++	int n;
++	u64 *data;
++
++	vif = mt7915_main_test_sdata_ap(test, hw, 1);
++	si = mt7915_main_test_mac80211_sta(test, hw, vif, addr);
++	msta = (struct mt7915_sta *)si->sta.drv_priv;
++	msta->wcid.stats.tx_mode[MT_PHY_TYPE_HE_SU] = 4321;
++	n = mt7915_get_et_sset_count(hw, vif, ETH_SS_STATS);
++	KUNIT_ASSERT_GT(test, n, MT7915_SSTATS_LEN - 1);
++	data = kunit_kcalloc(test, n, sizeof(*data), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++
++	mt7915_get_et_stats(hw, vif, NULL, data);
++	KUNIT_EXPECT_EQ(test, data[mt7915_main_test_stat_idx("v_tx_mode_he_su")],
++			4321);
++}
++
++/* the channel context mt76 drivers with their own give an interface */
++struct mt7915_main_test_ctx {
++	struct ieee80211_chanctx_conf conf;
++	struct mt76_chanctx mctx;
++};
++
++/* A station interface going off channel (a scan) tells its AP it dozes
++ * with a null frame, PM set, on the voice queue to the AP's station; back
++ * on channel, awake. (mt7915 has no channel contexts of its own, so on the
++ * router this is mt7996's path; here the interface gets one.)
++ */
++static void mt7915_main_test_offchannel_nullfunc(struct kunit *test)
++{
++	static const u8 ap[ETH_ALEN] = { 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01 };
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_main_test_ctx *ctx;
++	struct ieee80211_hdr *hdr;
++	struct ieee80211_vif *vif;
++	struct mt76_wcid *wcid;
++	struct sta_info *si;
++	struct sk_buff *skb;
++	int i;
++
++	vif = mt7915_main_test_sdata(test, hw, NL80211_IFTYPE_STATION, 1);
++	memcpy(vif->cfg.ap_addr, ap, ETH_ALEN);
++	vif->bss_conf.bssid = vif->cfg.ap_addr;
++	vif->cfg.assoc = true;
++	mt7915_main_test_sdata_up(test, vif);
++	si = mt7915_main_test_mac80211_sta(test, hw, vif, ap);
++	/* associated, as sta_info_move_state() leaves it */
++	set_bit(WLAN_STA_AUTH, &si->_flags);
++	set_bit(WLAN_STA_ASSOC, &si->_flags);
++	wcid = (struct mt76_wcid *)si->sta.drv_priv;
++	wcid->tx_info |= MT_WCID_TX_INFO_SET;
++	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ctx);
++	ctx->mctx.phy = &dev->mphy;
++	mt7915_main_test_mvif(vif)->mt76.ctx = &ctx->conf;
++	dev->mphy.main_chandef = dev->mphy.chandef;
++	mt76_worker_disable(&dev->mt76.tx_worker);
++
++	for (i = 0; i < 2; i++) {
++		bool off = !i;
++
++		mt76_offchannel_notify(&dev->mphy, off);
++		skb = mt7915_main_test_next_tx(wcid);
++		KUNIT_ASSERT_NOT_NULL(test, skb);
++		hdr = (struct ieee80211_hdr *)skb->data;
++		KUNIT_EXPECT_TRUE(test, ieee80211_is_qos_nullfunc(
++				  hdr->frame_control));
++		KUNIT_EXPECT_EQ(test, ieee80211_has_pm(hdr->frame_control), off);
++		KUNIT_EXPECT_MEMEQ(test, hdr->addr1, ap, ETH_ALEN);
++		KUNIT_EXPECT_EQ(test, skb_get_queue_mapping(skb),
++				IEEE80211_AC_VO);
++		kfree_skb(skb);
++	}
++
++	/* not on this phy: nothing */
++	ctx->mctx.phy = mt7915_ext_phy(dev)->mt76;
++	mt76_offchannel_notify(&dev->mphy, true);
++	KUNIT_EXPECT_NULL(test, mt7915_main_test_next_tx(wcid));
++
++	mt7915_main_test_mvif(vif)->mt76.ctx = NULL;
++	spin_lock_bh(&dev->mphy.tx_lock);
++	list_del_init(&wcid->tx_list);
++	spin_unlock_bh(&dev->mphy.tx_lock);
++	mt76_worker_enable(&dev->mt76.tx_worker);
++}
++
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* With WED, tx status comes per PPDU (TXS format 2+): its bytes, failures
++ * and retries go to the station's counters, and its tx BA session's
++ * timer is refreshed.
++ */
++static void mt7915_main_test_wed_txs(struct kunit *test)
++{
++	static const u8 addr[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x77 };
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	struct mt76_wcid *wcid;
++	struct sta_info *si;
++	__le32 txs[8] = {};
++
++	vif = mt7915_main_test_sdata_ap(test, hw, 1);
++	si = mt7915_main_test_mac80211_sta(test, hw, vif, addr);
++	wcid = (struct mt76_wcid *)si->sta.drv_priv;
++	mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++
++	txs[0] = cpu_to_le32(FIELD_PREP(MT_TXS0_TXS_FORMAT, 2) |
++			     FIELD_PREP(MT_TXS0_TID, 5));
++	txs[5] = cpu_to_le32(FIELD_PREP(MT_TXS5_MPDU_TX_BYTE, 3000));
++	txs[6] = cpu_to_le32(FIELD_PREP(MT_TXS6_MPDU_FAIL_CNT, 2));
++	txs[7] = cpu_to_le32(FIELD_PREP(MT_TXS7_MPDU_RETRY_BYTE, 1000) |
++			     FIELD_PREP(MT_TXS7_MPDU_RETRY_CNT, 3));
++
++	wcid->sta = 1;
++	mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bytes, 2000);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_failed, 2);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_retries, 3);
++
++	/* format 1 (per MPDU): not counted here */
++	txs[0] = cpu_to_le32(FIELD_PREP(MT_TXS0_TXS_FORMAT, 1));
++	mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs);
++	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bytes, 2000);
++	wcid->sta = 0;
++}
++#endif
++
++/* A FILS discovery frame or an unsolicited broadcast probe response (6
++ * GHz discovery) goes to the firmware with its interval in the BSS's
++ * offload TLV, as mac80211's template: FILS discovery's tx type 1,
++ * the probe response's 0. Without a template, or one too large, refused.
++ */
++static void mt7915_main_test_inband_discov(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct unsol_bcast_probe_resp_data *ubpr;
++	struct ieee80211_sub_if_data *sdata;
++	struct fils_discovery_data *fils;
++	struct mt76_test_msg *msg;
++	struct ieee80211_vif *vif;
++	int i;
++
++	vif = mt7915_main_test_sdata_ap(test, hw2, 1);
++	sdata = vif_to_sdata(vif);
++	fils = kunit_kzalloc(test, sizeof(*fils) + 64, GFP_KERNEL);
++	ubpr = kunit_kzalloc(test, sizeof(*ubpr) + MT7915_MAX_BEACON_SIZE + 1,
++			     GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, fils);
++	KUNIT_ASSERT_NOT_NULL(test, ubpr);
++	fils->len = 64;
++	for (i = 0; i < 64; i++)
++		fils->data[i] = 0xf0 + (i & 0xf);
++	ubpr->len = 48;
++	memset(ubpr->data, 0x77, 48);
++	vif->bss_conf.fils_discovery.max_interval = 20;
++	vif->bss_conf.unsol_bcast_probe_resp_interval = 0;
++	mt7915_main_test_clear(fake);
++
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_inband_discov(dev, vif,
++			BSS_CHANGED_FILS_DISCOVERY), -EINVAL);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++
++	rcu_assign_pointer(sdata->deflink.u.ap.fils_discovery, fils);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_inband_discov(dev, vif,
++			BSS_CHANGED_FILS_DISCOVERY), 0);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(BSS_INFO_UPDATE));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_TRUE(test, mt7915_main_test_msg_has(msg, fils->data, 64));
++
++	/* no probe response interval: nothing to send */
++	mt7915_main_test_clear(fake);
++	rcu_assign_pointer(sdata->deflink.u.ap.unsol_bcast_probe_resp, ubpr);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_inband_discov(dev, vif,
++			BSS_CHANGED_UNSOL_BCAST_PROBE_RESP), -EINVAL);
++	vif->bss_conf.unsol_bcast_probe_resp_interval = 20;
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_inband_discov(dev, vif,
++			BSS_CHANGED_UNSOL_BCAST_PROBE_RESP), 0);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(BSS_INFO_UPDATE));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_TRUE(test, mt7915_main_test_msg_has(msg, ubpr->data, 48));
++
++	mt7915_main_test_clear(fake);
++	ubpr->len = MT7915_MAX_BEACON_SIZE + 1;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_inband_discov(dev, vif,
++			BSS_CHANGED_UNSOL_BCAST_PROBE_RESP), -EINVAL);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++
++	RCU_INIT_POINTER(sdata->deflink.u.ap.fils_discovery, NULL);
++	RCU_INIT_POINTER(sdata->deflink.u.ap.unsol_bcast_probe_resp, NULL);
++	synchronize_rcu();
++}
++
++/* A station interface's BSS info names its AP's station, which mac80211
++ * finds by the BSSID, as the BSS's wcid.
++ */
++static void mt7915_main_test_bss_info_sta(struct kunit *test)
++{
++	static const u8 ap[ETH_ALEN] = { 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x02 };
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct bss_info_basic *basic;
++	struct ieee80211_vif *vif;
++	struct mt76_wcid *wcid;
++	struct sta_info *si;
++
++	vif = mt7915_main_test_sdata(test, hw, NL80211_IFTYPE_STATION, 1);
++	memcpy(vif->cfg.ap_addr, ap, ETH_ALEN);
++	vif->bss_conf.bssid = vif->cfg.ap_addr;
++	si = mt7915_main_test_mac80211_sta(test, hw, vif, ap);
++	wcid = (struct mt76_wcid *)si->sta.drv_priv;
++	mt7915_main_test_clear(fake);
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_bss_info(&dev->phy, vif, true), 0);
++	basic = mt7915_main_test_tlv(mt76_test_find_msg(fake,
++			MCU_EXT_CMD(BSS_INFO_UPDATE)), BSS_INFO_BASIC);
++	KUNIT_ASSERT_NOT_NULL(test, basic);
++	KUNIT_EXPECT_EQ(test, basic->bmc_wcid_lo, wcid->idx & 0xff);
++	KUNIT_EXPECT_EQ(test, basic->bmc_wcid_hi, wcid->idx >> 8);
++}
++
+ /* After a firmware restart, each agreement it dropped is torn down with
+  * the station, flow by flow, and counted lost; once.
+  */
+@@ -4442,6 +4850,14 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_twt_lost),
+ 	KUNIT_CASE(mt7915_main_test_add_beacon),
+ 	KUNIT_CASE(mt7915_main_test_ampdu_tx_stop_cont),
++	KUNIT_CASE(mt7915_main_test_drop_other_sta_real),
++	KUNIT_CASE(mt7915_main_test_et_stats_sta),
++	KUNIT_CASE(mt7915_main_test_offchannel_nullfunc),
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_main_test_wed_txs),
++#endif
++	KUNIT_CASE(mt7915_main_test_inband_discov),
++	KUNIT_CASE(mt7915_main_test_bss_info_sta),
+ #endif
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	KUNIT_CASE(mt7915_main_test_wed_sta_add),

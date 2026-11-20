@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:56:48 +0000
+Subject: [PATCH] wifi: mt76: no rx_lock when there are no frames to pass on
+
+mt76_rx_complete() took dev->rx_lock even with no frames to pass on: after every NAPI poll of a ring that carries only events (tx-free, TX status), and after a reorder timeout that releases nothing. It returns at once now when there are none.
+
+No test of its own: nothing changes for frames, and mt76-core-rx passes frames through it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index be4d0560..a858de2b 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1657,6 +1657,10 @@ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
+ 	struct sk_buff *skb, *tmp;
+ 	LIST_HEAD(list);
+ 
++	/* a tx-free or other event-only poll: no frames, no rx_lock */
++	if (skb_queue_empty(frames))
++		return;
++
+ 	spin_lock(&dev->rx_lock);
+ 	while ((skb = __skb_dequeue(frames)) != NULL) {
+ 		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;

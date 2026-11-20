@@ -1,0 +1,242 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:14:16 +0000
+Subject: [PATCH] wifi: mt76: an mtd-eeprom property without its offset doesn't
+ hold the MTD device
+
+mt76_get_of_data_from_mtd() took the MTD device the phandle names, then
+refused a mediatek,mtd-eeprom property of one cell without giving it back:
+the device's driver module could never be unloaded after that. And a
+property of 5 to 7 bytes passed the check, so the offset was read past its
+end.
+
+The property is checked for both cells (phandle and offset) before the
+device is taken.
+
+mt76_eeprom_test_mtd_short_property (fails without it: the reference is
+kept at 4 bytes, the read past the end succeeds at 5), plus reads from an
+in-RAM MTD device: offset, corrected bitflips, read errors, short reads,
+past the partition, big-endian.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ eeprom.c            |  13 ++--
+ tests/eeprom-test.c | 167 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 175 insertions(+), 5 deletions(-)
+
+diff --git a/eeprom.c b/eeprom.c
+index 6503cc24..ef7ca590 100644
+--- a/eeprom.c
++++ b/eeprom.c
+@@ -59,6 +59,14 @@ int mt76_get_of_data_from_mtd(struct mt76_dev *dev, void *eep, int offset, int l
+ 	if (!np)
+ 		return -EINVAL;
+ 
++	/* the phandle and the offset in the partition, before the MTD
++	 * device is held: the error path below gives back only the node
++	 */
++	if (size < 2 * sizeof(*list)) {
++		ret = -EINVAL;
++		goto out_put_node;
++	}
++
+ 	part = of_get_property(np, "label", NULL);
+ 	if (!part)
+ 		part = np->name;
+@@ -69,11 +77,6 @@ int mt76_get_of_data_from_mtd(struct mt76_dev *dev, void *eep, int offset, int l
+ 		goto out_put_node;
+ 	}
+ 
+-	if (size <= sizeof(*list)) {
+-		ret = -EINVAL;
+-		goto out_put_node;
+-	}
+-
+ 	offset += be32_to_cpup(list);
+ 	ret = mtd_read(mtd, offset, len, &retlen, eep);
+ 	put_mtd_device(mtd);
+diff --git a/tests/eeprom-test.c b/tests/eeprom-test.c
+index 19cac357..658d6da6 100644
+--- a/tests/eeprom-test.c
++++ b/tests/eeprom-test.c
+@@ -246,6 +246,170 @@ static void mt76_eeprom_test_mtd(struct kunit *test)
+ 			sizeof(buf)), -ENODEV);
+ }
+ 
++/* An MTD device in RAM, named as mt76 looks for it (the node's label, or
++ * its name), counting the references held on it.
++ */
++struct mt76_eeprom_test_mtd {
++	struct mtd_info mtd;
++	u8 data[64];
++	int read_ret;		/* what a read returns ... */
++	size_t short_by;	/* ... having read this many bytes fewer */
++	int refs;		/* references held */
++};
++
++static struct mt76_eeprom_test_mtd *
++mt76_eeprom_test_to_mtd(struct mtd_info *mtd)
++{
++	return container_of(mtd, struct mt76_eeprom_test_mtd, mtd);
++}
++
++static int mt76_eeprom_test_mtd_read(struct mtd_info *mtd, loff_t from,
++				     size_t len, size_t *retlen, u_char *buf)
++{
++	struct mt76_eeprom_test_mtd *m = mt76_eeprom_test_to_mtd(mtd);
++
++	memcpy(buf, m->data + from, len);
++	*retlen = len - min(len, m->short_by);
++	return m->read_ret;
++}
++
++static int mt76_eeprom_test_mtd_get(struct mtd_info *mtd)
++{
++	mt76_eeprom_test_to_mtd(mtd)->refs++;
++	return 0;
++}
++
++static void mt76_eeprom_test_mtd_put(struct mtd_info *mtd)
++{
++	mt76_eeprom_test_to_mtd(mtd)->refs--;
++}
++
++static void mt76_eeprom_test_mtd_unregister(void *mtd)
++{
++	mtd_device_unregister(mtd);
++}
++
++/* the MTD device @live (a node of the live tree) names, until @test ends;
++ * its bytes are their own offsets
++ */
++static struct mt76_eeprom_test_mtd *
++mt76_eeprom_test_mtd_dev(struct kunit *test, struct device_node *live)
++{
++	struct mt76_eeprom_test_mtd *m;
++	int i;
++
++	m = kunit_kzalloc(test, sizeof(*m), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, m);
++	for (i = 0; i < sizeof(m->data); i++)
++		m->data[i] = i;
++	m->mtd.name = of_get_property(live, "label", NULL) ?: live->name;
++	/* no block device for it: nothing else opens it */
++	m->mtd.type = MTD_ABSENT;
++	m->mtd.flags = MTD_NO_ERASE;
++	m->mtd.size = sizeof(m->data);
++	m->mtd.writesize = 1;
++	m->mtd.writebufsize = 1;
++	m->mtd._read = mt76_eeprom_test_mtd_read;
++	m->mtd._get_device = mt76_eeprom_test_mtd_get;
++	m->mtd._put_device = mt76_eeprom_test_mtd_put;
++	KUNIT_ASSERT_EQ(test, mtd_device_register(&m->mtd, NULL, 0), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_eeprom_test_mtd_unregister, &m->mtd), 0);
++
++	return m;
++}
++
++/* The EEPROM is read from the partition at the device tree's offset plus
++ * the caller's. A bitflip the ECC corrected still counts as read; a read
++ * error, a short read or a range past the partition doesn't. The device is
++ * given back every time.
++ */
++static void mt76_eeprom_test_mtd_read_partition(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_eeprom_test_dev(test);
++	struct device_node *np = mt76_eeprom_test_of(test, dev);
++	struct device_node *live = mt76_eeprom_test_live(test);
++	struct mt76_eeprom_test_mtd *m = mt76_eeprom_test_mtd_dev(test, live);
++	u8 buf[8];
++
++	MT76_EEPROM_TEST_CELLS(test, np, "mediatek,mtd-eeprom", live->phandle,
++			       0x10);
++	KUNIT_EXPECT_EQ(test, mt76_get_of_data_from_mtd(dev, buf, 4,
++			sizeof(buf)), 0);
++	KUNIT_EXPECT_MEMEQ(test, buf, m->data + 0x14, sizeof(buf));
++	KUNIT_EXPECT_EQ(test, m->refs, 0);
++
++	/* one bitflip, corrected (-EUCLEAN from mtd_read()) */
++	m->mtd.ecc_strength = 1;
++	m->mtd.bitflip_threshold = 1;
++	m->read_ret = 1;
++	memset(buf, 0, sizeof(buf));
++	KUNIT_EXPECT_EQ(test, mt76_get_of_data_from_mtd(dev, buf, 0,
++			sizeof(buf)), 0);
++	KUNIT_EXPECT_MEMEQ(test, buf, m->data + 0x10, sizeof(buf));
++	KUNIT_EXPECT_EQ(test, m->refs, 0);
++
++	m->read_ret = -EIO;
++	KUNIT_EXPECT_EQ(test, mt76_get_of_data_from_mtd(dev, buf, 0,
++			sizeof(buf)), -EIO);
++	KUNIT_EXPECT_EQ(test, m->refs, 0);
++
++	m->read_ret = 0;
++	m->short_by = 2;
++	KUNIT_EXPECT_EQ(test, mt76_get_of_data_from_mtd(dev, buf, 0,
++			sizeof(buf)), -EINVAL);
++	KUNIT_EXPECT_EQ(test, m->refs, 0);
++
++	m->short_by = 0;
++	KUNIT_EXPECT_EQ(test, mt76_get_of_data_from_mtd(dev, buf,
++			sizeof(m->data) - 0x10 - 4, sizeof(buf)), -EINVAL);
++	KUNIT_EXPECT_EQ(test, m->refs, 0);
++}
++
++/* A big-endian EEPROM in flash is turned into the little-endian one the
++ * driver reads: every 16-bit word swapped.
++ */
++static void mt76_eeprom_test_mtd_big_endian(struct kunit *test)
++{
++	static const u8 want[] = { 0x21, 0x20, 0x23, 0x22, 0x25, 0x24 };
++	struct mt76_dev *dev = mt76_eeprom_test_dev(test);
++	struct device_node *np = mt76_eeprom_test_of(test, dev);
++	struct device_node *live = mt76_eeprom_test_live(test);
++	u8 buf[sizeof(want)];
++
++	mt76_eeprom_test_mtd_dev(test, live);
++	MT76_EEPROM_TEST_CELLS(test, np, "mediatek,mtd-eeprom", live->phandle,
++			       0x20);
++	mt76_eeprom_test_prop(test, np, "big-endian", NULL, 0);
++	KUNIT_EXPECT_EQ(test, mt76_get_of_data_from_mtd(dev, buf, 0,
++			sizeof(buf)), 0);
++	KUNIT_EXPECT_MEMEQ(test, buf, want, sizeof(want));
++}
++
++/* A property with the phandle but not the whole offset after it is refused
++ * without the MTD device being held for good (4 bytes kept the reference
++ * get_mtd_device_nm() took) or the offset read past its end (5 to 7).
++ */
++static void mt76_eeprom_test_mtd_short_property(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_eeprom_test_dev(test);
++	struct device_node *np = mt76_eeprom_test_of(test, dev);
++	struct device_node *live = mt76_eeprom_test_live(test);
++	struct mt76_eeprom_test_mtd *m = mt76_eeprom_test_mtd_dev(test, live);
++	__be32 cells[2] = { cpu_to_be32(live->phandle), cpu_to_be32(0x10) };
++	u8 buf[8];
++	int len;
++
++	for (len = sizeof(cells[0]); len < sizeof(cells); len++) {
++		np->properties = NULL;
++		mt76_eeprom_test_prop(test, np, "mediatek,mtd-eeprom", cells,
++				      len);
++		KUNIT_EXPECT_EQ_MSG(test, mt76_get_of_data_from_mtd(dev, buf, 0,
++				    sizeof(buf)), -EINVAL, "%d bytes", len);
++		KUNIT_EXPECT_EQ_MSG(test, m->refs, 0, "%d bytes", len);
++	}
++}
++
+ /* An EEPROM in an NVMEM cell: none without the cell; a cell whose provider
+  * hasn't probed yet says to try again later.
+  */
+@@ -810,6 +974,9 @@ static struct kunit_case mt76_eeprom_test_cases[] = {
+ 	KUNIT_CASE(mt76_eeprom_test_init_no_dt),
+ 	KUNIT_CASE(mt76_eeprom_test_init_dt_data),
+ 	KUNIT_CASE(mt76_eeprom_test_mtd),
++	KUNIT_CASE(mt76_eeprom_test_mtd_read_partition),
++	KUNIT_CASE(mt76_eeprom_test_mtd_big_endian),
++	KUNIT_CASE(mt76_eeprom_test_mtd_short_property),
+ 	KUNIT_CASE(mt76_eeprom_test_nvmem),
+ 	KUNIT_CASE(mt76_eeprom_test_nvmem_cell),
+ 	KUNIT_CASE(mt76_eeprom_test_init_nvmem_defer),

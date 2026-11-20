@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:43:30 +0000
+Subject: [PATCH] wifi: mt76: the next ring index by a compare, not a division
+
+Queueing a frame, taking one off an rx ring and completing one on a tx ring each computed the next ring index as (idx + 1) % q->ndesc. The ring size is a variable, so that is a division for every frame, and not every ring size is a power of two (the 1536-entry rx rings). mt76_queue_next() steps and wraps with a compare instead: the same index for any ring size.
+
+No test of its own: the DMA suites (mt76-dma, mt76-dma-rx) run it for every frame they queue and take off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dma.c  | 6 +++---
+ mt76.h | 8 ++++++++
+ tx.c   | 2 +-
+ 3 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/dma.c b/dma.c
+index 2396e186..9d8ab38f 100644
+--- a/dma.c
++++ b/dma.c
+@@ -313,7 +313,7 @@ done:
+ 	entry->buf = data;
+ 	entry->wcid = 0xffff;
+ 	entry->skip_buf1 = true;
+-	q->head = (q->head + 1) % q->ndesc;
++	q->head = mt76_queue_next(q, q->head);
+ 	q->queued++;
+ 
+ 	return idx;
+@@ -338,7 +338,7 @@ mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
+ 		u32 buf0 = buf[0].addr, buf1 = 0;
+ 
+ 		idx = q->head;
+-		next = (q->head + 1) % q->ndesc;
++		next = mt76_queue_next(q, q->head);
+ 
+ 		desc = &q->desc[idx];
+ 		entry = &q->entry[idx];
+@@ -626,7 +626,7 @@ mt76_dma_dequeue(struct mt76_dev *dev, struct mt76_queue *q, bool flush,
+ 		dma_rmb();
+ 	}
+ done:
+-	q->tail = (q->tail + 1) % q->ndesc;
++	q->tail = mt76_queue_next(q, q->tail);
+ 	q->queued--;
+ 
+ 	return mt76_dma_get_buf(dev, q, idx, len, info, more, drop, flush);
+diff --git a/mt76.h b/mt76.h
+index c5c2d1fa..a693f709 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -2129,6 +2129,14 @@ static inline bool mt76_queue_is_npu(struct mt76_queue *q)
+ 	return q->flags & MT_QFLAG_NPU;
+ }
+ 
++/* The ring index after @idx: a compare, not a division by a ring size that
++ * isn't a power of two everywhere (1536-entry rx rings)
++ */
++static inline u16 mt76_queue_next(struct mt76_queue *q, u16 idx)
++{
++	return ++idx == q->ndesc ? 0 : idx;
++}
++
+ static inline bool mt76_queue_is_npu_tx(struct mt76_queue *q)
+ {
+ 	return mt76_queue_is_npu(q) &&
+diff --git a/tx.c b/tx.c
+index 37533d2b..3f097e5c 100644
+--- a/tx.c
++++ b/tx.c
+@@ -1664,7 +1664,7 @@ void mt76_queue_tx_complete(struct mt76_dev *dev, struct mt76_queue *q,
+ 		dev->drv->tx_complete_skb(dev, e);
+ 
+ 	spin_lock_bh(&q->lock);
+-	q->tail = (q->tail + 1) % q->ndesc;
++	q->tail = mt76_queue_next(q, q->tail);
+ 	q->queued--;
+ 	spin_unlock_bh(&q->lock);
+ }

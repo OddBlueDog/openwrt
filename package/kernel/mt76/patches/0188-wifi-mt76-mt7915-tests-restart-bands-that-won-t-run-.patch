@@ -1,0 +1,200 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:33:23 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: restart bands that won't run, RCU
+ in two tests
+
+mt7915_test_mac_restart_main_run_fails / _ext_run_fails: a band that
+was running when the reset came and can't be run again (its firmware
+refuses the power state) fails the restart, to be retried, and stays
+stopped: the main band first, the second band when only it ran.
+
+mt7915_mcu2_dpd_freq_idx_mt7915 now tells the two DPD channel lists
+apart (it passed with either): channel 144 and the 2.4 GHz slots'
+numbers differ. Called out of line, so gcov counts the list chosen.
+
+mt7915_main_test_rx_check_ps and mt7915_main_test_wed_txs called
+mt76_rx_poll_complete() and mt76_connac2_mac_fill_txs() without the
+RCU read lock their driver callers hold (NAPI's mt76_dma_rx_poll(),
+mt7915_mac_add_txs()): the debug kernel's lockdep said so.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/mac-test.c  | 50 +++++++++++++++++++++++++++++++++++++---
+ mt7915/tests/main-test.c | 11 +++++++++
+ mt7915/tests/mcu2-test.c | 20 ++++++++++++----
+ 3 files changed, 73 insertions(+), 8 deletions(-)
+
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 6565c211..6c073e5a 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -5599,9 +5599,10 @@ static int mt7915_test_boot_hook(struct mt76_test_fake *fake,
+  */
+ /* the chip a restart runs on, when not the MT7986 */
+ struct mt7915_test_restart_chip {
+-	u32 rev;
++	u32 rev;	/* 0: the MT7986 */
+ 	bool pcie, hif2;
+ 	u8 wed;		/* WED version attached, 0: none */
++	bool run_main, run_ext;	/* bands running when the reset came */
+ };
+ 
+ static int __mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
+@@ -5626,13 +5627,19 @@ static int __mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
+ 	fake->mcu_hook = mt7915_test_boot_hook;
+ 	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+ 	/* no band running (mt7915_run() has tests of its own, on a wiphy
+-	 * that is registered): none run again
++	 * that is registered): none run again, unless the chip says so for
++	 * a run the firmware refuses (before mac80211 work is queued)
+ 	 */
+ 	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+ 	clear_bit(MT76_STATE_RUNNING, &phy1->mt76->state);
+ 
+ 	if (c) {
+-		dev->mt76.rev = c->rev;
++		if (c->run_main)
++			set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++		if (c->run_ext)
++			set_bit(MT76_STATE_RUNNING, &phy1->mt76->state);
++		if (c->rev)
++			dev->mt76.rev = c->rev;
+ 		if (c->hif2) {
+ 			dev->hif2 = kunit_kzalloc(test, sizeof(*dev->hif2),
+ 						  GFP_KERNEL);
+@@ -5743,6 +5750,41 @@ static void mt7915_test_mac_restart_eeprom_fails(struct kunit *test)
+ 			MCU_EXT_CMD(TXBF_ACTION)), 0);
+ }
+ 
++/* A band that was running and can't be run again (its firmware refuses
++ * the power state) fails the restart, to be retried, and stays stopped:
++ * the main band first, the second band when only it ran.
++ */
++static void mt7915_test_mac_restart_run_fails(struct kunit *test,
++					      const struct mt7915_test_restart_chip *c)
++{
++	struct mt7915_dev *dev;
++
++	KUNIT_EXPECT_EQ(test, __mt7915_test_mac_restart_boot(test,
++			MCU_EXT_CMD(PM_STATE_CTRL), &dev, c), -EIO);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(mt76_test_fake,
++			MCU_EXT_CMD(PM_STATE_CTRL)), 1);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_RUNNING, &dev->mphy.state));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_RUNNING,
++					  &dev->mt76.phys[MT_BAND1]->state));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_RESET, &dev->mphy.state));
++}
++
++static void mt7915_test_mac_restart_main_run_fails(struct kunit *test)
++{
++	static const struct mt7915_test_restart_chip c = {
++		.run_main = true, .run_ext = true,
++	};
++
++	mt7915_test_mac_restart_run_fails(test, &c);
++}
++
++static void mt7915_test_mac_restart_ext_run_fails(struct kunit *test)
++{
++	static const struct mt7915_test_restart_chip c = { .run_ext = true };
++
++	mt7915_test_mac_restart_run_fails(test, &c);
++}
++
+ /* Plays the firmware crashing while the driver waits for the last SER
+  * step: once the driver reports RESET_DONE, the WDT bit is set and the
+  * waiter woken.
+@@ -6353,6 +6395,8 @@ static struct kunit_case mt7915_mac_reset_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_mac_restart),
+ 	KUNIT_CASE(mt7915_test_mac_restart_ok),
+ 	KUNIT_CASE(mt7915_test_mac_restart_eeprom_fails),
++	KUNIT_CASE(mt7915_test_mac_restart_main_run_fails),
++	KUNIT_CASE(mt7915_test_mac_restart_ext_run_fails),
+ 	KUNIT_CASE(mt7915_test_mac_restart_mt7915),
+ 	KUNIT_CASE(mt7915_test_mac_restart_mt7916),
+ 	{}
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 48ddadb7..6f25e4b8 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2999,8 +2999,11 @@ static void mt7915_main_test_rx_check_ps(struct kunit *test)
+ 	__skb_queue_tail(q, mt7915_main_test_rx_frame(test, dev, vif, addr,
+ 			 IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_NULLFUNC |
+ 			 IEEE80211_FCTL_PM, wcid));
++	/* as NAPI's mt76_dma_rx_poll() calls it */
+ 	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_rx_poll_complete(&dev->mt76, MT_RXQ_MAIN, NULL);
++	rcu_read_unlock();
+ 	local_bh_enable();
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
+ 	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
+@@ -3008,8 +3011,11 @@ static void mt7915_main_test_rx_check_ps(struct kunit *test)
+ 
+ 	__skb_queue_tail(q, mt7915_main_test_rx_frame(test, dev, vif, addr,
+ 			 IEEE80211_FTYPE_DATA | IEEE80211_STYPE_NULLFUNC, wcid));
++	/* as NAPI's mt76_dma_rx_poll() calls it */
+ 	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_rx_poll_complete(&dev->mt76, MT_RXQ_MAIN, NULL);
++	rcu_read_unlock();
+ 	local_bh_enable();
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
+ 	KUNIT_EXPECT_FALSE(test, test_sta_flag(si, WLAN_STA_PS_STA));
+@@ -3051,14 +3057,19 @@ static void mt7915_main_test_wed_txs(struct kunit *test)
+ 			     FIELD_PREP(MT_TXS7_MPDU_RETRY_CNT, 3));
+ 
+ 	wcid->sta = 1;
++	/* under RCU, as mt7915_mac_add_txs() calls it */
++	rcu_read_lock();
+ 	mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs);
++	rcu_read_unlock();
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bytes, 2000);
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_failed, 2);
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_retries, 3);
+ 
+ 	/* format 1 (per MPDU): not counted here */
+ 	txs[0] = cpu_to_le32(FIELD_PREP(MT_TXS0_TXS_FORMAT, 1));
++	rcu_read_lock();
+ 	mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs);
++	rcu_read_unlock();
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bytes, 2000);
+ 	wcid->sta = 0;
+ }
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 84481433..54ea1bfe 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -3688,16 +3688,26 @@ static void mt7915_mcu2_fw_handshake_timeouts(struct kunit *test)
+  */
+ static void mt7915_mcu2_dpd_freq_idx_mt7915(struct kunit *test)
+ {
++	int (*idx)(struct mt7915_dev *dev, u16 freq, u8 bw) = mt7915_dpd_freq_idx;
+ 	struct mt7915_dev *dev = mt7915_test_dev(test);
+ 	u32 rev = dev->mt76.rev;
+-	int v2;
+ 
+-	v2 = mt7915_dpd_freq_idx(dev, 5180, 0);
++	/* out of line: inlined here, gcov doesn't count the list chosen */
++	OPTIMIZER_HIDE_VAR(idx);
++
++	/* the others': 6 GHz first, then 5 GHz (channel 144 too); 2.4 GHz
++	 * after the 97 of them
++	 */
++	KUNIT_EXPECT_EQ(test, idx(dev, 5180, NL80211_CHAN_WIDTH_20), 66);
++	KUNIT_EXPECT_EQ(test, idx(dev, 5720, NL80211_CHAN_WIDTH_20), 85);
++	KUNIT_EXPECT_EQ(test, idx(dev, 2412, NL80211_CHAN_WIDTH_20), 97);
++
++	/* the MT7915's 24: 5 GHz only, no channel 144 */
+ 	dev->mt76.rev = 0x79150000;
+-	KUNIT_EXPECT_GE(test, mt7915_dpd_freq_idx(dev, 5180, 0), 0);
+-	KUNIT_EXPECT_GE(test, mt7915_dpd_freq_idx(dev, 2412, 0), 0);
++	KUNIT_EXPECT_EQ(test, idx(dev, 5180, NL80211_CHAN_WIDTH_20), 0);
++	KUNIT_EXPECT_EQ(test, idx(dev, 5720, NL80211_CHAN_WIDTH_20), -1);
++	KUNIT_EXPECT_EQ(test, idx(dev, 2412, NL80211_CHAN_WIDTH_20), 24);
+ 	dev->mt76.rev = rev;
+-	KUNIT_EXPECT_GE(test, v2, 0);
+ }
+ 
+ /* A channel switch with no memory for the message fails cleanly. */

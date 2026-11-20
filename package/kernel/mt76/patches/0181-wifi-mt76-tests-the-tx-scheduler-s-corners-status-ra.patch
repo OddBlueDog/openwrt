@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:56:26 +0000
+Subject: [PATCH] wifi: mt76: tests: the tx scheduler's corners, status rates,
+ pacing clock
+
+On the power save simulation's real mac80211 stations:
+
+- mt76_psim_test_sched_skips: a txq whose station is unpublished, at its
+  non-AQL limit or held for its silence keeps its frames; a pending BAR
+  goes out first; rates are looked up for a station without a fixed one.
+- mt76_psim_test_sched_dozing: a dozing station gets one frame per AC to
+  the firmware, then its burst stops.
+- mt76_psim_test_status_rate: a frame's status carries the station's
+  last rate.
+- mt76_psim_test_non_aql_drain: a station leaving its non-AQL limit is
+  scheduled again.
+- mt76_psim_test_pace_clock: pacing on the kernel's clock.
+- mt76_psim_test_silent_work: with a station held, the work re-arms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/ps-sim-test.c | 175 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 175 insertions(+)
+
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index b056593e..ab7bae34 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -2805,6 +2805,7 @@ static void mt76_psim_test_silent_work(struct kunit *test)
+ 		.kinds = { PSIM_LAPTOP }, .n_sta = 1,
+ 	};
+ 	struct mt76_dev *dev;
++	struct mt76_wcid *wcid;
+ 	unsigned long expires;
+ 	struct psim *s;
+ 
+@@ -2825,7 +2826,176 @@ static void mt76_psim_test_silent_work(struct kunit *test)
+ 
+ 	flush_delayed_work(&dev->silent_work);
+ 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dev->silent_work));
++
++	/* a station held: the work probes it and comes back for it */
++	wcid = psim_wcid(&s->sta[0]);
++	set_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++	set_bit(wcid->idx, dev->silent_wait);
++	wcid->silent_probe = jiffies + HZ;
++	mt76_tx_silent_arm(dev, 1);
++	flush_delayed_work(&dev->silent_work);
++	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dev->silent_work));
++	clear_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
+ 	mt76_tx_silent_stop(dev);
++	clear_bit(wcid->idx, dev->silent_wait);
++}
++
++/* --- the tx scheduler's corners ------------------------------------------- */
++
++/* A txq the scheduler takes off mac80211's active list and leaves: its
++ * station unpublished (being removed, or after a full reset), its non-AQL
++ * frames at the limit, or held for its silence. Each keeps its frames.
++ * Then a BA session's pending BAR goes out first, rates are looked up for
++ * a station without a fixed rate, and everything queued drains.
++ */
++static void mt76_psim_test_sched_skips(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 7, .kinds = { PSIM_LAPTOP }, .n_sta = 1,
++	};
++	struct ieee80211_txq *txq;
++	struct mt76_wcid *wcid;
++	struct mt76_txq *mtxq;
++	struct psim_sta *ps;
++	struct psim *s;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	ps = &s->sta[0];
++	wcid = psim_wcid(ps);
++	txq = ps->si->sta.txq[0];
++	mtxq = (struct mt76_txq *)txq->drv_priv;
++
++	psim_enqueue(s, ps, 0);
++	rcu_assign_pointer(s->dev->wcid[wcid->idx], NULL);
++	psim_worker(s);
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 0), 1);
++	rcu_assign_pointer(s->dev->wcid[wcid->idx], wcid);
++	synchronize_rcu();
++
++	atomic_set(&wcid->non_aql_packets, MT_MAX_NON_AQL_PKT);
++	psim_enqueue(s, ps, 0);
++	psim_worker(s);
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 0), 2);
++	atomic_set(&wcid->non_aql_packets, 0);
++
++	set_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++	psim_enqueue(s, ps, 0);
++	psim_worker(s);
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 0), 3);
++	clear_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++
++	/* the BAR needs the interface's channel for its band */
++	psim_pace_chanctx.def.chan = &psim_chan;
++	psim_pace_chanctx.def.width = NL80211_CHAN_WIDTH_20;
++	psim_pace_chanctx.def.center_freq1 = psim_chan.center_freq;
++	rcu_assign_pointer(s->sdata->vif.bss_conf.chanctx_conf,
++			   &psim_pace_chanctx);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			psim_pace_reset, s), 0);
++	mtxq->aggr = true;
++	mtxq->send_bar = true;
++	mtxq->agg_ssn = 0x55;
++	/* rates from mac80211 (every one allowed, as ieee80211_if_add()
++	 * starts an interface)
++	 */
++	s->sdata->rc_rateidx_mask[NL80211_BAND_5GHZ] =
++		BIT(ARRAY_SIZE(psim_rates)) - 1;
++	wcid->tx_info &= ~MT_WCID_TX_INFO_SET;
++	psim_enqueue(s, ps, 0);
++	psim_worker(s);
++	KUNIT_EXPECT_FALSE(test, mtxq->send_bar);
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 0), 0);
++	mtxq->aggr = false;
++	wcid->tx_info |= MT_WCID_TX_INFO_SET;
++}
++
++/* A dozing station's frames, the firmware buffering them: one per AC goes
++ * to the hardware, then the burst stops.
++ */
++static void mt76_psim_test_sched_dozing(struct kunit *test)
++{
++	struct psim *s = psim_release_init(test);
++	struct psim_sta *ps = &s->sta[0];
++
++	psim_enqueue(s, ps, 0);
++	psim_enqueue(s, ps, 0);
++	psim_enqueue(s, ps, 0);
++	psim_worker(s);
++	KUNIT_EXPECT_EQ(test, psim_txq_depth(ps, 0), 2);
++	KUNIT_EXPECT_EQ(test, ps->ps_out[psim_tid_to_ac[0]], 1);
++}
++
++/* A frame's status reports the station's last tx rate with it, when the
++ * driver knows one.
++ */
++static void mt76_psim_test_status_rate(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 9, .kinds = { PSIM_LAPTOP }, .n_sta = 1,
++	};
++	struct sk_buff_head list;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++	struct psim *s;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	wcid = psim_wcid(&s->sta[0]);
++	wcid->rate.legacy = 60;
++
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	skb_put_zero(skb, 24);
++	memset(IEEE80211_SKB_CB(skb), 0, sizeof(struct ieee80211_tx_info));
++	mt76_tx_skb_cb(skb)->wcid = wcid->idx;
++
++	mt76_tx_status_lock(s->dev, &list);
++	__skb_queue_tail(&list, skb);
++	mt76_tx_status_unlock(s->dev, &list);
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&list));
++	wcid->rate.legacy = 0;
++}
++
++/* A station at its non-AQL limit gets its txqs scheduled again as soon as
++ * one of those frames completes.
++ */
++static void mt76_psim_test_non_aql_drain(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 11, .kinds = { PSIM_LAPTOP }, .n_sta = 1,
++	};
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++	struct psim *s;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	wcid = psim_wcid(&s->sta[0]);
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memset(IEEE80211_SKB_CB(skb), 0, sizeof(struct ieee80211_tx_info));
++
++	atomic_set(&wcid->non_aql_packets, MT_MAX_NON_AQL_PKT);
++	mt76_tx_check_non_aql(s->dev, wcid, skb);
++	KUNIT_EXPECT_EQ(test, atomic_read(&wcid->non_aql_packets),
++			MT_MAX_NON_AQL_PKT - 1);
++	atomic_set(&wcid->non_aql_packets, 0);
++	kfree_skb(skb);
++}
++
++/* The pacing clock, outside the tests' own: the kernel's, in microseconds. */
++static void mt76_psim_test_pace_clock(struct kunit *test)
++{
++	u64 saved = mt76_tx_pace_test_now, a, b;
++
++	mt76_tx_pace_test_now = 0;
++	a = mt76_tx_pace_now();
++	udelay(10);
++	b = mt76_tx_pace_now();
++	mt76_tx_pace_test_now = saved;
++	KUNIT_EXPECT_GE(test, b, a + 10);
++	KUNIT_EXPECT_LE(test, b, div_u64(ktime_get_ns(), NSEC_PER_USEC));
+ }
+ 
+ static struct kunit_case mt76_psim_test_cases[] = {
+@@ -2840,6 +3010,11 @@ static struct kunit_case mt76_psim_test_cases[] = {
+ 	KUNIT_CASE(mt76_psim_test_wake_tx_queue),
+ 	KUNIT_CASE(mt76_psim_test_agg_ssn),
+ 	KUNIT_CASE(mt76_psim_test_silent_work),
++	KUNIT_CASE(mt76_psim_test_sched_skips),
++	KUNIT_CASE(mt76_psim_test_sched_dozing),
++	KUNIT_CASE(mt76_psim_test_status_rate),
++	KUNIT_CASE(mt76_psim_test_non_aql_drain),
++	KUNIT_CASE(mt76_psim_test_pace_clock),
+ 	{}
+ };
+ 

@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:40:49 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: tx-free corners, TWT rounding, WA
+ watchdog, WED stop
+
+- mt7915_test_tx_free_v3_header_alone: a v3 MPDU header no MSDU follows
+  still counts its transmissions to its station.
+- mt7915_test_tx_free_psd_ring: a band whose PS queue is a ring of its
+  own has both rings cleaned.
+- mt7915_test_twt_interval_round: an interval past 16 bits, rounded up
+  never shorter, rounded down never longer.
+- mt7915_test_full_reset_wa: a full reset after the WA's watchdog is
+  counted to the WA.
+- mt7915_test_reset_work_wed_stop: an L1 recovery stops WED first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/mac-test.c | 138 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 134 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index f6f18fe8..9095148d 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -18,6 +18,7 @@
+ #include <linux/kthread.h>
+ #include "fake.h"
+ #include "fw-files.h"
++#include "../../tests/wed-fake.h"
+ 
+ /* --- TWT ------------------------------------------------------------------ */
+ 
+@@ -37,6 +38,30 @@ static int mt7915_test_twt_check(u16 mantissa, u8 exp, u8 min_dur)
+ 	return mt7915_mac_check_twt_req(setup);
+ }
+ 
++/* An interval beyond 16 bits takes an exponent; rounded up, the mantissa
++ * goes up wherever the shift dropped a remainder, so the result is never
++ * shorter than asked for; rounded down, never longer.
++ */
++static void mt7915_test_twt_interval_round(struct kunit *test)
++{
++	struct ieee80211_twt_params twt = {};
++	u64 interval = 2 * 65537 + 1;
++	u64 got;
++	u8 exp;
++
++	mt7915_mac_twt_set_interval(&twt, interval, true);
++	exp = le16_get_bits(twt.req_type, IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
++	got = (u64)le16_to_cpu(twt.mantissa) << exp;
++	KUNIT_EXPECT_GE(test, got, interval);
++	KUNIT_EXPECT_LE(test, le16_to_cpu(twt.mantissa), U16_MAX);
++	KUNIT_EXPECT_EQ(test, exp, 2);
++
++	mt7915_mac_twt_set_interval(&twt, interval, false);
++	exp = le16_get_bits(twt.req_type, IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
++	got = (u64)le16_to_cpu(twt.mantissa) << exp;
++	KUNIT_EXPECT_LE(test, got, interval);
++}
++
+ /* A station can't set up an agreement with a zero wake interval, or one
+  * it would spend awake.
+  */
+@@ -2658,6 +2683,65 @@ static void mt7915_test_tx_free_frags(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->rx_event_frags, 1);
+ }
+ 
++/* A v3 MPDU header word that no MSDU follows (the next word names another
++ * station) still counts its transmissions to the station it was for.
++ */
++static void mt7915_test_tx_free_v3_header_alone(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *msta = mt7915_test_sta(test, dev, 9, mvif);
++	struct sk_buff *skb;
++	u32 info[4];
++	__le32 *ev;
++	int id;
++
++	mvif->sta.wcid.idx = 12;
++	rcu_assign_pointer(dev->mt76.wcid[12], &mvif->sta.wcid);
++	id = mt7915_test_token(test, dev, 12, &skb);
++
++	info[0] = MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 9);
++	info[1] = MT_TX_FREE_MPDU_HEADER_V3 |
++		  FIELD_PREP(MT_TX_FREE_COUNT_V3, 3) |
++		  FIELD_PREP(MT_TX_FREE_STAT_V3, 1);
++	info[2] = MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 12);
++	info[3] = id | (MT_TX_FREE_MSDU_ID_V3 << 15);
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 1,
++			       FIELD_PREP(MT_TX_FREE_VER, 4), info, 4);
++
++	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 6 * 4));
++	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb));
++	/* sent 3 times, never acked */
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_retries, 2);
++	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 1);
++	kfree_skb(skb);
++}
++
++/* A band whose PS queue is a ring of its own (not the MT7986's layout):
++ * a tx-free event cleans both of each band's rings.
++ */
++static void mt7915_test_tx_free_psd_ring(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_phy *phy1 = mt7915_test_band1(test, env);
++	struct mt76_queue *psd;
++	u32 info[1] = { MT_TX_FREE_PAIR | FIELD_PREP(MT_TX_FREE_WLAN_ID, 9) };
++	__le32 *ev;
++
++	psd = kunit_kzalloc(test, sizeof(*psd), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, psd);
++	dev->mphy.q_tx[MT_TXQ_PSD] = psd;
++	phy1->mt76->q_tx[MT_TXQ_PSD] = psd;
++	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 0, 0, info, 1);
++
++	mt7915_test_rx_check(dev, ev, 3 * 4);
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 4);
++	dev->mphy.q_tx[MT_TXQ_PSD] = &env->q;
++	phy1->mt76->q_tx[MT_TXQ_PSD] = &env->q;
++}
++
+ /* Version 4 (v3 format) events: two MSDU IDs per word (0x7fff: none) and
+  * MPDU header words that only carry statistics.
+  */
+@@ -5223,6 +5307,31 @@ static void mt7915_test_reset_work_aborted(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, work_pending(&dev->reset_work));
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* An L1 recovery with a WED stops WED first, before the firmware is told
++ * the host's DMA stopped.
++ */
++static void mt7915_test_reset_work_wed_stop(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_test_wed *w;
++
++	mt7915_test_band1(test, env);
++	mt7915_test_rings(test, dev);
++	mt7915_test_block_wq(test, dev);
++	w = mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++	dev->recovery.state = MT_MCU_CMD_STOP_DMA | MT_MCU_CMD_RESET_DONE |
++			      MT_MCU_CMD_WM_WDT;
++
++	mt7915_mac_reset_work(&dev->reset_work);
++	KUNIT_EXPECT_EQ(test, w->n_stop, 1);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_MCU_INT_EVENT),
++			MT_MCU_INT_EVENT_DMA_STOPPED);
++	tasklet_kill(&dev->mt76.irq_tasklet);
++}
++#endif
++
+ /* sets the WDT bit once the driver told the firmware DMA stopped: the
+  * firmware crashes in the middle of the handshake
+  */
+@@ -5899,7 +6008,7 @@ static void mt7915_test_reset_work_no_normal_state(struct kunit *test)
+  * updates; the global entry is set up again, the recovery state cleared,
+  * mac80211 asked to restore its configuration and the watchdog re-armed.
+  */
+-static void mt7915_test_full_reset(struct kunit *test)
++static void __mt7915_test_full_reset(struct kunit *test, u32 wdt)
+ {
+ 	struct mt7915_test_env *env = mt7915_test_hw_env(test);
+ 	struct mt7915_dev *dev = env->dev;
+@@ -5921,13 +6030,16 @@ static void mt7915_test_full_reset(struct kunit *test)
+ 	list_add_tail(&msta->rc_list, &dev->sta_rc_list);
+ 	dev->recovery.hw_init_done = true;
+ 	dev->recovery.restart = true;
+-	dev->recovery.state = MT_MCU_CMD_WM_WDT;
++	dev->recovery.state = wdt;
+ 	dev->mt76.mmio.irqmask = 0;
+ 
+ 	mt7915_mac_reset_work(&dev->reset_work);
+ 
+-	KUNIT_EXPECT_EQ(test, dev->recovery.wm_reset_count, 1);
+-	KUNIT_EXPECT_EQ(test, dev->recovery.wa_reset_count, 0);
++	/* counted for the processor whose watchdog fired */
++	KUNIT_EXPECT_EQ(test, dev->recovery.wm_reset_count,
++			wdt == MT_MCU_CMD_WM_WDT);
++	KUNIT_EXPECT_EQ(test, dev->recovery.wa_reset_count,
++			wdt == MT_MCU_CMD_WA_WDT);
+ 	/* ten attempts, each through the patch semaphore */
+ 	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
+ 			MCU_CMD(PATCH_SEM_CONTROL)), 2 * 10);
+@@ -5960,6 +6072,17 @@ static void mt7915_test_full_reset(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
+ }
+ 
++static void mt7915_test_full_reset(struct kunit *test)
++{
++	__mt7915_test_full_reset(test, MT_MCU_CMD_WM_WDT);
++}
++
++/* the same, after the WA's watchdog fired */
++static void mt7915_test_full_reset_wa(struct kunit *test)
++{
++	__mt7915_test_full_reset(test, MT_MCU_CMD_WA_WDT);
++}
++
+ /* The tx buffers WED sends from on the host's behalf (its token half): one
+  * cut-through 802.3 descriptor each, its single buffer right after the
+  * descriptor and the txp, tagged with the WED's token. The rest of both is
+@@ -6000,6 +6123,7 @@ static void mt7915_test_wed_init_buf(struct kunit *test)
+ static struct kunit_case mt7915_mac_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_wed_init_buf),
+ 	KUNIT_CASE(mt7915_test_twt_interval),
++	KUNIT_CASE(mt7915_test_twt_interval_round),
+ 	KUNIT_CASE(mt7915_test_twt_reset),
+ 	KUNIT_CASE(mt7915_test_cca_reset_register),
+ 	KUNIT_CASE(mt7915_test_tx_free_short_event),
+@@ -6068,6 +6192,8 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_tx_free),
+ 	KUNIT_CASE(mt7915_test_tx_free_frags),
+ 	KUNIT_CASE(mt7915_test_tx_free_v3),
++	KUNIT_CASE(mt7915_test_tx_free_v3_header_alone),
++	KUNIT_CASE(mt7915_test_tx_free_psd_ring),
+ 	KUNIT_CASE(mt7915_test_tx_free_v3_odd),
+ 	KUNIT_CASE(mt7915_test_tx_free_attempts),
+ 	KUNIT_CASE(mt7915_test_tx_free_null),
+@@ -6139,6 +6265,9 @@ static struct kunit_case mt7915_mac_reset_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_wait_reset_state),
+ 	KUNIT_CASE(mt7915_test_reset_work_idle),
+ 	KUNIT_CASE(mt7915_test_reset_work_aborted),
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_test_reset_work_wed_stop),
++#endif
+ 	KUNIT_CASE(mt7915_test_reset_work_dma_reset),
+ 	KUNIT_CASE(mt7915_test_reset_work_crash_late),
+ 	KUNIT_CASE(mt7915_test_mac_restart),
+@@ -6159,6 +6288,7 @@ static struct kunit_case mt7915_mac_hw_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_reset_work_no_recovery_done),
+ 	KUNIT_CASE(mt7915_test_reset_work_no_normal_state),
+ 	KUNIT_CASE(mt7915_test_full_reset),
++	KUNIT_CASE(mt7915_test_full_reset_wa),
+ 	{}
+ };
+ 

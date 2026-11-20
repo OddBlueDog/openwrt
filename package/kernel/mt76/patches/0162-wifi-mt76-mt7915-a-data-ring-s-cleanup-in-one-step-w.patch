@@ -1,0 +1,516 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:56:48 +0000
+Subject: [PATCH] wifi: mt76: mt7915: a data ring's cleanup in one step,
+ without its entries
+
+Every frame mt7915 puts on a band's data ring is one descriptor that its tx token owns (mt7915_tx_prepare_skb()): buf0 is the txwi, which stays mapped; buf1 the header the firmware parses, left mapped for the token to unmap; no skb, the token holds it; no txwi to free (MT_DRV_TXWI_NO_FREE). Yet mt76_dma_add_buf() filled each descriptor's queue entry, and mt76_dma_tx_cleanup() walked the ring entry by entry: copied and cleared each one, found nothing to unmap or free, and took q->lock once per descriptor to step the tail, against the tx worker queueing more under the same lock.
+
+A ring whose frames all have that shape is marked MT_QFLAG_TX_NO_ENTRY; mt7915_init_tx_queues() marks the data rings, not the firmware ones. On such a ring add_buf writes only the descriptors, and the cleanup moves the tail up to the DMA index in one step, under q->lock once, reading the index once. A flush, or an index that can't be read (a dead bus), takes everything back, as the loop did; an index past the head takes back no more than is queued. An empty ring (an idle band, on every tx-free event) takes no lock and reads no index, and one the hardware hasn't moved on takes no q->lock, as with the loop. A raw frame, an skb to unmap and free, is refused on such a ring, and add_buf warns if a frame isn't of that shape. q->entry stays allocated.
+
+KUnit (mt76-dma): mt76_dma_test_tx_no_entry (descriptors written, entries never; the tail to the index; nothing completed through the driver), _wrap (across the ring's end, a full ring in one step), _bad_idx (an index past the head, a dead bus), _flush (the resync, and a second flush of the empty ring). mt7915-dma: only the data rings carry the flag, and the DBDC reset test marks band 1's ring as holding a frame instead of queueing a raw one there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dma.c                   | 105 +++++++++++++++++---
+ mt76.h                  |  11 +++
+ mt7915/dma.c            |   4 +-
+ mt7915/tests/dma-test.c |  18 +++-
+ tests/dma-test.c        | 211 ++++++++++++++++++++++++++++++++++++++++
+ tx.c                    |   3 +-
+ 6 files changed, 335 insertions(+), 17 deletions(-)
+
+diff --git a/dma.c b/dma.c
+index 9d8ab38f..b9ebaacc 100644
+--- a/dma.c
++++ b/dma.c
+@@ -324,12 +324,19 @@ mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
+ 		 struct mt76_queue_buf *buf, int nbufs, u32 info,
+ 		 struct sk_buff *skb, void *txwi)
+ {
++	bool no_entry = mt76_queue_is_tx_no_entry(q);
+ 	struct mt76_queue_entry *entry;
+ 	struct mt76_desc *desc;
+ 	int i, idx = -1;
+ 	u32 ctrl, next;
+ 
+-	if (txwi) {
++	/* nothing a token-tracked queue's cleanup would have to undo */
++	if (no_entry)
++		WARN_ON_ONCE(skb || !txwi ||
++			     !(dev->drv->drv_flags & MT_DRV_TXWI_NO_FREE) ||
++			     (nbufs > 1 && !buf[1].skip_unmap) || nbufs > 2);
++
++	if (txwi && !no_entry) {
+ 		q->entry[q->head].txwi = DMA_DUMMY_DATA;
+ 		q->entry[q->head].skip_buf0 = true;
+ 	}
+@@ -341,30 +348,34 @@ mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
+ 		next = mt76_queue_next(q, q->head);
+ 
+ 		desc = &q->desc[idx];
+-		entry = &q->entry[idx];
++		entry = no_entry ? NULL : &q->entry[idx];
+ 
+-		if (buf[0].skip_unmap)
+-			entry->skip_buf0 = true;
+-		entry->skip_buf1 = i == nbufs - 1;
++		if (entry) {
++			if (buf[0].skip_unmap)
++				entry->skip_buf0 = true;
++			entry->skip_buf1 = i == nbufs - 1;
+ 
+-		entry->dma_addr[0] = buf[0].addr;
+-		entry->dma_len[0] = buf[0].len;
++			entry->dma_addr[0] = buf[0].addr;
++			entry->dma_len[0] = buf[0].len;
++		}
+ 
+ 		ctrl = FIELD_PREP(MT_DMA_CTL_SD_LEN0, buf[0].len);
+ #ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+ 		info |= FIELD_PREP(MT_DMA_CTL_SDP0_H, buf[0].addr >> 32);
+ #endif
+ 		if (i < nbufs - 1) {
+-			entry->dma_addr[1] = buf[1].addr;
+-			entry->dma_len[1] = buf[1].len;
+ 			buf1 = buf[1].addr;
+ 			ctrl |= FIELD_PREP(MT_DMA_CTL_SD_LEN1, buf[1].len);
+ #ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+ 			info |= FIELD_PREP(MT_DMA_CTL_SDP1_H,
+ 					   buf[1].addr >> 32);
+ #endif
+-			if (buf[1].skip_unmap)
+-				entry->skip_buf1 = true;
++			if (entry) {
++				entry->dma_addr[1] = buf[1].addr;
++				entry->dma_len[1] = buf[1].len;
++				if (buf[1].skip_unmap)
++					entry->skip_buf1 = true;
++			}
+ 		}
+ 
+ 		if (i == nbufs - 1)
+@@ -381,9 +392,11 @@ mt76_dma_add_buf(struct mt76_dev *dev, struct mt76_queue *q,
+ 		q->queued++;
+ 	}
+ 
+-	q->entry[idx].txwi = txwi;
+-	q->entry[idx].skb = skb;
+-	q->entry[idx].wcid = 0xffff;
++	if (!no_entry) {
++		q->entry[idx].txwi = txwi;
++		q->entry[idx].skb = skb;
++		q->entry[idx].wcid = 0xffff;
++	}
+ 
+ 	return idx;
+ }
+@@ -419,6 +432,61 @@ mt76_dma_kick_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ 		Q_WRITE(q, cpu_idx, q->head);
+ }
+ 
++/* A token-tracked queue (MT_QFLAG_TX_NO_ENTRY): the descriptors up to the
++ * DMA index are done and hold nothing to undo, so the tail moves there in
++ * one step, under one q->lock. A flush, or a DMA index that can't be read
++ * (a dead bus), takes everything back, as the per-entry loop would.
++ */
++static void
++mt76_dma_tx_cleanup_no_entry(struct mt76_dev *dev, struct mt76_queue *q,
++			     bool flush)
++{
++	int last, done;
++	bool empty;
++
++	/* An empty ring (an idle band, on every tx-free event): no index to
++	 * read, no lock to take. A frame queued meanwhile waits for the next
++	 * cleanup, which its own completion brings; the cleanup that emptied
++	 * the ring has woken tx_wait.
++	 */
++	if (!flush && !READ_ONCE(q->queued))
++		return;
++
++	spin_lock_bh(&q->cleanup_lock);
++	last = flush ? -1 : mt76_dma_read_dma_idx(q, -1);
++	/* the hardware hasn't moved (a dead bus reads -1, never the tail) */
++	if (last == q->tail) {
++		spin_unlock_bh(&q->cleanup_lock);
++		return;
++	}
++
++	spin_lock_bh(&q->lock);
++	if (last < 0) {
++		q->tail = q->head;
++		q->queued = 0;
++	} else if (q->queued > 0) {
++		done = last - q->tail;
++		if (done < 0)
++			done += q->ndesc;
++		/* an index past the head: no more than is queued */
++		done = min(done, q->queued);
++		q->tail += done;
++		if (q->tail >= q->ndesc)
++			q->tail -= q->ndesc;
++		q->queued -= done;
++	}
++	if (flush) {
++		mt76_dma_sync_idx(dev, q);
++		mt76_dma_kick_queue(dev, q);
++	}
++	empty = !q->queued;
++	spin_unlock_bh(&q->lock);
++	spin_unlock_bh(&q->cleanup_lock);
++
++	if (empty)
++		wake_up(&dev->tx_wait);
++}
++
+ static void
+ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ {
+@@ -428,6 +496,11 @@ mt76_dma_tx_cleanup(struct mt76_dev *dev, struct mt76_queue *q, bool flush)
+ 	if (!q || !q->ndesc)
+ 		return;
+ 
++	if (mt76_queue_is_tx_no_entry(q)) {
++		mt76_dma_tx_cleanup_no_entry(dev, q, flush);
++		return;
++	}
++
+ 	spin_lock_bh(&q->cleanup_lock);
+ 	if (flush)
+ 		last = -1;
+@@ -642,6 +715,10 @@ mt76_dma_tx_queue_skb_raw(struct mt76_dev *dev, struct mt76_queue *q,
+ 	if (test_bit(MT76_MCU_RESET, &dev->phy.state))
+ 		goto error;
+ 
++	/* an skb to unmap and free: not on a token-tracked queue */
++	if (WARN_ON_ONCE(mt76_queue_is_tx_no_entry(q)))
++		goto error;
++
+ 	if (q->queued + 1 >= q->ndesc - 1)
+ 		goto error;
+ 
+diff --git a/mt76.h b/mt76.h
+index a693f709..3b91d5ab 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -51,6 +51,12 @@
+ #define MT_QFLAG_WED_RRO_EN	BIT(7)
+ #define MT_QFLAG_EMI_EN		BIT(8)
+ #define MT_QFLAG_NPU		BIT(9)
++/* A tx queue whose frames the driver tracks by token: every descriptor's
++ * buffers stay mapped (the txwi, the header the firmware parses) and no skb
++ * or txwi is freed with it, so its entries are never written or read and
++ * its cleanup just moves the tail up to the DMA index.
++ */
++#define MT_QFLAG_TX_NO_ENTRY	BIT(10)
+ 
+ #define __MT_WED_Q(_type, _n)	(MT_QFLAG_WED | \
+ 				 FIELD_PREP(MT_QFLAG_WED_TYPE, _type) | \
+@@ -2129,6 +2135,11 @@ static inline bool mt76_queue_is_npu(struct mt76_queue *q)
+ 	return q->flags & MT_QFLAG_NPU;
+ }
+ 
++static inline bool mt76_queue_is_tx_no_entry(struct mt76_queue *q)
++{
++	return q->flags & MT_QFLAG_TX_NO_ENTRY;
++}
++
+ /* The ring index after @idx: a compare, not a division by a ring size that
+  * isn't a power of two everywhere (1536-entry rx rings)
+  */
+diff --git a/mt7915/dma.c b/mt7915/dma.c
+index 529899cc..cd0a1fa9 100644
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -21,8 +21,10 @@ mt7915_init_tx_queues(struct mt7915_phy *phy, int idx, int n_desc, int ring_base
+ 		wed = &dev->mt76.mmio.wed;
+ 	}
+ 
++	/* every frame is one descriptor the token owns (mt7915_tx_prepare_skb()) */
+ 	return mt76_connac_init_tx_queues(phy->mt76, idx, n_desc, ring_base,
+-					  wed, MT_WED_Q_TX(idx));
++					  wed, MT_WED_Q_TX(idx) |
++					  MT_QFLAG_TX_NO_ENTRY);
+ }
+ 
+ static int mt7915_poll_tx(struct napi_struct *napi, int budget)
+diff --git a/mt7915/tests/dma-test.c b/mt7915/tests/dma-test.c
+index 2415467a..2b99a938 100644
+--- a/mt7915/tests/dma-test.c
++++ b/mt7915/tests/dma-test.c
+@@ -645,6 +645,16 @@ static void mt7915_dma_test_lifecycle(struct kunit *test)
+ 	/* every access category shares band 0's data ring */
+ 	for (i = 0; i <= MT_TXQ_PSD; i++)
+ 		KUNIT_EXPECT_PTR_EQ(test, dev->mphy.q_tx[i], q);
++	/* its frames are the tokens' (one descriptor each, nothing to unmap
++	 * or free from the ring); the firmware rings' frames are the ring's
++	 */
++	KUNIT_EXPECT_TRUE(test, mt76_queue_is_tx_no_entry(q));
++	KUNIT_EXPECT_FALSE(test,
++			   mt76_queue_is_tx_no_entry(mdev->q_mcu[MT_MCUQ_FWDL]));
++	KUNIT_EXPECT_FALSE(test,
++			   mt76_queue_is_tx_no_entry(mdev->q_mcu[MT_MCUQ_WM]));
++	KUNIT_EXPECT_FALSE(test,
++			   mt76_queue_is_tx_no_entry(mdev->q_mcu[MT_MCUQ_WA]));
+ 
+ 	mt7915_dma_test_expect_ring(test, dev, mdev->q_mcu[MT_MCUQ_FWDL],
+ 				    MT7915_DMA_TEST_TX_RING(16),
+@@ -767,7 +777,13 @@ static void mt7915_dma_test_dbdc_reset(struct kunit *test)
+ 	KUNIT_EXPECT_PTR_NE(test, dev->mphy.q_tx[MT_TXQ_BE], tx1);
+ 
+ 	mt7915_dma_test_queue_raw(test, dev, mcu);
+-	mt7915_dma_test_queue_raw(test, dev, tx1);
++	/* a data frame on band 1's ring, as far as the ring knows: one
++	 * descriptor its token owns (a raw frame isn't taken there)
++	 */
++	spin_lock_bh(&tx1->lock);
++	tx1->head = 1;
++	tx1->queued = 1;
++	spin_unlock_bh(&tx1->lock);
+ 	writel(100, &rx->regs->dma_idx);
+ 	mt7915_dma_test_log.n_rst = 0;
+ 
+diff --git a/tests/dma-test.c b/tests/dma-test.c
+index d5038ce9..fbefb96c 100644
+--- a/tests/dma-test.c
++++ b/tests/dma-test.c
+@@ -1371,6 +1371,213 @@ static void mt76_dma_test_tx_cleanup_no_free(struct kunit *test)
+ 	local_bh_enable();
+ }
+ 
++/* --- token-tracked tx queues (MT_QFLAG_TX_NO_ENTRY) ----------------------- */
++
++/* A tx queue of @ndesc descriptors whose frames are the driver's tokens' */
++static struct mt76_queue *
++mt76_dma_test_token_queue(struct mt76_dma_test *t, int ndesc)
++{
++	struct mt76_queue *q = mt76_dma_test_tx_queue(t, 0, ndesc);
++
++	q->flags |= MT_QFLAG_TX_NO_ENTRY;
++	return q;
++}
++
++/* @n frames as the mt7915 queues them: one descriptor each, the txwi in
++ * buf0 and the header the firmware parses in buf1, both left mapped
++ */
++static void mt76_dma_test_token_frames(struct mt76_dma_test *t,
++				       struct mt76_queue *q, int n)
++{
++	static u8 txwi;
++	int i;
++
++	for (i = 0; i < n; i++) {
++		struct mt76_queue_buf buf[2] = {
++			{ .addr = 0x10000 + i * 0x100, .len = 32 },
++			{ .addr = 0x20000 + i * 0x100, .len = 72,
++			  .skip_unmap = true },
++		};
++		int idx;
++
++		spin_lock_bh(&q->lock);
++		idx = mt76_dma_add_buf(t->dev, q, buf, 2, 0, NULL, &txwi);
++		spin_unlock_bh(&q->lock);
++		KUNIT_ASSERT_GE(t->test, idx, 0);
++	}
++	t->dev->queue_ops->kick(t->dev, q);
++}
++
++/* The queue's entries are as allocated: never written */
++static bool mt76_dma_test_entries_clear(struct mt76_queue *q)
++{
++	return !memchr_inv(q->entry, 0, q->ndesc * sizeof(*q->entry));
++}
++
++/* Frames go out as one descriptor each, without touching the entries;
++ * cleanup moves the tail to the DMA index in one step and completes
++ * nothing through the driver (its tokens do that).
++ */
++static void mt76_dma_test_tx_no_entry(struct kunit *test)
++{
++	struct mt76_dma_test *t;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	struct mt76_dev *dev;
++	u32 ctrl;
++
++	t = mt76_dma_test_init(test, &mt76_dma_test_drv_no_free);
++	dev = t->dev;
++	q = mt76_dma_test_token_queue(t, 8);
++	regs = mt76_dma_test_qregs(q);
++	mt76_dma_test_token_frames(t, q, 3);
++
++	KUNIT_EXPECT_EQ(test, q->head, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 3);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 3);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[1].buf0), 0x10100);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(q->desc[1].buf1), 0x20100);
++	ctrl = le32_to_cpu(q->desc[1].ctrl);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN0, ctrl), 32);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_DMA_CTL_SD_LEN1, ctrl), 72);
++	KUNIT_EXPECT_TRUE(test, ctrl & MT_DMA_CTL_LAST_SEC1);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_entries_clear(q));
++
++	/* nothing done yet */
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->queued, 3);
++	KUNIT_EXPECT_EQ(test, q->tail, 0);
++
++	regs->dma_idx = 2;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->tail, 2);
++	KUNIT_EXPECT_EQ(test, q->queued, 1);
++
++	regs->dma_idx = 3;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->tail, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	/* the tokens' frames: nothing for the ring to complete */
++	KUNIT_EXPECT_EQ(test, t->n_done, 0);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_entries_clear(q));
++}
++
++/* Across the ring's end: the DMA index behind the tail is a wrap, not a
++ * step back.
++ */
++static void mt76_dma_test_tx_no_entry_wrap(struct kunit *test)
++{
++	struct mt76_dma_test *t;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	struct mt76_dev *dev;
++
++	t = mt76_dma_test_init(test, &mt76_dma_test_drv_no_free);
++	dev = t->dev;
++	q = mt76_dma_test_token_queue(t, 8);
++	regs = mt76_dma_test_qregs(q);
++
++	mt76_dma_test_token_frames(t, q, 6);
++	regs->dma_idx = 6;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++
++	/* slots 6, 7, 0, 1, 2 */
++	mt76_dma_test_token_frames(t, q, 5);
++	KUNIT_EXPECT_EQ(test, q->head, 3);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 3);
++
++	regs->dma_idx = 1;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_EQ(test, q->queued, 2);
++
++	regs->dma_idx = 3;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->tail, 3);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++
++	/* a full ring (ndesc - 1 frames) drains in one step */
++	mt76_dma_test_token_frames(t, q, 7);
++	KUNIT_EXPECT_EQ(test, q->head, 2);
++	regs->dma_idx = 2;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->tail, 2);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_TRUE(test, mt76_dma_test_entries_clear(q));
++}
++
++/* A DMA index past the head takes back no more than is queued; one that
++ * can't be read (a dead bus) takes back everything, as the per-entry
++ * cleanup does, and keeps the indices in range.
++ */
++static void mt76_dma_test_tx_no_entry_bad_idx(struct kunit *test)
++{
++	struct mt76_dma_test *t;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	struct mt76_dev *dev;
++
++	t = mt76_dma_test_init(test, &mt76_dma_test_drv_no_free);
++	dev = t->dev;
++	q = mt76_dma_test_token_queue(t, 8);
++	regs = mt76_dma_test_qregs(q);
++
++	mt76_dma_test_token_frames(t, q, 2);
++	regs->dma_idx = 5;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 2);
++	KUNIT_EXPECT_EQ(test, q->tail, q->head);
++
++	/* nothing queued: the index is ignored */
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->tail, 2);
++
++	mt76_dma_test_token_frames(t, q, 3);
++	regs->dma_idx = 0xffffffff;
++	dev->queue_ops->tx_cleanup(dev, q, false);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->tail, 5);
++	KUNIT_EXPECT_EQ(test, q->tail, q->head);
++	KUNIT_EXPECT_LT(test, (int)q->tail, q->ndesc);
++	regs->dma_idx = 5;
++}
++
++/* A flush takes everything back and resyncs the ring to the hardware, as
++ * on any other queue.
++ */
++static void mt76_dma_test_tx_no_entry_flush(struct kunit *test)
++{
++	struct mt76_dma_test *t;
++	struct mt76_queue_regs *regs;
++	struct mt76_queue *q;
++	struct mt76_dev *dev;
++
++	t = mt76_dma_test_init(test, &mt76_dma_test_drv_no_free);
++	dev = t->dev;
++	q = mt76_dma_test_token_queue(t, 8);
++	regs = mt76_dma_test_qregs(q);
++	mt76_dma_test_token_frames(t, q, 3);
++	regs->dma_idx = 1;
++	regs->ring_size = 0;
++
++	dev->queue_ops->tx_cleanup(dev, q, true);
++
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->head, 1);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++	KUNIT_EXPECT_EQ(test, regs->cpu_idx, 1);
++	KUNIT_EXPECT_EQ(test, regs->ring_size, 8);
++	KUNIT_EXPECT_EQ(test, t->n_done, 0);
++
++	/* again on the empty ring: nothing changes */
++	dev->queue_ops->tx_cleanup(dev, q, true);
++	KUNIT_EXPECT_EQ(test, q->queued, 0);
++	KUNIT_EXPECT_EQ(test, q->head, 1);
++	KUNIT_EXPECT_EQ(test, q->tail, 1);
++}
++
+ /* Cleaning up a missing or unallocated queue does nothing. */
+ static void mt76_dma_test_tx_cleanup_no_queue(struct kunit *test)
+ {
+@@ -2326,6 +2533,10 @@ static struct kunit_case mt76_dma_test_cases[] = {
+ 	KUNIT_CASE(mt76_dma_test_tx_cleanup_flush),
+ 	KUNIT_CASE(mt76_dma_test_tx_cleanup_dead_bus),
+ 	KUNIT_CASE(mt76_dma_test_tx_cleanup_no_free),
++	KUNIT_CASE(mt76_dma_test_tx_no_entry),
++	KUNIT_CASE(mt76_dma_test_tx_no_entry_wrap),
++	KUNIT_CASE(mt76_dma_test_tx_no_entry_bad_idx),
++	KUNIT_CASE(mt76_dma_test_tx_no_entry_flush),
+ 	KUNIT_CASE(mt76_dma_test_tx_cleanup_no_queue),
+ 	{}
+ };
+diff --git a/tx.c b/tx.c
+index 3f097e5c..174068c9 100644
+--- a/tx.c
++++ b/tx.c
+@@ -364,7 +364,8 @@ __mt76_tx_queue_skb(struct mt76_phy *phy, int qid, struct sk_buff *skb,
+ 	if (idx < 0 || !sta)
+ 		return idx;
+ 
+-	q->entry[idx].wcid = wcid->idx;
++	if (!mt76_queue_is_tx_no_entry(q))
++		q->entry[idx].wcid = wcid->idx;
+ 
+ 	if (!non_aql)
+ 		return idx;

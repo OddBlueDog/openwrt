@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:34:48 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: WDS wcid move, polled removal,
+ refused spatial reuse
+
+- mt7915_main_test_wed_4addr_mt7915: with WED on the MT7915, a station
+  switching to four-address mode moves to a wcid of WED's WDS range: the
+  firmware gets it there (rate control too), the new wcid is published,
+  the old one unpublished after a grace period, freed and disconnected.
+  Once there it stays; with the range full it stays where it was.
+- mt7915_main_test_sta_remove_polled: a station removed while queued for
+  a statistics poll comes off the list.
+- mt7915_main_test_spr_apply_refused: spatial reuse over the radio's
+  running HE interfaces (wiphy lock held); a refusal is reported and
+  returned.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/main-test.c | 126 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 126 insertions(+)
+
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index f4c22f1e..f5bb34d4 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -3035,6 +3035,127 @@ static void mt7915_main_test_twt_lost(struct kunit *test)
+ }
+ #endif
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* Four-address mode with a WED on the MT7915: WED only reaches WDS
++ * stations by a wcid of its own range, so the station moves there: the
++ * firmware gets it on the new wcid (rate control too), the new one is
++ * published, and only after a grace period is the old one unpublished,
++ * freed and disconnected in the firmware. Once there, it stays; with the
++ * range full, it stays where it was.
++ */
++static void mt7915_main_test_wed_4addr_mt7915(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct sta_rec_basic *basic;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	struct mt76_test_msg *msg;
++	u32 rev = dev->mt76.rev;
++	u16 old, idx;
++	int i;
++
++	vif = mt7915_main_test_ap(test, hw2, 1);
++	sta = mt7915_main_test_add_sta(test, hw2, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	old = msta->wcid.idx;
++	mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++	dev->mt76.rev = 0x79150000;
++	mt7915_main_test_clear(fake);
++
++	MT7915_MAIN_TEST_OP(sta_set_4addr)(hw2, vif, sta, true);
++	idx = msta->wcid.idx;
++	KUNIT_EXPECT_GE(test, idx, MT76_WED_WDS_MIN);
++	KUNIT_EXPECT_LT(test, idx, MT76_WED_WDS_MAX);
++	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(dev->mt76.wcid[idx]),
++			    &msta->wcid);
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(dev->mt76.wcid[old]));
++	KUNIT_EXPECT_FALSE(test, dev->mt76.wcid_mask[old / 32] & BIT(old % 32));
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(STA_REC_UPDATE)), 3);
++	msg = mt76_test_msg(fake, 0);
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_EQ(test, msg->data[1], (u8)idx);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(STA_REC_UPDATE));
++	KUNIT_EXPECT_EQ(test, msg->data[1], (u8)old);
++	basic = mt7915_main_test_tlv(msg, STA_REC_BASIC);
++	KUNIT_ASSERT_NOT_NULL(test, basic);
++	KUNIT_EXPECT_EQ(test, basic->conn_state, CONN_STATE_DISCONNECT);
++
++	/* already a WDS wcid */
++	mt7915_main_test_clear(fake);
++	MT7915_MAIN_TEST_OP(sta_set_4addr)(hw2, vif, sta, true);
++	KUNIT_EXPECT_EQ(test, msta->wcid.idx, idx);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(STA_REC_UPDATE)), 0);
++
++	/* the range full: another station stays where it is */
++	sta = mt7915_main_test_add_sta(test, hw2, vif, 2);
++	old = mt7915_main_test_msta(sta)->wcid.idx;
++	for (i = MT76_WED_WDS_MIN; i < MT76_WED_WDS_MAX; i++)
++		dev->mt76.wcid_mask[i / 32] |= BIT(i % 32);
++	MT7915_MAIN_TEST_OP(sta_set_4addr)(hw2, vif, sta, true);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_msta(sta)->wcid.idx, old);
++	dev->mt76.rev = rev;
++}
++#endif
++
++/* A station removed while still queued for a statistics poll comes off
++ * the poll list (it would be polled after it is freed otherwise).
++ */
++static void mt7915_main_test_sta_remove_polled(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	sta = mt7915_main_test_add_sta(test, hw, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	mt7915_main_test_add_poll(dev, &msta->wcid);
++
++	mt7915_mac_sta_remove(&dev->mt76, vif, sta);
++	KUNIT_EXPECT_TRUE(test, list_empty(&msta->wcid.poll_list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->mt76.sta_poll_list));
++}
++
++#ifdef MT7915_MAIN_TEST_SDATA
++/* Spatial reuse applied to every running HE interface of the radio (under
++ * the wiphy lock): a firmware that refuses it is reported, and the error
++ * returned.
++ */
++static void mt7915_main_test_spr_apply_refused(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	int ret;
++
++	vif = mt7915_main_test_sdata_ap(test, hw, 1);
++	vif->bss_conf.he_support = true;
++	mt7915_main_test_sdata_up(test, vif);
++	mt7915_main_test_clear(fake);
++
++	wiphy_lock(hw->wiphy);
++	ret = mt7915_spr_apply(mt7915_hw_phy(hw));
++	wiphy_unlock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_GE(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(SET_SPR)), 1);
++
++	mt7915_main_test_fail_at(fake, 1, -EIO);
++	wiphy_lock(hw->wiphy);
++	ret = mt7915_spr_apply(mt7915_hw_phy(hw));
++	wiphy_unlock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, ret, -EIO);
++}
++#endif
++
+ /* After a full reset and before mac80211's restart has started the band
+  * again, a new station is refused (mac80211 re-adds the ones it has);
+  * once mt7915_start() runs, stations are added again. The other band
+@@ -4858,7 +4979,12 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ #endif
+ 	KUNIT_CASE(mt7915_main_test_inband_discov),
+ 	KUNIT_CASE(mt7915_main_test_bss_info_sta),
++	KUNIT_CASE(mt7915_main_test_spr_apply_refused),
++#endif
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_main_test_wed_4addr_mt7915),
+ #endif
++	KUNIT_CASE(mt7915_main_test_sta_remove_polled),
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	KUNIT_CASE(mt7915_main_test_wed_sta_add),
+ 	KUNIT_CASE(mt7915_main_test_wed_set_4addr),

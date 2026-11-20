@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:54:48 +0000
+Subject: [PATCH] wifi: mt76: tests: the default EEPROM file,
+ mt76_wake_tx_queue(), agg_ssn
+
+- mt7915_eeprom_test_load_default_file: the A-die's default EEPROM from
+  /lib/firmware is copied in whole and counts as flash; a short or an
+  empty file is refused, nothing copied.
+- mt76_psim_test_wake_tx_queue: mac80211's wake_tx_queue schedules the tx
+  worker (called out of line: the simulation's calls are inlined, and
+  gcov counted none of them).
+- mt76_psim_test_agg_ssn: mt76_tx_check_agg_ssn() (mt76x02's) tracks the
+  next sequence number of an aggregating TID's QoS data only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/eeprom-test.c | 40 ++++++++++++++++++++++++
+ tests/ps-sim-test.c        | 64 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 104 insertions(+)
+
+diff --git a/mt7915/tests/eeprom-test.c b/mt7915/tests/eeprom-test.c
+index ab90c254..753b07f6 100644
+--- a/mt7915/tests/eeprom-test.c
++++ b/mt7915/tests/eeprom-test.c
+@@ -15,6 +15,7 @@
+ #include <linux/of.h>
+ #include "../mcu.h"
+ #include "fake.h"
++#include "fw-files.h"
+ 
+ /* MT_CONNINFRA_SKU_DEC_ADDR, where the A-die SKU lives, in the window */
+ #define MT7915_EEPROM_TEST_SKU	(MT_CONNINFRA_SKU_DEC_ADDR - MT_INFRA_BASE)
+@@ -210,6 +211,44 @@ static void mt7915_eeprom_test_load_default(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, eep[0], 0x5a);
+ }
+ 
++/* The default EEPROM for the A-die (the GL-MT6000's one MT7976 doing both
++ * bands) from /lib/firmware: copied in whole, as if from flash. A file
++ * shorter than the EEPROM, or an empty one, is refused and nothing copied.
++ */
++static void mt7915_eeprom_test_load_default_file(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	int size = mt7915_eeprom_size(dev);
++	u8 *eep = mt7915_eeprom_test_buf(test, dev, 0x5a);
++	u8 *bin;
++	int i;
++
++	mt76_test_set_reg(mt76_test_fake, MT7915_EEPROM_TEST_SKU,
++			  MT7976_ONE_ADIE_DBDC);
++	mt7915_replay_test_mkdir(test, "/lib/firmware/mediatek");
++	bin = kunit_kmalloc(test, size + 16, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, bin);
++	for (i = 0; i < size + 16; i++)
++		bin[i] = i * 7;
++
++	mt7915_replay_test_write(test, MT7986_EEPROM_MT7976_DEFAULT_DBDC, bin,
++				 size - 1);
++	KUNIT_EXPECT_EQ(test, mt7915_eeprom_load_default(dev), -EINVAL);
++	KUNIT_EXPECT_EQ(test, eep[0], 0x5a);
++	KUNIT_EXPECT_FALSE(test, dev->flash_mode);
++
++	mt7915_replay_test_write(test, MT7986_EEPROM_MT7976_DEFAULT_DBDC, bin, 0);
++	KUNIT_EXPECT_LT(test, mt7915_eeprom_load_default(dev), 0);
++	KUNIT_EXPECT_FALSE(test, dev->flash_mode);
++
++	/* longer than the EEPROM is fine: what it needs is taken */
++	mt7915_replay_test_write(test, MT7986_EEPROM_MT7976_DEFAULT_DBDC, bin,
++				 size + 16);
++	KUNIT_EXPECT_EQ(test, mt7915_eeprom_load_default(dev), 0);
++	KUNIT_EXPECT_MEMEQ(test, eep, bin, size);
++	KUNIT_EXPECT_TRUE(test, dev->flash_mode);
++}
++
+ /* Without an EEPROM in the device tree it is read from efuse: the free
+  * block count first, then every 16-byte block in order.
+  */
+@@ -712,6 +751,7 @@ static struct kunit_case mt7915_eeprom_test_cases[] = {
+ 	KUNIT_CASE(mt7915_eeprom_test_check),
+ 	KUNIT_CASE(mt7915_eeprom_test_name),
+ 	KUNIT_CASE(mt7915_eeprom_test_load_default),
++	KUNIT_CASE(mt7915_eeprom_test_load_default_file),
+ 	KUNIT_CASE(mt7915_eeprom_test_load_efuse),
+ 	KUNIT_CASE(mt7915_eeprom_test_load_efuse_errors),
+ 	KUNIT_CASE(mt7915_eeprom_test_load_dt),
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index 7ad7dba0..b056593e 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -2732,6 +2732,68 @@ static void mt76_psim_test_release_pending(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, mt76_ps_tids_pending(sta, 0));
+ }
+ 
++/* What mac80211 calls when a txq gets frames: the tx worker is scheduled
++ * (it runs only when something schedules it here).
++ */
++static void mt76_psim_test_wake_tx_queue(struct kunit *test)
++{
++	void (*wake)(struct ieee80211_hw *hw, struct ieee80211_txq *txq) =
++		mt76_wake_tx_queue;
++	struct psim *s = psim_release_init(test);
++	struct mt76_dev *dev = s->dev;
++
++	/* out of line, as mac80211's ops call it */
++	OPTIMIZER_HIDE_VAR(wake);
++	clear_bit(MT76_WORKER_SCHEDULED, &dev->tx_worker.state);
++	wake(s->hw, s->sta[0].si->sta.txq[0]);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_WORKER_SCHEDULED,
++					 &dev->tx_worker.state));
++}
++
++/* The next sequence number to expect after an aggregated QoS data frame,
++ * for the drivers that track it (mt76x02): kept per TID, and only for a
++ * TID that aggregates and a frame that carries data.
++ */
++static void mt76_psim_test_agg_ssn(struct kunit *test)
++{
++	void (*check)(struct ieee80211_sta *sta, struct sk_buff *skb) =
++		mt76_tx_check_agg_ssn;
++	struct psim *s = psim_release_init(test);
++	struct ieee80211_sta *sta = &s->sta[0].si->sta;
++	struct mt76_txq *mtxq = (struct mt76_txq *)sta->txq[5]->drv_priv;
++	struct ieee80211_qos_hdr *hdr;
++	struct sk_buff *skb;
++
++	OPTIMIZER_HIDE_VAR(check);
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	hdr = skb_put_zero(skb, sizeof(*hdr));
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 IEEE80211_STYPE_QOS_DATA);
++	hdr->seq_ctrl = cpu_to_le16(0x120);
++	skb->priority = 5;
++
++	check(sta, skb);
++	KUNIT_EXPECT_EQ(test, mtxq->agg_ssn, 0);
++
++	mtxq->aggr = true;
++	check(sta, skb);
++	KUNIT_EXPECT_EQ(test, mtxq->agg_ssn, 0x130);
++
++	/* not data, not QoS, or no station: nothing */
++	mtxq->agg_ssn = 0;
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 IEEE80211_STYPE_QOS_NULLFUNC);
++	check(sta, skb);
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 IEEE80211_STYPE_DATA);
++	check(sta, skb);
++	check(NULL, skb);
++	KUNIT_EXPECT_EQ(test, mtxq->agg_ssn, 0);
++	mtxq->aggr = false;
++	kfree_skb(skb);
++}
++
+ /* The silent hold's work on the kernel's clock (the other tests run it on
+  * theirs): armed, it runs on the device's workqueue, a later deadline
+  * doesn't push it back, and with nobody held it doesn't arm itself again.
+@@ -2775,6 +2837,8 @@ static struct kunit_case mt76_psim_test_cases[] = {
+ 	KUNIT_CASE(mt76_psim_test_silent_on),
+ 	KUNIT_CASE(mt76_psim_test_release),
+ 	KUNIT_CASE(mt76_psim_test_release_pending),
++	KUNIT_CASE(mt76_psim_test_wake_tx_queue),
++	KUNIT_CASE(mt76_psim_test_agg_ssn),
+ 	KUNIT_CASE(mt76_psim_test_silent_work),
+ 	{}
+ };

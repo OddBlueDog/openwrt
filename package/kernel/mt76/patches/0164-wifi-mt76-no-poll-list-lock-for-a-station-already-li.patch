@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:56:48 +0000
+Subject: [PATCH] wifi: mt76: no poll-list lock for a station already listed
+
+Every received unicast frame, and every tx-free event and TX status naming a station, calls mt76_wcid_add_poll(), which took sta_poll_lock to find, nearly every time, the station already on the poll list. It returns before the lock now when the station is listed: the poll that takes it off the list reads its counters after that, so it covers this frame too. A CPU that sees the station listed just as a poll on another one takes it off leaves it for the next frame to list again; the counters are cumulative, so the poll after that catches up.
+
+KUnit (mt76-core-sta): mt76_test_wcid_add_poll_in_poll: a station a running poll has taken off the device's list, but not read yet, stays on the poll's list, and is listed again once read.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mac80211.c        |  8 ++++++++
+ tests/core-test.c | 37 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index 8e161d85..be4d0560 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1958,6 +1958,14 @@ void mt76_wcid_add_poll(struct mt76_dev *dev, struct mt76_wcid *wcid)
+ 	if (test_bit(MT76_MCU_RESET, &dev->phy.state) || !wcid->sta)
+ 		return;
+ 
++	/* Already listed (every rx frame of a busy station asks): the poll
++	 * that takes it off the list reads its counters after that, so it
++	 * covers this frame too. Seen listed just as a poll took it off on
++	 * another CPU, the next frame lists it again: the counters add up.
++	 */
++	if (!list_empty(&wcid->poll_list))
++		return;
++
+ 	spin_lock_bh(&dev->sta_poll_lock);
+ 	if (list_empty(&wcid->poll_list))
+ 		list_add_tail(&wcid->poll_list, &dev->sta_poll_list);
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 0084b714..5008535e 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -3251,6 +3251,42 @@ static void mt76_test_wcid_add_poll(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->sta_poll_list), 2);
+ }
+ 
++/* A station a running poll has taken (spliced onto its own list, not yet
++ * read) stays there: that poll reads its counters later, so it covers the
++ * frame asking too. Once the poll has read it, the next frame lists it
++ * again.
++ */
++static void mt76_test_wcid_add_poll_in_poll(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	LIST_HEAD(polling);
++	struct mt76_wcid *a;
++
++	a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, a);
++	mt76_wcid_init(a, MT_BAND0);
++	a->sta = 1;
++	mt76_wcid_add_poll(dev, a);
++
++	spin_lock_bh(&dev->sta_poll_lock);
++	list_splice_init(&dev->sta_poll_list, &polling);
++	spin_unlock_bh(&dev->sta_poll_lock);
++
++	mt76_wcid_add_poll(dev, a);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->sta_poll_list));
++	KUNIT_EXPECT_PTR_EQ(test, list_first_entry(&polling, struct mt76_wcid,
++						   poll_list), a);
++
++	spin_lock_bh(&dev->sta_poll_lock);
++	list_del_init(&a->poll_list);
++	spin_unlock_bh(&dev->sta_poll_lock);
++
++	mt76_wcid_add_poll(dev, a);
++	KUNIT_EXPECT_EQ(test, list_count_nodes(&dev->sta_poll_list), 1);
++	KUNIT_EXPECT_TRUE(test, list_empty(&polling));
++	mt76_wcid_cleanup(dev, a);
++}
++
+ /* A full reset forgets every station: wcids unpublished and cleaned up,
+  * all allocation masks and lists empty, the phys' station counts and
+  * channel contexts cleared. A station's wcid can be polled again after.
+@@ -3663,6 +3699,7 @@ static struct kunit_case mt76_core_sta_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_sta_state_no_phy),
+ 	KUNIT_CASE(mt76_test_wcid_cleanup),
+ 	KUNIT_CASE(mt76_test_wcid_add_poll),
++	KUNIT_CASE(mt76_test_wcid_add_poll_in_poll),
+ 	KUNIT_CASE(mt76_test_reset_device),
+ 	KUNIT_CASE(mt76_test_reset_device_hw_ps),
+ 	KUNIT_CASE(mt76_test_reset_device_unpublished),

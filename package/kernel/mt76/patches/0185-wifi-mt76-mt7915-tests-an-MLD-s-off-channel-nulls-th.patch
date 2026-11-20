@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:11:30 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: an MLD's off-channel nulls, the rx
+ side's power save checks
+
+- mt7915_main_test_offchannel_mld: a station interface of an MLD tells
+  its AP on each link on the radio going off or on channel (the frame
+  names the link), and starts that link's beacon monitoring over; a link
+  on the other radio is left alone.
+- mt7915_main_test_rx_check_ps: with MT_WCID_FLAG_CHECK_PS (mt76x02's;
+  mt7915's firmware tracks power save itself), a PS-Poll the driver
+  couldn't match is matched by address and answered by mac80211, a QoS
+  null with PM set triggers U-APSD and moves the station into power
+  save, a null without PM out of it, and hearing it ends a silent hold.
+
+main-test.c purges a mac80211 station's queues before freeing it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/main-test.c | 173 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 173 insertions(+)
+
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index f5bb34d4..48ddadb7 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -440,6 +440,7 @@ static void mt7915_main_test_si_free(void *data)
+ 	mt76_sta_state(t->hw, t->vif, &si->sta, IEEE80211_STA_NONE,
+ 		       IEEE80211_STA_NOTEXIST);
+ 	wiphy_lock(local->hw.wiphy);
++	ieee80211_purge_sta_txqs(si);
+ 	sta_info_free(local, si);
+ 	wiphy_unlock(local->hw.wiphy);
+ }
+@@ -2852,6 +2853,176 @@ static void mt7915_main_test_offchannel_nullfunc(struct kunit *test)
+ 	mt76_worker_enable(&dev->mt76.tx_worker);
+ }
+ 
++/* A station interface of an MLD: each of its links on the radio going
++ * off and on channel tells its AP, on that link (the frame says which);
++ * back on channel, its beacon monitoring starts over. A link on another
++ * radio is left alone.
++ */
++static void mt7915_main_test_offchannel_mld(struct kunit *test)
++{
++	static const u8 ap[ETH_ALEN] = { 0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x03 };
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_main_test_ctx *ctx0, *ctx1;
++	struct mt76_vif_link *mlink0, *mlink1;
++	struct ieee80211_tx_info *info;
++	struct mt76_vif_data *mvd;
++	struct ieee80211_vif *vif;
++	struct mt76_wcid *wcid;
++	struct sta_info *si;
++	struct sk_buff *skb;
++
++	vif = mt7915_main_test_sdata(test, hw, NL80211_IFTYPE_STATION, 1);
++	memcpy(vif->cfg.ap_addr, ap, ETH_ALEN);
++	vif->bss_conf.bssid = vif->cfg.ap_addr;
++	vif->cfg.assoc = true;
++	mt7915_main_test_sdata_up(test, vif);
++	si = mt7915_main_test_mac80211_sta(test, hw, vif, ap);
++	set_bit(WLAN_STA_AUTH, &si->_flags);
++	set_bit(WLAN_STA_ASSOC, &si->_flags);
++	wcid = (struct mt76_wcid *)si->sta.drv_priv;
++	wcid->tx_info |= MT_WCID_TX_INFO_SET;
++
++	ctx0 = kunit_kzalloc(test, sizeof(*ctx0), GFP_KERNEL);
++	ctx1 = kunit_kzalloc(test, sizeof(*ctx1), GFP_KERNEL);
++	mvd = kunit_kzalloc(test, sizeof(*mvd), GFP_KERNEL);
++	mlink1 = kunit_kzalloc(test, sizeof(*mlink1), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ctx0);
++	KUNIT_ASSERT_NOT_NULL(test, ctx1);
++	KUNIT_ASSERT_NOT_NULL(test, mvd);
++	KUNIT_ASSERT_NOT_NULL(test, mlink1);
++	ctx0->mctx.phy = &dev->mphy;
++	ctx1->mctx.phy = mt7915_ext_phy(dev)->mt76;
++	mlink0 = &mt7915_main_test_mvif(vif)->mt76;
++	mlink0->mvif = mvd;
++	mlink0->ctx = &ctx0->conf;
++	mlink0->beacon_mon_interval = 100;
++	mlink0->beacon_mon_last = 0;
++	mlink1->ctx = &ctx1->conf;
++	mlink1->beacon_mon_interval = 100;
++	rcu_assign_pointer(mvd->link[1], mlink1);
++	vif->valid_links = BIT(0) | BIT(1);
++	dev->mphy.main_chandef = dev->mphy.chandef;
++	mt76_worker_disable(&dev->mt76.tx_worker);
++
++	mt76_offchannel_notify(&dev->mphy, false);
++	skb = mt7915_main_test_next_tx(wcid);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	info = IEEE80211_SKB_CB(skb);
++	KUNIT_EXPECT_EQ(test, u32_get_bits(info->control.flags,
++			IEEE80211_TX_CTRL_MLO_LINK), 0);
++	KUNIT_EXPECT_FALSE(test, ieee80211_has_pm(
++			   ((struct ieee80211_hdr *)skb->data)->frame_control));
++	kfree_skb(skb);
++	KUNIT_EXPECT_NE(test, mlink0->beacon_mon_last, 0);
++	KUNIT_EXPECT_EQ(test, mlink1->beacon_mon_last, 0);
++	KUNIT_EXPECT_NULL(test, mt7915_main_test_next_tx(wcid));
++
++	vif->valid_links = 0;
++	mlink0->mvif = NULL;
++	mlink0->ctx = NULL;
++	mlink0->beacon_mon_interval = 0;
++	spin_lock_bh(&dev->mphy.tx_lock);
++	list_del_init(&wcid->tx_list);
++	spin_unlock_bh(&dev->mphy.tx_lock);
++	mt76_worker_enable(&dev->mt76.tx_worker);
++}
++
++static void mt7915_main_test_unstart(void *data)
++{
++	hw_to_local(data)->started = false;
++}
++
++/* an rx frame from @addr to @vif, @fc, as the driver hands it on */
++static struct sk_buff *
++mt7915_main_test_rx_frame(struct kunit *test, struct mt7915_dev *dev,
++			  struct ieee80211_vif *vif, const u8 *addr, u16 fc,
++			  struct mt76_wcid *wcid)
++{
++	struct mt76_rx_status *status;
++	struct ieee80211_hdr *hdr;
++	struct sk_buff *skb;
++
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	hdr = skb_put_zero(skb, 26);
++	hdr->frame_control = cpu_to_le16(fc);
++	memcpy(hdr->addr1, vif->addr, ETH_ALEN);
++	memcpy(hdr->addr2, addr, ETH_ALEN);
++	memcpy(hdr->addr3, vif->addr, ETH_ALEN);
++	status = (struct mt76_rx_status *)skb->cb;
++	memset(status, 0, sizeof(*status));
++	status->wcid = wcid;
++	status->band = NL80211_BAND_2GHZ;
++	status->freq = 2412;
++	status->chains = 1;
++	status->chain_signal[0] = -50;
++	return skb;
++}
++
++/* A driver that asks mt76 to follow its stations' power save from their
++ * frames (MT_WCID_FLAG_CHECK_PS: mt76x02; mt7915's firmware does it):
++ * a PS-Poll it couldn't match is matched by address and answered by
++ * mac80211, a U-APSD trigger is passed on, PM on and off moves the
++ * station into power save and out, and hearing it at all ends a silent
++ * hold.
++ */
++static void mt7915_main_test_rx_check_ps(struct kunit *test)
++{
++	static const u8 addr[ETH_ALEN] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x88 };
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_vif *vif;
++	struct mt76_wcid *wcid;
++	struct sk_buff_head *q;
++	struct sta_info *si;
++
++	vif = mt7915_main_test_sdata_ap(test, hw, 1);
++	mt7915_main_test_sdata_up(test, vif);
++	mt7915_main_test_set_beacon(test, hw, vif, 8);
++	si = mt7915_main_test_mac80211_sta(test, hw, vif, addr);
++	set_bit(WLAN_STA_AUTH, &si->_flags);
++	set_bit(WLAN_STA_ASSOC, &si->_flags);
++	wcid = (struct mt76_wcid *)si->sta.drv_priv;
++	wcid->sta = 1;
++	wcid->tx_info |= MT_WCID_TX_INFO_SET;
++	set_bit(MT_WCID_FLAG_CHECK_PS, &wcid->flags);
++	set_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++	hw_to_local(hw)->started = true;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_main_test_unstart, hw), 0);
++	mt76_worker_disable(&dev->mt76.tx_worker);
++
++	q = &dev->mt76.rx_skb[MT_RXQ_MAIN];
++	__skb_queue_tail(q, mt7915_main_test_rx_frame(test, dev, vif, addr,
++			 IEEE80211_FTYPE_CTL | IEEE80211_STYPE_PSPOLL, NULL));
++	__skb_queue_tail(q, mt7915_main_test_rx_frame(test, dev, vif, addr,
++			 IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_NULLFUNC |
++			 IEEE80211_FCTL_PM, wcid));
++	local_bh_disable();
++	mt76_rx_poll_complete(&dev->mt76, MT_RXQ_MAIN, NULL);
++	local_bh_enable();
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, test_sta_flag(si, WLAN_STA_PS_STA));
++
++	__skb_queue_tail(q, mt7915_main_test_rx_frame(test, dev, vif, addr,
++			 IEEE80211_FTYPE_DATA | IEEE80211_STYPE_NULLFUNC, wcid));
++	local_bh_disable();
++	mt76_rx_poll_complete(&dev->mt76, MT_RXQ_MAIN, NULL);
++	local_bh_enable();
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
++	KUNIT_EXPECT_FALSE(test, test_sta_flag(si, WLAN_STA_PS_STA));
++
++	clear_bit(MT_WCID_FLAG_CHECK_PS, &wcid->flags);
++	wcid->sta = 0;
++	skb_queue_purge(&wcid->tx_pending);
++	spin_lock_bh(&dev->mphy.tx_lock);
++	list_del_init(&wcid->tx_list);
++	spin_unlock_bh(&dev->mphy.tx_lock);
++	mt76_worker_enable(&dev->mt76.tx_worker);
++}
++
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ /* With WED, tx status comes per PPDU (TXS format 2+): its bytes, failures
+  * and retries go to the station's counters, and its tx BA session's
+@@ -4974,6 +5145,8 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_drop_other_sta_real),
+ 	KUNIT_CASE(mt7915_main_test_et_stats_sta),
+ 	KUNIT_CASE(mt7915_main_test_offchannel_nullfunc),
++	KUNIT_CASE(mt7915_main_test_offchannel_mld),
++	KUNIT_CASE(mt7915_main_test_rx_check_ps),
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	KUNIT_CASE(mt7915_main_test_wed_txs),
+ #endif

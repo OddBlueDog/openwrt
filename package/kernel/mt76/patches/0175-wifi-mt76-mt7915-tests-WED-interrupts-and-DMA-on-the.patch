@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 15:25:56 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: WED, interrupts and DMA on the
+ PCIe chips
+
+The MT7915's and MT7916's halves of the WED and DMA code had no test:
+the WED parameters from a PCIe BAR (WED's own interrupt registers, each
+chip's interrupt bits and wcid range), WED's ring control in the host
+config, the WA rings WED takes as its tx-free ring (the MT7915's WA
+event ring, the MT7916's band 0 tx-free ring), the second PCIe
+interface's band 1 rings, the interrupt handler and tasklet masking at
+WED, and the CBTOP register ranges a PCIe card remaps.
+
+mt7915_mmio_test_wed_init_pcie, mt7915_mmio_test_wed_irq,
+mt7915_mmio_test_remap_cbtop_pcie, mt7915_dma_test_init_wed_mt7915,
+mt7915_dma_test_init_wed_mt7916.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/dma-test.c  |  53 +++++++++++++++++
+ mt7915/tests/mmio-test.c | 122 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 175 insertions(+)
+
+diff --git a/mt7915/tests/dma-test.c b/mt7915/tests/dma-test.c
+index 51e56458..3f733f57 100644
+--- a/mt7915/tests/dma-test.c
++++ b/mt7915/tests/dma-test.c
+@@ -509,6 +509,57 @@ static void mt7915_dma_test_init_wed(struct kunit *test)
+ 
+ #endif
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* The PCIe chips' DMA with a WED: WED told which rings it takes in the
++ * host config (MT7915's own ring control), both data rings at WED's
++ * ring base, the WA event ring on the MT7915 and band 0's tx-free ring on
++ * the MT7916 taken by WED as its tx-free ring; a reset resets WED too.
++ * The MT7916 here has its second PCIe interface, for band 1's rings.
++ */
++static void mt7915_dma_test_init_wed_chip(struct kunit *test, u32 rev,
++					  bool hif2)
++{
++	struct mt7915_dev *dev = mt7915_dma_test_dev(test);
++	struct mt76_dev *mdev = &dev->mt76;
++	struct mt76_test_wed *w;
++	struct mt76_queue *wa;
++
++	dev->mt76.rev = rev;
++	if (hif2) {
++		dev->hif2 = kunit_kzalloc(test, sizeof(*dev->hif2), GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(test, dev->hif2);
++	}
++	w = mt76_test_wed_init(test, &mdev->mmio.wed);
++	__mt7915_dma_test_init(test, dev, true);
++
++	KUNIT_EXPECT_TRUE(test, mt76_rr(dev, MT_WFDMA_HOST_CONFIG) &
++			  MT_WFDMA_HOST_CONFIG_WED);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_WFDMA_WED_RING_CONTROL_RX1,
++			mt76_rr(dev, MT_WFDMA_WED_RING_CONTROL)),
++			is_mt7915(mdev) ? 1 : 2);
++	KUNIT_EXPECT_EQ(test, w->n_tx_ring, 2);
++	KUNIT_EXPECT_EQ(test, w->n_txfree, 1);
++	wa = is_mt7915(mdev) ? &mdev->q_rx[MT_RXQ_MCU_WA] :
++			       &mdev->q_rx[MT_RXQ_MAIN_WA];
++	KUNIT_EXPECT_TRUE(test, mt76_queue_is_wed_tx_free(wa));
++
++	mt7915_dma_test_run_reset(dev, false);
++	KUNIT_EXPECT_EQ(test, w->n_reset_dma, 1);
++	mt7915_dma_test_teardown(dev);
++	KUNIT_EXPECT_EQ(test, w->n_detach, 1);
++}
++
++static void mt7915_dma_test_init_wed_mt7915(struct kunit *test)
++{
++	mt7915_dma_test_init_wed_chip(test, 0x79150000, false);
++}
++
++static void mt7915_dma_test_init_wed_mt7916(struct kunit *test)
++{
++	mt7915_dma_test_init_wed_chip(test, 0x79060000, true);
++}
++#endif
++
+ /* With a second PCIe interface (not on the MT7986) its WFDMA is started too
+  * and the host told to split the bands between the two.
+  */
+@@ -913,6 +964,8 @@ static struct kunit_case mt7915_dma_test_cases[] = {
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	KUNIT_CASE(mt7915_dma_test_start_wed),
+ 	KUNIT_CASE(mt7915_dma_test_init_wed),
++	KUNIT_CASE(mt7915_dma_test_init_wed_mt7915),
++	KUNIT_CASE(mt7915_dma_test_init_wed_mt7916),
+ #endif
+ 	KUNIT_CASE(mt7915_dma_test_start_hif2),
+ 	KUNIT_CASE(mt7915_dma_test_enable),
+diff --git a/mt7915/tests/mmio-test.c b/mt7915/tests/mmio-test.c
+index 31c3421b..4a2719da 100644
+--- a/mt7915/tests/mmio-test.c
++++ b/mt7915/tests/mmio-test.c
+@@ -7,6 +7,7 @@
+  */
+ #include <kunit/test.h>
+ #include <linux/dma-mapping.h>
++#include <linux/pci.h>
+ #include <linux/platform_device.h>
+ #include <linux/rtnetlink.h>
+ #include "fake.h"
+@@ -444,6 +445,89 @@ static void mt7915_mmio_test_wed_init_attach(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, w->n_attach, 2);
+ }
+ 
++/* The WED setup of a PCIe card (MT7915, MT7916): the same parameters from
++ * BAR 0, WED's own interrupt registers, and each chip's interrupt bits
++ * and wcid range.
++ */
++static void mt7915_mmio_test_wed_init_pcie(struct kunit *test)
++{
++	static const struct {
++		u32 rev;
++		u8 tx_tbit, txfree_tbit, rx_tbit;
++		bool wcid_512;
++	} chips[] = {
++		{ 0x79150000, 4, 1, 16, false },
++		{ 0x79060000, 30, 1, 18, true },
++	};
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++	u32 rev = dev->mt76.rev, bar = MT7915_MMIO_TEST_WMAC_BASE;
++	struct pci_dev *pdev;
++	int i, irq = 42;
++
++	pdev = kunit_kzalloc(test, sizeof(*pdev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, pdev);
++	pdev->resource[0].start = bar;
++	pdev->resource[0].end = bar + MT7915_MMIO_TEST_WMAC_SIZE - 1;
++	pdev->resource[0].flags = IORESOURCE_MEM;
++	mt7915_mmio_test_wed_on(test);
++
++	for (i = 0; i < ARRAY_SIZE(chips); i++) {
++		memset(wed, 0, sizeof(*wed));
++		dev->mt76.rev = chips[i].rev;
++		KUNIT_EXPECT_EQ(test, mt7915_mmio_wed_init(dev, pdev, true,
++				&irq), 0);
++		KUNIT_EXPECT_EQ(test, irq, 42);
++		KUNIT_EXPECT_PTR_EQ(test, wed->wlan.pci_dev, pdev);
++		KUNIT_EXPECT_EQ(test, wed->wlan.bus_type, MTK_WED_BUS_PCIE);
++		KUNIT_EXPECT_NOT_NULL(test, wed->wlan.base);
++		KUNIT_EXPECT_EQ(test, wed->wlan.phy_base, bar);
++		KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_int,
++				bar + MT_INT_WED_SOURCE_CSR);
++		KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_mask,
++				bar + MT_INT_WED_MASK_CSR);
++		KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_phys,
++				bar + MT_WFDMA_EXT_CSR_BASE);
++		KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_rx_glo,
++				bar + MT_WPDMA_GLO_CFG);
++		KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_rx[0],
++				bar + MT_RXQ_WED_DATA_RING_BASE);
++		KUNIT_EXPECT_EQ(test, wed->wlan.tx_tbit[0], chips[i].tx_tbit);
++		KUNIT_EXPECT_EQ(test, wed->wlan.tx_tbit[1],
++				chips[i].tx_tbit + 1);
++		KUNIT_EXPECT_EQ(test, wed->wlan.txfree_tbit,
++				chips[i].txfree_tbit);
++		KUNIT_EXPECT_EQ(test, wed->wlan.rx_tbit[0], chips[i].rx_tbit);
++		KUNIT_EXPECT_EQ(test, wed->wlan.rx_tbit[1],
++				chips[i].rx_tbit + 1);
++		KUNIT_EXPECT_EQ(test, wed->wlan.wcid_512, chips[i].wcid_512);
++	}
++	dev->mt76.rev = rev;
++}
++
++/* On a PCIe card the CBTOP ranges go through the L1 remap too (on the
++ * MT7986 they are no registers of its own).
++ */
++static void mt7915_mmio_test_remap_cbtop_pcie(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct device *kdev = dev->mt76.dev;
++	const struct bus_type *bus = kdev->bus;
++	u32 l1, addr;
++
++	addr = __mt7915_reg_remap_addr(dev, MT_CBTOP1_PHY_START + 0x40);
++	kdev->bus = &pci_bus_type;
++	l1 = mt7915_reg_map_l1(dev, MT_CBTOP1_PHY_START + 0x40);
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_remap_addr(dev,
++			MT_CBTOP1_PHY_START + 0x40), l1);
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_remap_addr(dev,
++			MT_CBTOP2_PHY_START + 0x40),
++			mt7915_reg_map_l1(dev, MT_CBTOP2_PHY_START + 0x40));
++	kdev->bus = bus;
++	KUNIT_EXPECT_EQ(test, __mt7915_reg_remap_addr(dev,
++			MT_CBTOP1_PHY_START + 0x40), addr);
++}
++
+ /* the fake firmware: the SER trigger of a WED reset done at once */
+ static int mt7915_mmio_test_wed_ser(struct mt76_test_fake *fake,
+ 				    const struct mt76_test_msg *msg)
+@@ -934,6 +1018,41 @@ static void mt7915_mmio_test_dual_hif_mask(struct kunit *test)
+ 			BIT(2) | BIT(4));
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* With a WED, the interrupt handler and tasklet mask the device's
++ * interrupts at WED and take the pending ones from it; a second
++ * interface's mask goes off too.
++ */
++static void mt7915_mmio_test_wed_irq(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_mmio_test_irq_dev(test, false);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt76_test_wed *w;
++
++	tasklet_setup(&dev->mt76.irq_tasklet, mt7915_mmio_test_tasklet_stub);
++	w = mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++	dev->hif2 = kunit_kzalloc(test, sizeof(*dev->hif2), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev->hif2);
++	dev->mt76.mmio.irqmask = MT_INT_MCU_CMD;
++
++	mt76_test_set_reg(fake, MT_INT_MASK_CSR, ~0);
++	mt76_test_set_reg(fake, MT_INT1_MASK_CSR, ~0);
++	KUNIT_EXPECT_EQ(test, mt7915_irq_handler(0, dev), IRQ_NONE);
++	KUNIT_EXPECT_EQ(test, w->n_set_mask, 1);
++	KUNIT_EXPECT_EQ(test, w->irq_mask, 0);
++	/* the device's own mask is WED's to set now */
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, MT_INT_MASK_CSR), ~0);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, MT_INT1_MASK_CSR), 0);
++
++	mt76_test_set_reg(fake, MT_INT1_MASK_CSR, ~0);
++	mt7915_mmio_test_run_tasklet(dev);
++	KUNIT_EXPECT_EQ(test, w->n_irq_get, 1);
++	KUNIT_EXPECT_GE(test, w->n_set_mask, 2);
++	tasklet_kill(&dev->mt76.irq_tasklet);
++}
++
++#endif
++
+ static struct kunit_case mt7915_mmio_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_reg_direct),
+ 	KUNIT_CASE(mt7915_test_reg_fixed_map),
+@@ -952,7 +1071,10 @@ static struct kunit_case mt7915_mmio_test_cases[] = {
+ 	KUNIT_CASE(mt7915_mmio_test_wed_reset),
+ 	KUNIT_CASE(mt7915_mmio_test_wed_rx_stats),
+ 	KUNIT_CASE(mt7915_mmio_test_wed_irq_mask),
++	KUNIT_CASE(mt7915_mmio_test_wed_init_pcie),
++	KUNIT_CASE(mt7915_mmio_test_wed_irq),
+ #endif
++	KUNIT_CASE(mt7915_mmio_test_remap_cbtop_pcie),
+ 	KUNIT_CASE(mt7915_mmio_test_tasklet_rx_tx),
+ 	KUNIT_CASE(mt7915_mmio_test_tasklet_rx_queues),
+ 	KUNIT_CASE(mt7915_mmio_test_tasklet_ser),

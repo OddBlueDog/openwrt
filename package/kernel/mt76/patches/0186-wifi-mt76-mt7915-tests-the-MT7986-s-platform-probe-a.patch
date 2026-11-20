@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:16:45 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: the MT7986's platform probe and
+ remove
+
+mt798x_wmac_probe() and mt798x_wmac_remove() had no test past a missing
+window or an unknown chip: the VM has no device behind the WMAC's
+addresses and no registration could follow. Three KUnit static stub
+seams (no-ops without KUnit, as mt7915_spr_apply()'s): the register
+windows (mt798x_wmac_ioremap()), mt7915_register_device() and
+mt7915_unregister_device().
+
+The test's MT7986: its device tree node for the chip match, the windows
+in memory, an interrupt and a consys reset line of its own.
+mt7915_soc_test_probe_register_fails: the probe up to the registration,
+which fails: the interrupt taken back, the device freed.
+mt7915_soc_test_probe_remove: a probe that goes through keeps its
+interrupt, and removing the device unregisters it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/init.c           |   5 +
+ mt7915/soc.c            |  16 ++-
+ mt7915/tests/soc-test.c | 224 ++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 242 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 6db1bd7e..65cb5b50 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1349,6 +1349,9 @@ int mt7915_register_device(struct mt7915_dev *dev)
+ 	struct mt7915_phy *phy2;
+ 	int ret;
+ 
++	/* a seam for the KUnit tests of the platform probe */
++	KUNIT_STATIC_STUB_REDIRECT(mt7915_register_device, dev);
++
+ 	dev->phy.dev = dev;
+ 	dev->phy.mt76 = &dev->mt76.phy;
+ 	dev->mt76.phy.priv = &dev->phy;
+@@ -1428,6 +1431,8 @@ free_phy2:
+ 
+ void mt7915_unregister_device(struct mt7915_dev *dev)
+ {
++	KUNIT_STATIC_STUB_REDIRECT(mt7915_unregister_device, dev);
++
+ 	/*
+ 	 * No more resets or dumps: the irq tasklet, and firmware commands
+ 	 * timing out (likely while a hung firmware is torn down), would
+diff --git a/mt7915/soc.c b/mt7915/soc.c
+index a80b4544..fc951766 100644
+--- a/mt7915/soc.c
++++ b/mt7915/soc.c
+@@ -1217,6 +1217,16 @@ void mt7986_wmac_disable(struct mt7915_dev *dev)
+ 	mt7986_wmac_consys_reset(dev, false);
+ }
+ 
++/* one of the WMAC's register windows (a seam for the KUnit tests: their
++ * VM has no device behind the addresses)
++ */
++static void __iomem *mt798x_wmac_ioremap(struct platform_device *pdev,
++					 unsigned int index)
++{
++	KUNIT_STATIC_STUB_REDIRECT(mt798x_wmac_ioremap, pdev, index);
++	return devm_platform_ioremap_resource(pdev, index);
++}
++
+ static int mt798x_wmac_init(struct mt7915_dev *dev)
+ {
+ 	struct device *pdev = dev->mt76.dev;
+@@ -1235,11 +1245,11 @@ static int mt798x_wmac_init(struct mt7915_dev *dev)
+ 	else if (clk_prepare_enable(ap_conn_clk))
+ 		dev_err(pdev, "ap2conn clock configuration failed\n");
+ 
+-	dev->dcm = devm_platform_ioremap_resource(pfdev, 1);
++	dev->dcm = mt798x_wmac_ioremap(pfdev, 1);
+ 	if (IS_ERR(dev->dcm))
+ 		return PTR_ERR(dev->dcm);
+ 
+-	dev->sku = devm_platform_ioremap_resource(pfdev, 2);
++	dev->sku = mt798x_wmac_ioremap(pfdev, 2);
+ 	if (IS_ERR(dev->sku))
+ 		return PTR_ERR(dev->sku);
+ 
+@@ -1257,7 +1267,7 @@ static int mt798x_wmac_probe(struct platform_device *pdev)
+ 
+ 	chip_id = (uintptr_t)of_device_get_match_data(&pdev->dev);
+ 
+-	mem_base = devm_platform_ioremap_resource(pdev, 0);
++	mem_base = mt798x_wmac_ioremap(pdev, 0);
+ 	if (IS_ERR(mem_base)) {
+ 		dev_err(&pdev->dev, "Failed to get memory resource\n");
+ 		return PTR_ERR(mem_base);
+diff --git a/mt7915/tests/soc-test.c b/mt7915/tests/soc-test.c
+index 053aeb1c..b2724dd6 100644
+--- a/mt7915/tests/soc-test.c
++++ b/mt7915/tests/soc-test.c
+@@ -17,6 +17,8 @@
+ #include <kunit/static_stub.h>
+ #include <linux/clk-provider.h>
+ #include <linux/clkdev.h>
++#include <linux/irq.h>
++#include <linux/reset-controller.h>
+ #include <linux/pinctrl/machine.h>
+ #include "../mcu.h"
+ #include "../eeprom.h"
+@@ -1546,6 +1548,226 @@ static void mt7915_soc_test_wmac_init_windows(struct kunit *test)
+ 	dev->rstc = NULL;
+ }
+ 
++/* --- the whole probe ------------------------------------------------------- */
++
++#define MT7915_SOC_TEST_PROBE_ID	7987
++
++/* What the probe gets instead of the hardware: its register windows in
++ * memory (the VM has no device behind the addresses), a reset line, an
++ * interrupt; the registration with mac80211 (tested on its own) stubbed.
++ */
++struct mt7915_soc_test_probe {
++	void *window;
++	u32 dcm[0x40];
++	u32 sku[0x100];
++	struct device_node *np;
++	struct reset_controller_dev rcdev;
++	int irq;
++	int reg_ret;		/* what mt7915_register_device() returns */
++	int n_register, n_unregister;
++	struct mt7915_dev *dev;
++};
++
++static struct mt7915_soc_test_probe *mt7915_soc_test_p;
++
++static void __iomem *
++mt7915_soc_test_ioremap(struct platform_device *pdev, unsigned int index)
++{
++	struct mt7915_soc_test_probe *p = mt7915_soc_test_p;
++
++	switch (index) {
++	case 0:
++		/* the match data is read by now: from here the device is
++		 * found by its name (reset line, interrupt), not in the DT
++		 */
++		pdev->dev.of_node = NULL;
++		return (void __force __iomem *)p->window;
++	case 1:
++		return (void __force __iomem *)p->dcm;
++	default:
++		return (void __force __iomem *)p->sku;
++	}
++}
++
++static int mt7915_soc_test_register(struct mt7915_dev *dev)
++{
++	struct mt7915_soc_test_probe *p = mt7915_soc_test_p;
++
++	p->n_register++;
++	p->dev = dev;
++	if (!p->reg_ret)
++		/* as mt76_register_device() does */
++		dev_set_drvdata(dev->mt76.dev, &dev->mt76);
++	return p->reg_ret;
++}
++
++/* what mt7915_unregister_device() ends with */
++static void mt7915_soc_test_unregister(struct mt7915_dev *dev)
++{
++	mt7915_soc_test_p->n_unregister++;
++	mt76_free_device(&dev->mt76);
++}
++
++static int mt7915_soc_test_reset_op(struct reset_controller_dev *rcdev,
++				    unsigned long id)
++{
++	return 0;
++}
++
++static const struct reset_control_ops mt7915_soc_test_reset_ops = {
++	.reset = mt7915_soc_test_reset_op,
++	.assert = mt7915_soc_test_reset_op,
++	.deassert = mt7915_soc_test_reset_op,
++};
++
++/* reset lookups can't be removed: one, for the probe test's device */
++static struct reset_control_lookup mt7915_soc_test_reset_lookup =
++	RESET_LOOKUP("mt7915e-soc-test-rst", 0, "mt7915e-soc-test.7987",
++		     "consys");
++
++static void mt7915_soc_test_rcdev_del(void *data)
++{
++	reset_controller_unregister(data);
++}
++
++static void mt7915_soc_test_irq_free(void *data)
++{
++	irq_free_descs((uintptr_t)data, 1);
++}
++
++static void mt7915_soc_test_vfree(void *p)
++{
++	vfree(p);
++}
++
++static void mt7915_soc_test_probe_done(void *data)
++{
++	mt7915_soc_test_p = NULL;
++}
++
++static struct mt7915_soc_test_probe *
++mt7915_soc_test_probe_env(struct kunit *test)
++{
++	static bool lookup_added;
++	struct mt7915_soc_test_probe *p;
++	struct platform_device *rpdev;
++	struct device *rdev;
++	struct property *pp;
++
++	p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	p->window = vzalloc(SZ_8M);
++	KUNIT_ASSERT_NOT_NULL(test, p->window);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_vfree, p->window), 0);
++	mt7915_soc_test_p = p;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_probe_done, p), 0);
++
++	/* the WMAC's device tree node, for the chip it is */
++	p->np = kunit_kzalloc(test, sizeof(*p->np), GFP_KERNEL);
++	pp = kunit_kzalloc(test, sizeof(*pp), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, p->np);
++	KUNIT_ASSERT_NOT_NULL(test, pp);
++	pp->name = "compatible";
++	pp->value = "mediatek,mt7986-wmac";
++	pp->length = sizeof("mediatek,mt7986-wmac");
++	p->np->name = "wifi";
++	p->np->full_name = "wifi";
++	p->np->properties = pp;
++
++	rpdev = platform_device_register_simple("mt7915e-soc-test-rst",
++						PLATFORM_DEVID_NONE, NULL, 0);
++	KUNIT_ASSERT_FALSE(test, IS_ERR(rpdev));
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_pdev_put, rpdev), 0);
++	rdev = &rpdev->dev;
++	p->rcdev.ops = &mt7915_soc_test_reset_ops;
++	p->rcdev.owner = THIS_MODULE;
++	p->rcdev.nr_resets = 1;
++	p->rcdev.dev = rdev;
++	KUNIT_ASSERT_EQ(test, reset_controller_register(&p->rcdev), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_rcdev_del, &p->rcdev), 0);
++	if (!lookup_added) {
++		reset_controller_add_lookup(&mt7915_soc_test_reset_lookup, 1);
++		lookup_added = true;
++	}
++
++	p->irq = irq_alloc_descs(-1, 1, 1, NUMA_NO_NODE);
++	KUNIT_ASSERT_GT(test, p->irq, 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_irq_free, (void *)(uintptr_t)p->irq), 0);
++	irq_set_chip_and_handler(p->irq, &dummy_irq_chip, handle_simple_irq);
++	irq_clear_status_flags(p->irq, IRQ_NOREQUEST | IRQ_NOPROBE);
++
++	kunit_activate_static_stub(test, mt798x_wmac_ioremap,
++				   mt7915_soc_test_ioremap);
++	kunit_activate_static_stub(test, mt7915_register_device,
++				   mt7915_soc_test_register);
++	kunit_activate_static_stub(test, mt7915_unregister_device,
++				   mt7915_soc_test_unregister);
++	return p;
++}
++
++static struct platform_device *
++mt7915_soc_test_probe_pdev(struct kunit *test, struct mt7915_soc_test_probe *p)
++{
++	struct resource res[] = {
++		DEFINE_RES_MEM(0x0c000000, SZ_8M),
++		DEFINE_RES_MEM(0x0c800000, SZ_4K),
++		DEFINE_RES_MEM(0x0c801000, SZ_4K),
++		DEFINE_RES_IRQ(p->irq),
++	};
++	struct platform_device *pdev;
++
++	pdev = platform_device_register_simple("mt7915e-soc-test",
++					       MT7915_SOC_TEST_PROBE_ID, res,
++					       ARRAY_SIZE(res));
++	KUNIT_ASSERT_FALSE(test, IS_ERR(pdev));
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_pdev_put, pdev), 0);
++	pdev->dev.of_node = p->np;
++	return pdev;
++}
++
++/* The MT7986's platform probe: an MT7986 by its device tree node, its
++ * register window, its interrupt requested, the SoC side set up (clocks,
++ * the INFRACFG and SKU windows, the consys reset line) and the WiFi
++ * subsystem reset; then the registration. One that fails takes the
++ * interrupt back and frees the device.
++ */
++static void mt7915_soc_test_probe_register_fails(struct kunit *test)
++{
++	struct mt7915_soc_test_probe *p = mt7915_soc_test_probe_env(test);
++	struct platform_device *pdev = mt7915_soc_test_probe_pdev(test, p);
++
++	p->reg_ret = -EIO;
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_probe(pdev), -EIO);
++	KUNIT_EXPECT_EQ(test, p->n_register, 1);
++	KUNIT_ASSERT_NOT_NULL(test, p->dev);
++	KUNIT_EXPECT_FALSE(test, irq_has_action(p->irq));
++}
++
++/* A probe whose registration goes through keeps its interrupt; removing
++ * the platform device unregisters it.
++ */
++static void mt7915_soc_test_probe_remove(struct kunit *test)
++{
++	struct mt7915_soc_test_probe *p = mt7915_soc_test_probe_env(test);
++	struct platform_device *pdev = mt7915_soc_test_probe_pdev(test, p);
++
++	KUNIT_ASSERT_EQ(test, mt7915_soc_test_probe(pdev), 0);
++	KUNIT_EXPECT_TRUE(test, irq_has_action(p->irq));
++	KUNIT_EXPECT_PTR_EQ(test, platform_get_drvdata(pdev),
++			    (void *)p->dev);
++	KUNIT_EXPECT_EQ(test, mt76_chip(&p->dev->mt76), 0x7986);
++
++	mt798x_wmac_remove(pdev);
++	KUNIT_EXPECT_EQ(test, p->n_unregister, 1);
++	devm_free_irq(&pdev->dev, p->irq, p->dev);
++}
++
+ static struct kunit_case mt7915_soc_test_cases[] = {
+ 	KUNIT_CASE(mt7915_soc_test_spi_access),
+ 	KUNIT_CASE(mt7915_soc_test_spi_busy),
+@@ -1587,6 +1809,8 @@ static struct kunit_case mt7915_soc_test_cases[] = {
+ 	KUNIT_CASE(mt7915_soc_test_disable),
+ 	KUNIT_CASE(mt7915_soc_test_probe_no_window),
+ 	KUNIT_CASE(mt7915_soc_test_probe_unknown_chip),
++	KUNIT_CASE(mt7915_soc_test_probe_register_fails),
++	KUNIT_CASE(mt7915_soc_test_probe_remove),
+ 	KUNIT_CASE(mt7915_soc_test_wmac_init),
+ 	KUNIT_CASE(mt7915_soc_test_wmac_init_windows),
+ 	{}

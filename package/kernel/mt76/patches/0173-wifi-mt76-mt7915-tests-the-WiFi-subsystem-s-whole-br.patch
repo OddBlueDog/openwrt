@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:56:48 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: the WiFi subsystem's whole
+ bring-up
+
+mt7986_wmac_enable() stopped at conninfra's setup in the test VM, whose
+device tree has no reserved memory: every step after it (the A-die found
+and set up, PLLs, the subsystem woken and powered, the SKU for the
+firmware) had a test of its own, the bring-up as a whole none. The
+"memory-region" lookup goes through mt798x_wmac_reserved_mem(), a KUnit
+static stub seam (a plain call without KUnit, as mt7915_spr_apply()'s).
+
+mt7915_soc_test_coninfra_setup_mem: the MCU EMI base, the bus EMI
+window, the PLL check and the SRAM. mt7915_soc_test_enable_all: the
+GL-MT6000's bring-up (one MT7976 doing both bands) succeeds, conninfra
+knows its memory, the SKU is one A-die DBDC, no lock left held.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/soc.c            | 22 +++++++++---
+ mt7915/tests/soc-test.c | 76 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 94 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/soc.c b/mt7915/soc.c
+index d5c8b94d..a80b4544 100644
+--- a/mt7915/soc.c
++++ b/mt7915/soc.c
+@@ -12,6 +12,7 @@
+ #include <linux/reset.h>
+ #include <linux/of_net.h>
+ #include <linux/clk.h>
++#include <kunit/static_stub.h>
+ 
+ #include "mt7915.h"
+ 
+@@ -286,19 +287,32 @@ static int mt798x_wmac_coninfra_check(struct mt7915_dev *dev)
+ 				 false, dev, MT_CONN_INFRA_BASE);
+ }
+ 
+-static int mt798x_wmac_coninfra_setup(struct mt7915_dev *dev)
++/* the WiFi subsystem's memory: the reserved memory the device tree's
++ * "memory-region" names (the KUnit tests give one: their VM has none)
++ */
++static struct reserved_mem *mt798x_wmac_reserved_mem(struct device *pdev)
+ {
+-	struct device *pdev = dev->mt76.dev;
+ 	struct reserved_mem *rmem;
+ 	struct device_node *np;
+-	u32 val;
++
++	KUNIT_STATIC_STUB_REDIRECT(mt798x_wmac_reserved_mem, pdev);
+ 
+ 	np = of_parse_phandle(pdev->of_node, "memory-region", 0);
+ 	if (!np)
+-		return -EINVAL;
++		return NULL;
+ 
+ 	rmem = of_reserved_mem_lookup(np);
+ 	of_node_put(np);
++
++	return rmem;
++}
++
++static int mt798x_wmac_coninfra_setup(struct mt7915_dev *dev)
++{
++	struct reserved_mem *rmem;
++	u32 val;
++
++	rmem = mt798x_wmac_reserved_mem(dev->mt76.dev);
+ 	if (!rmem)
+ 		return -EINVAL;
+ 
+diff --git a/mt7915/tests/soc-test.c b/mt7915/tests/soc-test.c
+index 986b760d..053aeb1c 100644
+--- a/mt7915/tests/soc-test.c
++++ b/mt7915/tests/soc-test.c
+@@ -14,6 +14,7 @@
+  * INFRACFG windows (dev->sku, dev->dcm) are plain memory.
+  */
+ #include <kunit/test.h>
++#include <kunit/static_stub.h>
+ #include <linux/clk-provider.h>
+ #include <linux/clkdev.h>
+ #include <linux/pinctrl/machine.h>
+@@ -1169,6 +1170,52 @@ static void mt7915_soc_test_coninfra_setup(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_TOP_MCU_EMI_BASE), 0);
+ }
+ 
++/* the GL-MT6000's WiFi memory, as its device tree reserves it */
++static struct reserved_mem mt7915_soc_test_rmem = {
++	.name = "wmcpu-reserved",
++	.base = 0x4fc00000,
++	.size = 0x100000,
++};
++
++static struct reserved_mem *
++mt7915_soc_test_reserved_mem(struct device *pdev)
++{
++	return &mt7915_soc_test_rmem;
++}
++
++/* the device's "memory-region" names mt7915_soc_test_rmem */
++static void mt7915_soc_test_memory_region(struct kunit *test)
++{
++	kunit_activate_static_stub(test, mt798x_wmac_reserved_mem,
++				   mt7915_soc_test_reserved_mem);
++}
++
++/* With its reserved memory found, conninfra is told where it is: the MCU's
++ * EMI base (in 64 KiB units) and the bus's EMI window; its PLL check is
++ * set and its SRAM powered and allowed to sleep.
++ */
++static void mt7915_soc_test_coninfra_setup_mem(struct kunit *test)
++{
++	struct mt7915_dev *dev;
++
++	mt7915_soc_test_init(test, &dev);
++	mt7915_soc_test_memory_region(test);
++	mt7915_soc_test_set_reg(MT_TOP_RGU_SYSRAM_PDN, 1);
++
++	KUNIT_ASSERT_EQ(test, mt798x_wmac_coninfra_setup(dev), 0);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TOP_MCU_EMI_BASE_MASK,
++			mt7915_soc_test_reg(MT_TOP_MCU_EMI_BASE)),
++			(0x4fc00000 >> 16) & MT_TOP_MCU_EMI_BASE_MASK);
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_INFRA_BUS_EMI_START),
++			0x4fc00000);
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_INFRA_BUS_EMI_END),
++			0x100000);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_INFRA_CKGEN_BUS_RDY_SEL_MASK,
++			mt7915_soc_test_reg(MT_INFRA_CKGEN_BUS)), 1);
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_TOP_RGU_SYSRAM_PDN), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_TOP_RGU_SYSRAM_SLP), 1);
++}
++
+ /* --- enable and disable --------------------------------------------------- */
+ 
+ static void mt7915_soc_test_unmap(void *map)
+@@ -1263,6 +1310,33 @@ static void mt7915_soc_test_enable(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_INFRA_BUS_EMI_START), 0);
+ }
+ 
++/* The whole bring-up of the GL-MT6000's WiFi subsystem (one MT7976 doing
++ * both bands): out of reset, pins, conninfra up and told its memory, the
++ * A-die found and set up, PLLs, the subsystem woken and powered, and the
++ * SKU the firmware gets: one A-die, DBDC.
++ */
++static void mt7915_soc_test_enable_all(struct kunit *test)
++{
++	struct mt7915_dev *dev;
++	struct mt7915_soc_test *t = mt7915_soc_test_init(test, &dev);
++	u32 slpprot = MT_INFRACFG_RX_EN_MASK | MT_INFRACFG_TX_EN_MASK;
++
++	mt7915_soc_test_pinctrl(test, dev, "dbdc");
++	mt7915_soc_test_memory_region(test);
++	t->sku[MT_TOP_POS_SKU / 4] = MT_TOP_POS_SKU_ADIE_DBDC_MASK;
++	t->dcm[MT_INFRACFG_AP2CONN_SLPPROT / 4] = slpprot;
++	t->dcm[MT_INFRACFG_CONN2AP_SLPPROT / 4] = slpprot;
++	t->adie[0].regs[MT_ADIE_CHIP_ID / 4] = 0x79768a00;
++	mt7915_soc_test_efuse_zero(t, 0);
++
++	KUNIT_EXPECT_EQ(test, mt7986_wmac_enable(dev), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_INFRA_BUS_EMI_START),
++			0x4fc00000);
++	KUNIT_EXPECT_EQ(test, mt7915_check_adie(dev, true),
++			MT7976_ONE_ADIE_DBDC);
++	KUNIT_EXPECT_TRUE(test, mt7915_soc_test_unlocked());
++}
++
+ /* Shutting the WiFi subsystem down: woken first, bus protection raised and
+  * acked, power off, PLLs back to their defaults, the EMI and infra requests
+  * pulsed, allowed to sleep, then the AP side protected and the consys reset.
+@@ -1504,10 +1578,12 @@ static struct kunit_case mt7915_soc_test_cases[] = {
+ 	KUNIT_CASE(mt7915_soc_test_wfsys_powerup),
+ 	KUNIT_CASE(mt7915_soc_test_wfsys_powerup_no_ack),
+ 	KUNIT_CASE(mt7915_soc_test_coninfra_setup),
++	KUNIT_CASE(mt7915_soc_test_coninfra_setup_mem),
+ 	KUNIT_CASE(mt7915_soc_test_consys_reset),
+ 	KUNIT_CASE(mt7915_soc_test_gpio_setup),
+ 	KUNIT_CASE(mt7915_soc_test_enable_no_pins),
+ 	KUNIT_CASE(mt7915_soc_test_enable),
++	KUNIT_CASE(mt7915_soc_test_enable_all),
+ 	KUNIT_CASE(mt7915_soc_test_disable),
+ 	KUNIT_CASE(mt7915_soc_test_probe_no_window),
+ 	KUNIT_CASE(mt7915_soc_test_probe_unknown_chip),

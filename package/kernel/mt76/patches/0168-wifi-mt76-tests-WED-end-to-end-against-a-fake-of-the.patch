@@ -1,0 +1,1373 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:29:15 +0000
+Subject: [PATCH] wifi: mt76: tests: WED end to end, against a fake of the
+ Ethernet side
+
+The MilkFlint WED setting (mt7915e wed_enable) puts the router's Wi-Fi
+on these paths, and most of them had no test: the WED attach at probe,
+its reset handshake, WED's rx buffers, the rings it takes over, the flow
+offload path, the WO's station records and rx counters.
+
+tests/wed-fake.h models the Ethernet driver's WED (mtk_wed.c) as the
+driver sees it: attach drops the RCU lock and hands over the WED's DMA
+device and interrupt, detach clears the device, ring setups give their
+rings registers in the WED's own register file, the rest is counted. It
+can be registered where mtk_wed_device_attach() looks.
+
+- mt76-wed: rx buffer fill and release (both bands' pools, running out
+  of rx tokens releases everything), ring setup per queue type, the DMA
+  reset handshake, TC offload, WED token counting, tx status ids.
+- mt7915-mmio: WED init with no WED, a refusing one, an attaching one
+  (interrupt, DMA device, 32-bit mask) and one that can't do 32-bit DMA;
+  the L1 reset under RTNL; WO rx counters; the interrupt mask through WED.
+- mt7915-mac: the tx buffers WED sends from.
+- mt7915-main: station records to the WO (a refused one isn't sent), WDS
+  wcids, four-address mode, the forward path.
+- mt7915-dma: the MT7986's rings with a WED attached, through a reset and
+  the teardown.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/dma-test.c  |  69 ++++++-
+ mt7915/tests/mac-test.c  |  38 ++++
+ mt7915/tests/main-test.c | 136 ++++++++++++++
+ mt7915/tests/mmio-test.c | 264 +++++++++++++++++++++++++++
+ tests/wed-fake.h         | 312 ++++++++++++++++++++++++++++++++
+ tests/wed-test.c         | 382 +++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 1199 insertions(+), 2 deletions(-)
+ create mode 100644 tests/wed-fake.h
+
+diff --git a/mt7915/tests/dma-test.c b/mt7915/tests/dma-test.c
+index 2b99a938..51e56458 100644
+--- a/mt7915/tests/dma-test.c
++++ b/mt7915/tests/dma-test.c
+@@ -16,6 +16,7 @@
+ #include <linux/rtnetlink.h>
+ #include "../mcu.h"
+ #include "fake.h"
++#include "../../tests/wed-fake.h"
+ 
+ /* The MT7986's WFDMA0 block, where all of its rings live */
+ #define MT7915_DMA_TEST_WFDMA0		0x24000
+@@ -130,9 +131,10 @@ static void mt7915_dma_test_release(void *data)
+ /* An MT7986 with its DMA set up by the driver (and torn down after @test);
+  * with DBDC, with band 1's phy as mt7915_register_device() makes it.
+  */
+-static struct mt7915_dev *mt7915_dma_test_init(struct kunit *test, bool dbdc)
++static struct mt7915_dev *__mt7915_dma_test_init(struct kunit *test,
++						 struct mt7915_dev *dev,
++						 bool dbdc)
+ {
+-	struct mt7915_dev *dev = mt7915_dma_test_dev(test);
+ 	struct mt7915_phy *phy2 = NULL;
+ 
+ 	dev->dbdc_support = dbdc;
+@@ -157,6 +159,11 @@ static struct mt7915_dev *mt7915_dma_test_init(struct kunit *test, bool dbdc)
+ 	return dev;
+ }
+ 
++static struct mt7915_dev *mt7915_dma_test_init(struct kunit *test, bool dbdc)
++{
++	return __mt7915_dma_test_init(test, mt7915_dma_test_dev(test), dbdc);
++}
++
+ /* --- queue layout --------------------------------------------------------- */
+ 
+ /* The MT7986 has a single WFDMA (WFDMA0) and its own ring numbering and
+@@ -445,6 +452,63 @@ static void mt7915_dma_test_start_wed(struct kunit *test)
+ }
+ #endif
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++static void mt7915_dma_test_run_reset(struct mt7915_dev *dev, bool force);
++
++/* The MT7986's DMA with a WED attached (version 2: it takes rx too): both
++ * bands' data rings and both rx data rings are WED's, set up through it
++ * (their registers WED's from then on), the rx rings' buffers registered as
++ * rx tokens; band 0's tx-free events come from WED. The firmware rings stay
++ * the host's. A reset resets WED's DMA too; the teardown detaches it.
++ */
++static void mt7915_dma_test_init_wed(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_dma_test_dev(test);
++	struct mt76_dev *mdev = &dev->mt76;
++	struct mt76_test_wed *w;
++	struct mt76_queue *q;
++	u16 token_size = mdev->rx_token_size;
++
++	w = mt76_test_wed_init(test, &mdev->mmio.wed);
++	__mt7915_dma_test_init(test, dev, true);
++
++	KUNIT_EXPECT_EQ(test, w->n_tx_ring, 2);
++	q = dev->mphy.q_tx[MT_TXQ_BE];
++	KUNIT_EXPECT_EQ(test, q->flags,
++			MT_WED_Q_TX(0) | MT_QFLAG_TX_NO_ENTRY);
++	KUNIT_EXPECT_EQ(test, q->wed_regs, MT76_TEST_WED_TX_REGS(0));
++	KUNIT_EXPECT_EQ(test, mt76_test_wed_reg(w, MT76_TEST_WED_TX_REGS(0) +
++			offsetof(struct mt76_queue_regs, ring_size)),
++			MT7915_TX_RING_SIZE);
++	q = mdev->phys[MT_BAND1]->q_tx[MT_TXQ_BE];
++	KUNIT_EXPECT_EQ(test, q->wed_regs, MT76_TEST_WED_TX_REGS(1));
++	KUNIT_EXPECT_FALSE(test, mdev->q_mcu[MT_MCUQ_WM]->flags & MT_QFLAG_WED);
++
++	KUNIT_EXPECT_EQ(test, w->n_rx_ring, 2);
++	KUNIT_EXPECT_EQ(test, mdev->q_rx[MT_RXQ_MAIN].flags,
++			MT_WED_Q_RX(MT7915_RXQ_BAND0));
++	KUNIT_EXPECT_EQ(test, mdev->q_rx[MT_RXQ_BAND1].flags,
++			MT_WED_Q_RX(MT7915_RXQ_BAND1));
++	KUNIT_EXPECT_EQ(test, mdev->rx_token_size,
++			token_size + 2 * MT7915_RX_RING_SIZE);
++	KUNIT_EXPECT_FALSE(test, idr_is_empty(&mdev->rx_token));
++	KUNIT_EXPECT_EQ(test, w->n_txfree, 1);
++	KUNIT_EXPECT_TRUE(test,
++			  mt76_queue_is_wed_tx_free(&mdev->q_rx[MT_RXQ_MAIN_WA]));
++	KUNIT_EXPECT_FALSE(test, mdev->q_rx[MT_RXQ_MCU].flags & MT_QFLAG_WED);
++
++	mt7915_dma_test_run_reset(dev, false);
++	KUNIT_EXPECT_EQ(test, w->n_reset_dma, 1);
++	/* emptied and handed to WED again */
++	KUNIT_EXPECT_EQ(test, w->n_txfree, 2);
++
++	mt7915_dma_test_teardown(dev);
++	KUNIT_EXPECT_EQ(test, w->n_detach, 1);
++	KUNIT_EXPECT_FALSE(test, mtk_wed_device_active(&mdev->mmio.wed));
++}
++
++#endif
++
+ /* With a second PCIe interface (not on the MT7986) its WFDMA is started too
+  * and the host told to split the bands between the two.
+  */
+@@ -848,6 +912,7 @@ static struct kunit_case mt7915_dma_test_cases[] = {
+ 	KUNIT_CASE(mt7915_dma_test_start_reset),
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	KUNIT_CASE(mt7915_dma_test_start_wed),
++	KUNIT_CASE(mt7915_dma_test_init_wed),
+ #endif
+ 	KUNIT_CASE(mt7915_dma_test_start_hif2),
+ 	KUNIT_CASE(mt7915_dma_test_enable),
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 4ffdeada..eeb02719 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -5860,7 +5860,45 @@ static void mt7915_test_full_reset(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
+ }
+ 
++/* The tx buffers WED sends from on the host's behalf (its token half): one
++ * cut-through 802.3 descriptor each, its single buffer right after the
++ * descriptor and the txp, tagged with the WED's token. The rest of both is
++ * zeroed.
++ */
++static void mt7915_test_wed_init_buf(struct kunit *test)
++{
++	struct mt76_connac_fw_txp *txp;
++	dma_addr_t phys = 0x40001000;
++	__le32 *txwi;
++	u8 *buf;
++	u32 len;
++
++	buf = kunit_kmalloc(test, 256, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, buf);
++	memset(buf, 0xff, 256);
++	txwi = (__le32 *)buf;
++	txp = (void *)(buf + MT_TXD_SIZE);
++
++	len = mt7915_wed_init_buf(buf, phys, 4097);
++	KUNIT_EXPECT_EQ(test, len, MT_TXD_SIZE + sizeof(*txp));
++	KUNIT_EXPECT_EQ(test, le32_get_bits(txwi[0], MT_TXD0_TX_BYTES),
++			MT_TXD_SIZE);
++	KUNIT_EXPECT_EQ(test, le32_get_bits(txwi[0], MT_TXD0_PKT_FMT),
++			MT_TX_TYPE_CT);
++	KUNIT_EXPECT_TRUE(test, le32_to_cpu(txwi[1]) & MT_TXD1_LONG_FORMAT);
++	KUNIT_EXPECT_EQ(test, le32_get_bits(txwi[1], MT_TXD1_HDR_FORMAT),
++			MT_HDR_FORMAT_802_3);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(txp->token), 4097);
++	KUNIT_EXPECT_EQ(test, txp->nbuf, 1);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(txp->buf[0]), phys + len);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(txwi[2]), 0);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(txp->len[0]), 0);
++	/* nothing past them touched */
++	KUNIT_EXPECT_EQ(test, buf[len], 0xff);
++}
++
+ static struct kunit_case mt7915_mac_test_cases[] = {
++	KUNIT_CASE(mt7915_test_wed_init_buf),
+ 	KUNIT_CASE(mt7915_test_twt_interval),
+ 	KUNIT_CASE(mt7915_test_twt_reset),
+ 	KUNIT_CASE(mt7915_test_cca_reset_register),
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index b98781fd..adf6a0b2 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -19,6 +19,7 @@
+ #include <kunit/static_stub.h>
+ #include "fake.h"
+ #include "../eeprom.h"
++#include "../../tests/wed-fake.h"
+ 
+ struct mt7915_dev *mt7915_init_test_device(struct kunit *test, u32 sku,
+ 					   struct mt76_test_fake **fake);
+@@ -2140,6 +2141,136 @@ static void mt7915_main_test_sta_add_full(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* With a WED, each station record goes to its WO too (so it can count the
++ * station's rx), before the firmware gets it; a record the WO refuses isn't
++ * sent at all. A station in four-address mode from the start gets a wcid of
++ * the range WED keeps for those (MT76_WED_WDS_MIN on).
++ */
++static void mt7915_main_test_wed_sta_add(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	struct mt76_test_wed *w;
++
++	vif = mt7915_main_test_ap(test, hw2, 1);
++	w = mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++	mt7915_main_test_clear(fake);
++
++	sta = mt7915_main_test_sta(test, vif, 1);
++	KUNIT_ASSERT_EQ(test, mt7915_mac_sta_add(&dev->mt76, vif, sta), 0);
++	KUNIT_EXPECT_EQ(test, w->n_msg, 1);
++	KUNIT_EXPECT_EQ(test, w->last_msg, WED_WO_STA_REC);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(STA_REC_UPDATE)), 1);
++	KUNIT_EXPECT_LT(test, mt7915_main_test_msta(sta)->wcid.idx,
++			MT76_WED_WDS_MIN);
++
++	sta = mt7915_main_test_sta(test, vif, 2);
++	msta = mt7915_main_test_msta(sta);
++	set_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags);
++	mt7915_main_test_clear(fake);
++	w->msg_ret = -EIO;
++	KUNIT_ASSERT_EQ(test, mt7915_mac_sta_add(&dev->mt76, vif, sta), 0);
++	KUNIT_EXPECT_GE(test, msta->wcid.idx, MT76_WED_WDS_MIN);
++	KUNIT_EXPECT_LT(test, msta->wcid.idx, MT76_WED_WDS_MAX);
++	KUNIT_EXPECT_EQ(test, w->n_msg, 2);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake,
++			MCU_EXT_CMD(STA_REC_UPDATE)), 0);
++}
++
++/* Four-address mode switched on later, with a WED: the MT7986 keeps the
++ * station's wcid (only the MT7915 moves it to the WDS range), and the mode
++ * is in its flags.
++ */
++static void mt7915_main_test_wed_set_4addr(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	u16 idx;
++
++	vif = mt7915_main_test_ap(test, hw2, 1);
++	sta = mt7915_main_test_sta(test, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	KUNIT_ASSERT_EQ(test, mt7915_mac_sta_add(&dev->mt76, vif, sta), 0);
++	idx = msta->wcid.idx;
++	mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++
++	MT7915_MAIN_TEST_OP(sta_set_4addr)(hw2, vif, sta, true);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags));
++	KUNIT_EXPECT_EQ(test, msta->wcid.idx, idx);
++	MT7915_MAIN_TEST_OP(sta_set_4addr)(hw2, vif, sta, false);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_4ADDR,
++					  &msta->wcid.flags));
++}
++
++/* The path the Ethernet driver offloads a flow along, to a station of an
++ * interface: WED's DMA ring, the interface's BSS and the station's band.
++ * The MT7986 names no station (0x3ff: WED finds it by address) unless it
++ * is a four-address one; the path ends there. No WED, no path; a wcid WED
++ * can't address, an error.
++ */
++static void mt7915_main_test_wed_forward_path(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct net_device_path_ctx ctx = {};
++	struct net_device_path path = {};
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	struct net_device *ndev;
++	u16 idx;
++
++	ndev = kunit_kzalloc(test, sizeof(*ndev), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, ndev);
++	vif = mt7915_main_test_ap(test, hw2, 1);
++	mt7915_main_test_ap(test, hw2, 2);
++	vif = mt7915_main_test_ap(test, hw2, 3);
++	sta = mt7915_main_test_sta(test, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	KUNIT_ASSERT_EQ(test, mt7915_mac_sta_add(&dev->mt76, vif, sta), 0);
++
++	ctx.dev = ndev;
++	KUNIT_EXPECT_EQ(test, mt7915_net_fill_forward_path(hw2, vif, sta,
++			&ctx, &path), -ENODEV);
++	KUNIT_EXPECT_PTR_EQ(test, ctx.dev, ndev);
++
++	mt76_test_wed_init(test, &dev->mt76.mmio.wed)->wed->wdma_idx = 1;
++	KUNIT_EXPECT_EQ(test, mt7915_net_fill_forward_path(hw2, vif, sta,
++			&ctx, &path), 0);
++	KUNIT_EXPECT_EQ(test, path.type, DEV_PATH_MTK_WDMA);
++	KUNIT_EXPECT_PTR_EQ(test, path.dev, ndev);
++	KUNIT_EXPECT_EQ(test, path.mtk_wdma.wdma_idx, 1);
++	KUNIT_EXPECT_EQ(test, path.mtk_wdma.bss,
++			mt7915_main_test_mvif(vif)->mt76.idx);
++	KUNIT_EXPECT_EQ(test, path.mtk_wdma.queue, MT_BAND1);
++	KUNIT_EXPECT_EQ(test, path.mtk_wdma.wcid, 0x3ff);
++	KUNIT_EXPECT_NULL(test, ctx.dev);
++
++	ctx.dev = ndev;
++	set_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags);
++	KUNIT_EXPECT_EQ(test, mt7915_net_fill_forward_path(hw2, vif, sta,
++			&ctx, &path), 0);
++	KUNIT_EXPECT_EQ(test, path.mtk_wdma.wcid, msta->wcid.idx);
++
++	ctx.dev = ndev;
++	idx = msta->wcid.idx;
++	msta->wcid.idx = MT7915_WTBL_STA + 1;
++	KUNIT_EXPECT_EQ(test, mt7915_net_fill_forward_path(hw2, vif, sta,
++			&ctx, &path), -EIO);
++	KUNIT_EXPECT_PTR_EQ(test, ctx.dev, ndev);
++	msta->wcid.idx = idx;
++}
++#endif
++
+ /* After a full reset and before mac80211's restart has started the band
+  * again, a new station is refused (mac80211 re-adds the ones it has);
+  * once mt7915_start() runs, stations are added again. The other band
+@@ -3950,6 +4081,11 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_start_stop_ap),
+ 	KUNIT_CASE(mt7915_main_test_sta_add),
+ 	KUNIT_CASE(mt7915_main_test_sta_add_full),
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_main_test_wed_sta_add),
++	KUNIT_CASE(mt7915_main_test_wed_set_4addr),
++	KUNIT_CASE(mt7915_main_test_wed_forward_path),
++#endif
+ 	KUNIT_CASE(mt7915_main_test_sta_add_restart_pending),
+ 	KUNIT_CASE(mt7915_main_test_sta_assoc),
+ 	KUNIT_CASE(mt7915_main_test_sta_authorize),
+diff --git a/mt7915/tests/mmio-test.c b/mt7915/tests/mmio-test.c
+index f0cb986b..31c3421b 100644
+--- a/mt7915/tests/mmio-test.c
++++ b/mt7915/tests/mmio-test.c
+@@ -6,7 +6,11 @@
+  * test build only).
+  */
+ #include <kunit/test.h>
++#include <linux/dma-mapping.h>
++#include <linux/platform_device.h>
++#include <linux/rtnetlink.h>
+ #include "fake.h"
++#include "../../tests/wed-fake.h"
+ 
+ /* Addresses below 1 MiB are offsets into the window already. */
+ static void mt7915_test_reg_direct(struct kunit *test)
+@@ -298,6 +302,259 @@ static void mt7915_mmio_test_wed_init(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, irq, 42);
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* the MT7986 WMAC's register window, as its device tree node gives it */
++#define MT7915_MMIO_TEST_WMAC_BASE	0x18000000
++#define MT7915_MMIO_TEST_WMAC_SIZE	0x1000000
++
++static void mt7915_mmio_test_wed_enable(void *data)
++{
++	wed_enable = (uintptr_t)data;
++}
++
++/* wed_enable on until @test ends */
++static void mt7915_mmio_test_wed_on(struct kunit *test)
++{
++	bool was = wed_enable;
++
++	wed_enable = true;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mmio_test_wed_enable, (void *)(uintptr_t)was), 0);
++}
++
++static void mt7915_mmio_test_pdev_put(void *data)
++{
++	platform_device_put(data);
++}
++
++/* the WMAC's platform device, with its register window or without */
++static struct platform_device *
++mt7915_mmio_test_pdev(struct kunit *test, bool mem)
++{
++	struct resource res = DEFINE_RES_MEM(MT7915_MMIO_TEST_WMAC_BASE,
++					     MT7915_MMIO_TEST_WMAC_SIZE);
++	struct platform_device *pdev;
++
++	pdev = platform_device_alloc("mt7915-wed-test", PLATFORM_DEVID_AUTO);
++	KUNIT_ASSERT_NOT_NULL(test, pdev);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mmio_test_pdev_put, pdev), 0);
++	if (mem)
++		KUNIT_ASSERT_EQ(test, platform_device_add_resources(pdev, &res,
++				1), 0);
++	return pdev;
++}
++
++/* The WED setup of the MT7986's platform probe, when no WED attaches (the
++ * Ethernet driver has none, or refuses): every parameter for WED filled in
++ * from the WMAC's register window, the device's own interrupt kept, and
++ * the probe goes on without WED. Without a register window, nothing.
++ */
++static void mt7915_mmio_test_wed_init_no_attach(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++	struct mt76_test_wed *w;
++	int irq = 42;
++
++	mt7915_mmio_test_wed_on(test);
++	KUNIT_EXPECT_EQ(test, mt7915_mmio_wed_init(dev,
++			mt7915_mmio_test_pdev(test, false), false, &irq), 0);
++	KUNIT_EXPECT_NULL(test, wed->wlan.base);
++
++	KUNIT_EXPECT_EQ(test, mt7915_mmio_wed_init(dev,
++			mt7915_mmio_test_pdev(test, true), false, &irq), 0);
++	KUNIT_EXPECT_EQ(test, irq, 42);
++	KUNIT_EXPECT_FALSE(test, mtk_wed_device_active(wed));
++	KUNIT_EXPECT_EQ(test, wed->wlan.bus_type, MTK_WED_BUS_AXI);
++	KUNIT_EXPECT_NOT_NULL(test, wed->wlan.base);
++	KUNIT_EXPECT_EQ(test, wed->wlan.phy_base, MT7915_MMIO_TEST_WMAC_BASE);
++	KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_int,
++			MT7915_MMIO_TEST_WMAC_BASE + MT_INT_SOURCE_CSR);
++	KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_mask,
++			MT7915_MMIO_TEST_WMAC_BASE + MT_INT_MASK_CSR);
++	KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_tx,
++			MT7915_MMIO_TEST_WMAC_BASE + MT_TXQ_WED_RING_BASE);
++	KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_txfree,
++			MT7915_MMIO_TEST_WMAC_BASE + MT_RXQ_WED_RING_BASE);
++	KUNIT_EXPECT_EQ(test, wed->wlan.wpdma_rx[0],
++			MT7915_MMIO_TEST_WMAC_BASE + MT_RXQ_WED_DATA_RING_BASE);
++	/* the MT7986's interrupt bits and token split */
++	KUNIT_EXPECT_EQ(test, wed->wlan.tx_tbit[0], 30);
++	KUNIT_EXPECT_EQ(test, wed->wlan.tx_tbit[1], 31);
++	KUNIT_EXPECT_EQ(test, wed->wlan.txfree_tbit, 2);
++	KUNIT_EXPECT_EQ(test, wed->wlan.rx_tbit[0], 22);
++	KUNIT_EXPECT_EQ(test, wed->wlan.rx_tbit[1], 23);
++	KUNIT_EXPECT_EQ(test, wed->wlan.nbuf, MT7915_HW_TOKEN_SIZE);
++	KUNIT_EXPECT_EQ(test, wed->wlan.token_start,
++			MT7915_TOKEN_SIZE - MT7915_HW_TOKEN_SIZE);
++	KUNIT_EXPECT_TRUE(test, wed->wlan.wcid_512);
++	KUNIT_EXPECT_TRUE(test, wed->wlan.init_buf == mt7915_wed_init_buf);
++	KUNIT_EXPECT_TRUE(test, wed->wlan.reset == mt7915_mmio_wed_reset);
++
++	/* a WED that refuses */
++	w = mt76_test_wed_new(test);
++	w->attach_ret = -EBUSY;
++	mt76_test_wed_publish(w);
++	KUNIT_EXPECT_EQ(test, mt7915_mmio_wed_init(dev,
++			mt7915_mmio_test_pdev(test, true), false, &irq), 0);
++	KUNIT_EXPECT_EQ(test, w->n_attach, 1);
++	KUNIT_EXPECT_FALSE(test, mtk_wed_device_active(wed));
++	KUNIT_EXPECT_EQ(test, irq, 42);
++}
++
++/* A WED attaches: its interrupt replaces the device's, DMA goes through
++ * its device (32-bit addresses), and the probe takes the WED path. A WED
++ * device that can't do 32-bit DMA fails the probe.
++ */
++static void mt7915_mmio_test_wed_init_attach(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++	struct device *eth, *no_dma;
++	struct mt76_test_wed *w;
++	int irq = 42;
++
++	mt7915_mmio_test_wed_on(test);
++	eth = kunit_device_register(test, "mt7915-wed-eth");
++	no_dma = kunit_device_register(test, "mt7915-wed-no-dma");
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(eth));
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(no_dma));
++	KUNIT_ASSERT_EQ(test, dma_coerce_mask_and_coherent(eth,
++			DMA_BIT_MASK(64)), 0);
++	no_dma->dma_mask = NULL;
++
++	w = mt76_test_wed_new(test);
++	w->dev = eth;
++	w->irq = 99;
++	mt76_test_wed_publish(w);
++	KUNIT_EXPECT_EQ(test, mt7915_mmio_wed_init(dev,
++			mt7915_mmio_test_pdev(test, true), false, &irq), 1);
++	KUNIT_EXPECT_TRUE(test, mtk_wed_device_active(wed));
++	KUNIT_EXPECT_EQ(test, irq, 99);
++	KUNIT_EXPECT_PTR_EQ(test, dev->mt76.dma_dev, eth);
++	KUNIT_EXPECT_EQ(test, *eth->dma_mask, DMA_BIT_MASK(32));
++	KUNIT_EXPECT_EQ(test, dev->mt76.rx_token_size,
++			MT7915_WED_RX_TOKEN_SIZE);
++
++	wed->ops = NULL;
++	w->dev = no_dma;
++	KUNIT_EXPECT_LT(test, mt7915_mmio_wed_init(dev,
++			mt7915_mmio_test_pdev(test, true), false, &irq), 0);
++	KUNIT_EXPECT_EQ(test, w->n_attach, 2);
++}
++
++/* the fake firmware: the SER trigger of a WED reset done at once */
++static int mt7915_mmio_test_wed_ser(struct mt76_test_fake *fake,
++				    const struct mt76_test_msg *msg)
++{
++	struct mt76_dev *mdev = fake->dev;
++
++	if (msg->cmd == MCU_EXT_CMD(SET_SER_TRIGGER))
++		complete(&mdev->mmio.wed_reset);
++	return 0;
++}
++
++/* The Ethernet driver's WED reset (under RTNL) runs an L1 recovery of the
++ * WLAN side: the firmware is told to start it, and the reset waits, without
++ * RTNL, for the host's DMA reset to say it's done. One at a time; a
++ * firmware that refuses ends it.
++ */
++static void mt7915_mmio_test_wed_reset(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt76_mmio *mmio = &dev->mt76.mmio;
++	struct mt76_test_msg *msg;
++	int ret;
++
++	init_completion(&mmio->wed_reset);
++	init_completion(&mmio->wed_reset_complete);
++	fake->mcu_hook = mt7915_mmio_test_wed_ser;
++
++	rtnl_lock();
++	ret = mt7915_mmio_wed_reset(&mmio->wed);
++	KUNIT_EXPECT_TRUE(test, rtnl_is_locked());
++	rtnl_unlock();
++	KUNIT_EXPECT_EQ(test, ret, 0);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_WED_RESET,
++					  &dev->mphy.state));
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(SET_SER_TRIGGER));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_EXPECT_EQ(test, msg->data[0], SER_RECOVER);
++	KUNIT_EXPECT_EQ(test, msg->data[1], SER_SET_RECOVER_L1);
++
++	/* another one already on */
++	set_bit(MT76_STATE_WED_RESET, &dev->mphy.state);
++	rtnl_lock();
++	ret = mt7915_mmio_wed_reset(&mmio->wed);
++	rtnl_unlock();
++	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
++	clear_bit(MT76_STATE_WED_RESET, &dev->mphy.state);
++
++	fake->mcu_ret = -EIO;
++	rtnl_lock();
++	ret = mt7915_mmio_wed_reset(&mmio->wed);
++	rtnl_unlock();
++	KUNIT_EXPECT_EQ(test, ret, -EIO);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_WED_RESET,
++					  &dev->mphy.state));
++}
++
++/* What the WO counted a station receiving goes to that station's counters;
++ * a station that isn't there (gone, or an index past the table) is skipped.
++ */
++static void mt7915_mmio_test_wed_rx_stats(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++	struct mtk_wed_wo_rx_stats st = {
++		.wlan_idx = cpu_to_le16(5),
++		.rx_pkt_cnt = cpu_to_le32(10),
++		.rx_byte_cnt = cpu_to_le32(1500),
++		.rx_err_cnt = cpu_to_le32(2),
++		.rx_drop_cnt = cpu_to_le32(1),
++	};
++	struct mt76_wcid *wcid;
++
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	wcid->idx = 5;
++	rcu_assign_pointer(dev->mt76.wcid[5], wcid);
++
++	mt7915_mmio_wed_update_rx_stats(wed, &st);
++	mt7915_mmio_wed_update_rx_stats(wed, &st);
++	KUNIT_EXPECT_EQ(test, wcid->stats.rx_packets, 20);
++	KUNIT_EXPECT_EQ(test, wcid->stats.rx_bytes, 3000);
++	KUNIT_EXPECT_EQ(test, wcid->stats.rx_errors, 4);
++	KUNIT_EXPECT_EQ(test, wcid->stats.rx_drops, 2);
++
++	st.wlan_idx = cpu_to_le16(6);
++	mt7915_mmio_wed_update_rx_stats(wed, &st);
++	st.wlan_idx = cpu_to_le16(0xffff);
++	mt7915_mmio_wed_update_rx_stats(wed, &st);
++	KUNIT_EXPECT_EQ(test, wcid->stats.rx_packets, 20);
++
++	RCU_INIT_POINTER(dev->mt76.wcid[5], NULL);
++	synchronize_rcu();
++}
++
++/* With a WED, the interrupt mask goes to WED as well, which raises the
++ * host's interrupts for it.
++ */
++static void mt7915_mmio_test_wed_irq_mask(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt76_test_wed *w;
++
++	w = mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++	mt7915_dual_hif_set_irq_mask(dev, true, 0, MT_INT_MCU_CMD);
++	KUNIT_EXPECT_EQ(test, w->n_set_mask, 1);
++	KUNIT_EXPECT_EQ(test, w->irq_mask, dev->mt76.mmio.irqmask);
++	KUNIT_EXPECT_NE(test, w->irq_mask & MT_INT_MCU_CMD, 0);
++}
++#endif
++
+ /* --- interrupts ----------------------------------------------------------- */
+ 
+ /* the rx queues the interrupt tasklet schedules */
+@@ -689,6 +946,13 @@ static struct kunit_case mt7915_mmio_test_cases[] = {
+ 	KUNIT_CASE(mt7915_mmio_test_probe_rev),
+ 	KUNIT_CASE(mt7915_mmio_test_probe_unknown),
+ 	KUNIT_CASE(mt7915_mmio_test_wed_init),
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_mmio_test_wed_init_no_attach),
++	KUNIT_CASE(mt7915_mmio_test_wed_init_attach),
++	KUNIT_CASE(mt7915_mmio_test_wed_reset),
++	KUNIT_CASE(mt7915_mmio_test_wed_rx_stats),
++	KUNIT_CASE(mt7915_mmio_test_wed_irq_mask),
++#endif
+ 	KUNIT_CASE(mt7915_mmio_test_tasklet_rx_tx),
+ 	KUNIT_CASE(mt7915_mmio_test_tasklet_rx_queues),
+ 	KUNIT_CASE(mt7915_mmio_test_tasklet_ser),
+diff --git a/tests/wed-fake.h b/tests/wed-fake.h
+new file mode 100644
+index 00000000..bb2d0cae
+--- /dev/null
++++ b/tests/wed-fake.h
+@@ -0,0 +1,312 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * A fake WED (Wireless Ethernet Dispatch) for mt76's KUnit tests
++ * (milkflint's QEMU test build only; included by the tests' *-test.c files).
++ *
++ * mtk_wed_device_active() only asks whether a WED device has ops: with this
++ * file's, the driver takes its WED paths against a model of the Ethernet
++ * driver's side (drivers/net/ethernet/mediatek/mtk_wed.c) that records what
++ * it is asked and answers as the test says:
++ *
++ * - attach, as mtk_wed_attach() does: drops the RCU read lock
++ *   mtk_wed_device_attach() took, then hands the WLAN driver the WED's
++ *   device (for DMA), interrupt, index and version;
++ * - detach clears the whole WED device, as __mtk_wed_detach() does;
++ * - a ring setup gives the ring its register base in the WED's own register
++ *   file (regs), which the ring's Q_READ()/Q_WRITE() then reach through
++ *   reg_read/reg_write;
++ * - everything else is counted.
++ *
++ * mt76_test_wed_init() gives a WED device the fake's ops directly (attached,
++ * as far as the driver can tell); mt76_test_wed_publish() registers them
++ * where mtk_wed_device_attach() looks, mtk_soc_wed_ops (tests/wed-test.c
++ * defines it, standing in for the Ethernet driver). One fake at a time, one
++ * global per file, gone when the test ends.
++ */
++#ifndef __MT76_TEST_WED_FAKE_H
++#define __MT76_TEST_WED_FAKE_H
++
++#include <kunit/test.h>
++#include <linux/soc/mediatek/mtk_wed.h>
++#include <linux/xarray.h>
++
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++
++/* where a ring's registers start in the WED's register file */
++#define MT76_TEST_WED_TX_REGS(n)	(0x300 + (n) * 0x10)
++#define MT76_TEST_WED_RX_REGS(n)	(0x500 + (n) * 0x10)
++#define MT76_TEST_WED_TXFREE_REGS	0x700
++
++struct mt76_test_wed {
++	struct kunit *test;
++	struct mtk_wed_device *wed;
++	struct mtk_wed_ops ops;		/* the WED's: a test may swap one */
++	struct xarray regs;		/* register offset -> value */
++	bool published;
++
++	/* what the calls return */
++	int attach_ret;
++	int tx_ring_ret, rx_ring_ret, txfree_ret;
++	int msg_ret, setup_tc_ret;
++	u32 irq_pending;		/* what irq_get reports, then clears */
++
++	/* what attach hands the WLAN driver */
++	struct device *dev;
++	int irq;
++	u8 version;
++	int wdma_idx;
++
++	/* what was asked */
++	int n_attach, n_detach, n_tx_ring, n_rx_ring, n_txfree;
++	int n_msg, n_start, n_stop, n_reset_dma, n_irq_get, n_set_mask;
++	int n_setup_tc, n_ppe_check, n_rro_rx, n_msdu_pg, n_ind;
++	int last_tx_ring, last_rx_ring, last_msg;
++	bool last_reset;
++	u32 start_mask, irq_mask;
++};
++
++static struct mt76_test_wed *mt76_test_wed __maybe_unused;
++
++static inline int mt76_test_wed_attach(struct mtk_wed_device *wed)
++	__releases(RCU)
++{
++	struct mt76_test_wed *w = mt76_test_wed;
++
++	rcu_read_unlock();
++	w->n_attach++;
++	if (w->attach_ret)
++		return w->attach_ret;
++
++	w->wed = wed;
++	wed->dev = w->dev;
++	wed->irq = w->irq;
++	wed->wdma_idx = w->wdma_idx;
++	wed->version = w->version;
++	return 0;
++}
++
++static inline void mt76_test_wed_detach(struct mtk_wed_device *wed)
++{
++	mt76_test_wed->n_detach++;
++	memset(wed, 0, sizeof(*wed));
++}
++
++static inline int mt76_test_wed_tx_ring(struct mtk_wed_device *wed, int ring,
++					void __iomem *regs, bool reset)
++{
++	struct mt76_test_wed *w = mt76_test_wed;
++
++	w->n_tx_ring++;
++	w->last_tx_ring = ring;
++	w->last_reset = reset;
++	if (w->tx_ring_ret)
++		return w->tx_ring_ret;
++	wed->tx_ring[ring].reg_base = MT76_TEST_WED_TX_REGS(ring);
++	return 0;
++}
++
++static inline int mt76_test_wed_rx_ring(struct mtk_wed_device *wed, int ring,
++					void __iomem *regs, bool reset)
++{
++	struct mt76_test_wed *w = mt76_test_wed;
++
++	w->n_rx_ring++;
++	w->last_rx_ring = ring;
++	w->last_reset = reset;
++	if (w->rx_ring_ret)
++		return w->rx_ring_ret;
++	wed->rx_ring[ring].reg_base = MT76_TEST_WED_RX_REGS(ring);
++	return 0;
++}
++
++static inline int mt76_test_wed_txfree_ring(struct mtk_wed_device *wed,
++					    void __iomem *regs)
++{
++	struct mt76_test_wed *w = mt76_test_wed;
++
++	w->n_txfree++;
++	if (w->txfree_ret)
++		return w->txfree_ret;
++	wed->txfree_ring.reg_base = MT76_TEST_WED_TXFREE_REGS;
++	return 0;
++}
++
++static inline int mt76_test_wed_msg(struct mtk_wed_device *wed, int cmd_id,
++				    void *data, int len)
++{
++	struct mt76_test_wed *w = mt76_test_wed;
++
++	w->n_msg++;
++	w->last_msg = cmd_id;
++	return w->msg_ret;
++}
++
++static inline void mt76_test_wed_ppe_check(struct mtk_wed_device *wed,
++					   struct sk_buff *skb, u32 reason,
++					   u32 hash)
++{
++	mt76_test_wed->n_ppe_check++;
++}
++
++static inline void mt76_test_wed_stop(struct mtk_wed_device *wed)
++{
++	mt76_test_wed->n_stop++;
++}
++
++static inline void mt76_test_wed_start(struct mtk_wed_device *wed, u32 mask)
++{
++	mt76_test_wed->n_start++;
++	mt76_test_wed->start_mask = mask;
++}
++
++static inline void mt76_test_wed_reset_dma(struct mtk_wed_device *wed)
++{
++	mt76_test_wed->n_reset_dma++;
++}
++
++static inline u32 mt76_test_wed_reg_read(struct mtk_wed_device *wed, u32 reg)
++{
++	void *v = xa_load(&mt76_test_wed->regs, reg);
++
++	return v ? xa_to_value(v) : 0;
++}
++
++static inline void mt76_test_wed_reg_write(struct mtk_wed_device *wed,
++					   u32 reg, u32 val)
++{
++	struct xarray *regs = &mt76_test_wed->regs;
++	unsigned long flags;
++
++	/* from any context, as fake.h's register file (same lock class) */
++	xa_lock_irqsave(regs, flags);
++	__xa_store(regs, reg, xa_mk_value(val), GFP_ATOMIC);
++	xa_unlock_irqrestore(regs, flags);
++}
++
++static inline u32 mt76_test_wed_irq_get(struct mtk_wed_device *wed, u32 mask)
++{
++	struct mt76_test_wed *w = mt76_test_wed;
++	u32 val = w->irq_pending & mask;
++
++	w->n_irq_get++;
++	w->irq_pending &= ~val;
++	return val;
++}
++
++static inline void mt76_test_wed_irq_set_mask(struct mtk_wed_device *wed,
++					      u32 mask)
++{
++	mt76_test_wed->n_set_mask++;
++	mt76_test_wed->irq_mask = mask;
++}
++
++static inline int mt76_test_wed_setup_tc(struct mtk_wed_device *wed,
++					 struct net_device *dev,
++					 enum tc_setup_type type,
++					 void *type_data)
++{
++	mt76_test_wed->n_setup_tc++;
++	return mt76_test_wed->setup_tc_ret;
++}
++
++static inline void mt76_test_wed_rro_rx_ring(struct mtk_wed_device *wed,
++					     int ring, void __iomem *regs)
++{
++	mt76_test_wed->n_rro_rx++;
++}
++
++static inline void mt76_test_wed_msdu_pg_ring(struct mtk_wed_device *wed,
++					      int ring, void __iomem *regs)
++{
++	mt76_test_wed->n_msdu_pg++;
++}
++
++static inline int mt76_test_wed_ind_ring(struct mtk_wed_device *wed,
++					 void __iomem *regs)
++{
++	mt76_test_wed->n_ind++;
++	return 0;
++}
++
++static inline void mt76_test_wed_free(void *data)
++{
++	struct mt76_test_wed *w = data;
++
++	if (w->published) {
++		RCU_INIT_POINTER(mtk_soc_wed_ops, NULL);
++		synchronize_rcu();
++	}
++	/* still attached: the driver doesn't see the fake's ops any more */
++	if (w->wed && w->wed->ops == &w->ops)
++		w->wed->ops = NULL;
++	xa_destroy(&w->regs);
++	if (mt76_test_wed == w)
++		mt76_test_wed = NULL;
++}
++
++/* a fresh fake WED, a version 2 one (the MT7986's), not attached yet */
++static inline struct mt76_test_wed *mt76_test_wed_new(struct kunit *test)
++{
++	struct mt76_test_wed *w;
++
++	w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	w->test = test;
++	w->version = 2;
++	w->irq = 77;
++	xa_init_flags(&w->regs, XA_FLAGS_LOCK_IRQ);
++	w->ops = (struct mtk_wed_ops) {
++		.attach = mt76_test_wed_attach,
++		.tx_ring_setup = mt76_test_wed_tx_ring,
++		.rx_ring_setup = mt76_test_wed_rx_ring,
++		.txfree_ring_setup = mt76_test_wed_txfree_ring,
++		.msg_update = mt76_test_wed_msg,
++		.detach = mt76_test_wed_detach,
++		.ppe_check = mt76_test_wed_ppe_check,
++		.stop = mt76_test_wed_stop,
++		.start = mt76_test_wed_start,
++		.reset_dma = mt76_test_wed_reset_dma,
++		.reg_read = mt76_test_wed_reg_read,
++		.reg_write = mt76_test_wed_reg_write,
++		.irq_get = mt76_test_wed_irq_get,
++		.irq_set_mask = mt76_test_wed_irq_set_mask,
++		.setup_tc = mt76_test_wed_setup_tc,
++		.rro_rx_ring_setup = mt76_test_wed_rro_rx_ring,
++		.msdu_pg_rx_ring_setup = mt76_test_wed_msdu_pg_ring,
++		.ind_rx_ring_setup = mt76_test_wed_ind_ring,
++	};
++	mt76_test_wed = w;
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_test_wed_free, w), 0);
++	return w;
++}
++
++/* @wed attached to the fake, as far as the driver can tell */
++static inline struct mt76_test_wed *
++mt76_test_wed_init(struct kunit *test, struct mtk_wed_device *wed)
++{
++	struct mt76_test_wed *w = mt76_test_wed_new(test);
++
++	w->wed = wed;
++	wed->ops = &w->ops;
++	wed->version = w->version;
++	wed->irq = w->irq;
++	return w;
++}
++
++/* the fake, where mtk_wed_device_attach() finds a WED */
++static inline void mt76_test_wed_publish(struct mt76_test_wed *w)
++{
++	rcu_assign_pointer(mtk_soc_wed_ops, &w->ops);
++	w->published = true;
++}
++
++/* a value in the WED's register file */
++static inline u32 mt76_test_wed_reg(struct mt76_test_wed *w, u32 reg)
++{
++	return mt76_test_wed_reg_read(w->wed, reg);
++}
++
++#endif /* CONFIG_NET_MEDIATEK_SOC_WED */
++
++#endif
+diff --git a/tests/wed-test.c b/tests/wed-test.c
+index 634c377b..8da482ea 100644
+--- a/tests/wed-test.c
++++ b/tests/wed-test.c
+@@ -15,7 +15,9 @@
+  * one).
+  */
+ #include <kunit/test.h>
++#include <net/page_pool/helpers.h>
+ #include "fake.h"
++#include "wed-fake.h"
+ 
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 
+@@ -104,10 +106,390 @@ static void mt76_wed_test_offload_enable_busy(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, dev->token_size, MT76_WED_TEST_START);
+ }
+ 
++/* --- the rx buffers WED keeps for the host --------------------------------- */
++
++/* The device's DMA setup, as a test needs it for page pools */
++static void mt76_wed_test_dma(struct kunit *test, struct mt76_dev *dev)
++{
++	KUNIT_ASSERT_EQ(test, dma_coerce_mask_and_coherent(dev->dma_dev,
++			DMA_BIT_MASK(32)), 0);
++}
++
++static void mt76_wed_test_pool_destroy(void *data)
++{
++	struct mt76_queue *q = data;
++
++	page_pool_destroy(q->page_pool);
++	q->page_pool = NULL;
++}
++
++/* rx queue @qid with a page pool of buffers of @buf_size bytes and its NAPI
++ * parked, as netif_napi_add() leaves it (the pool links to it)
++ */
++static struct mt76_queue *mt76_wed_test_rxq(struct kunit *test,
++					    struct mt76_dev *dev,
++					    enum mt76_rxq_id qid, int buf_size)
++{
++	struct mt76_queue *q = &dev->q_rx[qid];
++	struct napi_struct *napi = &dev->napi[qid];
++
++	set_bit(NAPI_STATE_SCHED, &napi->state);
++	WRITE_ONCE(napi->list_owner, -1);
++	q->ndesc = 8;
++	q->buf_size = buf_size;
++	KUNIT_ASSERT_EQ(test, mt76_create_page_pool(dev, q), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt76_wed_test_pool_destroy, q), 0);
++	return q;
++}
++
++/* the page pool rx buffer @buf came from */
++static struct page_pool *mt76_wed_test_pool(void *buf)
++{
++	return virt_to_head_page(buf)->pp;
++}
++
++/* the token in WED rx buffer descriptor @d */
++static int mt76_wed_test_desc_token(const struct mtk_wed_bm_desc *d)
++{
++	return FIELD_GET(MT_DMA_CTL_TOKEN, le32_to_cpu(d->token));
++}
++
++/* WED's rx buffer ring, filled by the host: a buffer of the main rx queue's
++ * page pool per descriptor, registered as an rx token, its address and token
++ * in the descriptor. Released, every token goes and every buffer is back in
++ * its pool, the rxwi with them. On WED version 2 with the main phy on band 1
++ * the buffers come from band 1's queue.
++ */
++static void mt76_wed_test_rx_buf(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mmio.wed;
++	struct mtk_wed_bm_desc *desc;
++	struct mt76_queue *q, *q1;
++	int i;
++
++	mt76_wed_test_dma(test, dev);
++	mt76_test_wed_init(test, wed);
++	q = mt76_wed_test_rxq(test, dev, MT_RXQ_MAIN, 2048);
++	q1 = mt76_wed_test_rxq(test, dev, MT_RXQ_BAND1, 2048);
++	dev->rx_token_size = 16;
++	desc = kunit_kcalloc(test, 8, sizeof(*desc), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, desc);
++	wed->rx_buf_ring.desc = desc;
++
++	KUNIT_ASSERT_EQ(test, mt76_wed_init_rx_buf(wed, 8), 0);
++	for (i = 0; i < 8; i++) {
++		struct mt76_txwi_cache *t;
++
++		t = idr_find(&dev->rx_token, mt76_wed_test_desc_token(&desc[i]));
++		KUNIT_ASSERT_NOT_NULL_MSG(test, t, "descriptor %d", i);
++		KUNIT_ASSERT_NOT_NULL(test, t->ptr);
++		KUNIT_EXPECT_PTR_EQ(test, mt76_wed_test_pool(t->ptr),
++				    q->page_pool);
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(desc[i].buf0),
++				lower_32_bits(t->dma_addr));
++	}
++
++	mt76_wed_release_rx_buf(wed);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->rx_token));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->rxwi_cache));
++
++	memset(desc, 0, 8 * sizeof(*desc));
++	dev->phy.band_idx = MT_BAND1;
++	KUNIT_ASSERT_EQ(test, mt76_wed_init_rx_buf(wed, 2), 0);
++	for (i = 0; i < 2; i++) {
++		struct mt76_txwi_cache *t;
++
++		t = idr_find(&dev->rx_token, mt76_wed_test_desc_token(&desc[i]));
++		KUNIT_ASSERT_NOT_NULL(test, t);
++		KUNIT_EXPECT_PTR_EQ(test, mt76_wed_test_pool(t->ptr),
++				    q1->page_pool);
++	}
++	mt76_wed_release_rx_buf(wed);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->rx_token));
++}
++
++/* More buffers asked for than there are rx tokens: the fill fails, and
++ * what it had registered is released again, nothing kept.
++ */
++static void mt76_wed_test_rx_buf_no_tokens(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mtk_wed_device *wed = &dev->mmio.wed;
++
++	mt76_wed_test_dma(test, dev);
++	mt76_test_wed_init(test, wed);
++	mt76_wed_test_rxq(test, dev, MT_RXQ_MAIN, 2048);
++	dev->rx_token_size = 4;
++	wed->rx_buf_ring.desc = kunit_kcalloc(test, 8,
++					      sizeof(*wed->rx_buf_ring.desc),
++					      GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wed->rx_buf_ring.desc);
++
++	KUNIT_EXPECT_EQ(test, mt76_wed_init_rx_buf(wed, 8), -ENOMEM);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->rx_token));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->rxwi_cache));
++}
++
++/* --- rings ------------------------------------------------------------------ */
++
++/* a queue of @ndesc descriptors in memory, flagged @flags, on the device's
++ * WED
++ */
++static struct mt76_queue *mt76_wed_test_queue(struct kunit *test,
++					      struct mt76_dev *dev, u16 flags)
++{
++	struct mt76_queue *q = kunit_kzalloc(test, sizeof(*q), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, q);
++	q->ndesc = 4;
++	q->desc = kunit_kcalloc(test, q->ndesc, sizeof(*q->desc), GFP_KERNEL);
++	q->entry = kunit_kcalloc(test, q->ndesc, sizeof(*q->entry), GFP_KERNEL);
++	q->regs = (void __force __iomem *)kunit_kzalloc(test,
++			sizeof(struct mt76_queue_regs), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, q->desc);
++	KUNIT_ASSERT_NOT_NULL(test, q->entry);
++	KUNIT_ASSERT_NOT_NULL(test, (void __force *)q->regs);
++	q->flags = flags;
++	q->wed = &dev->mmio.wed;
++	return q;
++}
++
++/* A queue WED doesn't take: none there, no WED attached, or no WED flag; it
++ * is the host's, its WED flag dropped.
++ */
++static void mt76_wed_test_dma_setup_none(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_queue *q = mt76_wed_test_queue(test, dev, MT_WED_Q_TX(0));
++	struct mt76_queue empty = {};
++
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, NULL, false), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, &empty, false), -EINVAL);
++
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), 0);
++	KUNIT_EXPECT_FALSE(test, q->flags & MT_QFLAG_WED);
++
++	mt76_test_wed_init(test, &dev->mmio.wed);
++	q->flags = MT_WED_Q_TX(0);
++	q->wed = NULL;
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), 0);
++	KUNIT_EXPECT_FALSE(test, q->flags & MT_QFLAG_WED);
++}
++
++/* WED takes a tx or rx ring over by its number: the queue's registers are
++ * WED's from then on; a ring WED refuses keeps none. A type WED doesn't
++ * have is refused.
++ */
++static void mt76_wed_test_dma_setup_rings(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_test_wed *w = mt76_test_wed_init(test, &dev->mmio.wed);
++	struct mt76_queue *q;
++
++	q = mt76_wed_test_queue(test, dev, MT_WED_Q_TX(1));
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, true), 0);
++	KUNIT_EXPECT_EQ(test, w->n_tx_ring, 1);
++	KUNIT_EXPECT_EQ(test, w->last_tx_ring, 1);
++	KUNIT_EXPECT_TRUE(test, w->last_reset);
++	KUNIT_EXPECT_EQ(test, q->wed_regs, MT76_TEST_WED_TX_REGS(1));
++	KUNIT_EXPECT_EQ(test, q->flags, MT_WED_Q_TX(1));
++	/* its registers are WED's now */
++	Q_WRITE(q, cpu_idx, 3);
++	KUNIT_EXPECT_EQ(test, mt76_test_wed_reg(w, MT76_TEST_WED_TX_REGS(1) +
++			offsetof(struct mt76_queue_regs, cpu_idx)), 3);
++	KUNIT_EXPECT_EQ(test, readl(&q->regs->cpu_idx), 0);
++
++	q = mt76_wed_test_queue(test, dev, MT_WED_Q_TX(0));
++	w->tx_ring_ret = -ENOMEM;
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), -ENOMEM);
++	KUNIT_EXPECT_EQ(test, q->wed_regs, 0);
++
++	q = mt76_wed_test_queue(test, dev, MT_WED_Q_RX(1));
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), 0);
++	KUNIT_EXPECT_EQ(test, w->last_rx_ring, 1);
++	KUNIT_EXPECT_FALSE(test, w->last_reset);
++	KUNIT_EXPECT_EQ(test, q->wed_regs, MT76_TEST_WED_RX_REGS(1));
++
++	q = mt76_wed_test_queue(test, dev, MT_WED_Q_RX(0));
++	w->rx_ring_ret = -EBUSY;
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), -EBUSY);
++	KUNIT_EXPECT_EQ(test, q->wed_regs, 0);
++
++	q = mt76_wed_test_queue(test, dev, __MT_WED_Q(7, 0));
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), -EINVAL);
++	KUNIT_EXPECT_EQ(test, q->flags, __MT_WED_Q(7, 0));
++}
++
++/* WED version 3's reorder rings (not the MT7986's): the host resets them
++ * itself, as full rings handed to the hardware, and WED is told where they
++ * are.
++ */
++static void mt76_wed_test_dma_setup_rro(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_test_wed *w = mt76_test_wed_init(test, &dev->mmio.wed);
++	struct mt76_queue *q;
++	u16 flags;
++
++	flags = MT_WED_RRO_Q_DATA(1);
++	q = mt76_wed_test_queue(test, dev, flags);
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), 0);
++	KUNIT_EXPECT_EQ(test, w->n_rro_rx, 1);
++	KUNIT_EXPECT_EQ(test, q->head, q->ndesc - 1);
++	KUNIT_EXPECT_EQ(test, q->queued, q->ndesc - 1);
++	KUNIT_EXPECT_EQ(test, q->flags, flags);
++	/* written by the host, not through WED */
++	KUNIT_EXPECT_EQ(test, readl(&q->regs->ring_size), q->ndesc);
++
++	flags = MT_WED_RRO_Q_MSDU_PG(2);
++	q = mt76_wed_test_queue(test, dev, flags);
++	KUNIT_EXPECT_EQ(test, mt76_wed_dma_setup(dev, q, false), 0);
++	KUNIT_EXPECT_EQ(test, w->n_msdu_pg, 1);
++	KUNIT_EXPECT_EQ(test, q->head, q->ndesc - 1);
++	KUNIT_EXPECT_EQ(test, q->flags, flags);
++}
++
++/* --- reset, offload ----------------------------------------------------------- */
++
++/* The DMA reset handshake with the Ethernet driver's WED reset: only while
++ * one is on (MT76_STATE_WED_RESET), the host says its DMA is reset and waits
++ * for WED to say it's done (mt76_wed_reset_complete()).
++ */
++static void mt76_wed_test_dma_reset(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_mmio *mmio = &dev->mmio;
++
++	init_completion(&mmio->wed_reset);
++	init_completion(&mmio->wed_reset_complete);
++
++	mt76_wed_dma_reset(dev);
++	KUNIT_EXPECT_FALSE(test, completion_done(&mmio->wed_reset));
++
++	set_bit(MT76_STATE_WED_RESET, &dev->phy.state);
++	mt76_wed_reset_complete(&mmio->wed);
++	mt76_wed_dma_reset(dev);
++	KUNIT_EXPECT_TRUE(test, completion_done(&mmio->wed_reset));
++	/* the one completion consumed by the wait */
++	KUNIT_EXPECT_FALSE(test, completion_done(&mmio->wed_reset_complete));
++	clear_bit(MT76_STATE_WED_RESET, &dev->phy.state);
++}
++
++/* A traffic control (flow offload) setup goes to WED, or is refused when
++ * there's none.
++ */
++static void mt76_wed_test_setup_tc(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_test_wed *w;
++
++	KUNIT_EXPECT_EQ(test, mt76_wed_net_setup_tc(dev->hw, NULL, NULL,
++			TC_SETUP_BLOCK, NULL), -EOPNOTSUPP);
++
++	w = mt76_test_wed_init(test, &dev->mmio.wed);
++	KUNIT_EXPECT_EQ(test, mt76_wed_net_setup_tc(dev->hw, NULL, NULL,
++			TC_SETUP_BLOCK, NULL), 0);
++	w->setup_tc_ret = -EBUSY;
++	KUNIT_EXPECT_EQ(test, mt76_wed_net_setup_tc(dev->hw, NULL, NULL,
++			TC_SETUP_BLOCK, NULL), -EBUSY);
++	KUNIT_EXPECT_EQ(test, w->n_setup_tc, 2);
++}
++
++/* --- tokens and tx status ----------------------------------------------------- */
++
++static struct mt76_txwi_cache *mt76_wed_test_txwi(struct kunit *test)
++{
++	struct mt76_txwi_cache *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, t);
++	t->qid = MT_TXQ_BE;
++	return t;
++}
++
++/* With a WED attached the host counts the frames it sent with tokens of
++ * WED's half (from token_start on), for mt76_wed_offload_enable() to wait
++ * until the last of them is back.
++ */
++static void mt76_wed_test_tokens(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_txwi_cache *t[2];
++	int token[2];
++
++	mt76_test_wed_init(test, &dev->mmio.wed);
++	t[0] = mt76_wed_test_txwi(test);
++	t[1] = mt76_wed_test_txwi(test);
++
++	/* the host's half: not counted */
++	token[0] = mt76_token_consume(dev, &t[0]);
++	KUNIT_EXPECT_EQ(test, token[0], 0);
++	KUNIT_EXPECT_EQ(test, dev->wed_token_count, 0);
++
++	/* one of WED's (the host's own half all taken) */
++	dev->token_start = MT76_WED_TEST_START;
++	token[1] = mt76_token_consume(dev, &t[1]);
++	KUNIT_EXPECT_EQ(test, token[1], MT76_WED_TEST_START);
++	KUNIT_EXPECT_EQ(test, dev->wed_token_count, 1);
++	KUNIT_EXPECT_EQ(test, dev->token_count, 2);
++
++	KUNIT_EXPECT_PTR_EQ(test, mt76_token_release(dev, token[1], NULL),
++			    t[1]);
++	KUNIT_EXPECT_EQ(test, dev->wed_token_count, 0);
++	KUNIT_EXPECT_PTR_EQ(test, mt76_token_release(dev, token[0], NULL),
++			    t[0]);
++	KUNIT_EXPECT_EQ(test, dev->wed_token_count, 0);
++	KUNIT_EXPECT_EQ(test, dev->token_count, 0);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->token));
++}
++
++/* A data frame without a status request goes through WED without a packet
++ * id the host tracks: MT_PACKET_ID_WED, whether 802.3 or 802.11; anything
++ * else without a request gets none at all.
++ */
++static void mt76_wed_test_status_id(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_wed_test_dev(test);
++	struct mt76_wcid wcid = {};
++	struct ieee80211_hdr *hdr;
++	struct sk_buff *skb;
++
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	hdr = skb_put_zero(skb, 24);
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 IEEE80211_STYPE_QOS_DATA);
++
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, &wcid, skb),
++			MT_PACKET_ID_NO_SKB);
++	mt76_test_wed_init(test, &dev->mmio.wed);
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, &wcid, skb),
++			MT_PACKET_ID_WED);
++
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
++					 IEEE80211_STYPE_ACTION);
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, &wcid, skb),
++			MT_PACKET_ID_NO_SKB);
++	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
++	KUNIT_EXPECT_EQ(test, mt76_tx_status_skb_add(dev, &wcid, skb),
++			MT_PACKET_ID_WED);
++	kfree_skb(skb);
++}
++
+ static struct kunit_case mt76_wed_test_cases[] = {
+ 	KUNIT_CASE(mt76_wed_test_no_wed),
+ 	KUNIT_CASE(mt76_wed_test_offload_enable),
+ 	KUNIT_CASE(mt76_wed_test_offload_enable_busy),
++	KUNIT_CASE(mt76_wed_test_rx_buf),
++	KUNIT_CASE(mt76_wed_test_rx_buf_no_tokens),
++	KUNIT_CASE(mt76_wed_test_dma_setup_none),
++	KUNIT_CASE(mt76_wed_test_dma_setup_rings),
++	KUNIT_CASE(mt76_wed_test_dma_setup_rro),
++	KUNIT_CASE(mt76_wed_test_dma_reset),
++	KUNIT_CASE(mt76_wed_test_setup_tc),
++	KUNIT_CASE(mt76_wed_test_tokens),
++	KUNIT_CASE(mt76_wed_test_status_id),
+ 	{}
+ };
+ 

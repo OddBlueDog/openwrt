@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 14:48:19 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: the hardware init with wcid 0
+ taken
+
+mt7915_init_hardware()'s error paths after the firmware is up had no
+test. mt7915_replay_test_init_hardware_no_wcid0: with wcid 0 (the global
+one, for beacons and management frames) already taken, the init fails
+with -ENOSPC once the firmware runs, and takes everything down again:
+WFDMA stopped, the firmware given back, no global wcid published.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/replay-test.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/mt7915/tests/replay-test.c b/mt7915/tests/replay-test.c
+index 910d7106..2c1f6088 100644
+--- a/mt7915/tests/replay-test.c
++++ b/mt7915/tests/replay-test.c
+@@ -520,6 +520,37 @@ static void mt7915_replay_test_init_hardware(struct kunit *test)
+ 	mt7915_replay_test_same(test, data, again);
+ }
+ 
++/* With wcid 0 taken (it must be the global one: beacons and management
++ * frames go out on it), the hardware init fails after the firmware is up,
++ * and takes everything down again: WFDMA stopped, the firmware given back,
++ * no global wcid published.
++ */
++static void mt7915_replay_test_init_hardware_no_wcid0(struct kunit *test)
++{
++	struct mt7915_phy *phy2;
++	struct mt7915_dev *dev;
++
++	mt7915_replay_test_firmware(test);
++	rcu_expedite_gp();
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_init_test_unexpedite, NULL), 0);
++
++	dev = mt7915_replay_test_model(test, true);
++	dev->dbdc_support = mt7915_band_config(dev);
++	phy2 = mt7915_alloc_ext_phy(dev);
++	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(phy2));
++	dev->mt76.wcid_mask[0] |= BIT(0);
++
++	KUNIT_EXPECT_EQ(test, mt7915_init_hardware(dev, phy2), -ENOSPC);
++	KUNIT_EXPECT_NE(test, mt76_rr(dev, MT_TOP_LPCR_HOST_BAND(0)) &
++			MT_TOP_LPCR_HOST_FW_OWN, 0);
++	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
++			(MT_WFDMA0_GLO_CFG_TX_DMA_EN |
++			 MT_WFDMA0_GLO_CFG_RX_DMA_EN), 0);
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(dev->mt76.wcid[0]));
++	ieee80211_free_hw(phy2->mt76->hw);
++}
++
+ /* All of mt7915_register_device(), the init work it queues and
+  * mt7915_unregister_device(), replayed: both bands registered with
+  * mac80211, the init work's commands answered, the debugfs and coredump
+@@ -635,6 +666,7 @@ static void mt7915_replay_test_capture(struct kunit *test)
+ static struct kunit_case mt7915_replay_test_cases[] = {
+ 	KUNIT_CASE(mt7915_replay_test_init_firmware),
+ 	KUNIT_CASE(mt7915_replay_test_init_hardware),
++	KUNIT_CASE(mt7915_replay_test_init_hardware_no_wcid0),
+ 	KUNIT_CASE(mt7915_replay_test_register_device),
+ 	KUNIT_CASE(mt7915_replay_test_capture),
+ 	{}

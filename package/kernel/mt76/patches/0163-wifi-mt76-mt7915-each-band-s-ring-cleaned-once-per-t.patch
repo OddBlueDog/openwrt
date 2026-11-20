@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:56:48 +0000
+Subject: [PATCH] wifi: mt76: mt7915: each band's ring cleaned once per tx-free
+ event
+
+mt7915_mac_tx_free_prepare() cleaned each band's MT_TXQ_PSD queue, then its MT_TXQ_BE queue. mt76_connac_init_tx_queues() points all of a band's q_tx[] up to MT_TXQ_PSD at one ring, so the second cleanup found nothing left and only read the ring's DMA index again: a register read and a lock pair per band on every tx-free event. The PSD queue is cleaned now only if it is a ring of its own.
+
+KUnit (mt7915-mac-tx): the tx-free tests count one cleanup per band instead of two.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/mac.c            | 13 ++++++++++---
+ mt7915/tests/mac-test.c | 16 ++++++++--------
+ 2 files changed, 18 insertions(+), 11 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 39b228e0..972ba18b 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -860,12 +860,19 @@ mt7915_mac_tx_free_prepare(struct mt7915_dev *dev)
+ 	struct mt76_dev *mdev = &dev->mt76;
+ 	struct mt76_phy *mphy_ext = mdev->phys[MT_BAND1];
+ 
+-	/* clean DMA queues and unmap buffers first */
+-	mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_PSD], false);
++	/* clean DMA queues and unmap buffers first: each band's one ring,
++	 * which all its q_tx[] up to MT_TXQ_PSD point at
++	 * (mt76_connac_init_tx_queues()), so a second cleanup of it would only
++	 * read its DMA index again
++	 */
+ 	mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_BE], false);
++	if (dev->mphy.q_tx[MT_TXQ_PSD] != dev->mphy.q_tx[MT_TXQ_BE])
++		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[MT_TXQ_PSD], false);
+ 	if (mphy_ext) {
+-		mt76_queue_tx_cleanup(dev, mphy_ext->q_tx[MT_TXQ_PSD], false);
+ 		mt76_queue_tx_cleanup(dev, mphy_ext->q_tx[MT_TXQ_BE], false);
++		if (mphy_ext->q_tx[MT_TXQ_PSD] != mphy_ext->q_tx[MT_TXQ_BE])
++			mt76_queue_tx_cleanup(dev, mphy_ext->q_tx[MT_TXQ_PSD],
++					      false);
+ 	}
+ }
+ 
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 592fc1cd..4ffdeada 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -2599,8 +2599,8 @@ static void mt7915_test_tx_free(struct kunit *test)
+ 			      msta->wcid.stats.tx_attempts[3] +
+ 			      msta->wcid.stats.tx_attempts[4], 0);
+ 	KUNIT_EXPECT_FALSE(test, env->q.blocked);
+-	/* band 0's PSD and BE rings were cleaned first */
+-	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
++	/* band 0's ring (its PSD and BE queues) was cleaned first, once */
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 1);
+ 
+ 	/* polled: four chains at -62 dBm combine to -57 dBm */
+ 	KUNIT_EXPECT_TRUE(test, list_empty(&dev->mt76.sta_poll_list));
+@@ -2694,8 +2694,8 @@ static void mt7915_test_tx_free_v3(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_retries, 1);
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_failed, 0);
+ 	KUNIT_EXPECT_EQ(test, msta->wcid.stats.tx_attempts[1], 1);
+-	/* both bands' rings */
+-	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 4);
++	/* both bands' rings, once each */
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
+ }
+ 
+ /*
+@@ -2974,7 +2974,7 @@ static void mt7915_test_tx_free_v0(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, mt7915_test_skb_freed(skb[1]));
+ 	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, 0);
+ 	KUNIT_EXPECT_FALSE(test, env->q.blocked);
+-	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 1);
+ 	/* the station was polled from its frame's descriptor: three chains
+ 	 * at -62 dBm, the fourth unheard
+ 	 */
+@@ -3184,10 +3184,10 @@ static void mt7915_test_rx_check_types(struct kunit *test)
+ 
+ 	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY, 0, 0, NULL, 0);
+ 	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 8));
+-	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 1);
+ 	ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY_V0, 0, 0, NULL, 0);
+ 	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 8));
+-	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 4);
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
+ 	ev = mt7915_test_event(test, PKT_TYPE_RX_FW_MONITOR, 0, 0, NULL, 0);
+ 	KUNIT_EXPECT_FALSE(test, mt7915_test_rx_check(dev, ev, 8));
+ 	ev = mt7915_test_event(test, PKT_TYPE_TXS, 0, 0, NULL, 0);
+@@ -3197,7 +3197,7 @@ static void mt7915_test_rx_check_types(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, mt7915_test_rx_check(dev, ev, 8));
+ 	ev = mt7915_test_event(test, PKT_TYPE_RX_EVENT, 0, 0, NULL, 0);
+ 	KUNIT_EXPECT_TRUE(test, mt7915_test_rx_check(dev, ev, 8));
+-	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 4);
++	KUNIT_EXPECT_EQ(test, mt7915_test_cleanups, 2);
+ }
+ 
+ static struct sk_buff *mt7915_test_event_skb(struct kunit *test, __le32 *ev,

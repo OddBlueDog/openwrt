@@ -1,0 +1,438 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 13:45:30 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: TWT teardowns, beacons and BA
+ stops on mac80211's own interfaces
+
+The callbacks that hand an interface back to mac80211 had no test: the
+main tests' interfaces were the driver's part only, and mac80211 would
+look past them for its own. That left the TWT teardowns sent after a
+firmware restart (MilkFlint's own code) at 0%, and the beacon a BSS
+gives the firmware untested beyond "beaconing off".
+
+The KUnit build gives mt7915/main.c mac80211's internal headers (as tx.c
+has them for the power save simulation), and main-test.c an AP interface
+that is mac80211's sub_if_data, with a beacon when a test needs one.
+
+- mt7915_main_test_twt_send_teardown: an unprotected S1G TWT Teardown
+  with the flow, from the interface, on the voice queue of the station's
+  band, counted; one mac80211 drops (a 4-address VLAN without its
+  station) neither sent nor counted.
+- mt7915_main_test_twt_lost: after a restart each lost flow is torn down
+  in turn and counted lost, once.
+- mt7915_main_test_add_beacon: mac80211's template (TIM included) in the
+  enabled offload TLV; off, none; too large for the firmware, or no
+  beacon, refused with nothing sent.
+- mt7915_main_test_ampdu_tx_stop_cont: the firmware session ends, the txq
+  stops aggregating, mac80211 is told.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/Makefile          |   6 +
+ mt7915/tests/main-test.c | 362 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 368 insertions(+)
+
+diff --git a/mt7915/Makefile b/mt7915/Makefile
+index 410d81ac..2ab5fdd4 100644
+--- a/mt7915/Makefile
++++ b/mt7915/Makefile
+@@ -4,6 +4,12 @@ ccflags-y += -DCONFIG_MT76_LEDS
+ ifneq ($(MT76_RECORD),)
+ ccflags-y += -DCONFIG_MT76_RECORD
+ endif
++# milkflint's KUnit tests (QEMU test build only): tests/main-test.c gives
++# the driver interfaces that are mac80211's own, so main.c sees mac80211's
++# internal headers there
++ifneq ($(findstring -DCONFIG_MT76_KUNIT_TEST,$(NOSTDINC_FLAGS)),)
++CFLAGS_main.o += -I$(firstword $(wildcard $(KBUILD_EXTMOD)/../mac80211-*/backports-*/net/mac80211))
++endif
+ obj-$(CONFIG_MT7915E) += mt7915e.o
+ 
+ mt7915e-y := pci.o init.o dma.o eeprom.o main.o mcu.o mac.o \
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index adf6a0b2..91c885df 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -290,6 +290,84 @@ static void mt7915_main_test_check_group(struct kunit *test,
+ 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(msg->data + 12), group);
+ }
+ 
++#if __has_include("ieee80211_i.h")
++/*
++ * mac80211's internal headers (mt7915/Makefile): sta_info.h declares the
++ * same EWMAs as mt76.h (signal) and mt7915.h (avg_signal), its copies get
++ * other names here
++ */
++#define ewma_signal		mt7915_main_test_mac80211_ewma_signal
++#define ewma_signal_init	mt7915_main_test_mac80211_ewma_signal_init
++#define ewma_signal_read	mt7915_main_test_mac80211_ewma_signal_read
++#define ewma_signal_add		mt7915_main_test_mac80211_ewma_signal_add
++#define ewma_avg_signal		mt7915_main_test_mac80211_ewma_avg_signal
++#define ewma_avg_signal_init	mt7915_main_test_mac80211_ewma_avg_signal_init
++#define ewma_avg_signal_read	mt7915_main_test_mac80211_ewma_avg_signal_read
++#define ewma_avg_signal_add	mt7915_main_test_mac80211_ewma_avg_signal_add
++#include "ieee80211_i.h"
++#include "sta_info.h"
++#undef ewma_signal
++#undef ewma_signal_init
++#undef ewma_signal_read
++#undef ewma_signal_add
++#undef ewma_avg_signal
++#undef ewma_avg_signal_init
++#undef ewma_avg_signal_read
++#undef ewma_avg_signal_add
++#define MT7915_MAIN_TEST_SDATA
++
++/* An AP interface added on @hw that is mac80211's own (its sub_if_data,
++ * as ieee80211_if_add() leaves it): what mac80211 does with a vif the
++ * driver hands back, ieee80211_tx_prepare_skb() among it, works on it.
++ */
++static struct ieee80211_vif *
++mt7915_main_test_sdata_ap(struct kunit *test, struct ieee80211_hw *hw, u8 id)
++{
++	struct ieee80211_sub_if_data *sdata;
++	struct ieee80211_vif *vif;
++	int ac;
++
++	sdata = kunit_kzalloc(test, sizeof(*sdata) + sizeof(struct mt7915_vif),
++			      GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, sdata);
++	sdata->local = hw_to_local(hw);
++	sdata->wdev.wiphy = hw->wiphy;
++	sdata->wdev.iftype = NL80211_IFTYPE_AP;
++	sdata->flags = IEEE80211_SDATA_IN_DRIVER;
++	sdata->control_port_protocol = cpu_to_be16(ETH_P_PAE);
++	sdata->bss = &sdata->u.ap;
++	INIT_LIST_HEAD(&sdata->u.ap.vlans);
++	skb_queue_head_init(&sdata->u.ap.ps.bc_buf);
++	sdata->deflink.sdata = sdata;
++	sdata->deflink.conf = &sdata->vif.bss_conf;
++	/* every rate of every band, as ieee80211_if_add() starts it */
++	for (ac = 0; ac < NUM_NL80211_BANDS; ac++) {
++		struct ieee80211_supported_band *sband = hw->wiphy->bands[ac];
++
++		if (sband)
++			sdata->rc_rateidx_mask[ac] = BIT(sband->n_bitrates) - 1;
++	}
++
++	vif = &sdata->vif;
++	vif->type = NL80211_IFTYPE_AP;
++	vif->addr[0] = 0x02;
++	vif->addr[4] = 0x76;
++	vif->addr[5] = id;
++	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++)
++		vif->hw_queue[ac] = ac;
++	vif->bss_conf.vif = vif;
++	memcpy(vif->bss_conf.addr, vif->addr, ETH_ALEN);
++	vif->bss_conf.bssid = vif->addr;
++	vif->bss_conf.beacon_int = 100;
++	vif->bss_conf.dtim_period = 2;
++	RCU_INIT_POINTER(vif->link_conf[0], &vif->bss_conf);
++	RCU_INIT_POINTER(sdata->link[0], &sdata->deflink);
++
++	KUNIT_ASSERT_EQ(test, mt7915_add_interface(hw, vif), 0);
++	return vif;
++}
++#endif
++
+ /* --- start / stop ---------------------------------------------------------- */
+ 
+ /* Starting band 0 powers its MAC on in the firmware (power save off first,
+@@ -2271,6 +2349,284 @@ static void mt7915_main_test_wed_forward_path(struct kunit *test)
+ }
+ #endif
+ 
++#ifdef MT7915_MAIN_TEST_SDATA
++static void mt7915_main_test_ba_params(struct ieee80211_ampdu_params *p,
++				       struct ieee80211_sta *sta,
++				       enum ieee80211_ampdu_mlme_action action);
++static struct sta_rec_ba *mt7915_main_test_ba(void);
++
++/* the next frame for @wcid, taken off its queue */
++static struct sk_buff *mt7915_main_test_next_tx(struct mt76_wcid *wcid)
++{
++	return skb_dequeue(&wcid->tx_pending);
++}
++
++/* An agreement's teardown, sent to a station that has it: an unprotected
++ * S1G TWT Teardown action with the flow, from the interface, on the voice
++ * queue of the station's band, counted. A frame mac80211 refuses is
++ * neither sent nor counted.
++ */
++static void mt7915_main_test_twt_send_teardown(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct mt7915_phy *phy2 = mt7915_ext_phy(dev);
++	struct ieee80211_sub_if_data *sdata;
++	struct ieee80211_tx_info *info;
++	struct ieee80211_mgmt *mgmt;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	struct sk_buff *skb;
++
++	vif = mt7915_main_test_sdata_ap(test, hw2, 1);
++	sdata = vif_to_sdata(vif);
++	sta = mt7915_main_test_add_sta(test, hw2, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	msta->wcid.tx_info |= MT_WCID_TX_INFO_SET;
++	/* the tx worker needs DMA queues: keep it off */
++	mt76_worker_disable(&dev->mt76.tx_worker);
++
++	mt7915_mac_twt_send_teardown(phy2, sta, 3);
++	KUNIT_EXPECT_EQ(test, phy2->twt_counters.teardown_tx, 1);
++	skb = mt7915_main_test_next_tx(&msta->wcid);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_EXPECT_NULL(test, mt7915_main_test_next_tx(&msta->wcid));
++	mgmt = (struct ieee80211_mgmt *)skb->data;
++	KUNIT_EXPECT_TRUE(test, ieee80211_is_action(mgmt->frame_control));
++	KUNIT_EXPECT_MEMEQ(test, mgmt->da, sta->addr, ETH_ALEN);
++	KUNIT_EXPECT_MEMEQ(test, mgmt->sa, vif->addr, ETH_ALEN);
++	KUNIT_EXPECT_MEMEQ(test, mgmt->bssid, vif->addr, ETH_ALEN);
++	KUNIT_EXPECT_EQ(test, mgmt->u.action.category, WLAN_CATEGORY_S1G);
++	KUNIT_EXPECT_EQ(test, mgmt->u.action.u.s1g.action_code,
++			WLAN_S1G_TWT_TEARDOWN);
++	KUNIT_EXPECT_EQ(test, mgmt->u.action.u.s1g.variable[0], 3);
++	KUNIT_EXPECT_EQ(test, skb_get_queue_mapping(skb), IEEE80211_AC_VO);
++	info = IEEE80211_SKB_CB(skb);
++	KUNIT_EXPECT_TRUE(test, info->flags & IEEE80211_TX_INTFL_DONT_ENCRYPT);
++	KUNIT_EXPECT_PTR_EQ(test, info->control.vif, vif);
++	KUNIT_EXPECT_EQ(test, (int)info->band, NL80211_BAND_5GHZ);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TX_HW_QUEUE_PHY,
++					(u32)info->hw_queue), MT_BAND1);
++	kfree_skb(skb);
++
++	/* a four-address VLAN without its station: mac80211 drops it */
++	vif->type = NL80211_IFTYPE_AP_VLAN;
++	sdata->wdev.use_4addr = true;
++	mt7915_mac_twt_send_teardown(phy2, sta, 4);
++	vif->type = NL80211_IFTYPE_AP;
++	sdata->wdev.use_4addr = false;
++	KUNIT_EXPECT_EQ(test, phy2->twt_counters.teardown_tx, 1);
++	KUNIT_EXPECT_NULL(test, mt7915_main_test_next_tx(&msta->wcid));
++
++	spin_lock_bh(&phy2->mt76->tx_lock);
++	list_del_init(&msta->wcid.tx_list);
++	spin_unlock_bh(&phy2->mt76->tx_lock);
++	mt76_worker_enable(&dev->mt76.tx_worker);
++}
++
++/* @needle is somewhere in @msg's payload */
++static bool mt7915_main_test_msg_has(const struct mt76_test_msg *msg,
++				     const void *needle, int len)
++{
++	int i;
++
++	for (i = 0; i + len <= msg->len; i++)
++		if (!memcmp(msg->data + i, needle, len))
++			return true;
++	return false;
++}
++
++/* the band 1 channel the interfaces' beacons go out on */
++static struct ieee80211_chanctx_conf mt7915_main_test_chanctx;
++
++static void mt7915_main_test_beacon_off(void *data)
++{
++	struct ieee80211_vif *vif = data;
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++
++	RCU_INIT_POINTER(sdata->deflink.u.ap.beacon, NULL);
++	RCU_INIT_POINTER(vif->bss_conf.chanctx_conf, NULL);
++	clear_bit(SDATA_STATE_RUNNING, &sdata->state);
++}
++
++/* @vif up and beaconing, as hostapd's start_ap leaves it: a beacon of a
++ * @head_len byte head (the header and fixed fields) and @tail_len bytes
++ * of elements after the TIM, the "MilkFlint" SSID first
++ */
++static u8 *mt7915_main_test_set_beacon(struct kunit *test,
++				       struct ieee80211_hw *hw,
++				       struct ieee80211_vif *vif,
++				       int tail_len)
++{
++	static const u8 ssid[] = { WLAN_EID_SSID, 9, 'M', 'i', 'l', 'k',
++				   'F', 'l', 'i', 'n', 't' };
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++	int head_len = offsetof(struct ieee80211_mgmt, u.beacon.variable) +
++		       sizeof(ssid);
++	struct ieee80211_mgmt *mgmt;
++	struct beacon_data *b;
++
++	b = kunit_kzalloc(test, sizeof(*b) + head_len + tail_len, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, b);
++	b->head = (u8 *)(b + 1);
++	b->head_len = head_len;
++	b->tail = b->head + head_len;
++	b->tail_len = tail_len;
++	memset(b->tail, WLAN_EID_VENDOR_SPECIFIC, tail_len);
++	mgmt = (struct ieee80211_mgmt *)b->head;
++	mgmt->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
++					  IEEE80211_STYPE_BEACON);
++	eth_broadcast_addr(mgmt->da);
++	memcpy(mgmt->sa, vif->addr, ETH_ALEN);
++	memcpy(mgmt->bssid, vif->addr, ETH_ALEN);
++	mgmt->u.beacon.beacon_int = cpu_to_le16(100);
++	memcpy(mgmt->u.beacon.variable, ssid, sizeof(ssid));
++
++	mt7915_main_test_chanctx.def = mt7915_hw_phy(hw)->mt76->chandef;
++	rcu_assign_pointer(vif->bss_conf.chanctx_conf,
++			   &mt7915_main_test_chanctx);
++	rcu_assign_pointer(sdata->deflink.u.ap.beacon, b);
++	set_bit(SDATA_STATE_RUNNING, &sdata->state);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_main_test_beacon_off, vif), 0);
++	return b->head;
++}
++
++/* A beacon handed to the firmware: mac80211's template for the interface,
++ * TIM and all, in the BSS's offload TLV (enabled). Turned off, no template.
++ * A beacon too large for the firmware, or no beacon at all, is refused and
++ * nothing sent.
++ */
++static void mt7915_main_test_add_beacon(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct ieee80211_sub_if_data *sdata;
++	struct bss_info_bcn *bcn;
++	struct mt76_test_msg *msg;
++	struct ieee80211_vif *vif;
++	u8 *head;
++
++	vif = mt7915_main_test_sdata_ap(test, hw2, 1);
++	sdata = vif_to_sdata(vif);
++	head = mt7915_main_test_set_beacon(test, hw2, vif, 40);
++	mt7915_main_test_clear(fake);
++
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_beacon(hw2, vif, true,
++			BSS_CHANGED_BEACON), 0);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(BSS_INFO_UPDATE));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	bcn = mt7915_main_test_tlv(msg, BSS_INFO_OFFLOAD);
++	KUNIT_ASSERT_NOT_NULL(test, bcn);
++	KUNIT_EXPECT_EQ(test, bcn->enable, 1);
++	/* the beacon itself, from its header on */
++	KUNIT_EXPECT_TRUE(test, mt7915_main_test_msg_has(msg, head,
++		offsetof(struct ieee80211_mgmt, u.beacon.variable) + 11));
++
++	mt7915_main_test_clear(fake);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_add_beacon(hw2, vif, false,
++			BSS_CHANGED_BEACON_ENABLED), 0);
++	bcn = mt7915_main_test_tlv(mt76_test_find_msg(fake,
++			MCU_EXT_CMD(BSS_INFO_UPDATE)), BSS_INFO_OFFLOAD);
++	KUNIT_ASSERT_NOT_NULL(test, bcn);
++	KUNIT_EXPECT_EQ(test, bcn->enable, 0);
++
++	mt7915_main_test_clear(fake);
++	mt7915_main_test_set_beacon(test, hw2, vif, MT7915_MAX_BEACON_SIZE);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_beacon(hw2, vif, true,
++			BSS_CHANGED_BEACON), -EINVAL);
++	RCU_INIT_POINTER(sdata->deflink.u.ap.beacon, NULL);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_add_beacon(hw2, vif, true,
++			BSS_CHANGED_BEACON), -EINVAL);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
++}
++
++/* mac80211 stopping a tx BA session that goes on (STOP_CONT): the
++ * firmware's session ends, the txq stops aggregating, and mac80211 is told
++ * it's done.
++ */
++static void mt7915_main_test_ampdu_tx_stop_cont(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct ieee80211_ampdu_params p;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	struct mt76_txq *mtxq;
++	struct sta_rec_ba *ba;
++
++	vif = mt7915_main_test_sdata_ap(test, hw2, 1);
++	sta = mt7915_main_test_add_sta(test, hw2, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	mtxq = (struct mt76_txq *)sta->txq[5]->drv_priv;
++
++	mt7915_main_test_ba_params(&p, sta, IEEE80211_AMPDU_TX_START);
++	mt7915_ampdu_action(hw2, vif, &p);
++	p.action = IEEE80211_AMPDU_TX_OPERATIONAL;
++	KUNIT_ASSERT_EQ(test, mt7915_ampdu_action(hw2, vif, &p), 0);
++	KUNIT_ASSERT_TRUE(test, mtxq->aggr);
++	mt7915_main_test_clear(fake);
++
++	p.action = IEEE80211_AMPDU_TX_STOP_CONT;
++	KUNIT_EXPECT_EQ(test, mt7915_ampdu_action(hw2, vif, &p), 0);
++	KUNIT_EXPECT_FALSE(test, mtxq->aggr);
++	KUNIT_EXPECT_FALSE(test, test_bit(5, &msta->wcid.ampdu_state));
++	ba = mt7915_main_test_ba();
++	KUNIT_ASSERT_NOT_NULL(test, ba);
++	KUNIT_EXPECT_EQ(test, ba->ba_type, MT_BA_TYPE_ORIGINATOR);
++	KUNIT_EXPECT_EQ(test, ba->ba_en, 0);
++}
++
++/* After a firmware restart, each agreement it dropped is torn down with
++ * the station, flow by flow, and counted lost; once.
++ */
++static void mt7915_main_test_twt_lost(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct mt7915_phy *phy2 = mt7915_ext_phy(dev);
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	struct sk_buff *skb;
++	int flow;
++
++	vif = mt7915_main_test_sdata_ap(test, hw2, 1);
++	sta = mt7915_main_test_add_sta(test, hw2, vif, 1);
++	msta = mt7915_main_test_msta(sta);
++	msta->wcid.tx_info |= MT_WCID_TX_INFO_SET;
++	mt76_worker_disable(&dev->mt76.tx_worker);
++
++	msta->twt.lost_mask = BIT(1) | BIT(4);
++	mt7915_twt_lost_iter(phy2, sta);
++	KUNIT_EXPECT_EQ(test, msta->twt.lost_mask, 0);
++	KUNIT_EXPECT_EQ(test, phy2->twt_counters.lost, 2);
++	KUNIT_EXPECT_EQ(test, phy2->twt_counters.teardown_tx, 2);
++	for (flow = 1; flow <= 4; flow += 3) {
++		struct ieee80211_mgmt *mgmt;
++
++		skb = mt7915_main_test_next_tx(&msta->wcid);
++		KUNIT_ASSERT_NOT_NULL(test, skb);
++		mgmt = (struct ieee80211_mgmt *)skb->data;
++		KUNIT_EXPECT_EQ(test, mgmt->u.action.u.s1g.variable[0], flow);
++		kfree_skb(skb);
++	}
++
++	mt7915_twt_lost_iter(phy2, sta);
++	KUNIT_EXPECT_EQ(test, phy2->twt_counters.lost, 2);
++	KUNIT_EXPECT_NULL(test, mt7915_main_test_next_tx(&msta->wcid));
++
++	spin_lock_bh(&phy2->mt76->tx_lock);
++	list_del_init(&msta->wcid.tx_list);
++	spin_unlock_bh(&phy2->mt76->tx_lock);
++	mt76_worker_enable(&dev->mt76.tx_worker);
++}
++#endif
++
+ /* After a full reset and before mac80211's restart has started the band
+  * again, a new station is refused (mac80211 re-adds the ones it has);
+  * once mt7915_start() runs, stations are added again. The other band
+@@ -4081,6 +4437,12 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_start_stop_ap),
+ 	KUNIT_CASE(mt7915_main_test_sta_add),
+ 	KUNIT_CASE(mt7915_main_test_sta_add_full),
++#ifdef MT7915_MAIN_TEST_SDATA
++	KUNIT_CASE(mt7915_main_test_twt_send_teardown),
++	KUNIT_CASE(mt7915_main_test_twt_lost),
++	KUNIT_CASE(mt7915_main_test_add_beacon),
++	KUNIT_CASE(mt7915_main_test_ampdu_tx_stop_cont),
++#endif
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	KUNIT_CASE(mt7915_main_test_wed_sta_add),
+ 	KUNIT_CASE(mt7915_main_test_wed_set_4addr),
