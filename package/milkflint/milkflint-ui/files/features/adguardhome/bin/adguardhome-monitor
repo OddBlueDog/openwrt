@@ -216,7 +216,7 @@ function vpn_clients(w) {
 	const list = have.clients ?? [];
 	const theirs = {};
 	for (let cl in list)
-		if (!(cl.name in [ agh.VPN_CLIENT, agh.NOVPN_CLIENT, agh.ROUTER_CLIENT ]))
+		if (!agh.own_client(cl.name))
 			for (let id in cl.ids ?? [])
 				theirs[id] = cl.name;
 	const domain = cursor().get('dhcp', '@dnsmasq[0]', 'domain') ?? 'lan';
@@ -261,8 +261,115 @@ function vpn_clients(w) {
 	return true;
 }
 
+// ---- Device control's SafeSearch ---------------------------------------------
+//
+// Each person on the Device control page with SafeSearch on (a milkflint
+// person section, safesearch '1') is a client, "Device control: <name>",
+// with their devices' addresses now and SafeSearch (YouTube's Restricted
+// Mode with it) on for every search engine AdGuard Home knows; the rest of
+// its settings are the global ones. An address the VPN's client has (the
+// device's lookups go through the tunnel) or a client made in AdGuard Home's
+// own web interface has stays with that one, and is listed in
+// state.devctl.skipped for the page.
+
+function in_subnet4(ip, cidr) {
+	const m = match(cidr, /^([0-9.]+)\/([0-9]+)$/);
+	if (!m || index(ip, ':') >= 0)
+		return false;
+	const n = (a) => {
+		let v = 0;
+		for (let x in split(a, '.'))
+			v = v * 256 + +x;
+		return v;
+	};
+	const size = 2 ** (32 - +m[2]);
+	return int(n(ip) / size) == int(n(m[1]) / size);
+}
+
+function devctl_people() {
+	const out = [];
+	cursor().foreach('milkflint', 'person', (p) => {
+		if (p.safesearch != '1' || !match(p['.name'], /^devctl_[a-z0-9]{4}$/))
+			return;
+		const macs = map(as_list(p.device), lc);
+		if (length(macs))
+			push(out, { id: p['.name'], name: p.name, macs });
+	});
+	return out;
+}
+
+function devctl_clients(w, list, theirs) {
+	const people = devctl_people();
+	const vpn = (w.state == 'tunnel') ? [ ...(w.ids ?? []) ] : [];
+	const through_vpn = (a) => (a in vpn) || length(filter(vpn, (c) => in_subnet4(a, c))) > 0 ||
+		// the VPN takes whole IPv6 ranges too: a device's IPv6 lookups stay with it
+		(index(a, ':') >= 0 && length(filter(vpn, (c) => index(c, ':') >= 0)) > 0);
+	let engines = null;
+	const wanted = {}, skipped = {};
+	for (let p in people) {
+		// the name a person goes by in AdGuard Home, made unique by their id
+		let name = `${agh.DEVCTL_PREFIX}${p.name ?? p.macs[0]}`;
+		if (wanted[name])
+			name += ` (${substr(p.id, 7)})`;
+		const ids = [];
+		for (let a in agh.addresses_of(p.macs)) {
+			if (through_vpn(a) || theirs[a])
+				push(skipped[p.id] ??= [], a);
+			else
+				push(ids, a);
+		}
+		wanted[name] = ids;
+	}
+	for (let cl in list)
+		if (index(cl.name ?? '', agh.DEVCTL_PREFIX) == 0 && !(cl.name in wanted))
+			agh.api('POST', '/control/clients/delete', { name: cl.name }, API_S);
+	for (let name, ids in wanted) {
+		const cur = filter(list, (cl) => cl.name == name)[0];
+		if (!length(ids)) {
+			if (cur)
+				agh.api('POST', '/control/clients/delete', { name }, API_S);
+			continue;
+		}
+		if (cur && sprintf('%J', sort([ ...(cur.ids ?? []) ])) == sprintf('%J', sort([ ...ids ])) && cur.safe_search?.enabled == true)
+			continue;
+		// every search engine AdGuard Home's own SafeSearch setting has, on
+		if (!engines) {
+			engines = {};
+			let global = agh.api('GET', '/control/safesearch/status', null, API_S);
+			if (type(global) != 'object')
+				global = { enabled: true, youtube: true };
+			for (let k, v in global)
+				if (type(v) == 'bool')
+					engines[k] = true;
+		}
+		const data = cur ? { ...cur, ids, safe_search: { ...(cur.safe_search ?? {}), ...engines } } : {
+			name, ids, upstreams: [], tags: [],
+			use_global_settings: true, use_global_blocked_services: true,
+			filtering_enabled: true, parental_enabled: false, safebrowsing_enabled: false,
+			safe_search: engines,
+			ignore_querylog: false, ignore_statistics: false,
+			upstreams_cache_enabled: false, upstreams_cache_size: 0
+		};
+		if (cur)
+			agh.api('POST', '/control/clients/update', { name, data }, API_S);
+		else
+			agh.api('POST', '/control/clients/add', data, API_S);
+	}
+	return { people: length(people), skipped };
+}
+
 function vpn_sync() {
 	const w = vpn_wanted();
+	// Device control's clients first: they let go of what the VPN's client takes
+	const have = agh.api('GET', '/control/clients', null, API_S);
+	if (type(have) == 'object') {
+		const theirs = {};
+		for (let cl in have.clients ?? [])
+			if (!agh.own_client(cl.name))
+				for (let id in cl.ids ?? [])
+					theirs[id] = cl.name;
+		state.devctl = devctl_clients(w, have.clients ?? [], theirs);
+	}
 	if (vpn_clients(w)) {
 		state.vpn = w;
 		vpn_at = time();

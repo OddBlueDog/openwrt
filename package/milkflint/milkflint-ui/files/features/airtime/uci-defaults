@@ -1,8 +1,9 @@
 #!/bin/sh
-# Airtime fairness: the service always runs (it idles with every band off);
-# the policy is on for a band while milkflint.wifi.airtime_<band> is "1",
-# which the package's own first-boot defaults set once, for every band, with
-# the auto shares at the balanced strength.
+# Airtime fairness: the service always runs, and idles with every band off,
+# as on a new install (measuring every device each second costs some CPU).
+# The policy is on for a band while milkflint.wifi.airtime_<band> is "1";
+# the package's own first-boot defaults only choose how the shares are
+# worked out once it is (auto, at the balanced strength).
 [ -f /etc/config/milkflint ] || touch /etc/config/milkflint
 /etc/init.d/milkflint-airtime enable
 exit 0

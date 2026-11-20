@@ -2,8 +2,8 @@
 # MilkFlint airtime fairness (ui feature "airtime"): the service that gives
 # devices with a poor Wi-Fi link a smaller share of the air, per band from
 # milkflint.wifi.airtime_2g / _5g / _6g ("1" on). It reads the setting
-# itself every second, so a change needs no restart; with every band off it
-# sets nothing, and only measures while the Wi-Fi page is open.
+# itself every second, so a change needs no restart; with every band off (as
+# on a new install: measuring costs some CPU) it measures and sets nothing.
 
 START=96
 USE_PROCD=1

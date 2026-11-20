@@ -330,15 +330,16 @@ if [ -z "$(uci -q get milkflint.defaults.wifi_mu_edca)" ]; then
 	fi
 fi
 
-# Airtime fairness (features/airtime) on every band, once: a device with a
-# poor link gets a smaller share of the air while others want it, worked out
-# as it goes at the balanced strength (a share in proportion to its useful
-# rate). A band whose shares were already chosen keeps them; after this,
-# switching a band off or back to goals set by hand stays as chosen.
+# Airtime fairness (features/airtime) stays off on every band until it's
+# switched on: while on, the router measures every Wi-Fi device each second,
+# which costs some CPU. Once, for the day a band is switched on: its shares
+# worked out as it goes at the balanced strength (a device with a poor link
+# gets a share in proportion to its useful rate). A band whose shares were
+# already chosen keeps them, and a band already on stays on; after this,
+# switching a band on or back to goals set by hand stays as chosen.
 if [ -z "$(uci -q get milkflint.defaults.airtime)" ]; then
 	uci -q get milkflint.wifi > /dev/null || uci set milkflint.wifi=wifi
 	for band in 2g 5g 6g; do
-		uci set "milkflint.wifi.airtime_$band=1"
 		[ -n "$(uci -q get "milkflint.wifi.airtime_${band}_auto")" ] || uci set "milkflint.wifi.airtime_${band}_auto=balanced"
 	done
 	uci -q batch <<-UCI

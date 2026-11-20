@@ -1,0 +1,38 @@
+#!/usr/bin/ucode
+// Which device is asking (ui feature "device-control";
+// /cgi-bin/milkflint-device-control): its address and, from the neighbour
+// table, its MAC, so the page can mark "this device" and ask before pausing
+// it. A CGI because only the web server knows the device's address
+// (REMOTE_ADDR). It tells a device only about itself.
+//   POST, Content-Type: application/json -> {"ip", "mac"} or {"ip"}
+'use strict';
+
+import { popen } from 'fs';
+
+function reply(status, body) {
+	print(`Status: ${status}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\r\n`);
+	print(sprintf('%J\n', body));
+	exit(0);
+}
+
+const env = getenv();
+if (env.REQUEST_METHOD != 'POST')
+	reply('405 Method Not Allowed', { error: 'POST only' });
+// another site's page can't send application/json here without a CORS
+// preflight, which this never answers
+if (index(env.CONTENT_TYPE ?? '', 'application/json') != 0)
+	reply('415 Unsupported Media Type', { error: 'application/json only' });
+
+const ip = replace(env.REMOTE_ADDR ?? '', /^::ffff:([0-9.]+)$/, '$1');
+if (ip == '' || !match(ip, /^[0-9a-fA-F:.]+$/))
+	reply('200 OK', {});
+let mac = null;
+const p = popen(`ip neigh show ${ip}`, 'r');
+if (p) {
+	const f = split(trim(p.read('all') ?? ''), ' ');
+	p.close();
+	const i = index(f, 'lladdr');
+	if (i >= 0 && match(f[i + 1] ?? '', /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+		mac = f[i + 1];
+}
+reply('200 OK', mac == null ? { ip } : { ip, mac });

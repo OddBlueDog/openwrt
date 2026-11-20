@@ -1,0 +1,8 @@
+# fw4's include for Device control (ui feature "device-control"; the
+# firewall's include section devctl_restore, type script): fw4 sources this
+# after each start and reload. It fills the pause and extra-time sets from
+# /etc/milkflint/device-control.json with the time each has left, and notes
+# the time zone's offset the ruleset's times were loaded with. Nothing to
+# fill: nothing changes.
+[ -x /usr/libexec/milkflint/device-control ] && /usr/libexec/milkflint/device-control restore
+true

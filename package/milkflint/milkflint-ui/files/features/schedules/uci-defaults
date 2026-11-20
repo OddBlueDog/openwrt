@@ -1,4 +1,69 @@
 #!/bin/sh
-[ -f /etc/config/milkflint ] || touch /etc/config/milkflint
-/etc/init.d/milkflint-schedules enable
+# Scheduled tasks are plain lines of root's crontab: the Scheduled tasks page
+# and LuCI's Scheduled Tasks both edit the file, and cron runs it. An older
+# MilkFlint kept them as milkflint.schedule sections, which its own init
+# script wrote into a marked block of the crontab for a runner script: they
+# become plain lines here, once (a task switched off as a commented-out
+# line), and the block and the sections go. Nothing to do: nothing changes.
+. /lib/functions.sh
+
+CRONTAB=/etc/crontabs/root
+BEGIN='# milkflint-schedules begin (managed by the web interface)'
+END='# milkflint-schedules end'
+RUN=/usr/libexec/milkflint/schedule-run
+
+TASKS=$(mktemp)
+SECTIONS=
+
+add_task() {
+	local cfg="$1" enabled action time days hour minute command mark
+	SECTIONS="$SECTIONS $cfg"
+	config_get_bool enabled "$cfg" enabled 1
+	config_get action "$cfg" action
+	config_get time "$cfg" time
+	config_get days "$cfg" days
+	case "$action" in
+		reboot) command=/sbin/reboot ;;
+		wifi_off) command='/sbin/wifi down' ;;
+		wifi_on) command='/sbin/wifi up' ;;
+		*) return 0 ;;
+	esac
+	case "$time" in [01][0-9]:[0-5][0-9]|2[0-3]:[0-5][0-9]) ;; *) return 0 ;; esac
+	hour=${time%%:*}
+	minute=${time##*:}
+	hour=${hour#0}
+	minute=${minute#0}
+	days=$(echo "$days" | tr ' ' ',')
+	case "$days" in ''|*[!0-6,]*) days='*' ;; esac
+	mark=
+	[ "$enabled" = 1 ] || mark='# '
+	echo "$mark$minute $hour * * $days $command" >> "$TASKS"
+}
+
+config_load milkflint
+config_foreach add_task schedule
+
+if [ -f "$CRONTAB" ] && grep -qxF "$BEGIN" "$CRONTAB"; then
+	# no sections (taken out by hand): the block's own lines, for the runner's commands
+	[ -n "$SECTIONS" ] || awk -v b="$BEGIN" -v e="$END" '$0 == b { on = 1; next } $0 == e { on = 0; next } on' "$CRONTAB" |
+		sed -e "s#$RUN reboot\$#/sbin/reboot#" -e "s#$RUN wifi_off\$#/sbin/wifi down#" -e "s#$RUN wifi_on\$#/sbin/wifi up#" |
+		grep -vF "$RUN" >> "$TASKS"
+	awk -v b="$BEGIN" -v e="$END" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' "$CRONTAB" > "$CRONTAB.new"
+	cat "$TASKS" >> "$CRONTAB.new"
+	mv "$CRONTAB.new" "$CRONTAB"
+	chmod 600 "$CRONTAB"
+elif [ -s "$TASKS" ]; then
+	mkdir -p /etc/crontabs
+	cat "$TASKS" >> "$CRONTAB"
+	chmod 600 "$CRONTAB"
+fi
+[ ! -s "$TASKS" ] || /etc/init.d/cron enable
+rm -f "$TASKS"
+
+if [ -n "$SECTIONS" ]; then
+	for s in $SECTIONS; do
+		uci -q delete "milkflint.$s"
+	done
+	uci commit milkflint
+fi
 exit 0

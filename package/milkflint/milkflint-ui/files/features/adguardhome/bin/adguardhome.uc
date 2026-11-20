@@ -710,6 +710,14 @@ export const VPN_CLIENT = 'Through the VPN (MilkFlint)';
 export const NOVPN_CLIENT = 'Not through the VPN (MilkFlint)';
 // the router itself (its own checks of the DNS path), not counted
 export const ROUTER_CLIENT = 'This router (MilkFlint)';
+// Device control's people with SafeSearch on: "Device control: Sam"
+export const DEVCTL_PREFIX = 'Device control: ';
+
+// MilkFlint's own clients, kept up by the monitor (anything else was made in
+// AdGuard Home's web interface and is left alone)
+export function own_client(name) {
+	return name in [ VPN_CLIENT, NOVPN_CLIENT, ROUTER_CLIENT ] || index(name ?? '', DEVCTL_PREFIX) == 0;
+};
 export const VPN_MARK = '0x10000000';
 export const VPN_MASK = '0xf0000000';
 

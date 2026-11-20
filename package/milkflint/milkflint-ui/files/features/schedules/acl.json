@@ -1,7 +1,17 @@
 {
 	"milkflint-schedules": {
-		"description": "MilkFlint web interface: Scheduled Tasks",
-		"read": { "uci": [ "milkflint" ] },
-		"write": { "uci": [ "milkflint" ] }
+		"description": "MilkFlint web interface: Scheduled tasks (root's crontab, as LuCI's Scheduled Tasks reads and writes it)",
+		"read": {
+			"ubus": { "file": [ "read" ] },
+			"file": { "/etc/crontabs/root": [ "read" ] }
+		},
+		"write": {
+			"ubus": { "file": [ "write", "exec" ] },
+			"file": {
+				"/etc/crontabs/root": [ "write" ],
+				"/etc/init.d/cron enable": [ "exec" ],
+				"/etc/init.d/cron reload": [ "exec" ]
+			}
+		}
 	}
 }

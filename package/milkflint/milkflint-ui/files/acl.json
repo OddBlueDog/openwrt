@@ -10,7 +10,7 @@
 				"network.device": [ "status" ],
 				"luci-rpc": [ "getDHCPLeases", "getHostHints", "getWirelessDevices" ],
 				"uci": [ "get", "changes" ],
-				"luci": [ "getTimezones", "getUnixtime" ],
+				"luci": [ "getTimezones", "getUnixtime", "getBuiltinEthernetPorts" ],
 				"session": [ "destroy" ]
 			},
 			"uci": [ "network", "wireless", "dhcp", "firewall", "system", "sqm", "milkflint", "dnsproxy", "upnpd", "nlbwmon" ],

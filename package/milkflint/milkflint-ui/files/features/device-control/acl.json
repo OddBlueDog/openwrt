@@ -1,0 +1,13 @@
+{
+	"milkflint-device-control": {
+		"description": "MilkFlint web interface: Device control (pause, extra time and status; the times are firewall rules written through UCI)",
+		"read": {
+			"ubus": { "milkflint.devicecontrol": [ "status" ] },
+			"uci": [ "firewall", "milkflint", "system" ]
+		},
+		"write": {
+			"ubus": { "milkflint.devicecontrol": [ "pause", "extra", "resume" ] },
+			"uci": [ "firewall", "milkflint" ]
+		}
+	}
+}

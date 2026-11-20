@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+# Device control's service (ui feature "device-control",
+# /usr/libexec/milkflint/device-control): ends a device's open connections
+# when it goes off the internet, keeps every rule with times right across a
+# change to or from summer time, and notes each device's data at midnight.
+# Needed in router mode only: in access point mode another router does the
+# firewall. It sleeps until the next change, and a change to the firewall's
+# or MilkFlint's config wakes it.
+
+START=96
+STOP=05
+USE_PROCD=1
+
+start_service() {
+	[ "$(uci -q get milkflint.mode.mode)" != ap ] || return 0
+	# procd writes the pid file before the service starts
+	mkdir -p /var/run/milkflint
+	procd_open_instance service
+	procd_set_param command /usr/bin/ucode /usr/libexec/milkflint/device-control
+	procd_set_param respawn 3600 5 0
+	procd_set_param pidfile /var/run/milkflint/device-control.pid
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger firewall milkflint
+}
+
+reload_service() {
+	if [ "$(uci -q get milkflint.mode.mode)" = ap ]; then
+		stop
+	elif /etc/init.d/milkflint-device-control running; then
+		procd_send_signal milkflint-device-control service HUP
+	else
+		start
+	fi
+}

@@ -1,0 +1,7 @@
+# Device control (ui feature "device-control"): what ntpd says of the clock,
+# for the page's "the router's clock isn't set" note, and after a step of
+# the clock, the pause and extra-time sets' time left set again from when
+# each ends.
+case "$ACTION" in
+	stratum|step|unsync|periodic) /usr/bin/ucode /usr/libexec/milkflint/device-control ntp "$ACTION" "$stratum" ;;
+esac

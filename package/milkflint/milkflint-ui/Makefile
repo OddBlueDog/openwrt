@@ -38,7 +38,8 @@ endef
 
 # Core files, then each feature's router side by convention
 # (files/features/<id>/: rpcd.uc, acl.json, init, uci-defaults, preinit, cgi,
-# bin/*, nftables.d/<position>/<chain>/*.nft for fw4's includes, licenses/*:
+# bin/*, nftables.d/<position>/<chain>/*.nft for fw4's includes,
+# hotplug.d/<subsystem>/* for /etc/hotplug.d, licenses/*:
 # the license texts of what the feature installs, served at /licenses/<id>/
 # for its page to link to and in /usr/share/licenses/<id>). A preinit
 # hook runs after preinit restores the config a sysupgrade kept
@@ -71,6 +72,7 @@ define Package/milkflint-ui/install
 		[ ! -f $$$$f/cgi ] || $(INSTALL_BIN) $$$$f/cgi $(1)/www/cgi-bin/milkflint-$$$$id; \
 		[ ! -d $$$$f/bin ] || $(INSTALL_BIN) $$$$f/bin/* $(1)/usr/libexec/milkflint/; \
 		[ ! -d $$$$f/nftables.d ] || { $(INSTALL_DIR) $(1)/usr/share/nftables.d && $(CP) $$$$f/nftables.d/* $(1)/usr/share/nftables.d/; }; \
+		[ ! -d $$$$f/hotplug.d ] || { $(INSTALL_DIR) $(1)/etc/hotplug.d && $(CP) $$$$f/hotplug.d/* $(1)/etc/hotplug.d/; }; \
 		[ ! -d $$$$f/licenses ] || { $(INSTALL_DIR) $(1)/www/licenses/$$$$id $(1)/usr/share/licenses && $(INSTALL_DATA) $$$$f/licenses/* $(1)/www/licenses/$$$$id/ && $(LN) /www/licenses/$$$$id $(1)/usr/share/licenses/$$$$id; }; \
 	done
 endef

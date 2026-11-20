@@ -1,7 +1,8 @@
 // rpcd plugin for the "airtime" feature: what the airtime service sees and
 // does (/tmp/milkflint/airtime.json), for the Wi-Fi page. Reading it also
-// says someone is looking, which keeps the service measuring while every
-// band's policy is off.
+// says someone is looking, for which the service reads how busy each channel
+// is as well. It measures nothing while every band's policy is off, looked
+// at or not.
 'use strict';
 
 import { readfile, writefile, mkdir } from 'fs';
@@ -17,8 +18,8 @@ return {
 		//   air_tx, air_rx, tx_mbit, rx_mbit, asleep, tx_phy, rx_phy, chains, connected }],
 		//   history: [{ t, full, slow, weak, lost, other }] }] }
 		// `running` is false while the service hasn't written a state in the
-		// last few seconds (it isn't installed or started, or it has only
-		// just been asked to measure).
+		// last few seconds (every band is off, it isn't installed or
+		// started, or a band has only just been switched on).
 		status: {
 			call: function() {
 				mkdir(DIR);

@@ -1,0 +1,164 @@
+#!/usr/bin/ucode
+// Device control's service (ui feature "device-control",
+// /etc/init.d/milkflint-device-control), and the commands fw4's include and
+// ntpd's hotplug run:
+//
+//   device-control            the service
+//   device-control restore    fill the pause and extra-time sets from the
+//                             state file (fw4 runs it after each load)
+//   device-control ntp ACTION STRATUM
+//                             what ntpd said; a step moves every time left
+//
+// The service sleeps until the next moment something could change: a rule's
+// start or end, a pause or extra time ending, local midnight, the top of the
+// hour. Then, for each device a rule or a pause covers:
+// - a device that has just become blocked has its open connections ended
+//   (a connection already open would otherwise carry on: fw4 lets every
+//   established connection through before its rules, and the flow table
+//   speeds them past the firewall altogether);
+// - if the time zone's offset is no longer the one fw4 loaded its ruleset
+//   with (summer time began or ended), the kernel's time zone is set again
+//   and fw4 reloads: nftables turns a rule's local times into UTC as it
+//   loads them, and its day check uses the kernel's time zone, so every
+//   rule with times would otherwise run an hour out;
+// - at local midnight each device's nlbwmon totals are noted, for the
+//   page's "used today" (nlbwmon counts by month).
+// A change to the firewall's or MilkFlint's config, or a pause from the page,
+// wakes it at once (SIGHUP).
+'use strict';
+
+import { readfile, writefile, mkdir } from 'fs';
+import * as uloop from 'uloop';
+import * as dc from './device-control.uc';
+
+const HOUR = 3600;
+
+function log(msg) {
+	system(['logger', '-t', 'device-control', msg]);
+}
+
+// fw4's include: the sets as the state file has them, and the offset this
+// ruleset's times were loaded with
+function restore() {
+	const now = time();
+	mkdir(dc.RUN);
+	writefile(dc.LOADED, `${dc.offset(now)}\n`);
+	if (!dc.sets_ready())
+		return;
+	const st = dc.load_state(now);
+	if (st.changed)
+		dc.save_state(st);
+	dc.fill(st, now);
+}
+
+function signal_service() {
+	const pid = +(readfile(dc.PID) ?? '0');
+	if (pid > 1)
+		system(`kill -HUP ${pid} 2>/dev/null`);
+}
+
+// ntpd's hotplug (stratum, step, periodic, unsync), with its stratum (16: not synced)
+function ntp(action, stratum) {
+	const s = +(stratum ?? '16');
+	const synced = action == 'unsync' ? false : (s > 0 && s < 16);
+	dc.write_clock({ synced, stratum: s, at: time() });
+	// the clock moved: every member's time left is wrong by as much
+	if (action == 'step') {
+		restore();
+		signal_service();
+	}
+}
+
+const args = ARGV;
+if (args[0] == 'restore') {
+	restore();
+	exit(0);
+}
+if (args[0] == 'ntp') {
+	ntp(args[1], args[2]);
+	exit(0);
+}
+
+// ---- the service ----
+
+let was_blocked = {};
+let today = dc.read_today();
+let timer;
+
+function date_of(t, off) {
+	const tm = gmtime(t + off);
+	return sprintf('%04d-%02d-%02d', tm.year, tm.mon, tm.mday);
+}
+
+function note_totals(now, off) {
+	const day = date_of(now, off);
+	if (today?.day == day)
+		return;
+	const t = dc.totals();
+	if (t == null)
+		return;
+	const l = dc.local(now, off);
+	// started after midnight (a boot): it counts from now, and says so
+	today = { day, since: now, midnight: l.midnight, totals: t };
+	mkdir(dc.RUN);
+	dc.write_atomic(dc.TODAY, sprintf('%J\n', today));
+}
+
+function tick() {
+	const now = time();
+	const off = dc.offset(now);
+
+	// summer time began or ended since fw4 loaded its ruleset
+	const loaded = readfile(dc.LOADED);
+	if (loaded != null && +loaded != off) {
+		log(`the time zone's offset is now ${off} s: setting the kernel's and reloading the firewall`);
+		system('hwclock -u --systz 2>/dev/null');
+		writefile(dc.LOADED, `${off}\n`);
+		system('fw4 -q reload');
+	}
+
+	// what has ended leaves the state file (nftables has let go of it by itself)
+	const st = dc.load_state(now);
+	if (st.changed)
+		dc.save_state(st);
+	const rules = dc.device_rules();
+	const macs = {};
+	for (let r in rules)
+		for (let m in r.macs)
+			macs[m] = true;
+	for (let m in st.paused)
+		macs[m] = true;
+	for (let m in st.extra)
+		macs[m] = true;
+
+	const now_blocked = {}, newly = [];
+	for (let m in macs) {
+		now_blocked[m] = dc.blocked(m, rules, st, now, off);
+		if (now_blocked[m] && !was_blocked[m])
+			push(newly, m);
+	}
+	was_blocked = now_blocked;
+	if (length(newly)) {
+		const n = dc.cut(newly);
+		log(`${length(newly)} device(s) now off the internet: their open connections ended (${n} address(es))`);
+	}
+
+	note_totals(now, off);
+
+	// the next edge, or the top of the hour (for summer time), whichever comes first
+	const l = dc.local(now, off);
+	const hour = l.midnight + (int(l.sec / HOUR) + 1) * HOUR;
+	const next = min(dc.next_edge(rules, st, now, off), hour);
+	timer.set(max(200, (next - time()) * 1000 + 150));
+}
+
+mkdir(dc.RUN);
+// no Device control include yet (nobody set up): fw4 loaded at boot, at the offset now
+if (readfile(dc.LOADED) == null)
+	writefile(dc.LOADED, `${dc.offset(time())}\n`);
+uloop.init();
+timer = uloop.timer(0, tick);
+uloop.signal('SIGHUP', () => { timer.set(0); });
+uloop.signal('SIGTERM', () => { uloop.end(); });
+uloop.signal('SIGINT', () => { uloop.end(); });
+uloop.run();

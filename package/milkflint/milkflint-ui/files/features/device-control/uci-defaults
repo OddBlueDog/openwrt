@@ -1,0 +1,46 @@
+#!/bin/sh
+# Device control (ui feature "device-control"): its service runs in router
+# mode, and once someone is set up, the firewall has the two sets, the pause
+# rule and the include that fills the sets after each load. The page writes
+# those with the first person; here they're only put back if a person
+# section is there and one of them isn't (a restored backup, say). Safe to
+# run again: nothing changes.
+/etc/init.d/milkflint-device-control enable
+
+uci -q show milkflint 2> /dev/null | grep -q '^milkflint\.devctl_[a-z0-9]*=person$' || exit 0
+wan=wan
+changed=
+for set in devctl_paused devctl_extra; do
+	[ "$(uci -q get "firewall.$set")" = ipset ] && continue
+	uci -q batch <<-UCI
+		set firewall.$set=ipset
+		set firewall.$set.name='$set'
+		set firewall.$set.family='any'
+		add_list firewall.$set.match='src_mac'
+		set firewall.$set.timeout='0'
+	UCI
+	changed=1
+done
+if [ "$(uci -q get firewall.devctl_pause)" != rule ]; then
+	uci -q batch <<-UCI
+		set firewall.devctl_pause=rule
+		set firewall.devctl_pause.name='Device control: paused'
+		set firewall.devctl_pause.src='*'
+		set firewall.devctl_pause.dest='$wan'
+		set firewall.devctl_pause.ipset='devctl_paused'
+		set firewall.devctl_pause.proto='all'
+		set firewall.devctl_pause.target='REJECT'
+	UCI
+	changed=1
+fi
+if [ "$(uci -q get firewall.devctl_restore)" != include ]; then
+	uci -q batch <<-UCI
+		set firewall.devctl_restore=include
+		set firewall.devctl_restore.type='script'
+		set firewall.devctl_restore.path='/usr/libexec/milkflint/device-control-restore'
+		set firewall.devctl_restore.fw4_compatible='1'
+	UCI
+	changed=1
+fi
+[ -z "$changed" ] || uci commit firewall
+exit 0

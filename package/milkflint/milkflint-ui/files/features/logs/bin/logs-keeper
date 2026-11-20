@@ -61,6 +61,7 @@
 import { open, stat, rename, mkdir, readfile, writefile, popen, glob, unlink } from 'fs';
 import { connect } from 'ubus';
 import * as nl80211 from 'nl80211';
+import { lookup, query_type, failed_answer, wifi_daemon, fw_trouble as trouble_in, banip_drop } from './log-lines.uc';
 
 const DISK = '/root/milkflint-logs';
 const RAM = '/tmp/milkflint-logs';
@@ -211,12 +212,8 @@ let trace = 0;	// lines left of a kernel warning's dump
 // hostapd's beacon report lines since the last sample, for rrm_replies()
 let beacon_lines = [];
 
-// `rest`: a logread line after its time, "kern.warn kernel: [ 12.3] mt7915e ..."
-function is_wifi(rest) {
-	const m = match(rest, /^[a-z0-9]+\.[a-z]+ ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
-	if (!m)
-		return false;
-	const tag = m[1], msg = m[3];
+// a system log line's tag and message: "kernel", "[ 12.3] mt7915e ..."
+function is_wifi(tag, msg) {
 	if (tag == 'kernel') {
 		// a warning's whole dump, whatever its subsystem: the stack says whose
 		if (match(msg, /cut here|WARNING:|BUG:|Oops|Unable to handle/)) {
@@ -233,7 +230,7 @@ function is_wifi(rest) {
 	// to its ubus subscribers (rrm_events() below), not its own request
 	if (tag == 'hostapd' && match(msg, /^Unexpected Link measurement report/))
 		return false;
-	if (match(tag, /^(hostapd|wpa_supplicant|milkflint-wifi|milkflint-tuning)/))
+	if (wifi_daemon(tag))
 		return true;
 	if (tag == 'netifd')
 		return match(msg, /radio[0-9]|[Ww]ireless|phy[0-9]|-ap[0-9]/) != null;
@@ -242,11 +239,7 @@ function is_wifi(rest) {
 
 // System log lines the debug counters copy, highlighted: services starting
 // again, the WAN going down or up, the WAN port's link.
-function notable(rest) {
-	const m = match(rest, /^[a-z0-9]+\.[a-z]+ ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
-	if (!m)
-		return false;
-	const tag = m[1], msg = m[3];
+function notable(tag, msg) {
 	if (tag == 'procd')
 		return match(msg, /crash loop|Instance (network|wpad|hostapd|dnsmasq|dnsproxy|adguardhome)/) != null;
 	if (tag == 'AdGuardHome')
@@ -315,21 +308,22 @@ function dns_took(ms) {
 // lines; the first is when. Times the lookup when `live` (not the RAM
 // buffer's past), and returns whether the line was one of these.
 function dns_lookup(ms, msg, live) {
-	// (POSIX regular expressions: no (?:...) groups)
-	const m = match(msg, /^([0-9]+) ([^ \/]+)\/[0-9]+ ([^ ]+) ([^ ]+)( (is|to|from) (.*))?$/);
+	// (taken apart without a pattern, log-lines.uc: this runs for every
+	// line dnsmasq writes, several a lookup)
+	const m = lookup(msg);
 	if (!m)
 		return false;
 	if (!live)
 		return true;
-	const id = m[1], what = m[3];
-	const q = match(what, /^query\[([A-Za-z0-9]+)\]$/);
-	if (q) {
+	const id = m.id, what = m.what;
+	const asked_for = query_type(what);
+	if (asked_for != null) {
 		dns_counts.asked++;
-		dns_pending[id] = { ms, name: m[4], type: q[1], client: m[2] };
+		dns_pending[id] = { ms, name: m.name, type: asked_for, client: m.client };
 		return true;
 	}
 	const p = dns_pending[id];
-	if (p == null || m[6] != 'is')
+	if (p == null || m.word != 'is')
 		return true;
 	delete dns_pending[id];
 	dns_answered[`${p.client} ${p.name} ${p.type}`] = ms;
@@ -348,9 +342,9 @@ function dns_lookup(ms, msg, live) {
 	const asked = (times > 1) ? ` (asked ${times} times)` : '';
 	// dnsmasq couldn't ask its servers ("config error is REFUSED (EDE:
 	// network error)"), or they failed
-	if (match(m[7], /^(REFUSED|SERVFAIL)/)) {
+	if (failed_answer(m.more)) {
 		dns_counts.failed++;
-		dns_line('warn', `failed: ${p.name} (${p.type}) for ${dns_who(p.client)} after ${dns_took(took)}${asked}: ${m[7]}`);
+		dns_line('warn', `failed: ${p.name} (${p.type}) for ${dns_who(p.client)} after ${dns_took(took)}${asked}: ${m.more}`);
 		return true;
 	}
 	if (what != 'reply') {
@@ -360,7 +354,7 @@ function dns_lookup(ms, msg, live) {
 	push(dns_counts.times, took);
 	if (took > DNS_SLOW_MS) {
 		dns_counts.slow++;
-		dns_line('warn', `slow: ${p.name} (${p.type}) for ${dns_who(p.client)}: ${dns_took(took)}${asked}, answer ${m[7]}`);
+		dns_line('warn', `slow: ${p.name} (${p.type}) for ${dns_who(p.client)}: ${dns_took(took)}${asked}, answer ${m.more}`);
 	}
 	return true;
 }
@@ -436,14 +430,14 @@ if (DNS) {
 // The driver's and mac80211's lines when the firmware stops answering or
 // the chip is being reset: a command that timed out (which starts a chip
 // reset), a firmware crash, an error recovery (L1 SER) and its escalation,
-// a failed reset, mac80211 restarting the radios. For QUIET_S after one,
+// a failed reset, mac80211 restarting the radios (log-lines.uc has the
+// pattern). For QUIET_S after one,
 // nothing here asks the firmware (the devices' numbers, which include a
 // query for each one's receive rate; the channel survey; the MU counters;
 // the 802.11k requests), and the dashboard's temperature reading waits too
 // (QUIET_FILE): a reader waiting on a firmware in trouble holds the
 // driver's lock, with the kernel's network lock waiting behind it, and a
 // query that times out starts another reset.
-const FW_TROUBLE = /mt7915e [^ ]+: (Message [0-9a-f]+ \(seq [0-9]+\) timeout|.*firmware crash|L1 SER|chip full reset|band[0-9]: PLE error)|Hardware restart was requested/;
 const QUIET_S = 120;
 const QUIET_FILE = '/tmp/milkflint/wifi-quiet';
 let quiet_until = 0;
@@ -467,30 +461,31 @@ function on_log_line(line) {
 	const ms = int(m[2]) * 1000 + int(m[3]);
 	const text = m[1] + ' ' + m[4];
 	// only what happens from now on: the RAM buffer's lines are the past
-	const trouble = ms > START_MS ? match(m[4], FW_TROUBLE) : null;
+	const trouble = ms > START_MS ? trouble_in(m[4]) : null;
 	if (trouble)
 		fw_trouble(trouble[1] ?? trouble[0]);
 	let wrote = false;
+	// the line's level, tag and message, "daemon.info dnsmasq[123]: ...",
+	// taken apart once for every reader below (null: not such a line)
+	const t = match(m[4], /^[a-z0-9]+\.([a-z]+) ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
 	// the DNS log: lookups are timed and kept out of system.log, the DNS
 	// services' lines copied
-	let lookup = false;
-	if (DNS) {
-		const t = match(m[4], /^[a-z0-9]+\.([a-z]+) ([^:\[ ]+)(\[[0-9]+\])?: (.*)$/);
-		if (t && t[2] == 'dnsmasq')
-			lookup = dns_lookup(ms, t[4], ms > START_MS);
-		if (t && !lookup && ms > dns_log.since && dns_service(t[1], t[2], t[4])) {
+	let is_lookup = false;
+	if (DNS && t) {
+		if (t[2] == 'dnsmasq')
+			is_lookup = dns_lookup(ms, t[4], ms > START_MS);
+		if (!is_lookup && ms > dns_log.since && dns_service(t[1], t[2], t[4])) {
 			dns_log.file.write(text);
 			state[dns_log.path] = ms;
 			wrote = true;
 		}
 	}
-	const banip_drop = match(m[4], /^kern\.[a-z]+ kernel: (\[ *[0-9.]+\] )?banIP\//) != null;
-	if (system_log && !lookup && !banip_drop && ms > system_log.since) {
+	if (system_log && !is_lookup && !banip_drop(m[4]) && ms > system_log.since) {
 		system_log.file.write(text);
 		state[system_log.path] = ms;
 		wrote = true;
 	}
-	if (wifi_log && is_wifi(m[4]) && ms > wifi_log.since) {
+	if (wifi_log && t && is_wifi(t[2], t[4]) && ms > wifi_log.since) {
 		wifi_log.file.write(text);
 		state[wifi_log.path] = ms;
 		wrote = true;
@@ -498,7 +493,7 @@ function on_log_line(line) {
 			push(beacon_lines, m[4]);
 	}
 	// only what happens from now on: the RAM buffer's lines are the past
-	if (COUNTERS && ms > START_MS && notable(m[4]))
+	if (COUNTERS && ms > START_MS && t && notable(t[2], t[4]))
 		debug_log.file.write(`${m[1]} daemon.warn counters: SYSLOG ${m[4]}`);
 	if (wrote)
 		save_state();
@@ -734,8 +729,9 @@ function trouble_of(d, s) {
 function access_points(conn) {
 	const out = [];
 	for (let obj in conn.list() ?? []) {
-		const dev = match(obj, /^hostapd\.(.+)$/)?.[1];
-		const phy = dev ? trim(readfile(`/sys/class/net/${dev}/phy80211/name`) ?? '') : '';
+		// (by its start, not a pattern: this looks at every ubus object)
+		const dev = (substr(obj, 0, 8) == 'hostapd.') ? substr(obj, 8) : '';
+		const phy = (dev != '') ? trim(readfile(`/sys/class/net/${dev}/phy80211/name`) ?? '') : '';
 		if (phy != '')
 			push(out, { dev, phy, bssid: lc(trim(readfile(`/sys/class/net/${dev}/address`) ?? '')) });
 	}
