@@ -6,6 +6,7 @@ import { Field } from '@/components/field';
 import { Card, CardContent } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
+import { AIRTIME_COST_NOTE, airtimeMeasuring } from '../wifi/airtime';
 import { AirtimeBandsTable } from '../wifi/airtime-bands';
 import { AirtimeLive } from '../wifi/airtime-card';
 import { explain } from '@/components/explain';
@@ -92,7 +93,12 @@ function Choice<T extends string | number>({
   );
 }
 
-export function AirtimeSection({ forms, set }: Omit<SectionProps, 'options'>): ReactElement {
+/** `saved`: the radios as the router has them, which is what it measures by */
+export function AirtimeSection({
+  forms,
+  saved,
+  set,
+}: Omit<SectionProps, 'options'> & { saved: readonly RadioForm[] }): ReactElement {
   return (
     <Card>
       <CardHeading
@@ -133,8 +139,16 @@ export function AirtimeSection({ forms, set }: Omit<SectionProps, 'options'>): R
             </>
           )}
         </BandColumns>
+        <p className="text-xs text-muted-foreground">{AIRTIME_COST_NOTE}</p>
         <NowSection id="airtime-now" title="Who is using the air now">
-          <AirtimeLive />
+          {airtimeMeasuring(saved) ? (
+            <AirtimeLive />
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Airtime fairness is off on every band, so nothing is measured. Turn it on for a band and save to see who is using
+              the air.
+            </p>
+          )}
         </NowSection>
       </CardContent>
     </Card>

@@ -17,7 +17,7 @@ import {
   TriangleAlertIcon,
   XIcon,
 } from 'lucide-react';
-import { type ReactElement, useId, useMemo, useState } from 'react';
+import { type ReactElement, useEffect, useId, useMemo, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
@@ -866,14 +866,21 @@ export function ProtectionTab({
   c,
   s,
   onSaved,
+  onPick,
 }: {
   c: BanipConfig;
   s: BanipStatus | undefined;
   onSaved: () => void;
+  /** The preset card chosen here and not saved yet, so the page's switch can start it. */
+  onPick?: (p: PresetId | undefined) => void;
 }): ReactElement {
   const [draft, setDraft] = useState<Draft>(() => initialDraft(c));
   // a preset card chosen here: the one way this tab turns banIP on or off
   const [picked, setPicked] = useState<PresetId>();
+  useEffect(() => {
+    onPick?.(picked);
+    return () => onPick?.(undefined);
+  }, [picked, onPick]);
   const [state, setState] = useState<ApplyState>({ phase: 'idle' });
   const saved = initialDraft(c);
   const enabled = c.enabled === true;

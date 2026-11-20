@@ -6,7 +6,7 @@
 import { ChevronRightIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { Sparkline } from '@/components/charts/sparkline';
-import { globalIpv6, ipv4 } from '@/lib/api/network';
+import { ipv4, wanIpv6 } from '@/lib/api/network';
 import type { Poll } from '@/hooks/use-poll';
 import { Progress } from '@/components/ui/progress';
 import { formatBitrate, formatBitrateOf, formatDurationShort, formatNumber, formatPercent } from '@/lib/format';
@@ -171,11 +171,8 @@ export function InternetTile({ d, ap }: { d: Dashboard; ap: boolean }): ReactEle
   const online = d.wan?.up === true;
   const v4 = ipv4(d.wan)?.split('/')[0];
   // the range the provider delegates, else the router's own address
-  const prefix = d.wan6?.['ipv6-prefix']?.[0];
-  const v6 =
-    prefix === undefined
-      ? globalIpv6([...(d.wan6?.['ipv6-address'] ?? []), ...(d.wan?.['ipv6-address'] ?? [])].map((a) => a.address))[0]
-      : `${prefix.address}/${String(prefix.mask)}`;
+  const wan6 = wanIpv6([d.wan6, d.wan]);
+  const v6 = wan6.range ?? wan6.address?.split('/')[0];
   const addresses: [string, string][] = [
     ...(v4 === undefined ? [] : [['IPv4', v4] as [string, string]]),
     // a range shows its length (/56): no need to say so beside it, where a tile is narrow
@@ -296,7 +293,7 @@ export function DevicesTile({ d }: { d: Dashboard }): ReactElement {
 /** Ten minutes of pings along the tile's foot. */
 const PING_SPAN_S = 600;
 
-/** Responsiveness as a tile: the last 5 minutes' typical ping, its state, the latest, and the hour's worst and loss. */
+/** Responsiveness as a tile: the last 5 minutes' typical ping, its state, the latest, and the hour's peak and loss. */
 export function ResponsivenessTile({ live }: { live: Poll<Live> }): ReactElement {
   const g = responsivenessGlance(live);
   const data = live.data;
@@ -316,7 +313,7 @@ export function ResponsivenessTile({ live }: { live: Poll<Live> }): ReactElement
       lines={[
         r.state.label,
         r.now === undefined ? 'No ping yet' : r.now === null ? 'Latest ping lost' : `Latest ${ms(r.now)}`,
-        `Worst ${r.hour.worst === undefined ? '—' : ms(r.hour.worst)} · ${formatPercent(r.hour.loss)} lost`,
+        `Peak ${r.hour.peak === undefined ? '—' : ms(r.hour.peak)} · ${formatPercent(r.hour.loss)} lost`,
       ]}
       spark={{
         values,

@@ -65,7 +65,14 @@ export function OffBadge(): ReactElement {
 }
 
 /** Who made a row: OpenWrt (its standard rules) or another MilkFlint page (a link to it). */
-export function OriginMark({ origin }: { origin: 'openwrt' | { page: FeatureId; title: string } }): ReactElement {
+export function OriginMark({
+  origin,
+  to,
+}: {
+  origin: 'openwrt' | { page: FeatureId; title: string };
+  /** where it links: the page, or a place on it */
+  to?: string;
+}): ReactElement {
   if (origin === 'openwrt') {
     return (
       <Badge variant="secondary" className="h-5 px-2 font-normal" title="One of OpenWrt’s standard rules">
@@ -75,7 +82,7 @@ export function OriginMark({ origin }: { origin: 'openwrt' | { page: FeatureId; 
   }
   return (
     <a
-      href={href(origin.page)}
+      href={to ?? href(origin.page)}
       className="inline-flex h-5 items-center rounded-full bg-primary-subtle px-2 text-xs whitespace-nowrap text-primary-subtle-foreground underline-offset-4 hover:underline"
       title={`Made by the ${origin.title} page`}
     >

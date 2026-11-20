@@ -6,9 +6,12 @@
 // where the driver can pace a device, the slowest are held back for part of
 // the time while a device with a good link has traffic waiting.
 // Off, the router's own airtime fairness applies (an equal share for every
-// busy device) and the service only measures while the page is open. The
-// service reads the option itself within a second: no radio restarts. What
-// the card (airtime-card.tsx) shows of its reply is worked out here.
+// busy device). Measuring costs the router CPU every second, so it is off on
+// every band until someone turns it on, and with every band off the service
+// measures nothing, the page open or not; with some band on, the others'
+// devices are watched too. The service reads the option itself within a
+// second: no radio restarts. What the card (airtime-card.tsx) shows of its
+// reply is worked out here.
 
 import { snrOf } from '@/lib/snr';
 
@@ -39,6 +42,18 @@ export function airtimeOf(value: string | undefined): boolean {
 export function airtimeValue(on: boolean): string | undefined {
   return on ? '1' : undefined;
 }
+
+/**
+ * Whether the router is measuring at all: only while some band's policy is
+ * on, as saved. Until then the card asks it for nothing.
+ */
+export function airtimeMeasuring(forms: readonly { airtime: boolean }[]): boolean {
+  return forms.some((f) => f.airtime);
+}
+
+/** What having it on costs, said under the switches */
+export const AIRTIME_COST_NOTE =
+  'While it’s on for any band, the router measures every Wi-Fi device once a second, which uses some CPU. It’s off unless you turn it on.';
 
 /**
  * What the policy does on a band: applied; switched off, so only watched; or

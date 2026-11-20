@@ -1,9 +1,10 @@
 // The router's processor and memory: each core's use now, the load average
 // and the last two minutes, with the process list a click away; memory in
-// use with the cache beside it.
+// use with its buffers and cache beside it.
 import type { ReactElement } from 'react';
 import { ProcessesButton } from '@/components/processes/processes-sheet';
 import { Progress } from '@/components/ui/progress';
+import { memoryInUse } from '@/lib/api/system';
 import { formatBytes, formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { agoLabels, CORE_BUSY } from './model';
@@ -83,10 +84,16 @@ export function CpuCard({ d }: { d: Dashboard }): ReactElement {
   );
 }
 
+/** The memory widget's parts, in the track's order: each one's share, its swatch and its words. */
+const MEMORY_PARTS = [
+  { key: 'used', label: 'In use', swatch: 'bg-chart-1' },
+  { key: 'buffered', label: 'Buffered', swatch: 'bg-chart-1/60' },
+  { key: 'cached', label: 'Cached', swatch: 'bg-chart-1/30' },
+] as const;
+
 export function MemoryCard({ d }: { d: Dashboard }): ReactElement {
   const mem = d.info.memory;
-  const used = mem.total - (mem.available ?? mem.free + mem.buffered);
-  const cache = (mem.cached ?? 0) + mem.buffered;
+  const amounts = { used: memoryInUse(mem), buffered: mem.buffered, cached: mem.cached ?? 0 };
   const share = (n: number): number => (mem.total > 0 ? Math.max(0, Math.min(1, n / mem.total)) * 100 : 0);
 
   return (
@@ -94,37 +101,33 @@ export function MemoryCard({ d }: { d: Dashboard }): ReactElement {
       <div className="flex flex-1 flex-col gap-3 px-5">
         <div className="flex flex-col">
           <span className="text-xs text-muted-foreground">In use</span>
-          <span className="text-3xl font-semibold tracking-tight tabular">{formatPercent(used / mem.total)}</span>
+          <span className="text-3xl font-semibold tracking-tight tabular">{formatPercent(amounts.used / mem.total)}</span>
           <span className="text-sm text-muted-foreground tabular">
-            <span className="whitespace-nowrap">{formatBytes(used)}</span> of{' '}
+            <span className="whitespace-nowrap">{formatBytes(amounts.used)}</span> of{' '}
             <span className="whitespace-nowrap">{formatBytes(mem.total)}</span>
           </span>
         </div>
-        {/* in use, then cache, on one track (the rest is free), at the widget's foot however tall its cell */}
+        {/* in use, then buffers and cache, on one track (the rest is free), at the widget's foot however tall its cell */}
         <div className="mt-auto flex flex-col gap-3">
           <div
             role="img"
-            aria-label={`${formatBytes(used)} in use and ${formatBytes(cache)} of cache, of ${formatBytes(mem.total)}`}
+            aria-label={`${formatBytes(amounts.used)} in use, ${formatBytes(amounts.buffered)} buffered and ${formatBytes(amounts.cached)} cached, of ${formatBytes(mem.total)}`}
             className="flex h-2 gap-0.5 overflow-hidden rounded-full bg-muted forced-colors:border"
           >
-            <div className="rounded-full bg-chart-1" style={{ width: `${String(share(used))}%` }} />
-            <div className="rounded-full bg-chart-1/35" style={{ width: `${String(share(cache))}%` }} />
+            {MEMORY_PARTS.map((p) => (
+              <div key={p.key} className={cn('rounded-full', p.swatch)} style={{ width: `${String(share(amounts[p.key]))}%` }} />
+            ))}
           </div>
           <dl className="flex flex-col gap-1.5 text-sm">
-            <div data-fit className="flex items-baseline justify-between gap-3">
-              <dt className="flex items-center gap-2 text-muted-foreground">
-                <span className="size-2 shrink-0 rounded-full bg-chart-1" aria-hidden="true" />
-                In use
-              </dt>
-              <dd className="font-medium tabular">{formatBytes(used)}</dd>
-            </div>
-            <div data-fit className="flex items-baseline justify-between gap-3">
-              <dt className="flex items-center gap-2 text-muted-foreground">
-                <span className="size-2 shrink-0 rounded-full bg-chart-1/35" aria-hidden="true" />
-                Cache
-              </dt>
-              <dd className="font-medium tabular">{formatBytes(cache)}</dd>
-            </div>
+            {MEMORY_PARTS.map((p) => (
+              <div key={p.key} data-fit className="flex items-baseline justify-between gap-3">
+                <dt className="flex items-center gap-2 text-muted-foreground">
+                  <span className={cn('size-2 shrink-0 rounded-full', p.swatch)} aria-hidden="true" />
+                  {p.label}
+                </dt>
+                <dd className="font-medium tabular">{formatBytes(amounts[p.key])}</dd>
+              </div>
+            ))}
             <div data-fit className="flex items-baseline justify-between gap-3">
               <dt className="flex items-center gap-2 text-muted-foreground">
                 <span className="size-2 shrink-0 rounded-full border border-muted-foreground" aria-hidden="true" />
@@ -134,7 +137,7 @@ export function MemoryCard({ d }: { d: Dashboard }): ReactElement {
             </div>
           </dl>
           <p data-fit className="text-xs text-muted-foreground">
-            Cache isn’t counted as in use: Linux frees it whenever it’s needed.
+            Buffers and cache aren’t counted as in use: Linux frees them whenever they’re needed.
           </p>
         </div>
       </div>

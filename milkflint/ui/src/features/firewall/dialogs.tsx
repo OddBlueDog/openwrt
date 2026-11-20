@@ -4,7 +4,7 @@ import { ForwardSheet } from '../port-forwards/forward-sheet';
 import type { FirewallData } from './api';
 import { BlockSheet } from './blocks';
 import type { Actions } from './forms';
-import { managedBy } from './model';
+import { managerOf } from './model';
 import { NatSheet } from './nat';
 import { ConfirmDialog } from './parts';
 import { RuleSheet } from './rule-sheet';
@@ -66,7 +66,7 @@ export function FirewallDialogs({
             r === undefined
               ? undefined
               : () => {
-                  const managed = managedBy[r.section];
+                  const managed = managerOf(r.section);
                   confirm({
                     title: `Delete ${r.name ?? r.label}?`,
                     body:
@@ -82,7 +82,7 @@ export function FirewallDialogs({
       );
     }
     case 'block':
-      return <BlockSheet rule={dialog.rule} data={data} onClose={onClose} onSave={onSave} />;
+      return <BlockSheet data={data} onClose={onClose} onSave={onSave} />;
     case 'nat': {
       const r = dialog.nat;
       return (

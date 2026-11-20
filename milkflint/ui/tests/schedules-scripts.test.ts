@@ -1,147 +1,137 @@
-// The Scheduled Tasks page's router side run for real, with a pretend crontab
-// and config: the marked block it keeps in root's crontab, and the task runner.
+// The Scheduled tasks' first-boot step, run for real with a pretend crontab
+// and config: an older MilkFlint's tasks (milkflint.schedule sections, and
+// the marked block its init script kept in root's crontab for a runner)
+// become plain cron lines once, as the page and LuCI write them.
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-const dir = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/schedules/', import.meta.url));
+const script = fileURLToPath(
+  new URL('../../../package/milkflint/milkflint-ui/files/features/schedules/uci-defaults', import.meta.url),
+);
 const BEGIN = '# milkflint-schedules begin (managed by the web interface)';
 const END = '# milkflint-schedules end';
 const RUN = '/usr/libexec/milkflint/schedule-run';
 
-interface Task {
+interface Section {
   action?: string;
   time?: string;
   days?: string;
   enabled?: string;
 }
 
-/** The init script's start with these tasks: the crontab it leaves, and whether cron was restarted. */
-function start(tasks: Task[], crontab?: string): { crontab: string; restarted: boolean } {
+interface Result {
+  /** undefined: no crontab */
+  crontab: string | undefined;
+  /** the sections deleted and committed, as uci was called */
+  uci: string[];
+  /** cron's init script, as it was called */
+  cron: string[];
+}
+
+/** The step with these sections in the config and this crontab (none if undefined). */
+function migrate(sections: Section[], crontab?: string): Result {
   const root = mkdtempSync(join(tmpdir(), 'schedules-'));
   try {
-    const tab = join(root, 'crontab');
-    const log = join(root, 'cron.log');
-    if (crontab !== undefined) writeFileSync(tab, crontab);
-    writeFileSync(join(root, 'cron'), `#!/bin/sh\necho "$1" >> ${log}\n`);
-    chmodSync(join(root, 'cron'), 0o755);
-    const init = readFileSync(join(dir, 'init'), 'utf8')
-      .replace('/etc/crontabs/root', tab)
-      .replaceAll('/etc/init.d/cron', join(root, 'cron'));
-    // rc.common's config functions, over the tasks given
-    const config = tasks.flatMap((t, i) => Object.entries(t).map(([k, v]) => `CFG_t${String(i)}_${k}='${String(v)}'`)).join('\n');
-    const harness = `config_load() { :; }
-config_foreach() { for s in ${tasks.map((_, i) => `t${String(i)}`).join(' ')}; do "$1" "$s"; done; }
+    const tabs = join(root, 'crontabs');
+    const tab = join(tabs, 'root');
+    const bin = join(root, 'bin');
+    mkdirSync(bin);
+    if (crontab !== undefined) {
+      mkdirSync(tabs);
+      writeFileSync(tab, crontab);
+    }
+    for (const name of ['uci', 'cron']) {
+      writeFileSync(join(bin, name), `#!/bin/sh\necho "$*" >> ${join(root, `${name}.log`)}\n`);
+      chmodSync(join(bin, name), 0o755);
+    }
+    // /lib/functions.sh's config functions, over the sections given
+    const config = sections.flatMap((t, i) => Object.entries(t).map(([k, v]) => `CFG_s${String(i)}_${k}='${String(v)}'`));
+    const functions = `config_load() { :; }
+config_foreach() { for s in ${sections.map((_, i) => `s${String(i)}`).join(' ')}; do "$1" "$s"; done; }
 config_get() { eval "$1=\\\${CFG_$2_$3:-}"; }
 config_get_bool() { eval "v=\\\${CFG_$2_$3:-$4}"; case "$v" in 1|on|true|yes) eval "$1=1" ;; *) eval "$1=0" ;; esac; }
-${config}
-${init}
-start_service
-`;
-    writeFileSync(join(root, 'harness.sh'), harness);
-    execFileSync('/bin/sh', [join(root, 'harness.sh')], {
-      env: { PATH: '/usr/bin:/bin' },
+${config.join('\n')}`;
+    const body = readFileSync(script, 'utf8')
+      .replace('. /lib/functions.sh', functions)
+      .replaceAll('/etc/crontabs/root', tab)
+      .replaceAll('/etc/crontabs', tabs)
+      .replaceAll('/etc/init.d/cron', join(bin, 'cron'));
+    writeFileSync(join(root, 'run.sh'), body);
+    execFileSync('/bin/sh', [join(root, 'run.sh')], {
+      env: { PATH: `${bin}:/usr/bin:/bin` },
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    return { crontab: readFileSync(tab, 'utf8'), restarted: existsSync(log) && readFileSync(log, 'utf8').includes('restart') };
+    const log = (name: string): string[] => {
+      const p = join(root, `${name}.log`);
+      return existsSync(p) ? readFileSync(p, 'utf8').trim().split('\n') : [];
+    };
+    return { crontab: existsSync(tab) ? readFileSync(tab, 'utf8') : undefined, uci: log('uci'), cron: log('cron') };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
-const line = (time: string, days: string, action: string): string => `${time} * * ${days} ${RUN} ${action}`;
-const block = (...lines: string[]): string => [BEGIN, ...lines, END, ''].join('\n');
+const block = (...lines: string[]): string => [BEGIN, ...lines, END].join('\n');
 
-test('a task: minute and hour without leading zeroes, as cron reads them', () => {
-  assert.equal(start([{ action: 'reboot', time: '08:05' }]).crontab, block(line('5 8', '*', 'reboot')));
-  assert.equal(start([{ action: 'wifi_off', time: '00:00' }]).crontab, block(line('0 0', '*', 'wifi_off')));
-  assert.equal(start([{ action: 'wifi_on', time: '23:59' }]).crontab, block(line('59 23', '*', 'wifi_on')));
-  assert.equal(start([{ action: 'wifi_on', time: '10:30' }]).crontab, block(line('30 10', '*', 'wifi_on')));
-});
-
-test('its days as cron’s list; anything else means every day', () => {
-  assert.equal(start([{ action: 'reboot', time: '04:00', days: '1 3 5' }]).crontab, block(line('0 4', '1,3,5', 'reboot')));
-  assert.equal(start([{ action: 'reboot', time: '04:00', days: '0' }]).crontab, block(line('0 4', '0', 'reboot')));
-  for (const days of ['7', 'mon', '1;reboot', '*']) {
-    assert.equal(start([{ action: 'reboot', time: '04:00', days }]).crontab, block(line('0 4', '*', 'reboot')), days);
-  }
-});
-
-test('anything but a real time, or a known action, is left out', () => {
-  for (const time of ['', '8:05', '08:5', '24:00', '25:61', '12:60', '08-05', 'x:y', '08:05:00', '* *']) {
-    assert.equal(start([{ action: 'reboot', time }]).crontab, '', time);
-  }
-  for (const action of ['', 'halt', 'wifi_down', 'reboot;id', '../x']) {
-    assert.equal(start([{ action, time: '04:00' }]).crontab, '', action);
-  }
-});
-
-test('turned off, it’s left out', () => {
-  assert.equal(start([{ action: 'reboot', time: '04:00', enabled: '0' }]).crontab, '');
-  assert.equal(start([{ action: 'reboot', time: '04:00', enabled: '1' }]).crontab, block(line('0 4', '*', 'reboot')));
-});
-
-test('the user’s own lines outside the block stay, before and after it', () => {
+test('nothing to move: nothing changes, no crontab made, uci and cron left alone', () => {
+  assert.deepEqual(migrate([]), { crontab: undefined, uci: [], cron: [] });
   const mine = '0 3 * * * /root/backup.sh\n';
-  const after = '# a note\n*/5 * * * * /root/check.sh\n';
-  const old = `${mine}${block(line('0 1', '*', 'reboot'))}${after}`;
-  const r = start([{ action: 'wifi_off', time: '22:30' }], old);
-  assert.equal(r.crontab, `${mine}${after}${block(line('30 22', '*', 'wifi_off'))}`);
-  assert.ok(!r.crontab.includes('0 1 * * *'));
+  assert.deepEqual(migrate([], mine), { crontab: mine, uci: [], cron: [] });
 });
 
-test('no tasks left: the block goes, the rest stays', () => {
-  const mine = '0 3 * * * /root/backup.sh\n';
-  assert.equal(start([], `${mine}${block(line('0 1', '*', 'reboot'))}`).crontab, mine);
-});
-
-test('several tasks, one block, in order', () => {
-  const r = start([
-    { action: 'wifi_off', time: '23:00' },
-    { action: 'wifi_on', time: '07:00', days: '1 2' },
+test('each section a plain line: minute and hour as cron reads them, its days as a list, the command itself', () => {
+  const r = migrate([
+    { action: 'reboot', time: '08:05' },
+    { action: 'wifi_off', time: '23:30', days: '1 2 3 4 5' },
+    { action: 'wifi_on', time: '00:00', days: '0' },
   ]);
-  assert.equal(r.crontab, block(line('0 23', '*', 'wifi_off'), line('0 7', '1,2', 'wifi_on')));
+  assert.equal(r.crontab, '5 8 * * * /sbin/reboot\n30 23 * * 1,2,3,4,5 /sbin/wifi down\n0 0 * * 0 /sbin/wifi up\n');
+  assert.deepEqual(r.uci, ['-q delete milkflint.s0', '-q delete milkflint.s1', '-q delete milkflint.s2', 'commit milkflint']);
+  assert.deepEqual(r.cron, ['enable']);
 });
 
-test('cron is restarted when the crontab changed, and only then', () => {
-  const tab = block(line('0 4', '*', 'reboot'));
-  assert.equal(start([{ action: 'reboot', time: '04:00' }]).restarted, true);
-  assert.equal(start([{ action: 'reboot', time: '04:00' }], tab).restarted, false);
-  assert.equal(start([{ action: 'reboot', time: '05:00' }], tab).restarted, true);
-  assert.equal(start([]).restarted, false);
+test('a task switched off is a line commented out; anything else odd is left out, its section goes too', () => {
+  const r = migrate([
+    { action: 'reboot', time: '04:00', enabled: '0' },
+    { action: 'halt', time: '04:00' },
+    { action: 'reboot;id', time: '04:00' },
+    { action: 'reboot', time: '24:00' },
+    { action: 'reboot', time: '4:00' },
+    { action: 'wifi_on', time: '07:00', days: '1;reboot' },
+  ]);
+  assert.equal(r.crontab, '# 0 4 * * * /sbin/reboot\n0 7 * * * /sbin/wifi up\n');
+  assert.equal(r.uci.length, 7);
 });
 
-test('running twice gives the same crontab', () => {
-  const once = start([{ action: 'reboot', time: '04:00' }], '0 3 * * * /root/x\n').crontab;
-  assert.equal(start([{ action: 'reboot', time: '04:00' }], once).crontab, once);
+test('the old block goes, the user’s own lines stay where they were, the tasks after them', () => {
+  const mine = '0 3 * * * /root/backup.sh';
+  const after = '# a note\n*/5 * * * * /root/check.sh';
+  const r = migrate([{ action: 'wifi_off', time: '22:30' }], `${mine}\n${block(`30 22 * * * ${RUN} wifi_off`)}\n${after}\n`);
+  assert.equal(r.crontab, `${mine}\n${after}\n30 22 * * * /sbin/wifi down\n`);
 });
 
-test('the runner does what the task says, and nothing for anything else', () => {
-  const root = mkdtempSync(join(tmpdir(), 'schedule-run-'));
-  try {
-    const bin = join(root, 'bin');
-    mkdirSync(bin);
-    const log = join(root, 'log');
-    for (const name of ['reboot', 'wifi', 'logger']) {
-      writeFileSync(join(bin, name), `#!/bin/sh\n[ "${name}" = logger ] || echo "${name} $*" >> ${log}\n`);
-      chmodSync(join(bin, name), 0o755);
-    }
-    const run = (arg: string): { status: number | null; log: string } => {
-      writeFileSync(log, '');
-      const r = spawnSync('/bin/sh', [join(dir, 'bin/schedule-run'), arg], { env: { PATH: `${bin}:/usr/bin:/bin` } });
-      return { status: r.status, log: readFileSync(log, 'utf8') };
-    };
-    assert.deepEqual(run('reboot'), { status: 0, log: 'reboot \n' });
-    assert.deepEqual(run('wifi_off'), { status: 0, log: 'wifi down\n' });
-    assert.deepEqual(run('wifi_on'), { status: 0, log: 'wifi up\n' });
-    assert.deepEqual(run('halt'), { status: 1, log: '' });
-    assert.deepEqual(run(''), { status: 1, log: '' });
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
+test('banIP’s block is banIP’s: left as it is', () => {
+  const banip =
+    '# milkflint-banip begin (managed by the web interface)\n34 3,15 * * * /usr/libexec/milkflint/banip-action reload\n# milkflint-banip end\n';
+  const r = migrate([{ action: 'reboot', time: '04:00' }], `${block(`0 4 * * * ${RUN} reboot`)}\n${banip}`);
+  assert.equal(r.crontab, `${banip}0 4 * * * /sbin/reboot\n`);
+});
+
+test('a block without its sections (taken out by hand): its lines with the runner’s commands', () => {
+  const r = migrate([], `${block(`5 4 * * 1,2 ${RUN} reboot`, `0 23 * * * ${RUN} wifi_off`, `0 1 * * * ${RUN} halt`)}\n`);
+  assert.equal(r.crontab, '5 4 * * 1,2 /sbin/reboot\n0 23 * * * /sbin/wifi down\n');
+  assert.deepEqual(r.uci, []);
+  // a block with nothing left in it just goes
+  assert.equal(migrate([], `0 3 * * * x\n${block()}\n`).crontab, '0 3 * * * x\n');
+});
+
+test('run again, it changes nothing', () => {
+  const once = migrate([{ action: 'reboot', time: '04:00' }], `0 3 * * * x\n${block(`0 4 * * * ${RUN} reboot`)}\n`).crontab;
+  assert.deepEqual(migrate([], once), { crontab: once, uci: [], cron: [] });
 });

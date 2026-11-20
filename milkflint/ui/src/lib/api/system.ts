@@ -50,6 +50,14 @@ const infoSchema = z.object({
 });
 export type SystemInfo = z.output<typeof infoSchema>;
 
+/**
+ * Memory in use, bytes: what Linux can't hand back. Its cache (cached) and
+ * buffers (buffered) aren't counted: it frees them whenever it's needed.
+ */
+export function memoryInUse(m: SystemInfo['memory']): number {
+  return m.total - (m.available ?? m.free + m.buffered + (m.cached ?? 0));
+}
+
 export function getBoard(): Promise<Board> {
   return call('system', 'board', {}, boardSchema);
 }

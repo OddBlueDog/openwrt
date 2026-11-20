@@ -10,6 +10,7 @@ export const featureIds = [
   'wifi-scan',
   'radar-scan',
   'clients',
+  'device-control',
   'lan',
   'ipv6',
   'remote-access',

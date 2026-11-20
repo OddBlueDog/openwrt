@@ -1,7 +1,9 @@
 // A device's side sheet, opened from its row: how it's connected now, its
-// name and reserved address (a DHCP host section), and where to block it or
-// see its data usage.
-import { type ReactElement, useState } from 'react';
+// name and reserved address (a DHCP host section), its Device control state
+// (paused, off until…) with the way there, and its data usage.
+import { type ReactElement, useCallback, useState } from 'react';
+import { useLoad } from '@/hooks/use-load';
+import { deviceStatus } from '../device-control/api';
 import { InfoRow } from '@/components/card-heading';
 import { SignalReading } from '@/components/charts/signal-bars';
 import { EditorSheet } from '@/components/editor-sheet';
@@ -34,6 +36,8 @@ export function DeviceSheet({
   const [ip, setIp] = useState(device.ip ?? '');
   const ipError = reserve ? reserveError(ip, device.mac, data) : undefined;
   const badName = nameError(name);
+  // its Device control state, read once the sheet opens (router mode only)
+  const control = useLoad(useCallback(async () => (links ? deviceStatus(device.mac) : undefined), [links, device.mac])).data;
 
   return (
     <EditorSheet
@@ -136,8 +140,14 @@ export function DeviceSheet({
             <p className="text-xs text-muted-foreground">What it has downloaded and uploaded this period.</p>
           </div>
           <div className="flex flex-col gap-1">
-            <GoLink href={href('firewall')}>Block it from the internet</GoLink>
-            <p className="text-xs text-muted-foreground">On the Firewall page, under Block a device: always, or at set times.</p>
+            <GoLink href={`${href('device-control')}/${device.mac}`}>
+              {control === undefined ? 'When it may use the internet' : 'Device control'}
+            </GoLink>
+            <p className="text-xs text-muted-foreground" aria-live="polite">
+              {control === undefined
+                ? 'On Device control: a bedtime, school hours, a pause, or blocked always.'
+                : `${control.who === undefined ? '' : `${control.who} · `}${control.text}${control.next === undefined ? '' : `. ${control.next}`}.`}
+            </p>
           </div>
         </section>
       )}

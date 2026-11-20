@@ -7,6 +7,7 @@ import {
   AIRTIME_BAND_KEYS,
   AIRTIME_CLASS_LABELS,
   AIRTIME_CLASSES,
+  AIRTIME_COST_NOTE,
   AIRTIME_STRIP_MARKS,
   type AirtimeBands,
   type AirtimeClass,
@@ -34,6 +35,7 @@ import {
   airtimeState,
   airtimeKey,
   airtimeLabel,
+  airtimeMeasuring,
   airtimeOf,
   airtimeOption,
   airtimeSecondParts,
@@ -722,4 +724,16 @@ test('airtime: with auto, a held-back device says its share of the air and who i
   assert.match(airtimeTrimWords(100, 125) ?? '', /^Paced at 10% of the time by the driver’s estimate/);
   assert.equal(airtimeTrimWords(120, 125), undefined);
   assert.equal(airtimeTrimWords(170, 0), undefined);
+});
+
+test('nothing is measured until a band is on, so the card asks the router for nothing before that', () => {
+  assert.equal(airtimeMeasuring([]), false);
+  assert.equal(airtimeMeasuring([{ airtime: false }, { airtime: false }, { airtime: false }]), false);
+  assert.equal(airtimeMeasuring([{ airtime: false }, { airtime: true }]), true);
+  assert.equal(airtimeMeasuring([{ airtime: true }]), true);
+});
+
+test('the card says that having it on uses CPU, and that it starts off', () => {
+  assert.match(AIRTIME_COST_NOTE, /uses some CPU/);
+  assert.match(AIRTIME_COST_NOTE, /off unless you turn it on/i);
 });

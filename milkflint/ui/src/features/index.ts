@@ -7,6 +7,7 @@ import { feature as banip } from './banip/feature';
 import { feature as clients } from './clients/feature';
 import { feature as dashboard } from './dashboard/feature';
 import { feature as dataStatistics } from './data-statistics/feature';
+import { feature as deviceControl } from './device-control/feature';
 import { feature as dns } from './dns/feature';
 import { feature as firewall } from './firewall/feature';
 import { groups } from './groups';
@@ -48,6 +49,7 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   'wifi-scan': wifiScan,
   'radar-scan': radarScan,
   clients,
+  'device-control': deviceControl,
   lan,
   ipv6,
   'remote-access': remoteAccess,

@@ -7,6 +7,7 @@
 import {
   ActivityIcon,
   ArrowDownUpIcon,
+  CableIcon,
   CalendarClockIcon,
   ChartBarDecreasingIcon,
   ChartColumnIcon,
@@ -21,6 +22,7 @@ import {
   RouteIcon,
   RouterIcon,
   ShieldBanIcon,
+  ShieldUserIcon,
   ShieldXIcon,
   SmartphoneIcon,
   ThermometerIcon,
@@ -32,10 +34,12 @@ import type { ReactElement } from 'react';
 import type { Poll } from '@/hooks/use-poll';
 import type { Live } from '../network-quality/live';
 import { ClientsCard } from './clients-card';
+import { DeviceControlCard } from './device-control-card';
 import { GuestCard } from './guest-card';
 import { InternetDetailsCard } from './internet-details-card';
 import { type Catalog, type Height, type Layout, parseLayout, type Size, type Width } from './layout';
 import { PathCard } from './path-card';
+import { PortsCard } from './ports-card';
 import { RadiosCard } from './radios-card';
 import { CpuCard, MemoryCard } from './resources-cards';
 import { ResponsivenessCard } from './responsiveness-card';
@@ -165,6 +169,15 @@ export const widgets = {
     sizes: [size(1, 1), size(2, 1)],
     render: ({ d }) => <DevicesTile d={d} />,
   },
+  'device-control': {
+    title: 'Device control',
+    description: 'Each person’s internet now (off until 07:00, paused, on), with Pause beside them.',
+    icon: ShieldUserIcon,
+    group: 'Devices',
+    sizes: [size(2, 1), size(1, 1), size(1, 2), size(2, 2)],
+    render: () => <DeviceControlCard />,
+    hidden: ({ ap }) => ap,
+  },
   usage: {
     title: 'Data usage',
     description: 'What was downloaded and uploaded this period, and by which devices.',
@@ -172,6 +185,14 @@ export const widgets = {
     group: 'Devices',
     sizes: [size(2, 1), size(1, 1)],
     render: ({ ap }) => <UsageCard ap={ap} />,
+  },
+  ports: {
+    title: 'Ethernet ports',
+    description: 'Which of the router’s ports have a cable in, at what speed, and their traffic now.',
+    icon: CableIcon,
+    group: 'Devices',
+    sizes: [size(2, 1), size(4, 1), size(1, 1)],
+    render: ({ d }) => <PortsCard d={d} />,
   },
   cpu: {
     title: 'CPU',
@@ -183,7 +204,7 @@ export const widgets = {
   },
   memory: {
     title: 'Memory',
-    description: 'Memory in use, with the cache Linux frees when it’s needed.',
+    description: 'Memory in use, with the buffers and cache Linux frees when they’re needed.',
     icon: MemoryStickIcon,
     group: 'Router',
     sizes: [size(1, 1), size(2, 1)],
@@ -209,7 +230,7 @@ export const widgets = {
   },
   schedules: {
     title: 'Scheduled tasks',
-    description: 'The next restart or Wi-Fi switch, by the router’s clock.',
+    description: 'The next restart, Wi-Fi switch or other scheduled job, by the router’s clock.',
     icon: CalendarClockIcon,
     group: 'Router',
     sizes: [size(1, 1)],

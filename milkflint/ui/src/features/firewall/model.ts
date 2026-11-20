@@ -6,6 +6,7 @@
 // includes, helpers) are never touched. fw4's own defaults are mirrored
 // here: a zone's policies fall back to the global ones, which fall back to
 // drop; rules and port forwards are TCP and UDP unless they say otherwise.
+import { devctlPart } from '../device-control/names';
 import { bool, type Change, list, type Section, str } from '@/lib/api/uci';
 import { INTERCEPT_SECTIONS } from '../dns/intercept';
 import type { FeatureId } from '../ids';
@@ -425,6 +426,17 @@ export const managedBy: Record<string, { page: FeatureId; title: string }> = {
   ...Object.fromEntries(SERVER_FIREWALL.map((section) => [section, { page: 'remote-access', title: 'Remote access' }])),
   ...Object.fromEntries(CLIENT_FIREWALL.map((section) => [section, { page: 'vpn-client', title: 'Send through a VPN' }])),
 };
+
+/**
+ * Which page made a section and keeps it up: the fixed ones above, and
+ * Device control's (its people's rules and the sections they share, known
+ * by their devctl_ names).
+ */
+export function managerOf(section: string): { page: FeatureId; title: string } | undefined {
+  return (
+    managedBy[section] ?? (devctlPart(section) === undefined ? undefined : { page: 'device-control', title: 'Device control' })
+  );
+}
 
 /** Names for devices: by MAC (lower case) and by IP. */
 export interface Names {

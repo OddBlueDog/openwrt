@@ -33,18 +33,91 @@ const PEERS = [
   { key: 'aB2cD4eF6gH8iJ0kL2mN4oP6qR8sT0uV2wX4yZ6aB8c=', name: 'Alex’s Pixel', handshake: 0 },
 ];
 
+/** Device control's people on the busy router: Sam off on school nights, and Alex (a long name) paused for half an hour. */
+export const SAM = { id: 'devctl_s4m0', devices: ['aa:00:00:00:00:01', 'aa:00:00:00:00:02'] } as const;
+export const ALEX = { id: 'devctl_a1ex', devices: ['aa:00:00:00:00:03'] } as const;
+
 function milkflint(s: Scenario): unknown {
   return uci([
     ['mode', 'mode', { mode: s === 'ap' ? 'ap' : 'router' }],
     ['datastats', 'datastats', { enabled: s === 'quiet' ? '0' : '1' }],
+    ...(s === 'busy' ? [...GUESTS.map((g) => [g.id, 'guest_network', { label: g.label }] as const)] : []),
     ...(s === 'busy'
-      ? [
-          ...GUESTS.map((g) => [g.id, 'guest_network', { label: g.label }] as const),
-          ['nightly', 'schedule', { action: 'reboot', time: '04:00', days: ['1', '4'], enabled: '1' }] as const,
-          ['bedtime', 'schedule', { action: 'wifi_off', time: '23:30', days: ['0', '1', '2', '3', '4', '5', '6'] }] as const,
-        ]
+      ? ([
+          [SAM.id, 'person', { name: 'Sam', device: [...SAM.devices] }],
+          [ALEX.id, 'person', { name: 'Alexandra-Margaret Kensington', device: [...ALEX.devices], safesearch: '1' }],
+        ] as const)
       : []),
   ]);
+}
+
+/** Sam's school nights as Device control writes them, and the sections everyone shares. */
+function devctlRules(): (readonly [string, string, Options])[] {
+  const person = { src: '*', dest: 'wan', src_mac: [...SAM.devices], ipset: '!devctl_extra', proto: 'all', target: 'REJECT' };
+  const set = (name: string): readonly [string, string, Options] => [
+    name,
+    'ipset',
+    { name, family: 'any', match: ['src_mac'], timeout: '0' },
+  ];
+  return [
+    set('devctl_paused'),
+    set('devctl_extra'),
+    [
+      'devctl_pause',
+      'rule',
+      { name: 'Device control: paused', src: '*', dest: 'wan', ipset: 'devctl_paused', proto: 'all', target: 'REJECT' },
+    ],
+    ['devctl_restore', 'include', { type: 'script', path: '/usr/libexec/milkflint/device-control-restore', fw4_compatible: '1' }],
+    [
+      `${SAM.id}_w1`,
+      'rule',
+      { ...person, name: 'Sam: School nights', start_time: '21:00:00', stop_time: '23:59:59', weekdays: 'Mon Tue Wed Thu Sun' },
+    ],
+    [
+      `${SAM.id}_w1_am`,
+      'rule',
+      {
+        ...person,
+        name: 'Sam: School nights (morning)',
+        start_time: '00:00:00',
+        stop_time: '07:00:00',
+        weekdays: 'Mon Tue Wed Thu Fri',
+      },
+    ],
+  ];
+}
+
+/** milkflint.devicecontrol's status: Alex paused for half an hour from NOW. */
+function deviceControl(s: Scenario): unknown {
+  return {
+    now: NOW,
+    offset: 0,
+    paused: s === 'busy' ? { [ALEX.devices[0]]: NOW + 1800 } : {},
+    extra: {},
+    ready: s === 'busy',
+    today:
+      s === 'busy'
+        ? { since: NOW - 55_800, midnight: NOW - 55_800, devices: { [SAM.devices[0]]: [812_000_000, 40_000_000] } }
+        : null,
+    seen: { [SAM.devices[1]]: 7_200 },
+    clock: { ntp: true, synced: true, stratum: 2, at: NOW - 600, uptime: 90_000 },
+    adguard: { installed: true, enabled: false, state: null },
+  };
+}
+
+/** root's crontab: in the busy scenario a restart twice a week, Wi-Fi off at night, a check every few minutes and banIP's update. */
+function crontab(s: Scenario): string {
+  return s === 'busy'
+    ? [
+        '0 4 * * 1,4 /sbin/reboot',
+        '30 23 * * * /sbin/wifi down',
+        '*/5 * * * * /root/check-the-backup-drive-is-still-mounted.sh > /dev/null 2>&1',
+        '# milkflint-banip begin (managed by the web interface)',
+        '34 3,15 * * * /usr/libexec/milkflint/banip-action reload',
+        '# milkflint-banip end',
+        '',
+      ].join('\n')
+    : '';
 }
 
 function network(s: Scenario): unknown {
@@ -127,6 +200,7 @@ function firewall(s: Scenario): unknown {
           [`${g.id}_wan`, 'forwarding', { src: g.id, dest: 'wan' }] as const,
         ])
       : []),
+    ...(s === 'busy' ? devctlRules() : []),
   ]);
 }
 
@@ -334,6 +408,8 @@ export function answer(s: Scenario, object: string, method: string, params: Reco
         return uci([['eth1', 'queue', { enabled: '1', interface: 'eth1', download: '500000', upload: '50000' }]]);
       return undefined;
     }
+    case 'file read':
+      return params['path'] === '/etc/crontabs/root' ? { data: crontab(s) } : undefined;
     case 'network.interface dump':
       return interfaces(s);
     case 'luci-rpc getWirelessDevices':
@@ -358,6 +434,10 @@ export function answer(s: Scenario, object: string, method: string, params: Reco
       return vpn(s);
     case 'milkflint.sensors history':
       return sensorHistory(s);
+    case 'milkflint.devicecontrol status':
+      return deviceControl(s);
+    case 'milkflint neighbors':
+      return { neighbors: [] };
     default:
       return undefined;
   }

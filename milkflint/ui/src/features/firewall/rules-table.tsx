@@ -18,7 +18,7 @@ import {
   ShieldIcon,
   SquarePenIcon,
 } from 'lucide-react';
-import { type DragEvent, type KeyboardEvent, type ReactElement, useId, useRef, useState } from 'react';
+import { type DragEvent, type KeyboardEvent, type ReactElement, useId, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Switch } from '@/components/ui/switch';
@@ -29,7 +29,7 @@ import {
   builtInRules,
   enabledChange,
   type FirewallConfig,
-  managedBy,
+  managerOf,
   moveTo,
   portsText,
   type Rule,
@@ -37,6 +37,7 @@ import {
   zoneTitle,
 } from './model';
 import { foldOpenWrt, moveTarget, namesText, plural, ruleOrigin, type RuleRow } from './summary';
+import { type DevctlRow, devctlRows } from '../device-control/model';
 import {
   GroupHeader,
   HeadRow,
@@ -144,18 +145,19 @@ function matchText(r: Rule): string {
   return parts.join(' · ');
 }
 
-/** What an OpenWrt rule is for, or which page made it. */
-function why(r: Rule): string | undefined {
-  const managed = managedBy[r.section];
+/** What an OpenWrt rule is for, or which page made it (Device control's: who it's for and when, in words). */
+function why(r: Rule, dc: DevctlRow | undefined): string | undefined {
+  if (dc !== undefined) return dc.text;
+  const managed = managerOf(r.section);
   if (managed !== undefined) return `Made by the ${managed.title} page.`;
   return r.name === undefined ? undefined : builtInRules[r.name];
 }
 
 /** The rule's name with its marks: who made it, and Off in words while it's off. */
-function NameCell({ r, wide }: { r: Rule; wide: boolean }): ReactElement {
+function NameCell({ r, wide, dc }: { r: Rule; wide: boolean; dc?: DevctlRow | undefined }): ReactElement {
   const origin = ruleOrigin(r);
-  const managed = managedBy[r.section];
-  const description = why(r);
+  const managed = managerOf(r.section);
+  const description = why(r, dc);
   return (
     <span className="flex min-w-0 flex-col gap-0.5">
       <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
@@ -163,10 +165,10 @@ function NameCell({ r, wide }: { r: Rule; wide: boolean }): ReactElement {
           {r.name ?? r.label}
         </span>
         {origin === 'openwrt' && <OriginMark origin="openwrt" />}
-        {managed !== undefined && <OriginMark origin={managed} />}
+        {managed !== undefined && <OriginMark origin={managed} {...(dc === undefined ? {} : { to: dc.href })} />}
         {!r.enabled && <OffBadge />}
       </span>
-      {description !== undefined && origin !== 'page' && (
+      {description !== undefined && (origin !== 'page' || dc !== undefined) && (
         <span
           className={cn('text-xs text-muted-foreground', wide ? 'max-w-md truncate' : 'line-clamp-2')}
           title={wide ? description : undefined}
@@ -237,6 +239,11 @@ function Folded({ rules, onShow }: { rules: readonly Rule[]; onShow: () => void 
   );
 }
 
+/** To another page (Device control, for its rules). */
+function goTo(to: string): void {
+  window.location.hash = to;
+}
+
 const SHOW_KEY = 'milkflint.firewall.show-openwrt-rules';
 
 /** "Show OpenWrt's rules", remembered in this browser (off when storage isn't there). */
@@ -270,6 +277,13 @@ export function RulesTable({
 }): ReactElement {
   const id = useId();
   const [show, setShow] = useShowOpenWrt();
+  const dc = useMemo(() => devctlRows(data.cfg, data.sections, data.milkflint, (mac) => data.names.byMac.get(mac)), [data]);
+  // Device control's rules open there, unless they were changed by hand
+  const open = (r: Rule): void => {
+    const row = dc.get(r.section);
+    if (row !== undefined && !row.byHand) goTo(row.href);
+    else actions.editRule(r);
+  };
   const groups = chains(data.cfg.rules, data.cfg).map((chain) => ({ chain, rows: foldOpenWrt(chain.rules, show) }));
   const number = new Map(data.cfg.rules.map((r, i) => [r.section, i + 1]));
   const openwrt = data.cfg.rules.filter((r) => ruleOrigin(r) === 'openwrt').length;
@@ -313,15 +327,18 @@ export function RulesTable({
       }}
     />
   );
-  const edit = (r: Rule): ReactElement => (
-    <RowButton
-      label={`Edit ${r.name ?? r.label}`}
-      icon={SquarePenIcon}
-      onClick={() => {
-        actions.editRule(r);
-      }}
-    />
-  );
+  const edit = (r: Rule): ReactElement => {
+    const row = dc.get(r.section);
+    return (
+      <RowButton
+        label={row !== undefined && !row.byHand ? `Edit ${r.name ?? r.label} on Device control` : `Edit ${r.name ?? r.label}`}
+        icon={SquarePenIcon}
+        onClick={() => {
+          open(r);
+        }}
+      />
+    );
+  };
   const showAll = (): void => {
     setShow(true);
   };
@@ -415,7 +432,7 @@ export function RulesTable({
                       }}
                       {...dropProps(chain, r)}
                       onClick={rowClick(() => {
-                        actions.editRule(r);
+                        open(r);
                       })}
                       className={cn(
                         'cursor-pointer border-b last:border-b-0 hover:bg-muted/60',
@@ -447,7 +464,7 @@ export function RulesTable({
                         </span>
                       </td>
                       <td className="max-w-80 px-3 py-2">
-                        <NameCell r={r} wide />
+                        <NameCell r={r} wide dc={dc.get(r.section)} />
                       </td>
                       <td className="px-3 py-2">
                         <span className="flex items-center gap-1.5">
@@ -501,7 +518,7 @@ export function RulesTable({
                       <span className="flex items-start justify-between gap-3">
                         <span className="flex min-w-0 gap-2">
                           <span className="pt-px text-xs text-muted-foreground tabular">{number.get(r.section)}</span>
-                          <NameCell r={r} wide={false} />
+                          <NameCell r={r} wide={false} dc={dc.get(r.section)} />
                         </span>
                         <VerdictBadge verdict={r.target} off={!r.enabled} />
                       </span>

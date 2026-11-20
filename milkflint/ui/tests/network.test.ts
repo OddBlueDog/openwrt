@@ -4,7 +4,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { wanBehindNat } from '../src/features/firewall/api.ts';
-import { globalIpv6, hintName, inSubnet, intToIp, ipToInt, isPrivateMac, prefixLength } from '../src/lib/api/network.ts';
+import {
+  globalIpv6,
+  hintName,
+  inSubnet,
+  intToIp,
+  ipToInt,
+  isPrivateMac,
+  type NetworkInterface,
+  prefixLength,
+  wanInterfaces,
+  wanIpv6,
+} from '../src/lib/api/network.ts';
 import { describeRate, generationOf } from '../src/lib/api/wireless.ts';
 
 test('a netmask or a prefix length, as a prefix length', () => {
@@ -96,4 +107,27 @@ test('the Wi-Fi generation of a rate', () => {
   assert.equal(generationOf({ rate: 6000 }), 0);
   assert.equal(describeRate({ rate: 1200900, he: true, mcs: 11, nss: 2, mhz: 80 }), 'Wi-Fi 6 · MCS 11 · 2×2 · 80 MHz');
   assert.equal(describeRate({ rate: 6000 }), 'legacy');
+});
+
+test('the router’s IPv6 on the internet side: its own address if it has one, and the range delegated to it', () => {
+  const iface = (name: string, over: Partial<NetworkInterface>): NetworkInterface => ({
+    interface: name,
+    up: true,
+    proto: 'x',
+    ...over,
+  });
+  // many providers: a range for the devices, no address for the router itself
+  const wan6 = iface('wan6', { 'ipv6-address': [], 'ipv6-prefix': [{ address: '2001:db8:0:9800::', mask: 56 }] });
+  const wan = iface('wan', { 'ipv6-address': [{ address: 'fe80::1', mask: 64 }] });
+  assert.deepEqual(wanIpv6([wan6, wan]), { address: undefined, range: '2001:db8:0:9800::/56' });
+  const both = iface('wan6', { ...wan6, 'ipv6-address': [{ address: '2001:db8::5', mask: 128 }] });
+  assert.deepEqual(wanIpv6([both]), { address: '2001:db8::5/128', range: '2001:db8:0:9800::/56' });
+  assert.deepEqual(wanIpv6([undefined, iface('wan6', {})]), { address: undefined, range: undefined });
+  // PPPoE's wan_6, read with the others; the LAN's left out
+  const all = [iface('lan', { 'ipv6-prefix': [{ address: 'fd00::', mask: 48 }] }), { ...wan6, interface: 'wan_6' }, wan];
+  assert.deepEqual(
+    wanInterfaces(all).map((i) => i.interface),
+    ['wan_6', 'wan'],
+  );
+  assert.equal(wanIpv6(wanInterfaces(all)).range, '2001:db8:0:9800::/56');
 });

@@ -149,12 +149,22 @@ export function ScheduleFields({
   id,
   value,
   onChange,
+  nights = false,
+  error: shown,
 }: {
   id: string;
   value: ScheduleForm;
   onChange: (s: ScheduleForm) => void;
+  /**
+   * Over midnight, the days are the nights it starts on (Device control,
+   * which writes an evening rule and a morning rule); otherwise fw4's own
+   * reading, the day of each packet.
+   */
+  nights?: boolean;
+  /** the error to show in place of the schedule's own check */
+  error?: string | undefined;
 }): ReactElement {
-  const error = scheduleError(value);
+  const error = shown ?? scheduleError(value);
   return (
     <div className="grid gap-3 rounded-lg border border-dashed p-3">
       <div className="flex flex-wrap items-end gap-3">
@@ -209,7 +219,11 @@ export function ScheduleFields({
       </div>
       <p className={cn('text-xs', error === undefined ? 'text-muted-foreground' : 'text-destructive')}>
         {error ??
-          'By the router’s clock. Over midnight (22:00 until 07:00) it covers both ends of each day ticked: its early morning and its evening.'}
+          (nights
+            ? value.stop !== '00:00' && value.stop < value.start
+              ? 'By the router’s clock. Over midnight, the days are the nights it starts on: Sun is Sunday night into Monday morning.'
+              : 'By the router’s clock.'
+            : 'By the router’s clock. Over midnight (22:00 until 07:00) it covers both ends of each day ticked: its early morning and its evening.')}
       </p>
     </div>
   );

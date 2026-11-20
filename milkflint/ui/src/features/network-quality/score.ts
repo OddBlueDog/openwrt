@@ -13,6 +13,8 @@ export interface ProbeSummary {
   typical: number | undefined;
   /** 95th percentile of the answered probes. */
   worst: number | undefined;
+  /** The single slowest answered probe. */
+  peak: number | undefined;
   /** Share of probes with no answer, 0..1. */
   loss: number;
   answered: number;
@@ -52,6 +54,7 @@ function summarizeValues(values: readonly (number | null)[]): ProbeSummary {
     current: values[values.length - 1] ?? null,
     typical: quantile(answered, 0.5),
     worst: quantile(answered, 0.95),
+    peak: answered[answered.length - 1],
     loss: values.length === 0 ? 0 : 1 - answered.length / values.length,
     answered: answered.length,
   };

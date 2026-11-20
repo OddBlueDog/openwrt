@@ -10,7 +10,7 @@ import type { NatRule, Redirect, Rule } from './model';
 export type OpenDialog =
   | { kind: 'forward'; forward: Redirect | undefined }
   | { kind: 'rule'; rule: Rule | undefined; preset: RulePreset | undefined }
-  | { kind: 'block'; rule: Rule | undefined }
+  | { kind: 'block' }
   | { kind: 'nat'; nat: NatRule | undefined }
   | { kind: 'confirm'; title: string; body: string; action: string; changes: Change[] };
 
@@ -49,7 +49,7 @@ export function useFirewallActions(onApplied: () => void): {
         setDialog({ kind: 'nat', nat });
       },
       blockDevice: () => {
-        setDialog({ kind: 'block', rule: undefined });
+        setDialog({ kind: 'block' });
       },
       confirm: (c) => {
         setDialog({ kind: 'confirm', ...c });

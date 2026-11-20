@@ -94,7 +94,7 @@ export function WifiDriverPage(): ReactElement {
           <FormSkeleton />
         ) : (
           <>
-            <AirtimeSection forms={forms} set={set} />
+            <AirtimeSection forms={forms} saved={saved} set={set} />
             <TwtSection forms={forms} options={data?.options ?? {}} set={set} />
             <SharingSection forms={forms} options={data?.options ?? {}} set={set} />
             <GroupSection forms={forms} set={set} />

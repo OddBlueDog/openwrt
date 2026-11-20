@@ -23,8 +23,8 @@ import { AdvancedSheet } from './advanced-sheet';
 import { enableBanip, getConfig, getStatus, runAction, saveOptions } from './api';
 import { ListsTab } from './lists';
 import { ProtectionTab } from './protection';
-import { PRESETS } from './feeds';
-import { plainFeeds } from './model';
+import { PRESETS, type PresetId } from './feeds';
+import { plainFeeds, withPreset } from './model';
 import type { Options } from './options';
 import { StatusCard } from './status-card';
 import { LicenseCard } from './license-card';
@@ -43,6 +43,8 @@ export function BanipPage(): ReactElement {
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [state, setState] = useState<ApplyState>({ phase: 'idle' });
+  // the preset card picked under Protection and not saved yet: turning banIP on starts it
+  const [pick, setPick] = useState<PresetId>();
   const s = status.data;
   const c = config.data;
 
@@ -138,15 +140,25 @@ export function BanipPage(): ReactElement {
       run('toggle', () => enableBanip(false), 'banIP is off: nothing is blocked, and its rules are gone.');
       return;
     }
-    const recommended = PRESETS.find((p) => p.id === 'recommended')?.feeds ?? [];
+    // a preset card picked under Protection and not saved yet wins; with nothing chosen at all, Recommended
+    const want = pick === 'recommended' || pick === 'strict' ? pick : empty ? 'recommended' : undefined;
+    const title = PRESETS.find((p) => p.id === want)?.title;
     run(
       'toggle',
       async () => {
-        if (empty) await saveOptions({ ban_feed: [...recommended] }, { preset: 'recommended' });
+        if (want !== undefined) {
+          const o = withPreset(c.options ?? {}, want);
+          const lists: Options = {};
+          for (const k of ['ban_feed', 'ban_feedin', 'ban_feedout', 'ban_feedinout', 'ban_feedreset'] as const) {
+            const v = o[k];
+            if (v !== undefined) lists[k] = v;
+          }
+          await saveOptions(lists, { preset: want });
+        }
         await enableBanip(true);
       },
-      empty
-        ? 'banIP is on, with the Recommended lists: it’s downloading and loading them now.'
+      title !== undefined
+        ? `banIP is on, with the ${title} lists: it’s downloading and loading them now.`
         : 'banIP is on: it’s loading the lists now.',
     );
   };
@@ -197,7 +209,7 @@ export function BanipPage(): ReactElement {
             <Tabs label="banIP" prefix="banip" items={TABS} value={tab} onChange={setTab} className="mt-2" />
             {/* Protection and Your lists stay mounted, so unsaved edits survive a look at another tab; Activity polls, so only while it's shown */}
             <TabPanel prefix="banip" id="protection" value={tab}>
-              <ProtectionTab key={version} c={c} s={s} onSaved={reload} />
+              <ProtectionTab key={version} c={c} s={s} onSaved={reload} onPick={setPick} />
             </TabPanel>
             <TabPanel prefix="banip" id="lists" value={tab}>
               <ListsTab key={version} c={c} onSaved={reload} />

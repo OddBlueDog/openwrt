@@ -139,7 +139,8 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
             {load.paired === 0 ? quietly('Measuring…') : load.underLoad === undefined ? quietly('None seen') : ms(load.underLoad)}
           </Reading>
           <Figure label="Typical" value={r.hour.typical === undefined ? '—' : ms(r.hour.typical)} />
-          <Figure label="Worst" value={r.hour.worst === undefined ? '—' : ms(r.hour.worst)} />
+          <Figure label="Slowest 5%" value={r.hour.worst === undefined ? '—' : ms(r.hour.worst)} />
+          <Figure label="Peak" value={r.hour.peak === undefined ? '—' : ms(r.hour.peak)} />
           <Figure label="Lost" value={formatPercent(r.hour.loss)} tone={r.hour.loss > 0.02 ? 'warning' : undefined} />
           {/* these go before the graph does, when the widget is short of room */}
           <Figure fit={1} label="Jitter" value={time(hourly.jitter)} />
@@ -178,8 +179,8 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
               : load.busy === 0
                 ? `No load seen since you opened Home (${hhmm(since)}).`
                 : `At rest and under load: since ${hhmm(since)}, while Home is open; shaded where the line was busy.`}{' '}
-            Typical (the median), worst (the slowest 5%), lost, jitter, DNS lookup and gateway: the last hour; the score, as on
-            Network quality: the last 5 minutes.
+            Typical (the median), slowest 5% (95% of pings were quicker), peak (the single slowest ping), lost, jitter, DNS lookup
+            and gateway: the last hour; the score, as on Network quality: the last 5 minutes.
             {lost.length > 0 && ' Ticks along the foot are pings that got no answer.'}
             {cut !== undefined && ` The scale stops at ${String(top)} ms; the highest was ${ms(cut)}.`}
           </p>

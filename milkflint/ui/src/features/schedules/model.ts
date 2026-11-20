@@ -1,124 +1,201 @@
-// Scheduled tasks as the router keeps them (milkflint.schedule sections, run
-// by its cron on its own clock), in words, and when the next one runs: the
-// Scheduled tasks page and Home's widget share them. Plain data, so the
-// tests check it.
-import { bool, list, type Section, str } from '@/lib/api/uci';
+// Scheduled tasks as the Scheduled tasks page and Home's widget show them:
+// the jobs in root's crontab (cron.ts), each with what it does in words
+// (restart the router, Wi-Fi off or on, banIP's update, or a command of your
+// own) and when; the edits the Tasks view makes, each to its own line of the
+// file, leaving every other line as it was; and the next one to run. Plain
+// data, so the tests check it.
+import {
+  clock,
+  crontabText,
+  DAYS,
+  describeDays,
+  describeTimes,
+  type Job,
+  jobLine,
+  type Line,
+  nextTime,
+  parseCrontab,
+  simpleFields,
+  simpleTimes,
+  timesOf,
+} from './cron';
 
+export { DAYS as days, describeDays };
+
+/** What the Tasks view adds and edits, and the line each is in the crontab. */
 export const actions = {
-  reboot: { label: 'Restart the router', done: 'restarts the router' },
-  wifi_off: { label: 'Turn Wi-Fi off', done: 'turns Wi-Fi off' },
-  wifi_on: { label: 'Turn Wi-Fi on', done: 'turns Wi-Fi on' },
+  reboot: { label: 'Restart the router', done: 'restarts the router', command: '/sbin/reboot' },
+  wifi_off: { label: 'Turn Wi-Fi off', done: 'turns Wi-Fi off', command: '/sbin/wifi down' },
+  wifi_on: { label: 'Turn Wi-Fi on', done: 'turns Wi-Fi on', command: '/sbin/wifi up' },
 } as const;
 export type Action = keyof typeof actions;
 
-// cron numbering: 0 = Sunday
-export const days = [
-  { n: 1, label: 'Mon', name: 'Monday' },
-  { n: 2, label: 'Tue', name: 'Tuesday' },
-  { n: 3, label: 'Wed', name: 'Wednesday' },
-  { n: 4, label: 'Thu', name: 'Thursday' },
-  { n: 5, label: 'Fri', name: 'Friday' },
-  { n: 6, label: 'Sat', name: 'Saturday' },
-  { n: 0, label: 'Sun', name: 'Sunday' },
-] as const;
+/** banIP's list update: the banIP page sets its times, and keeps it in the crontab. */
+export const BANIP_COMMAND = '/usr/libexec/milkflint/banip-action';
 
-export interface Task {
-  /** Stable key in the page's form. */
-  key: string;
-  /** UCI section name for tasks already saved. */
-  section: string | undefined;
-  action: Action;
-  time: string;
-  /** Empty: every day. */
-  days: number[];
-  enabled: boolean;
-}
+/** An action of the page's, banIP's update, or any other command. */
+export type Kind = Action | 'banip' | 'command';
 
 export function isAction(v: string | undefined): v is Action {
   return v !== undefined && Object.hasOwn(actions, v);
 }
 
-/** The tasks in the milkflint config's sections; one with an action this page doesn't know is left out. */
-export function tasksFrom(sections: readonly Section[]): Task[] {
-  return sections
-    .filter((s) => s['.type'] === 'schedule')
-    .flatMap((s): Task[] => {
-      const action = str(s, 'action');
-      if (!isAction(action)) return [];
-      return [
-        {
-          key: s['.name'],
-          section: s['.name'],
-          action,
-          time: str(s, 'time') ?? '04:00',
-          days: list(s, 'days')
-            .map(Number)
-            .filter((n) => n >= 0 && n <= 6),
-          enabled: bool(s, 'enabled', true),
-        },
-      ];
-    });
+/** What a job's command does, as the page knows it ("reboot" and "/sbin/reboot" alike). */
+export function kindOf(command: string): Kind {
+  const c = command.trim().replace(/\s+/g, ' ');
+  if (/^(\/sbin\/)?reboot$/.test(c)) return 'reboot';
+  if (/^(\/sbin\/)?wifi down$/.test(c)) return 'wifi_off';
+  if (/^(\/sbin\/)?wifi up$/.test(c)) return 'wifi_on';
+  if (c.startsWith(`${BANIP_COMMAND} `)) return 'banip';
+  return 'command';
 }
 
-export function describeDays(d: readonly number[]): string {
-  if (d.length === 0 || d.length === 7) return 'every day';
-  const set = new Set(d);
-  if (set.size === 5 && [1, 2, 3, 4, 5].every((n) => set.has(n))) return 'on weekdays';
-  if (set.size === 2 && set.has(0) && set.has(6)) return 'at weekends';
-  return `on ${days
-    .filter((x) => set.has(x.n))
-    .map((x) => x.label)
-    .join(', ')}`;
+export interface Task {
+  /** Its line in the crontab, from 0. */
+  line: number;
+  kind: Kind;
+  job: Job;
+  /** Once a day at a time, on some days of the week: the Tasks view edits those; anything else in the crontab view. */
+  simple: { time: string; days: number[] } | undefined;
 }
 
-/** "Restarts the router at 04:00 every day" */
+export function tasksOf(lines: readonly Line[]): Task[] {
+  return lines.flatMap((l, line) =>
+    l.job === undefined ? [] : [{ line, kind: kindOf(l.job.command), job: l.job, simple: simpleTimes(l.job.fields) }],
+  );
+}
+
+/** The tasks in a crontab's text. */
+export function tasksFrom(text: string): Task[] {
+  return tasksOf(parseCrontab(text));
+}
+
+/** What it does: "Restart the router", "Update banIP’s lists", else its command. */
+export function label(t: Task): string {
+  if (isAction(t.kind)) return actions[t.kind].label;
+  return t.kind === 'banip' ? 'Update banIP’s lists' : t.job.command;
+}
+
+/** When it runs, in words: "at 04:00 every day". */
+export function whenOf(t: Task): string {
+  return describeTimes(t.job.fields);
+}
+
+/** "Restarts the router at 04:00 every day"; "Runs /root/backup.sh every 6 hours at :00" */
 export function sentence(t: Task): string {
-  const s = `${actions[t.action].done} at ${t.time} ${describeDays(t.days)}`;
+  const what = isAction(t.kind) ? actions[t.kind].done : t.kind === 'banip' ? 'updates banIP’s lists' : `runs ${t.job.command}`;
+  const s = `${what} ${whenOf(t)}`;
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-/** "HH:MM" as minutes after midnight; undefined for anything else. */
-function minutesOf(time: string): number | undefined {
-  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(time);
-  return m === null ? undefined : Number(m[1]) * 60 + Number(m[2]);
+// ---- The Tasks view's edits: each rewrites its own line, the rest stay as they were ----
+
+export interface TaskChange {
+  action?: Action;
+  time?: string;
+  days?: number[];
+  enabled?: boolean;
 }
+
+/**
+ * The crontab with the task on `line` changed: another action, a new time or
+ * days (for a task the view edits that way), switched on or off. Unchanged
+ * when there's no task there, or the time isn't one.
+ */
+export function editTask(text: string, line: number, change: TaskChange): string {
+  const lines = parseCrontab(text);
+  const job = lines[line]?.job;
+  if (job === undefined) return text;
+  let fields = job.fields;
+  if (change.time !== undefined || change.days !== undefined) {
+    const simple = simpleTimes(job.fields);
+    if (simple === undefined) return text;
+    const f = simpleFields(change.time ?? simple.time, change.days ?? simple.days);
+    if (f === undefined) return text;
+    fields = f;
+  }
+  const next: Job = {
+    enabled: change.enabled ?? job.enabled,
+    fields,
+    command: change.action === undefined ? job.command : actions[change.action].command,
+  };
+  return crontabText(lines.map((l, i) => (i === line ? jobLine(next) : l.text)));
+}
+
+/** The crontab without the line `line`. */
+export function removeLine(text: string, line: number): string {
+  return crontabText(
+    parseCrontab(text)
+      .filter((_, i) => i !== line)
+      .map((l) => l.text),
+  );
+}
+
+/** The crontab with a task added at its end; unchanged for a time that isn't one. */
+export function addTask(text: string, action: Action, time: string, days: readonly number[] = []): string {
+  const fields = simpleFields(time, days);
+  if (fields === undefined) return text;
+  const lines = parseCrontab(text).map((l) => l.text);
+  return crontabText([...lines, jobLine({ enabled: true, fields, command: actions[action].command })]);
+}
+
+// ---- The next one to run (Home's widget) ----
 
 export interface NextRun {
   task: Task;
-  /** 0 today, 1 tomorrow… up to 7 (a weekly task whose time today has passed). */
+  /** When, on the router's clock read in UTC. */
+  at: number;
+  /** 0 today, 1 tomorrow… */
   inDays: number;
   /** cron's day, 0 = Sunday */
   day: number;
 }
 
 /**
- * The switched-on task that runs next after `localtime`: the router's clock
- * in its own time zone, as epoch seconds read in UTC (as ubus system info
- * gives it). One at this very minute has already run.
+ * Runs a few times a day at most: one minute, not every hour. One that runs
+ * every few minutes would always be next.
  */
-export function nextRun(tasks: readonly Task[], localtime: number): NextRun | undefined {
-  const now = new Date(localtime * 1000);
-  const today = now.getUTCDay();
-  const minute = now.getUTCHours() * 60 + now.getUTCMinutes();
-  let best: (NextRun & { at: number }) | undefined;
-  for (const task of tasks) {
-    const m = minutesOf(task.time);
-    if (!task.enabled || m === undefined) continue;
-    for (let inDays = 0; inDays <= 7; inDays++) {
-      const day = (today + inDays) % 7;
-      if (task.days.length > 0 && !task.days.includes(day)) continue;
-      if (inDays === 0 && m <= minute) continue;
-      const at = inDays * 1440 + m;
-      if (best === undefined || at < best.at) best = { task, inDays, day, at };
-      break;
-    }
-  }
-  return best === undefined ? undefined : { task: best.task, inDays: best.inDays, day: best.day };
+export function occasional(t: Task): boolean {
+  const times = timesOf(t.job.fields);
+  return times?.minutes.length === 1 && times.hours.length < 24;
 }
 
-/** "today at 23:00", "tomorrow at 04:00", "on Saturday at 04:00" */
+/**
+ * The switched-on task that runs next after `localtime`, of the occasional
+ * ones: the router's clock in its own time zone, as epoch seconds read in
+ * UTC (as ubus system info gives it). One at this very minute has already run.
+ */
+export function nextRun(tasks: readonly Task[], localtime: number): NextRun | undefined {
+  let best: { task: Task; at: number } | undefined;
+  for (const task of tasks) {
+    if (!task.job.enabled || !occasional(task)) continue;
+    const times = timesOf(task.job.fields);
+    const at = times === undefined ? undefined : nextTime(times, localtime);
+    if (at !== undefined && (best === undefined || at < best.at)) best = { task, at };
+  }
+  if (best === undefined) return undefined;
+  return {
+    task: best.task,
+    at: best.at,
+    inDays: Math.floor(best.at / 86400) - Math.floor(localtime / 86400),
+    day: new Date(best.at * 1000).getUTCDay(),
+  };
+}
+
+/** "today at 23:00", "tomorrow at 04:00", "on Saturday at 04:00", "on 1 December at 04:00" */
 export function whenText(r: NextRun): string {
-  const name = days.find((d) => d.n === r.day)?.name ?? '';
-  const on = r.inDays === 0 ? 'today' : r.inDays === 1 ? 'tomorrow' : r.inDays === 7 ? `next ${name}` : `on ${name}`;
-  return `${on} at ${r.task.time}`;
+  const d = new Date(r.at * 1000);
+  const time = clock(d.getUTCHours(), d.getUTCMinutes());
+  const name = DAYS.find((x) => x.n === r.day)?.name ?? '';
+  const on =
+    r.inDays === 0
+      ? 'today'
+      : r.inDays === 1
+        ? 'tomorrow'
+        : r.inDays < 7
+          ? `on ${name}`
+          : r.inDays === 7
+            ? `next ${name}`
+            : `on ${d.toLocaleDateString('en-GB', { timeZone: 'UTC', day: 'numeric', month: 'long' })}`;
+  return `${on} at ${time}`;
 }

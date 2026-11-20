@@ -28,9 +28,14 @@ export function getInterfaces(): Promise<NetworkInterface[]> {
 
 const deviceSchema = z.object({
   type: z.string().optional(),
+  /** "dsa" for a switch port */
+  devtype: z.string().optional(),
   up: z.boolean().optional(),
   carrier: z.boolean().optional(),
+  /** the link's speed and duplex, e.g. "1000F" (only while it has a link) */
   speed: z.string().optional(),
+  /** the speeds the port can do, e.g. "2500baseT-F" */
+  'link-supported': z.array(z.string()).optional(),
   macaddr: z.string().optional(),
   'bridge-members': z.array(z.string()).optional(),
   statistics: z
@@ -47,6 +52,14 @@ export type NetworkDevice = z.output<typeof deviceSchema>;
 
 export function getDevices(): Promise<Record<string, NetworkDevice>> {
   return call('network.device', 'status', {}, z.record(z.string(), deviceSchema));
+}
+
+const portSchema = z.object({ role: z.string(), device: z.string() });
+export type BuiltinPort = z.output<typeof portSchema>;
+
+/** The router's own Ethernet ports (its board's list, as LuCI's port status reads it): "lan1"…, and the WAN port. */
+export function getBuiltinPorts(): Promise<BuiltinPort[]> {
+  return call('luci', 'getBuiltinEthernetPorts', {}, z.object({ result: z.array(portSchema) })).then((r) => r.result);
 }
 
 const leaseSchema = z.object({
@@ -118,6 +131,30 @@ export function isPrivateMac(mac: string): boolean {
 /** Global IPv6 addresses: not link-local (fe80::/10) or unique local (fc00::/7). */
 export function globalIpv6(addrs: readonly string[] | undefined): string[] {
   return (addrs ?? []).filter((a) => !/^f[cde]/i.test(a));
+}
+
+/**
+ * The router's IPv6 on the internet side, from its interfaces (wan6, PPPoE's
+ * wan_6, and wan itself): the global address it was given, if any, and the
+ * range (prefix) delegated to it for the devices behind it. Many providers
+ * give only the range; each is "address/length".
+ */
+export function wanIpv6(interfaces: readonly (NetworkInterface | undefined)[]): {
+  address: string | undefined;
+  range: string | undefined;
+} {
+  const v6 = interfaces.filter((i) => i !== undefined);
+  const address = v6.flatMap((i) => i['ipv6-address'] ?? []).find((a) => globalIpv6([a.address]).length > 0);
+  const range = v6.flatMap((i) => i['ipv6-prefix'] ?? [])[0];
+  return {
+    address: address === undefined ? undefined : `${address.address}/${String(address.mask)}`,
+    range: range === undefined ? undefined : `${range.address}/${String(range.mask)}`,
+  };
+}
+
+/** The interfaces wanIpv6 reads, out of netifd's list. */
+export function wanInterfaces(interfaces: readonly NetworkInterface[]): NetworkInterface[] {
+  return ['wan6', 'wan_6', 'wan'].flatMap((name) => interfaces.filter((i) => i.interface === name));
 }
 
 /** "192.168.1.1" + "255.255.255.0" or "24" -> prefix length. */

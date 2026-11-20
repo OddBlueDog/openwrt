@@ -4,7 +4,7 @@
 // router instead.
 import type { ReactElement, ReactNode } from 'react';
 import { Progress } from '@/components/ui/progress';
-import { globalIpv6, ipv4 } from '@/lib/api/network';
+import { ipv4, wanIpv6 } from '@/lib/api/network';
 import { formatBitrate, formatDuration } from '@/lib/format';
 import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
@@ -86,8 +86,8 @@ export function InternetDetailsCard({ d, ap }: { d: Dashboard; ap: boolean }): R
   const online = wan?.up === true;
   const v4 = ipv4(wan)?.split('/')[0];
   const behind = wanBehindNat(v4);
-  const v6 = globalIpv6([...(d.wan6?.['ipv6-address'] ?? []), ...(wan?.['ipv6-address'] ?? [])].map((a) => a.address))[0];
-  const prefix = d.wan6?.['ipv6-prefix']?.[0];
+  // many providers give the router no IPv6 address of its own, only a range for the devices
+  const v6 = wanIpv6([d.wan6, wan]);
   const gateway = wan?.route?.find((r) => r.target === '0.0.0.0' && r.mask === 0)?.nexthop;
   const down = d.cake.find((c) => c.download);
   const up = d.cake.find((c) => !c.download);
@@ -124,12 +124,17 @@ export function InternetDetailsCard({ d, ap }: { d: Dashboard; ap: boolean }): R
               </span>
             )}
           </Row>
-          <Row label="IPv6">
-            {/* an IPv6 address may break anywhere rather than overflow */}
-            <span className="break-all">
-              {v6 ?? (prefix === undefined ? 'None' : `${prefix.address}/${String(prefix.mask)}`)}
-            </span>
-          </Row>
+          {/* an IPv6 address may break anywhere rather than overflow */}
+          {(v6.address !== undefined || v6.range === undefined) && (
+            <Row label="IPv6">
+              <span className="break-all">{v6.address?.split('/')[0] ?? 'None'}</span>
+            </Row>
+          )}
+          {v6.range !== undefined && (
+            <Row label="IPv6 range">
+              <span className="break-all">{v6.range}</span>
+            </Row>
+          )}
           {online && wan.uptime !== undefined && <Row label="Connected for">{formatDuration(wan.uptime)}</Row>}
           {wan !== undefined && <Row label="Connection">{protoName[wan.proto] ?? wan.proto}</Row>}
           {gateway !== undefined && <Row label="Gateway">{gateway}</Row>}

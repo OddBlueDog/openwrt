@@ -18,7 +18,7 @@ import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
-import { getInterfaces, ipv4 } from '@/lib/api/network';
+import { getInterfaces, ipv4, wanInterfaces, wanIpv6 } from '@/lib/api/network';
 import { bool, getConfig, list, str } from '@/lib/api/uci';
 import { formatDuration } from '@/lib/format';
 import { href } from '@/lib/router';
@@ -83,9 +83,9 @@ function InternetAnswer({ proto }: { proto: string | undefined }): ReactElement 
   const reason =
     code !== undefined && code !== 'USER_REQUEST' ? (PPP_ERRORS[code] ?? `The connection failed (${code}).`) : undefined;
   const trying = proto === 'pppoe' && wan?.up !== true && wan?.pending === true && reason === undefined;
-  const wan6 = data?.find((i) => i.interface === 'wan6');
   const gateway = wan?.route?.find((r) => r.target === '0.0.0.0')?.nexthop;
-  const v6 = wan6?.['ipv6-address']?.[0] ?? wan6?.['ipv6-prefix-assignment']?.[0];
+  // many providers give the router no IPv6 address of its own, only a range for the devices
+  const v6 = wanIpv6(wanInterfaces(data ?? []));
   const address = ipv4(wan);
   const dns = wan?.['dns-server'] ?? [];
   const up = wan?.up === true;
@@ -117,14 +117,24 @@ function InternetAnswer({ proto }: { proto: string | undefined }): ReactElement 
         <span className={cn(reason !== undefined && 'text-foreground')}>{stateText}</span>
       </AnswerCell>
       <AnswerCell title="Address" value={<Figure>{address ?? '—'}</Figure>}>
-        {address === undefined ? (
-          'None from your provider yet.'
-        ) : (
-          <span className="flex flex-col gap-0.5">
+        <span className="flex flex-col gap-0.5">
+          {address === undefined ? (
+            <span>No IPv4 address from your provider yet.</span>
+          ) : (
             <span>Gateway {gateway === undefined ? '—' : <Mono>{gateway}</Mono>}</span>
-            <span>IPv6 {v6 === undefined ? 'none' : <Mono>{`${v6.address}/${String(v6.mask)}`}</Mono>}</span>
-          </span>
-        )}
+          )}
+          {v6.address !== undefined && (
+            <span>
+              IPv6 <Mono>{v6.address}</Mono>
+            </span>
+          )}
+          {v6.range !== undefined && (
+            <span>
+              IPv6 range <Mono>{v6.range}</Mono>
+            </span>
+          )}
+          {v6.address === undefined && v6.range === undefined && address !== undefined && <span>IPv6 none</span>}
+        </span>
       </AnswerCell>
       <AnswerCell
         title="Connected for"

@@ -3,22 +3,14 @@
 // rules there are (yours, MilkFlint's other pages', OpenWrt's own). Also how
 // the rules table folds OpenWrt's standard rules away for a newcomer and
 // where a rule moves to when they're folded.
-import {
-  type FirewallConfig,
-  isBuiltIn,
-  isDeviceBlock,
-  isDmz,
-  isInternetForward,
-  isInternetZone,
-  managedBy,
-  type Rule,
-} from './model';
+import { type FirewallConfig, isBuiltIn, isDmz, isInternetForward, isInternetZone, managerOf, type Rule } from './model';
+import { deviceRules } from '../device-control/model';
 
 /** Who made a rule: you, another MilkFlint page, or OpenWrt (its standard rules). */
 export type Origin = 'own' | 'page' | 'openwrt';
 
 export function ruleOrigin(r: Rule): Origin {
-  if (managedBy[r.section] !== undefined) return 'page';
+  if (managerOf(r.section) !== undefined) return 'page';
   return isBuiltIn(r) ? 'openwrt' : 'own';
 }
 
@@ -147,7 +139,8 @@ export function firewallSummary(cfg: FirewallConfig, upnp = 0): FirewallSummary 
       page: cfg.rules.filter((r) => ruleOrigin(r) === 'page').length,
       openwrt: cfg.rules.filter((r) => ruleOrigin(r) === 'openwrt').length,
       off: cfg.rules.filter((r) => !r.enabled).length,
-      blocks: cfg.rules.filter((r) => r.enabled && isDeviceBlock(r, cfg)).length,
+      // devices some rule keeps off the internet (always or at set times): Block a device's and Device control's
+      blocks: new Set(deviceRules(cfg).flatMap((r) => r.macs)).size,
     },
   };
 }

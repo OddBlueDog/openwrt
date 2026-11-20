@@ -30,6 +30,8 @@ export interface Network {
 
 export interface FirewallData {
   sections: Section[];
+  /** MilkFlint's own config: the guest networks' labels, Device control's people */
+  milkflint: Section[];
   cfg: FirewallConfig;
   networks: Network[];
   devices: Device[];
@@ -123,6 +125,7 @@ export async function loadFirewall(): Promise<FirewallData> {
   const upnpSection = upnpd.find((s) => s['.type'] === 'upnpd');
   return {
     sections,
+    milkflint,
     cfg,
     networks,
     devices: sorted.filter((d) => (d.ip === undefined ? d.name !== undefined : atHome(d.ip))),

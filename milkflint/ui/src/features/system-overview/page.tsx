@@ -13,9 +13,9 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { usePoll } from '@/hooks/use-poll';
-import { getInterfaces, ipv4, type NetworkInterface } from '@/lib/api/network';
+import { getInterfaces, ipv4, type NetworkInterface, wanInterfaces, wanIpv6 } from '@/lib/api/network';
 import { getStats, type Stats } from '@/lib/api/stats';
-import { type Board, firmwareName, getBoard, getInfo, type SystemInfo } from '@/lib/api/system';
+import { type Board, firmwareName, getBoard, getInfo, memoryInUse, type SystemInfo } from '@/lib/api/system';
 import { formatBytes, formatDuration, formatNumber, formatPercent } from '@/lib/format';
 import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
@@ -130,11 +130,10 @@ export function SystemOverviewPage(): ReactElement {
 
   const { board, info, stats, interfaces, cores } = data;
   const mem = info.memory;
-  const cache = (mem.cached ?? 0) + mem.buffered;
-  const used = mem.total - (mem.available ?? mem.free + mem.buffered);
+  const used = memoryInUse(mem);
   const wan = interfaces.find((i) => i.interface === 'wan');
   const lan = interfaces.find((i) => i.interface === 'lan');
-  const wan6 = interfaces.find((i) => i.interface === 'wan6')?.['ipv6-address']?.[0];
+  const v6 = wanIpv6(wanInterfaces(interfaces));
   const coreRows = cores ?? stats.cpu.filter((c) => c.name !== 'cpu').map(() => undefined);
   const time = new Date(info.localtime * 1000);
 
@@ -203,7 +202,8 @@ export function SystemOverviewPage(): ReactElement {
               <CardContent>
                 <Meter label="In use" used={used} total={mem.total} format={formatBytes} />
                 <dl className="divide-y border-t">
-                  <Row label="Cache and buffers (freed when needed)">{formatBytes(cache)}</Row>
+                  <Row label="Cached (freed when needed)">{formatBytes(mem.cached ?? 0)}</Row>
+                  <Row label="Buffered (freed when needed)">{formatBytes(mem.buffered)}</Row>
                   {mem.available !== undefined && <Row label="Available">{formatBytes(mem.available)}</Row>}
                   <Row label="Free">{formatBytes(mem.free)}</Row>
                   <Row label="Shared">{formatBytes(mem.shared)}</Row>
@@ -312,8 +312,13 @@ export function SystemOverviewPage(): ReactElement {
                   <Row label="LAN">{ipv4(lan) ?? '—'}</Row>
                   <Row label="WAN IPv4">{ipv4(wan) ?? (wan?.up === true ? 'none' : 'not connected')}</Row>
                   <Row label="WAN IPv6" wrap>
-                    {wan6 === undefined ? '—' : `${wan6.address}/${String(wan6.mask)}`}
+                    {v6.address ?? (v6.range === undefined ? '—' : 'none of its own')}
                   </Row>
+                  {v6.range !== undefined && (
+                    <Row label="IPv6 range" wrap>
+                      {v6.range}
+                    </Row>
+                  )}
                   <Row label="DNS servers" wrap>
                     {wan?.['dns-server']?.join(', ') ?? '—'}
                   </Row>

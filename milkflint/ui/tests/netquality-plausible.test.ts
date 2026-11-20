@@ -105,6 +105,7 @@ test('Home: responsiveness, its chart’s scale and its load pairs never take an
   hour[700] = round(now - 3595 + 700 * 5, JUMP);
   const r = responsiveness(hour, now);
   assert.equal(r.hour.worst, 10);
+  assert.equal(r.hour.peak, 10);
   assert.equal(r.hour.loss, 0);
   assert.equal(r.state.label, 'Steady');
   // the caption's "the highest was …" can't be the jump

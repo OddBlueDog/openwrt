@@ -4,6 +4,8 @@
 import { useRef } from 'react';
 import { usePoll } from '@/hooks/use-poll';
 import {
+  type BuiltinPort,
+  getBuiltinPorts,
   getDevices,
   getHostHints,
   getInterfaces,
@@ -14,12 +16,13 @@ import {
   type NetworkInterface,
 } from '@/lib/api/network';
 import { getSqmStatus, getStats, type Stats } from '@/lib/api/stats';
-import { getBoard, getInfo, type Board, type SystemInfo } from '@/lib/api/system';
+import { getBoard, getInfo, memoryInUse, type Board, type SystemInfo } from '@/lib/api/system';
 import { getConfig, list, str } from '@/lib/api/uci';
 import { bandOf, describeRate, generationOf, getAccessPoints, getWirelessStatus, stationSnr } from '@/lib/api/wireless';
 import { deviceName } from '../clients/model';
 import { directionsOf, type DirectionSummary, summarize } from '../sqm/cake';
 import { wiredDevices } from './model';
+import { type Port, portList, portsOf } from './ports';
 
 export const POLL_MS = 2000;
 export const HISTORY = 60; // samples: 2 minutes
@@ -34,6 +37,13 @@ async function neighborsNow(): Promise<Awaited<ReturnType<typeof getNeighbors>> 
   const value = await getNeighbors().catch(() => undefined);
   neighborsCache = { at: now, value };
   return value;
+}
+
+/** The board's Ethernet ports: they don't change, so they're asked for once (undefined: the router can't say). */
+let builtinPorts: Promise<BuiltinPort[] | undefined> | undefined;
+function builtinPortsOnce(): Promise<BuiltinPort[] | undefined> {
+  builtinPorts ??= getBuiltinPorts().catch(() => undefined);
+  return builtinPorts;
 }
 
 export interface Sample {
@@ -121,6 +131,8 @@ export interface Dashboard {
   clients: Client[];
   /** Devices online on the LAN's cables (answering, and not on the Wi-Fi); undefined when the router can't say. */
   wired: number | undefined;
+  /** The router's Ethernet ports: the WAN port first. */
+  ports: Port[];
   /** Empty while Smart Queue isn't shaping. */
   cake: CakeDirection[];
   history: Sample[];
@@ -167,7 +179,7 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
   const generations = useRef(new Map<string, number>());
 
   return usePoll(async (): Promise<Dashboard> => {
-    const [board, info, stats, devices, interfaces, wireless, leases, hints, dhcp, sqm, neighbors] = await Promise.all([
+    const [board, info, stats, devices, interfaces, wireless, leases, hints, dhcp, sqm, neighbors, builtin] = await Promise.all([
       getBoard(),
       getInfo(),
       getStats(),
@@ -181,6 +193,7 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
       // the wired devices online, as All devices counts them: a count that needn't
       // follow every 2 s sample, so it's asked for at most every NEIGHBORS_MS
       neighborsNow(),
+      builtinPortsOnce(),
     ]);
     const now = performance.now();
 
@@ -280,7 +293,8 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
     clients.sort((a, b) => (b.signal ?? -200) - (a.signal ?? -200));
 
     const wan = interfaces.find((i) => i.interface === 'wan');
-    const wan6 = interfaces.find((i) => i.interface === 'wan6');
+    // PPPoE's IPv6 comes up as wan_6 when it has no wan6 of its own
+    const wan6 = interfaces.find((i) => i.interface === 'wan6') ?? interfaces.find((i) => i.interface === 'wan_6');
     const lan = interfaces.find((i) => i.interface === 'lan');
     // in access point mode the main router answers on the LAN too: it isn't one of the devices
     const gateway = lan?.route?.find((r) => r.target === '0.0.0.0' && r.mask === 0)?.nexthop;
@@ -290,6 +304,8 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
       new Set(clients.map((c) => c.mac)),
       new Set(gateway === undefined ? [] : [gateway]),
     );
+
+    const ports = portsOf(portList(builtin, devices, wan), devices, interfaces, rateOf);
 
     const cpuPrev = new Map(prev?.cpu.map((c) => [c.name, c]));
     const overall = stats.cpu.find((c) => c.name === 'cpu');
@@ -308,7 +324,7 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
     };
 
     const wanDev = wan?.l3_device ?? wan?.device;
-    const memory = 1 - (info.memory.available ?? info.memory.free + info.memory.buffered) / info.memory.total;
+    const memory = memoryInUse(info.memory) / info.memory.total;
     const sample: Sample = {
       t: Date.now() / 1000,
       cpu,
@@ -330,6 +346,6 @@ export function useDashboard(): ReturnType<typeof usePoll<Dashboard>> {
       stats.temperatures = sampleTemperatures(phys, wan?.device);
     }
 
-    return { board, info, stats, cpu, cores, wan, wan6, lan, radios, clients, wired, cake, history: history.current };
+    return { board, info, stats, cpu, cores, wan, wan6, lan, radios, clients, wired, ports, cake, history: history.current };
   }, POLL_MS);
 }

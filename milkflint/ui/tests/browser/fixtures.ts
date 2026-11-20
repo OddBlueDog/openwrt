@@ -10,6 +10,7 @@
 import type { Live } from '@/features/network-quality/live';
 import type { Poll } from '@/hooks/use-poll';
 import type { Client, Dashboard, Radio, Sample } from '@/features/dashboard/use-dashboard';
+import type { Port } from '@/features/dashboard/ports';
 import { HISTORY, POLL_MS } from '@/features/dashboard/use-dashboard';
 
 export type Scenario = 'busy' | 'quiet' | 'ap';
@@ -137,6 +138,38 @@ const lanIface: NonNullable<Dashboard['lan']> = {
   route: [],
 };
 
+/** The Flint 2's six ports: the WAN port, then lan1-lan5 (lan5 and the WAN port 2.5 Gbit/s). */
+function ports(s: Scenario): Port[] {
+  const busy = s === 'busy';
+  const port = (device: string, label: string, over: Partial<Port>): Port => ({
+    device,
+    label,
+    wan: device === 'eth1',
+    link: false,
+    mbit: undefined,
+    half: false,
+    maxMbit: device === 'eth1' || device === 'lan5' ? 2500 : 1000,
+    networks: [device === 'eth1' ? 'Internet' : 'LAN'],
+    down: undefined,
+    up: undefined,
+    ...over,
+  });
+  return [
+    port('eth1', 'WAN', {
+      link: true,
+      mbit: 1000,
+      networks: s === 'ap' ? ['LAN'] : ['Internet'],
+      down: busy ? 312_400_000 : 0,
+      up: busy ? 21_300_000 : 0,
+    }),
+    port('lan1', 'LAN 1', busy || s === 'ap' ? { link: true, mbit: 1000, down: busy ? 98_000_000 : 1_200, up: 4_100_000 } : {}),
+    port('lan2', 'LAN 2', busy ? { link: true, mbit: 100, half: true, down: 3_000, up: 1_000 } : {}),
+    port('lan3', 'LAN 3', busy ? { networks: ['guest'] } : {}),
+    port('lan4', 'LAN 4', busy ? { networks: [] } : {}),
+    port('lan5', 'LAN 5', busy ? { link: true, mbit: 2500, down: 1_234_000_000, up: 456_000_000 } : {}),
+  ];
+}
+
 /** Home's poll, as useDashboard makes it. */
 export function dashboard(s: Scenario): Dashboard {
   const busy = s === 'busy';
@@ -207,6 +240,7 @@ export function dashboard(s: Scenario): Dashboard {
     ],
     clients: list,
     wired: busy ? 2 : ap ? 1 : 0,
+    ports: ports(s),
     cake: busy
       ? [
           {
