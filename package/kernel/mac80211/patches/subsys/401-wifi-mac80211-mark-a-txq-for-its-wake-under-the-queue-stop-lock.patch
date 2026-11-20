@@ -1,0 +1,59 @@
+From: MilkFlint <milkflint@localhost>
+Date: Fri, 20 Nov 2026 11:40:00 +0000
+Subject: [PATCH] wifi: mac80211: mark a txq for its wake under the queue stop
+ lock
+
+ieee80211_tx_dequeue() read the hardware queue's stop reasons under
+queue_stop_reason_lock and, finding the queue stopped, marked the txq
+dirty after dropping the lock. __ieee80211_wake_queue() clears the stop
+under that lock and then wakes the driver for the txqs it finds marked. A
+wake that ran between the unlock and the mark found nothing to wake: the
+driver had been told the txq had nothing for it, the queue was awake, and
+the frames stayed where they were until something else brought the driver
+round (with mt76 an enqueue for any station or a tx-free event, which on
+a quiet radio can be a long wait).
+
+Mark the txq while the lock is held. The wake then either clears the stop
+first, and the dequeue sees the queue awake, or looks for marked txqs
+afterwards, and finds this one.
+
+The lock is only taken when the queue looks stopped. Every dequeued frame
+took it before, to read a word that only stopping and waking a queue
+write. The unlocked read can miss a stop that is being set at that
+moment, as a dequeue already past the check always could.
+
+---
+--- a/net/mac80211/tx.c
++++ b/net/mac80211/tx.c
+@@ -3939,14 +3939,24 @@
+ 		return NULL;
+ 
+ begin:
+-	spin_lock_irqsave(&local->queue_stop_reason_lock, flags);
+-	q_stopped = local->queue_stop_reasons[q];
+-	spin_unlock_irqrestore(&local->queue_stop_reason_lock, flags);
++	/*
++	 * A stopped queue is rare (a scan's visit to another channel, a
++	 * reset), so only that case takes the lock. The txq is marked for
++	 * the wake under the lock __ieee80211_wake_queue() clears the stop
++	 * under: either that wake finds the mark when it goes looking for
++	 * txqs, or the queue is seen awake here. Marked after the unlock, a
++	 * wake in between found nothing, and the txq's frames waited for
++	 * whatever next brought the driver round.
++	 */
++	if (unlikely(READ_ONCE(local->queue_stop_reasons[q]))) {
++		spin_lock_irqsave(&local->queue_stop_reason_lock, flags);
++		q_stopped = local->queue_stop_reasons[q];
++		if (q_stopped)
++			set_bit(IEEE80211_TXQ_DIRTY, &txqi->flags);
++		spin_unlock_irqrestore(&local->queue_stop_reason_lock, flags);
+ 
+-	if (unlikely(q_stopped)) {
+-		/* mark for waking later */
+-		set_bit(IEEE80211_TXQ_DIRTY, &txqi->flags);
+-		return NULL;
++		if (q_stopped)
++			return NULL;
+ 	}
+ 
+ 	spin_lock_bh(&fq->lock);
