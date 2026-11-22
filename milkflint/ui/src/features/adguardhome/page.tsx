@@ -409,16 +409,21 @@ function SignInCard({
   const showForm = !switchOn;
   return (
     <Card>
-      <CardHeading
-        title="Sign-in"
-        description={
-          switchOn
-            ? 'Opening AdGuard Home from this page signs you straight in using your router login.'
-            : 'The user name and password for AdGuard Home’s web interface. Saving restarts it; the router answers DNS meanwhile.'
-        }
-        action={
+      <CardHeading title="Sign-in" description="How you sign in to AdGuard Home’s web interface." />
+      <CardContent className="flex flex-col gap-4 border-t pt-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <Label htmlFor="agh-router-login">Use router login</Label>
+            <p className="max-w-prose text-xs text-muted-foreground">
+              {switchOn
+                ? 'Opening AdGuard Home from this page signs you in for an hour, and signing out here signs you out there too. Direct sign-in at its address stays locked, so there’s no second password to keep.'
+                : routerLogin
+                  ? 'Still on until you save a separate user name and password below. Switch back on to keep using your router login.'
+                  : 'Turn on to sign straight in from this page with your router login instead of keeping a separate password. Direct sign-in at its address will be locked.'}
+            </p>
+          </div>
           <Switch
-            aria-label="Use router login"
+            id="agh-router-login"
             checked={switchOn}
             disabled={busy !== undefined}
             onCheckedChange={(v) => {
@@ -435,27 +440,16 @@ function SignInCard({
               }
             }}
           />
-        }
-      />
-      <CardContent className="flex flex-col gap-3 border-t pt-4">
+        </div>
         {!showForm ? (
-          <>
-            <p className="max-w-prose text-sm">
-              <span className="font-medium">Use router login.</span> Opening AdGuard Home from this page signs you in for an hour,
-              and signing out here signs you out there too. Direct sign-in at its address stays locked, so there’s no second
-              password to keep. Turn this off to set a user name and password of its own (for third-party apps, or signing in at
-              its address directly).
-            </p>
-            <RouterPasswordNote />
-          </>
+          <RouterPasswordNote />
         ) : (
-          <>
-            {routerLogin && (
-              <p className="max-w-prose text-sm text-muted-foreground">
-                Choose a user name and password to turn off router login. Saving restarts AdGuard Home; the router answers DNS
-                meanwhile.
-              </p>
-            )}
+          <div className="flex flex-col gap-3 border-t pt-4">
+            <p className="max-w-prose text-sm text-muted-foreground">
+              {routerLogin
+                ? 'Set a user name and password for AdGuard Home’s web interface and third-party apps. Saving turns off router login and restarts AdGuard Home; the router answers DNS meanwhile.'
+                : 'Change the user name or password for AdGuard Home’s web interface and third-party apps. Saving restarts AdGuard Home; the router answers DNS meanwhile.'}
+            </p>
             <CredentialsForm
               key={s.user ?? ''}
               initialUser={s.user ?? 'admin'}
@@ -469,7 +463,7 @@ function SignInCard({
                 );
               }}
             />
-          </>
+          </div>
         )}
       </CardContent>
     </Card>
