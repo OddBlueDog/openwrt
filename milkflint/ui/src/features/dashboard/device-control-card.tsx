@@ -69,7 +69,7 @@ export function DeviceControlCard(): ReactElement {
     return (
       <Widget aside={link}>
         <OffNote action={null}>
-          {people.error !== undefined || status.error !== undefined ? 'Device control didn’t load.' : 'Reading who’s on…'}
+          {people.error !== undefined || status.error !== undefined ? 'Device control didn’t load.' : 'Reading Device control…'}
         </OffNote>
       </Widget>
     );
@@ -78,8 +78,8 @@ export function DeviceControlCard(): ReactElement {
   if (list.length === 0) {
     return (
       <Widget>
-        <OffNote action={<WidgetLink href={href('device-control')}>Add a person</WidgetLink>}>
-          A bedtime, school hours and a pause for each person’s devices.
+        <OffNote action={<WidgetLink href={href('device-control')}>Set times for devices</WidgetLink>}>
+          A bedtime, school hours and a pause, for a group of devices or a single one.
         </OffNote>
       </Widget>
     );
@@ -91,7 +91,7 @@ export function DeviceControlCard(): ReactElement {
   const picked = rows.find((r) => r.e.key === choosing);
 
   return (
-    <Widget status={off === 0 ? 'Everyone on' : `${String(off)} off now`} aside={link}>
+    <Widget status={off === 0 ? 'All on' : `${String(off)} off now`} aside={link}>
       {picked !== undefined ? (
         <div className="flex flex-col gap-2 px-5" role="group" aria-label={`Pause ${picked.e.title}`}>
           <div className="flex items-center justify-between gap-2">

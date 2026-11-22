@@ -1,5 +1,5 @@
-// Adding or editing a person on the Device control page (and the Firewall
-// page's Block a device, for a device on its own): their name, their
+// Adding or editing a group of devices or a single device on the Device
+// control page (and the Firewall page's Block a device): a group's name, the
 // devices, when their internet is off (at set times, always, or only when
 // paused), Guest Wi-Fi at their times, and SafeSearch. Saving writes their
 // milkflint section and their firewall rules in one apply; the Firewall
@@ -77,7 +77,7 @@ interface Form {
   manual: string;
 }
 
-function initialForm(entry: Entry | undefined, kind: 'person' | 'device'): Form {
+function initialForm(entry: Entry | undefined, kind: 'person' | 'device', blocking: boolean): Form {
   if (entry?.person !== undefined) {
     const p = entry.person;
     const own = entry.own;
@@ -113,7 +113,8 @@ function initialForm(entry: Entry | undefined, kind: 'person' | 'device'): Form 
   return {
     name: '',
     devices: [],
-    when: kind === 'device' ? 'always' : 'times',
+    // blocking (the Firewall page's Block a device) starts on always; anything else on set times, as a group does
+    when: kind === 'device' && blocking ? 'always' : 'times',
     windows: [],
     safeSearch: false,
     guest: false,
@@ -187,7 +188,7 @@ function DeviceChecklist({
             d.guest ? 'on Guest Wi-Fi' : undefined,
             d.privateMac ? 'private address' : undefined,
             d.mac === me ? 'this device' : undefined,
-            other === undefined ? undefined : `in ${other}’s`,
+            other === undefined ? undefined : `in ${other}`,
           ].filter((x) => x !== undefined);
           return (
             <li key={d.mac} className="bg-card">
@@ -235,6 +236,7 @@ export function PersonSheet({
   me,
   deviceName,
   initialDevices,
+  blocking = false,
   onClose,
   onSave,
   onDelete,
@@ -244,8 +246,10 @@ export function PersonSheet({
   initialDevices?: readonly string[] | undefined;
   /** undefined: someone new */
   entry: Entry | undefined;
-  /** a person (a name, devices) or a device on its own */
+  /** a group of devices (with a name) or a single device */
   kind: 'person' | 'device';
+  /** opened to block a device (the Firewall page's Block a device): says Block, and starts on always */
+  blocking?: boolean;
   /** this device's MAC */
   me: string | undefined;
   deviceName: (mac: string) => string | undefined;
@@ -262,7 +266,7 @@ export function PersonSheet({
         ? entry.person.name === undefined
         : entry.macs.length === 1;
   const [f, setF] = useState<Form>(() => {
-    const start = initialForm(entry, single ? 'device' : 'person');
+    const start = initialForm(entry, single ? 'device' : 'person', blocking);
     return entry === undefined && initialDevices !== undefined ? { ...start, devices: [...initialDevices] } : start;
   });
   const isNew = entry === undefined;
@@ -299,12 +303,16 @@ export function PersonSheet({
       : !isMac(manual)
         ? 'A MAC address like a4:83:e7:12:34:56.'
         : takenBy.has(manual)
-          ? `It’s in ${takenBy.get(manual) ?? ''}’s already.`
+          ? `It’s in ${takenBy.get(manual) ?? ''} already.`
           : undefined;
 
   const windowErrors = f.when === 'times' ? f.windows.map(windowError) : [];
   const nameError =
-    !single && f.name.trim() === '' ? 'A name, like Sam.' : f.name.length > 32 ? 'At most 32 characters.' : undefined;
+    !single && f.name.trim() === ''
+      ? 'A name for the group, like Sam or Games consoles.'
+      : f.name.length > 32
+        ? 'At most 32 characters.'
+        : undefined;
   const devicesError = f.devices.length === 0 ? 'Pick at least one device.' : undefined;
   const timesError =
     f.when === 'times' && f.windows.length === 0 ? 'Add a time, or choose Always or Only when paused.' : undefined;
@@ -335,7 +343,13 @@ export function PersonSheet({
   const olderOfPerson: DeviceRule[] = entry?.person === undefined ? [] : entry.older;
   const privateOnes = f.devices.filter((m) => listed.find((d) => d.mac === m)?.privateMac === true);
   const changedMeaning = taking ? entry.older.filter(oldMeaningDiffers) : [];
-  const title = isNew ? (single ? 'Block a device' : 'Add a person') : `Edit ${entry.title}`;
+  const title = isNew
+    ? single
+      ? blocking
+        ? 'Block a device'
+        : 'Add a single device'
+      : 'Add a group of devices'
+    : `Edit ${entry.title}`;
 
   return (
     <EditorSheet
@@ -343,7 +357,7 @@ export function PersonSheet({
       description={
         single
           ? 'When this device may use the internet. It stays on your network either way.'
-          : 'Group someone’s devices so one set of times covers them all. They stay on your network either way.'
+          : 'Devices that share one set of times, such as one person’s or the games consoles. They stay on your network either way.'
       }
       onClose={onClose}
       status={
@@ -361,8 +375,8 @@ export function PersonSheet({
             Cancel
           </Button>
           <Button disabled={blocked !== undefined} onClick={save}>
-            {single && isNew ? <ShieldBanIcon /> : null}
-            {isNew ? (single ? 'Block' : 'Add') : 'Save'}
+            {isNew && single && blocking ? <ShieldBanIcon /> : null}
+            {isNew ? (single && blocking ? 'Block' : 'Add') : 'Save'}
           </Button>
         </>
       }
@@ -377,13 +391,13 @@ export function PersonSheet({
         )}
 
         {!single && (
-          <DialogField id={`${id}-name`} label="Name" error={f.name === '' ? undefined : nameError}>
+          <DialogField id={`${id}-name`} label="Group name" error={f.name === '' ? undefined : nameError}>
             <Input
               id={`${id}-name`}
               value={f.name}
               maxLength={32}
               autoComplete="off"
-              placeholder="Sam"
+              placeholder="Sam, or Games consoles"
               onChange={(e) => {
                 setF((x) => ({ ...x, name: e.target.value }));
               }}
@@ -593,8 +607,8 @@ export function PersonSheet({
             title="SafeSearch and YouTube’s Restricted Mode"
             hint={
               data.adguard === 'on'
-                ? 'Google, Bing, DuckDuckGo and YouTube for their devices, through AdGuard Home. Apps with their own encrypted DNS, or a VPN app, can get round it.'
-                : 'For one person it needs AdGuard Home on. It’s kept for when it is.'
+                ? `Google, Bing, DuckDuckGo and YouTube for ${single ? 'this device' : 'these devices'}, through AdGuard Home. Apps with their own encrypted DNS, or a VPN app, can get round it.`
+                : `Just for ${single ? 'this device' : 'these devices'}, it needs AdGuard Home on. It’s kept for when it is.`
             }
           />
           {f.safeSearch && data.adguard !== 'on' && (

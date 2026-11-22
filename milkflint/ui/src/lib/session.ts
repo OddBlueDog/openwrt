@@ -94,6 +94,16 @@ export function setAdminPassword(adminPassword: AdminPassword): void {
 }
 
 export async function logout(): Promise<void> {
+  // Also end any AdGuard Home router-login session: best-effort, and not waited for (the router
+  // gives a hung AdGuard Home 2 s); keepalive lets it finish after the page moves on.
+  void fetch('/cgi-bin/milkflint-adguardhome', {
+    method: 'POST',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    keepalive: true,
+    headers: { 'Content-Type': 'application/json' },
+    body: '{"logout":true}',
+  }).catch(() => undefined);
   try {
     await exec('session', 'destroy');
   } finally {

@@ -16,7 +16,7 @@ import { TabPanel, Tabs } from '@/components/ui/tabs';
 import type { ApplyState } from '@/hooks/use-apply';
 import { useLoad } from '@/hooks/use-load';
 import { usePoll } from '@/hooks/use-poll';
-import { href } from '@/lib/router';
+import { href, tabFrom, tabHref, useSubPath } from '@/lib/router';
 import { errorMessage } from '@/lib/utils';
 import { ActivityTab } from './activity';
 import { AdvancedSheet } from './advanced-sheet';
@@ -39,7 +39,11 @@ const TABS: { id: TabId; label: string }[] = [
 export function BanipPage(): ReactElement {
   const status = usePoll(getStatus, 3000);
   const config = useLoad(getConfig);
-  const [tab, setTab] = useState<TabId>('protection');
+  // the tab is in the address (#/banip/activity), so a link or the menu's search opens it
+  const tab = tabFrom(useSubPath(), TABS, 'protection');
+  const setTab = (t: TabId): void => {
+    window.location.hash = tabHref('banip', t, 'protection');
+  };
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [state, setState] = useState<ApplyState>({ phase: 'idle' });

@@ -1,11 +1,12 @@
-// The Device control page: when each person's devices may use the
-// internet. It opens on the answer (who's off now and until when, what
-// changes next, who's online), then a card per person with their state,
-// their week and the two everyday actions, Pause and Extra time. Their
+// The Device control page: when devices may use the internet, a group of
+// them (one person's, the games consoles) or a single device. It opens on the
+// answer (what's off now and until when, what changes next, what's online),
+// then a card for each group and device with its state, its week and the two
+// everyday actions, Pause and Extra time. Their
 // times are firewall rules (the Firewall page shows the same ones), saved
 // through UCI with fw4's check; pause and extra time are set on the router
 // at once, with no reload. #/device-control/<mac> opens on that device.
-import { ClockAlertIcon, InfoIcon, PlusIcon, ShieldBanIcon, UserPlusIcon } from 'lucide-react';
+import { ClockAlertIcon, InfoIcon, MonitorSmartphoneIcon, PlusIcon } from 'lucide-react';
 import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { PageHeader } from '@/components/layout/page-header';
@@ -187,7 +188,7 @@ export function DeviceControlPage(): ReactElement {
     <>
       <PageHeader
         title="Device control"
-        description="When each person’s devices may use the internet: bedtimes, school hours, and a pause when it’s time for dinner."
+        description="When your devices may use the internet, one at a time or in groups: bedtimes, school hours, and a pause when it’s time for dinner."
       />
       <div className="flex flex-col gap-4">
         <ApplyStatus state={shownState} />
@@ -254,7 +255,7 @@ export function DeviceControlPage(): ReactElement {
                 void act(`${e.title} has extra time until ${atText(until, clock)}.`, () => giveExtra(e.macs, until));
               }}
               onResume={(e) => {
-                void act(`${e.title}’s times apply again.`, () => resume(e.macs));
+                void act(`The times for ${e.title} apply again.`, () => resume(e.macs));
               }}
             />
           )
@@ -400,12 +401,13 @@ function Body({
         {trouble !== undefined && <ClockAlert text={trouble} />}
         <Card className="items-start gap-3 px-6 py-8">
           <span aria-hidden="true" className="grid size-12 place-items-center rounded-full bg-muted text-muted-foreground">
-            <UserPlusIcon className="size-6" />
+            <MonitorSmartphoneIcon className="size-6" />
           </span>
-          <h2 className="text-lg font-semibold">Add a person</h2>
+          <h2 className="text-lg font-semibold">Choose when devices can use the internet</h2>
           <p className="max-w-prose text-sm text-muted-foreground">
-            Group someone’s devices (Sam: iPad, phone, Switch) so one set of times covers them all: a bedtime, school hours, or
-            off until you say. You can pause them, or give extra time, from here or from Home.
+            Put devices in a group (Sam’s iPad, phone and Switch, or the games consoles) so one set of times covers them all, or
+            give a single device times of its own: a bedtime, school hours, or off until you say. You can pause them, or give
+            extra time, from here or from Home.
           </p>
           <div className="mt-1 flex flex-wrap gap-2">
             <Button
@@ -415,7 +417,7 @@ function Body({
                 onAdd('person');
               }}
             >
-              <PlusIcon /> Add a person
+              <PlusIcon /> Add a group of devices
             </Button>
             <Button
               size="lg"
@@ -425,7 +427,7 @@ function Body({
                 onAdd('device');
               }}
             >
-              <ShieldBanIcon /> Block a device
+              <PlusIcon /> Add a single device
             </Button>
           </div>
         </Card>
@@ -444,7 +446,7 @@ function Body({
               {clock === undefined
                 ? 'Checking…'
                 : first === undefined
-                  ? 'Everyone can use the internet'
+                  ? 'Every device can use the internet'
                   : `${first.e.title}: ${lowerFirst(stateText(first.st.state, clock))}`}
             </Figure>
           }
@@ -455,8 +457,8 @@ function Body({
                 .map((x) => `${x.e.title}: ${lowerFirst(stateText(x.st.state, clock))}`)
                 .join(' · ')
             : first === undefined
-              ? 'Nobody is paused or in their time off.'
-              : `Everyone else can use the internet.`}
+              ? 'Nothing is paused or in its time off.'
+              : 'The rest can use the internet.'}
         </AnswerCell>
         <AnswerCell
           title="Next"
@@ -466,10 +468,10 @@ function Body({
             ? 'No times in the coming week.'
             : next.st.blocked
               ? `${next.e.title} can use the internet again.`
-              : `${next.e.title}’s internet goes off.`}
+              : `Internet goes off for ${next.e.title}.`}
         </AnswerCell>
         <AnswerCell title="Online now" value={<Figure>{`${String(onlineTheirs)} of ${String(peopleDevices.size)}`}</Figure>}>
-          Their devices online ({String(online)} on the network in all)
+          Of the devices set up here ({String(online)} on the network in all)
           {status?.today !== null && status?.today !== undefined && usedToday > 0 && `; ${formatBytes(usedToday)} used today`}
           {status?.today !== null &&
           status?.today !== undefined &&
@@ -487,7 +489,7 @@ function Body({
           <ClockAlertIcon />
           <AlertTitle>Pause and extra time aren’t ready</AlertTitle>
           <AlertDescription>
-            The firewall hasn’t loaded Device control’s sets. Save a person once, or restart the firewall.
+            The firewall hasn’t loaded Device control’s sets. Save a group or a device once, or restart the firewall.
           </AlertDescription>
         </Alert>
       )}
@@ -497,8 +499,8 @@ function Body({
           <AlertTitle>{d.name ?? d.mac} joined Guest Wi-Fi with a new address</AlertTitle>
           <AlertDescription>
             <span>
-              It has the name of one of {owner.title}’s devices, so it may be the same one with a new private address, and{' '}
-              {owner.title}’s times don’t cover it yet.
+              It has the same name as a device in {owner.title}, so it may be the same one with a new private address, and the
+              times for {owner.title} don’t cover it yet.
             </span>
             <Button
               variant="outline"
@@ -572,7 +574,7 @@ function Body({
             onAdd('person');
           }}
         >
-          <PlusIcon /> Add a person
+          <PlusIcon /> Add a group of devices
         </Button>
         <Button
           size="lg"
@@ -582,7 +584,7 @@ function Body({
             onAdd('device');
           }}
         >
-          <ShieldBanIcon /> Block a device
+          <PlusIcon /> Add a single device
         </Button>
       </div>
       <OutOfScope />

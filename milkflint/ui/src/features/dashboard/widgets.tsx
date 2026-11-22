@@ -171,7 +171,8 @@ export const widgets = {
   },
   'device-control': {
     title: 'Device control',
-    description: 'Each person’s internet now (off until 07:00, paused, on), with Pause beside them.',
+    description:
+      'The internet now for each group of devices and single device (off until 07:00, paused, on), with Pause beside them.',
     icon: ShieldUserIcon,
     group: 'Devices',
     sizes: [size(2, 1), size(1, 1), size(1, 2), size(2, 2)],

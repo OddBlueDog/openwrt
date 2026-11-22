@@ -291,6 +291,23 @@ export function getSpatialReuse(device: string): Promise<SpatialReuse> {
   return call('milkflint.wifi', 'spatial_reuse', { device }, spatialReuse);
 }
 
+const muruStatus = z.object({
+  /** an access point of this radio is up */
+  running: z.boolean(),
+  /** the driver exposes live multi-user (MU-MIMO / OFDMA) toggles */
+  supported: z.boolean(),
+  ofdma_dl: z.boolean().nullable(),
+  ofdma_ul: z.boolean().nullable(),
+  mimo_dl: z.boolean().nullable(),
+  mimo_ul: z.boolean().nullable(),
+});
+export type MuruStatus = z.output<typeof muruStatus>;
+
+/** Multi-user (MU-MIMO / OFDMA) flags on a radio now; by interface or phy. */
+export function getMuru(device: string): Promise<MuruStatus> {
+  return call('milkflint.wifi', 'muru', { device }, muruStatus);
+}
+
 const twtStatus = z.object({
   /** an access point of this radio is up */
   running: z.boolean(),

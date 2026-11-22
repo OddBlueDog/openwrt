@@ -95,8 +95,13 @@ export function versionLabel(v: string | null | undefined): string {
 
 /** The share of lookups it blocked, e.g. "12.4%"; undefined before any. */
 export function blockedShare(stats: AdGuardStatus['stats']): string | undefined {
-  if (stats === null || stats === undefined || stats.queries <= 0) return undefined;
-  const p = (stats.blocked / stats.queries) * 100;
+  return stats === null || stats === undefined ? undefined : shareOf(stats.blocked, stats.queries);
+}
+
+/** What share of the lookups were blocked, as its dashboard says it: "4.2%", "12%". */
+export function shareOf(blocked: number, queries: number): string | undefined {
+  if (queries <= 0) return undefined;
+  const p = (blocked / queries) * 100;
   return `${p < 10 ? p.toFixed(1) : p.toFixed(0)}%`;
 }
 
@@ -164,4 +169,67 @@ export function networkOf(cidr: string): string {
   if (n === undefined || !Number.isInteger(bits) || bits < 0 || bits > 32) return cidr;
   const size = 2 ** (32 - bits);
   return `${intToIp(n - (n % size))}/${String(bits)}`;
+}
+
+const IPV4 = /^[0-9]+(?:\.[0-9]+){3}$/;
+const HOSTNAME = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/i;
+
+/**
+ * Where to open AdGuard Home so the session cookie set on `pageHostname`
+ * reaches it (cookies are shared across ports on one host, not across
+ * different IP addresses). A router name like `milkflint.lan` resolves to
+ * the router's home address, so it swaps in cleanly; a different IP (e.g. a
+ * WireGuard tunnel address or IPv6) can't carry the cookie to `url`'s IP.
+ */
+export function adGuardOpenTarget(url: string, pageHostname: string): { url: string; sameHost: boolean; host: string } {
+  try {
+    const u = new URL(url);
+    const host = pageHostname.trim().toLowerCase();
+    if (host === u.hostname.toLowerCase()) return { url: u.toString(), sameHost: true, host: u.hostname };
+    // A DNS name (not localhost, not an IPv4/IPv6 literal): e.g. milkflint.lan
+    if (host !== '' && host !== 'localhost' && !host.includes(':') && !IPV4.test(host) && HOSTNAME.test(host)) {
+      u.hostname = host;
+      return { url: u.toString(), sameHost: true, host };
+    }
+    return { url: u.toString(), sameHost: false, host: u.hostname };
+  } catch {
+    return { url, sameHost: false, host: '' };
+  }
+}
+
+// ---- what it's seeing (its statistics) ----
+
+/** One slot of its series: an hour, or a day. */
+export function slotSeconds(unit: 'hours' | 'days' | undefined): number {
+  return unit === 'days' ? 86_400 : 3_600;
+}
+
+/** Its window in words: "24 hours", "7 days". */
+export function windowText(slots: number, unit: 'hours' | 'days' | undefined): string {
+  const word = unit === 'days' ? 'day' : 'hour';
+  return `${String(slots)} ${word}${slots === 1 ? '' : 's'}`;
+}
+
+/**
+ * When each slot of a series ends, oldest first: the last one is the slot going
+ * on now, which ends at `at`, so the line reaches "now". Slots are whole hours
+ * (or days) of the router's clock, as AdGuard Home counts them.
+ */
+export function slotTimes(count: number, unit: 'hours' | 'days' | undefined, at: number): number[] {
+  const step = slotSeconds(unit);
+  const current = Math.floor(at / step) * step;
+  return Array.from({ length: count }, (_, i) => (i === count - 1 ? at : current - (count - 2 - i) * step));
+}
+
+/** Address → the name the router knows a device by (host hints: leases, neighbours, /etc/ethers). */
+export function namesByAddress(
+  hints: Readonly<Record<string, { name?: string | undefined; ipaddrs?: string[] | undefined; ip6addrs?: string[] | undefined }>>,
+): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const h of Object.values(hints)) {
+    const name = h.name?.split('.')[0];
+    if (name === undefined || name === '') continue;
+    for (const ip of [...(h.ipaddrs ?? []), ...(h.ip6addrs ?? [])]) out.set(ip.toLowerCase(), name);
+  }
+  return out;
 }

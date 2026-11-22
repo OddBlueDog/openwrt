@@ -176,7 +176,7 @@ export function PersonCard({
         </div>
       </div>
 
-      <ul className="mt-3 flex flex-wrap gap-x-3 gap-y-1 px-5 text-sm" aria-label={`${entry.title}’s devices`}>
+      <ul className="mt-3 flex flex-wrap gap-x-3 gap-y-1 px-5 text-sm" aria-label={`Devices in ${entry.title}`}>
         {entry.macs.map((m) => {
           const d = devices.get(m);
           const on = d?.online === true;
@@ -198,7 +198,7 @@ export function PersonCard({
       </ul>
 
       <div className="mt-4 px-5">
-        <WeekTimeline spans={spans} today={day} nowSec={sec} label={`${entry.title}’s week: time off is filled in`} />
+        <WeekTimeline spans={spans} today={day} nowSec={sec} label={`The week for ${entry.title}: time off is filled in`} />
       </div>
 
       <div className="mt-3 flex flex-col gap-1 px-5 text-sm">
@@ -279,7 +279,7 @@ export function PersonCard({
             className="flex flex-col gap-3"
           >
             <p id={`${id}-choices-title`} className="text-sm font-medium">
-              {open === 'pause' ? `Pause ${entry.title}’s internet` : `Extra time for ${entry.title}`}
+              {open === 'pause' ? `Pause the internet for ${entry.title}` : `Extra time for ${entry.title}`}
             </p>
             {open === 'extra' && extraOk === 'old' ? (
               <p className="text-sm text-muted-foreground">

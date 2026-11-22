@@ -6,7 +6,7 @@ import { type ReactElement, type ReactNode, useState } from 'react';
 import { CardHeading, InfoRow } from '@/components/card-heading';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
-import { Logo } from '@/components/layout/sidebar';
+import { Logo, Wordmark } from '@/components/layout/sidebar';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
 import { SaveBar } from '@/components/save-bar';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -55,7 +55,7 @@ function Sample(): ReactElement {
     <div className="flex flex-col gap-4 bg-background p-4 text-foreground">
       <div className="flex items-center gap-3">
         <Logo className="size-7" />
-        <span className="text-sm font-semibold">MilkFlint</span>
+        <Wordmark className="text-sm" />
         <Badge variant="success" className="ml-auto">
           Online
         </Badge>

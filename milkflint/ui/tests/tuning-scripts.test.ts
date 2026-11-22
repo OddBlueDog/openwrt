@@ -26,10 +26,18 @@ mkdirSync(ctParams);
 mkdirSync(wifiParams);
 mkdirSync(radio, { recursive: true });
 mkdirSync(join(root, 'bin'));
-// uci -q get <option>: from the environment, failing if unset, as uci does
+// uci -q get <option>: from the environment, failing if unset, as uci does;
+// uci -q show <config>.<section>: every option of it that's set
 writeFileSync(
   join(root, 'bin', 'uci'),
   `#!/bin/sh
+if [ "$2" = show ]; then
+	p="UCI_$(echo "$3" | tr . _)_"
+	env | while IFS='=' read -r k v; do
+		case "$k" in "$p"*) printf "%s.%s='%s'\\n" "$3" "\${k#"$p"}" "$v" ;; esac
+	done
+	exit 0
+fi
 n=$(echo "$3" | tr . _)
 eval "[ -n \\"\\\${UCI_$n+x}\\" ]" || exit 1
 eval "printf '%s\\n' \\"\\$UCI_$n\\""
@@ -51,18 +59,28 @@ chmodSync(join(root, 'bin', 'uci'), 0o755);
 chmodSync(join(root, 'bin', 'logger'), 0o755);
 chmodSync(join(root, 'bin', 'iw'), 0o755);
 
-/** Runs a script with /sys pointing at the pretend files; settings are uci option to value */
-function run(name: string, settings: Record<string, string>, args: string[] = [], dir = scripts): void {
+/** A script's copy with /sys pointing at the pretend files; its path */
+function stage(name: string, dir = scripts): string {
   const text = readFileSync(join(dir, name), 'utf8')
     .replaceAll('/sys/module/sch_cake/parameters', cakeParams)
     .replaceAll('/sys/module/nf_conntrack/parameters', ctParams)
     .replaceAll('/sys/module/mt76_connac_lib/parameters', wifiParams)
     .replaceAll('/sys/kernel/debug/ieee80211', join(root, 'ieee80211'));
-  const env: Record<string, string> = { PATH: `${join(root, 'bin')}:${process.env['PATH'] ?? ''}` };
-  for (const [option, value] of Object.entries(settings)) env[`UCI_${option.replaceAll('.', '_')}`] = value;
   const path = join(root, name);
   writeFileSync(path, text);
-  execFileSync('sh', [path, ...args], { env, stdio: 'pipe' });
+  return path;
+}
+
+/** The environment a script runs in: the pretend tools first; settings are uci option to value */
+function envOf(settings: Record<string, string>, more: Record<string, string> = {}): Record<string, string> {
+  const env: Record<string, string> = { PATH: `${join(root, 'bin')}:${process.env['PATH'] ?? ''}`, ...more };
+  for (const [option, value] of Object.entries(settings)) env[`UCI_${option.replaceAll('.', '_')}`] = value;
+  return env;
+}
+
+/** Runs a script with /sys pointing at the pretend files; settings are uci option to value */
+function run(name: string, settings: Record<string, string>, args: string[] = [], dir = scripts): void {
+  execFileSync('sh', [stage(name, dir), ...args], { env: envOf(settings), stdio: 'pipe' });
 }
 
 function aql(settings: Record<string, string>): { limits: string; total: number } {
@@ -354,6 +372,126 @@ test('wifi-twt: a driver without the file is left alone', () => {
   mkdirSync(join(root, 'ieee80211', 'phy1'));
   run('wifi-twt', { 'milkflint.wifi.twt_5g_flows': '4' }, ['phy1'], wifiBin);
   assert.throws(() => readFileSync(join(root, 'ieee80211', 'phy1', 'mt76', 'twt_policy')));
+});
+
+function muruFile(phy: string): string {
+  const dir = join(root, 'ieee80211', phy, 'mt76');
+  mkdirSync(dir, { recursive: true });
+  return join(dir, 'muru');
+}
+
+function muru(settings: Record<string, string>, args: string[] = []): Record<string, string> {
+  const phys = ['phy0', 'phy1', 'phy2'];
+  for (const phy of phys) writeFileSync(muruFile(phy), 'untouched');
+  run('wifi-muru', settings, args, wifiBin);
+  return Object.fromEntries(phys.map((phy) => [phy, readFileSync(muruFile(phy), 'utf8').trim()]));
+}
+
+const MURU_DEFAULT_LINE = 'ofdma_dl=1 ofdma_ul=0 mimo_dl=1 mimo_ul=0';
+
+test('wifi-muru: defaults have download on and upload off, per band', () => {
+  assert.deepEqual(muru({}), {
+    phy0: MURU_DEFAULT_LINE,
+    phy1: MURU_DEFAULT_LINE,
+    phy2: MURU_DEFAULT_LINE,
+  });
+  assert.deepEqual(
+    muru({
+      'milkflint.wifi.muru_5g_ofdma_dl': '0',
+      'milkflint.wifi.muru_5g_mimo_dl': '0',
+      'milkflint.wifi.muru_2g_mimo_ul': '1',
+      'milkflint.wifi.muru_6g_ofdma_ul': '1',
+    }),
+    {
+      phy0: 'ofdma_dl=1 ofdma_ul=0 mimo_dl=1 mimo_ul=1',
+      phy1: 'ofdma_dl=0 ofdma_ul=0 mimo_dl=0 mimo_ul=0',
+      phy2: 'ofdma_dl=1 ofdma_ul=1 mimo_dl=1 mimo_ul=0',
+    },
+  );
+});
+
+test('wifi-muru: invalid values fall back to safe defaults', () => {
+  assert.deepEqual(
+    muru({
+      'milkflint.wifi.muru_5g_ofdma_dl': '0; reboot',
+      'milkflint.wifi.muru_5g_mimo_ul': '1; reboot',
+      'milkflint.wifi.muru_5g_ofdma_ul': 'yes',
+    }),
+    { phy0: MURU_DEFAULT_LINE, phy1: MURU_DEFAULT_LINE, phy2: MURU_DEFAULT_LINE },
+  );
+});
+
+test('wifi-muru: only the radios named, and a driver refusal does not stop the others', () => {
+  assert.deepEqual(muru({ 'milkflint.wifi.muru_5g_mimo_dl': '0' }, ['phy1']), {
+    phy0: 'untouched',
+    phy1: 'ofdma_dl=1 ofdma_ul=0 mimo_dl=0 mimo_ul=0',
+    phy2: 'untouched',
+  });
+  for (const phy of ['phy1', 'phy2']) writeFileSync(muruFile(phy), 'untouched');
+  rmSync(muruFile('phy0'), { force: true });
+  mkdirSync(muruFile('phy0'));
+  run('wifi-muru', { 'milkflint.wifi.muru_5g_ofdma_dl': '0', 'milkflint.wifi.muru_6g_mimo_ul': '1' }, [], wifiBin);
+  assert.equal(readFileSync(muruFile('phy1'), 'utf8').trim(), 'ofdma_dl=0 ofdma_ul=0 mimo_dl=1 mimo_ul=0');
+  assert.equal(readFileSync(muruFile('phy2'), 'utf8').trim(), 'ofdma_dl=1 ofdma_ul=0 mimo_dl=1 mimo_ul=1');
+  rmSync(muruFile('phy0'), { recursive: true, force: true });
+});
+
+test('wifi-muru: a driver without the file is left alone', () => {
+  rmSync(join(root, 'ieee80211', 'phy1'), { recursive: true, force: true });
+  mkdirSync(join(root, 'ieee80211', 'phy1'));
+  run('wifi-muru', { 'milkflint.wifi.muru_5g_mimo_dl': '0' }, ['phy1'], wifiBin);
+  assert.throws(() => readFileSync(join(root, 'ieee80211', 'phy1', 'mt76', 'muru')));
+});
+
+const wifiHotplug = fileURLToPath(
+  new URL('../../../package/milkflint/milkflint-ui/files/features/wifi/hotplug.d/ieee80211/', import.meta.url),
+);
+
+/**
+ * The ieee80211 hotplug, sourced as hotplug-call does, against the pretend /sys; it
+ * runs wifi-muru in the background, which here it does in the foreground.
+ * What each radio's muru file holds after.
+ */
+function muruHotplug(env: Record<string, string>, settings: Record<string, string> = {}): Record<string, string> {
+  const phys = ['phy0', 'phy1', 'phy2'];
+  for (const phy of phys) writeFileSync(muruFile(phy), 'untouched');
+  const helper = stage('wifi-muru', wifiBin);
+  const original = readFileSync(join(wifiHotplug, '35-milkflint-muru-flags'), 'utf8');
+  const text = original
+    .replaceAll('/sys/kernel/debug/ieee80211', join(root, 'ieee80211'))
+    .replaceAll('/usr/libexec/milkflint/wifi-muru', `sh ${helper}`)
+    .replace(') > /dev/null 2>&1 &\n', ') > /dev/null 2>&1\n');
+  assert.notEqual(text, original);
+  assert.ok(!text.includes('2>&1 &'), 'the hotplug still leaves its job in the background');
+  const path = join(root, 'muru.hotplug');
+  writeFileSync(path, text);
+  execFileSync('sh', ['-c', `. ${path}`], { env: envOf(settings, env), stdio: 'pipe' });
+  return Object.fromEntries(phys.map((phy) => [phy, readFileSync(muruFile(phy), 'utf8').trim()]));
+}
+
+const UNTOUCHED = { phy0: 'untouched', phy1: 'untouched', phy2: 'untouched' };
+
+test('muru hotplug: only a radio that appears, and only with a setting of its own', () => {
+  const set = { 'milkflint.wifi.muru_5g_mimo_dl': '0' };
+  assert.deepEqual(muruHotplug({ ACTION: 'remove', DEVICENAME: 'phy1' }, set), UNTOUCHED);
+  // none set: the driver starts on the defaults, nothing to write
+  assert.deepEqual(muruHotplug({ ACTION: 'add', DEVICENAME: 'phy1' }), UNTOUCHED);
+  // another feature's settings don't count
+  assert.deepEqual(muruHotplug({ ACTION: 'add', DEVICENAME: 'phy1' }, { 'milkflint.wifi.twt_5g_flows': '4' }), UNTOUCHED);
+  assert.deepEqual(muruHotplug({ ACTION: 'add', DEVICENAME: 'phy1' }, set), {
+    ...UNTOUCHED,
+    phy1: 'ofdma_dl=1 ofdma_ul=0 mimo_dl=0 mimo_ul=0',
+  });
+});
+
+test('muru hotplug: the radio from DEVPATH when there is no DEVICENAME', () => {
+  assert.deepEqual(
+    muruHotplug(
+      { ACTION: 'add', DEVPATH: '/devices/platform/soc/18000000.wifi/ieee80211/phy2' },
+      { 'milkflint.wifi.muru_6g_mimo_ul': '1' },
+    ),
+    { ...UNTOUCHED, phy2: 'ofdma_dl=1 ofdma_ul=0 mimo_dl=1 mimo_ul=1' },
+  );
 });
 
 /** gro show, against a pretend /etc/config/sqm (each section a queue) and a wan on eth1 */

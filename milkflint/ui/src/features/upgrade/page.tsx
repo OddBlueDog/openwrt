@@ -39,8 +39,8 @@ const UPGRADE_SECONDS = 120;
 const MAX_IMAGE_BYTES = 128 * 1024 * 1024;
 /** When Install was pressed (ms since 1970), kept over the reload so the page can tell how it went. */
 const STARTED_KEY = 'milkflint.upgrade-started';
-/** MilkFlint's published images */
-const RELEASES = 'https://github.com/OddBlueDog/milkflint2/releases';
+/** MilkFlint's published images: the public fork's releases */
+const RELEASES = 'https://github.com/OddBlueDog/openwrt/releases';
 
 const PHASES: Record<RestartPhase, string> = {
   starting: 'Starting the upgrade…',

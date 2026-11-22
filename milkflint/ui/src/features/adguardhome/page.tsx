@@ -26,6 +26,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import type { ApplyState } from '@/hooks/use-apply';
@@ -34,22 +35,27 @@ import { usePoll } from '@/hooks/use-poll';
 import { getConfig, type Section, str } from '@/lib/api/uci';
 import { formatBytes, formatNumber } from '@/lib/format';
 import { href } from '@/lib/router';
+import { useSession } from '@/lib/session';
 import { errorMessage } from '@/lib/utils';
 import { homeDhcp, readDeviceDns } from '../dns/device-dns';
 import { SERVER } from '../remote-access/sections';
+import { InsightsCard } from './insights';
 import { guestLabels, isGuestNetwork } from '../wifi-guest/guest';
 import {
   type AdGuardStatus,
   checkUpdates,
   enableAdGuard,
+  enableRouterLogin,
   getAdGuardStatus,
   installVersion,
+  openAdGuard,
   repairAdGuard,
   setCredentials,
   setFallback,
   setupAdGuard,
 } from './api';
 import {
+  adGuardOpenTarget,
   blockedShare,
   type Credentials,
   describeState,
@@ -113,6 +119,25 @@ function Stat({ label, children }: { label: string; children: ReactNode }): Reac
       <dt className="text-xs text-muted-foreground">{label}</dt>
       <dd className="truncate text-base font-semibold tabular">{children}</dd>
     </div>
+  );
+}
+
+function RouterPasswordNote(): ReactElement | null {
+  const session = useSession();
+  if (session.status !== 'authenticated' || session.adminPassword === 'set') return null;
+  const old = session.adminPassword === 'old-default';
+  return (
+    <Alert variant="warning">
+      <TriangleAlertIcon />
+      <AlertTitle>{old ? 'Your router still uses the default password' : 'Your router has no admin password yet'}</AlertTitle>
+      <AlertDescription>
+        Anyone who can sign in here can open AdGuard Home too. {old ? 'Change it' : 'Set one'} on{' '}
+        <a href={href('admin-password')} className={link}>
+          Router access
+        </a>
+        .
+      </AlertDescription>
+    </Alert>
   );
 }
 
@@ -204,7 +229,7 @@ function UpdatesCard({
     <Card>
       <CardHeading
         title="Updates"
-        description="From MilkFlint’s package feed, built from AdGuard Home’s source. Its own updater is off."
+        description="From MilkFlint’s package feed, packaging AdGuard Home’s official releases. Its own updater is off."
         action={
           <Button
             variant="outline"
@@ -239,7 +264,13 @@ function UpdatesCard({
             <LoaderCircleIcon className="size-4 animate-spin" /> Installing; the router answers DNS itself meanwhile.
           </p>
         )}
-        {!working && u?.action === 'install' && u.ok === false && (
+        {!working && u?.action === 'install' && u.ok === false && u.error === 'settings' && (
+          <p className="text-sm text-destructive">
+            That version can’t read AdGuard Home’s settings, which a newer version changed, so {versionLabel(u.installed)} is back
+            on.
+          </p>
+        )}
+        {!working && u?.action === 'install' && u.ok === false && u.error !== 'settings' && (
           <p className="text-sm text-destructive">
             The last install didn’t work
             {u.log !== null && u.log !== undefined && u.log !== '' ? `: ${u.log.split('\n').slice(-2).join(' ')}` : '.'}
@@ -361,6 +392,157 @@ function FallbackCard({
   );
 }
 
+/** Sign-in mode and password: use MilkFlint's router login (default) or a separate user name and password. */
+function SignInCard({
+  s,
+  busy,
+  run,
+}: {
+  s: AdGuardStatus;
+  busy: Busy;
+  run: (what: string, fn: () => Promise<unknown>, done?: string) => void;
+}): ReactElement {
+  const routerLogin = s.router_login === true;
+  const [wantSeparate, setWantSeparate] = useState(false);
+  if (!routerLogin && wantSeparate) setWantSeparate(false);
+  const switchOn = routerLogin && !wantSeparate;
+  const showForm = !switchOn;
+  return (
+    <Card>
+      <CardHeading
+        title="Sign-in"
+        description={
+          switchOn
+            ? 'Opening AdGuard Home from this page signs you straight in using your router login.'
+            : 'The user name and password for AdGuard Home’s web interface. Saving restarts it; the router answers DNS meanwhile.'
+        }
+        action={
+          <Switch
+            aria-label="Use router login"
+            checked={switchOn}
+            disabled={busy !== undefined}
+            onCheckedChange={(v) => {
+              if (!v) {
+                setWantSeparate(true);
+              } else if (routerLogin) {
+                setWantSeparate(false);
+              } else {
+                run(
+                  'router_login',
+                  enableRouterLogin,
+                  'Saved: open AdGuard Home from this page to sign in with your router login.',
+                );
+              }
+            }}
+          />
+        }
+      />
+      <CardContent className="flex flex-col gap-3 border-t pt-4">
+        {!showForm ? (
+          <>
+            <p className="max-w-prose text-sm">
+              <span className="font-medium">Use router login.</span> Opening AdGuard Home from this page signs you in for an hour,
+              and signing out here signs you out there too. Direct sign-in at its address stays locked, so there’s no second
+              password to keep. Turn this off to set a user name and password of its own (for third-party apps, or signing in at
+              its address directly).
+            </p>
+            <RouterPasswordNote />
+          </>
+        ) : (
+          <>
+            {routerLogin && (
+              <p className="max-w-prose text-sm text-muted-foreground">
+                Choose a user name and password to turn off router login. Saving restarts AdGuard Home; the router answers DNS
+                meanwhile.
+              </p>
+            )}
+            <CredentialsForm
+              key={s.user ?? ''}
+              initialUser={s.user ?? 'admin'}
+              submitLabel={routerLogin ? 'Use this password' : 'Save'}
+              busy={busy?.what === 'credentials'}
+              onSubmit={(c) => {
+                run(
+                  'credentials',
+                  () => setCredentials(c.user, c.password),
+                  'Saved: sign in to AdGuard Home with the new password.',
+                );
+              }}
+            />
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function SetupSection({
+  defaultRouterLogin,
+  busy,
+  run,
+}: {
+  defaultRouterLogin: boolean;
+  busy: Busy;
+  run: (what: string, fn: () => Promise<unknown>, done?: string) => void;
+}): ReactElement {
+  const [routerLogin, setRouterLogin] = useState(defaultRouterLogin);
+  const doneNote = 'AdGuard Home is on. It answers once it has started; choose its lists in its web interface.';
+  return (
+    <div className="flex flex-col gap-4 border-t px-5 pt-4 pb-5">
+      <p className="max-w-prose text-sm">
+        Turning it on writes its first settings (no lists yet: you choose them in its web interface), so its setup wizard never
+        runs. Your devices keep asking the router, which sends their lookups through AdGuard Home, then on to the DNS page’s
+        servers. It runs as a program of its own, using some of the router’s memory. If it stops answering once it has started,
+        their lookups fail until it’s back, so nothing gets through unfiltered: you can have the router answer them meanwhile
+        instead, once it’s on.
+      </p>
+      <div className="flex items-start justify-between gap-4 border-t pt-4">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <Label htmlFor="agh-setup-router-login">Use router login</Label>
+          <p className="max-w-prose text-xs text-muted-foreground">
+            {routerLogin
+              ? 'Opening AdGuard Home from this page signs you straight in using your router session. Direct sign-in at its address stays locked.'
+              : 'Set a separate user name and password for AdGuard Home’s web interface and third-party apps.'}
+          </p>
+        </div>
+        <Switch
+          id="agh-setup-router-login"
+          checked={routerLogin}
+          disabled={busy !== undefined}
+          onCheckedChange={setRouterLogin}
+        />
+      </div>
+      {routerLogin ? (
+        <>
+          <RouterPasswordNote />
+          <div className="flex justify-end">
+            <Button
+              disabled={busy !== undefined}
+              onClick={() => {
+                run('setup', () => setupAdGuard({ routerLogin: true }), doneNote);
+              }}
+            >
+              {busy?.what === 'setup' && <LoaderCircleIcon className="animate-spin" />}
+              Turn on AdGuard Home
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className="border-t">
+          <CredentialsForm
+            initialUser="admin"
+            submitLabel="Turn on AdGuard Home"
+            busy={busy?.what === 'setup'}
+            onSubmit={(c) => {
+              run('setup', () => setupAdGuard({ routerLogin: false, user: c.user, password: c.password }), doneNote);
+            }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** What it's doing now, in one line over the state's sentence. */
 function headline(s: AdGuardStatus): string {
   if (s.mode === 'ap') return 'Not used in access point mode';
@@ -398,6 +580,26 @@ function Answer({
   const configured = s.configured === true;
   const share = blockedShare(s.stats);
   const stats = s.stats ?? undefined;
+  const routerLogin = s.router_login === true;
+  const target = s.url === undefined ? undefined : adGuardOpenTarget(s.url, window.location.hostname);
+  // this page opened at another address than AdGuard Home's (Remote access's, IPv6): where it should be instead
+  const offHost = routerLogin && target !== undefined && !target.sameHost && target.host !== '' ? target.host : undefined;
+  const openWithRouterLogin = (): void => {
+    if (target === undefined) return;
+    // Open the tab synchronously inside the click so browsers don't block it as a popup.
+    const tab = window.open('', '_blank');
+    if (tab !== null) tab.opener = null;
+    run('open', async () => {
+      try {
+        await openAdGuard();
+        if (tab !== null) tab.location.replace(target.url);
+        else window.location.assign(target.url);
+      } catch (err) {
+        tab?.close();
+        throw err;
+      }
+    });
+  };
   return (
     <Card className="gap-0 py-0">
       <div className="flex flex-col gap-3 p-5">
@@ -440,11 +642,25 @@ function Answer({
       {configured && !ap && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t px-5 py-4">
           {on && s.running === true ? (
-            <Button asChild>
-              <a href={s.url} target="_blank" rel="noreferrer">
-                Open AdGuard Home <ExternalLinkIcon />
-              </a>
-            </Button>
+            routerLogin ? (
+              offHost !== undefined ? (
+                // the sign-in cookie can't reach AdGuard Home from this address: this page at the home address can
+                <Button asChild>
+                  <a href={`http://${offHost}/${href('adguardhome')}`}>Open this page at {offHost}</a>
+                </Button>
+              ) : (
+                <Button disabled={busy !== undefined} onClick={openWithRouterLogin}>
+                  {busy?.what === 'open' ? <LoaderCircleIcon className="animate-spin" /> : null}
+                  Open AdGuard Home <ExternalLinkIcon />
+                </Button>
+              )
+            ) : (
+              <Button asChild>
+                <a href={s.url} target="_blank" rel="noreferrer">
+                  Open AdGuard Home <ExternalLinkIcon />
+                </a>
+              </Button>
+            )
           ) : (
             // nothing answers there while it's off or not running
             <Button disabled>
@@ -454,33 +670,26 @@ function Answer({
           <p className="min-w-0 text-sm text-muted-foreground">
             Its lists and rules are set there:{' '}
             <span className="font-mono text-xs whitespace-nowrap text-foreground">{s.url}</span>, from your home network
-            {around?.remoteAdmin === true ? ' and Remote access' : ''}. Sign in as {s.user ?? 'your user'}.
+            {around?.remoteAdmin === true ? ' and Remote access' : ''}.{' '}
+            {routerLogin ? (
+              <>
+                {offHost === undefined ? (
+                  'Open it from here to sign straight in with your router login.'
+                ) : (
+                  <>
+                    Opened from here, its sign-in can’t reach it: the router login carries over only from the router’s home
+                    address. Open this page at <span className="font-mono text-xs text-foreground">http://{offHost}/</span>{' '}
+                    (signing in there), then open AdGuard Home from it.
+                  </>
+                )}
+              </>
+            ) : (
+              <>Sign in as {s.user ?? 'your user'}.</>
+            )}
           </p>
         </div>
       )}
-      {!configured && !ap && (
-        <div className="border-t px-5 pt-4 pb-5">
-          <p className="max-w-prose text-sm">
-            Choose the user name and password for its web interface. Turning it on writes its first settings (no lists yet: you
-            choose them there), so its setup wizard never runs. Your devices keep asking the router, which sends their lookups
-            through AdGuard Home, then on to the DNS page’s servers. It runs as a program of its own, using some of the router’s
-            memory. If it stops answering once it has started, their lookups fail until it’s back, so nothing gets through
-            unfiltered: you can have the router answer them meanwhile instead, once it’s on.
-          </p>
-          <CredentialsForm
-            initialUser="admin"
-            submitLabel="Turn on AdGuard Home"
-            busy={busy?.what === 'setup'}
-            onSubmit={(c) => {
-              run(
-                'setup',
-                () => setupAdGuard(c.user, c.password),
-                'AdGuard Home is on. It answers once it has started; choose its lists in its web interface.',
-              );
-            }}
-          />
-        </div>
-      )}
+      {!configured && !ap && <SetupSection defaultRouterLogin={s.router_login ?? true} busy={busy} run={run} />}
     </Card>
   );
 }
@@ -660,31 +869,14 @@ export function AdGuardHomePage(): ReactElement {
           </Problem>
         )}
 
+        {/* what it's seeing: read once a minute, only while it's on and answering */}
+        {s.configured === true && !ap && on && s.running === true && <InsightsCard />}
+
         {s.configured === true && !ap && <FallbackCard s={s} busy={busy} run={run} />}
 
         {s.configured === true && (
           <div className="grid items-start gap-4 xl:grid-cols-2">
-            <Card>
-              <CardHeading
-                title="Sign-in"
-                description="The user name and password for AdGuard Home’s web interface. Saving restarts it; the router answers DNS meanwhile."
-              />
-              <CardContent className="border-t">
-                <CredentialsForm
-                  key={s.user ?? ''}
-                  initialUser={s.user ?? 'admin'}
-                  submitLabel="Save"
-                  busy={busy?.what === 'credentials'}
-                  onSubmit={(c) => {
-                    run(
-                      'credentials',
-                      () => setCredentials(c.user, c.password),
-                      'Saved: sign in to AdGuard Home with the new password.',
-                    );
-                  }}
-                />
-              </CardContent>
-            </Card>
+            <SignInCard s={s} busy={busy} run={run} />
             <UpdatesCard s={s} busy={busy} run={run} />
           </div>
         )}
@@ -736,16 +928,19 @@ export function AdGuardHomePage(): ReactElement {
           <div className="flex flex-col gap-2 border-t px-5 pt-4 text-sm text-muted-foreground">
             <h3 className="font-medium text-foreground">License</h3>
             <p className="max-w-4xl">
-              AdGuard Home is free software, under the GNU General Public License version 3. MilkFlint builds it from its source,
-              unchanged, and installs it; MilkFlint isn’t made or endorsed by AdGuard, whose trademark the name is.
+              AdGuard Home is free software, under the GNU General Public License version 3. MilkFlint packages AdGuard’s official
+              release, unchanged, with its own service settings; MilkFlint isn’t made or endorsed by AdGuard, whose trademark the
+              name is.
             </p>
             <div className="flex flex-wrap gap-x-4 gap-y-1">
               <a href={s.licenses?.license} target="_blank" rel="noreferrer" className={link}>
                 License (GPL-3.0)
               </a>
-              <a href={s.licenses?.notices} target="_blank" rel="noreferrer" className={link}>
-                Third-party notices
-              </a>
+              {s.licenses?.notices !== null && s.licenses?.notices !== undefined && s.licenses.notices !== '' && (
+                <a href={s.licenses.notices} target="_blank" rel="noreferrer" className={link}>
+                  Third-party notices
+                </a>
+              )}
               {version !== undefined && (
                 <a
                   href={`https://github.com/AdguardTeam/AdGuardHome/tree/v${version}`}

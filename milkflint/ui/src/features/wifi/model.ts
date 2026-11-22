@@ -4,7 +4,7 @@
 // radio; the Wi-Fi driver page (features/wifi-driver) its driver settings.
 // Each page writes only its own part, so one never rewrites the other's.
 import type { Change, Section } from '@/lib/api/uci';
-import type { Country, Frequency, RegRule, SpatialReuse } from '@/lib/api/wireless';
+import type { Country, Frequency, MuruStatus, RegRule, SpatialReuse } from '@/lib/api/wireless';
 import {
   type AirtimeBandKey,
   type AirtimeBands,
@@ -15,6 +15,7 @@ import {
 } from './airtime';
 import { blockOf } from './channels';
 import { type HoldBack, holdBackValues } from './hold-back';
+import { type MuruSetting, muruDriverOptions } from './muru';
 import { keyError } from './security';
 import { type SprSetting, sprDriverMode, sprOption, sprRadioOptions } from './spatial-reuse';
 import { type TwtSetting, twtDriverOptions, twtRadioOptions, twtRestarts } from './twt';
@@ -215,6 +216,8 @@ export interface RadioForm {
   airtimeBands: AirtimeBands;
   /** multicast_to_unicast: mac80211 sends multicast to each device on its own */
   multicastToUnicast: boolean;
+  /** Per-band multi-user (MU-MIMO & OFDMA) flags, applied live to the Wi-Fi driver */
+  muru: MuruSetting;
 }
 
 /** What the Networks & radios page edits of a band; the rest is the Wi-Fi driver page's. */
@@ -244,6 +247,7 @@ export const DRIVER_FIELDS = [
   'airtime',
   'airtimeBands',
   'multicastToUnicast',
+  'muru',
 ] as const satisfies readonly (keyof RadioForm)[];
 
 export interface RadioOptions {
@@ -258,6 +262,8 @@ export interface RadioOptions {
   spr: SpatialReuse | undefined;
   /** The Wi-Fi driver has TWT limits (only a radio's own switch otherwise) */
   twtLimits: boolean;
+  /** Multi-user (MU-MIMO / OFDMA) flags on the radio now */
+  muru: MuruStatus | undefined;
 }
 
 export interface WifiData {
@@ -597,6 +603,7 @@ export function driverSection(forms: readonly RadioForm[]): Record<string, strin
     forms.flatMap((f) => [
       [sprOption(f.band), sprDriverMode(f.spr)],
       ...Object.entries(twtDriverOptions(f.band, f.twt)),
+      ...Object.entries(muruDriverOptions(f.band, f.muru)),
       [airtimeOption(f.band), airtimeValue(f.airtime)],
       // off, the band's settings are left as they are
       ...(f.airtime ? Object.entries(airtimeBandValues(f.band, f.airtimeBands)) : []),

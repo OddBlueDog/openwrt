@@ -73,24 +73,42 @@ test('each card says its state in words, its times and its next change', async (
 test('Pause opens its four lengths in place; Escape closes them and gives the focus back to the page', async () => {
   const screen = await drawPage();
   await screen.getByRole('button', { name: 'Pause' }).click();
-  const group = screen.getByRole('group', { name: 'Pause Sam’s internet' });
+  const group = screen.getByRole('group', { name: 'Pause the internet for Sam' });
   await expect.element(group).toBeVisible();
   for (const label of ['30 min', '1 hour', 'Until 07:00', 'Until I resume'])
     await expect.element(group.getByRole('button', { name: label })).toBeVisible();
   await expect.element(group.getByRole('button', { name: '30 min' })).toHaveFocus();
   await userEvent.keyboard('{Escape}');
-  expect(screen.getByRole('group', { name: 'Pause Sam’s internet' }).query()).toBeNull();
+  expect(screen.getByRole('group', { name: 'Pause the internet for Sam' }).query()).toBeNull();
 });
 
-test('Add a person opens the sheet with the presets', async () => {
+test('Add a group of devices opens the sheet with a group name and the presets', async () => {
   const screen = await drawPage();
-  await screen.getByRole('button', { name: 'Add a person' }).first().click();
-  const sheet = screen.getByRole('dialog', { name: 'Add a person' });
+  await screen.getByRole('button', { name: 'Add a group of devices' }).first().click();
+  const sheet = screen.getByRole('dialog', { name: 'Add a group of devices' });
   await expect.element(sheet).toBeVisible();
+  await expect.element(sheet.getByLabelText('Group name')).toHaveAttribute('placeholder', 'Sam, or Games consoles');
   for (const label of ['Bedtime', 'School nights', 'School hours', 'Weekends'])
     await expect.element(sheet.getByRole('button', { name: label })).toBeVisible();
   await sheet.getByRole('button', { name: 'School nights' }).click();
   await expect.element(sheet.getByText('Off 21:00–07:00 on school nights')).toBeVisible();
+});
+
+test('Add a single device opens a sheet for one device: no group name, its times, and Add (not Block)', async () => {
+  const screen = await drawPage();
+  await screen.getByRole('button', { name: 'Add a single device' }).first().click();
+  const sheet = screen.getByRole('dialog', { name: 'Add a single device' });
+  await expect.element(sheet).toBeVisible();
+  await expect
+    .element(sheet.getByText('When this device may use the internet. It stays on your network either way.'))
+    .toBeVisible();
+  await expect.element(sheet.getByLabelText('Group name')).not.toBeInTheDocument();
+  await expect.element(sheet.getByRole('radiogroup', { name: 'Internet off' })).toBeVisible();
+  // like a group, it starts on set times (Block a device, on the Firewall page, starts on always)
+  await expect.element(sheet.getByRole('radio', { name: 'At set times' })).toBeChecked();
+  // the footer's (the MAC address row has an Add of its own, before it)
+  await expect.element(sheet.getByRole('button', { name: 'Add', exact: true }).last()).toBeInTheDocument();
+  await expect.element(sheet.getByRole('button', { name: 'Block', exact: true })).not.toBeInTheDocument();
 });
 
 describe.each(pickableThemes().map((t) => ({ name: t.name, id: t.id })))('$name', ({ id }) => {

@@ -5,6 +5,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { airtimeBandDefaults } from '../src/features/wifi/airtime.ts';
+import { MURU_DEFAULTS } from '../src/features/wifi/muru.ts';
 import {
   driverChanged,
   driverChanges,
@@ -49,6 +50,7 @@ function band(radio: string, b: string, more: Partial<RadioForm> = {}): RadioFor
     airtime: true,
     airtimeBands: { ...airtimeBandDefaults(b), auto: 'balanced' },
     multicastToUnicast: false,
+    muru: { ...MURU_DEFAULTS },
     ...more,
   };
 }
@@ -140,11 +142,20 @@ test('validation is split the same way', () => {
 });
 
 test('the driver’s own options for every band go to milkflint.wifi', () => {
-  const forms = two().map((f) => ({ ...f, spr: { mode: 'off' as const, threshold: -72 }, airtime: false }));
+  const forms = two().map((f) => ({
+    ...f,
+    spr: { mode: 'off' as const, threshold: -72 },
+    airtime: false,
+    muru: f.band === '5g' ? { mimoDl: false, ofdmaDl: true, mimoUl: true, ofdmaUl: false } : f.muru,
+  }));
   const section = driverSection(forms);
   assert.equal(section['spr_2g'], 'off');
   assert.equal(section['spr_5g'], 'off');
   assert.equal(section['airtime_5g'], undefined);
+  assert.equal(section['muru_5g_mimo_dl'], '0');
+  assert.equal(section['muru_5g_ofdma_dl'], undefined);
+  assert.equal(section['muru_5g_mimo_ul'], '1');
+  assert.equal(section['muru_5g_ofdma_ul'], undefined);
   assert.ok('twt_5g_max_interval' in section);
 });
 
@@ -219,8 +230,13 @@ test('turning a band off, or every band', () => {
 
 test('a driver save restarts only bands whose wireless config it changes', () => {
   const saved = two();
-  // the driver's own spatial reuse mode and the airtime policy apply at once, without a restart
-  const atOnce = saved.map((f) => ({ ...f, spr: { mode: 'off' as const, threshold: -72 }, airtime: false }));
+  // the driver's own spatial reuse mode, live MURU flags and airtime policy apply at once, without a restart
+  const atOnce = saved.map((f) => ({
+    ...f,
+    spr: { mode: 'off' as const, threshold: -72 },
+    airtime: false,
+    muru: { mimoDl: false, ofdmaDl: false, mimoUl: false, ofdmaUl: false },
+  }));
   assert.deepEqual(driverImpacts(atOnce, saved, options), []);
   const restart = saved.map((f) => (f.band === '2g' ? { ...f, holdBack: 'openwrt' as const } : f));
   assert.deepEqual(driverImpacts(restart, saved, options), [{ band: '2g', kind: 'restart', changed: [], radarS: 0 }]);

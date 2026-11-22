@@ -29,6 +29,23 @@ export function Logo({ className, ...props }: ComponentProps<'svg'>): ReactEleme
   );
 }
 
+/** MilkFlint's stylized wordmark: tight bold tracking with a primary circle spark over the i in Flint. */
+export function Wordmark({ className }: { className?: string }): ReactElement {
+  return (
+    <span className={cn('inline-flex items-baseline leading-none font-bold tracking-[-0.042em]', className)}>
+      <span className="sr-only">MilkFlint</span>
+      <span aria-hidden="true" className="inline-flex items-baseline">
+        MilkFl
+        <span className="relative inline-block">
+          {'\u0131'}
+          <span className="absolute top-[0.07em] left-1/2 size-[0.165em] -translate-x-1/2 rounded-full bg-primary" />
+        </span>
+        nt
+      </span>
+    </span>
+  );
+}
+
 /**
  * The product's name and the router's, as the rail and the top bar show them:
  * its hostname, or its model while the hostname is the firmware's own name
@@ -40,8 +57,8 @@ export function Brand({ board }: { board: Board | undefined }): ReactElement {
   return (
     <a href={href('dashboard')} className="flex min-w-0 items-center gap-3 rounded-lg">
       <Logo className="size-8 shrink-0" />
-      <span className="min-w-0">
-        <span className="block truncate text-sm font-semibold">MilkFlint</span>
+      <span className="flex min-w-0 flex-col gap-0.5">
+        <Wordmark className="text-sm" />
         <span className="block truncate text-xs text-sidebar-muted-foreground">{named ?? board?.model ?? 'Router'}</span>
       </span>
     </a>

@@ -276,7 +276,7 @@ function Log({ radar }: { radar: Radar }): ReactElement {
     radar.logging === false ? (
       <p className="text-sm text-muted-foreground">
         The radar log is off, so new radar checks and radar aren&apos;t kept. Turn it on on the{' '}
-        <a href="#/logs" className="font-medium text-foreground underline underline-offset-2">
+        <a href="#/logs/radar" className="font-medium text-foreground underline underline-offset-2">
           Logs
         </a>{' '}
         page.

@@ -27,7 +27,7 @@ import {
   validateDriver,
 } from '../wifi/model';
 import { SaveArea } from '@/components/save-area';
-import { AirtimeSection, GroupSection, SharingSection, TwtSection } from './sections';
+import { AirtimeSection, GroupSection, MuruSection, SharingSection, TwtSection } from './sections';
 
 const loadDriver = (): ReturnType<typeof loadWifi> => loadWifi('driver');
 
@@ -97,6 +97,7 @@ export function WifiDriverPage(): ReactElement {
             <AirtimeSection forms={forms} saved={saved} set={set} />
             <TwtSection forms={forms} options={data?.options ?? {}} set={set} />
             <SharingSection forms={forms} options={data?.options ?? {}} set={set} />
+            <MuruSection forms={forms} options={data?.options ?? {}} set={set} />
             <GroupSection forms={forms} set={set} />
             <BeamformingCard />
           </>

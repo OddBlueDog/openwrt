@@ -43,6 +43,18 @@ export function useSubPath(): string {
   return useSyncExternalStore(subscribe, subPath);
 }
 
-export function href(route: Route): string {
-  return `#/${route}`;
+/** A page's address, or a part of it (a tab, a card it scrolls to): #/logs, #/logs/radar. */
+export function href(route: Route, sub?: string): string {
+  return sub === undefined || sub === '' ? `#/${route}` : `#/${route}/${sub}`;
+}
+
+/** A page's tab, from what follows its id in the address; its first tab when that names none. */
+export function tabFrom<T extends string>(sub: string, tabs: readonly { id: T }[], first: T): T {
+  const name = sub.split('/')[0] ?? '';
+  return tabs.find((t) => t.id === name)?.id ?? first;
+}
+
+/** Where a page's tab lives: the page's own address for its first tab, #/<route>/<tab> for the others. */
+export function tabHref<T extends string>(route: Route, tab: T, first: T): string {
+  return href(route, tab === first ? undefined : tab);
 }

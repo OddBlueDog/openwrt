@@ -1,8 +1,10 @@
 // The Wi-Fi driver page's cards: each of the driver's settings for every band,
 // side by side, with what it's doing now where the router can tell.
+import { TriangleAlertIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
+import { Note } from '@/components/note';
 import { Card, CardContent } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
@@ -19,6 +21,7 @@ import {
   holdBackChoices,
 } from '../wifi/hold-back';
 import { type RadioForm, type RadioOptions, validateDriver } from '../wifi/model';
+import { type MuruFlag, muruEnabled, muruNow, muruOption, muruWithMaster } from '../wifi/muru';
 import { qosMapChoice, qosMapHint, qosMapValue } from '../wifi/qos-map';
 import {
   SPR_MODE_LABELS,
@@ -50,7 +53,8 @@ import {
   twtWithPreset,
 } from '../wifi/twt';
 import { TwtLive } from '../wifi/twt-card';
-import { BandColumns, NeedsWifi6, NoNetwork, NowSection } from './band-columns';
+import { BandColumns, NeedsWifi6, NoNetwork, NotHere, NowSection } from './band-columns';
+import { href } from '@/lib/router';
 
 type Set = (f: RadioForm) => <K extends keyof RadioForm>(key: K, value: RadioForm[K]) => void;
 
@@ -417,6 +421,171 @@ export function SharingSection({ forms, options, set }: SectionProps): ReactElem
                     }}
                   />
                 </Field>
+              </>
+            );
+          }}
+        </BandColumns>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function MuruSection({ forms, options, set }: SectionProps): ReactElement {
+  return (
+    <Card>
+      <CardHeading
+        title="Multi-user (MU-MIMO & OFDMA)"
+        description="Lets each band talk to several devices at once. Changes apply live to the Wi-Fi driver, without restarting Wi-Fi."
+      />
+      <CardContent>
+        <BandColumns topic="muru" forms={forms}>
+          {(f) => {
+            if (!['VHT', 'HE', 'EHT'].includes(f.modePrefix)) {
+              return (
+                <NotHere>
+                  Needs Wi-Fi 5 or newer: this band runs an older Wi-Fi mode.{' '}
+                  <a href={href('wifi')} className="font-medium link">
+                    Change it on Networks &amp; radios
+                  </a>
+                  .
+                </NotHere>
+              );
+            }
+            const hasWifi6 = wifi6(f);
+            const muMimo = f.beamforming && f.muMimo;
+            const mimoDlStatus = muMimo ? undefined : 'Needs beamforming and MU-MIMO on in Networks & radios.';
+            const now = muruNow(options[f.radio]?.muru, { wifi6: hasWifi6, muMimo });
+            const opt = (name: MuruFlag): string => `milkflint.wifi.${muruOption(f.band, name)}`;
+            const setMuru = (muru: RadioForm['muru']): void => {
+              set(f)('muru', muru);
+            };
+            const nowLine = now !== '' && <p className="text-xs text-muted-foreground">{now}</p>;
+            if (!hasWifi6) {
+              // Wi-Fi 5 has no OFDMA and no uplink MU-MIMO: downlink MU-MIMO is the one switch
+              return (
+                <Field
+                  id={id(f, 'muruOn')}
+                  label="Downlink MU-MIMO"
+                  status={mimoDlStatus}
+                  {...explain(
+                    'Sends to several devices at once on separate spatial streams (Wi-Fi 5 has no OFDMA or uplink multi-user). On by default; applies at once without restarting Wi-Fi.',
+                    [opt('mimo_dl')],
+                  )}
+                >
+                  <Switch
+                    id={id(f, 'muruOn')}
+                    checked={f.muru.mimoDl}
+                    onCheckedChange={(v) => {
+                      setMuru(muruWithMaster(v));
+                    }}
+                  />
+                  {nowLine}
+                </Field>
+              );
+            }
+            const masterOn = muruEnabled(f.muru);
+            return (
+              <>
+                <Field
+                  id={id(f, 'muruOn')}
+                  label="MU-MIMO & OFDMA"
+                  {...explain(
+                    'Single switch for multi-user scheduling on this band. Turning it off switches off all download and upload MU-MIMO and OFDMA; turning it back on restores the defaults (download on, upload off). Applies at once without restarting Wi-Fi.',
+                    [`milkflint.wifi.muru_${f.band}_*`],
+                  )}
+                >
+                  <Switch
+                    id={id(f, 'muruOn')}
+                    checked={masterOn}
+                    onCheckedChange={(v) => {
+                      setMuru(muruWithMaster(v));
+                    }}
+                  />
+                  {nowLine}
+                </Field>
+                {masterOn && (
+                  <>
+                    <div className="flex flex-col border-l-2 border-border/60 py-2.5 pl-3">
+                      <p className="pb-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">Download</p>
+                      <div className="divide-y">
+                        <Field
+                          id={id(f, 'muruMimoDl')}
+                          label="Downlink MU-MIMO"
+                          status={mimoDlStatus}
+                          {...explain(
+                            'Sends to several devices at once on separate spatial streams. On by default; applies at once without restarting Wi-Fi.',
+                            [opt('mimo_dl')],
+                          )}
+                        >
+                          <Switch
+                            id={id(f, 'muruMimoDl')}
+                            checked={f.muru.mimoDl}
+                            onCheckedChange={(v) => {
+                              setMuru({ ...f.muru, mimoDl: v });
+                            }}
+                          />
+                        </Field>
+                        <Field
+                          id={id(f, 'muruOfdmaDl')}
+                          label="Downlink OFDMA"
+                          {...explain(
+                            'Splits a channel into smaller sub-channels to send to several Wi-Fi 6 devices in one transmission. On by default; applies at once without restarting Wi-Fi.',
+                            [opt('ofdma_dl')],
+                          )}
+                        >
+                          <Switch
+                            id={id(f, 'muruOfdmaDl')}
+                            checked={f.muru.ofdmaDl}
+                            onCheckedChange={(v) => {
+                              setMuru({ ...f.muru, ofdmaDl: v });
+                            }}
+                          />
+                        </Field>
+                      </div>
+                    </div>
+                    <div className="flex flex-col border-l-2 border-border/60 py-2.5 pl-3">
+                      <p className="pb-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">Upload</p>
+                      <Note tone="warning" icon={<TriangleAlertIcon />} className="my-2">
+                        Uplink MU-MIMO and uplink OFDMA have been found to cause periodic Wi-Fi pauses and latency spikes. Both
+                        are off by default; only turn them on if you are testing them.
+                      </Note>
+                      <div className="divide-y">
+                        <Field
+                          id={id(f, 'muruMimoUl')}
+                          label="Uplink MU-MIMO"
+                          {...explain(
+                            'Lets the router trigger Wi-Fi 6 devices to transmit together on separate spatial streams. Off by default because scheduled uplink has been found to cause issues; applies at once without restarting Wi-Fi.',
+                            [opt('mimo_ul')],
+                          )}
+                        >
+                          <Switch
+                            id={id(f, 'muruMimoUl')}
+                            checked={f.muru.mimoUl}
+                            onCheckedChange={(v) => {
+                              setMuru({ ...f.muru, mimoUl: v });
+                            }}
+                          />
+                        </Field>
+                        <Field
+                          id={id(f, 'muruOfdmaUl')}
+                          label="Uplink OFDMA"
+                          {...explain(
+                            'Lets the router schedule Wi-Fi 6 devices to upload together in sub-channels. Off by default because scheduled uplink has been found to cause issues; applies at once without restarting Wi-Fi.',
+                            [opt('ofdma_ul')],
+                          )}
+                        >
+                          <Switch
+                            id={id(f, 'muruOfdmaUl')}
+                            checked={f.muru.ofdmaUl}
+                            onCheckedChange={(v) => {
+                              setMuru({ ...f.muru, ofdmaUl: v });
+                            }}
+                          />
+                        </Field>
+                      </div>
+                    </div>
+                  </>
+                )}
               </>
             );
           }}

@@ -43,9 +43,11 @@ const statusSchema = z.object({
   mode: z.enum(['router', 'ap']).optional(),
   running: z.boolean().optional(),
   memory_kb: z.number().nullish(),
-  /** The installed package's version, e.g. 0.107.80-r1. */
+  /** The installed package's version, e.g. 1.0.0-r1. */
   version: z.string().nullish(),
-  /** The account to sign in to its web interface with. */
+  /** True when opening AdGuard Home from this page signs in with the router's login (no separate password). */
+  router_login: z.boolean().optional(),
+  /** The account to sign in to its web interface with (when router_login is off). */
   user: z.string().nullish(),
   url: z.string().optional(),
   dns_port: z.number().optional(),
@@ -66,7 +68,7 @@ const statusSchema = z.object({
   settings: z.array(settingSchema).optional(),
   networks: z.array(networkSchema).optional(),
   update: updateSchema.nullish(),
-  licenses: z.object({ license: z.string(), notices: z.string() }).optional(),
+  licenses: z.object({ license: z.string(), notices: z.string().nullish() }).optional(),
 });
 export type AdGuardStatus = z.output<typeof statusSchema>;
 
@@ -74,12 +76,50 @@ export function getAdGuardStatus(): Promise<AdGuardStatus> {
   return call('milkflint.adguardhome', 'status', {}, statusSchema);
 }
 
-const resultSchema = z.object({ ok: z.boolean().optional(), error: z.string().optional(), left: z.array(z.string()).optional() });
+const rankedSchema = z.array(z.object({ name: z.string(), count: z.number() }));
+
+const insightsSchema = z.object({
+  running: z.boolean(),
+  error: z.string().optional(),
+  /** When the router read these from AdGuard Home (epoch seconds; it keeps them 15 s). */
+  at: z.number().optional(),
+  /** What each slot of the series is: an hour, or a day for a window of several days. */
+  unit: z.enum(['hours', 'days']).optional(),
+  /** Lookups per slot, oldest first; the last slot is the one going on now. */
+  queries: z.array(z.number()).optional(),
+  /** Of those, blocked (filters, safe browsing, parental control). */
+  blocked: z.array(z.number()).optional(),
+  total: z.number().optional(),
+  total_blocked: z.number().optional(),
+  /** Its top lists, most first, up to ten each: names asked for, names blocked, devices by address. */
+  top_queried: rankedSchema.optional(),
+  top_blocked: rankedSchema.optional(),
+  top_clients: rankedSchema.optional(),
+});
+export type AdGuardInsights = z.output<typeof insightsSchema>;
+
+/** What AdGuard Home is seeing: its top lists and lookups over its window, as its own dashboard shows them. */
+export function getAdGuardInsights(): Promise<AdGuardInsights> {
+  return call('milkflint.adguardhome', 'insights', {}, insightsSchema);
+}
+
+const resultSchema = z.object({
+  ok: z.boolean().optional(),
+  error: z.string().optional(),
+  left: z.array(z.string()).optional(),
+  token: z.string().optional(),
+});
+
+/** Single-use token exchange CGI (sets AdGuard Home's HttpOnly session cookie). */
+export const OPEN_URL = '/cgi-bin/milkflint-adguardhome';
 
 const errors: Record<string, string> = {
   not_installed: 'AdGuard Home isn’t in this firmware.',
   not_configured: 'Turn it on first: that writes its settings.',
+  not_running: 'AdGuard Home isn’t running right now.',
   access_point: 'In access point mode the main router answers DNS.',
+  router_login_off: 'Router sign-in is off: sign in at AdGuard Home with its own password.',
+  login: 'The router couldn’t sign in to AdGuard Home.',
   user: 'The user name: letters, digits and . _ @ - (not “milkflint”, MilkFlint’s own).',
   password: 'The password: 8 to 72 characters, on one line.',
   hash: 'The router couldn’t make the password’s hash.',
@@ -94,9 +134,14 @@ async function act(method: string, params: Record<string, unknown>): Promise<z.o
   return r;
 }
 
-/** The first time: writes its settings with this user and password, then turns it on. */
-export async function setupAdGuard(user: string, password: string): Promise<void> {
-  await act('setup', { user, password });
+export type SetupChoice = { routerLogin: true } | { routerLogin: false; user: string; password: string };
+
+/** The first time: writes its settings (with router login or its own user and password), then turns it on. */
+export async function setupAdGuard(choice: SetupChoice): Promise<void> {
+  await act(
+    'setup',
+    choice.routerLogin ? { router_login: true } : { router_login: false, user: choice.user, password: choice.password },
+  );
 }
 
 export async function enableAdGuard(on: boolean): Promise<void> {
@@ -108,8 +153,41 @@ export async function setFallback(on: boolean): Promise<void> {
   await act('fallback', { on });
 }
 
+/** Sets a separate AdGuard Home user name and password (turns router login off). */
 export async function setCredentials(user: string, password: string): Promise<void> {
   await act('credentials', { user, password });
+  await logoutAdGuard();
+}
+
+/** Switches to signing in through MilkFlint's router login (drops the separate password). */
+export async function enableRouterLogin(): Promise<void> {
+  await act('router_login', { on: true });
+  await logoutAdGuard();
+}
+
+/** Exchanges the router's admin session for an HttpOnly AdGuard Home session cookie on this host. */
+export async function openAdGuard(): Promise<void> {
+  const r = await act('open', {});
+  if (r.token === undefined || r.token === '') throw new Error(errors['login']);
+  const res = await fetch(OPEN_URL, {
+    method: 'POST',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: r.token }),
+  });
+  if (!res.ok) throw new Error(errors['login']);
+}
+
+/** Clears AdGuard Home's browser session cookie and revokes it server-side (best-effort). */
+export async function logoutAdGuard(): Promise<void> {
+  await fetch(OPEN_URL, {
+    method: 'POST',
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{"logout":true}',
+  }).catch(() => undefined);
 }
 
 /** Puts back the settings the DNS chain needs; the keys still not right. */

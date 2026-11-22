@@ -1,5 +1,7 @@
 // Other words people use for what each page does, so the menu's search finds
-// "QoS" on Smart Queue and "SSID" on Networks & radios. Lower case.
+// "QoS" on Smart Queue and "SSID" on Networks & radios. Lower case. Pages out
+// of the menu aren't searched: their words go on the tab or card they became
+// (sections.ts).
 import type { FeatureId } from './ids';
 
 export const keywords: Partial<Readonly<Record<FeatureId, string>>> = {
@@ -10,7 +12,6 @@ export const keywords: Partial<Readonly<Record<FeatureId, string>>> = {
   wifi: 'wireless ssid password network name channel band 2.4 5 ghz radio country transmit power dfs',
   'wifi-guest': 'guest visitors smart home iot qr isolation',
   'wifi-scan': 'scan neighbours nearby interference channel survey radar dfs weather',
-  'radar-scan': 'dfs radar weather channel check',
   clients: 'devices dhcp leases reserve block rename hostname mac',
   'device-control': 'parental controls kids children family bedtime schedule pause internet block screen time safesearch youtube',
   lan: 'lan dhcp range subnet router address ip',
@@ -28,10 +29,9 @@ export const keywords: Partial<Readonly<Record<FeatureId, string>>> = {
   upnp: 'upnp nat-pmp ports games console',
   'port-forwards': 'port forward nat dmz open ports games console camera server',
   'wifi-driver':
-    'airtime fairness twt target wake time spatial reuse bss colour mu edca multicast dscp qos map beamforming driver',
+    'airtime fairness twt target wake time spatial reuse bss colour mu edca mu-mimo mimo ofdma muru downlink uplink multicast dscp qos map beamforming driver',
   'system-overview': 'hardware model firmware memory storage about',
   'admin-password': 'root login password ssh luci https certificate tls ssl router access',
-  https: 'certificate tls ssl https redirect',
   upgrade: 'firmware update sysupgrade flash image',
   time: 'hostname name time zone ntp clock',
   schedules: 'cron crontab reboot restart schedule wifi off command job timer',

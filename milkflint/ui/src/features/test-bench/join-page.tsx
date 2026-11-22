@@ -1,6 +1,6 @@
 import { ArrowRightIcon, LoaderCircleIcon, LogOutIcon, SmartphoneIcon } from 'lucide-react';
 import { type ReactElement, type SyntheticEvent, useEffect, useRef, useState } from 'react';
-import { Logo } from '@/components/layout/sidebar';
+import { Logo, Wordmark } from '@/components/layout/sidebar';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -49,7 +49,7 @@ function JoinForm({
       <div className="mb-8 flex flex-col items-center gap-3 text-center">
         <span className="flex items-center gap-2.5">
           <Logo className="size-9" />
-          <span className="text-base font-semibold">MilkFlint</span>
+          <Wordmark className="text-lg" />
         </span>
         <h1 className="text-xl font-semibold tracking-tight">Join a test bench</h1>
         <p className="text-sm text-muted-foreground">
@@ -190,7 +190,7 @@ export function JoinPage(): ReactElement {
             <div className="flex flex-col items-center gap-3 text-center">
               <span className="flex items-center gap-2.5">
                 <Logo className="size-9" />
-                <span className="text-base font-semibold">MilkFlint</span>
+                <Wordmark className="text-lg" />
               </span>
               <h1 className="text-xl font-semibold tracking-tight">Joining the bench</h1>
               <p className="flex items-center gap-2 text-sm text-muted-foreground">

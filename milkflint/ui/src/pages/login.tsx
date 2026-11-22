@@ -3,7 +3,7 @@
 // so anyone on a cable can sign in meanwhile).
 import { ArrowRightIcon, KeyRoundIcon, LoaderCircleIcon } from 'lucide-react';
 import { type ReactElement, type SyntheticEvent, useState } from 'react';
-import { Logo } from '@/components/layout/sidebar';
+import { Logo, Wordmark } from '@/components/layout/sidebar';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
 import { Note } from '@/components/note';
 import { Button } from '@/components/ui/button';
@@ -43,9 +43,9 @@ export function LoginPage({ reason }: { reason: 'expired' | 'logged-out' | undef
       <main className="flex w-full max-w-sm flex-col gap-6">
         <div className="flex items-center gap-3">
           <Logo className="size-10 shrink-0" />
-          <div className="flex min-w-0 flex-col">
-            <span className="text-lg leading-tight font-semibold">MilkFlint</span>
-            <span className="text-sm text-muted-foreground">Router settings</span>
+          <div className="flex min-w-0 flex-col gap-1">
+            <Wordmark className="text-xl" />
+            <span className="text-sm leading-none text-muted-foreground">Smooth under load.</span>
           </div>
         </div>
         <form

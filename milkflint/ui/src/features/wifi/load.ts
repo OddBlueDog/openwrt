@@ -8,6 +8,7 @@ import {
   getCountries,
   getDfsFrequencies,
   getFrequencies,
+  getMuru,
   getRadar,
   getRegulatedCountries,
   getSpatialReuse,
@@ -19,6 +20,7 @@ import { isGuestIface } from '../wifi-guest/guest';
 import { airtimeBandsOf, airtimeOf, airtimeOption } from './airtime';
 import { HOLD_BACK_OPTIONS, holdBackOf } from './hold-back';
 import { inBand, type RadioForm, type RadioOptions, radiosCountry, type WifiData } from './model';
+import { muruOf, muruOption } from './muru';
 import { sprOf, sprOption } from './spatial-reuse';
 import { twtOf, twtOption } from './twt';
 
@@ -90,6 +92,7 @@ export async function loadWifi(part: WifiPart): Promise<WifiData> {
       airtime: airtimeOf(str(wifiSection, airtimeOption(band))),
       airtimeBands: airtimeBandsOf((o) => str(wifiSection, o), band),
       multicastToUnicast: bool(iface, 'multicast_to_unicast'),
+      muru: muruOf((n) => str(wifiSection, muruOption(band, n))),
     };
   });
 
@@ -101,16 +104,26 @@ export async function loadWifi(part: WifiPart): Promise<WifiData> {
       // a Wi-Fi interface, or the radio's phy while its network is off (a fresh install)
       const device = status[f.radio]?.interfaces?.find((i) => i.ifname !== undefined)?.ifname ?? status[f.radio]?.iwinfo?.phy;
       if (device === undefined) {
-        options[f.radio] = { channels: [], txpowers: [], htmodes, dfs: [], cacMs: {}, spr: undefined, twtLimits: false };
+        options[f.radio] = {
+          channels: [],
+          txpowers: [],
+          htmodes,
+          dfs: [],
+          cacMs: {},
+          spr: undefined,
+          twtLimits: false,
+          muru: undefined,
+        };
         return;
       }
-      const [channels, txpowers, dfs, radar, spr, twt] = await Promise.all([
+      const [channels, txpowers, dfs, radar, spr, twt, muru] = await Promise.all([
         networks ? getFrequencies(device).catch(() => []) : [],
         networks ? getTxPowers(device).catch(() => []) : [],
         getDfsFrequencies(device).catch((): number[] => []),
         f.band === '5g' ? getRadar(device).catch(() => undefined) : undefined,
         networks ? undefined : getSpatialReuse(device).catch(() => undefined),
         networks ? undefined : getTwt(device).catch(() => undefined),
+        networks ? undefined : getMuru(device).catch(() => undefined),
       ]);
       options[f.radio] = {
         // all of them: which may be used goes by the country's rules (see usable)
@@ -121,6 +134,7 @@ export async function loadWifi(part: WifiPart): Promise<WifiData> {
         cacMs: Object.fromEntries((radar?.channels ?? []).flatMap((c) => (c.cac_ms === undefined ? [] : [[c.mhz, c.cac_ms]]))),
         spr,
         twtLimits: twt?.supported === true,
+        muru,
       };
     }),
   );

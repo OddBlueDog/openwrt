@@ -971,7 +971,7 @@ export function devctlRows(
       who: p === undefined ? undefined : whoName(p, deviceName),
       text:
         p === undefined
-          ? 'Its person is gone from Device control: it’s left as it is.'
+          ? 'Its group or device is gone from Device control: it’s left as it is.'
           : 'Changed by hand: Device control leaves it as it is.',
       byHand: true,
       href: `#/device-control/${part.person}`,

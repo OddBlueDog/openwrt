@@ -48,6 +48,7 @@ export function BlockSheet({
       }}
       entry={undefined}
       kind="device"
+      blocking
       me={undefined}
       deviceName={(mac) => names.get(mac)}
       onClose={onClose}

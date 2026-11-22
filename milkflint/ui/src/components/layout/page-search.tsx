@@ -2,9 +2,8 @@ import { CornerDownLeftIcon, SearchIcon } from 'lucide-react';
 import { type ReactElement, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { inputClass } from '@/components/ui/input';
 import { groupOf, menuFor } from '@/features';
-import { searchPages } from '@/features/search';
+import { type PageMatch, searchPages } from '@/features/search';
 import type { Feature } from '@/features/types';
-import { href } from '@/lib/router';
 import { useRouterMode } from '@/lib/router-mode';
 import { cn } from '@/lib/utils';
 import { useDecorativeIcons } from '@/lib/presentation';
@@ -12,7 +11,8 @@ import { useDecorativeIcons } from '@/lib/presentation';
 const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
 /**
- * Find a page by name or by another word for it ("qos", "ssid", "port").
+ * Find a page by name or by another word for it ("qos", "ssid", "port"), or a tab
+ * or card of one ("radar" finds the radar scan and the radar log): a result opens it.
  * ⌘K or Ctrl+K (or /) jumps here from anywhere; arrows pick, Enter goes.
  */
 export function PageSearch({
@@ -58,8 +58,8 @@ export function PageSearch({
     if (focusOnOpen) input.current?.focus();
   }, [focusOnOpen]);
 
-  const go = (feature: Feature): void => {
-    window.location.hash = href(feature.id);
+  const go = (hit: PageMatch): void => {
+    window.location.hash = hit.href;
     setQuery('');
     input.current?.blur();
     onNavigate?.();
@@ -94,15 +94,15 @@ export function PageSearch({
             setActive((a) => Math.max(a - 1, 0));
           } else if (e.key === 'Enter') {
             const hit = results[active];
-            if (hit !== undefined) go(hit.feature);
+            if (hit !== undefined) go(hit);
           } else if (e.key === 'Escape') {
             setQuery('');
           }
         }}
         onBlur={() => {
-          // let a click on a result land first
+          // let a click on a result land first; not if the box has focus again by then (typing on)
           window.setTimeout(() => {
-            setQuery('');
+            if (document.activeElement !== input.current) setQuery('');
           }, 150);
         }}
         className={cn(
@@ -123,17 +123,18 @@ export function PageSearch({
           {results.length === 0 && <p className="px-2.5 py-2 text-sm text-muted-foreground">No page matches “{query.trim()}”</p>}
           {results.map((r, i) => (
             <div
-              key={r.feature.id}
+              key={r.href}
               id={`${list}-${String(i)}`}
               role="option"
               tabIndex={-1}
               aria-selected={i === active}
               onMouseDown={(e) => {
                 e.preventDefault();
-                go(r.feature);
+                go(r);
               }}
-              onMouseEnter={() => {
-                setActive(i);
+              // the pointer picks when it moves, not when the list opens under a resting one: the arrows keep their pick
+              onMouseMove={() => {
+                if (i !== active) setActive(i);
               }}
               className={cn(
                 'flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-sm',
@@ -141,8 +142,11 @@ export function PageSearch({
               )}
             >
               {icons && <r.feature.icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />}
-              <span className="min-w-0 flex-1 truncate font-medium">{r.feature.title}</span>
-              <span className="shrink-0 text-xs text-muted-foreground">{r.group?.title ?? ''}</span>
+              <span className="min-w-0 flex-1 truncate font-medium">{r.section?.title ?? r.feature.title}</span>
+              {/* a tab or card says whose; a page, its group */}
+              <span className="shrink-0 text-xs text-muted-foreground">
+                {r.section !== undefined ? r.feature.title : (r.group?.title ?? '')}
+              </span>
               {i === active && <CornerDownLeftIcon aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />}
             </div>
           ))}
