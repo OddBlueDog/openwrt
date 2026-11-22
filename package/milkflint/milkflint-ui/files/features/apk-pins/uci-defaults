@@ -35,11 +35,6 @@ names='
 banip
 dnsproxy
 gawk
-golang1.27
-golang1.27-doc
-golang1.27-misc
-golang1.27-src
-golang1.27-tests
 iperf3
 iperf3-ssl
 libiperf3

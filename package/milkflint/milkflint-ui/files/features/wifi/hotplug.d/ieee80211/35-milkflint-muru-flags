@@ -1,0 +1,21 @@
+# MilkFlint: a radio's multi-user (OFDMA / MU-MIMO) flags
+# (milkflint.wifi.muru_<band>_*, the Wi-Fi driver page) for the Wi-Fi driver,
+# on every radio as it appears: at boot, or when the driver loads again.
+# Nothing to do with none set: the driver starts with downlink on and uplink
+# off. Installed as /etc/hotplug.d/ieee80211/35-milkflint-muru-flags;
+# hotplug-call sources it, so it returns rather than exits.
+
+[ "$ACTION" = add ] || return 0
+uci -q show milkflint.wifi | grep -q '\.muru_' || return 0
+
+(
+	phy=${DEVICENAME:-${DEVPATH##*/}}
+	f=/sys/kernel/debug/ieee80211/$phy/mt76/muru
+	# the driver adds its debugfs files after the radio is registered
+	i=0
+	while [ ! -w "$f" ] && [ $i -lt 20 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	/usr/libexec/milkflint/wifi-muru "$phy"
+) > /dev/null 2>&1 &

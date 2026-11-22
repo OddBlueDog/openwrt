@@ -102,6 +102,22 @@ function spatial_reuse(phy) {
 	};
 }
 
+// Multi-user (OFDMA / MU-MIMO) flags on a radio now, from the driver's debugfs
+// file. supported is false with a driver that has no such setting.
+function muru(phy) {
+	const running = length(filter(lsdir('/var/run/hostapd') ?? [], (s) => index(s, `${phy}-`) == 0)) > 0;
+	const text = readfile(`/sys/kernel/debug/ieee80211/${phy}/mt76/muru`);
+	if (text == null)
+		return { running, supported: false, ofdma_dl: null, ofdma_ul: null, mimo_dl: null, mimo_ul: null };
+	const flags = { ofdma_dl: null, ofdma_ul: null, mimo_dl: null, mimo_ul: null };
+	for (let line in split(text, '\n')) {
+		const m = match(line, /^(ofdma_dl|ofdma_ul|mimo_dl|mimo_ul) ([01])$/);
+		if (m)
+			flags[m[1]] = m[2] == '1';
+	}
+	return { running, supported: true, ...flags };
+}
+
 // Target Wake Time on a radio now: the driver's limits, how requests have gone,
 // the agreements it has (the driver's debugfs, with a mutex that the Wi-Fi
 // driver holds through a restart: don't poll this fast), and which connected
@@ -323,6 +339,19 @@ return {
 					return { error: 'invalid device' };
 				const phy = phy_of(dev);
 				return phy == null ? { running: false, mode: null, control: null, offset: null } : spatial_reuse(phy);
+			}
+		},
+		// multi-user (OFDMA / MU-MIMO) flags on the radio now (by phy or interface)
+		muru: {
+			args: { device: 'device' },
+			call: function(req) {
+				const dev = req.args.device;
+				if (type(dev) != 'string' || !match(dev, /^[A-Za-z0-9_.-]+$/))
+					return { error: 'invalid device' };
+				const phy = phy_of(dev);
+				return phy == null
+					? { running: false, supported: false, ofdma_dl: null, ofdma_ul: null, mimo_dl: null, mimo_ul: null }
+					: muru(phy);
 			}
 		},
 		// Target Wake Time on the radio now (by phy or interface)

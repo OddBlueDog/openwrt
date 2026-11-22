@@ -39,6 +39,21 @@ if [ -z "$(uci -q get milkflint.adguardhome.fallback)" ]; then
 	uci commit milkflint
 fi
 
+# how AdGuard Home's web interface signs in (the page's "Use router login",
+# milkflint.adguardhome.router_login): a new install uses MilkFlint's own
+# login; a router that already had AdGuard Home set up keeps its own user
+# name and password
+if [ -z "$(uci -q get milkflint.adguardhome.router_login)" ]; then
+	touch /etc/config/milkflint
+	uci -q get milkflint.adguardhome > /dev/null || uci set milkflint.adguardhome=adguardhome
+	if [ -s /etc/adguardhome/AdGuardHome.yaml ]; then
+		uci set milkflint.adguardhome.router_login=0
+	else
+		uci set milkflint.adguardhome.router_login=1
+	fi
+	uci commit milkflint
+fi
+
 # the service stays off until the page turns it on (its own init checks
 # adguardhome.config.enabled), and the monitor runs once it's on
 /etc/init.d/milkflint-adguardhome enable

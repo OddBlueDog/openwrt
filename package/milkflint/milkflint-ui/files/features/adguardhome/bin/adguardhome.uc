@@ -27,6 +27,10 @@ export const CONFIG = '/etc/adguardhome/AdGuardHome.yaml';
 export const KEY = '/etc/milkflint/adguardhome.key';
 export const STATE = '/var/run/milkflint/adguardhome.json';
 export const COOKIE = '/var/run/milkflint/adguardhome.cookie';
+export const OPEN_DIR = '/var/run/milkflint/agh-open';
+export const OPEN_TTL_S = 30;
+export const SESSION_TTL_ROUTER = '1h';
+export const SESSION_TTL_OWN = '720h';
 export const BIN = '/usr/bin/AdGuardHome';
 export const BCRYPT = '/usr/libexec/milkflint/bcrypt';
 export const DNS_PORT = 3053;
@@ -130,19 +134,21 @@ const yq = (s) => '"' + replace(replace(`${s}`, '\\', '\\\\'), '"', '\\"') + '"'
 // AdGuard Home's settings as MilkFlint first writes them: what the chain
 // needs, safe defaults for the rest, no lists (they're chosen in its own web
 // interface). Anything left out takes AdGuard Home's own default; it writes
-// the whole file out when it starts. o: { user, hash, api_hash, address }
+// the whole file out when it starts. o: { user, hash, api_hash, address };
+// user and hash are null when signing in through MilkFlint's router login.
 export function yaml_config(o) {
+	const users = (o.user != null && o.hash != null)
+		? [ `  - name: ${yq(o.user)}`, `    password: ${yq(o.hash)}` ]
+		: [];
+	push(users, `  - name: ${yq(API_USER)}`, `    password: ${yq(o.api_hash)}`);
 	return join('\n', [
 		'# MilkFlint wrote these first settings (its AdGuard Home page). AdGuard Home',
 		'# rewrites this file: change its settings in its own web interface.',
 		'http:',
 		`  address: ${o.address}`,
-		'  session_ttl: 720h',
+		`  session_ttl: ${(o.user != null) ? SESSION_TTL_OWN : SESSION_TTL_ROUTER}`,
 		'users:',
-		`  - name: ${yq(o.user)}`,
-		`    password: ${yq(o.hash)}`,
-		`  - name: ${yq(API_USER)}`,
-		`    password: ${yq(o.api_hash)}`,
+		...users,
 		'auth_attempts: 5',
 		'block_auth_min: 15',
 		'theme: auto',
@@ -416,7 +422,8 @@ const eq = (a, b) => sprintf('%J', a) == sprintf('%J', b);
 // as MilkFlint needs it: { key, have, want: raw value(s) to put back,
 // breaks: whether lookups or the router suffer (else it's a note), what }.
 // `address`: the web interface's address MilkFlint expects (LAN:3000).
-export function check_settings(tree, address) {
+// `router_login`: whether MilkFlint's router login signs in to AdGuard Home.
+export function check_settings(tree, address, router_login) {
 	const out = [];
 	const add = (key, have, want, breaks, what) => push(out, { key, have, want, breaks, what });
 	if (!tree)
@@ -451,10 +458,16 @@ export function check_settings(tree, address) {
 	if (value(tree, 'dns.cache_enabled') == 'false')
 		add('dns.cache_enabled', 'false', 'true', false, 'Its own cache is off: every lookup it lets through waits for the router’s DNS, even one it answered a moment ago.');
 	const users = map(value(tree, 'users') ?? [], (u) => u?.name);
-	if (!(API_USER in users))
-		add('users.api', null, null, false, 'MilkFlint’s own account in it is gone: this page can’t show its figures.');
-	if (!length(filter(users, (u) => u != API_USER)))
-		add('users', null, null, true, 'It has no account of yours: anyone on your network can open it. Set a user name and password below.');
+	if (router_login) {
+		if (!(API_USER in users))
+			add('users.api', null, null, true, 'MilkFlint’s own account in it is gone: anyone on your network can open it, and this page can’t sign you in or show its figures.');
+	}
+	else {
+		if (!(API_USER in users))
+			add('users.api', null, null, false, 'MilkFlint’s own account in it is gone: this page can’t show its figures.');
+		if (!length(filter(users, (u) => u != API_USER)))
+			add('users', null, null, true, 'It has no account of yours: anyone on your network can open it. Set a user name and password below.');
+	}
 	return out;
 };
 
@@ -513,25 +526,75 @@ export function repair_settings(text, fixes, api_hash) {
 	return text;
 };
 
-// The settings with the users replaced: `user` with `hash`, and MilkFlint's
-// own account with `api_hash` (each other account is dropped: MilkFlint's
-// page is where its password is set)
+// The settings with the users replaced: `user` with `hash` (omitted when
+// using MilkFlint's router login), and MilkFlint's own account with
+// `api_hash` (each other account is dropped). Also sets http.session_ttl to
+// match the login mode (1h for router login, 720h for a password of its own).
 export function set_users(text, user, hash, api_hash) {
 	const tree = yaml_parse(text);
 	const node = node_at(tree, 'users');
 	const lines = split(text, '\n');
-	const block = [
-		'users:',
-		`  - name: ${yq(user)}`,
-		`    password: ${yq(hash)}`,
-		`  - name: ${yq(API_USER)}`,
-		`    password: ${yq(api_hash)}`
-	];
+	const block = [ 'users:' ];
+	if (user != null && hash != null)
+		push(block, `  - name: ${yq(user)}`, `    password: ${yq(hash)}`);
+	push(block, `  - name: ${yq(API_USER)}`, `    password: ${yq(api_hash)}`);
 	if (node)
 		splice(lines, node.key_line, max(node.end, node.key_line + 1) - node.key_line, ...block);
 	else
 		splice(lines, tree?.end ?? length(lines), 0, ...block);
-	return join('\n', lines);
+	const next = join('\n', lines);
+	return yaml_set(next, 'http.session_ttl', (user != null) ? SESSION_TTL_OWN : SESSION_TTL_ROUTER) ?? next;
+};
+
+// ---- going back to an older AdGuard Home -------------------------------------
+
+// An AdGuard Home refuses settings in a format newer than it knows (its
+// schema_version: "unknown current schema version N") and doesn't start, so
+// going back to an older version after a newer one rewrote them fails. The
+// formats a step down from which change nothing in MilkFlint's settings, and
+// why: going back takes their number down a step.
+//   35 (1.0.0): hosts files off, only for --no-etc-hosts, which MilkFlint's
+//               init never passes
+export const SCHEMA_STEP_DOWN = { '35': 34 };
+
+// What the AdGuard Home installed now says of these settings: null if it
+// reads them. On a copy, in a folder of its own: reading them, it may write
+// them back in its own format.
+export function check_config(text) {
+	const dir = `/tmp/milkflint-agh-check.${random_token(12)}`;
+	if (!mkdir(dir, 0o700))
+		return 'no folder for the check';
+	const conf = `${dir}/AdGuardHome.yaml`;
+	let r = { code: -1, out: 'the settings could not be copied' };
+	if (write_atomic(conf, text, 0o600))
+		r = run(`${BIN} --check-config --no-check-update -c ${sh_quote(conf)} -w ${sh_quote(dir)}`);
+	system(`rm -rf ${sh_quote(dir)}`);
+	return (r.code == 0) ? null : (trim(r.out) || `exit ${r.code}`);
+};
+
+// The settings as the AdGuard Home installed now reads them: as they are, or
+// a format or more down (SCHEMA_STEP_DOWN); null if it can't read them, with
+// the reason in `why` (an array, for the updater's log).
+export function settings_for_installed(text, why) {
+	for (let i = 0; i < 8; i++) {
+		const err = check_config(text);
+		if (err == null)
+			return text;
+		const m = match(err, /unknown current schema version ([0-9]+)/);
+		const to = m ? SCHEMA_STEP_DOWN[m[1]] : null;
+		if (to == null) {
+			push(why, err);
+			return null;
+		}
+		push(why, `settings format ${m[1]} taken back to ${to}`);
+		text = yaml_set(text, 'schema_version', `${to}`);
+		if (text == null) {
+			push(why, 'its schema_version could not be set');
+			return null;
+		}
+	}
+	push(why, 'too many format steps');
+	return null;
 };
 
 // ---- is it answering ---------------------------------------------------------
@@ -648,7 +711,9 @@ function http(method, path, body, cookie, secs) {
 	return { status: st ? +st[1] : 0, headers, body: substr(resp, at + 4) };
 }
 
-function login(secs) {
+// A fresh session cookie ("agh_session=...") for MilkFlint's account, without
+// touching MilkFlint's own cached API cookie.
+export function open_session(secs) {
 	const key = trim(readfile(KEY) ?? '');
 	if (key == '')
 		return null;
@@ -656,14 +721,36 @@ function login(secs) {
 	if (r?.status != 200)
 		return null;
 	for (let c in split(r.headers['set-cookie'] ?? '', '\n')) {
-		const m = match(c, /(agh_session=[^;]+)/);
-		if (m) {
-			mkdir('/var/run/milkflint', 0o700);
-			write_atomic(COOKIE, m[1], 0o600);
+		const m = match(c, /(agh_session=[0-9a-fA-F]+)/);
+		if (m)
 			return m[1];
-		}
 	}
 	return null;
+};
+
+// End one AdGuard Home web session (best-effort, used on MilkFlint sign-out).
+export function logout_session(cookie, secs) {
+	if (type(cookie) != 'string' || !match(cookie, /^agh_session=[0-9a-fA-F]{32,128}$/))
+		return false;
+	return http('GET', '/control/logout', null, cookie, secs ?? 2) != null;
+};
+
+// Drop AdGuard Home's persisted session database (call with AdGuard Home
+// stopped) so existing web sessions are revoked when credentials or login
+// mode change.
+export function clear_sessions() {
+	const work = cursor().get('adguardhome', 'config', 'work_dir') ?? '/srv/adguardhome';
+	unlink(`${work}/data/sessions.db`);
+	unlink(COOKIE);
+};
+
+function login(secs) {
+	const c = open_session(secs);
+	if (!c)
+		return null;
+	mkdir('/var/run/milkflint', 0o700);
+	write_atomic(COOKIE, c, 0o600);
+	return c;
 }
 
 // a call to its API as MilkFlint's account: the reply's JSON (true for an
@@ -874,6 +961,19 @@ export function read_state() {
 // answers either way.
 export function falls_back(c) {
 	return (c ?? cursor()).get('milkflint', 'adguardhome', 'fallback') == '1';
+};
+
+// Whether AdGuard Home's web interface signs in through MilkFlint's own
+// login rather than a separate user name and password
+// (milkflint.adguardhome.router_login): true on a new install (default on);
+// false if AdGuard Home was already set up before this setting existed.
+export function uses_router_login(c) {
+	const v = (c ?? cursor()).get('milkflint', 'adguardhome', 'router_login');
+	if (v == '1')
+		return true;
+	if (v == '0')
+		return false;
+	return access(CONFIG) != true;
 };
 
 export function router_mode() {

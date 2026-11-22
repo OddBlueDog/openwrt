@@ -2,11 +2,11 @@
 	"milkflint-adguardhome": {
 		"description": "MilkFlint web interface: AdGuard Home",
 		"read": {
-			"ubus": { "milkflint.adguardhome": [ "status" ] },
+			"ubus": { "milkflint.adguardhome": [ "status", "insights" ] },
 			"uci": [ "adguardhome", "firewall", "milkflint" ]
 		},
 		"write": {
-			"ubus": { "milkflint.adguardhome": [ "setup", "enable", "fallback", "credentials", "repair", "update_check", "update" ] },
+			"ubus": { "milkflint.adguardhome": [ "setup", "enable", "fallback", "credentials", "router_login", "open", "repair", "update_check", "update" ] },
 			"uci": [ "firewall" ]
 		}
 	}

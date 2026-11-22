@@ -6,7 +6,9 @@
 // name built another way, never replaces it. AdGuard Home's own updater is
 // off (--no-check-update). The feed keeps earlier versions: going back to one
 // is installing it (adguardhome@milkflint=<version>, which pins it until the
-// next update from the page).
+// next update from the page), and taking its settings back to the format it
+// reads when a newer one changed it (see adguardhome.uc's SCHEMA_STEP_DOWN);
+// if it can't read them, the version that was there goes back on ('settings').
 //
 //   adguardhome-update check              the versions the feed has
 //   adguardhome-update install [VERSION]  that one ('' or none: the newest)
@@ -124,6 +126,7 @@ if (action == 'install' && status.error == null) {
 		agh.write_atomic(PAUSE, `${time() + 300}`, 0o644);
 		system('nft delete table inet milkflint_adguardhome 2>/dev/null');
 		const spec = (want == '') ? 'adguardhome@milkflint' : `adguardhome@milkflint=${want}`;
+		const before = status.installed;
 		// apk's indexes first (a repository it can't reach doesn't stop it)
 		agh.run('apk update');
 		const r = agh.run(`apk add ${agh.sh_quote(spec)}`);
@@ -133,6 +136,30 @@ if (action == 'install' && status.error == null) {
 		status.ok = (want == '') ? (status.installed == status.latest) : (status.installed == want);
 		if (!status.ok)
 			status.error = 'install';
+		// gone back to an older one: it must read the settings the newer one
+		// left (agh.SCHEMA_STEP_DOWN), or the one that was there goes back on
+		if (status.ok && before != null && vcmp(status.installed, before) < 0 && readfile(agh.CONFIG) != null) {
+			const why = [];
+			// stopped first: stopping, it may write them again
+			system('/etc/init.d/adguardhome stop');
+			const text = readfile(agh.CONFIG);
+			const fixed = agh.settings_for_installed(text, why);
+			if (fixed != null && fixed != text) {
+				agh.write_atomic(agh.CONFIG, fixed, 0o600);
+				system(`chown adguardhome:adguardhome ${agh.sh_quote(agh.CONFIG)}`);
+			}
+			if (fixed == null) {
+				const back = agh.run('apk add ' + agh.sh_quote('adguardhome@milkflint=' + before));
+				status.installed = agh.package_version();
+				status.pinned = pinned();
+				status.ok = false;
+				status.error = 'settings';
+				push(why, (status.installed == before) ? `${before} is back on` : `${before} didn't go back on`);
+				status.log = substr(trim(`${status.log}\n${trim(back.out)}\n${join('\n', why)}`), -2000);
+			}
+			else if (length(why))
+				status.log = substr(trim(`${status.log}\n${join('\n', why)}`), -2000);
+		}
 		if (agh.cmd('uci -q get adguardhome.config.enabled') == '1')
 			system('/etc/init.d/adguardhome restart');
 		system(`rm -f ${PAUSE}`);
