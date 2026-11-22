@@ -1,0 +1,1376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 11:02:05 +0000
+Subject: [PATCH] wifi: mt76: mt7915: default UL MU-MIMO off and add live MURU
+ flag control
+
+Scheduled uplink triggers on MT798x can briefly pause best-effort
+downlink traffic when either uplink MU flag is enabled. Previously
+mimo_ul_en was unconditionally set on !MT7915, the AP always advertised
+UL MU-MIMO in its HE PHY capabilities, and the firmware took the band
+and BSS MURU flags from the first station record only, so changing them
+needed a driver reload or a reboot.
+
+- Add muru_mimo_ul (default off) and muru_ofdma_dl (default on) module
+  parameters alongside muru_ofdma_ul (default off). muru_mimo_ul also
+  gates IEEE80211_HE_PHY_CAP2_UL_MU_FULL_MU_MIMO; the capabilities
+  follow it when the radio is set up, not the live control below.
+- Stop sending muru->mimo_ul.partial_ul_mimo: the AP advertises
+  full-bandwidth UL MU-MIMO only, so the firmware isn't told a station
+  can do it in part of the channel.
+- Add mt7915_mcu_set_muru_dl_ul() (MURU_CTRL subcmd 81) and send the
+  flags for the band and the BSS on AP start, for the band and every AP
+  and station BSS after a firmware restart, and through a new per-phy
+  debugfs file (muru), so all four flags can be changed live per band.
+  The band keeps DL MU-MIMO only while one of its APs MU beamforms;
+  station interfaces don't count. A refused update is sent again by
+  the next write. mimo_ul=1 is taken on the MT7915 but stays off there,
+  so a line with all four flags still sets the other three.
+- muru_unapplied is a plain bool, not a bit field next to
+  restart_pending: it is written under the wiphy lock alone, and the
+  reset work writes restart_pending without that lock.
+- KUnit: STA_REC_MURU, HE capabilities, start_ap (another BSS keeping
+  the band's DL MU-MIMO, a refused update), the band and BSS updates
+  over every interface, restart recovery, parsing, and the debugfs
+  file's read format and write.
+
+Signed-off-by: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/debugfs.c            |  58 +++++
+ mt7915/init.c               |   2 +-
+ mt7915/main.c               | 212 +++++++++++++++++
+ mt7915/mcu.c                |  85 ++++++-
+ mt7915/mcu.h                |  14 ++
+ mt7915/mt7915.h             |  13 +
+ mt7915/tests/debugfs-test.c |  52 ++++
+ mt7915/tests/init-test.c    |  46 +++-
+ mt7915/tests/main-test.c    | 456 +++++++++++++++++++++++++++++++++++-
+ mt7915/tests/mcu-test.c     | 104 +++++++-
+ 10 files changed, 1024 insertions(+), 18 deletions(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 7fa566cc..b64d87d2 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1437,6 +1437,63 @@ static const struct file_operations mt7915_spatial_reuse_fops = {
+ 	.llseek = default_llseek,
+ };
+ 
++/* The band's flags as set (a band without an MU beamformer AP still sends
++ * no DL MU-MIMO), one "<name> <0|1>" line each, as MilkFlint's rpcd reads them
++ */
++static int mt7915_muru_show(const struct mt7915_phy *phy, char *buf,
++			    size_t size)
++{
++	u8 flags = mt7915_muru_band_flags(phy);
++
++	return scnprintf(buf, size,
++			 "ofdma_dl %u\nofdma_ul %u\nmimo_dl %u\nmimo_ul %u\n",
++			 !!(flags & MURU_OFDMA_DL_EN),
++			 !!(flags & MURU_OFDMA_UL_EN),
++			 !!(flags & MURU_MIMO_DL_EN),
++			 !!(flags & MURU_MIMO_UL_EN));
++}
++
++static ssize_t
++mt7915_muru_read(struct file *file, char __user *userbuf,
++		 size_t count, loff_t *ppos)
++{
++	struct mt7915_phy *phy = file->private_data;
++	char buf[64];
++	int len;
++
++	len = mt7915_muru_show(phy, buf, sizeof(buf));
++
++	return simple_read_from_buffer(userbuf, count, ppos, buf, len);
++}
++
++static ssize_t
++mt7915_muru_handler(struct wiphy *wiphy, struct file *file, char *buf,
++		    size_t count, void *data)
++{
++	int ret = mt7915_muru_set_flags(data, buf);
++
++	return ret ? ret : count;
++}
++
++static ssize_t
++mt7915_muru_write(struct file *file, const char __user *userbuf,
++		  size_t count, loff_t *ppos)
++{
++	struct mt7915_phy *phy = file->private_data;
++	char buf[64];
++
++	return wiphy_locked_debugfs_write(phy->mt76->hw->wiphy, file, buf,
++					  sizeof(buf), userbuf, count,
++					  mt7915_muru_handler, phy);
++}
++
++static const struct file_operations mt7915_muru_fops = {
++	.open = simple_open,
++	.read = mt7915_muru_read,
++	.write = mt7915_muru_write,
++	.llseek = default_llseek,
++};
++
+ static const char * const mt7915_twt_trigger_names[] = {
+ 	[MT7915_TWT_TRIGGER_ALLOW] = "allow",
+ 	[MT7915_TWT_TRIGGER_NEVER] = "never",
+@@ -1669,6 +1726,7 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 
+ 	dir = mt76_register_debugfs_fops(phy->mt76, NULL);
+ 
++	debugfs_create_file("muru", 0600, dir, phy, &mt7915_muru_fops);
+ 	debugfs_create_file("muru_debug", 0600, dir, dev, &fops_muru_debug);
+ 	debugfs_create_file("muru_stats", 0400, dir, phy,
+ 			    &mt7915_muru_stats_fops);
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 65cb5b50..255d0052 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1071,7 +1071,7 @@ mt7915_set_stream_he_txbf_caps(struct mt7915_phy *phy,
+ 	elem->phy_cap_info[7] &= ~c;
+ 
+ 	c = IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US;
+-	if (!is_mt7915(&dev->mt76))
++	if (!is_mt7915(&dev->mt76) && READ_ONCE(mt7915_muru_mimo_ul))
+ 		c |= IEEE80211_HE_PHY_CAP2_UL_MU_FULL_MU_MIMO;
+ 	elem->phy_cap_info[2] |= c;
+ 
+diff --git a/mt7915/main.c b/mt7915/main.c
+index e021a879..90d4eea0 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -725,6 +725,51 @@ mt7915_vif_check_caps(struct mt7915_phy *phy, struct ieee80211_vif *vif)
+ 	vc->he_mu_ebfer = vif->bss_conf.he_mu_beamformer;
+ }
+ 
++/* Whether the band keeps DL MU-MIMO goes by its access points alone: an AP
++ * sends it, a station interface doesn't, and a station's caps are never read
++ * (they stay all set from mt7915_add_interface()).
++ */
++static void mt7915_muru_any_mimo_dl_iter(void *data, u8 *mac,
++					 struct ieee80211_vif *vif)
++{
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	bool *any = data;
++
++	if (vif->type == NL80211_IFTYPE_AP &&
++	    (mvif->cap.he_mu_ebfer || mvif->cap.vht_mu_ebfer))
++		*any = true;
++}
++
++static void mt7915_muru_update_vif(struct mt7915_phy *phy,
++				   struct ieee80211_vif *vif)
++{
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	struct mt7915_dev *dev = phy->dev;
++	u8 band_flags = mt7915_muru_band_flags(phy);
++	u8 bss_flags = mt7915_muru_bss_flags(phy, vif);
++	int ret, bss_ret;
++
++	if ((band_flags & MURU_MIMO_DL_EN) && !(bss_flags & MURU_MIMO_DL_EN)) {
++		bool any = false;
++
++		ieee80211_iterate_active_interfaces_mtx(phy->mt76->hw,
++							IEEE80211_IFACE_ITER_NORMAL,
++							mt7915_muru_any_mimo_dl_iter,
++							&any);
++		if (!any)
++			band_flags &= ~MURU_MIMO_DL_EN;
++	}
++
++	ret = mt7915_mcu_set_muru_dl_ul(dev, MURU_DL_UL_TYPE_BAND,
++					phy->mt76->band_idx,
++					MURU_DL_UL_EN_MASK, band_flags);
++	bss_ret = mt7915_mcu_set_muru_dl_ul(dev, MURU_DL_UL_TYPE_BSS,
++					    mvif->mt76.idx,
++					    MURU_DL_UL_EN_MASK, bss_flags);
++	if (ret || bss_ret)
++		phy->muru_unapplied = true;
++}
++
+ static int
+ mt7915_start_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		struct ieee80211_bss_conf *link_conf)
+@@ -741,6 +786,9 @@ mt7915_start_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	if (err)
+ 		goto out;
+ 	err = mt7915_mcu_add_sta(dev, vif, NULL, CONN_STATE_PORT_SECURE, false);
++	if (err)
++		goto out;
++	mt7915_muru_update_vif(phy, vif);
+ out:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -2081,6 +2129,169 @@ int mt7915_spr_set_mode(struct mt7915_phy *phy, const char *name)
+ 	return ret;
+ }
+ 
++static const char * const mt7915_muru_flag_names[] = {
++	[0] = "ofdma_dl",
++	[1] = "ofdma_ul",
++	[2] = "mimo_dl",
++	[3] = "mimo_ul",
++};
++
++static int mt7915_muru_parse_flag(const char *name, const char *val,
++				  u8 *mask, u8 *bits)
++{
++	int idx = match_string(mt7915_muru_flag_names,
++			       ARRAY_SIZE(mt7915_muru_flag_names), name);
++
++	if (idx < 0)
++		return -EINVAL;
++	if (!strcmp(val, "1"))
++		*bits |= BIT(idx);
++	else if (!strcmp(val, "0"))
++		*bits &= ~BIT(idx);
++	else
++		return -EINVAL;
++
++	*mask |= BIT(idx);
++	return 0;
++}
++
++static int mt7915_muru_parse_flags(const char *buf, u8 *mask, u8 *bits)
++{
++	char tmp[64], *p, *tok, *eq;
++	char name[16], val[8], extra[2];
++	int n;
++
++	if (strscpy(tmp, buf, sizeof(tmp)) < 0)
++		return -EINVAL;
++
++	*mask = 0;
++	*bits = 0;
++	p = strim(tmp);
++	if (!*p)
++		return -EINVAL;
++
++	if (!strchr(p, '=')) {
++		n = sscanf(p, "%15s %7s %1s", name, val, extra);
++		if (n != 2)
++			return -EINVAL;
++		return mt7915_muru_parse_flag(name, val, mask, bits);
++	}
++
++	while ((tok = strsep(&p, " \t\n\r")) != NULL) {
++		if (!*tok)
++			continue;
++		eq = strchr(tok, '=');
++		if (!eq)
++			return -EINVAL;
++		*eq = '\0';
++		if (mt7915_muru_parse_flag(tok, eq + 1, mask, bits))
++			return -EINVAL;
++	}
++
++	return *mask ? 0 : -EINVAL;
++}
++
++struct mt7915_muru_apply_data {
++	struct mt7915_phy *phy;
++	bool has_ap;		/* an AP interface is up */
++	bool any_mimo_dl;	/* and one of them sends DL MU-MIMO */
++	int err;
++};
++
++static void mt7915_muru_apply_iter(void *_data, u8 *mac,
++				   struct ieee80211_vif *vif)
++{
++	struct mt7915_muru_apply_data *data = _data;
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	u8 flags;
++	int ret;
++
++	if (vif->type != NL80211_IFTYPE_AP &&
++	    vif->type != NL80211_IFTYPE_STATION)
++		return;
++
++	flags = mt7915_muru_bss_flags(data->phy, vif);
++	/* the band's DL MU-MIMO goes by its APs, as in
++	 * mt7915_muru_any_mimo_dl_iter()
++	 */
++	if (vif->type == NL80211_IFTYPE_AP) {
++		data->has_ap = true;
++		if (flags & MURU_MIMO_DL_EN)
++			data->any_mimo_dl = true;
++	}
++
++	ret = mt7915_mcu_set_muru_dl_ul(data->phy->dev, MURU_DL_UL_TYPE_BSS,
++					mvif->mt76.idx, MURU_DL_UL_EN_MASK,
++					flags);
++	if (ret && !data->err)
++		data->err = ret;
++}
++
++/* Push this radio's multi-user (OFDMA / MU-MIMO) flags to the firmware for the
++ * band and every active AP/STA BSS. Under the wiphy lock.
++ */
++static int mt7915_muru_apply(struct mt7915_phy *phy)
++{
++	struct mt7915_muru_apply_data data = { .phy = phy };
++	struct mt7915_dev *dev = phy->dev;
++	u8 band_flags = mt7915_muru_band_flags(phy);
++	int ret;
++
++	KUNIT_STATIC_STUB_REDIRECT(mt7915_muru_apply, phy);
++
++	mutex_lock(&dev->mt76.mutex);
++	ieee80211_iterate_active_interfaces_mtx(phy->mt76->hw,
++						IEEE80211_IFACE_ITER_NORMAL,
++						mt7915_muru_apply_iter, &data);
++	if (data.has_ap && !data.any_mimo_dl)
++		band_flags &= ~MURU_MIMO_DL_EN;
++
++	ret = mt7915_mcu_set_muru_dl_ul(dev, MURU_DL_UL_TYPE_BAND,
++					phy->mt76->band_idx,
++					MURU_DL_UL_EN_MASK, band_flags);
++	mutex_unlock(&dev->mt76.mutex);
++
++	if (ret && !data.err)
++		data.err = ret;
++
++	if (data.err)
++		dev_warn(dev->mt76.dev, "muru flags 0x%x not applied: %d\n",
++			 band_flags, data.err);
++
++	return data.err;
++}
++
++/* Update one or more per-band multi-user flags live. Accepts either a single
++ * "<name> <0|1>" pair or whitespace-separated "<name>=<0|1>" tokens. Under the
++ * wiphy lock. mimo_ul=1 is taken on the MT7915 too but stays off there
++ * (mt7915_muru_band_flags()), so a line with all four flags still sets the
++ * other three.
++ */
++int mt7915_muru_set_flags(struct mt7915_phy *phy, const char *buf)
++{
++	u8 mask, bits, old_flags, ov, new_ov, new_flags;
++	int ret;
++
++	ret = mt7915_muru_parse_flags(buf, &mask, &bits);
++	if (ret)
++		return ret;
++
++	old_flags = mt7915_muru_band_flags(phy);
++	ov = READ_ONCE(phy->muru_en);
++	new_ov = (((ov >> 4) | mask) << 4) |
++		 ((ov & MURU_DL_UL_EN_MASK & ~mask) | bits);
++	WRITE_ONCE(phy->muru_en, new_ov);
++	new_flags = mt7915_muru_band_flags(phy);
++
++	if (new_flags == old_flags && !phy->muru_unapplied)
++		return 0;
++
++	ret = mt7915_muru_apply(phy);
++	phy->muru_unapplied = !!ret;
++
++	return ret;
++}
++
+ /* The restarted firmware has no TWT agreements: a station that still sleeps by
+  * one would miss what's sent outside its wake periods, and no one tells it else.
+  */
+@@ -2136,6 +2347,7 @@ mt7915_reconfig_complete(struct ieee80211_hw *hw,
+ 	if (reconfig_type == IEEE80211_RECONFIG_TYPE_RESTART) {
+ 		mt7915_bss_color_restore(phy);
+ 		phy->spr_unapplied = !!mt7915_spr_apply(phy);
++		phy->muru_unapplied = !!mt7915_muru_apply(phy);
+ 	}
+ 
+ 	ieee80211_wake_queues(hw);
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index e63708a0..b9af89f3 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -58,6 +58,11 @@ static bool vow_fw_quanta;
+ module_param(vow_fw_quanta, bool, 0444);
+ MODULE_PARM_DESC(vow_fw_quanta, "Alternative airtime (VoW) values: no WATF with ATF, the firmware's own quantum table, station quanta one level down");
+ 
++/* On by default: off is there to compare or work around client issues. */
++static bool muru_ofdma_dl = true;
++module_param(muru_ofdma_dl, bool, 0644);
++MODULE_PARM_DESC(muru_ofdma_dl, "Let the firmware schedule DL OFDMA (default on)");
++
+ /* Off by default, as stock mt76 has it since upstream found UL OFDMA hung
+  * the firmware (75977a85).
+  */
+@@ -65,6 +70,15 @@ static bool muru_ofdma_ul;
+ module_param(muru_ofdma_ul, bool, 0644);
+ MODULE_PARM_DESC(muru_ofdma_ul, "Let the firmware schedule UL OFDMA for HE stations (default off, as stock mt76; the firmware keeps the first station's setting per band, so set it before stations join)");
+ 
++/* Off by default: scheduled uplink triggers can pause best-effort downlink
++ * traffic on MT798x. It also decides whether the HE capabilities advertise
++ * full-bandwidth UL MU-MIMO, which they take when the radio is set up: the
++ * debugfs muru file switches the firmware's scheduling only.
++ */
++bool mt7915_muru_mimo_ul;
++module_param_named(muru_mimo_ul, mt7915_muru_mimo_ul, bool, 0644);
++MODULE_PARM_DESC(muru_mimo_ul, "Let the firmware schedule UL MU-MIMO on MT7916/MT798x and advertise it in the HE capabilities, which follow it at load (default off)");
++
+ static int muru_platform_type = -1;
+ module_param(muru_platform_type, int, 0444);
+ MODULE_PARM_DESC(muru_platform_type, "MU/RU platform type sent at boot: -1 by chip (2 on the MT7915, none on the MT798x), 0 none, 1 or 2 that value");
+@@ -1217,6 +1231,38 @@ mt7915_mcu_sta_he_tlv(struct sk_buff *skb, struct ieee80211_sta *sta,
+ 	he->pkt_ext = 2;
+ }
+ 
++u8 mt7915_muru_band_flags(const struct mt7915_phy *phy)
++{
++	u8 ov = READ_ONCE(phy->muru_en);
++	u8 set = ov >> 4;
++	u8 flags = MURU_MIMO_DL_EN;
++
++	if (READ_ONCE(muru_ofdma_dl))
++		flags |= MURU_OFDMA_DL_EN;
++	if (READ_ONCE(muru_ofdma_ul))
++		flags |= MURU_OFDMA_UL_EN;
++	if (!is_mt7915(&phy->dev->mt76) && READ_ONCE(mt7915_muru_mimo_ul))
++		flags |= MURU_MIMO_UL_EN;
++
++	flags = (flags & ~set) | (ov & set);
++	if (is_mt7915(&phy->dev->mt76))
++		flags &= ~MURU_MIMO_UL_EN;
++
++	return flags;
++}
++
++u8 mt7915_muru_bss_flags(const struct mt7915_phy *phy,
++			 const struct ieee80211_vif *vif)
++{
++	const struct mt7915_vif *mvif = (const struct mt7915_vif *)vif->drv_priv;
++	u8 flags = mt7915_muru_band_flags(phy);
++
++	if (!mvif->cap.he_mu_ebfer && !mvif->cap.vht_mu_ebfer)
++		flags &= ~MURU_MIMO_DL_EN;
++
++	return flags;
++}
++
+ static void
+ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 			struct ieee80211_sta *sta, struct ieee80211_vif *vif)
+@@ -1225,6 +1271,7 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	struct ieee80211_he_cap_elem *elem = &sta->deflink.he_cap.he_cap_elem;
+ 	struct sta_rec_muru *muru;
+ 	struct tlv *tlv;
++	u8 flags;
+ 
+ 	if (vif->type != NL80211_IFTYPE_STATION &&
+ 	    vif->type != NL80211_IFTYPE_AP)
+@@ -1238,12 +1285,11 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	 * VHT MU beamformee bit (hostapd's mu_beamformee, on by default) is
+ 	 * about receiving it and doesn't count
+ 	 */
+-	muru->cfg.mimo_dl_en = mvif->cap.he_mu_ebfer ||
+-			       mvif->cap.vht_mu_ebfer;
+-	if (!is_mt7915(&dev->mt76))
+-		muru->cfg.mimo_ul_en = true;
+-	muru->cfg.ofdma_dl_en = true;
+-	muru->cfg.ofdma_ul_en = READ_ONCE(muru_ofdma_ul);
++	flags = mt7915_muru_bss_flags(mvif->phy, vif);
++	muru->cfg.mimo_dl_en = !!(flags & MURU_MIMO_DL_EN);
++	muru->cfg.mimo_ul_en = !!(flags & MURU_MIMO_UL_EN);
++	muru->cfg.ofdma_dl_en = !!(flags & MURU_OFDMA_DL_EN);
++	muru->cfg.ofdma_ul_en = !!(flags & MURU_OFDMA_UL_EN);
+ 
+ 	if (sta->deflink.vht_cap.vht_supported)
+ 		muru->mimo_dl.vht_mu_bfee =
+@@ -1255,10 +1301,12 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	muru->mimo_dl.partial_bw_dl_mimo =
+ 		HE_PHY(CAP6_PARTIAL_BANDWIDTH_DL_MUMIMO, elem->phy_cap_info[6]);
+ 
++	/* no partial_ul_mimo: the AP advertises full-bandwidth UL MU-MIMO
++	 * only (mt7915_set_stream_he_txbf_caps()), so the firmware isn't told
++	 * a station can do it in part of the channel
++	 */
+ 	muru->mimo_ul.full_ul_mimo =
+ 		HE_PHY(CAP2_UL_MU_FULL_MU_MIMO, elem->phy_cap_info[2]);
+-	muru->mimo_ul.partial_ul_mimo =
+-		HE_PHY(CAP2_UL_MU_PARTIAL_MU_MIMO, elem->phy_cap_info[2]);
+ 
+ 	muru->ofdma_dl.punc_pream_rx =
+ 		HE_PHY(CAP1_PREAMBLE_PUNC_RX_MASK, elem->phy_cap_info[1]);
+@@ -2635,6 +2683,27 @@ int mt7915_mcu_set_muru_ctrl(struct mt7915_dev *dev, u32 cmd, u32 val)
+ 				 sizeof(req), false);
+ }
+ 
++int mt7915_mcu_set_muru_dl_ul(struct mt7915_dev *dev, u8 type, u8 idx,
++			      u8 mask, u8 val)
++{
++	struct {
++		__le32 cmd;
++		u8 type;
++		u8 idx;
++		u8 mask;
++		u8 val;
++	} __packed req = {
++		.cmd = cpu_to_le32(MURU_SET_DL_UL_EN),
++		.type = type,
++		.idx = idx,
++		.mask = mask & MURU_DL_UL_EN_MASK,
++		.val = val & mask & MURU_DL_UL_EN_MASK,
++	};
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(MURU_CTRL), &req,
++				 sizeof(req), false);
++}
++
+ /*
+  * The MU/RU platform type goes to the MT7915 only (2); on
+  * the MT798x the firmware keeps its boot value, which reads like 2 in the
+diff --git a/mt7915/mcu.h b/mt7915/mcu.h
+index 0eba4619..3defd18f 100644
+--- a/mt7915/mcu.h
++++ b/mt7915/mcu.h
+@@ -509,8 +509,22 @@ enum {
+ enum {
+ 	MURU_SET_ARB_OP_MODE = 14,
+ 	MURU_SET_PLATFORM_TYPE = 25,
++	MURU_SET_DL_UL_EN = 81,
+ };
+ 
++enum {
++	MURU_DL_UL_TYPE_BAND = 0,
++	MURU_DL_UL_TYPE_BSS = 1,
++	MURU_DL_UL_TYPE_QUERY = 2,
++};
++
++#define MURU_OFDMA_DL_EN		BIT(0)
++#define MURU_OFDMA_UL_EN		BIT(1)
++#define MURU_MIMO_DL_EN			BIT(2)
++#define MURU_MIMO_UL_EN			BIT(3)
++#define MURU_DL_UL_EN_MASK		(MURU_OFDMA_DL_EN | MURU_OFDMA_UL_EN | \
++					 MURU_MIMO_DL_EN | MURU_MIMO_UL_EN)
++
+ enum {
+ 	MURU_PLATFORM_TYPE_PERF_LEVEL_1 = 1,
+ 	MURU_PLATFORM_TYPE_PERF_LEVEL_2,
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 0b3c548f..78700b04 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -310,6 +310,12 @@ struct mt7915_phy {
+ 	struct mt76_mib_stats mib;
+ 	struct mt76_channel_state state_ts;
+ 	u8 muru_work_count;	/* mac_work's MIB rounds since the MU stats */
++	u8 muru_en;		/* low 4 bits: MURU_*_EN, high 4 bits: set mask */
++	/* the firmware didn't take the flags: a write tries again. Not a bit
++	 * field: it's written under the wiphy lock alone, and the reset work
++	 * writes restart_pending without that lock
++	 */
++	bool muru_unapplied;
+ 
+ 	bool sku_limit_en:1;
+ 	bool sku_path_en:1;
+@@ -664,6 +670,11 @@ int mt7915_mcu_set_protection(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 			      u8 ht_mode, bool use_cts_prot);
+ const char *mt7915_spr_mode_name(const struct mt7915_phy *phy);
+ int mt7915_spr_set_mode(struct mt7915_phy *phy, const char *name);
++extern bool mt7915_muru_mimo_ul;
++u8 mt7915_muru_band_flags(const struct mt7915_phy *phy);
++u8 mt7915_muru_bss_flags(const struct mt7915_phy *phy,
++			 const struct ieee80211_vif *vif);
++int mt7915_muru_set_flags(struct mt7915_phy *phy, const char *buf);
+ int mt7915_mcu_add_obss_spr(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 			    struct ieee80211_he_obss_pd *he_obss_pd);
+ int mt7915_mcu_add_rate_ctrl(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+@@ -710,6 +721,8 @@ int mt7915_mcu_set_pulse_th(struct mt7915_dev *dev,
+ int mt7915_mcu_set_radar_th(struct mt7915_dev *dev, int index,
+ 			    const struct mt7915_dfs_pattern *pattern);
+ int mt7915_mcu_set_muru_ctrl(struct mt7915_dev *dev, u32 cmd, u32 val);
++int mt7915_mcu_set_muru_dl_ul(struct mt7915_dev *dev, u8 type, u8 idx,
++			      u8 mask, u8 val);
+ 
+ struct mt7915_sta_ps_stats {
+ 	u64 dozing_ms;
+diff --git a/mt7915/tests/debugfs-test.c b/mt7915/tests/debugfs-test.c
+index 1ab18b1d..ef143ada 100644
+--- a/mt7915/tests/debugfs-test.c
++++ b/mt7915/tests/debugfs-test.c
+@@ -231,6 +231,57 @@ static void mt7915_debugfs_test_twt_policy_set(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "max_flows many"), -EINVAL);
+ }
+ 
++/* muru: the band's flags, one "<name> <0|1>" line each, as MilkFlint's rpcd
++ * reads them; a write returns what it took, or why it didn't
++ */
++static void mt7915_debugfs_test_muru(struct kunit *test)
++{
++	char line[] = "ofdma_dl=1 ofdma_ul=0 mimo_dl=1 mimo_ul=0\n";
++	struct mt7915_phy *phy;
++	struct mt7915_dev *dev;
++	char buf[64];
++
++	dev = kunit_kzalloc(test, sizeof(*dev), GFP_KERNEL);
++	phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_NOT_NULL(test, phy);
++	mutex_init(&dev->mt76.mutex);
++	dev->mt76.rev = 0x79860000;
++	phy->dev = dev;
++
++	/* the defaults: download on, upload off */
++	KUNIT_EXPECT_EQ(test, mt7915_muru_show(phy, buf, sizeof(buf)),
++			(int)strlen("ofdma_dl 1\nofdma_ul 0\nmimo_dl 1\nmimo_ul 0\n"));
++	KUNIT_EXPECT_STREQ(test, buf,
++			   "ofdma_dl 1\nofdma_ul 0\nmimo_dl 1\nmimo_ul 0\n");
++
++	phy->muru_en = (MURU_DL_UL_EN_MASK << 4) | MURU_OFDMA_UL_EN |
++		       MURU_MIMO_UL_EN;
++	mt7915_muru_show(phy, buf, sizeof(buf));
++	KUNIT_EXPECT_STREQ(test, buf,
++			   "ofdma_dl 0\nofdma_ul 1\nmimo_dl 0\nmimo_ul 1\n");
++	/* the MT7915 has no UL MU-MIMO */
++	dev->mt76.rev = 0x79150000;
++	mt7915_muru_show(phy, buf, sizeof(buf));
++	KUNIT_EXPECT_STREQ(test, buf,
++			   "ofdma_dl 0\nofdma_ul 1\nmimo_dl 0\nmimo_ul 0\n");
++	dev->mt76.rev = 0x79860000;
++	phy->muru_en = 0;
++
++	/* the defaults written over the defaults: taken, nothing to send */
++	KUNIT_EXPECT_EQ(test, mt7915_muru_handler(NULL, NULL, line,
++						  strlen(line), phy),
++			(ssize_t)strlen(line));
++	KUNIT_EXPECT_EQ(test, phy->muru_en,
++			(MURU_DL_UL_EN_MASK << 4) | MURU_OFDMA_DL_EN |
++			MURU_MIMO_DL_EN);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_handler(NULL, NULL, "bogus 1", 7,
++						  phy), -EINVAL);
++	KUNIT_EXPECT_EQ(test, phy->muru_en,
++			(MURU_DL_UL_EN_MASK << 4) | MURU_OFDMA_DL_EN |
++			MURU_MIMO_DL_EN);
++}
++
+ /* twt_status: a radio's own agreements, in the terms the page shows */
+ static void mt7915_debugfs_test_twt_status(struct kunit *test)
+ {
+@@ -346,6 +397,7 @@ static struct kunit_case mt7915_debugfs_test_cases[] = {
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_stats_locked),
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_policy_set),
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_status),
++	KUNIT_CASE(mt7915_debugfs_test_muru),
+ 	KUNIT_CASE(mt7915_debugfs_test_rdd_reports),
+ 	KUNIT_CASE(mt7915_debugfs_test_fwlog_close),
+ 	{}
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 829f9d52..4ece1a68 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -528,8 +528,7 @@ static void mt7915_init_test_he_caps(struct kunit *test)
+ 			IEEE80211_HE_PHY_CAP1_LDPC_CODING_IN_PAYLOAD);
+ 	KUNIT_EXPECT_EQ(test, phy[2], IEEE80211_HE_PHY_CAP2_STBC_TX_UNDER_80MHZ |
+ 			IEEE80211_HE_PHY_CAP2_STBC_RX_UNDER_80MHZ |
+-			IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US |
+-			IEEE80211_HE_PHY_CAP2_UL_MU_FULL_MU_MIMO);
++			IEEE80211_HE_PHY_CAP2_NDP_4x_LTF_AND_3_2US);
+ 	KUNIT_EXPECT_EQ(test, phy[3],
+ 			IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_TX_QPSK |
+ 			IEEE80211_HE_PHY_CAP3_DCM_MAX_CONST_RX_QPSK |
+@@ -811,6 +810,48 @@ static void mt7915_init_test_he_caps_mt7915(struct kunit *test)
+ 	dev->mt76.rev = 0x79860000;
+ }
+ 
++static void mt7915_init_test_mimo_ul_off(void *data)
++{
++	mt7915_muru_mimo_ul = false;
++}
++
++/* UL MU-MIMO HE PHY cap follows muru_mimo_ul on MT7986 and stays off on MT7915. */
++static void mt7915_init_test_he_caps_ul_mimo(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_init_test_chip(test,
++						       MT7976_ONE_ADIE_DBDC);
++	struct mt7915_phy *phy = &dev->phy;
++	struct ieee80211_sband_iftype_data *data;
++	const struct ieee80211_sband_iftype_data *ap;
++	int n;
++
++	data = kunit_kcalloc(test, NUM_NL80211_IFTYPES, sizeof(*data),
++			     GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, data);
++	phy->mt76->antenna_mask = 0xf;
++	phy->mt76->chainmask = 0xf;
++
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_init_test_mimo_ul_off, NULL), 0);
++	mt7915_muru_mimo_ul = true;
++
++	n = mt7915_init_he_caps(phy, NL80211_BAND_5GHZ, data);
++	ap = mt7915_init_test_find(data, n, NL80211_IFTYPE_AP);
++	KUNIT_ASSERT_NOT_NULL(test, ap);
++	KUNIT_EXPECT_NE(test, ap->he_cap.he_cap_elem.phy_cap_info[2] &
++			IEEE80211_HE_PHY_CAP2_UL_MU_FULL_MU_MIMO, 0);
++
++	dev->mt76.rev = 0x79150000;
++	memset(data, 0, NUM_NL80211_IFTYPES * sizeof(*data));
++	n = mt7915_init_he_caps(phy, NL80211_BAND_5GHZ, data);
++	ap = mt7915_init_test_find(data, n, NL80211_IFTYPE_AP);
++	KUNIT_ASSERT_NOT_NULL(test, ap);
++	KUNIT_EXPECT_EQ(test, ap->he_cap.he_cap_elem.phy_cap_info[2] &
++			IEEE80211_HE_PHY_CAP2_UL_MU_FULL_MU_MIMO, 0);
++	dev->mt76.rev = 0x79860000;
++	mt7915_muru_mimo_ul = false;
++}
++
+ /* A 6 GHz band also announces its 6 GHz band capabilities. */
+ static void mt7915_init_test_he_caps_6ghz(struct kunit *test)
+ {
+@@ -1961,6 +2002,7 @@ static struct kunit_case mt7915_init_test_cases[] = {
+ 	KUNIT_CASE(mt7915_init_test_he_caps_shrink),
+ 	KUNIT_CASE(mt7915_init_test_vht_txbf_caps),
+ 	KUNIT_CASE(mt7915_init_test_he_caps_mt7915),
++	KUNIT_CASE(mt7915_init_test_he_caps_ul_mimo),
+ 	KUNIT_CASE(mt7915_init_test_he_caps_6ghz),
+ 	KUNIT_CASE(mt7915_init_test_txpower),
+ 	KUNIT_CASE(mt7915_init_test_regd_notifier),
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 6f25e4b8..f2ee6b56 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -887,6 +887,447 @@ static void mt7915_main_test_spr_set_mode_refused(struct kunit *test)
+ 	wiphy_unlock(hw->wiphy);
+ }
+ 
++/* --- live MURU flags ------------------------------------------------------- */
++
++static int mt7915_main_test_muru_applied;
++static int mt7915_main_test_muru_apply_ret;
++
++static int mt7915_main_test_muru_apply_stub(struct mt7915_phy *phy)
++{
++	mt7915_main_test_muru_applied++;
++	return mt7915_main_test_muru_apply_ret;
++}
++
++struct mt7915_test_muru_dl_ul_req {
++	__le32 cmd;
++	u8 type;
++	u8 idx;
++	u8 mask;
++	u8 val;
++} __packed;
++
++/* Parsing, per-band isolation, MT7915 guard, no-op skip and retry after error. */
++static void mt7915_main_test_muru_set_flags(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_phy *phy2 = mt7915_hw_phy(mt7915_main_test_hw2(dev));
++
++	mt7915_main_test_muru_applied = 0;
++	mt7915_main_test_muru_apply_ret = 0;
++	kunit_activate_static_stub(test, mt7915_muru_apply,
++				   mt7915_main_test_muru_apply_stub);
++
++	KUNIT_EXPECT_EQ(test, mt7915_muru_band_flags(phy),
++			MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++
++	wiphy_lock(hw->wiphy);
++	/* invalid inputs leave flags and apply count untouched */
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, ""), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "   "), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "\n"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "bogus 1"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "mimo_ul 2"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "mimo_ul 1 extra"),
++			-EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "mimo_ul=yes"),
++			-EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "ofdma_dl=1 extra"),
++			-EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 0);
++
++	/* single-pair and multi-token writes */
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "mimo_ul 1\n"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_band_flags(phy),
++			MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN | MURU_MIMO_UL_EN);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 1);
++
++	/* writing the same state skips firmware update */
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "mimo_ul=1"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 1);
++
++	/* atomic multi-flag write; other band stays at defaults */
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy,
++			"ofdma_dl=0 ofdma_ul=1 mimo_dl=0 mimo_ul=0\n"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_band_flags(phy), MURU_OFDMA_UL_EN);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_band_flags(phy2),
++			MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 2);
++
++	/* firmware error marks unapplied so the same write retries */
++	mt7915_main_test_muru_apply_ret = -EIO;
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "ofdma_dl 1"), -EIO);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 3);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "ofdma_dl 1"), -EIO);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 4);
++	mt7915_main_test_muru_apply_ret = 0;
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "ofdma_dl 1"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 5);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "ofdma_dl 1"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 5);
++
++	/* the MT7915 has no UL MU-MIMO: mimo_ul=1 is taken but stays off, and
++	 * the rest of a four-flag line (as MilkFlint writes it) still applies
++	 */
++	dev->mt76.rev = 0x79150000;
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy,
++			"ofdma_dl=0 ofdma_ul=0 mimo_dl=1 mimo_ul=1"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_band_flags(phy), MURU_MIMO_DL_EN);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 6);
++	/* there mimo_ul alone changes nothing the firmware has */
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "mimo_ul 0"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 6);
++	dev->mt76.rev = 0x79860000;
++	wiphy_unlock(hw->wiphy);
++}
++
++/* Applying live MURU flags sends BSS subcmd 81 per AP/STA vif (skipping other
++ * types) and respects each BSS's MU beamformer capability; only APs count for
++ * the band's DL MU-MIMO.
++ */
++static void mt7915_main_test_muru_apply_iter(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_muru_apply_data data = { .phy = phy };
++	struct mt7915_muru_apply_data sta_data = { .phy = phy };
++	struct mt7915_test_muru_dl_ul_req *req;
++	struct mt76_test_msg *msg;
++	struct ieee80211_vif *vif, *sta;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	memset(&mt7915_main_test_mvif(vif)->cap, 0,
++	       sizeof(mt7915_main_test_mvif(vif)->cap));
++	mt7915_main_test_clear(fake);
++
++	/* without MU beamformer cap, BSS mimo_dl stays off */
++	mt7915_muru_apply_iter(&data, vif->addr, vif);
++	KUNIT_ASSERT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(MURU_CTRL)), 1);
++	KUNIT_EXPECT_TRUE(test, data.has_ap);
++	KUNIT_EXPECT_FALSE(test, data.any_mimo_dl);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(MURU_CTRL));
++	req = (void *)msg->data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->cmd), MURU_SET_DL_UL_EN);
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN);
++
++	/* with HE MU beamformer cap, BSS mimo_dl is on */
++	mt7915_main_test_mvif(vif)->cap.he_mu_ebfer = true;
++	mt7915_main_test_clear(fake);
++	mt7915_muru_apply_iter(&data, vif->addr, vif);
++	KUNIT_EXPECT_TRUE(test, data.any_mimo_dl);
++	msg = mt76_test_find_msg(fake, MCU_EXT_CMD(MURU_CTRL));
++	req = (void *)msg->data;
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++
++	/* monitor vifs are skipped */
++	vif->type = NL80211_IFTYPE_MONITOR;
++	mt7915_main_test_clear(fake);
++	mt7915_muru_apply_iter(&data, vif->addr, vif);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(MURU_CTRL)), 0);
++
++	/* a station interface gets its BSS flags (with the caps
++	 * mt7915_add_interface() leaves it, all set) but doesn't count for the
++	 * band
++	 */
++	sta = mt7915_main_test_sdata(test, hw, NL80211_IFTYPE_STATION, 2);
++	mt7915_main_test_clear(fake);
++	mt7915_muru_apply_iter(&sta_data, sta->addr, sta);
++	KUNIT_ASSERT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(MURU_CTRL)), 1);
++	KUNIT_EXPECT_FALSE(test, sta_data.has_ap);
++	KUNIT_EXPECT_FALSE(test, sta_data.any_mimo_dl);
++	KUNIT_EXPECT_EQ(test, sta_data.err, 0);
++	req = (void *)mt76_test_find_msg(fake, MCU_EXT_CMD(MURU_CTRL))->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, req->idx, mt7915_main_test_mvif(sta)->mt76.idx);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++
++	/* the first error is kept */
++	fake->mcu_ret = -EIO;
++	mt7915_muru_apply_iter(&sta_data, sta->addr, sta);
++	fake->mcu_ret = -ENOMEM;
++	mt7915_muru_apply_iter(&sta_data, sta->addr, sta);
++	fake->mcu_ret = 0;
++	KUNIT_EXPECT_EQ(test, sta_data.err, -EIO);
++}
++
++/* mt7915_muru_apply() walks the band's interfaces: a BSS message for each AP
++ * and station interface, then the band's, which keeps DL MU-MIMO only while
++ * an AP sends it.
++ */
++static void mt7915_main_test_muru_apply(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_test_muru_dl_ul_req *req;
++	struct ieee80211_vif *ap, *ap2, *sta;
++	int i;
++
++	ap = mt7915_main_test_sdata_ap(test, hw, 1);
++	ap2 = mt7915_main_test_sdata_ap(test, hw, 2);
++	mt7915_main_test_sdata_up(test, ap);
++	mt7915_main_test_sdata_up(test, ap2);
++	/* as start_ap leaves them: MU beamforming on the first only */
++	memset(&mt7915_main_test_mvif(ap)->cap, 0,
++	       sizeof(mt7915_main_test_mvif(ap)->cap));
++	memset(&mt7915_main_test_mvif(ap2)->cap, 0,
++	       sizeof(mt7915_main_test_mvif(ap2)->cap));
++	mt7915_main_test_mvif(ap)->cap.vht_mu_ebfer = true;
++
++	wiphy_lock(hw->wiphy);
++	mt7915_main_test_clear(fake);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_apply(phy), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 3);
++	for (i = 0; i < 3; i++) {
++		KUNIT_EXPECT_EQ(test, mt76_test_msg(fake, i)->cmd,
++				MCU_EXT_CMD(MURU_CTRL));
++		KUNIT_EXPECT_TRUE(test, mt76_test_msg(fake, i)->locked);
++		req = (void *)mt76_test_msg(fake, i)->data;
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(req->cmd), MURU_SET_DL_UL_EN);
++		KUNIT_EXPECT_EQ(test, req->mask, MURU_DL_UL_EN_MASK);
++	}
++	req = (void *)mt76_test_msg(fake, 0)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, req->idx, mt7915_main_test_mvif(ap)->mt76.idx);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++	req = (void *)mt76_test_msg(fake, 1)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, req->idx, mt7915_main_test_mvif(ap2)->mt76.idx);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN);
++	req = (void *)mt76_test_msg(fake, 2)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, req->idx, phy->mt76->band_idx);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++
++	/* neither AP sends it (MU-MIMO off on Networks & radios): nor does the
++	 * band
++	 */
++	mt7915_main_test_mvif(ap)->cap.vht_mu_ebfer = false;
++	mt7915_main_test_clear(fake);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_apply(phy), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 3);
++	req = (void *)mt76_test_msg(fake, 2)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN);
++
++	/* a station interface on the band, its caps all set, doesn't keep the
++	 * band's on either
++	 */
++	sta = mt7915_main_test_sdata(test, hw, NL80211_IFTYPE_STATION, 3);
++	mt7915_main_test_sdata_up(test, sta);
++	mt7915_main_test_clear(fake);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_apply(phy), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 4);
++	req = (void *)mt76_test_msg(fake, 2)->data;
++	KUNIT_EXPECT_EQ(test, req->idx, mt7915_main_test_mvif(sta)->mt76.idx);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++	req = (void *)mt76_test_msg(fake, 3)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN);
++
++	/* the firmware refusing them: every message still goes, the error
++	 * comes back
++	 */
++	mt7915_main_test_clear(fake);
++	fake->mcu_ret = -EIO;
++	KUNIT_EXPECT_EQ(test, mt7915_muru_apply(phy), -EIO);
++	KUNIT_EXPECT_EQ(test, fake->n_msgs, 4);
++	fake->mcu_ret = 0;
++	wiphy_unlock(hw->wiphy);
++}
++
++/* With only station interfaces, or none, the band's DL MU-MIMO stays as set:
++ * no AP says otherwise.
++ */
++static void mt7915_main_test_muru_apply_no_ap(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct mt7915_test_muru_dl_ul_req *req;
++	struct ieee80211_vif *sta;
++
++	wiphy_lock(hw->wiphy);
++	mt7915_main_test_clear(fake);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_apply(phy), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 1);
++	req = (void *)mt76_test_msg(fake, 0)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++
++	sta = mt7915_main_test_sdata(test, hw, NL80211_IFTYPE_STATION, 1);
++	mt7915_main_test_sdata_up(test, sta);
++	memset(&mt7915_main_test_mvif(sta)->cap, 0,
++	       sizeof(mt7915_main_test_mvif(sta)->cap));
++	mt7915_main_test_clear(fake);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_apply(phy), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 2);
++	req = (void *)mt76_test_msg(fake, 0)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN);
++	req = (void *)mt76_test_msg(fake, 1)->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++	wiphy_unlock(hw->wiphy);
++}
++
++/* After a firmware restart the flags go back (the restarted firmware has the
++ * defaults); refused, the next write of the same flags tries again.
++ */
++static void mt7915_main_test_muru_after_restart(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++
++	mt7915_main_test_muru_applied = 0;
++	mt7915_main_test_muru_apply_ret = 0;
++	kunit_activate_static_stub(test, mt7915_muru_apply,
++				   mt7915_main_test_muru_apply_stub);
++
++	wiphy_lock(hw->wiphy);
++	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_SUSPEND);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 0);
++	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 1);
++	KUNIT_EXPECT_FALSE(test, phy->muru_unapplied);
++
++	mt7915_main_test_muru_apply_ret = -EIO;
++	mt7915_reconfig_complete(hw, IEEE80211_RECONFIG_TYPE_RESTART);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 2);
++	KUNIT_EXPECT_TRUE(test, phy->muru_unapplied);
++
++	/* the defaults again, as MilkFlint writes them at boot: sent anyway */
++	mt7915_main_test_muru_apply_ret = 0;
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy,
++			"ofdma_dl=1 ofdma_ul=0 mimo_dl=1 mimo_ul=0"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 3);
++	KUNIT_EXPECT_FALSE(test, phy->muru_unapplied);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy,
++			"ofdma_dl=1 ofdma_ul=0 mimo_dl=1 mimo_ul=0"), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_main_test_muru_applied, 3);
++	wiphy_unlock(hw->wiphy);
++}
++
++static int mt7915_main_test_refuse_muru(struct mt76_test_fake *fake,
++					const struct mt76_test_msg *msg)
++{
++	return msg->cmd == MCU_EXT_CMD(MURU_CTRL) ? -EIO : 0;
++}
++
++/* The firmware refusing the MURU flags doesn't fail start_ap (the BSS runs on
++ * the firmware's own); it's marked, so the next write sends them again.
++ */
++static void mt7915_main_test_start_ap_muru_refused(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct ieee80211_vif *vif;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	vif->bss_conf.he_mu_beamformer = true;
++	mt7915_main_test_clear(fake);
++	fake->mcu_hook = mt7915_main_test_refuse_muru;
++
++	wiphy_lock(hw->wiphy);
++	KUNIT_EXPECT_EQ(test, mt7915_start_ap(hw, vif, &vif->bss_conf), 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(MURU_CTRL)), 2);
++	KUNIT_EXPECT_TRUE(test, phy->muru_unapplied);
++
++	fake->mcu_hook = NULL;
++	mt7915_main_test_clear(fake);
++	KUNIT_EXPECT_EQ(test, mt7915_muru_set_flags(phy, "ofdma_dl 1"), 0);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, MCU_EXT_CMD(MURU_CTRL)), 1);
++	KUNIT_EXPECT_FALSE(test, phy->muru_unapplied);
++	wiphy_unlock(hw->wiphy);
++}
++
++/* A BSS without MU beamforming starting next to one with it: the band keeps
++ * DL MU-MIMO for the other, the new BSS doesn't get it.
++ */
++static void mt7915_main_test_start_ap_muru_other_ap(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_test_muru_dl_ul_req *band_req, *bss_req;
++	struct ieee80211_vif *ap, *ap2;
++
++	ap = mt7915_main_test_sdata_ap(test, hw, 1);
++	ap2 = mt7915_main_test_sdata_ap(test, hw, 2);
++	mt7915_main_test_sdata_up(test, ap);
++	mt7915_main_test_sdata_up(test, ap2);
++	memset(&mt7915_main_test_mvif(ap)->cap, 0,
++	       sizeof(mt7915_main_test_mvif(ap)->cap));
++	mt7915_main_test_mvif(ap)->cap.he_mu_ebfer = true;
++	ap2->bss_conf.vht_mu_beamformer = false;
++	ap2->bss_conf.he_mu_beamformer = false;
++
++	wiphy_lock(hw->wiphy);
++	mt7915_main_test_clear(fake);
++	KUNIT_ASSERT_EQ(test, mt7915_start_ap(hw, ap2, &ap2->bss_conf), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 5);
++	band_req = (void *)mt76_test_msg(fake, 3)->data;
++	bss_req = (void *)mt76_test_msg(fake, 4)->data;
++	KUNIT_EXPECT_EQ(test, band_req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, band_req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++	KUNIT_EXPECT_EQ(test, bss_req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, bss_req->idx, mt7915_main_test_mvif(ap2)->mt76.idx);
++	KUNIT_EXPECT_EQ(test, bss_req->val, MURU_OFDMA_DL_EN);
++
++	/* the other one is a station interface (caps all set): it doesn't
++	 * count, the band's goes off
++	 */
++	ap->type = NL80211_IFTYPE_STATION;
++	mt7915_main_test_mvif(ap)->cap.vht_mu_ebfer = true;
++	mt7915_main_test_clear(fake);
++	KUNIT_ASSERT_EQ(test, mt7915_start_ap(hw, ap2, &ap2->bss_conf), 0);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 5);
++	band_req = (void *)mt76_test_msg(fake, 3)->data;
++	KUNIT_EXPECT_EQ(test, band_req->val, MURU_OFDMA_DL_EN);
++	ap->type = NL80211_IFTYPE_AP;
++	wiphy_unlock(hw->wiphy);
++}
++
++/* start_ap updates both band and BSS MURU flags so turning MU-MIMO off on
++ * wifi reload takes effect in firmware without rebooting.
++ */
++static void mt7915_main_test_start_ap_muru_off(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct mt7915_test_muru_dl_ul_req *band_req, *bss_req;
++	struct ieee80211_vif *vif;
++
++	vif = mt7915_main_test_ap(test, hw, 1);
++	mt7915_main_test_clear(fake);
++	vif->bss_conf.vht_mu_beamformer = false;
++	vif->bss_conf.he_mu_beamformer = false;
++
++	/* as mac80211 calls it: the interface walk needs the wiphy lock */
++	wiphy_lock(hw->wiphy);
++	KUNIT_ASSERT_EQ(test, mt7915_start_ap(hw, vif, &vif->bss_conf), 0);
++	wiphy_unlock(hw->wiphy);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 5);
++	band_req = (void *)mt76_test_msg(fake, 3)->data;
++	bss_req = (void *)mt76_test_msg(fake, 4)->data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(band_req->cmd), MURU_SET_DL_UL_EN);
++	KUNIT_EXPECT_EQ(test, band_req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, band_req->val, MURU_OFDMA_DL_EN);
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(bss_req->cmd), MURU_SET_DL_UL_EN);
++	KUNIT_EXPECT_EQ(test, bss_req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, bss_req->val, MURU_OFDMA_DL_EN);
++}
++
+ /* An interface going away no longer counts as using spatial reuse on its band. */
+ static void mt7915_main_test_spr_remove_interface(struct kunit *test)
+ {
+@@ -2241,7 +2682,7 @@ static void mt7915_main_test_start_stop_ap(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, cap->he_su_ebfer);
+ 	KUNIT_EXPECT_TRUE(test, cap->he_su_ebfee);
+ 	KUNIT_EXPECT_TRUE(test, cap->he_mu_ebfer);
+-	KUNIT_ASSERT_EQ(test, fake->n_msgs, 3);
++	KUNIT_ASSERT_EQ(test, fake->n_msgs, 5);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_msg(fake, 0)->cmd,
+ 			MCU_EXT_CMD(BSS_INFO_UPDATE));
+ 	sbasic = mt7915_main_test_tlv(mt76_test_msg(fake, 1), STA_REC_BASIC);
+@@ -2249,6 +2690,11 @@ static void mt7915_main_test_start_stop_ap(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, sbasic->conn_state, CONN_STATE_PORT_SECURE);
+ 	/* band 0, hw BSSID 0: group 0 */
+ 	mt7915_main_test_check_group(test, mt76_test_msg(fake, 2), 0);
++	/* live MURU band + BSS flag updates */
++	KUNIT_EXPECT_EQ(test, mt76_test_msg(fake, 3)->cmd,
++			MCU_EXT_CMD(MURU_CTRL));
++	KUNIT_EXPECT_EQ(test, mt76_test_msg(fake, 4)->cmd,
++			MCU_EXT_CMD(MURU_CTRL));
+ 
+ 	mt7915_main_test_clear(fake);
+ 	fake->mcu_ret = -EIO;
+@@ -5113,6 +5559,14 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_spr_apply_iter),
+ 	KUNIT_CASE(mt7915_main_test_spr_apply_iter_error),
+ 	KUNIT_CASE(mt7915_main_test_spr_set_mode_refused),
++	KUNIT_CASE(mt7915_main_test_muru_set_flags),
++	KUNIT_CASE(mt7915_main_test_muru_apply_iter),
++	KUNIT_CASE(mt7915_main_test_muru_apply),
++	KUNIT_CASE(mt7915_main_test_muru_apply_no_ap),
++	KUNIT_CASE(mt7915_main_test_muru_after_restart),
++	KUNIT_CASE(mt7915_main_test_start_ap_muru_refused),
++	KUNIT_CASE(mt7915_main_test_start_ap_muru_other_ap),
++	KUNIT_CASE(mt7915_main_test_start_ap_muru_off),
+ 	KUNIT_CASE(mt7915_main_test_spr_remove_interface),
+ 	KUNIT_CASE(mt7915_main_test_spr_bss_start_off),
+ 	KUNIT_CASE(mt7915_main_test_spr_after_restart),
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 054c7308..eb814157 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -3091,9 +3091,20 @@ static void mt7915_test_muru_ofdma_ul_off(void *data)
+ 	muru_ofdma_ul = false;
+ }
+ 
+-/* MU settings for APs and stations: DL OFDMA always, UL OFDMA only with
+- * the muru_ofdma_ul switch on, UL MU-MIMO on this chip, DL MU-MIMO if we
+- * can MU beamform, and the station's HE MU capabilities.
++static void mt7915_test_muru_ofdma_dl_on(void *data)
++{
++	muru_ofdma_dl = true;
++}
++
++static void mt7915_test_muru_mimo_ul_off(void *data)
++{
++	mt7915_muru_mimo_ul = false;
++}
++
++/* MU settings for APs and stations: DL OFDMA on by default, UL OFDMA and
++ * UL MU-MIMO off by default (and UL MU-MIMO always off on MT7915), DL
++ * MU-MIMO if we can MU beamform, per-phy debugfs overrides, and the
++ * station's HE MU capabilities (full-BW UL MU-MIMO only).
+  */
+ static void mt7915_test_sta_muru(struct kunit *test)
+ {
+@@ -3101,14 +3112,16 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	struct sta_rec_muru *muru;
+ 	struct mt7915_test_ctx c;
+ 
+-	/* by default as stock mt76 sends it: DL OFDMA only */
++	/* defaults: DL OFDMA and DL MU-MIMO on, both UL flags off */
+ 	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
+ 	muru = mt7915_test_muru_tlv(test, &c);
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_dl_en);
+ 	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_ul_en);
++	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_dl_en);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.mimo_ul_en);
+ 
+-	/* switched on: UL OFDMA too */
++	/* UL OFDMA module parameter */
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+ 			mt7915_test_muru_ofdma_ul_off, NULL), 0);
+ 	muru_ofdma_ul = true;
+@@ -3117,8 +3130,43 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_ul_en);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_dl_en);
+ 	muru_ofdma_ul = false;
++
++	/* DL OFDMA module parameter off */
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_test_muru_ofdma_dl_on, NULL), 0);
++	muru_ofdma_dl = false;
++	muru = mt7915_test_muru_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, muru);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_dl_en);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_ul_en);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_dl_en);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.mimo_ul_en);
++	muru_ofdma_dl = true;
++
++	/* UL MU-MIMO module parameter: on for MT7986, stays off for MT7915 */
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_test_muru_mimo_ul_off, NULL), 0);
++	mt7915_muru_mimo_ul = true;
++	muru = mt7915_test_muru_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, muru);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_ul_en);
++	c.dev->mt76.rev = 0x79150000;
++	muru = mt7915_test_muru_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, muru);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.mimo_ul_en);
++	c.dev->mt76.rev = 0x79860000;
++	mt7915_muru_mimo_ul = false;
++
++	/* per-phy overrides beat defaults and module parameters */
++	c.phy->muru_en = (MURU_DL_UL_EN_MASK << 4) | MURU_MIMO_UL_EN;
++	muru = mt7915_test_muru_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, muru);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_dl_en);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_ul_en);
++	KUNIT_EXPECT_FALSE(test, muru->cfg.mimo_dl_en);
++	KUNIT_EXPECT_TRUE(test, muru->cfg.mimo_ul_en);
++	c.phy->muru_en = 0;
++
+ 	KUNIT_EXPECT_FALSE(test, muru->mimo_dl.vht_mu_bfee);
+ 	KUNIT_EXPECT_FALSE(test, muru->ofdma_ul.mu_cascading);
+ 
+@@ -3173,7 +3221,7 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+ 	KUNIT_EXPECT_TRUE(test, muru->mimo_dl.partial_bw_dl_mimo);
+ 	KUNIT_EXPECT_TRUE(test, muru->mimo_ul.full_ul_mimo);
+-	KUNIT_EXPECT_TRUE(test, muru->mimo_ul.partial_ul_mimo);
++	KUNIT_EXPECT_FALSE(test, muru->mimo_ul.partial_ul_mimo);
+ 	KUNIT_EXPECT_EQ(test, muru->ofdma_dl.punc_pream_rx, 3);
+ 	KUNIT_EXPECT_TRUE(test, muru->ofdma_dl.he_20m_in_40m_2g);
+ 	KUNIT_EXPECT_TRUE(test, muru->ofdma_dl.he_20m_in_160m);
+@@ -3190,6 +3238,49 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	KUNIT_EXPECT_NULL(test, mt7915_test_muru_tlv(test, &c));
+ }
+ 
++/* Live MURU DL/UL enable command (subcmd 81): 8-byte payload with type
++ * (band or BSS), index, 4-bit mask and masked value.
++ */
++static void mt7915_test_mcu_set_muru_dl_ul(struct kunit *test)
++{
++	struct mt7915_test_muru_dl_ul_req {
++		__le32 cmd;
++		u8 type;
++		u8 idx;
++		u8 mask;
++		u8 val;
++	} __packed;
++	struct mt7915_test_muru_dl_ul_req *req;
++	struct mt76_test_msg *msg;
++	struct mt7915_test_ctx c;
++
++	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_set_muru_dl_ul(c.dev,
++			MURU_DL_UL_TYPE_BAND, 1, 0xff,
++			MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN | BIT(7)), 0);
++	msg = mt76_test_find_msg(c.fake, MCU_EXT_CMD(MURU_CTRL));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_ASSERT_EQ(test, msg->len, sizeof(*req));
++	req = (void *)msg->data;
++	KUNIT_EXPECT_EQ(test, le32_to_cpu(req->cmd), MURU_SET_DL_UL_EN);
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BAND);
++	KUNIT_EXPECT_EQ(test, req->idx, 1);
++	KUNIT_EXPECT_EQ(test, req->mask, MURU_DL_UL_EN_MASK);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_OFDMA_DL_EN | MURU_MIMO_DL_EN);
++
++	/* bits outside @mask are cleared from val */
++	KUNIT_ASSERT_EQ(test, mt7915_mcu_set_muru_dl_ul(c.dev,
++			MURU_DL_UL_TYPE_BSS, 3, MURU_MIMO_UL_EN,
++			MURU_OFDMA_DL_EN | MURU_MIMO_UL_EN), 0);
++	msg = mt76_test_find_msg(c.fake, MCU_EXT_CMD(MURU_CTRL));
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	req = (void *)msg->data;
++	KUNIT_EXPECT_EQ(test, req->type, MURU_DL_UL_TYPE_BSS);
++	KUNIT_EXPECT_EQ(test, req->idx, 3);
++	KUNIT_EXPECT_EQ(test, req->mask, MURU_MIMO_UL_EN);
++	KUNIT_EXPECT_EQ(test, req->val, MURU_MIMO_UL_EN);
++}
++
+ /* HT and VHT TLVs carry the station's capabilities, and are left out
+  * without them.
+  */
+@@ -4780,6 +4871,7 @@ static struct kunit_case mt7915_mcu_sta_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_sta_he_mcs_widths),
+ 	KUNIT_CASE(mt7915_test_sta_he_mcs_nss),
+ 	KUNIT_CASE(mt7915_test_sta_muru),
++	KUNIT_CASE(mt7915_test_mcu_set_muru_dl_ul),
+ 	KUNIT_CASE(mt7915_test_sta_ht_vht),
+ 	KUNIT_CASE(mt7915_test_sta_amsdu),
+ 	KUNIT_CASE(mt7915_test_sta_wtbl_hdr_trans),
