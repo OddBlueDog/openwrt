@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 12:40:00 +0000
+Subject: [PATCH] net: ethernet: mtk_eth_soc: QDMA's delay interrupt halves, RX events only for a ring's own
+
+Two things in the adaptive interrupt moderation (Net DIM) the RSS patches
+brought:
+
+- mtk_dim_rx() and mtk_dim_tx() write QDMA's delay interrupt register the
+  other way round from PDMA's: RX's moderation in the high half (TX done,
+  bits 31:16, as upstream and PDMA have it) and TX's in the low one. That
+  came with the RSS patches; upstream writes one layout to
+  both registers. On the MT7986 the CPU sends through QDMA, so if QDMA's
+  register is laid out as PDMA's, TX completions are held back by RX's
+  moderation (capped at 40 us by rx_dim_max_us) and TX's moderation goes
+  nowhere. Nothing at hand says which the hardware has. qdma_tx_dim, a
+  module parameter (off by default, as before; writable at runtime, taken
+  at each moderation's next change), writes them as upstream. Comparing
+  TX completion interrupts per packet sent, with rx_dim_max_us moved,
+  under each setting tells them apart.
+
+- mtk_handle_irq_rx() counted an event for moderation before it checked
+  the interrupt was its ring's; the PDMA interrupts are requested shared,
+  so a call that returns IRQ_NONE added one too. It counts after the
+  check now.
+
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -3847,12 +3847,14 @@ static irqreturn_t mtk_handle_irq_rx(int irq, void *priv)
+ 	struct mtk_eth *eth = rx_napi->eth;
+ 	struct mtk_rx_ring *ring = rx_napi->rx_ring;
+ 
+-	WRITE_ONCE(rx_napi->rx_events, rx_napi->rx_events + 1);
+ 	if (unlikely(!(mtk_r32(eth, eth->soc->reg_map->pdma.irq_status) &
+ 		       mtk_r32(eth, eth->soc->reg_map->pdma.irq_mask) &
+ 		       MTK_RX_DONE_INT(ring->ring_no))))
+ 		return IRQ_NONE;
+-
++	/* an event for adaptive moderation only when it was this ring's:
++	 * the PDMA interrupts are requested shared
++	 */
++	WRITE_ONCE(rx_napi->rx_events, rx_napi->rx_events + 1);
+ 
+ 	if (likely(napi_schedule_prep(&rx_napi->napi))) {
+ 		mtk_rx_irq_disable(eth, MTK_RX_DONE_INT(ring->ring_no));
+@@ -4322,6 +4324,22 @@ static unsigned int rx_dim_max_us = 40;
+ module_param(rx_dim_max_us, uint, 0644);
+ MODULE_PARM_DESC(rx_dim_max_us, "The longest an RX interrupt is held back for more packets, in us (0: as adaptive moderation picks)");
+ 
++/* Which half of QDMA's delay interrupt register each adaptive moderation
++ * writes. The RSS patches put RX's in the high
++ * half and TX's in the low one, the other way round from PDMA's register;
++ * upstream writes one layout to both, TX's in the high half (TX done, bits
++ * 31:16) and RX's in the low (15:0). On the MT7986 the CPU sends through
++ * QDMA and receives through PDMA, so QDMA's TX completions are held back
++ * by one of the two. Off: as the RSS patches. On: as upstream, TX's moderation on
++ * TX completions. Each half takes it at its moderation's next change.
++ * Which the hardware has isn't documented: comparing TX completion
++ * interrupts per packet sent, with rx_dim_max_us moved, tells them
++ * apart; until then it stays as it was.
++ */
++static bool qdma_tx_dim;
++module_param(qdma_tx_dim, bool, 0644);
++MODULE_PARM_DESC(qdma_tx_dim, "QDMA's TX completion delay from TX's adaptive moderation, as upstream (Y), or from RX's, as before (N)");
++
+ static void mtk_dim_rx(struct work_struct *work)
+ {
+ 	struct dim *dim = container_of(work, struct dim, work);
+@@ -4345,9 +4363,13 @@ static void mtk_dim_rx(struct work_struct *work)
+ 	cur = min_t(u32, cur_profile.pkts, MTK_PDMA_DELAY_PINT_MASK);
+ 	val |= cur << MTK_PDMA_DELAY_RX_PINT_SHIFT;
+ 
+-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA))
+-		mtk_m32(eth, MTK_PDMA_DELAY_TX_MASK,
+-			val << MTK_PDMA_DELAY_TX_PTIME_SHIFT, reg_map->qdma.delay_irq);
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
++		if (READ_ONCE(qdma_tx_dim))
++			mtk_m32(eth, MTK_PDMA_DELAY_RX_MASK, val, reg_map->qdma.delay_irq);
++		else
++			mtk_m32(eth, MTK_PDMA_DELAY_TX_MASK,
++				val << MTK_PDMA_DELAY_TX_PTIME_SHIFT, reg_map->qdma.delay_irq);
++	}
+ 
+ 	if (RX_DESC_OFS(eth, 1) == sizeof(struct mtk_rx_dma)) {
+ 		mtk_m32(eth, MTK_PDMA_DELAY_RX_MASK, val, reg_map->pdma.delay_irq);
+@@ -4384,9 +4406,13 @@ static void mtk_dim_tx(struct work_struct *work)
+ 	cur = min_t(u32, cur_profile.pkts, MTK_PDMA_DELAY_PINT_MASK);
+ 	val |= cur << MTK_PDMA_DELAY_TX_PINT_SHIFT;
+ 
+-	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA))
+-		mtk_m32(eth, MTK_PDMA_DELAY_RX_MASK,
+-			val >> MTK_PDMA_DELAY_TX_PTIME_SHIFT, reg_map->qdma.delay_irq);
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
++		if (READ_ONCE(qdma_tx_dim))
++			mtk_m32(eth, MTK_PDMA_DELAY_TX_MASK, val, reg_map->qdma.delay_irq);
++		else
++			mtk_m32(eth, MTK_PDMA_DELAY_RX_MASK,
++				val >> MTK_PDMA_DELAY_TX_PTIME_SHIFT, reg_map->qdma.delay_irq);
++	}
+ 
+ 	if (RX_DESC_OFS(eth, 1) == sizeof(struct mtk_rx_dma)) {
+ 		mtk_m32(eth, MTK_PDMA_DELAY_TX_MASK, val, reg_map->pdma.delay_irq);
