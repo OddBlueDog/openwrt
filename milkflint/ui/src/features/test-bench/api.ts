@@ -137,7 +137,7 @@ const routerLiveSchema = z.object({
   self: z.array(z.number()).nullish(),
   /** the WAN port's bit/s: [in, out] */
   wan: z.tuple([z.number(), z.number()]).nullish(),
-  /** Smart Queue's busiest tin, download and upload: [average, peak] delay, µs */
+  /** Smart Queue, download and upload: [average, peak] delay, µs, weighted by what each tin sent since the sample before (none: too few packets to tell) */
   down: z.tuple([z.number(), z.number()]).nullish(),
   up: z.tuple([z.number(), z.number()]).nullish(),
   /** connections offloaded, of all tracked */

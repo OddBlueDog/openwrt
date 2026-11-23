@@ -33,7 +33,7 @@ import {
 } from './advanced';
 import { cakeTargetMs, NO_SPLIT_GSO_KBIT, takesWhole } from './gso';
 import { linkPresets, lowMemlimit, presetOverhead } from './model';
-import { MULTI_QUEUE_KBIT, usesMultiQueue } from './multi-queue';
+import { multiQueueThresholdKbit, usesMultiQueue } from './multi-queue';
 
 export type TabId = Direction | 'line' | 'queue';
 const tabs: { id: TabId; label: string; icon: LucideIcon }[] = [
@@ -313,10 +313,16 @@ function DirectionTab({
             hint={
               <>
                 One CAKE per network-card queue, sharing the speed by what each needs, so more than one CPU can shape at once
-                (cake_mq). With RSS (Performance Tuning), each receive ring feeds its own queue on its own CPU; on a PPPoE line,
-                each CPU packet steering hands a connection to has its own queue. Each queue holds its packets to its share of the
-                speed, so a packet can wait a little longer than in one CAKE, more so on a slower line, which one CPU shapes
-                easily: Automatic uses it from {MULTI_QUEUE_KBIT / 1000} Mbit/s. Saved as milkflint.cake.multi_queue too.
+                (cake_mq). With RSS (Performance Tuning), each receive ring feeds its own queue on its own CPU; with packet
+                steering instead (a PPPoE line, or RSS off), each CPU it hands connections to has its own queue. Each queue holds
+                its packets to its share of the speed, so a packet can wait a little longer than in one CAKE, and fairness between
+                devices is shared out between the queues rather than exact.{' '}
+                {data.pppoe
+                  ? 'Your line is PPPoE: RSS can’t spread it, so every download reaches CPU 0 before packet steering hands it on to CPUs 1–3. Automatic uses multi-queue from '
+                  : 'On an Ethernet line, GRO hands CAKE large packets and one CAKE keeps up with about 1 Gbit/s: Automatic uses multi-queue from '}
+                {multiQueueThresholdKbit(data.pppoe) / 1000} Mbit/s. In MilkFlint’s steering layouts downloads use three of the
+                four queues, on CPUs 1–3: queue 1 stays for CPU 0, which sends, and carries little. Saved as
+                milkflint.cake.multi_queue too.
                 {rssNote !== undefined && mq && <span className="mt-1 block text-warning">{rssNote}</span>}
               </>
             }
@@ -327,7 +333,7 @@ function DirectionTab({
               options={[
                 {
                   value: 'auto',
-                  label: `Automatic: ${usesMultiQueue(data.downloadKbit, 'auto') ? 'on' : 'off'} at ${formatBitrate(data.downloadKbit * 1000)}`,
+                  label: `Automatic: ${usesMultiQueue(data.downloadKbit, 'auto', data.pppoe) ? 'on' : 'off'} at ${formatBitrate(data.downloadKbit * 1000)}`,
                 },
                 { value: 'on', label: 'On (cake_mq)' },
                 { value: 'off', label: 'Off: one CAKE' },

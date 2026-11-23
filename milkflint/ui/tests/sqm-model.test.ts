@@ -19,13 +19,13 @@ const queue = (values: Record<string, string> = {}): Section =>
     ...values,
   });
 
-const load = (sqm: Section[] | undefined, milkflint: Section[] = []): SqmData =>
+const load = (sqm: Section[] | undefined, milkflint: Section[] = [], line: 'dhcp' | 'pppoe' = 'dhcp'): SqmData =>
   sqmData({
     sqm,
     firewall: [section('defaults', 'cfg01')],
     milkflint,
-    wanDevice: 'eth1',
-    wanProto: 'dhcp',
+    wanDevice: line === 'pppoe' ? 'pppoe-wan' : 'eth1',
+    wanProto: line,
     devices: ['eth0', 'eth1', 'lo', 'br-lan'],
   });
 
@@ -99,16 +99,33 @@ test('Performance Tuning’s GRO choice isn’t touched by a speed change', () =
   }
 });
 
-test('automatic multi-queue follows the speed across 500 Mbit/s; a LuCI use_mq stays', () => {
-  const sqm = [queue({ download: '400000', use_mq: '0' })];
-  const data = load(sqm);
+test('automatic multi-queue follows the speed across its line’s threshold (1 Gbit/s on Ethernet, 500 Mbit/s on PPPoE); a LuCI use_mq stays', () => {
+  // Ethernet: on from 1 Gbit/s, off again below it
+  const eth = [queue({ download: '900000', use_mq: '0' })];
+  const data = load(eth);
   assert.equal(data.form.multiQueue, 'auto');
-  assert.equal(after(data, sqm, save(data, { downloadMbit: '600' }))['use_mq'], '1');
+  assert.equal(after(data, eth, save(data, { downloadMbit: '950' }))['use_mq'], '0', 'still one CAKE at 950');
+  assert.equal(after(data, eth, save(data, { downloadMbit: '1000' }))['use_mq'], '1');
+  const fast = [queue({ download: '1100000', use_mq: '1' })];
+  const fastData = load(fast);
+  assert.equal(fastData.form.multiQueue, 'auto');
+  assert.equal(after(fastData, fast, save(fastData, { downloadMbit: '950' }))['use_mq'], '0');
+  // PPPoE: on from 500 Mbit/s
+  const ppp = [queue({ interface: 'pppoe-wan', download: '450000', use_mq: '0' })];
+  const pppData = load(ppp, [], 'pppoe');
+  assert.equal(pppData.form.multiQueue, 'auto');
+  assert.equal(after(pppData, ppp, save(pppData, { downloadMbit: '500' }))['use_mq'], '1');
+  assert.equal(after(pppData, ppp, save(pppData, { downloadMbit: '950' }))['use_mq'], '1');
+  // an Ethernet queue at 800 Mbit/s with use_mq as the old 500 Mbit/s rule left it: shown on, and left so
+  const old = [queue({ download: '800000', use_mq: '1' })];
+  const oldData = load(old);
+  assert.equal(oldData.form.multiQueue, 'on');
+  assert.equal(after(oldData, old, save(oldData, { downloadMbit: '820' }))['use_mq'], '1');
 
-  const luci = [queue({ download: '800000', use_mq: '0' })];
+  const luci = [queue({ download: '1200000', use_mq: '0' })];
   const off = load(luci);
   assert.equal(off.form.multiQueue, 'off');
-  const changes = save(off, { downloadMbit: '820' });
+  const changes = save(off, { downloadMbit: '1300' });
   assert.equal(after(off, luci, changes)['use_mq'], '0');
   // the shown choice isn't saved as Performance Tuning's either
   assert.equal(
@@ -225,7 +242,8 @@ test('a new queue gets everything, and loads back as saved', () => {
     upload: '60000',
     qdisc: 'cake',
     script: 'piece_of_cake.qos',
-    use_mq: '1',
+    // one CAKE: on an Ethernet line Automatic is from 1 Gbit/s
+    use_mq: '0',
     use_mq_egress: '0',
     linklayer: 'ethernet',
     overhead: '44',
@@ -308,36 +326,39 @@ test('a speed under 1 kbit/s is refused: written as 0, it would mean don’t sha
 });
 
 test('multi-queue CAKE can’t estimate the speed: the kernel refuses it and downloads go unshaped', () => {
-  const sqm = [queue({ download: '800000', iqdisc_opts: 'nat autorate-ingress' })];
+  const sqm = [queue({ download: '1200000', iqdisc_opts: 'nat autorate-ingress' })];
   const data = load(sqm);
   assert.equal(data.form.multiQueue, 'auto');
   assert.notEqual(validate(data.form, data).multiQueue, undefined);
   // either one off
   assert.deepEqual(validate({ ...data.form, multiQueue: 'off' }, data), {});
-  assert.deepEqual(validate({ ...data.form, downloadMbit: '300' }, data), {}, 'one CAKE below 500 Mbit/s');
+  assert.deepEqual(validate({ ...data.form, downloadMbit: '900' }, data), {}, 'one CAKE below 1 Gbit/s on Ethernet');
+  // on PPPoE, from 500 Mbit/s
+  const ppp = load([queue({ interface: 'pppoe-wan', download: '600000', iqdisc_opts: 'nat autorate-ingress' })], [], 'pppoe');
+  assert.notEqual(validate(ppp.form, ppp).multiQueue, undefined);
   assert.notEqual(validate({ ...data.form, downloadMbit: '300', multiQueue: 'on' }, data).multiQueue, undefined);
   // not while it's off
   assert.deepEqual(validate({ ...data.form, enabled: false }, data), {});
   // without autorate, nothing to say
-  const plain = load([queue({ download: '800000', iqdisc_opts: 'nat' })]);
+  const plain = load([queue({ download: '1200000', iqdisc_opts: 'nat' })]);
   assert.deepEqual(validate(plain.form, plain), {});
 });
 
 test('a new queue’s upload stays one CAKE; an existing queue’s choice isn’t touched', () => {
   const data = load([]);
   const sqm =
-    applied({ sqm: [] }, toChanges({ ...data.form, enabled: true, downloadMbit: '800', uploadMbit: '100' }, data))['sqm'] ?? [];
+    applied({ sqm: [] }, toChanges({ ...data.form, enabled: true, downloadMbit: '1200', uploadMbit: '100' }, data))['sqm'] ?? [];
   const q = sqm[0];
   assert.ok(q !== undefined);
   assert.equal(q['use_mq'], '1');
   assert.equal(q['use_mq_egress'], '0');
   // as sqm-scripts gets it: multi-queue down, one CAKE up (without use_mq_egress the upload followed use_mq)
-  const adv = advancedData(q, []);
+  const adv = advancedData(q, [], false);
   assert.equal(cakeArgs(adv.form, adv, 'down')[0], 'cake_mq');
   assert.equal(cakeArgs(adv.form, adv, 'up')[0], 'cake');
   const unset = { ...q };
   Reflect.deleteProperty(unset, 'use_mq_egress');
-  const was = advancedData(unset, []);
+  const was = advancedData(unset, [], false);
   assert.equal(cakeArgs(was.form, was, 'up')[0], 'cake_mq');
   // a queue that's there: nothing about it, whatever the speed does
   for (const values of [{}, { use_mq_egress: '1' }]) {

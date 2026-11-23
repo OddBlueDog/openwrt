@@ -318,7 +318,7 @@ function sqm(x: Context): Check {
       statuses.push(signals === 0 && st === 'pass' ? 'warn' : st);
       values.push(`${arrow[dir]} ${ms(delay)}`);
       notes.push(
-        `${arrow[dir]} full for ${count(full.length)} s: the busiest tin’s delay ${ms(delay)} typical, ${ms(delays[delays.length - 1] ?? 0)} at most; ${count(full.reduce((a, s) => a + s.drops, 0))} drops, ${count(full.reduce((a, s) => a + s.marks, 0))} ECN marks.` +
+        `${arrow[dir]} full for ${count(full.length)} s: CAKE’s delay ${ms(delay)} typical, ${ms(delays[delays.length - 1] ?? 0)} at most; ${count(full.reduce((a, s) => a + s.drops, 0))} drops, ${count(full.reduce((a, s) => a + s.marks, 0))} ECN marks.` +
           (signals === 0
             ? ' It neither dropped nor marked anything, so the queue that kept the line full may be somewhere else.'
             : ''),
@@ -343,7 +343,7 @@ function sqm(x: Context): Check {
     value: values.length === 0 ? undefined : values.join(' · '),
     detail:
       values.length > 0
-        ? 'The busiest tin’s average delay while CAKE sent at 90% of its rate or more.'
+        ? 'CAKE’s average delay, weighted by what each of its queues sent, while it sent at 90% of its rate or more.'
         : status === 'info'
           ? 'The line never came near the shaped rate, so Smart Queue wasn’t what limited it.'
           : 'The line was never full for long enough to judge.',

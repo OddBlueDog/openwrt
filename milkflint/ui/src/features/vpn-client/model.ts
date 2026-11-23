@@ -20,6 +20,7 @@ import {
   CLIENT,
   CLIENT_FIREWALL,
   CLIENT_MARK,
+  CLIENT_META,
   CLIENT_PEER_TYPE,
   CLIENT_QUEUE,
   CLIENT_RULES,
@@ -57,6 +58,10 @@ export interface ClientForm {
   macs: string[];
   guests: GuestId[];
   killSwitch: boolean;
+  /** whether the tunnel's devices use the VPN provider's DNS instead of the router's */
+  useVpnDns: boolean;
+  /** the provider's DNS servers, from [Interface] DNS (e.g. 10.64.0.1) */
+  dns: string[];
   /** a Smart Queue inside the tunnel */
   shaper: boolean;
   downMbit: string;
@@ -112,7 +117,7 @@ export interface ClientData {
   form: ClientForm;
   /** the peer's section: wg_out_server, or one LuCI made */
   peerSection: string;
-  present: { network: Section[]; firewall: Section[]; sqm: Section[] | undefined };
+  present: { network: Section[]; firewall: Section[]; sqm: Section[] | undefined; milkflint: Section[] };
   wanZone: string;
   lanZone: string;
   guestZones: { id: GuestId; label: string }[];
@@ -150,14 +155,33 @@ export function blankForm(d: Pick<ClientData, 'wanRates' | 'sqm'>): ClientForm {
     macs: [],
     guests: [],
     killSwitch: true,
+    useVpnDns: true,
+    dns: [],
     shaper: d.sqm && d.wanRates !== undefined,
     downMbit: d.wanRates === undefined ? '' : String(Math.floor(d.wanRates.down * TUNNEL_SHARE)),
     upMbit: d.wanRates === undefined ? '' : String(Math.floor(d.wanRates.up * TUNNEL_SHARE)),
   };
 }
 
-/** A provider's .conf into the form: its keys, addresses and server. */
+const isIpv6Address = (s: string): boolean => /^[0-9a-f:]+$/i.test(s) && s.includes(':') && s.split('::').length <= 2;
+
+export function isDnsAddress(s: string): boolean {
+  return ipToInt(s) !== undefined || isIpv6Address(s);
+}
+
+/** The VPN's DNS servers as typed (keeps a trailing comma while typing), without blanks. */
+export function dnsOf(f: ClientForm): string[] {
+  return f.dns.map((a) => a.trim()).filter((a) => a !== '');
+}
+
+/** The VPN DNS servers that can actually be reached through the tunnel (IPv6 only when the tunnel has IPv6). */
+export function activeDnsOf(f: ClientForm): string[] {
+  return dnsOf(f).filter((a) => !a.includes(':') || hasIpv6(f));
+}
+
+/** A provider's .conf into the form: its keys, addresses, DNS and server. */
 export function fromConf(f: ClientForm, c: WgConf): ClientForm {
+  const dns = c.dns.filter(isDnsAddress);
   return {
     ...f,
     privateKey: c.privateKey,
@@ -168,6 +192,8 @@ export function fromConf(f: ClientForm, c: WgConf): ClientForm {
     endpointHost: c.peer.endpointHost,
     endpointPort: c.peer.endpointPort === '' ? DEFAULT_PORT : c.peer.endpointPort,
     keepalive: c.peer.keepalive === '' ? DEFAULT_KEEPALIVE : c.peer.keepalive,
+    dns,
+    useVpnDns: f.useVpnDns || (dnsOf(f).length === 0 && dns.length > 0),
   };
 }
 
@@ -221,6 +247,14 @@ export function validate(f: ClientForm, d: ClientData): Errors {
       e['mtu'] = 'From 1280 to 1500, or empty for 1420.';
     if (f.keepalive !== '' && !portOk(f.keepalive, 0)) e['keepalive'] = 'Seconds, or empty.';
   }
+  const dns = dnsOf(f);
+  if (dns.some((a) => !isDnsAddress(a))) {
+    e['dns'] = 'One or more IP addresses, separated by commas (like 10.64.0.1).';
+  } else if (f.useVpnDns && (f.enabled || !blank)) {
+    if (dns.length === 0) e['dns'] = 'Enter the VPN’s DNS server ([Interface] DNS), or turn off “Use VPN’s DNS”.';
+    else if (!hasIpv6(f) && !dns.some((a) => ipToInt(a) !== undefined))
+      e['dns'] = 'Add an IPv4 DNS server: this tunnel has no IPv6 address.';
+  }
   if ((f.who === 'only' || f.who === 'except') && f.macs.length === 0) e['macs'] = 'Add at least one device.';
   if (f.macs.some((m) => !isMac(m))) e['macs'] = 'One of these isn’t a MAC address.';
   if (f.who === 'none' && f.guests.length === 0) e['who'] = 'Pick who uses it: home-network devices, a guest network, or both.';
@@ -240,6 +274,7 @@ function owned(d: ClientData): Owned[] {
     ...[...CLIENT_RULES, ...CLIENT_RULES6].map((name) => ({ config: 'network', name })),
     ...CLIENT_FIREWALL.map((name) => ({ config: 'firewall', name })),
     ...(d.present.sqm === undefined ? [] : [{ config: 'sqm', name: CLIENT_QUEUE }]),
+    { config: 'milkflint', name: CLIENT_META },
   ];
 }
 
@@ -405,6 +440,18 @@ export function wanted(f: ClientForm, d: ClientData): Wanted[] {
       },
     });
   }
+  const dns = dnsOf(f);
+  if (f.useVpnDns || dns.length > 0) {
+    w.push({
+      config: 'milkflint',
+      type: 'vpn_client',
+      name: CLIENT_META,
+      values: {
+        use_vpn_dns: f.useVpnDns ? '1' : '0',
+        dns,
+      },
+    });
+  }
   return w;
 }
 
@@ -459,6 +506,41 @@ export function serverText(f: ClientForm): string {
   return f.endpointHost.trim() === '' ? 'the VPN server' : joinEndpoint(f.endpointHost.trim(), f.endpointPort);
 }
 
+function dnsLine(f: ClientForm, d: ClientData): Line {
+  if (f.useVpnDns) {
+    const servers = activeDnsOf(f);
+    if (servers.length === 0)
+      return { ok: false, text: 'Their DNS lookups: “Use VPN’s DNS” is on, but no usable VPN DNS server is entered yet.' };
+    const list = servers.join(', ');
+    if (d.adguard !== undefined) {
+      return {
+        ok: true,
+        text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the VPN’s DNS (${list})${f.killSwitch ? ', and nowhere else' : ' (directly while the tunnel is down, as the rest of their traffic)'}. Other devices keep this router’s DNS.`,
+      };
+    }
+    return {
+      ok: true,
+      text: `Their DNS lookups go through the tunnel to the VPN’s DNS (${list})${f.killSwitch ? ', and nowhere else' : ''}. Names on your network still work, and other devices keep this router’s DNS.`,
+    };
+  }
+  if (d.adguard === 'tunnel') {
+    return {
+      ok: true,
+      text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the DNS page’s servers${f.killSwitch ? ', and nowhere else' : ' (directly while the tunnel is down, as the rest of their traffic)'}.`,
+    };
+  }
+  if (d.adguard === 'automatic') {
+    return {
+      ok: false,
+      text: 'Their DNS lookups don’t go through the VPN: the DNS page uses your internet provider’s servers, which don’t answer through a VPN. Turn on “Use VPN’s DNS”, or choose servers on the DNS page.',
+    };
+  }
+  return {
+    ok: false,
+    text: 'Their DNS lookups don’t go through the VPN: the router answers them with the DNS page’s servers, which see your home address (your provider doesn’t, with encrypted DNS).',
+  };
+}
+
 /** What the settings set up, one line per part, for "What this sets up". */
 export function describe(f: ClientForm, d: ClientData): Line[] {
   if (!f.enabled) return [{ ok: false, text: 'Off: every device goes out to the internet directly.' }];
@@ -477,20 +559,7 @@ export function describe(f: ClientForm, d: ClientData): Line[] {
     hasIpv6(f)
       ? { ok: true, text: 'Their IPv6 goes through the tunnel too.' }
       : { ok: true, text: 'The VPN has no IPv6, so their IPv6 is blocked rather than going out directly: their apps use IPv4.' },
-    d.adguard === 'tunnel'
-      ? {
-          ok: true,
-          text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the DNS page’s servers${f.killSwitch ? ', and nowhere else' : ' (directly while the tunnel is down, as the rest of their traffic)'}.`,
-        }
-      : d.adguard === 'automatic'
-        ? {
-            ok: false,
-            text: 'Their DNS lookups don’t go through the VPN: the DNS page uses your internet provider’s servers, which don’t answer through a VPN. Choose servers there (plain or encrypted) and AdGuard Home sends their lookups through the tunnel.',
-          }
-        : {
-            ok: false,
-            text: 'Their DNS lookups don’t go through the VPN: the router answers them with the DNS page’s servers, which see your home address (your provider doesn’t, with encrypted DNS).',
-          },
+    dnsLine(f, d),
   ];
   if (d.sqm) {
     lines.push(
@@ -526,6 +595,16 @@ export function summary(before: ClientForm | undefined, after: ClientForm, d: Cl
   }
   if (before !== undefined && before.killSwitch !== after.killSwitch)
     out.push(after.killSwitch ? 'Turned the kill switch on.' : 'Turned the kill switch off.');
+  if (
+    before !== undefined &&
+    (before.useVpnDns !== after.useVpnDns || (after.useVpnDns && JSON.stringify(dnsOf(before)) !== JSON.stringify(dnsOf(after))))
+  ) {
+    out.push(
+      after.useVpnDns
+        ? `Its devices now use the VPN’s DNS${dnsOf(after).length > 0 ? ` (${dnsOf(after).join(', ')})` : ''}.`
+        : 'Its devices now use this router’s DNS.',
+    );
+  }
   if (
     before !== undefined &&
     (before.shaper !== after.shaper || before.downMbit !== after.downMbit || before.upMbit !== after.upMbit)

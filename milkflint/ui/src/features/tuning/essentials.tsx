@@ -40,7 +40,9 @@ const PPPOE_RSS =
 /** What Automatic runs, and why when it isn't RSS */
 function autoText(inUse: SteeringInUse, line: { pppoe: boolean; rssMissing: boolean }): string {
   if (inUse === 'rss') return 'RSS';
-  return line.pppoe ? 'RPS, as your internet connection is PPPoE, which RSS can’t spread' : 'RPS, as this image has no RSS rings';
+  return line.pppoe
+    ? 'RPS, as your internet connection is PPPoE, which the hardware’s RSS can’t spread: CPU 0 receives every download and packet steering spreads the connections over CPUs 1–3, each with its own Smart Queue queue when multi-queue is on'
+    : 'RPS, as this image has no RSS rings';
 }
 
 function isSteering(v: string): v is Steering {

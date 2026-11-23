@@ -25,6 +25,8 @@ export interface FixtureOptions {
   pcSentNothing?: boolean;
   /** the PC joined over a global IPv6 address, and the Mac's browser wrote one into an error */
   publicAddresses?: boolean;
+  /** cake_mq: two more download queues, each sending a 60-byte packet a second, their delays still a burst's of long ago */
+  quietQueues?: boolean;
 }
 
 export const phases: Phase[] = [
@@ -113,6 +115,14 @@ export function fixture(o: FixtureOptions = {}): RunData {
                 ],
               ],
               'eth1 1:': [s * 2000, s * 400, 0, 0, [[s * 2000, 0, 0, 0, 5000, 1000, 500, 1, 0]]],
+              ...(o.quietQueues === true
+                ? Object.fromEntries(
+                    ['ifb4eth1 1:2', 'ifb4eth1 1:3'].map((k) => [
+                      k,
+                      [s * 60, s, 0, 0, [[s * 60, 0, 0, 0, 5000, 60_000, 40_000, 1, 0]]],
+                    ]),
+                  )
+                : {}),
             },
       ct: 40 + s,
       self: [0.008, 0.001, 0.001],

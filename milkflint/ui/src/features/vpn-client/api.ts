@@ -19,7 +19,16 @@ function aghPath(agh: AdGuardStatus | undefined, milkflint: readonly Section[]):
   );
   return mode === 'static' || mode === 'encrypted' ? 'tunnel' : 'automatic';
 }
-import { CLIENT, CLIENT_PEER, CLIENT_PEER_TYPE, CLIENT_QUEUE, CLIENT_SKIP, isVpnShaper, markSection } from './sections';
+import {
+  CLIENT,
+  CLIENT_META,
+  CLIENT_PEER,
+  CLIENT_PEER_TYPE,
+  CLIENT_QUEUE,
+  CLIENT_SKIP,
+  isVpnShaper,
+  markSection,
+} from './sections';
 
 export async function loadClient(): Promise<ClientData> {
   const [network, firewall, sqm, milkflint, interfaces, status, leases, hints, agh] = await Promise.all([
@@ -88,7 +97,7 @@ export async function loadClient(): Promise<ClientData> {
     exists: iface !== undefined,
     form: blankForm({ wanRates, sqm: sqm !== undefined }),
     peerSection: peer?.['.name'] ?? CLIENT_PEER,
-    present: { network, firewall, sqm },
+    present: { network, firewall, sqm, milkflint },
     wanZone: wanZone(cfg)?.name ?? 'wan',
     lanZone: lanZone(cfg)?.name ?? 'lan',
     guestZones,
@@ -102,6 +111,7 @@ export async function loadClient(): Promise<ClientData> {
   if (iface !== undefined) {
     const markLan = firewall.find((s) => s['.name'] === markSection('lan'));
     const skip = firewall.find((s) => s['.name'] === CLIENT_SKIP);
+    const meta = milkflint.find((s) => s['.name'] === CLIENT_META);
     const onlyMacs = list(markLan, 'src_mac').map((m) => m.toLowerCase());
     const who = !hasFw(markSection('lan')) ? 'none' : onlyMacs.length > 0 ? 'only' : hasFw(CLIENT_SKIP) ? 'except' : 'all';
     data.form = {
@@ -119,6 +129,9 @@ export async function loadClient(): Promise<ClientData> {
       macs: who === 'only' ? onlyMacs : who === 'except' ? list(skip, 'src_mac').map((m) => m.toLowerCase()) : [],
       guests: guestZones.map((g) => g.id).filter((id: GuestId) => hasFw(markSection(id))),
       killSwitch: hasRule(`${CLIENT}_kill`),
+      // an existing tunnel created before this setting existed has no milkflint.vpn_client yet
+      useVpnDns: meta !== undefined && bool(meta, 'use_vpn_dns', true),
+      dns: list(meta, 'dns'),
       shaper: queue !== undefined && (!on || bool(queue, 'enabled')),
       downMbit: queue === undefined ? data.form.downMbit : String(mbit(queue, 'download')),
       upMbit: queue === undefined ? data.form.upMbit : String(mbit(queue, 'upload')),

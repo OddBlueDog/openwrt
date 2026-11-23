@@ -254,6 +254,7 @@ export function sqmData({ sqm, firewall, milkflint, wanDevice, wanProto, devices
       str(cake, 'multi_queue'),
       queue === undefined ? undefined : bool(queue, 'use_mq'),
       Number(str(queue, 'download') ?? '0'),
+      pppoe !== undefined,
     ),
     restoreDscp: str(cake, 'dscp_restore') === '1',
     offloadOff: false,
@@ -318,7 +319,11 @@ export function validate(f: SqmForm, data: SqmData): SqmErrors {
   }
   // the kernel refuses a multi-queue CAKE that estimates the line's speed,
   // and the download then goes unshaped
-  if (f.enabled && usesMultiQueue(kbit(f.downloadMbit), f.multiQueue) && words(data.iqdiscOpts).includes('autorate-ingress')) {
+  if (
+    f.enabled &&
+    usesMultiQueue(kbit(f.downloadMbit), f.multiQueue, data.pppoe !== undefined) &&
+    words(data.iqdiscOpts).includes('autorate-ingress')
+  ) {
     e.multiQueue =
       'Multi-queue CAKE can’t estimate the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
   }
@@ -358,8 +363,10 @@ export function toChanges(f: SqmForm, data: SqmData): Change[] {
     values['qdisc'] = 'cake';
     values['script'] = f.prioritise ? 'layer_cake.qos' : 'piece_of_cake.qos';
   }
-  const multiQueue = usesMultiQueue(download, f.multiQueue);
-  if (changed('multiQueue') || multiQueue !== usesMultiQueue(wasDownload, f.multiQueue))
+  // Automatic's threshold goes with the line: PPPoE or not (./multi-queue.ts)
+  const pppoeLine = data.pppoe !== undefined;
+  const multiQueue = usesMultiQueue(download, f.multiQueue, pppoeLine);
+  if (changed('multiQueue') || multiQueue !== usesMultiQueue(wasDownload, f.multiQueue, pppoeLine))
     values['use_mq'] = multiQueue ? '1' : '0';
   // the upload stays one CAKE, as the hint says (./multi-queue.ts): first
   // boot set use_mq_egress on the queues it found, and where it's unset

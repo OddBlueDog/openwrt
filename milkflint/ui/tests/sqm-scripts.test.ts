@@ -17,6 +17,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -693,6 +694,66 @@ void describe('sqm-scripts', { concurrency: 8 }, () => {
     assert.equal((await r.run('start')).status, 0);
     assertShaping(r, 'eth1', 'cake', 'cake_mq');
     assert.equal(r.sys('ifb4eth1', 'queues/tx-0/xps_cpus'), undefined);
+  });
+
+  // RSS off (milkflint.steering.rss=0, or OpenWrt's layout): the port's packets
+  // all come in on its first queue and RPS spreads them, so the kernel would
+  // put all of them in sub-queue 1, fed by every CPU. As a PPP device's (110).
+  test('an Ethernet port that RPS spreads: each cake_mq sub-queue takes one CPU’s packets', { skip }, async () => {
+    const r = new Router();
+    writeFileSync(join(r.root, 'sys/class/net/eth1/queues/rx-0/rps_cpus'), 'e\n');
+    r.sqm({ eth1: WAN });
+    const run = await r.run('start');
+    assert.equal(run.status, 0, run.out);
+    assertShaping(r, 'eth1', 'cake', 'cake_mq');
+    assert.deepEqual(
+      [0, 1, 2, 3].map((n) => r.sys('ifb4eth1', `queues/tx-${String(n)}/xps_cpus`)),
+      ['1', '2', '4', '8'],
+    );
+  });
+
+  test('an Ethernet port that RPS spreads, packet steering off: the ifb’s queues left to the kernel', { skip }, async () => {
+    const r = new Router();
+    writeFileSync(join(r.root, 'sys/class/net/eth1/queues/rx-0/rps_cpus'), 'e\n');
+    r.network({ wan: { device: 'eth1', proto: 'dhcp' } }, { packet_steering: '0' });
+    r.sqm({ eth1: WAN });
+    assert.equal((await r.run('start')).status, 0);
+    assertShaping(r, 'eth1', 'cake', 'cake_mq');
+    assert.equal(r.sys('ifb4eth1', 'queues/tx-0/xps_cpus'), undefined);
+  });
+
+  // a VLAN WAN: RPS runs on the port under it, its own queue has no mask
+  test('a VLAN on an Ethernet port that RPS spreads: each cake_mq sub-queue takes one CPU’s packets', { skip }, async () => {
+    const r = new Router();
+    r.dev('eth1.10');
+    symlinkSync(join(r.root, 'sys/class/net/eth1'), join(r.root, 'sys/class/net/eth1.10/lower_eth1'));
+    writeFileSync(join(r.root, 'sys/class/net/eth1/queues/rx-0/rps_cpus'), 'e\n');
+    writeFileSync(join(r.root, 'sys/class/net/eth1.10/queues/rx-0/rps_cpus'), '0\n');
+    r.sqm({ eth1: { ...WAN, interface: 'eth1.10' } });
+    const run = await r.run('start');
+    assert.equal(run.status, 0, run.out);
+    assertShaping(r, 'eth1.10', 'cake', 'cake_mq');
+    assert.deepEqual(
+      [0, 1, 2, 3].map((n) => r.sys('ifb4eth1.10', `queues/tx-${String(n)}/xps_cpus`)),
+      ['1', '2', '4', '8'],
+    );
+    // the port without RPS (RSS): the kernel's choice
+    const rss = new Router();
+    rss.dev('eth1.10');
+    symlinkSync(join(rss.root, 'sys/class/net/eth1'), join(rss.root, 'sys/class/net/eth1.10/lower_eth1'));
+    rss.sqm({ eth1: { ...WAN, interface: 'eth1.10' } });
+    assert.equal((await rss.run('start')).status, 0);
+    assert.equal(rss.sys('ifb4eth1.10', 'queues/tx-0/xps_cpus'), undefined);
+  });
+
+  test('an RPS mask of nothing but zeros (and commas) spreads nothing', { skip }, async () => {
+    for (const mask of ['0', '00000000,00000000']) {
+      const r = new Router();
+      writeFileSync(join(r.root, 'sys/class/net/eth1/queues/rx-0/rps_cpus'), `${mask}\n`);
+      r.sqm({ eth1: WAN });
+      assert.equal((await r.run('start')).status, 0);
+      assert.equal(r.sys('ifb4eth1', 'queues/tx-0/xps_cpus'), undefined, mask);
+    }
   });
 
   test('upload multi-queue on with download multi-queue off: cake_mq on the port, one CAKE on the ifb', { skip }, async () => {

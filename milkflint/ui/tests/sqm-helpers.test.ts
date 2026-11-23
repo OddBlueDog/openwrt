@@ -5,7 +5,9 @@ import { test } from 'node:test';
 import { delayMs, directionsOf, summarize } from '../src/features/sqm/cake.ts';
 import { cakeTargetMs, GSO, optValue, takesWhole, wholeOf, wholeSetting, wholeValue, withOpts } from '../src/features/sqm/gso.ts';
 import {
-  MULTI_QUEUE_KBIT,
+  MULTI_QUEUE_ETH_KBIT,
+  MULTI_QUEUE_PPPOE_KBIT,
+  multiQueueThresholdKbit,
   multiQueueOf,
   multiQueueSetting,
   multiQueueValue,
@@ -69,11 +71,26 @@ test('taking GRO packets whole', () => {
   assert.equal(wholeSetting('2'), 'auto');
 });
 
-test('multi-queue CAKE goes with the download speed, unless chosen', () => {
-  assert.equal(usesMultiQueue(MULTI_QUEUE_KBIT - 1, 'auto'), false);
-  assert.equal(usesMultiQueue(MULTI_QUEUE_KBIT, 'auto'), true);
-  assert.equal(usesMultiQueue(20_000, 'on'), true);
-  assert.equal(usesMultiQueue(800_000, 'off'), false);
+test('multi-queue CAKE goes with the download speed and the line, unless chosen', () => {
+  // Ethernet: one CAKE keeps up with about 1 Gbit/s (GRO)
+  assert.equal(multiQueueThresholdKbit(false), MULTI_QUEUE_ETH_KBIT);
+  assert.equal(MULTI_QUEUE_ETH_KBIT, 1_000_000);
+  assert.equal(usesMultiQueue(500_000, 'auto', false), false);
+  assert.equal(usesMultiQueue(950_000, 'auto', false), false);
+  assert.equal(usesMultiQueue(999_999, 'auto', false), false);
+  assert.equal(usesMultiQueue(1_000_000, 'auto', false), true);
+  // PPPoE: from 500 Mbit/s, as before
+  assert.equal(multiQueueThresholdKbit(true), MULTI_QUEUE_PPPOE_KBIT);
+  assert.equal(MULTI_QUEUE_PPPOE_KBIT, 500_000);
+  assert.equal(usesMultiQueue(450_000, 'auto', true), false);
+  assert.equal(usesMultiQueue(499_999, 'auto', true), false);
+  assert.equal(usesMultiQueue(500_000, 'auto', true), true);
+  assert.equal(usesMultiQueue(950_000, 'auto', true), true);
+  // a choice wins on either line
+  for (const pppoe of [false, true]) {
+    assert.equal(usesMultiQueue(20_000, 'on', pppoe), true);
+    assert.equal(usesMultiQueue(2_000_000, 'off', pppoe), false);
+  }
   for (const c of ['auto', 'on', 'off'] as const) assert.equal(multiQueueSetting(multiQueueValue(c)), c);
   assert.equal(multiQueueSetting(undefined), 'auto');
   assert.equal(multiQueueSetting('yes'), 'auto');
@@ -81,18 +98,22 @@ test('multi-queue CAKE goes with the download speed, unless chosen', () => {
 
 test('the multi-queue choice shown is what the queue does', () => {
   // no queue yet: the setting
-  assert.equal(multiQueueOf(undefined, undefined, 0), 'auto');
-  assert.equal(multiQueueOf('0', undefined, 800_000), 'off');
-  // use_mq as the setting gives at this speed: the setting
-  assert.equal(multiQueueOf(undefined, true, 900_000), 'auto');
-  assert.equal(multiQueueOf(undefined, false, 50_000), 'auto');
-  assert.equal(multiQueueOf('1', true, 50_000), 'on');
-  assert.equal(multiQueueOf('0', false, 900_000), 'off');
-  // use_mq set elsewhere (LuCI) to something else: shown as it is, and saved so
-  assert.equal(multiQueueOf(undefined, false, 900_000), 'off');
-  assert.equal(multiQueueOf(undefined, true, 50_000), 'on');
-  assert.equal(multiQueueOf('1', false, 900_000), 'off');
-  assert.equal(multiQueueOf('0', true, 50_000), 'on');
+  assert.equal(multiQueueOf(undefined, undefined, 0, false), 'auto');
+  assert.equal(multiQueueOf('0', undefined, 800_000, false), 'off');
+  // use_mq as the setting gives at this speed on this line: the setting
+  assert.equal(multiQueueOf(undefined, true, 1_200_000, false), 'auto');
+  assert.equal(multiQueueOf(undefined, false, 900_000, false), 'auto');
+  assert.equal(multiQueueOf(undefined, true, 900_000, true), 'auto');
+  assert.equal(multiQueueOf(undefined, false, 50_000, true), 'auto');
+  assert.equal(multiQueueOf('1', true, 50_000, false), 'on');
+  assert.equal(multiQueueOf('0', false, 1_200_000, false), 'off');
+  // use_mq set elsewhere (LuCI), or by the old 500 Mbit/s rule on an Ethernet
+  // line, to something else: shown as it is, and saved so
+  assert.equal(multiQueueOf(undefined, true, 900_000, false), 'on');
+  assert.equal(multiQueueOf(undefined, false, 900_000, true), 'off');
+  assert.equal(multiQueueOf(undefined, true, 50_000, true), 'on');
+  assert.equal(multiQueueOf('1', false, 900_000, false), 'off');
+  assert.equal(multiQueueOf('0', true, 50_000, false), 'on');
 });
 
 const cake = (dev: string, over: Partial<CakeQdisc> = {}): CakeQdisc => ({ kind: 'cake', dev, ...over });

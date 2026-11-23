@@ -58,10 +58,11 @@ import { type WedConfig, wedOffChanges, wedOn, wedOnChanges } from './wed';
 // Unset everywhere is what the image does: Restore defaults unsets them.
 // A change of layout can also switch Smart Queue's multi-queue CAKE (sqm's
 // use_mq), which only spreads over CPUs where each CPU feeds its own
-// sub-queue: with RSS, and on a PPPoE line in the RPS layout too (sqm-scripts
-// gives pppoe-wan's ifb a sub-queue per CPU). To such a layout it goes back
-// to following the download speed (milkflint.cake.multi_queue unset,
-// ../sqm/multi-queue.ts), away from it off ("0").
+// sub-queue: with RSS, and in the RPS layout too (sqm-scripts gives the ifb
+// of pppoe-wan, and of a port RPS spreads, a sub-queue per CPU: its patches
+// 109 and 110). To such a layout it goes back to following the download
+// speed (milkflint.cake.multi_queue unset, ../sqm/multi-queue.ts, whose
+// threshold goes with the line: PPPoE or not), away from it off ("0").
 
 export type Aql = 'default' | 'off' | 'custom';
 export type Steering = 'auto' | 'rss' | 'rps' | 'openwrt' | 'off';
@@ -194,9 +195,14 @@ export function steeringInUse(s: Steering, line: { pppoe: boolean; rssMissing: b
   return s === 'rss' && line.rssMissing ? 'rps' : s;
 }
 
-/** Whether multi-queue CAKE's download spreads over the CPUs in a layout: each CPU feeding its own sub-queue */
-function multiQueueSpreads(s: SteeringInUse, pppoe: boolean): boolean {
-  return s === 'rss' || (s === 'rps' && pppoe);
+/**
+ * Whether multi-queue CAKE's download spreads over the CPUs in a layout: each
+ * CPU feeding its own sub-queue. RSS's rings do it; in the RPS layout, the
+ * per-CPU queues sqm-scripts gives the ifb of a PPP device or an RPS-spread
+ * port. OpenWrt's layout may steer to one CPU; off moves the threads around.
+ */
+function multiQueueSpreads(s: SteeringInUse): boolean {
+  return s === 'rss' || s === 'rps';
 }
 
 export async function loadTuning(): Promise<TuningData> {
@@ -292,8 +298,8 @@ export function aqlValue(f: TuningForm): string | undefined {
  */
 export function queueSwitch(f: TuningForm, data: TuningData): boolean | undefined {
   if (data.sqm === undefined || f.steering === data.form.steering) return undefined;
-  const spreads = multiQueueSpreads(steeringInUse(f.steering, { pppoe: data.pppoe, rssMissing: false }), data.pppoe);
-  const want = spreads && (data.sqm.multiQueue || usesMultiQueue(data.sqm.download, 'auto'));
+  const spreads = multiQueueSpreads(steeringInUse(f.steering, { pppoe: data.pppoe, rssMissing: false }));
+  const want = spreads && (data.sqm.multiQueue || usesMultiQueue(data.sqm.download, 'auto', data.pppoe));
   return want === data.sqm.multiQueue ? undefined : want;
 }
 

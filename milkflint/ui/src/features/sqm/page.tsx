@@ -26,7 +26,7 @@ import { AdvancedSheet, type TabId } from './advanced-sheet';
 import { ShapingNow } from './answer';
 import { useSqmLive } from './live';
 import { type SqmData, type SqmErrors, type SqmForm, sqmData, toChanges, validate } from './model';
-import { usesMultiQueue } from './multi-queue';
+import { multiQueueThresholdKbit, usesMultiQueue } from './multi-queue';
 import { PowerSwitch } from '@/components/power-switch';
 import { QueuesCard } from './queues';
 import { shapingProblems } from './running';
@@ -140,18 +140,21 @@ export function SqmPage(): ReactElement {
             : undefined;
   // multi-queue as saved, and why its queues don't spread over the CPUs now
   const saved = data?.form;
-  const mqOn = saved !== undefined && usesMultiQueue(Math.round(Number(saved.downloadMbit) * 1000), saved.multiQueue);
+  const pppoeLine = data?.pppoe !== undefined;
+  const mqOn = saved !== undefined && usesMultiQueue(Math.round(Number(saved.downloadMbit) * 1000), saved.multiQueue, pppoeLine);
+  const net = live.data?.net;
+  // a download queue per CPU: by the RSS rings, or by packet steering (a PPPoE
+  // line's, or an Ethernet line's with RSS off: sqm-scripts' XPS)
+  const perCpu = net?.queues.some((q) => q.download && q.cpu !== undefined) === true;
+  const spreadBy = !mqOn || !perCpu ? undefined : net.rss?.spreading === true ? 'RSS' : 'packet steering';
   const multiQueueText =
     saved === undefined
       ? '—'
-      : saved.multiQueue === 'auto'
-        ? `Automatic, ${mqOn ? 'on' : 'off'} at this speed`
-        : saved.multiQueue === 'on'
-          ? 'On'
-          : 'Off';
-  const net = live.data?.net;
-  // a PPPoE line's download queues each have their CPU even without RSS (packet steering, XPS)
-  const perCpu = net?.queues.some((q) => q.download && q.cpu !== undefined) === true;
+      : (saved.multiQueue === 'auto'
+          ? `Automatic, ${mqOn ? 'on' : 'off'} at this speed (from ${String(multiQueueThresholdKbit(pppoeLine) / 1000)} Mbit/s${pppoeLine ? ' on PPPoE' : ''})`
+          : saved.multiQueue === 'on'
+            ? 'On'
+            : 'Off') + (spreadBy === undefined ? '' : `, a queue per CPU by ${spreadBy}`);
   const rssNote =
     net !== undefined && net.rss?.spreading !== true && !perCpu
       ? `RSS isn’t spreading downloads now, so they all use one queue${net.rps.length > 0 ? `, and packet steering spreads the rest over ${cpuText(net.rps)}` : ''}.`
@@ -185,7 +188,7 @@ export function SqmPage(): ReactElement {
       />
       {advanced !== undefined && data?.queue !== undefined && (
         <AdvancedSheet
-          data={advancedData(data.queue, data.milkflint)}
+          data={advancedData(data.queue, data.milkflint, data.pppoe !== undefined)}
           tab={advanced}
           rssNote={rssNote}
           onClose={() => {
@@ -271,6 +274,7 @@ export function SqmPage(): ReactElement {
                 <QueuesCard
                   live={live.data}
                   multiQueue={multiQueueText}
+                  spread={spreadBy !== undefined}
                   rssNote={rssNote}
                   advanced={{
                     why: advancedWhy,

@@ -3,8 +3,8 @@
 // from the router's samples its CPU per core, Smart Queue each way, the
 // WAN port, connections, softnet and the members' Wi-Fi stations. Times are
 // ms from the run's start (t0); a second's point sits in its middle.
+import { cakeDelay, type RouterLine, type RttSample } from './analysis';
 import type { Phase } from './api';
-import type { RouterLine, RttSample } from './analysis';
 import type { RunRecord } from './member';
 
 const palette = ['var(--chart-2)', 'var(--chart-1)', 'var(--chart-3)', 'var(--chart-4)'];
@@ -125,7 +125,7 @@ export function ifRate(lines: readonly RouterLine[], t0: number, dev: string, i:
 export interface CakeSecond {
   /** ms from the start */
   t: number;
-  /** the busiest tin's average and peak delay, of the tins that sent anything this second (undefined: none did) */
+  /** average and peak delay, from the tins that sent this second, weighted by what each sent (cakeDelay(); undefined: too little went to tell) */
   avgMs: number | undefined;
   peakMs: number | undefined;
   /** this second's drops and ECN marks, every tin */
@@ -167,12 +167,11 @@ export function cakeSeconds(lines: readonly RouterLine[], t0: number, dir: 'down
         if (pt === undefined) return;
         s.drops += Math.max(0, tin[1] - pt[1]);
         s.marks += Math.max(0, tin[2] - pt[2]);
-        if (tin[0] > pt[0]) {
-          s.avgMs = Math.max(s.avgMs ?? 0, tin[6] / 1000);
-          s.peakMs = Math.max(s.peakMs ?? 0, tin[5] / 1000);
-        }
       });
     }
+    const d = cakeDelay(was, l, dir);
+    s.avgMs = d?.avgMs;
+    s.peakMs = d?.peakMs;
     out.push(s);
   }
   return out;

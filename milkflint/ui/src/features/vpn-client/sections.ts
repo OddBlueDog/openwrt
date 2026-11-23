@@ -57,6 +57,9 @@ export const CLIENT_RULES6 = CLIENT_RULES.map((r) => `${r}6`);
 /** The Smart Queue inside the tunnel: sqm.wg_out, on the wg_out device and its ifb4wg_out. */
 export const CLIENT_QUEUE = CLIENT;
 
+/** milkflint.vpn_client: the provider's DNS servers and whether the tunnel's devices use them. */
+export const CLIENT_META = 'vpn_client';
+
 export function isVpnShaper(device: string | undefined): boolean {
   return device === CLIENT || device === `ifb4${CLIENT}`;
 }

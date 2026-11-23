@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  activeDnsOf,
   blankForm,
   type ClientData,
   type ClientForm,
@@ -14,6 +15,7 @@ import {
   pickerLabel,
   removal,
   sources,
+  summary,
   toChanges,
   validate,
   wanted,
@@ -43,6 +45,8 @@ const form = (over: Partial<ClientForm> = {}): ClientForm => ({
   macs: [],
   guests: [],
   killSwitch: true,
+  useVpnDns: true,
+  dns: ['10.64.0.1'],
   shaper: false,
   downMbit: '',
   upMbit: '',
@@ -54,7 +58,7 @@ const data = (f: ClientForm = form(), over: Partial<ClientData> = {}): ClientDat
   exists: false,
   form: f,
   peerSection: 'wg_out_server',
-  present: { network: [], firewall: [], sqm: [] },
+  present: { network: [], firewall: [], sqm: [], milkflint: [] },
   wanZone: 'wan',
   lanZone: 'lan',
   guestZones: [{ id: 'guest', label: 'My visitors!' }],
@@ -74,7 +78,12 @@ const get = (w: readonly Wanted[], name: string): Wanted => {
 };
 const onRouter = (f: ClientForm): ClientData['present'] => {
   const p = presentOf(wanted(f, data(f)));
-  return { network: p['network'] ?? [], firewall: p['firewall'] ?? [], sqm: p['sqm'] ?? [] };
+  return {
+    network: p['network'] ?? [],
+    firewall: p['firewall'] ?? [],
+    sqm: p['sqm'] ?? [],
+    milkflint: p['milkflint'] ?? [],
+  };
 };
 
 test('everyone at home: one mark for the zone, no device list, nobody skipped', () => {
@@ -222,7 +231,7 @@ test('the queue goes when its switch does, and is left out where SQM isn’t ins
   const now = form();
   const changes = toChanges(now, data(now, { present: onRouter(was) }));
   assert.deepEqual(changes, [{ op: 'delete', config: 'sqm', section: 'wg_out' }]);
-  const noSqm = data(was, { present: { network: [], firewall: [], sqm: undefined } });
+  const noSqm = data(was, { present: { network: [], firewall: [], sqm: undefined, milkflint: [] } });
   assert.ok(!toChanges(was, noSqm).some((c) => c.config === 'sqm'));
   assert.ok(!removal(noSqm).some((c) => c.config === 'sqm'));
 });
@@ -247,9 +256,14 @@ test('a tunnel saved off before any config: the next load sees no drift and noth
   // its keys and server are empty; uci drops empty options rather than keeping ''
   const f = { ...blankForm({ wanRates: undefined, sqm: true }), who: 'only' as const, macs: [MAC] };
   assert.deepEqual(validate(f, data(f)), {});
-  const empty = { network: [], firewall: [], sqm: [] };
+  const empty = { network: [], firewall: [], sqm: [], milkflint: [] };
   const after = applied(empty, toChanges(f, data(f, { present: empty })));
-  const present = { network: after['network'] ?? [], firewall: after['firewall'] ?? [], sqm: after['sqm'] ?? [] };
+  const present = {
+    network: after['network'] ?? [],
+    firewall: after['firewall'] ?? [],
+    sqm: after['sqm'] ?? [],
+    milkflint: after['milkflint'] ?? [],
+  };
   const d = data(f, { present, exists: true });
   assert.deepEqual(drift(d), []);
   assert.deepEqual(toChanges(f, d), []);
@@ -287,7 +301,7 @@ test('Remove takes every part, a peer LuCI made included, and nothing else', () 
   present.network.push(section('wireguard_wg_out', 'cfg123abc'), section('interface', 'lan'));
   present.firewall.push(section('rule', 'Allow-Ping'));
   const left = applied(
-    { network: present.network, firewall: present.firewall, sqm: present.sqm ?? [] },
+    { network: present.network, firewall: present.firewall, sqm: present.sqm ?? [], milkflint: present.milkflint },
     removal(data(f, { present })),
   );
   assert.deepEqual(
@@ -299,6 +313,7 @@ test('Remove takes every part, a peer LuCI made included, and nothing else', () 
     ['Allow-Ping'],
   );
   assert.deepEqual(left['sqm'], []);
+  assert.deepEqual(left['milkflint'], []);
 });
 
 test('a blank tunnel that’s off can be saved; on, or half filled in, it can’t', () => {
@@ -317,6 +332,8 @@ test('a new tunnel starts with its rates under the internet port’s, and everyt
   assert.equal(blank.upMbit, '92');
   assert.equal(blank.shaper, true);
   assert.equal(blank.killSwitch, true);
+  assert.equal(blank.useVpnDns, true);
+  assert.deepEqual(blank.dns, []);
   assert.equal(blankForm({ sqm: true, wanRates: undefined }).shaper, false);
   assert.equal(blankForm({ sqm: false, wanRates: { down: 500, up: 100 } }).shaper, false);
 });
@@ -365,7 +382,7 @@ test('a provider’s config fills in its part of the form and leaves the rest', 
   const conf: WgConf = {
     privateKey: KEY,
     addresses: ['10.2.0.2/32'],
-    dns: [],
+    dns: ['10.2.0.1', 'search.example'],
     mtu: '1400',
     peer: { publicKey: OTHER, presharedKey: '', endpointHost: 'x.example.net', endpointPort: '', keepalive: '' },
   } as unknown as WgConf;
@@ -377,18 +394,85 @@ test('a provider’s config fills in its part of the form and leaves the rest', 
   assert.equal(f.who, 'only');
   assert.deepEqual(f.macs, [MAC]);
   assert.equal(f.killSwitch, false);
+  assert.deepEqual(f.dns, ['10.2.0.1']);
+  assert.equal(f.useVpnDns, true);
+
+  // upgrading an existing tunnel that had no VPN DNS turns Use VPN's DNS on when a new config brings one
+  const upgraded = fromConf(form({ useVpnDns: false, dns: [] }), conf);
+  assert.equal(upgraded.useVpnDns, true);
+  assert.deepEqual(upgraded.dns, ['10.2.0.1']);
+
+  // if the user had DNS saved and explicitly turned Use VPN's DNS off, importing a config keeps it off
+  const keptOff = fromConf(form({ useVpnDns: false, dns: ['10.64.0.1'] }), conf);
+  assert.equal(keptOff.useVpnDns, false);
+  assert.deepEqual(keptOff.dns, ['10.2.0.1']);
 });
 
-test('their DNS: with AdGuard Home on, through the tunnel (or why not); without it, outside', () => {
+test('VPN DNS: stored in milkflint.vpn_client, validated, and IPv6-only requires an IPv6 tunnel', () => {
+  const w = wanted(form({ useVpnDns: true, dns: ['10.64.0.1', 'fc00::1'] }), data());
+  const meta = get(w, 'vpn_client');
+  assert.equal(meta.config, 'milkflint');
+  assert.equal(meta.values['use_vpn_dns'], '1');
+  assert.deepEqual(meta.values['dns'], ['10.64.0.1', 'fc00::1']);
+  assert.deepEqual(activeDnsOf(form({ addresses: ['10.64.12.7/32'], dns: ['10.64.0.1', 'fc00::1'] })), ['10.64.0.1']);
+  assert.deepEqual(activeDnsOf(form({ addresses: ['10.64.12.7/32', 'fd00::7/128'], dns: ['10.64.0.1', 'fc00::1'] })), [
+    '10.64.0.1',
+    'fc00::1',
+  ]);
+
+  // turning it off keeps the provider's DNS saved so turning it back on restores it
+  const off = wanted(form({ useVpnDns: false, dns: ['10.64.0.1'] }), data());
+  assert.equal(get(off, 'vpn_client').values['use_vpn_dns'], '0');
+  assert.deepEqual(get(off, 'vpn_client').values['dns'], ['10.64.0.1']);
+
+  // an older tunnel with neither useVpnDns nor dns emits no milkflint.vpn_client (no false drift)
+  const legacy = form({ useVpnDns: false, dns: [] });
+  assert.ok(!names(wanted(legacy, data(legacy))).includes('vpn_client'));
+
+  // validation
+  assert.notEqual(validate(form({ useVpnDns: true, dns: [] }), data())['dns'], undefined);
+  assert.notEqual(validate(form({ useVpnDns: true, dns: ['not-an-ip'] }), data())['dns'], undefined);
+  assert.notEqual(validate(form({ useVpnDns: true, dns: ['fc00::1'], addresses: ['10.64.12.7/32'] }), data())['dns'], undefined);
+  assert.equal(
+    validate(form({ useVpnDns: true, dns: ['fc00::1'], addresses: ['10.64.12.7/32', 'fd00::7/128'] }), data())['dns'],
+    undefined,
+  );
+  assert.equal(validate(form({ useVpnDns: false, dns: [] }), data())['dns'], undefined);
+
+  // save summary
+  assert.match(
+    summary(form({ useVpnDns: false }), form({ useVpnDns: true, dns: ['10.64.0.1'] }), data()).join(' '),
+    /10\.64\.0\.1/,
+  );
+  assert.match(summary(form({ useVpnDns: true }), form({ useVpnDns: false }), data()).join(' '), /this router’s DNS/);
+});
+
+test('their DNS: with Use VPN’s DNS on, through the tunnel to the VPN’s DNS; off, falls back to router DNS', () => {
   const line = (f: ClientForm, adguard: ClientData['adguard']): { ok: boolean; text: string } | undefined =>
     describe(f, data(f, { adguard })).find((l) => l.text.startsWith('Their DNS lookups'));
-  assert.equal(line(form(), 'tunnel')?.ok, true);
-  assert.match(line(form(), 'tunnel')?.text ?? '', /through the tunnel.*nowhere else/);
-  assert.match(line(form({ killSwitch: false }), 'tunnel')?.text ?? '', /directly while the tunnel is down/);
-  assert.equal(line(form(), 'automatic')?.ok, false);
-  assert.match(line(form(), 'automatic')?.text ?? '', /Choose servers there/);
-  assert.equal(line(form(), undefined)?.ok, false);
-  assert.match(line(form(), undefined)?.text ?? '', /don’t go through the VPN/);
+
+  // Use VPN's DNS ON
+  assert.equal(line(form({ useVpnDns: true, dns: ['10.64.0.1'] }), undefined)?.ok, true);
+  assert.match(
+    line(form({ useVpnDns: true, dns: ['10.64.0.1'] }), undefined)?.text ?? '',
+    /VPN’s DNS \(10\.64\.0\.1\).*nowhere else/,
+  );
+  assert.equal(line(form({ useVpnDns: true, dns: ['10.64.0.1'] }), 'automatic')?.ok, true);
+  assert.match(
+    line(form({ useVpnDns: true, dns: ['10.64.0.1'] }), 'automatic')?.text ?? '',
+    /AdGuard Home.*VPN’s DNS \(10\.64\.0\.1\)/,
+  );
+  assert.equal(line(form({ useVpnDns: true, dns: [] }), undefined)?.ok, false);
+
+  // Use VPN's DNS OFF
+  const off = (over: Partial<ClientForm> = {}): ClientForm => form({ useVpnDns: false, ...over });
+  assert.equal(line(off(), 'tunnel')?.ok, true);
+  assert.match(line(off(), 'tunnel')?.text ?? '', /through the tunnel.*nowhere else/);
+  assert.match(line(off({ killSwitch: false }), 'tunnel')?.text ?? '', /directly while the tunnel is down/);
+  assert.equal(line(off(), 'automatic')?.ok, false);
+  assert.match(line(off(), 'automatic')?.text ?? '', /Turn on “Use VPN’s DNS”/);
+  assert.equal(line(off(), undefined)?.ok, false);
+  assert.match(line(off(), undefined)?.text ?? '', /don’t go through the VPN/);
 });
 
 test('who uses it, in a few words for the answer', () => {

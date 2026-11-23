@@ -3,7 +3,7 @@
 // that the page reads each setting the same way.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -248,6 +248,122 @@ test('cake-dscp: sch_cake not loaded yet, or an image without the parameters', (
   assert.equal(readFileSync(join(ctParams, 'dscp_learn'), 'utf8').trim(), '1');
   rmSync(join(ctParams, 'dscp_learn'), { force: true });
   run('cake-dscp', { 'milkflint.cake.dscp_restore': '1' });
+});
+
+/** A script's exit status, run as run() runs it */
+function status(name: string, settings: Record<string, string>): number {
+  try {
+    run(name, settings);
+    return 0;
+  } catch (err) {
+    return (err as { status?: number }).status ?? -1;
+  }
+}
+
+/** Runs @f with sch_cake not loaded: its parameters folder gone, back after */
+function withoutCake(f: () => void): void {
+  const away = `${cakeParams}.away`;
+  renameSync(cakeParams, away);
+  try {
+    f();
+  } finally {
+    renameSync(away, cakeParams);
+  }
+}
+
+test('cake-ecn and cake-dscp: sch_cake not loaded, they say nothing of it was set (exit 1); conntrack’s side still is', () => {
+  withoutCake(() => {
+    writeFileSync(join(ctParams, 'dscp_learn'), '');
+    assert.equal(status('cake-ecn', { 'milkflint.cake.ecn_drop': '16', 'milkflint.cake.l4s': '60' }), 1);
+    assert.equal(status('cake-dscp', { 'milkflint.cake.dscp_restore': '1' }), 1);
+    assert.equal(readFileSync(join(ctParams, 'dscp_learn'), 'utf8').trim(), '1');
+  });
+  // loaded: done
+  writeFileSync(join(cakeParams, 'ecn_fail_count'), '');
+  writeFileSync(join(cakeParams, 'l4s_ramp'), '');
+  writeFileSync(join(cakeParams, 'dscp_restore'), '');
+  assert.equal(status('cake-ecn', { 'milkflint.cake.ecn_drop': '16' }), 0);
+  assert.equal(status('cake-dscp', {}), 0);
+});
+
+const tuningInit = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/tuning/init', import.meta.url));
+
+/**
+ * milkflint-tuning's apply(), as a start (force) or a reload runs it: the
+ * real cake-ecn and cake-dscp against the pretend /sys, every other command
+ * it runs a stand-in that does nothing
+ */
+function tuningApply(settings: Record<string, string>, force = false): void {
+  const libexec = join(root, 'libexec');
+  const initd = join(root, 'init.d');
+  mkdirSync(libexec, { recursive: true });
+  mkdirSync(initd, { recursive: true });
+  for (const name of ['cake-ecn', 'cake-dscp']) {
+    writeFileSync(join(libexec, name), readFileSync(stage(name), 'utf8'));
+    chmodSync(join(libexec, name), 0o755);
+  }
+  for (const name of [
+    'wed',
+    'wifi-aql',
+    'rx-delay',
+    'wifi-vo-aggr',
+    'wifi-spr',
+    'wifi-twt',
+    'wifi-muru',
+    'wifi-retries',
+    'gro',
+  ]) {
+    writeFileSync(join(libexec, name), '#!/bin/sh\nexit 0\n');
+    chmodSync(join(libexec, name), 0o755);
+  }
+  // packet_steering disabled: nothing reloaded
+  writeFileSync(join(initd, 'packet_steering'), '#!/bin/sh\nexit 1\n');
+  chmodSync(join(initd, 'packet_steering'), 0o755);
+  const text = readFileSync(tuningInit, 'utf8')
+    .replaceAll('/var/run/milkflint-tuning', join(root, 'tuning-run'))
+    .replaceAll('/usr/libexec/milkflint/', `${libexec}/`)
+    .replaceAll('/etc/init.d/', `${initd}/`);
+  writeFileSync(join(root, 'tuning-init'), text);
+  execFileSync('sh', ['-c', `. "${join(root, 'tuning-init')}"; ${force ? 'FORCE=1; ' : ''}apply`], {
+    env: envOf(settings),
+    stdio: 'pipe',
+  });
+}
+
+/** sch_cake's three parameters, as the module has them */
+function cakeNow(): string[] {
+  return ['ecn_fail_count', 'l4s_ramp', 'dscp_restore'].map((p) => readFileSync(join(cakeParams, p), 'utf8').trim());
+}
+
+// sch_cake loads at boot (/etc/modules.d/sched-cake), before milkflint-tuning;
+// were it loaded later, a run before then must not count as done
+test('milkflint-tuning: CAKE’s settings from a run without sch_cake aren’t kept as done; the next reload puts them in', () => {
+  const settings = { 'milkflint.cake.ecn_drop': '16', 'milkflint.cake.l4s': '60', 'milkflint.cake.dscp_restore': '1' };
+  rmSync(join(root, 'tuning-run'), { recursive: true, force: true });
+  withoutCake(() => {
+    tuningApply(settings, true);
+  });
+  assert.equal(existsSync(join(root, 'tuning-run', 'cake_ecn')), false);
+  assert.equal(existsSync(join(root, 'tuning-run', 'cake_dscp')), false);
+  // another setting it ran is kept as done, as before
+  assert.equal(existsSync(join(root, 'tuning-run', 'rx_delay')), true);
+
+  // sch_cake loaded, with its defaults; a reload (the same settings) puts them in
+  writeFileSync(join(cakeParams, 'ecn_fail_count'), '8');
+  writeFileSync(join(cakeParams, 'l4s_ramp'), '100');
+  writeFileSync(join(cakeParams, 'dscp_restore'), '0');
+  tuningApply(settings);
+  assert.deepEqual(cakeNow(), ['16', '60', '1']);
+  assert.equal(readFileSync(join(root, 'tuning-run', 'cake_ecn'), 'utf8').trim(), '16 60');
+  assert.equal(readFileSync(join(root, 'tuning-run', 'cake_dscp'), 'utf8').trim(), '1');
+
+  // done: a reload with nothing changed leaves sch_cake alone
+  writeFileSync(join(cakeParams, 'ecn_fail_count'), 'untouched');
+  tuningApply(settings);
+  assert.equal(readFileSync(join(cakeParams, 'ecn_fail_count'), 'utf8').trim(), 'untouched');
+  // a changed setting goes in at the next reload
+  tuningApply({ ...settings, 'milkflint.cake.ecn_drop': '32' });
+  assert.equal(cakeNow()[0], '32');
 });
 
 const wifiBin = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/wifi/bin/', import.meta.url));

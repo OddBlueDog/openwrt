@@ -50,10 +50,16 @@ async function card(steering: Steering, pppoe: boolean): Promise<Awaited<ReturnT
   );
 }
 
-test('Automatic on a PPPoE line uses RPS, and says why', async () => {
+test('Automatic on a PPPoE line uses RPS, says why, and that each CPU gets its own Smart Queue queue', async () => {
   const screen = await card('auto', true);
   await expect.element(screen.getByText('Automatic (default)')).toBeVisible();
-  await expect.element(screen.getByText('RPS, as your internet connection is PPPoE, which RSS can’t spread')).toBeVisible();
+  await expect
+    .element(
+      screen.getByText(
+        'RPS, as your internet connection is PPPoE, which the hardware’s RSS can’t spread: CPU 0 receives every download and packet steering spreads the connections over CPUs 1–3, each with its own Smart Queue queue when multi-queue is on',
+      ),
+    )
+    .toBeVisible();
 });
 
 test('Automatic on another line uses RSS', async () => {

@@ -98,14 +98,14 @@ function blocks(data: RunData, run: ReportRun, schedule: Schedule, members: read
         {r.down !== undefined && (
           <>
             {' · queue '}
-            <Dir d="down" /> {ms(r.down.avgMs)} ms
+            <Dir d="down" /> {r.down.avgMs === undefined ? '—' : `${ms(r.down.avgMs)} ms`}
             {r.down.drops + r.down.marks > 0 && ` (${String(r.down.drops)} drops, ${String(r.down.marks)} marks)`}
           </>
         )}
         {r.up !== undefined && (
           <>
             {r.down === undefined ? ' · queue ' : ' · '}
-            <Dir d="up" /> {ms(r.up.avgMs)} ms
+            <Dir d="up" /> {r.up.avgMs === undefined ? '—' : `${ms(r.up.avgMs)} ms`}
             {r.up.drops + r.up.marks > 0 && ` (${String(r.up.drops)} drops, ${String(r.up.marks)} marks)`}
           </>
         )}

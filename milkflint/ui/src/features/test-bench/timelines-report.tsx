@@ -289,7 +289,10 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
 
       {built.cake && (
         <>
-          <Chart title="Smart Queue delay" hint="The busiest tin’s, of those that sent anything that second">
+          <Chart
+            title="Smart Queue delay"
+            hint="Each queue’s, weighted by what it sent that second; none where too few packets went to tell"
+          >
             <TimelineChart
               {...common}
               series={built.delay}

@@ -135,8 +135,8 @@ test("the router's pings: each once, in the window", () => {
 });
 
 // a router sample: CPUs [busy, softirq, irq]; softnet [done, dropped, squeezed]; CAKE [bytes, packets, drops, backlog, tins]
-const tin = (drops: number, marks: number, peakUs: number, avgUs: number): number[] => [
-  0,
+const tin = (bytes: number, drops: number, marks: number, peakUs: number, avgUs: number): number[] => [
+  bytes,
   drops,
   marks,
   0,
@@ -153,9 +153,10 @@ const sample = (t: number, cpu: [number, number][], drops: number, marks: number
     cpu: cpu.map(([b, s]) => [b, s, 0]),
     sn,
     self: [0.01, 0.005],
+    // the download a MB and a thousand packets each second
     cake: {
-      'eth1 8005:': [0, 0, 0, 0, [tin(0, 0, 300, 100)]],
-      'ifb4eth1 8007:1': [0, 0, drops, 0, [tin(drops, marks, avgUs * 2, avgUs)]],
+      'eth1 8005:': [0, 0, 0, 0, [tin(0, 0, 0, 300, 100)]],
+      'ifb4eth1 8007:1': [t * 1000, t, drops, 0, [tin(t * 1000, drops, marks, avgUs * 2, avgUs)]],
     },
     ct_scan: t === 2000 ? { n: 100, off: 40, m: { m1: [10, 8, 9, 1] } } : null,
   });

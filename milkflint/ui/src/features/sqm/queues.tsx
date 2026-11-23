@@ -112,12 +112,15 @@ function DirectionQueues({ d }: { d: LiveDirection }): ReactElement {
 export function QueuesCard({
   live,
   multiQueue,
+  spread,
   rssNote,
   advanced,
 }: {
   live: SqmLive;
   /** Multi-queue as set, in words */
   multiQueue: string;
+  /** the download's queues each have their CPU (RSS, or packet steering): queue 1 then carries little */
+  spread: boolean;
   /** why the download's queues don't spread over the CPUs now, when they don't */
   rssNote: string | undefined;
   /** the way to Multi-queue in the advanced sheet; why it can't open now */
@@ -157,6 +160,12 @@ export function QueuesCard({
                 <span className="text-xs text-muted-foreground">{advanced.why}</span>
               )}
             </div>
+            {spread && mqDownload && (
+              <p className="text-xs text-muted-foreground">
+                Downloads use queues 2–4, on CPUs 1–3. Queue 1 stays for CPU 0, which sends everything and handles the interrupts,
+                so it carries little: that’s by design, not a stuck queue.
+              </p>
+            )}
             {rssNote !== undefined && mqDownload && (
               <Note tone="warning" icon={<TriangleAlertIcon />}>
                 {rssNote}

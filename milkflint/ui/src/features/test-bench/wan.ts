@@ -7,6 +7,16 @@
 // none), in RECORD_MS buckets. Cloudflare's answers carry its server's own
 // view of the connection (Server-Timing cfL4: its RTT, retransmits and
 // lost packets), kept too.
+//
+// A stream that moves nothing for STALL_MS is given up and a new one
+// opened (a burst of drops can wedge a connection, which would otherwise
+// sit silent until its phase ends), and the stall is recorded. The browser
+// may reuse the same connection for the new one: every stream to one
+// origin can share one HTTP/2 or HTTP/3 connection, and with a member
+// loading both ways its uploads and its downloads' acknowledgements then
+// travel in one flow, one queue in Smart Queue's upload CAKE, where the ACK
+// filter can't thin them. Loads from two members (one down, one up) keep
+// the directions apart.
 import type { Clock } from './clock';
 import type { RunRecord } from './member';
 
@@ -45,6 +55,44 @@ export function cfL4(description: string): { rtt: number; minRtt: number; retran
     minRtt: Number.isFinite(minRtt) ? minRtt / 1000 : rtt / 1000,
     retrans: count('retrans'),
     lost: count('lost'),
+  };
+}
+
+/** How long a stream may move nothing before it's given up for a new one. */
+export const STALL_MS = 5000;
+
+/** A stream given up for moving nothing; its error names how long. */
+class Stalled extends Error {
+  constructor(what: string, ms: number) {
+    super(`${what}: nothing moved for ${String(ms / 1000)} s; a new stream opened`);
+  }
+}
+
+/**
+ * Watches one stream: `moved()` on each read or progress event; nothing
+ * for `ms` runs `onStall` once. Checked a few times within `ms`, so one
+ * timer a stream rather than one a read.
+ */
+function stallWatch(ms: number, onStall: () => void): { moved: () => void; stalled: () => boolean; stop: () => void } {
+  let last = performance.now();
+  let stalled = false;
+  const timer = setInterval(
+    () => {
+      if (stalled || performance.now() - last < ms) return;
+      stalled = true;
+      clearInterval(timer);
+      onStall();
+    },
+    Math.max(10, Math.min(1000, ms / 4)),
+  );
+  return {
+    moved: () => {
+      last = performance.now();
+    },
+    stalled: () => stalled,
+    stop: () => {
+      clearInterval(timer);
+    },
   };
 }
 
@@ -122,36 +170,58 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
 
 let streams = 0;
 
-/** One download stream: chunk after chunk until `signal` aborts. */
+/** One download stream: chunk after chunk until `signal` aborts; one that stalls (`stallMs`) is given up for a new one. */
 export async function download(
   endpoint: Endpoint,
   meter: Meter,
   clock: Clock,
   signal: AbortSignal,
   record: (r: RunRecord) => void,
+  stallMs = STALL_MS,
 ): Promise<void> {
   while (!signal.aborted) {
     const url = downloadUrl(endpoint, streams++);
+    // this chunk's own abort: the phase ending, or a stall
+    const chunk = new AbortController();
+    const end = (): void => {
+      chunk.abort();
+    };
+    signal.addEventListener('abort', end);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const watch = stallWatch(stallMs, () => {
+      chunk.abort();
+      // a body that doesn't end with its fetch still lets go of the read
+      reader?.cancel().catch(() => undefined);
+    });
     try {
-      const res = await fetch(url, { signal, cache: 'no-store', credentials: 'omit' });
+      const res = await fetch(url, { signal: chunk.signal, cache: 'no-store', credentials: 'omit' });
       if (!res.ok || res.body === null) {
         const t = clock.router();
         if (t !== undefined) record(['err', Math.round(t), `download: the server answered ${String(res.status)}`]);
         await pause(1000, signal);
         continue;
       }
-      const reader = res.body.getReader();
+      reader = res.body.getReader();
       for (;;) {
         const { done, value } = await reader.read();
+        if (watch.stalled()) throw new Stalled('download', stallMs);
         if (done) break;
+        watch.moved();
         meter.add('d', value.byteLength);
       }
       await serverView(url, clock, record);
     } catch (err) {
       if (aborted(signal)) return;
       const t = clock.router();
-      if (t !== undefined) record(['err', Math.round(t), `download: ${err instanceof Error ? err.message : String(err)}`]);
-      await pause(500, signal);
+      const why = watch.stalled()
+        ? new Stalled('download', stallMs).message
+        : `download: ${err instanceof Error ? err.message : String(err)}`;
+      if (t !== undefined) record(['err', Math.round(t), why]);
+      // a stalled stream is replaced at once; an error waits a little
+      if (!watch.stalled()) await pause(500, signal);
+    } finally {
+      watch.stop();
+      signal.removeEventListener('abort', end);
     }
   }
 }
@@ -167,43 +237,57 @@ function uploadBody(): Uint8Array<ArrayBuffer> {
   return body;
 }
 
-function uploadOnce(url: string, meter: Meter, signal: AbortSignal): Promise<number> {
+function uploadOnce(url: string, meter: Meter, signal: AbortSignal, stallMs: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     let sent = 0;
+    const watch = stallWatch(stallMs, () => {
+      xhr.abort();
+    });
+    const end = (): void => {
+      xhr.abort();
+    };
+    const done = (): void => {
+      watch.stop();
+      signal.removeEventListener('abort', end);
+    };
     xhr.open('POST', url);
     xhr.upload.onprogress = (e) => {
+      watch.moved();
       meter.add('u', e.loaded - sent);
       sent = e.loaded;
     };
     xhr.onload = () => {
+      done();
       resolve(xhr.status);
     };
     xhr.onerror = () => {
+      done();
       reject(new Error('the upload failed'));
     };
     xhr.onabort = () => {
-      resolve(0);
+      done();
+      if (watch.stalled()) reject(new Stalled('upload', stallMs));
+      else resolve(0);
     };
-    signal.addEventListener('abort', () => {
-      xhr.abort();
-    });
+    signal.addEventListener('abort', end);
     xhr.send(uploadBody());
   });
 }
 
-/** One upload stream: chunk after chunk until `signal` aborts. */
+/** One upload stream: chunk after chunk until `signal` aborts; one that stalls (`stallMs`) is given up for a new one. */
 export async function upload(
   endpoint: Endpoint,
   meter: Meter,
   clock: Clock,
   signal: AbortSignal,
   record: (r: RunRecord) => void,
+  stallMs = STALL_MS,
 ): Promise<void> {
   while (!signal.aborted) {
     const url = uploadUrl(endpoint, streams++);
     try {
-      const status = await uploadOnce(url, meter, signal);
+      const status = await uploadOnce(url, meter, signal, stallMs);
       if (aborted(signal)) return;
       if (status < 200 || status >= 300) {
         const t = clock.router();
@@ -215,6 +299,11 @@ export async function upload(
     } catch (err) {
       if (aborted(signal)) return;
       const t = clock.router();
+      if (err instanceof Stalled) {
+        // replaced at once
+        if (t !== undefined) record(['err', Math.round(t), err.message]);
+        continue;
+      }
       if (t !== undefined) record(['err', Math.round(t), `upload: ${err instanceof Error ? err.message : String(err)}`]);
       await pause(500, signal);
     }

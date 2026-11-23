@@ -46,6 +46,7 @@ import { Choice } from '../firewall/parts';
 import { Cell, CheckItem, NoWireGuard, Traffic } from '../remote-access/parts';
 import { loadClient } from './api';
 import {
+  activeDnsOf,
   type ClientForm,
   describe,
   type Device,
@@ -62,7 +63,7 @@ import {
   type Who,
   whoSummary,
 } from './model';
-import { CLIENT, CLIENT_PEER, CLIENT_TABLE } from './sections';
+import { CLIENT, CLIENT_META, CLIENT_PEER, CLIENT_TABLE } from './sections';
 
 function ImportDialog({
   open,
@@ -102,7 +103,7 @@ function ImportDialog({
           value={text}
           rows={10}
           spellCheck={false}
-          placeholder={'[Interface]\nPrivateKey = …\nAddress = …\n\n[Peer]\nPublicKey = …\nEndpoint = …'}
+          placeholder={'[Interface]\nPrivateKey = …\nAddress = …\nDNS = …\n\n[Peer]\nPublicKey = …\nEndpoint = …'}
           aria-label="The WireGuard config"
           aria-invalid={error !== undefined}
           className={cn(inputClass, 'h-auto py-2 font-mono text-xs')}
@@ -579,8 +580,18 @@ export function VpnClientPage(): ReactElement {
     if (form === undefined) return 'Not loaded yet.';
     const conf = parseConf(text);
     if ('error' in conf) return `That isn’t a WireGuard config this page can use: ${conf.error}`;
+    // a first config turns it on: that's what it's for
+    const next = { ...fromConf(form, conf), enabled: form.enabled || blank };
     const notes: string[] = [];
-    if (conf.dns.length > 0) notes.push(`Its DNS server (${conf.dns.join(', ')}) isn’t used: devices keep this router’s DNS.`);
+    const skippedDns = conf.dns.filter((x) => !next.dns.includes(x));
+    if (skippedDns.length > 0)
+      notes.push(`Its search domain${skippedDns.length === 1 ? '' : 's'} (${skippedDns.join(', ')}) aren’t used.`);
+    if (next.dns.length === 0 && next.useVpnDns)
+      notes.push(
+        'It didn’t list a DNS server: enter one under “Use VPN’s DNS”, or turn that switch off to keep this router’s DNS.',
+      );
+    else if (next.dns.length > 0 && !next.useVpnDns)
+      notes.push(`Its DNS server (${next.dns.join(', ')}) was saved, ready if you turn “Use VPN’s DNS” back on.`);
     const all =
       conf.peer.allowedIps.length === 0 || (conf.peer.allowedIps.includes('0.0.0.0/0') && conf.peer.allowedIps.includes('::/0'));
     if (!all)
@@ -588,8 +599,7 @@ export function VpnClientPage(): ReactElement {
         `Its AllowedIPs (${conf.peer.allowedIps.join(', ')}) are replaced: this page sends all of a device’s traffic through the VPN.`,
       );
     setImported(notes);
-    // a first config turns it on: that's what it's for
-    setEdit({ ...fromConf(form, conf), enabled: form.enabled || blank });
+    setEdit(next);
     // what it read in, to check before saving
     setDetails(true);
     return undefined;
@@ -660,7 +670,7 @@ export function VpnClientPage(): ReactElement {
                 </p>
               </div>
               {!blank && (
-                <div className="grid divide-y border-t md:grid-cols-2 md:divide-x md:divide-y-0">
+                <div className="grid divide-y border-t md:grid-cols-3 md:divide-x md:divide-y-0">
                   <Cell
                     title="Goes through the tunnel"
                     status={
@@ -670,6 +680,22 @@ export function VpnClientPage(): ReactElement {
                     }
                   >
                     <p>The rest, and the router’s own traffic, go out directly as before.</p>
+                  </Cell>
+                  <Cell
+                    title="DNS"
+                    status={
+                      saved.useVpnDns && activeDnsOf(saved).length > 0 ? (
+                        <Badge variant="success">VPN’s DNS</Badge>
+                      ) : (
+                        <Badge variant="secondary">Router’s DNS</Badge>
+                      )
+                    }
+                  >
+                    <p>
+                      {saved.useVpnDns && activeDnsOf(saved).length > 0
+                        ? `Its devices use ${activeDnsOf(saved).join(', ')} through the tunnel; other devices keep this router’s DNS.`
+                        : 'All devices keep this router’s DNS.'}
+                    </p>
                   </Cell>
                   <Cell
                     title="Kill switch"
@@ -778,6 +804,41 @@ export function VpnClientPage(): ReactElement {
                             set('killSwitch', v);
                           }}
                         />
+                      </Field>
+                      <Field
+                        id="vpn-dns"
+                        label="Use VPN’s DNS"
+                        hint="Devices sent through the VPN use its DNS server through the tunnel; other devices keep this router’s DNS."
+                        why={
+                          <>
+                            Lookups from marked devices go to a local forwarder ({opt('milkflint-vpn')}) that asks the provider’s
+                            DNS through the tunnel ({opt(`milkflint.${CLIENT_META}`)}), while names on your network still come
+                            from dnsmasq. Other devices and the router itself keep the DNS page’s servers.
+                          </>
+                        }
+                        error={errors['dns']}
+                      >
+                        <div className="flex flex-col gap-2">
+                          <Switch
+                            id="vpn-dns"
+                            checked={form.useVpnDns}
+                            onCheckedChange={(v) => {
+                              set('useVpnDns', v);
+                            }}
+                          />
+                          {form.useVpnDns && (
+                            <Input
+                              aria-label="VPN DNS servers"
+                              value={form.dns.join(', ')}
+                              placeholder="10.64.0.1"
+                              className="font-mono"
+                              aria-invalid={errors['dns'] !== undefined}
+                              onChange={(e) => {
+                                set('dns', e.target.value.split(/,\s*/));
+                              }}
+                            />
+                          )}
+                        </div>
                       </Field>
                       {data.sqm && (
                         <Field

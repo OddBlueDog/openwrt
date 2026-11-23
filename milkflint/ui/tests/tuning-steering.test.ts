@@ -52,14 +52,14 @@ test('what runs: Automatic is RSS, but RPS on a PPPoE line or without the rings'
   assert.equal(steeringInUse('openwrt', { pppoe: true, rssMissing: false }), 'openwrt');
 });
 
-function data(steering: TuningData['form']['steering'], pppoe: boolean, multiQueue = true): TuningData {
+function data(steering: TuningData['form']['steering'], pppoe: boolean, multiQueue = true, download = 800_000): TuningData {
   return {
     form: { ...defaults, steering },
     milkflint: [],
     globals: 'globals',
     packetSteering: undefined,
     firewall: undefined,
-    sqm: { section: 'eth1', multiQueue, download: 800_000, iqdiscOpts: undefined, targetMs: null },
+    sqm: { section: 'eth1', multiQueue, download, iqdiscOpts: undefined, targetMs: null },
     wed: { milkflint: [], sqm: [], firewall: [] },
     accessPoint: false,
     pppoe,
@@ -72,11 +72,19 @@ test('multi-queue CAKE stays on where it still spreads: on a PPPoE line, each CP
   assert.equal(queueSwitch({ ...defaults, steering: 'auto' }, data('rps', true)), undefined);
 });
 
-test('multi-queue CAKE goes off where everything reaches one queue, and back on with RSS', () => {
-  // a DHCP line in the RPS layout: every download on ring 0, so one sub-queue
-  assert.equal(queueSwitch({ ...defaults, steering: 'rps' }, data('auto', false)), false);
-  assert.equal(queueSwitch({ ...defaults, steering: 'auto' }, data('rps', false, false)), true);
+test('multi-queue CAKE stays on in the RPS layout on an Ethernet line too: its ifb has a sub-queue per CPU (sqm-scripts 110)', () => {
+  assert.equal(queueSwitch({ ...defaults, steering: 'rps' }, data('auto', false)), undefined);
+  assert.equal(queueSwitch({ ...defaults, steering: 'auto' }, data('rps', false)), undefined);
+});
+
+test('multi-queue CAKE goes off where one CPU at a time feeds it, and back with the speed’s threshold for the line', () => {
   // OpenWrt's layout and off: one CPU at a time, PPPoE or not
   assert.equal(queueSwitch({ ...defaults, steering: 'openwrt' }, data('auto', true)), false);
-  assert.equal(queueSwitch({ ...defaults, steering: 'off' }, data('auto', true)), false);
+  assert.equal(queueSwitch({ ...defaults, steering: 'off' }, data('auto', false)), false);
+  // back to a spreading layout: on where Automatic gives it at the speed
+  // (1 Gbit/s on Ethernet, 500 Mbit/s on PPPoE), else left as one CAKE
+  assert.equal(queueSwitch({ ...defaults, steering: 'auto' }, data('off', false, false, 800_000)), undefined);
+  assert.equal(queueSwitch({ ...defaults, steering: 'rss' }, data('openwrt', false, false, 1_200_000)), true);
+  assert.equal(queueSwitch({ ...defaults, steering: 'auto' }, data('off', true, false, 800_000)), true);
+  assert.equal(queueSwitch({ ...defaults, steering: 'rps' }, data('off', true, false, 450_000)), undefined);
 });

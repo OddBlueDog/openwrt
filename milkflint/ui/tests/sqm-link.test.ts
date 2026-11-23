@@ -181,13 +181,13 @@ test('a preset is CAKE’s own compensation: tc’s size table or HTB’s isn’
     const done = after(sqm, changes);
     assert.equal(load([done]).form.link, 'ethernet', llam);
     // what sqm-scripts then gives CAKE: its own overhead and mpu, no stab in front
-    const adv = advancedData(done, []);
+    const adv = advancedData(done, [], false);
     assert.equal(cakeArgs(adv.form, adv, 'up').join(' '), 'cake bandwidth 20000kbit overhead 44 mpu 84 diffserv3 nat besteffort');
   }
   // before: tc's table in front of CAKE and none of CAKE's own, or with HTB's no compensation at all
-  const stab = advancedData(queue({ ...ethernet, linklayer_adaptation_mechanism: 'tc_stab' }), []);
+  const stab = advancedData(queue({ ...ethernet, linklayer_adaptation_mechanism: 'tc_stab' }), [], false);
   assert.match(cakeArgs(stab.form, stab, 'up').join(' '), /^stab .* cake bandwidth 20000kbit diffserv3/);
-  const htb = advancedData(queue({ ...ethernet, linklayer_adaptation_mechanism: 'htb_private' }), []);
+  const htb = advancedData(queue({ ...ethernet, linklayer_adaptation_mechanism: 'htb_private' }), [], false);
   assert.equal(cakeArgs(htb.form, htb, 'up').join(' '), 'cake bandwidth 20000kbit diffserv3 nat besteffort');
   // CAKE's own, named: the preset, and another preset leaves it
   for (const llam of ['default', 'cake']) {

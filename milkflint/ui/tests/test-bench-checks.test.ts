@@ -128,6 +128,12 @@ test('the made-up run’s verdicts, in the report’s order', () => {
   assert.equal(by.get('quality')?.value, 'clock ±1.5 ms');
 });
 
+test('Smart Queue with the line full: quiet cake_mq queues holding an old burst’s 40 ms don’t fail it', () => {
+  const c = checks({ quietQueues: true });
+  assert.equal(c.get('sqm')?.status, 'pass');
+  assert.match(c.get('sqm')?.value ?? '', /↓ 4 ms/);
+});
+
 test('thresholds change the verdicts', () => {
   const t = { ...defaultThresholds(), wanAdded: { pass: 25, warn: 40 }, wifiSignal: { pass: -72, warn: -80 } };
   const c = checks({}, t);

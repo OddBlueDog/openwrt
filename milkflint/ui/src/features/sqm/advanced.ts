@@ -118,6 +118,8 @@ export interface AdvancedData {
   useMq: boolean;
   /** Keep devices' priorities on downloads sets squash_dscp and squash_ingress */
   dscpRestore: boolean;
+  /** the internet connection is PPPoE: Automatic multi-queue's threshold is its (./multi-queue.ts) */
+  pppoe: boolean;
 }
 
 interface Item {
@@ -212,7 +214,8 @@ export function optsWith(current: string | undefined, was: DirectionForm, now: D
   return changed ? items.flatMap((i) => i.words).join(' ') : undefined;
 }
 
-export function advancedData(queue: Section, milkflint: Section[]): AdvancedData {
+/** @param pppoe the internet connection is PPPoE: Automatic multi-queue's threshold is its (./multi-queue.ts) */
+export function advancedData(queue: Section, milkflint: Section[], pppoe: boolean): AdvancedData {
   const downloadKbit = Number(str(queue, 'download') ?? '0');
   const iq = str(queue, 'iqdisc_opts');
   const mqEgress = str(queue, 'use_mq_egress');
@@ -229,7 +232,7 @@ export function advancedData(queue: Section, milkflint: Section[]): AdvancedData
         iq,
         downloadKbit,
       ),
-      multiQueue: multiQueueOf(str(cake, 'multi_queue'), bool(queue, 'use_mq'), downloadKbit),
+      multiQueue: multiQueueOf(str(cake, 'multi_queue'), bool(queue, 'use_mq'), downloadKbit, pppoe),
       script: str(queue, 'script') ?? '',
       squashDscp: str(queue, 'squash_dscp') !== '0',
       squashIngress: str(queue, 'squash_ingress') !== '0',
@@ -251,6 +254,7 @@ export function advancedData(queue: Section, milkflint: Section[]): AdvancedData
     uploadKbit: Number(str(queue, 'upload') ?? '0'),
     useMq: bool(queue, 'use_mq'),
     dscpRestore: str(cake, 'dscp_restore') === '1',
+    pppoe,
   };
 }
 
@@ -258,7 +262,7 @@ export type AdvancedErrors = Partial<Record<string, string>>;
 
 /** Whether the download runs multi-queue CAKE with these settings. */
 export function downloadMq(f: AdvancedForm, data: AdvancedData): boolean {
-  return usesMultiQueue(data.downloadKbit, f.multiQueue);
+  return usesMultiQueue(data.downloadKbit, f.multiQueue, data.pppoe);
 }
 
 const TIME = /^\d+(?:\.\d+)?(?:us|ms|s)$/;

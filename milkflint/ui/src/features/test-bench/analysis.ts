@@ -256,7 +256,7 @@ export interface RouterWindow {
   /** the busiest CPU's busy share: its 95th percentile and highest second */
   cpuP95: number | undefined;
   cpuMax: number | undefined;
-  /** Smart Queue, each way: the busiest tin's highest average and peak delay (ms), and drops and ECN marks in the window */
+  /** Smart Queue, each way: its highest second's delays (cakeDelay(), ms), and drops and ECN marks in the window */
   down: CakeWindow | undefined;
   up: CakeWindow | undefined;
   /** softnet: packets dropped from a CPU's backlog, and the times NAPI ran out of budget */
@@ -269,10 +269,53 @@ export interface RouterWindow {
 }
 
 export interface CakeWindow {
-  avgMs: number;
-  peakMs: number;
+  /** undefined: no second in the window moved enough packets to tell (an idle phase) */
+  avgMs: number | undefined;
+  peakMs: number | undefined;
   drops: number;
   marks: number;
+}
+
+/**
+ * CAKE's delays are averages over packets, each packet moving them 1/256 of
+ * the way: a second with fewer packets than that shows mostly what went
+ * before it. A queue that has gone quiet keeps an earlier burst's delay for
+ * as long as it sends almost nothing (a keepalive a second moves it 1/256).
+ */
+export const CAKE_AVG_PACKETS = 256;
+/** A tin's share of the bytes below which its peak delay is left out: an old figure, not this second's. */
+const PEAK_SHARE = 0.05;
+
+/**
+ * Smart Queue's delay one way between two samples (downloads on the ifb
+ * device, uploads on the WAN port; with cake_mq each of its queues is a CAKE
+ * of its own): each tin's average delay weighted by the bytes it sent in
+ * between, and the highest peak of the tins that sent at least a twentieth
+ * of them, the busiest among them whatever its part (32 queues and tins
+ * sharing evenly each send under a twentieth). Undefined when nothing was
+ * sent, or too few packets for CAKE's averages to be this second's.
+ */
+export function cakeDelay(was: RouterLine, l: RouterLine, dir: 'down' | 'up'): { avgMs: number; peakMs: number } | undefined {
+  let packets = 0;
+  const tins: { bytes: number; avg: number; peak: number }[] = [];
+  for (const [k, q] of Object.entries(l.cake)) {
+    if (k.startsWith('ifb') !== (dir === 'down')) continue;
+    const p = was.cake[k];
+    if (p === undefined) continue;
+    packets += Math.max(0, q[1] - p[1]);
+    q[4].forEach((tin, i) => {
+      const pt = p[4][i];
+      if (pt === undefined) return;
+      const bytes = tin[0] - pt[0];
+      if (bytes > 0) tins.push({ bytes, avg: tin[6], peak: tin[5] });
+    });
+  }
+  const total = tins.reduce((a, x) => a + x.bytes, 0);
+  if (total === 0 || packets < CAKE_AVG_PACKETS) return undefined;
+  const avg = tins.reduce((a, x) => a + x.bytes * x.avg, 0) / total;
+  const busiest = Math.max(...tins.map((x) => x.bytes));
+  const peak = Math.max(...tins.filter((x) => x.bytes >= PEAK_SHARE * total || x.bytes === busiest).map((x) => x.peak));
+  return { avgMs: avg / 1000, peakMs: peak / 1000 };
 }
 
 /** What the router did in a window. Smart Queue downloads through an ifb device (ifb4<WAN>), uploads on the WAN port. */
@@ -288,7 +331,10 @@ export function routerWindow(lines: readonly RouterLine[], w: { from: number; to
   // counters per qdisc and tin, at the window's first sample and its last
   const first = new Map<string, number[]>();
   const last = new Map<string, number[]>();
+  let prev: RouterLine | undefined;
   for (const l of lines) {
+    const was = prev;
+    prev = l;
     if (!inside(l.t, w)) continue;
     const cpus = (l.cpu ?? []).flatMap((c) => (c === null ? [] : [c[0]]));
     if (cpus.length > 0) busiest.push(Math.max(...cpus));
@@ -304,14 +350,21 @@ export function routerWindow(lines: readonly RouterLine[], w: { from: number; to
     }
     for (const [key, q] of Object.entries(l.cake)) {
       const dir = key.startsWith('ifb') ? 'down' : 'up';
-      const c = (cake[dir] ??= { avgMs: 0, peakMs: 0, drops: 0, marks: 0 });
+      cake[dir] ??= { avgMs: undefined, peakMs: undefined, drops: 0, marks: 0 };
       q[4].forEach((tin, i) => {
-        c.avgMs = Math.max(c.avgMs, tin[6] / 1000);
-        c.peakMs = Math.max(c.peakMs, tin[5] / 1000);
         const k = `${key} ${String(i)}`;
         if (!first.has(k)) first.set(k, [tin[1], tin[2], dir === 'down' ? 1 : 0]);
         last.set(k, [tin[1], tin[2], dir === 'down' ? 1 : 0]);
       });
+    }
+    // the highest second's delays, each way
+    if (was === undefined) continue;
+    for (const dir of ['down', 'up'] as const) {
+      const c = cake[dir];
+      const d = c === undefined ? undefined : cakeDelay(was, l, dir);
+      if (c === undefined || d === undefined) continue;
+      c.avgMs = Math.max(c.avgMs ?? 0, d.avgMs);
+      c.peakMs = Math.max(c.peakMs ?? 0, d.peakMs);
     }
   }
   // drops and marks are counters: the window's are its last sample's less its first's

@@ -46,7 +46,7 @@ test('a device’s speed each second: nothing arriving in its load phase is 0, o
   assert.deepEqual(memberRate(recs, 'u', T0, phases, 'm1', T0 + 26_000), []);
 });
 
-test('Smart Queue each second: drops and marks since the last sample, the busiest tin of those that sent', () => {
+test('Smart Queue each second: drops and marks since the last sample, the delay of the tins that sent', () => {
   const lines = parseRouter([
     JSON.stringify({
       t: T0,
@@ -84,6 +84,104 @@ test('Smart Queue each second: drops and marks since the last sample, the busies
   // the second tin sent nothing: its old delay isn't this second's
   assert.deepEqual(s, { t: 1000, avgMs: 3, peakMs: 7, drops: 2, marks: 5, backlog: 1500, mbit: 10 });
   assert.deepEqual(cakeSeconds(lines, T0, 'up'), []);
+});
+
+// cake_mq's four download queues, a sample a second: [bytes, packets, avg delay µs, peak µs] each
+// queue's one tin moved since the sample before, the backlog left
+const mqSecond = (dt: [number, number, number, number][], backlog = 0): string[] => {
+  const q = (b: number, p: number, avg: number, peak: number): unknown => [
+    b,
+    p,
+    0,
+    backlog,
+    [[b, 0, 0, backlog, 5000, peak, avg]],
+  ];
+  return [
+    JSON.stringify({
+      t: T0,
+      cake: Object.fromEntries(dt.map((d, i) => [`ifb4eth1 8007:${String(i + 1)}`, q(0, 0, d[2], d[3])])),
+    }),
+    JSON.stringify({
+      t: T0 + 1000,
+      dt: 1,
+      cake: Object.fromEntries(dt.map((d, i) => [`ifb4eth1 8007:${String(i + 1)}`, q(d[0], d[1], d[2], d[3])])),
+    }),
+  ];
+};
+
+test('Smart Queue each second: a cake_mq queue gone quiet keeps an old burst’s delay; it counts for what it sent', () => {
+  // queue 2 carries the line at 5 ms; queues 1 and 3 one 60-byte packet each,
+  // their averages still 40 ms from a burst long ago; queue 4 sends nothing
+  const [s] = cakeSeconds(
+    parseRouter(
+      mqSecond([
+        [60, 1, 40_000, 60_000],
+        [118_000_000, 80_000, 5000, 9000],
+        [60, 1, 40_000, 60_000],
+        [0, 0, 45_000, 70_000],
+      ]),
+    ),
+    T0,
+    'down',
+  );
+  assert.ok(s?.avgMs !== undefined && Math.abs(s.avgMs - 5) < 0.01, `avg ${String(s?.avgMs)}`);
+  assert.equal(s.peakMs, 9);
+  // two busy queues: each counts for what it sent, the peak is the higher
+  const [two] = cakeSeconds(
+    parseRouter(
+      mqSecond([
+        [30_000_000, 20_000, 2000, 4000],
+        [90_000_000, 60_000, 6000, 8000],
+      ]),
+    ),
+    T0,
+    'down',
+  );
+  assert.equal(two?.avgMs, 5);
+  assert.equal(two.peakMs, 8);
+});
+
+test('Smart Queue each second: 32 queues and tins sharing evenly (diffserv8 over four queues) still have a peak', () => {
+  // [bytes, packets, avg µs, peak µs] for each queue's eight tins
+  const line = (t: number, sent: (q: number, tin: number) => number): string =>
+    JSON.stringify({
+      t: T0 + t,
+      ...(t > 0 ? { dt: 1 } : {}),
+      cake: Object.fromEntries(
+        [0, 1, 2, 3].map((q) => [
+          `ifb4eth1 8007:${String(q + 1)}`,
+          [
+            0,
+            1000 * t,
+            0,
+            0,
+            Array.from({ length: 8 }, (_, tin) => [sent(q, tin) * t, 0, 0, 0, 5000, 1000 * (q * 8 + tin + 1), 2000]),
+          ],
+        ]),
+      ),
+    });
+  // evenly: each under a twentieth; the highest peak of them all
+  const [even] = cakeSeconds(parseRouter([line(0, () => 1_000_000), line(1, () => 1_000_000)]), T0, 'down');
+  assert.equal(even?.avgMs, 2);
+  assert.equal(even.peakMs, 32);
+  // the busiest at 3.5%, the rest at 3.1% with older, higher peaks: its own peak
+  const [one] = cakeSeconds(
+    parseRouter([line(0, () => 0), line(1, (q, tin) => (q === 0 && tin === 0 ? 1_160_000 : 1_000_000))]),
+    T0,
+    'down',
+  );
+  assert.equal(one?.peakMs, 1);
+});
+
+test('Smart Queue each second: an idle second (a keepalive, nothing queued) has no delay to show', () => {
+  const [s] = cakeSeconds(parseRouter(mqSecond([[60, 1, 30_000, 45_000]])), T0, 'down');
+  assert.ok(s !== undefined);
+  assert.equal(s.avgMs, undefined);
+  assert.equal(s.peakMs, undefined);
+  assert.equal(s.backlog, 0);
+  // the same second with enough packets for CAKE's average to be its own
+  const [busy] = cakeSeconds(parseRouter(mqSecond([[400_000, 300, 3000, 4000]])), T0, 'down');
+  assert.equal(busy?.avgMs, 3);
 });
 
 test('a Wi-Fi station every 2 s: retries and failed frames as shares of those sent since', () => {

@@ -87,7 +87,7 @@ function RouterStrip({
           </>
         )}
       </Figure>
-      <Figure label="Smart Queue delay" hint="the busiest tin's average">
+      <Figure label="Smart Queue delay" hint="the average, weighted by what each queue sent">
         {live.down === undefined || live.down === null ? (
           '—'
         ) : (
