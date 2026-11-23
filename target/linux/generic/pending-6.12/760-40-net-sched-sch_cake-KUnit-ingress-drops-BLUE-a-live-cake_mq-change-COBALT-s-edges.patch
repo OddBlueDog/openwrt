@@ -1,0 +1,773 @@
+From: MilkFlint <milkflint@localhost>
+Date: Mon, 23 Nov 2026 12:10:00 +0000
+Subject: [PATCH] net/sched: sch_cake: KUnit: ingress drops ahead of the shaper, BLUE, a live cake_mq change, COBALT's edges
+
+More KUnit cases, for behaviour that was there:
+
+- sparse_ahead_us in ingress mode with COBALT dropping the packet that
+  was to go ahead: the dequeue looks ahead again and the flow's next
+  packet goes, both charged to the shaper, the bulk flow still held; the
+  look-ahead can't carry over to the bulk flows (the time held to and the
+  failsafe haven't moved). Then, the shaper due, a bulk packet dropped is
+  followed by the flow's next one.
+- BLUE under cake_mq: a flood into a full buffer raises p_drop a step
+  each target at most and counts the flow unresponsive; back under the
+  rate every packet gets through (a flow's last is spared), p_drop steps
+  down at each empty queue more than target apart, 32 steps from 2/256
+  to 0, the flow counts as responsive and leaves the flowchain, and a
+  burst then gets through whole.
+- cake_mq_change() on a cake_mq root sharing its config with four live
+  sub-cakes, packets in all four tins of diffserv4, flows gone bulk: to
+  besteffort, each drops the other tins' packets and its counts are tin
+  0's; the host tables still hold what the sub-cakes count; the overflow
+  heap built over four tins is built over one at the next drop. Back to
+  diffserv4 with overhead 18 and mpu 64: the packet sizes seen start
+  afresh and a new packet is charged with them. Everything sent: nothing
+  counted queued anywhere, the host tables empty.
+- COBALT's count after a pause at counts of 65, 1000 and 100000, pauses
+  just short of, at and past what the steps take all the way down, half
+  of it and just over the jump's 32 steps; intervals of 100 ms, U32_MAX
+  and one past it (cobalt_control() takes it as a u32): the count never
+  wraps, never ends below the steps' or more than 2 above, and the jump
+  never moves drop_next past the pause's end.
+
+And three tests of host fairness took hosts 5 and 6 as two hosts. The
+host hash key is random each boot, and about one boot in a thousand their
+source hashes meet in one slot: the second takes the first's while
+neither has a bulk flow (as upstream CAKE does), and they count as one
+host. They now take 5 and the first host after it whose slot differs.
+
+---
+--- a/net/sched/sch_cake_test.c
++++ b/net/sched/sch_cake_test.c
+@@ -1619,6 +1619,28 @@ static void cake_test_mq_share_converges(struct kunit *test)
+ }
+ 
+ /* cake_mq's host loads: four sub-cakes' tin 0, one host table between them */
++/* Two LAN hosts for a test of host fairness: 5, and the first from 6 on
++ * whose source hash falls in another slot of the host table (and another
++ * cake_mq host bucket) than 5's. The hash key is random each boot: about
++ * one boot in a thousand, 5 and 6 meet. Then the second takes the first's
++ * slot while neither has a bulk flow yet (as upstream CAKE does), and
++ * they're counted as one host, which isn't what these tests are about.
++ */
++static void cake_test_two_hosts(struct kunit *test, u8 *first, u8 *second)
++{
++	u32 src[2], dst;
++	u8 h;
++
++	cake_host_hashes(cake_test_skb(test, false, IPPROTO_TCP, 5, 40000, 0), 0, &src[0], &dst);
++	for (h = 6; h < 250; h++) {
++		cake_host_hashes(cake_test_skb(test, false, IPPROTO_TCP, h, 40000, 0), 0, &src[1], &dst);
++		if (src[0] % CAKE_QUEUES != src[1] % CAKE_QUEUES)
++			break;
++	}
++	*first = 5;
++	*second = h;
++}
++
+ struct cake_test_hosts {
+ 	struct cake_sched_config cfg;
+ 	struct cake_sched_data *q[4];
+@@ -1713,12 +1735,14 @@ static void cake_test_mq_host_load_shared(struct kunit *test)
+ {
+ 	struct cake_test_hosts *h = cake_test_hosts_alloc(test);
+ 	struct cake_flow *a[2], *b[3], *other;
++	u8 one, two;
+ 	int i;
+ 
++	cake_test_two_hosts(test, &one, &two);
+ 	for (i = 0; i < 2; i++)
+-		a[i] = cake_test_hosts_bulk(test, h, 0, 5, 40000 + i);
++		a[i] = cake_test_hosts_bulk(test, h, 0, one, 40000 + i);
+ 	for (i = 0; i < 3; i++)
+-		b[i] = cake_test_hosts_bulk(test, h, 1, 5, 41000 + i);
++		b[i] = cake_test_hosts_bulk(test, h, 1, one, 41000 + i);
+ 	cake_test_hosts_check(test, h);
+ 
+ 	/* host 5 has 2 bulk flows here and 3 there: 5 in all, as one CAKE sees */
+@@ -1739,7 +1763,7 @@ static void cake_test_mq_host_load_shared(struct kunit *test)
+ 	 * server's sixth flow (triple-isolate); its own host's only one by
+ 	 * source alone (dual-srchost)
+ 	 */
+-	other = cake_test_hosts_bulk(test, h, 0, 6, 40000);
++	other = cake_test_hosts_bulk(test, h, 0, two, 40000);
+ 	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], other, CAKE_FLOW_TRIPLE), 6);
+ 	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], other, CAKE_FLOW_DUAL_SRC), 1);
+ 	KUNIT_EXPECT_EQ(test, cake_host_load(&h->q[0]->tins[0], other, CAKE_FLOW_DUAL_DST), 6);
+@@ -1761,12 +1785,14 @@ static void cake_test_mq_host_queues(struct kunit *test)
+ 	struct cake_tin_data *b0 = &h->q[0]->tins[0], *b1 = &h->q[1]->tins[0];
+ 	const int mode = CAKE_FLOW_SRC_IP;
+ 	struct cake_flow *a, *b, *c;
++	u8 one, two;
+ 	int i;
+ 
++	cake_test_two_hosts(test, &one, &two);
+ 	h->cfg.flow_mode = mode;
+-	a = cake_test_hosts_bulk(test, h, 0, 5, 40000);
+-	b = cake_test_hosts_bulk(test, h, 1, 5, 41000);
+-	c = cake_test_hosts_bulk(test, h, 0, 6, 40000);
++	a = cake_test_hosts_bulk(test, h, 0, one, 40000);
++	b = cake_test_hosts_bulk(test, h, 1, one, 41000);
++	c = cake_test_hosts_bulk(test, h, 0, two, 40000);
+ 	KUNIT_EXPECT_EQ(test, cake_host_load(b0, a, mode), 2);
+ 	KUNIT_EXPECT_EQ(test, cake_host_load(b1, b, mode), 2);
+ 	KUNIT_EXPECT_EQ(test, cake_host_load(b0, c, mode), 1);
+@@ -4059,6 +4085,7 @@ static void cake_test_wheel_live(struct kunit *test)
+ 	u32 host[2] = {}, flow[8] = {}, bad = 0, i, f, n = 0;
+ 	int ret = NET_XMIT_SUCCESS;
+ 	struct sk_buff **skb;
++	u8 one, two;
+ 
+ 	q->config->flow_mode = CAKE_FLOW_DUAL_SRC;
+ 	q->config->rate_flags &= ~CAKE_FLAG_SPLIT_GSO;
+@@ -4070,11 +4097,12 @@ static void cake_test_wheel_live(struct kunit *test)
+ 	b->cparams.interval = 100ULL * NSEC_PER_SEC;
+ 	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
+ 
+-	/* enough for all that's sent: half of it from host 5's one flow */
++	/* enough for all that's sent: half of it from the first host's one flow */
++	cake_test_two_hosts(test, &one, &two);
+ 	skb = cake_test_alloc(test, 400 * sizeof(*skb));
+ 	for (f = 0; f < 9; f++) {
+ 		for (i = 0; i < (f ? 25 : 200); i++, n++) {
+-			skb[n] = cake_test_skb(test, false, IPPROTO_TCP, f ? 6 : 5, 41000 + f, 0);
++			skb[n] = cake_test_skb(test, false, IPPROTO_TCP, f ? two : one, 41000 + f, 0);
+ 			kunit_remove_action(test, cake_test_free_skb, skb[n]);
+ 			qdisc_skb_cb(skb[n])->pkt_len = 16384;
+ 		}
+@@ -4149,6 +4177,300 @@ static bool cake_test_out(struct Qdisc *sch, struct sk_buff *skb)
+ 	return out && out == skb;
+ }
+ 
++/* The flow in @b whose queue starts with @skb */
++static struct cake_flow *cake_test_flow_of(struct cake_tin_data *b, struct sk_buff *skb)
++{
++	int i;
++
++	for (i = 0; i < CAKE_QUEUES; i++)
++		if (b->flows[i].head == skb)
++			return &b->flows[i];
++	return NULL;
++}
++
++/* cake_mq on @mq's device as cake_mq_init() leaves it, its first @n
++ * sub-cakes live: the root's config, shared by every sub-cake, at @rate in
++ * @tin_mode with triple-isolate; its host tables; each live sub-cake's tins
++ * and flows set up, its lock and watchdogs ready, its handle 2: on, and
++ * emptied and its watchdogs cancelled with the test
++ */
++static struct Qdisc *cake_test_mq_root(struct kunit *test, struct cake_test_mq *mq, int n,
++				       u64 rate, u8 tin_mode)
++{
++	struct Qdisc *root = cake_test_alloc(test, sizeof(*root) + sizeof(struct cake_mq_sched));
++	struct cake_mq_sched *priv = qdisc_priv(root);
++	struct cake_sched_config *cfg = &priv->cake_config;
++	int i, t, j;
++
++	root->dev_queue = netdev_get_tx_queue(mq->dev, 0);
++	cake_config_init(cfg, true);
++	cfg->rate_bps = rate;
++	cfg->tin_mode = tin_mode;
++	cfg->used_qs = mq->cfg->used_qs;
++	cfg->mq_hosts = cake_test_alloc(test, 2 * CAKE_MAX_TINS * CAKE_QUEUES * sizeof(atomic_t));
++	mq->cfg = cfg;
++	for (i = 0; i < CAKE_TEST_TXQS; i++) {
++		struct Qdisc *sch = mq->sch[i];
++		struct cake_sched_data *q = qdisc_priv(sch);
++
++		q->config = cfg;
++		if (i >= n)
++			continue;
++		spin_lock_init(qdisc_lock(sch));
++		sch->limit = 10240;
++		sch->handle = TC_H_MAKE((i + 2) << 16, 0);
++		q->tins = cake_test_alloc(test, CAKE_MAX_TINS * sizeof(*q->tins));
++		for (t = 0; t < CAKE_MAX_TINS; t++) {
++			struct cake_tin_data *b = &q->tins[t];
++
++			cake_init_flowchains(b);
++			for (j = 0; j < CAKE_QUEUES; j++) {
++				INIT_LIST_HEAD(&b->flows[j].flowchain);
++				cobalt_vars_init(&b->flows[j].cvars);
++			}
++		}
++		qdisc_watchdog_init(&q->watchdog, sch);
++		qdisc_watchdog_init(&q->mq_watchdog, sch);
++		KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_cancel_watchdogs, q));
++		cake_config_replace(sch, cfg);
++		q->min_netlen = ~0;
++		q->min_adjlen = ~0;
++		KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
++	}
++	return root;
++}
++
++/* Each tin's host table holds what @mq's first @n sub-cakes count in that
++ * tin under its tags: how many differ
++ */
++static u32 cake_test_mq_tables_off(struct cake_test_mq *mq, int n)
++{
++	int (*sums)[CAKE_QUEUES] = kcalloc(2, sizeof(*sums), GFP_KERNEL);
++	u32 off = 0;
++	int t, i, k;
++
++	if (!sums)
++		return U32_MAX;
++	for (t = 0; t < CAKE_MAX_TINS; t++) {
++		memset(sums, 0, 2 * sizeof(*sums));
++		for (i = 0; i < n; i++) {
++			struct cake_tin_data *b = &cake_test_mq_q(mq, i)->tins[t];
++
++			for (k = 0; k < CAKE_QUEUES; k++) {
++				sums[0][b->hosts[k].srchost_tag % CAKE_QUEUES] +=
++					b->hosts[k].srchost_bulk_flow_count;
++				sums[1][b->hosts[k].dsthost_tag % CAKE_QUEUES] +=
++					b->hosts[k].dsthost_bulk_flow_count;
++			}
++		}
++		for (k = 0; k < CAKE_QUEUES; k++) {
++			off += atomic_read(&mq->cfg->mq_hosts[2 * t * CAKE_QUEUES + k]) != sums[0][k];
++			off += atomic_read(&mq->cfg->mq_hosts[(2 * t + 1) * CAKE_QUEUES + k]) != sums[1][k];
++		}
++	}
++	kfree(sums);
++	return off;
++}
++
++/* Packets queued in @b, flow by flow */
++static u32 cake_test_tin_packets(struct cake_tin_data *b)
++{
++	u32 n = 0;
++	int k;
++
++	for (k = 0; k < CAKE_QUEUES; k++) {
++		struct sk_buff *skb;
++
++		for (skb = b->flows[k].head; skb; skb = skb->next)
++			n++;
++	}
++	return n;
++}
++
++/* Options for a change to @rate in @diffserv, with @overhead and @mpu */
++static struct nlattr *cake_test_opts_overhead(struct kunit *test, u64 rate, u32 diffserv,
++					      s32 overhead, u32 mpu)
++{
++	struct sk_buff *msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	struct nlattr *opts;
++
++	KUNIT_ASSERT_NOT_NULL(test, msg);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_free_skb, msg));
++	opts = nla_nest_start_noflag(msg, TCA_OPTIONS);
++	KUNIT_ASSERT_NOT_NULL(test, opts);
++	KUNIT_ASSERT_EQ(test, 0, nla_put_u64_64bit(msg, TCA_CAKE_BASE_RATE64, rate, TCA_CAKE_PAD));
++	KUNIT_ASSERT_EQ(test, 0, nla_put_u32(msg, TCA_CAKE_DIFFSERV_MODE, diffserv));
++	KUNIT_ASSERT_EQ(test, 0, nla_put_s32(msg, TCA_CAKE_OVERHEAD, overhead));
++	KUNIT_ASSERT_EQ(test, 0, nla_put_u32(msg, TCA_CAKE_MPU, mpu));
++	nla_nest_end(msg, opts);
++	return opts;
++}
++
++/* cake_mq_change() with packets queued in four sub-cakes, all four tins of
++ * diffserv4 in each, flows gone bulk and counted by host. To besteffort:
++ * every sub-cake drops the other tins' packets, its counts and backlog
++ * then tin 0's alone; their bulk flows leave the host tables, which still
++ * hold what the sub-cakes count; the overflow heap, built over four tins
++ * by a drop, is built again over one at the next. Back to diffserv4 with
++ * overhead 18 and mpu 64: each sub-cake's packet sizes seen start afresh,
++ * and a new packet is charged with them. Everything then sent: nothing
++ * counted queued anywhere, and the host tables empty once the rotations
++ * retire.
++ */
++static void cake_test_mq_change_live(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct Qdisc *root = cake_test_mq_root(test, mq, 4, 0, CAKE_DIFFSERV_DIFFSERV4);
++	struct cake_sched_data *q0 = cake_test_mq_q(mq, 0);
++	struct sk_buff *skb[4][4][2][4], *extra[2], *late;
++	u32 heap[2], timeout[2], tables[4], adj, want_adj;
++	u32 qlen[4], tin0[4], left[4], other[4];
++	int ret[3], s, t, h, i;
++	bool ok = true;
++
++	for (s = 0; s < 4; s++)
++		for (t = 0; t < 4; t++)
++			for (h = 0; h < 2; h++)
++				for (i = 0; i < 4; i++) {
++					struct sk_buff *x = cake_test_skb(test, false, IPPROTO_TCP,
++									  10 + 2 * s + h, 40000 + t, 0);
++
++					kunit_remove_action(test, cake_test_free_skb, x);
++					x->priority = TC_H_MAKE(mq->sch[s]->handle, t + 1);
++					/* full-sized to CAKE: a flow's quantum lasts one */
++					qdisc_skb_cb(x)->pkt_len = 1514;
++					skb[s][t][h][i] = x;
++				}
++	for (i = 0; i < 2; i++) {
++		extra[i] = cake_test_skb(test, false, IPPROTO_TCP, 10, 40000, 0);
++		kunit_remove_action(test, cake_test_free_skb, extra[i]);
++		qdisc_skb_cb(extra[i])->pkt_len = 1514;
++	}
++	late = cake_test_skb(test, false, IPPROTO_TCP, 12, 40002, 0);
++	kunit_remove_action(test, cake_test_free_skb, late);
++	late->priority = TC_H_MAKE(mq->sch[1]->handle, 3);
++
++	/* three packets for each of two hosts' flows in each tin; half sent,
++	 * their flows bulk; then a fourth for each, so every tin has some
++	 */
++	rcu_read_lock_bh();
++	for (s = 0; s < 4; s++) {
++		for (t = 0; t < 4; t++)
++			for (h = 0; h < 2; h++)
++				for (i = 0; i < 3; i++)
++					ok &= cake_test_in(mq->sch[s], skb[s][t][h][i]);
++		for (i = 0; i < 12; i++) {
++			struct sk_buff *out = cake_dequeue(mq->sch[s]);
++
++			ok &= out != NULL;
++			kfree_skb(out);
++		}
++		for (t = 0; t < 4; t++)
++			for (h = 0; h < 2; h++)
++				ok &= cake_test_in(mq->sch[s], skb[s][t][h][3]);
++	}
++	/* sub-cake 0's buffer full: a drop builds its heap */
++	extra[0]->priority = TC_H_MAKE(mq->sch[0]->handle, 2);
++	q0->buffer_limit = q0->buffer_used;
++	cake_test_in(mq->sch[0], extra[0]);
++	q0->buffer_limit = ~0;
++	heap[0] = q0->overflow_heap_len;
++	timeout[0] = q0->overflow_timeout;
++	rcu_read_unlock_bh();
++	tables[0] = cake_test_mq_tables_off(mq, 4);
++	KUNIT_ASSERT_TRUE(test, ok);
++	KUNIT_EXPECT_EQ(test, heap[0], 4 * CAKE_QUEUES);
++	/* the host tables have something to hold */
++	for (s = 0, i = 0; s < 4; s++)
++		for (t = 0; t < 4; t++)
++			i += cake_test_mq_q(mq, s)->tins[t].bulk_flow_count;
++	KUNIT_EXPECT_GT(test, i, 0);
++	KUNIT_EXPECT_GT(test, timeout[0], 0);
++
++	rtnl_lock();
++	ret[0] = cake_mq_change(root, cake_test_opts(test, 0, CAKE_DIFFSERV_BESTEFFORT, false), NULL);
++	rtnl_unlock();
++
++	for (s = 0; s < 4; s++) {
++		struct cake_sched_data *q = cake_test_mq_q(mq, s);
++
++		qlen[s] = mq->sch[s]->q.qlen;
++		tin0[s] = cake_test_tin_packets(&q->tins[0]);
++		other[s] = 0;
++		for (t = 1; t < CAKE_MAX_TINS; t++)
++			other[s] += q->tins[t].tin_backlog + cake_test_tin_packets(&q->tins[t]);
++		KUNIT_EXPECT_EQ_MSG(test, q->tin_cnt, 1, "sub-cake %d", s);
++		KUNIT_EXPECT_EQ_MSG(test, qlen[s], tin0[s], "sub-cake %d", s);
++		KUNIT_EXPECT_EQ_MSG(test, mq->sch[s]->qstats.backlog, q->tins[0].tin_backlog, "sub-cake %d", s);
++		KUNIT_EXPECT_EQ_MSG(test, other[s], 0, "sub-cake %d", s);
++		KUNIT_EXPECT_GE_MSG(test, qlen[s], 2, "sub-cake %d", s);
++	}
++	timeout[1] = q0->overflow_timeout;
++	tables[1] = cake_test_mq_tables_off(mq, 4);
++
++	/* the next drop builds the heap over the one tin */
++	rcu_read_lock_bh();
++	q0->buffer_limit = q0->buffer_used;
++	cake_test_in(mq->sch[0], extra[1]);
++	q0->buffer_limit = ~0;
++	heap[1] = q0->overflow_heap_len;
++	rcu_read_unlock_bh();
++
++	rtnl_lock();
++	ret[1] = cake_mq_change(root, cake_test_opts_overhead(test, 0, CAKE_DIFFSERV_DIFFSERV4, 18, 64),
++				NULL);
++	rtnl_unlock();
++	for (s = 0; s < 4; s++) {
++		struct cake_sched_data *q = cake_test_mq_q(mq, s);
++
++		KUNIT_EXPECT_EQ(test, q->tin_cnt, 4);
++		KUNIT_EXPECT_EQ(test, q->max_netlen, 0);
++		KUNIT_EXPECT_EQ(test, q->min_netlen, U16_MAX);
++	}
++	want_adj = max_t(s32, late->len - skb_network_offset(late) + 18, 64);
++	rcu_read_lock_bh();
++	ret[2] = cake_test_enqueue(mq->sch[1], late);
++	adj = get_cobalt_cb(late)->adjusted_len;
++	/* everything out */
++	for (s = 0; s < 4; s++) {
++		struct sk_buff *out;
++
++		while ((out = cake_dequeue(mq->sch[s])))
++			kfree_skb(out);
++		for (t = 0; t < CAKE_MAX_TINS; t++)
++			cake_mq_retire_tin(cake_test_mq_q(mq, s), &cake_test_mq_q(mq, s)->tins[t],
++					   ktime_get());
++	}
++	rcu_read_unlock_bh();
++	tables[2] = cake_test_mq_tables_off(mq, 4);
++	tables[3] = 0;
++	for (s = 0; s < 4; s++) {
++		struct cake_sched_data *q = cake_test_mq_q(mq, s);
++
++		left[s] = mq->sch[s]->q.qlen + mq->sch[s]->qstats.backlog + q->buffer_used;
++		for (t = 0; t < CAKE_MAX_TINS; t++)
++			left[s] += q->tins[t].tin_backlog + q->tins[t].bulk_flow_count;
++		KUNIT_EXPECT_EQ_MSG(test, left[s], 0, "sub-cake %d", s);
++	}
++	for (i = 0; i < 2 * CAKE_MAX_TINS * CAKE_QUEUES; i++)
++		if (atomic_read(&mq->cfg->mq_hosts[i]))
++			tables[3] = i + 1;
++
++	KUNIT_EXPECT_EQ(test, ret[0], 0);
++	KUNIT_EXPECT_EQ(test, ret[1], 0);
++	KUNIT_EXPECT_EQ(test, ret[2], NET_XMIT_SUCCESS);
++	KUNIT_EXPECT_EQ(test, tables[0], 0);
++	KUNIT_EXPECT_EQ(test, timeout[1], 0);
++	KUNIT_EXPECT_EQ(test, tables[1], 0);
++	KUNIT_EXPECT_EQ(test, heap[1], CAKE_QUEUES);
++	KUNIT_EXPECT_EQ(test, mq->cfg->rate_overhead, 18);
++	KUNIT_EXPECT_EQ(test, mq->cfg->rate_mpu, 64);
++	KUNIT_EXPECT_TRUE(test, mq->cfg->rate_flags & CAKE_FLAG_OVERHEAD);
++	KUNIT_EXPECT_EQ(test, adj, want_adj);
++	KUNIT_EXPECT_EQ(test, tables[2], 0);
++	KUNIT_EXPECT_EQ(test, tables[3], 0);
++}
++
+ /* With its failsafe due, the shaper lets the next packet go at once, as
+  * the hard shaper at the top of cake_dequeue() decides. In ingress mode a
+  * drop moves the shaper on but not the failsafe: a burst that overflows
+@@ -4401,6 +4723,133 @@ static void cake_test_mq_drained_rests(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, weight, 0);
+ }
+ 
++/* A cake_mq sub-cake's flow floods its buffer: each overflow drop tells
++ * BLUE it doesn't respond, and p_drop goes up 1/256, once in each target
++ * (5 ms) at most; the tin counts it unresponsive. Back under the rate, its
++ * queue runs empty after each packet, and every packet gets through: BLUE
++ * spares a flow's last. Each time the flow is found empty more than target
++ * after the last step, p_drop steps down 1/4096 (not sooner), back to 0
++ * after 32 steps from 2/256, when it counts as responsive again and, its
++ * AQM state at rest, leaves the flowchain. A burst then gets through whole.
++ * The time between steps is stood in for by moving BLUE's timer back.
++ */
++/* A cake_test_mq_live() sub-cake's packets go with the test: only its
++ * tin 0 is set up, which cake_reset() would go past
++ */
++static void cake_test_clear_tin0(void *sch)
++{
++	rcu_read_lock_bh();
++	cake_clear_tin(sch, 0);
++	rcu_read_unlock_bh();
++}
++
++static void cake_test_mq_blue_recovers(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_mq_live(test, mq, 1);
++	struct cake_tin_data *b = &q->tins[0];
++	struct Qdisc *sch = mq->sch[1];
++	struct sk_buff *flood[20], *one[2], *burst[4];
++	u32 drops[2], p[3], unresp[2], steps = 0, early, got = 0, through = 0;
++	struct cake_flow *flow = NULL;
++	bool ok = true, rests;
++	ktime_t at;
++	int i, r;
++
++	cake_test_pkts(test, flood, 20, 5, 1514);
++	cake_test_pkts(test, one, 2, 5, 1514);
++	cake_test_pkts(test, burst, 4, 5, 1514);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_clear_tin0, sch));
++
++	rcu_read_lock_bh();
++	/* two floods into a buffer of three packets, more than target apart */
++	for (r = 0; r < 2; r++) {
++		for (i = 0; i < 10; i++) {
++			struct sk_buff *to_free = NULL;
++
++			cake_enqueue(flood[10 * r + i], sch, &to_free);
++			kfree_skb_list(to_free);
++			if (!flow)
++				flow = cake_test_flow_of(b, flood[0]);
++			if (r == 0 && i == 2)
++				q->buffer_limit = q->buffer_used;
++		}
++		if (flow && r == 0) {
++			p[0] = flow->cvars.p_drop;
++			flow->cvars.blue_timer = ktime_sub_ns(flow->cvars.blue_timer,
++							      b->cparams.target + 1);
++		}
++	}
++	drops[0] = sch->qstats.drops;
++	unresp[0] = b->unresponsive_flow_count;
++	ok &= flow != NULL;
++	/* what's left goes (BLUE may take one but the last); found empty */
++	while (sch->q.qlen) {
++		struct sk_buff *out = cake_dequeue(sch);
++
++		ok &= out != NULL;
++		got += out != NULL;
++		kfree_skb(out);
++	}
++	cake_dequeue(sch);
++	if (ok) {
++		p[1] = flow->cvars.p_drop;
++		/* empty again within target of the last step: no step */
++		at = ktime_get();
++		flow->cvars.blue_timer = ktime_sub_ns(at, b->cparams.target / 2);
++		cake_flow_emptied(q, b, flow, at);
++		early = flow->cvars.p_drop;
++		while (flow->cvars.p_drop && steps < 100) {
++			u32 was = flow->cvars.p_drop;
++
++			at = ktime_get();
++			flow->cvars.blue_timer = ktime_sub_ns(at, b->cparams.target + 1);
++			cake_flow_emptied(q, b, flow, at);
++			ok &= flow->cvars.p_drop == was - min(was, b->cparams.p_dec);
++			steps++;
++			/* half way: a packet at a time all gets through (found
++			 * empty well within target of the step: no step)
++			 */
++			if (steps == 16) {
++				flow->cvars.blue_timer = ktime_get();
++				for (i = 0; i < 2; i++) {
++					ok &= cake_test_in(sch, one[i]);
++					through += cake_test_out(sch, one[i]);
++					cake_dequeue(sch);
++				}
++			}
++		}
++		p[2] = flow->cvars.p_drop;
++		unresp[1] = b->unresponsive_flow_count;
++		/* the count and drop_next at rest too: it leaves the flowchain */
++		if (flow->set != CAKE_SET_NONE)
++			cake_flow_emptied(q, b, flow, ktime_add_ns(at, NSEC_PER_SEC));
++		rests = flow->set == CAKE_SET_NONE && list_empty(&flow->flowchain) &&
++			!b->decaying_flow_count && !b->sparse_flow_count && !b->bulk_flow_count;
++		drops[1] = sch->qstats.drops;
++		q->buffer_limit = ~0;
++		for (i = 0; i < 4; i++)
++			ok &= cake_test_in(sch, burst[i]);
++		for (i = 0; i < 4; i++)
++			through += cake_test_out(sch, burst[i]);
++	}
++	rcu_read_unlock_bh();
++
++	KUNIT_ASSERT_TRUE(test, ok);
++	KUNIT_EXPECT_EQ(test, drops[0], 17);
++	KUNIT_EXPECT_EQ(test, p[0], b->cparams.p_inc);
++	KUNIT_EXPECT_EQ(test, unresp[0], 1);
++	KUNIT_EXPECT_GE(test, got, 1);
++	KUNIT_EXPECT_EQ(test, p[1], 2 * b->cparams.p_inc);
++	KUNIT_EXPECT_EQ(test, early, p[1]);
++	KUNIT_EXPECT_EQ(test, steps, 2 * b->cparams.p_inc / b->cparams.p_dec);
++	KUNIT_EXPECT_EQ(test, p[2], 0);
++	KUNIT_EXPECT_EQ(test, unresp[1], 0);
++	KUNIT_EXPECT_TRUE(test, rests);
++	KUNIT_EXPECT_EQ(test, through, 6);
++	KUNIT_EXPECT_EQ(test, sch->qstats.drops, drops[1]);
++}
++
+ /* COBALT's decay as it was: a step down for each interval / sqrt(count)
+  * the flow was away, however many (cobalt_should_drop() without the jump)
+  */
+@@ -4552,6 +5001,95 @@ static void cake_test_decay_small(struct kunit *test)
+ 	}
+ }
+ 
++/* When the steps take a count of @count all the way down at @interval:
++ * the last step's time, from a drop_next of 0
++ */
++static u64 cake_test_decay_full(u32 count, u64 interval)
++{
++	struct cobalt_vars v = {};
++
++	cobalt_set_count(&v, count);
++	while (v.count > 1) {
++		v.count--;
++		cobalt_invsqrt(&v);
++		v.drop_next = cobalt_control(v.drop_next, interval, v.rec_inv_sqrt);
++	}
++	return ktime_to_ns(v.drop_next);
++}
++
++/* COBALT's count after a pause, at the edges: counts of 65 (the least the
++ * jump takes), 1000 and 100000; pauses 1 ns short of what the steps take
++ * all the way down, exactly that, 1 ns over, half of it, and just over the
++ * 32 steps' worth the jump starts at; an interval of 100 ms, the largest a
++ * u32 holds (4.3 s: cobalt_control() takes it as one, as a long rtt has
++ * it) and one past that, which it takes as 5 us. The count never wraps,
++ * never ends below the steps' (so not at 0 while the steps would be at 1)
++ * or more than 2 (0.1%) above them, and the jump alone never moves
++ * drop_next past the pause's end. Near the full time the steps' count is
++ * known (1, or 0): the loop isn't run for 100000.
++ */
++static void cake_test_decay_edges(struct kunit *test)
++{
++	static const u32 counts[] = { 65, 1000, 100000 };
++	static const u64 intervals[] = { 100 * NSEC_PER_MSEC, U32_MAX, (1ULL << 32) + 5000 };
++	struct sk_buff *skb = cake_test_skb(test, true, IPPROTO_TCP, 2, 40000, 0);
++	u32 bad = 0, checked = 0;
++	int i, j, k;
++
++	for (i = 0; i < ARRAY_SIZE(intervals); i++) {
++		struct cobalt_params p = {
++			.interval = intervals[i],
++			.target = 5 * NSEC_PER_MSEC,
++			.mtu_time = 12 * NSEC_PER_USEC,
++		};
++
++		for (j = 0; j < ARRAY_SIZE(counts); j++) {
++			u64 full = cake_test_decay_full(counts[j], p.interval), gaps[5];
++			struct cobalt_vars v = {};
++
++			cobalt_set_count(&v, counts[j]);
++			gaps[0] = full - 1;
++			gaps[1] = full;
++			gaps[2] = full + 1;
++			gaps[3] = full / 2;
++			gaps[4] = 33ULL * reciprocal_scale(p.interval, v.rec_inv_sqrt) + 1;
++			for (k = 0; k < ARRAY_SIZE(gaps); k++) {
++				struct cobalt_vars a = {}, r, jmp;
++				ktime_t now = ns_to_ktime(gaps[k]);
++				bool ok;
++
++				/* half the full time: the loop is too long for 100000 */
++				if (k == 3 && counts[j] > 1000)
++					continue;
++				cobalt_set_count(&a, counts[j]);
++				r = a;
++				jmp = a;
++				if (k <= 2)
++					r.count = gaps[k] >= full ? 0 : 1;
++				else
++					cake_test_decay_ref(&r, p.interval, now);
++				cobalt_set_enqueue_time(skb, now);
++				cobalt_should_drop(&a, &p, now, skb, 0, 0);
++				cobalt_decay_jump(&jmp, p.interval, gaps[k]);
++
++				ok = a.count <= counts[j] && a.count >= r.count &&
++				     a.count - r.count <= max_t(u32, 2, r.count / 1000) &&
++				     jmp.count <= counts[j] &&
++				     (!jmp.count || ktime_to_ns(jmp.drop_next) <= gaps[k]);
++				checked++;
++				if (!ok) {
++					bad++;
++					kunit_info(test, "interval %llu, count %u, %llu ns away: %u (the steps %u), the jump %u at %lld",
++						   p.interval, counts[j], gaps[k], a.count, r.count,
++						   jmp.count, ktime_to_ns(jmp.drop_next));
++				}
++			}
++		}
++	}
++	KUNIT_EXPECT_EQ(test, bad, 0);
++	KUNIT_EXPECT_EQ(test, checked, 42);
++}
++
+ /* A tin with nothing queued is cleared without a look at its queues, and
+  * left as a look at each would leave it; one with packets is emptied
+  */
+@@ -5218,6 +5756,78 @@ static void cake_test_sparse_ahead_mq(struct kunit *test)
+ 	cake_clear_tin(sch, 0);
+ 	rcu_read_unlock_bh();
+ }
++
++/* sparse_ahead_us in ingress mode, COBALT dropping the packet that was to
++ * go ahead (BLUE at its highest drops all of a flow's packets but its
++ * last): the drop is charged to the shaper, which then holds all the more,
++ * so the dequeue looks ahead again and the flow's next packet goes, the
++ * bulk flow still held. It can't go on to the bulk flows with its look
++ * ahead left over from the drop: the time it holds to and the failsafe
++ * haven't moved. Then, the shaper due, a bulk packet COBALT drops is
++ * followed by the flow's next one, as ever.
++ */
++static void cake_test_sparse_ahead_drop(struct kunit *test)
++{
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	struct cake_sched_data *q = cake_test_cake_live(test, mq, 0, 125000,
++							CAKE_DIFFSERV_BESTEFFORT);
++	u64 dur = (100 * q->rate_ns) >> q->rate_shft, tn[2];
++	struct cake_tin_data *b = &q->tins[0];
++	struct cake_flow *sflow, *bflow;
++	struct Qdisc *sch = mq->sch[0];
++	struct sk_buff *bulk[3], *s[2], *out[2];
++	u32 drops[3], qlen[2];
++	bool ok = true;
++	ktime_t now;
++	int i;
++
++	cake_test_ahead_set(test, 20000);
++	q->config->rate_flags |= CAKE_FLAG_INGRESS;
++	cake_test_dl_pkts(test, bulk, 3, 5, 1514, true);
++	cake_test_dl_pkts(test, s, 2, 6, 100, true);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
++
++	rcu_read_lock_bh();
++	for (i = 0; i < 3; i++)
++		ok &= cake_test_in(sch, bulk[i]);
++	/* the shaper holds the next 12 ms */
++	ok &= cake_test_out(sch, bulk[0]);
++	for (i = 0; i < 2; i++)
++		ok &= cake_test_in(sch, s[i]);
++	sflow = cake_test_flow_of(b, s[0]);
++	bflow = cake_test_flow_of(b, bulk[1]);
++	ok &= sflow && bflow;
++	if (ok) {
++		sflow->cvars.p_drop = U32_MAX;
++		drops[0] = sch->qstats.drops;
++		tn[0] = ktime_to_ns(q->time_next_packet);
++		out[0] = cake_dequeue(sch);
++		tn[1] = ktime_to_ns(q->time_next_packet);
++		drops[1] = sch->qstats.drops;
++		qlen[0] = sch->q.qlen;
++		/* the shaper due: the bulk flow's next packet dropped, its last sent */
++		bflow->cvars.p_drop = U32_MAX;
++		now = ktime_get();
++		q->time_next_packet = now;
++		q->failsafe_next_packet = now;
++		out[1] = cake_dequeue(sch);
++		drops[2] = sch->qstats.drops;
++		qlen[1] = sch->q.qlen;
++	}
++	rcu_read_unlock_bh();
++
++	KUNIT_ASSERT_TRUE(test, ok);
++	KUNIT_EXPECT_PTR_EQ(test, out[0], s[1]);
++	KUNIT_EXPECT_EQ(test, drops[1], drops[0] + 1);
++	KUNIT_EXPECT_EQ(test, qlen[0], 2);
++	/* both of its packets charged: the one dropped, the one sent */
++	KUNIT_EXPECT_EQ(test, tn[1], tn[0] + 2 * dur);
++	KUNIT_EXPECT_PTR_EQ(test, out[1], bulk[2]);
++	KUNIT_EXPECT_EQ(test, drops[2], drops[1] + 1);
++	KUNIT_EXPECT_EQ(test, qlen[1], 0);
++	kfree_skb(out[0]);
++	kfree_skb(out[1]);
++}
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK) && defined(CONFIG_NET_REDIRECT)
+@@ -5453,6 +6063,7 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_sparse_ahead_train),
+ 	KUNIT_CASE(cake_test_sparse_ahead_rate),
+ 	KUNIT_CASE(cake_test_sparse_ahead_mq),
++	KUNIT_CASE(cake_test_sparse_ahead_drop),
+ #endif
+ 	KUNIT_CASE(cake_test_ecn_ignored_switches),
+ 	KUNIT_CASE(cake_test_ecn_ignored_ipv4),
+@@ -5476,6 +6087,7 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_decay_small),
+ 	KUNIT_CASE(cake_test_decay_jump),
+ 	KUNIT_CASE_SLOW(cake_test_decay_jump_large),
++	KUNIT_CASE(cake_test_decay_edges),
+ 	KUNIT_CASE(cake_test_mq_marks_its_queue),
+ 	KUNIT_CASE(cake_test_mq_count_back_from_idle),
+ 	KUNIT_CASE(cake_test_mq_count_real_queues),
+@@ -5512,6 +6124,8 @@ static struct kunit_case cake_test_cases[] = {
+ 	KUNIT_CASE(cake_test_change_refused),
+ 	KUNIT_CASE(cake_test_change_vs_autorate),
+ 	KUNIT_CASE(cake_test_clear_tin_parent),
++	KUNIT_CASE(cake_test_mq_change_live),
++	KUNIT_CASE(cake_test_mq_blue_recovers),
+ 	KUNIT_CASE(cake_test_clear_tin_empty),
+ 	KUNIT_CASE(cake_test_overflow_heap),
+ 	KUNIT_CASE(cake_test_set_rate),
