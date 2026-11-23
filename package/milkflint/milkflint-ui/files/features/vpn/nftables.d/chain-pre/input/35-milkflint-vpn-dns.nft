@@ -1,0 +1,5 @@
+# MilkFlint (ui feature "vpn"): the DNS lookups redirected from port 53 to the
+# VPN client's DNS forwarder (port 5455, table inet milkflint_vpn_dns) are let
+# in from every inside zone, as the lookups to port 53 they were. Only that
+# redirect turns port 53 into 5455; nothing else is opened.
+meta l4proto { tcp, udp } th dport 5455 ct status dnat ct original proto-dst 53 counter accept comment "MilkFlint: DNS redirected to VPN DNS"

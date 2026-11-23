@@ -15,13 +15,18 @@
 # that queue is wifi-vo-aggr's.
 #
 # milkflint-tuning runs this at boot and when the setting changes, the iface
-# hotplug 12-milkflint-cake-ecn after sqm, which may be what loads sch_cake.
+# hotplug 12-milkflint-cake-ecn after sqm. sch_cake loads at boot
+# (/etc/modules.d/sched-cake); one loaded later starts from its defaults.
 #
 #   cake-dscp
+#
+# Exits 1 when sch_cake isn't loaded, so it wasn't set there (conntrack's
+# side still is): milkflint-tuning then doesn't count it as done.
 
 on=0
 [ "$(uci -q get milkflint.cake.dscp_restore)" = 1 ] && on=1
 for p in /sys/module/nf_conntrack/parameters/dscp_learn /sys/module/sch_cake/parameters/dscp_restore; do
 	[ -w "$p" ] && echo "$on" > "$p"
 done
+[ -d /sys/module/sch_cake/parameters ] || exit 1
 exit 0

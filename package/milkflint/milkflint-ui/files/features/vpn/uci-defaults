@@ -1,0 +1,6 @@
+#!/bin/sh
+# MilkFlint VPN client DNS (ui feature "vpn"): enabled so its reload triggers
+# stay registered with procd; it only starts a forwarder and nftables rules
+# while wg_out is enabled with "Use VPN's DNS" on.
+/etc/init.d/milkflint-vpn enable
+exit 0

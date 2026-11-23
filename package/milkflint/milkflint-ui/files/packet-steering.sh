@@ -40,7 +40,9 @@
 # Unset (Automatic on the page) is RSS, but the RPS layout when any
 # interface is PPPoE; milkflint.steering.rss=1 is RSS whatever the line,
 # and then the PPPoE port's ring 0 alone gets RPS. Either way sqm-scripts
-# gives the PPP device's download ifb a sub-queue per CPU (its patch 109).
+# gives the PPP device's download ifb a sub-queue per CPU (its patch 109),
+# and an Ethernet port's when RPS spreads it (110: the RPS layout,
+# OpenWrt's).
 #
 # milkflint.steering.layout=openwrt (the Performance Tuning page) hands it
 # all to OpenWrt's packet-steering.uc instead, with the arguments
@@ -102,29 +104,62 @@ rss_off() {
 	done
 }
 
-# The ifbs sqm-scripts gives a sub-queue per CPU (a PPP device's, its patch
-# 109: queue N takes what CPU N hands it). That holds while each flow stays
-# on one CPU, as RPS and the pinned rings keep it, in every layout but off,
-# whose threads move between CPUs: there a flow's packets would reach two
-# sub-queues and be reordered, so the kernel's choice (by the receive queue)
-# again. For the ifbs already there: sqm-scripts sets new ones the same way.
-ppp_ifbs() {
-	local d q
+# whether RPS spreads what device $1 receives over the CPUs: its first
+# receive queue's mask isn't empty, or, for a device on top of one other (a
+# VLAN, a DSA port), that one's down to the port: RPS runs where the
+# packets come in
+rps_spreads() {
+	local dev=$1 m lower i=0
+	while [ $i -lt 4 ]; do
+		m=$(cat "/sys/class/net/$dev/queues/rx-0/rps_cpus" 2> /dev/null)
+		case "$m" in '' | *[!0-9a-fA-F,]*) ;; *) [ -n "$(echo "$m" | tr -d '0,')" ] && return 0 ;; esac
+		lower=$(ls -d /sys/class/net/$dev/lower_* 2> /dev/null)
+		[ -n "$lower" ] && [ "$(echo "$lower" | wc -l)" -eq 1 ] || return 1
+		dev=${lower##*/lower_}
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# The ifbs sqm-scripts gives a sub-queue per CPU, queue N taking what CPU N
+# hands it: a PPP device's (its patch 109) and an Ethernet port's that RPS
+# spreads (110). The kernel would pick an ifb's queue by the receive queue a
+# packet came in on: right with RSS, each ring's own sub-queue, but a PPPoE
+# session's packets, and all of a port's without RSS, come in on its first
+# queue, and every CPU RPS hands them to would feed sub-queue 1. It holds
+# while each flow stays on one CPU, as RPS and the pinned rings keep it, in
+# every layout but off, whose threads move between CPUs: there a flow's
+# packets would reach two sub-queues and be reordered, so the kernel's
+# choice again. Run once RPS is set, for the ifbs already there: sqm-scripts
+# sets new ones the same way.
+ifb_queues() {
+	local d q per
 	for d in /sys/class/net/ifb4*; do
-		[ "$(cat "/sys/class/net/${d##*/ifb4}/type" 2> /dev/null)" = 512 ] && [ -d "$d/queues/tx-1" ] || continue
+		[ -d "$d/queues/tx-1" ] || continue
+		per=
+		if [ "$1" = on ]; then
+			{ [ "$(cat "/sys/class/net/${d##*/ifb4}/type" 2> /dev/null)" = 512 ] ||
+				rps_spreads "${d##*/ifb4}"; } && per=1
+		fi
 		for q in "$d"/queues/tx-*; do
-			if [ "$1" = on ]; then printf '%x\n' $((1 << ${q##*tx-})); else echo 0; fi > "$q/xps_cpus"
+			if [ -n "$per" ]; then printf '%x\n' $((1 << ${q##*tx-})); else echo 0; fi > "$q/xps_cpus"
 		done
 	done
 }
-if [ "$1" = 0 ]; then ppp_ifbs off; else ppp_ifbs on; fi
 
 if [ "$(uci -q get milkflint.steering.layout)" = openwrt ] && [ -x /usr/libexec/network/packet-steering.uc ]; then
 	rss_off
 	ring_policy other
 	flows=$(uci -q get "network.@globals[0].steering_flows")
-	[ "${flows:-0}" -gt 0 ] 2> /dev/null && exec /usr/libexec/network/packet-steering.uc -l "$flows" "$1"
-	exec /usr/libexec/network/packet-steering.uc "$1"
+	if [ "${flows:-0}" -gt 0 ] 2> /dev/null; then
+		/usr/libexec/network/packet-steering.uc -l "$flows" "$1"
+	else
+		/usr/libexec/network/packet-steering.uc "$1"
+	fi
+	ret=$?
+	# after its RPS, which decides the ifbs' queues
+	if [ "$1" = 0 ]; then ifb_queues off; else ifb_queues on; fi
+	exit $ret
 fi
 
 [ "$1" = 0 ] && off=1
@@ -211,3 +246,5 @@ for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
 	fi
 	echo "$m" > "$q"
 done
+
+if [ -n "$off" ]; then ifb_queues off; else ifb_queues on; fi

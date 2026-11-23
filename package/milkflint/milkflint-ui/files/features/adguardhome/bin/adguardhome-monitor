@@ -34,6 +34,7 @@
 import { readfile, writefile, mkdir, access } from 'fs';
 import { cursor } from 'uci';
 import * as agh from './adguardhome.uc';
+import * as vpn_dns from './vpn-dns.uc';
 
 const TICK_MS = 500;
 // the state file, at least this often (else when it changes)
@@ -135,7 +136,7 @@ function nft_set(name, type_, elems, interval) {
 
 function ruleset() {
 	const v = state.vpn;
-	const tunnel = v?.state == 'tunnel';
+	const tunnel = v?.state == 'tunnel' || v?.state == 'forwarder';
 	const mark = `meta mark & ${agh.VPN_MASK} == ${agh.VPN_MARK}`;
 	let text = `table inet ${TABLE}\ndelete table inet ${TABLE}\n` +
 		`table inet ${TABLE} {\n` +
@@ -164,6 +165,7 @@ function ruleset() {
 		if (vpn_uid != null)
 			text += '\tchain vpn_out {\n' +
 				'\t\ttype route hook output priority mangle; policy accept;\n' +
+				'\t\tfib daddr type local return\n' +
 				`\t\tmeta skuid ${vpn_uid} meta mark set meta mark & 0x0fffffff | ${agh.VPN_MARK} counter comment "MilkFlint: the VPN devices' lookups go out through the tunnel"\n` +
 				'\t}\n';
 	}
@@ -173,25 +175,27 @@ function ruleset() {
 // ---- devices sent through the VPN ---------------------------------------------
 
 
-// the VPN's own dnsproxy (milkflint-adguardhome's "vpn" instance) runs
-function forwarder_up() {
-	const svc = agh.ubus_call('service', 'list', { name: 'milkflint-adguardhome' });
-	return svc?.['milkflint-adguardhome']?.instances?.vpn?.running == true;
+// the VPN's DNS forwarder runs (milkflint-vpn's "dns" when "Use VPN's DNS" is
+// on, else milkflint-adguardhome's "vpn" dnsproxy)
+function forwarder_up(service, inst) {
+	const svc = agh.ubus_call('service', 'list', { name: service });
+	return svc?.[service]?.instances?.[inst]?.running == true;
 }
 
 // What the VPN client page sends through the tunnel, as AdGuard Home needs
 // it: { state: 'off' | 'automatic' (the DNS page uses the provider's servers,
-// which don't answer through a VPN) | 'forwarder' (its dnsproxy isn't
-// running) | 'tunnel', ids, skip, conflicts }
+// which don't answer through a VPN) | 'forwarder' (its forwarder isn't
+// running yet) | 'tunnel', port, source, ids, skip, conflicts }
 function vpn_wanted() {
 	const c = cursor();
 	const d = agh.vpn_devices(c);
 	if (!d)
 		return { state: 'off' };
-	if (!agh.vpn_upstreams(c))
+	const use_vpn_dns = vpn_dns.vpn_dns_servers(c) != null;
+	if (!use_vpn_dns && !agh.vpn_upstreams(c))
 		return { state: 'automatic' };
-	if (!forwarder_up())
-		return { state: 'forwarder' };
+	const port = use_vpn_dns ? vpn_dns.VPN_DNS_PORT : agh.VPN_PORT;
+	const ready = use_vpn_dns ? forwarder_up('milkflint-vpn', 'dns') : forwarder_up('milkflint-adguardhome', 'vpn');
 	const dump = agh.ubus_call('network.interface', 'dump')?.interface ?? [];
 	let ids = [], skip = [];
 	if (d.home == 'all')
@@ -202,7 +206,7 @@ function vpn_wanted() {
 		skip = agh.addresses_of(d.skip);
 	for (let g in d.guests)
 		ids = [ ...ids, ...agh.zone_subnets(g, dump) ];
-	return { state: 'tunnel', ids: uniq(ids), skip: uniq(skip) };
+	return { state: ready ? 'tunnel' : 'forwarder', port, source: use_vpn_dns ? 'vpn' : 'router', ids: uniq(ids), skip: uniq(skip) };
 }
 
 // AdGuard Home's two clients as `w` needs them: added, changed (only their
@@ -220,7 +224,7 @@ function vpn_clients(w) {
 			for (let id in cl.ids ?? [])
 				theirs[id] = cl.name;
 	const domain = cursor().get('dhcp', '@dnsmasq[0]', 'domain') ?? 'lan';
-	const tunnel = w.state == 'tunnel';
+	const tunnel = w.state == 'tunnel' || w.state == 'forwarder';
 	w.conflicts = tunnel ? uniq(filter(map(w.ids, (id) => theirs[id]), (n) => n != null)) : [];
 	const put = (name, ids, upstreams) => {
 		const cur = filter(list, (cl) => cl.name == name)[0];
@@ -245,7 +249,7 @@ function vpn_clients(w) {
 		else
 			agh.api('POST', '/control/clients/add', data, API_S);
 	};
-	put(agh.VPN_CLIENT, tunnel ? filter(w.ids, (id) => !theirs[id]) : [], [ `[/${domain}/]${agh.DNSMASQ}`, `127.0.0.1:${agh.VPN_PORT}` ]);
+	put(agh.VPN_CLIENT, tunnel ? filter(w.ids, (id) => !theirs[id]) : [], [ `[/${domain}/]${agh.DNSMASQ}`, `127.0.0.1:${w.port ?? agh.VPN_PORT}` ]);
 	put(agh.NOVPN_CLIENT, tunnel ? filter(w.skip, (id) => !theirs[id]) : [], []);
 	// the router's own checks (Network Quality's probe, Test Bench) left out
 	// of its statistics and query log, which are about the devices
@@ -300,7 +304,7 @@ function devctl_people() {
 
 function devctl_clients(w, list, theirs) {
 	const people = devctl_people();
-	const vpn = (w.state == 'tunnel') ? [ ...(w.ids ?? []) ] : [];
+	const vpn = (w.state == 'tunnel' || w.state == 'forwarder') ? [ ...(w.ids ?? []) ] : [];
 	const through_vpn = (a) => (a in vpn) || length(filter(vpn, (c) => in_subnet4(a, c))) > 0 ||
 		// the VPN takes whole IPv6 ranges too: a device's IPv6 lookups stay with it
 		(index(a, ':') >= 0 && length(filter(vpn, (c) => index(c, ':') >= 0)) > 0);
@@ -478,7 +482,8 @@ for (;;) {
 		stopped_at = null;
 		state.answered = true;
 		set_state('active', 'answering');
-		if (time() - vpn_at >= VPN_EVERY_S)
+		const vpn_interval = (state.vpn?.state == 'forwarder') ? 1 : VPN_EVERY_S;
+		if (time() - vpn_at >= vpn_interval)
 			vpn_sync();
 		redirect(true);
 	}

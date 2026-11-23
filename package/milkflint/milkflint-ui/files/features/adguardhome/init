@@ -27,8 +27,12 @@ wanted() {
 vpn_args() {
 	ucode -e '
 		import * as a from "/usr/libexec/milkflint/adguardhome.uc";
+		import * as v from "/usr/libexec/milkflint/vpn-dns.uc";
 		import { cursor } from "uci";
 		const c = cursor();
+		// When "Use VPN'\''s DNS" is on, milkflint-vpn runs the VPN DNS forwarder on port 5455
+		if (v.vpn_dns_servers(c))
+			exit(0);
 		const u = a.vpn_upstreams(c);
 		if (!u || !a.vpn_devices(c))
 			exit(0);

@@ -20,7 +20,9 @@
 # - milkflint.cake.ecn_drop: after how many ignored marks Smart Queue drops
 #   from an ECN download that ignores them, "0" never (it always marks)
 #   (/usr/libexec/milkflint/cake-ecn; the iface hotplug 12-milkflint-cake-ecn
-#   runs it after sqm too);
+#   runs it after sqm too). sch_cake's parameters: kept as done only once
+#   sch_cake took them (put_done), so a run while it isn't loaded is
+#   tried again at the next start or reload;
 # - milkflint.cake.l4s: where L4S traffic starts to be marked by how long each
 #   packet has waited, in percent of Smart Queue's target, "0" not at all (the
 #   same script);
@@ -71,6 +73,20 @@ put() {
 	echo "$value" > "$RUN/$name"
 }
 
+# put, for a command that exits non-zero when the setting couldn't take
+# effect (a module not loaded): nothing is kept then, and the next start or
+# reload runs it again
+put_done() {
+	local name=$1 value=$2
+	shift 2
+	[ -z "$FORCE" ] && [ -f "$RUN/$name" ] && [ "$(cat "$RUN/$name")" = "$value" ] && return 0
+	if "$@"; then
+		echo "$value" > "$RUN/$name"
+	else
+		rm -f "$RUN/$name"
+	fi
+}
+
 # <service>: reload it, unless it's been disabled
 reload_if_enabled() {
 	! /etc/init.d/$1 enabled || /etc/init.d/$1 reload
@@ -83,8 +99,8 @@ apply() {
 	put aql "$(uci -q get milkflint.wifi.aql_be) $(uci -q get milkflint.wifi.aql_threshold)" /usr/libexec/milkflint/wifi-aql
 	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss) $(uci -q get milkflint.steering.wifi_all) $(uci -q get milkflint.steering.rings_rt)" reload_if_enabled packet_steering
 	put rx_delay "$(uci -q get milkflint.steering.rx_delay)" /usr/libexec/milkflint/rx-delay
-	put cake_ecn "$(uci -q get milkflint.cake.ecn_drop) $(uci -q get milkflint.cake.l4s)" /usr/libexec/milkflint/cake-ecn
-	put cake_dscp "$(uci -q get milkflint.cake.dscp_restore)" /usr/libexec/milkflint/cake-dscp
+	put_done cake_ecn "$(uci -q get milkflint.cake.ecn_drop) $(uci -q get milkflint.cake.l4s)" /usr/libexec/milkflint/cake-ecn
+	put_done cake_dscp "$(uci -q get milkflint.cake.dscp_restore)" /usr/libexec/milkflint/cake-dscp
 	put vo_aggr "$(uci -q get milkflint.wifi.vo_aggr)" /usr/libexec/milkflint/wifi-vo-aggr
 	put spr "$(uci -q get milkflint.wifi.spr_2g) $(uci -q get milkflint.wifi.spr_5g) $(uci -q get milkflint.wifi.spr_6g)" /usr/libexec/milkflint/wifi-spr
 	put twt "$(uci -q show milkflint.wifi | grep '\.twt_')" /usr/libexec/milkflint/wifi-twt

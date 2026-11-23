@@ -161,14 +161,25 @@ if [ -z "$(uci -q get milkflint.defaults.synflood)" ]; then
 	UCI
 fi
 
-# Multi-queue CAKE goes with the download speed: from 500 Mbit/s, and one
-# CAKE below that. Each of cake_mq's queues holds its packets to its own
-# share of the speed, so a packet waits behind another for longer than in
-# one CAKE, the more the slower the line, and one CPU shapes a slower line
-# easily. The web interface keeps use_mq in step with the speed it saves,
-# unless it's chosen there (milkflint.cake.multi_queue). A queue with
-# cake_mq off was a choice and stays off; the web interface's queue is the
-# first. Not a guest network's or the VPN's shaper. Once, like cake_mq.
+# Automatic multi-queue's threshold for queue $1's line, kbit/s: 500 Mbit/s
+# on a PPPoE line (the queue on a session's device, or wan PPPoE, as the
+# Smart Queue page tells), 1 Gbit/s on an Ethernet one, where GRO hands CAKE
+# large packets and one CAKE keeps up with about 1 Gbit/s (the web
+# interface's features/sqm/multi-queue.ts)
+mq_threshold() {
+	case "$(uci -q get "sqm.$1.interface")" in pppoe-*) echo 500000; return ;; esac
+	if [ "$(uci -q get network.wan.proto)" = pppoe ]; then echo 500000; else echo 1000000; fi
+}
+
+# Multi-queue CAKE goes with the download speed: from the line's threshold
+# (mq_threshold), and one CAKE below that. Each of cake_mq's queues holds its
+# packets to its own share of the speed, so a packet waits behind another
+# for longer than in one CAKE, the more the slower the line, and one CPU
+# shapes a slower line easily. The web interface keeps use_mq in step with
+# the speed it saves, unless it's chosen there (milkflint.cake.multi_queue).
+# A queue with cake_mq off was a choice and stays off; the web interface's
+# queue is the first. Not a guest network's or the VPN's shaper. Once, like
+# cake_mq.
 if [ -z "$(uci -q get milkflint.defaults.cake_mq_auto)" ]; then
 	first=1
 	for queue in $(uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p"); do
@@ -178,7 +189,7 @@ if [ -z "$(uci -q get milkflint.defaults.cake_mq_auto)" ]; then
 				set milkflint.cake=cake
 				set milkflint.cake.multi_queue='0'
 			UCI
-		elif ! [ "$(uci -q get "sqm.$queue.download")" -ge 500000 ] 2> /dev/null; then
+		elif ! [ "$(uci -q get "sqm.$queue.download")" -ge "$(mq_threshold "$queue")" ] 2> /dev/null; then
 			uci set "sqm.$queue.use_mq=0"
 		fi
 		first=
@@ -187,6 +198,29 @@ if [ -z "$(uci -q get milkflint.defaults.cake_mq_auto)" ]; then
 	uci -q batch <<-UCI
 		set milkflint.defaults=defaults
 		set milkflint.defaults.cake_mq_auto='1'
+		commit milkflint
+	UCI
+fi
+
+# Automatic multi-queue is from 1 Gbit/s on an Ethernet line since
+# 2026-11-23 (500 Mbit/s before, as still on PPPoE: mq_threshold). On an
+# upgrade, a queue Automatic had on multi-queue under 1 Gbit/s on an
+# Ethernet line goes back to one CAKE. Not where multi-queue was chosen
+# (milkflint.cake.multi_queue), nor a guest network's or the VPN's shaper.
+# A new install's cake_mq_auto has done it already. Once.
+if [ -z "$(uci -q get milkflint.defaults.cake_mq_eth_1g)" ]; then
+	if [ -z "$(uci -q get milkflint.cake.multi_queue)" ]; then
+		for queue in $(uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p"); do
+			case "$(uci -q get "sqm.$queue.interface")" in br-guest* | wg_out) continue ;; esac
+			[ "$(uci -q get "sqm.$queue.use_mq")" = 1 ] && [ "$(mq_threshold "$queue")" = 1000000 ] || continue
+			[ "$(uci -q get "sqm.$queue.download")" -ge 1000000 ] 2> /dev/null && continue
+			uci set "sqm.$queue.use_mq=0"
+		done
+		uci -q commit sqm
+	fi
+	uci -q batch <<-UCI
+		set milkflint.defaults=defaults
+		set milkflint.defaults.cake_mq_eth_1g='1'
 		commit milkflint
 	UCI
 fi

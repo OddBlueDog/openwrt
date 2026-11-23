@@ -505,22 +505,51 @@ function sample(t, n) {
 	return line;
 }
 
+// Smart Queue's delay one way since the sample before, [average, peak] in
+// us, as the report works it out (the UI's analysis.ts cakeDelay()): each
+// tin's average weighted by the bytes it sent meanwhile, the peak of those
+// that sent a twentieth of them and of the busiest. CAKE's averages move 1/256 a packet: with
+// fewer packets than that between samples they're still an earlier burst's
+// (a quiet cake_mq queue keeps one for minutes), so none then.
+function cake_delay(cake, was, down) {
+	let packets = 0, total = 0, sum = 0, pk = 0, busiest = 0, tins = [];
+	for (let k, q in cake) {
+		const p = was?.[k];
+		if ((index(k, IFB + ' ') == 0) != down || !p)
+			continue;
+		packets += max(0, q[1] - p[1]);
+		for (let i, t in q[4]) {
+			const bytes = t[0] - (p[4]?.[i]?.[0] ?? t[0]);
+			if (bytes > 0)
+				push(tins, [ bytes, t[6], t[5] ]);
+		}
+	}
+	for (let x in tins) {
+		total += x[0];
+		sum += x[0] * x[1];
+		busiest = max(busiest, x[0]);
+	}
+	if (!total || packets < 256)
+		return null;
+	for (let x in tins)
+		if (x[0] * 20 >= total || x[0] == busiest)
+			pk = max(pk, x[2]);
+	return [ int(sum / total), pk ];
+}
+
 // what the bench's pages show while the run is on: the last sample, in short
+let live_cake = null;
 function live(line) {
 	const l = { t: line.t, cpu: map(line.cpu ?? [], (c) => c ? [ c[0], c[1] ] : null), self: line.self };
 	const w = line.if?.[WAN];
 	if (w && line.dt)
 		l.wan = [ int(w[0] * 8 / line.dt), int(w[1] * 8 / line.dt) ];
-	for (let k, q in line.cake) {
-		const down = index(k, IFB + ' ') == 0;
-		let av = 0, pk = 0;
-		for (let t in q[4]) {
-			av = max(av, t[6]);
-			pk = max(pk, t[5]);
-		}
-		const slot = down ? 'down' : 'up';
-		l[slot] = [ max(l[slot]?.[0] ?? 0, av), max(l[slot]?.[1] ?? 0, pk) ];
-	}
+	const down = cake_delay(line.cake, live_cake, true), up = cake_delay(line.cake, live_cake, false);
+	live_cake = line.cake;
+	if (down)
+		l.down = down;
+	if (up)
+		l.up = up;
 	if (line.ct_scan)
 		l.off = [ line.ct_scan.off, line.ct_scan.n ];
 	else if (last_live?.off)

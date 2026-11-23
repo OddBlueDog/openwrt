@@ -1,0 +1,15 @@
+#!/bin/sh
+# MilkFlint (ui feature "vpn"): refresh the VPN DNS nftables interface sets
+# when an interface comes up or down (e.g. a guest bridge starting after boot),
+# only while milkflint-vpn's forwarder is running.
+[ "$INTERFACE" = loopback ] && exit 0
+case "$ACTION" in
+	ifup|ifdown)
+		[ -x /etc/init.d/milkflint-vpn ] || exit 0
+		ucode -e '
+			import * as v from "/usr/libexec/milkflint/vpn-dns.uc";
+			if (v.forwarder_running() && v.vpn_dns_servers())
+				v.apply_nft();
+		' 2> /dev/null
+		;;
+esac

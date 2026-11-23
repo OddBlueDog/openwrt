@@ -21,10 +21,16 @@
 # keeps them while it stays loaded.
 #
 #   cake-ecn
+#
+# Exits 1 when sch_cake isn't loaded, so nothing was set: milkflint-tuning
+# then doesn't count it as done. A sch_cake without a parameter (an older
+# one) has nothing to set for it.
 
 P=/sys/module/sch_cake/parameters/ecn_fail_count
 RAMP=/sys/module/sch_cake/parameters/l4s_ramp
 DEFAULT=8
+
+[ -d /sys/module/sch_cake/parameters ] || exit 1
 
 if [ -w "$RAMP" ]; then
 	v=$(uci -q get milkflint.cake.l4s)
@@ -40,7 +46,7 @@ if [ -w "$RAMP" ]; then
 	echo "$n" > "$RAMP"
 fi
 
-# sch_cake not loaded yet (Smart Queue off), or without the parameter
+# a sch_cake without the parameter
 [ -w "$P" ] || exit 0
 v=$(uci -q get milkflint.cake.ecn_drop)
 case "$v" in
