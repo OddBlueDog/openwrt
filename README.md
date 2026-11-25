@@ -18,24 +18,24 @@ It also has its own web interface for the everyday settings, served at the
 router's address; LuCI stays installed under "Advanced".
 
 MilkFlint is experimental (an alpha). Images are on the
-[Releases](https://github.com/OddBlueDog/openwrt/releases) page. The same
-build also makes images for the Zyxel EX5601-T0 (also sold as the EX5601-T1
-and Telenor's T-56), which has the same MT7986: those are more experimental
-still, built but not tested on the hardware here (see below).
+[Releases](https://github.com/OddBlueDog/openwrt/releases) page, for the
+GL.iNet GL-MT6000 (Flint 2) only: earlier releases also had images for the
+Zyxel EX5601-T0, which are no longer built.
 
 ## Installing
 
-> **Don't keep settings.** Untick "Keep settings" when you flash MilkFlint,
-> whether the router runs GL.iNet's firmware, OpenWrt or an earlier
-> MilkFlint (from a shell: `sysupgrade -n`). Settings from another firmware
-> or an earlier alpha may not match this one; start clean and set the
-> router up again. Back up first if you want your old settings for
-> reference.
+> **Already on MilkFlint? Keep your settings.** Flashing over an earlier
+> MilkFlint with "Keep settings" ticked keeps your configuration, and the
+> update brings it up to date. **From GL.iNet's firmware or OpenWrt, don't
+> keep settings:** untick "Keep settings" (from a shell: `sysupgrade -n`),
+> as settings from another firmware may not match this one.
 
 Flash only `milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin`. Never
 the factory, preloader or bl31-uboot images: they can brick the router or
 replace its bootloader, and with it the U-Boot recovery page.
 
+- **From an earlier MilkFlint:** System → Upgrade, or LuCI's System →
+  Backup / Flash Firmware → Flash image, with "Keep settings" ticked.
 - **From GL.iNet's firmware:** at <http://192.168.8.1>, System → Upgrade →
   Local Upgrade, upload the image, untick "Keep Settings".
 - **From OpenWrt:** LuCI's System → Backup / Flash Firmware → Flash image,
@@ -43,8 +43,8 @@ replace its bootloader, and with it the U-Boot recovery page.
 - **If it won't boot:** U-Boot recovery, on
   [OpenWrt's GL-MT6000 page](https://openwrt.org/toh/gl.inet/gl-mt6000).
 
-Then plug a cable into a LAN port and open <http://192.168.1.1>. There's no
-password yet: sign in with it empty and set one under System → Admin
+After a fresh install (settings not kept), plug a cable into a LAN port and
+open <http://192.168.1.1>. There's no password yet: sign in with it empty and set one under System → Admin
 Password. Wi-Fi is off until you set it up on the Wi-Fi page, with your
 country.
 
@@ -57,27 +57,6 @@ key the images already trust: `apk update` then `apk add kmod-…` (or
 LuCI's Software page) works as on OpenWrt. Modules built for another
 MilkFlint's kernel are refused. The MT7921/MT7925 and MT7996 Wi-Fi cards'
 drivers aren't in the feed.
-
-### Zyxel EX5601-T0 / T-56 (experimental)
-
-Built from the same tree, not tested on the hardware here: reports welcome.
-Install OpenWrt on it first, following
-[OpenWrt's device page](https://openwrt.org/toh/zyxel/t-56#installation)
-(filed under the T-56, an ISP's EX5601-T1: the same router without the
-SFP+ port) and the
-[EX5601-T0 forum thread](https://forum.openwrt.org/t/adding-openwrt-support-for-zyxel-ex5601-t0/155914),
-and make sure you can recover it from there (serial console, recovery image)
-before you flash anything else. Then flash the MilkFlint image for the
-flash layout it has, which `cat /tmp/sysinfo/board_name` tells:
-
-- `zyxel,ex5601-t0-ubootmod` (OpenWrt's U-Boot):
-  `milkflint-*-zyxel_ex5601-t0-ubootmod-squashfs-sysupgrade.itb`
-- `zyxel,ex5601-t0-stock` (Zyxel's bootloader):
-  `milkflint-*-zyxel_ex5601-t0-stock-squashfs-sysupgrade.bin`
-
-OpenWrt refuses an image for the other layout. Never flash the preloader or
-bl31-uboot images unless OpenWrt's page tells you to: they replace the
-bootloader. Its WAN port is `wan`, its LAN ports `lan1` to `lan4`.
 
 ## This branch
 
@@ -114,8 +93,7 @@ make -j$(nproc)
 `feeds install` says it isn't overriding the core packages in
 `package/milkflint/`: that's how they replace the feeds' copies. The images
 are in `bin/targets/mediatek/filogic/`; flash the
-`milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin` one, or the EX5601's
-for its layout (see Installing).
+`milkflint-*-glinet_gl-mt6000-squashfs-sysupgrade.bin` one.
 
 The configuration builds every kernel module as a package for the feed
 (`CONFIG_ALL_KMODS`), which takes a while; take it out of `.config` before
@@ -169,10 +147,12 @@ next to the package:
 `https://milkflint-packages.pages.dev/sources/adguardhome/<version>/SOURCE.txt`.
 
 **Updates** come from that same site, a feed signed with the key the
-images trust, tagged `@milkflint` in apk so OpenWrt's own `adguardhome`
-package (built another way) never replaces it. The page installs the
-newest, or goes back to one of the earlier versions the feed keeps.
-AdGuard Home's own updater is off (`--no-check-update`).
+images trust, tagged `@milkflint` in apk. `/etc/apk/world` pins AdGuard Home
+by version so OpenWrt's own `adguardhome` package (built another way) never
+replaces it and offline `apk` commands keep working without a cached index.
+The page installs the newest from `@milkflint`, or goes back to one of the
+earlier versions the feed keeps. AdGuard Home's own updater is off
+(`--no-check-update`).
 
 ---
 
