@@ -16,70 +16,231 @@ ubus interface, until hostapd is restarted.
 Wait for each part of the reply with poll(), and end the request with
 -ETIMEDOUT after 5 seconds without one. The kernel has handled the
 request by the time it was sent, and each part of a dump follows the
-read before it, so a reply that is seconds late was lost.
+read before it, so a reply that is seconds late was lost. Only a
+message of the reply (its sequence number) restarts the 5 seconds: on a
+shared socket the events and frames read meanwhile don't stop when the
+queue is full enough to drop a reply, and they would keep the wait from
+ever ending. What's left of the wait is rounded up to the next ms, so a
+reply already there with under 1 ms to go is still read.
+
+The wait is in nl80211_reply_wait.h, so that a test can run it on
+sockets of its own.
 
 Signed-off-by: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
 ---
- src/drivers/driver_nl80211.c | 34 +++++++++++++++++++++++++++++++++-
- 1 file changed, 33 insertions(+), 1 deletion(-)
+ src/drivers/driver_nl80211.c     |  38 +++++-------
+ src/drivers/nl80211_reply_wait.h | 128 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 143 insertions(+), 23 deletions(-)
 
 diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
-index 2c7a2d8..4da8f8f 100644
+index 09e9b56..6b7b745 100644
 --- a/src/drivers/driver_nl80211.c
 +++ b/src/drivers/driver_nl80211.c
-@@ -14,6 +14,7 @@
- #include <sys/types.h>
- #include <sys/utsname.h>
- #include <fcntl.h>
-+#include <poll.h>
- #include <net/if.h>
- #include <netlink/genl/genl.h>
- #include <netlink/genl/ctrl.h>
-@@ -519,6 +520,9 @@ out:
+@@ -41,6 +41,7 @@
+ #include "radiotap_iter.h"
+ #include "rfkill.h"
+ #include "driver_nl80211.h"
++#include "nl80211_reply_wait.h"
+ 
+ 
+ #ifndef NETLINK_CAP_ACK
+@@ -519,6 +520,13 @@ out:
  }
  
  
-+/* the longest wait for the next message of a reply after the request went out */
-+#define NL80211_REPLY_TIMEOUT_MS 5000
++/* each message read while a reply is awaited: those of the reply count */
++static int reply_msg_in_handler(struct nl_msg *msg, void *arg)
++{
++	nl80211_reply_wait_msg(arg, msg);
++	return debug_handler(msg, NULL);
++}
 +
  int send_and_recv_glb(struct nl80211_global *global,
  		      struct wpa_driver_nl80211_data *drv, /* may be NULL */
  		      struct nl_sock *nl_handle, struct nl_msg *msg,
-@@ -596,8 +600,36 @@ int send_and_recv_glb(struct nl80211_global *global,
+@@ -530,6 +538,7 @@ int send_and_recv_glb(struct nl80211_global *global,
+ {
+ 	struct nl_cb *cb, *s_nl_cb;
+ 	struct nl80211_ack_err_args err;
++	struct nl80211_reply_wait wait = {};
+ 	int opt;
+ 
+ 	if (!msg)
+@@ -577,8 +586,9 @@ int send_and_recv_glb(struct nl80211_global *global,
+ 	err.orig_msg = msg;
+ 	err.err_info = err_info;
+ 	err.drv = drv;
++	wait.seq = nlmsg_hdr(msg)->nlmsg_seq;
+ 
+-	nl_cb_set(cb, NL_CB_MSG_IN, NL_CB_CUSTOM, debug_handler, NULL);
++	nl_cb_set(cb, NL_CB_MSG_IN, NL_CB_CUSTOM, reply_msg_in_handler, &wait);
+ 	nl_cb_err(cb, NL_CB_CUSTOM, error_handler, &err);
+ 	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, &err.err);
+ 	if (ack_handler_custom) {
+@@ -595,28 +605,10 @@ int send_and_recv_glb(struct nl80211_global *global,
+ 		nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM,
  			  valid_handler, valid_data);
  
- 	while (err.err > 0) {
+-	while (err.err > 0) {
 -		int res = nl_recvmsgs(nl_handle, cb);
+-
+-		if (res == -NLE_DUMP_INTR) {
+-			/* Most likely one of the nl80211 dump routines hit a
+-			 * case where internal results changed while the dump
+-			 * was being sent. The most common known case for this
+-			 * is scan results fetching while associated were every
+-			 * received Beacon frame from the AP may end up
+-			 * incrementing bss_generation. This
+-			 * NL80211_CMD_GET_SCAN case tries again in the caller;
+-			 * other cases (of which there are no known common ones)
+-			 * will stop and return an error. */
+-			wpa_printf(MSG_DEBUG, "nl80211: %s; convert to -EAGAIN",
+-				   nl_geterror(res));
+-			err.err = -EAGAIN;
+-		} else if (res < 0) {
+-			wpa_printf(MSG_INFO,
+-				   "nl80211: %s->nl_recvmsgs failed: %d (%s)",
+-				   __func__, res, nl_geterror(res));
+-		}
+-	}
++	nl80211_reply_wait_recv(nl_handle, cb, &wait, &err.err,
++				NL80211_REPLY_TIMEOUT_MS,
++				((struct genlmsghdr *)
++				 nlmsg_data(nlmsg_hdr(msg)))->cmd);
+  out:
+ 	nl_cb_put(cb);
+ 	/* Always clear the message as it can potentially contain keys */
+diff --git a/src/drivers/nl80211_reply_wait.h b/src/drivers/nl80211_reply_wait.h
+new file mode 100644
+index 0000000..1a9df02
+--- /dev/null
++++ b/src/drivers/nl80211_reply_wait.h
+@@ -0,0 +1,128 @@
++/*
++ * Driver interaction with Linux nl80211/cfg80211: the wait for the reply to
++ * a request (send_and_recv_glb()), in a header of its own so that a test can
++ * run it on a socket of its own.
++ *
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
++ */
++
++#ifndef NL80211_REPLY_WAIT_H
++#define NL80211_REPLY_WAIT_H
++
++#include <poll.h>
++#include <netlink/netlink.h>
++#include <netlink/msg.h>
++#include <netlink/socket.h>
++#include <netlink/handlers.h>
++#include "utils/common.h"
++
++/* the longest wait for the next message of a reply after the request went out */
++#define NL80211_REPLY_TIMEOUT_MS 5000
++
++struct nl80211_reply_wait {
++	unsigned int seq;
++	unsigned int msgs;	/* the reply's messages so far */
++};
++
++/* For the NL_CB_MSG_IN handler, which sees every message read: is it one of
++ * the reply's?
++ */
++static inline void nl80211_reply_wait_msg(struct nl80211_reply_wait *wait,
++					  struct nl_msg *msg)
++{
++	if (nlmsg_hdr(msg)->nlmsg_seq == wait->seq)
++		wait->msgs++;
++}
++
++/* What's left of the wait in ms, rounded up (less than 1 ms left still looks
++ * once), 0 once it's over.
++ */
++static inline int nl80211_reply_wait_ms(struct os_reltime *deadline,
++					struct os_reltime *now)
++{
++	struct os_reltime left;
++
++	if (!os_reltime_before(now, deadline))
++		return 0;
++	os_reltime_sub(deadline, now, &left);
++	return os_reltime_in_ms(&left) + !!(left.usec % 1000);
++}
++
++/*
++ * Reads @nl_handle with @cb while *@pending is positive, that is until the
++ * reply's handlers end it (send_and_recv_glb()'s err.err).
++ *
++ * The kernel queues the reply while it handles the request, so it is there
++ * unless the receive queue was full and the reply was dropped (ENOBUFS).
++ * Don't wait for ever then, and don't spin on a non-blocking socket (one
++ * that an eloop handler reads, which also gets events and EAPOL frames),
++ * where nl_recvmsgs() returns 0 when there is nothing to read. Only a
++ * message of the reply (@wait, counted by the caller's NL_CB_MSG_IN
++ * handler with nl80211_reply_wait_msg()) gives the next one @timeout_ms
++ * more: the events and frames read meanwhile don't stop when the queue is
++ * that full, nor do signals. With nothing of the reply in that time,
++ * *@pending ends as -ETIMEDOUT (or poll()'s -errno). @cmd, the request's,
++ * is for the log.
++ */
++static inline void nl80211_reply_wait_recv(struct nl_sock *nl_handle,
++					   struct nl_cb *cb,
++					   struct nl80211_reply_wait *wait,
++					   int *pending, int timeout_ms,
++					   unsigned int cmd)
++{
++	struct os_reltime deadline, now;
++
++	os_get_reltime(&deadline);
++	os_reltime_add_ms(&deadline, timeout_ms);
++	while (*pending > 0) {
 +		struct pollfd pfd = {
 +			.fd = nl_socket_get_fd(nl_handle),
 +			.events = POLLIN,
 +		};
-+		int res;
++		unsigned int msgs;
++		int res, ms, err;
 +
-+		/*
-+		 * The kernel queues the reply while it handles the request, so
-+		 * it is there unless the receive queue was full and the reply
-+		 * was dropped (ENOBUFS). Don't wait for ever then, and don't
-+		 * spin on a non-blocking socket (one that an eloop handler
-+		 * reads, which also gets events and EAPOL frames), where
-+		 * nl_recvmsgs() returns 0 when there is nothing to read.
-+		 */
-+		res = poll(&pfd, 1, NL80211_REPLY_TIMEOUT_MS);
-+		if (res < 0 && errno == EINTR)
++		os_get_reltime(&now);
++		ms = nl80211_reply_wait_ms(&deadline, &now);
++		res = ms > 0 ? poll(&pfd, 1, ms) : 0;
++		err = errno;
++		if (res < 0 && err == EINTR)
 +			continue;
 +		if (res <= 0) {
 +			wpa_printf(MSG_ERROR,
 +				   "nl80211: no reply to command %u in %d ms%s%s",
-+				   ((struct genlmsghdr *)
-+				    nlmsg_data(nlmsg_hdr(msg)))->cmd,
-+				   NL80211_REPLY_TIMEOUT_MS,
-+				   res < 0 ? ": " : "",
-+				   res < 0 ? strerror(errno) : "");
-+			err.err = res < 0 ? -errno : -ETIMEDOUT;
++				   cmd, timeout_ms, res < 0 ? ": " : "",
++				   res < 0 ? strerror(err) : "");
++			*pending = res < 0 ? -err : -ETIMEDOUT;
 +			break;
 +		}
- 
++
++		msgs = wait->msgs;
 +		res = nl_recvmsgs(nl_handle, cb);
- 		if (res == -NLE_DUMP_INTR) {
- 			/* Most likely one of the nl80211 dump routines hit a
- 			 * case where internal results changed while the dump
++		if (wait->msgs != msgs) {
++			os_get_reltime(&deadline);
++			os_reltime_add_ms(&deadline, timeout_ms);
++		}
++		if (res == -NLE_DUMP_INTR) {
++			/* Most likely one of the nl80211 dump routines hit a
++			 * case where internal results changed while the dump
++			 * was being sent. The most common known case for this
++			 * is scan results fetching while associated were every
++			 * received Beacon frame from the AP may end up
++			 * incrementing bss_generation. This
++			 * NL80211_CMD_GET_SCAN case tries again in the caller;
++			 * other cases (of which there are no known common ones)
++			 * will stop and return an error. */
++			wpa_printf(MSG_DEBUG, "nl80211: %s; convert to -EAGAIN",
++				   nl_geterror(res));
++			*pending = -EAGAIN;
++		} else if (res < 0) {
++			wpa_printf(MSG_INFO,
++				   "nl80211: send_and_recv_glb->nl_recvmsgs failed: %d (%s)",
++				   res, nl_geterror(res));
++		}
++	}
++}
++
++#endif /* NL80211_REPLY_WAIT_H */
