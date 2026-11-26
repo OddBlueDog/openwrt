@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:00:26 +0000
+Subject: [PATCH] wifi: mt76: mt7915: reset spatial reuse shadow state on full
+ reset
+
+mt7915_mac_full_reset() restarts the firmware and clears dev->vif_mask
+and phy->omac_mask, after which mac80211 re-adds interfaces with fresh
+VIF indices. phy->spr_vifs, spr_dpd_off and spr_forced_off were not
+cleared, leaving stale VIF bits that prevent disabling spatial reuse
+and stale firmware-state flags on both bands.
+
+Reset spr_vifs, spr_dpd_off and spr_forced_off on both phys during
+mt7915_mac_full_reset() while keeping the configured spr_mode, and add
+a KUnit test verifying both bands.
+---
+ mt7915/mac.c            |  9 ++++++++-
+ mt7915/tests/mac-test.c | 40 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 9ce2d3ce..52c4577c 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1709,8 +1709,15 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ 		dev_err(dev->mt76.dev, "chip full reset failed\n");
+ 
+ 	dev->phy.omac_mask = 0;
+-	if (phy2)
++	dev->phy.spr_vifs = 0;
++	dev->phy.spr_dpd_off = false;
++	dev->phy.spr_forced_off = false;
++	if (phy2) {
+ 		phy2->omac_mask = 0;
++		phy2->spr_vifs = 0;
++		phy2->spr_dpd_off = false;
++		phy2->spr_forced_off = false;
++	}
+ 
+ 	/* the restarted firmware has no radar detector running */
+ 	dev->mphy.dfs_state = MT_DFS_STATE_UNKNOWN;
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 25aba6ab..3e3b4479 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -6323,6 +6323,45 @@ static void mt7915_test_ps_release_clears_dozing(struct kunit *test)
+ 	cancel_delayed_work_sync(&dev->mphy.mac_work);
+ }
+ 
++/* Full reset restarts the firmware and wipes VIF slots, so the per-phy
++ * spatial reuse shadow state (spr_vifs, spr_dpd_off, spr_forced_off) must
++ * be cleared on both bands while keeping the configured spr_mode.
++ */
++static void mt7915_test_full_reset_clears_spr(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_hw_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_phy *phy1 = mt7915_test_band1(test, env);
++
++	mt7915_test_rings(test, dev);
++	mt7915_test_soc(test, dev, true);
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++
++	dev->phy.spr_vifs = BIT_ULL(3);
++	dev->phy.spr_dpd_off = true;
++	dev->phy.spr_forced_off = true;
++	dev->phy.spr_mode = MT7915_SPR_OFF;
++	phy1->spr_vifs = BIT_ULL(5);
++	phy1->spr_dpd_off = true;
++	phy1->spr_forced_off = true;
++	phy1->spr_mode = MT7915_SPR_FIXED;
++
++	dev->recovery.hw_init_done = true;
++	dev->recovery.restart = true;
++	dev->recovery.state = MT_MCU_CMD_WM_WDT;
++
++	mt7915_mac_reset_work(&dev->reset_work);
++
++	KUNIT_EXPECT_EQ(test, dev->phy.spr_vifs, 0ULL);
++	KUNIT_EXPECT_FALSE(test, dev->phy.spr_dpd_off);
++	KUNIT_EXPECT_FALSE(test, dev->phy.spr_forced_off);
++	KUNIT_EXPECT_EQ(test, dev->phy.spr_mode, MT7915_SPR_OFF);
++	KUNIT_EXPECT_EQ(test, phy1->spr_vifs, 0ULL);
++	KUNIT_EXPECT_FALSE(test, phy1->spr_dpd_off);
++	KUNIT_EXPECT_FALSE(test, phy1->spr_forced_off);
++	KUNIT_EXPECT_EQ(test, phy1->spr_mode, MT7915_SPR_FIXED);
++}
++
+ /* The tx buffers WED sends from on the host's behalf (its token half): one
+  * cut-through 802.3 descriptor each, its single buffer right after the
+  * descriptor and the txp, tagged with the WED's token. The rest of both is
+@@ -6535,6 +6574,7 @@ static struct kunit_case mt7915_mac_hw_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_full_reset),
+ 	KUNIT_CASE(mt7915_test_full_reset_wa),
+ 	KUNIT_CASE(mt7915_test_ps_release_clears_dozing),
++	KUNIT_CASE(mt7915_test_full_reset_clears_spr),
+ 	{}
+ };
+ 

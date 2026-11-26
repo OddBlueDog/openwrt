@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:01:06 +0000
+Subject: [PATCH] wifi: mt76: mt7915: hold the device mutex in vow_atf and
+ rf_regval debugfs
+
+mt7915_vow_atf_set(), mt7915_rf_regval_get() and mt7915_rf_regval_set()
+send MCU commands (and vow_atf_set updates dev->vow_atf_en) without
+holding dev->mt76.mutex, racing with full reset and other MCU callers.
+
+Acquire dev->mt76.mutex around the MCU calls and dev->vow_atf_en
+accesses, and add a KUnit test verifying that every MCU message sent by
+these callbacks holds dev->mt76.mutex.
+---
+ mt7915/debugfs.c            | 19 ++++++++++++---
+ mt7915/tests/debugfs-test.c | 48 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index b64d87d2..d189fd24 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -207,22 +207,28 @@ static const struct file_operations mt7915_sys_recovery_ops = {
+ static int mt7915_vow_atf_set(void *data, u64 val)
+ {
+ 	struct mt7915_dev *dev = data;
++	int ret;
+ 
+ 	if (mt7915_vow_stock)
+ 		return -EOPNOTSUPP;
+ 
++	mutex_lock(&dev->mt76.mutex);
+ 	dev->vow_atf_en = !!val;
+ 	mt7915_mcu_set_vow_feature_ctrl(dev);
++	ret = mt7915_mcu_set_vow_drr_ctrl(dev, NULL,
++					  VOW_DRR_CTRL_AIRTIME_DEFICIT_BOUND, 0);
++	mutex_unlock(&dev->mt76.mutex);
+ 
+-	return mt7915_mcu_set_vow_drr_ctrl(dev, NULL,
+-					   VOW_DRR_CTRL_AIRTIME_DEFICIT_BOUND, 0);
++	return ret;
+ }
+ 
+ static int mt7915_vow_atf_get(void *data, u64 *val)
+ {
+ 	struct mt7915_dev *dev = data;
+ 
++	mutex_lock(&dev->mt76.mutex);
+ 	*val = dev->vow_atf_en;
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return 0;
+ }
+@@ -1372,7 +1378,9 @@ mt7915_rf_regval_get(void *data, u64 *val)
+ 	u32 regval;
+ 	int ret;
+ 
++	mutex_lock(&dev->mt76.mutex);
+ 	ret = mt7915_mcu_rf_regval(dev, dev->mt76.debugfs_reg, &regval, false);
++	mutex_unlock(&dev->mt76.mutex);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1386,8 +1394,13 @@ mt7915_rf_regval_set(void *data, u64 val)
+ {
+ 	struct mt7915_dev *dev = data;
+ 	u32 val32 = val;
++	int ret;
++
++	mutex_lock(&dev->mt76.mutex);
++	ret = mt7915_mcu_rf_regval(dev, dev->mt76.debugfs_reg, &val32, true);
++	mutex_unlock(&dev->mt76.mutex);
+ 
+-	return mt7915_mcu_rf_regval(dev, dev->mt76.debugfs_reg, &val32, true);
++	return ret;
+ }
+ 
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7915_rf_regval_get,
+diff --git a/mt7915/tests/debugfs-test.c b/mt7915/tests/debugfs-test.c
+index ef143ada..3e14862d 100644
+--- a/mt7915/tests/debugfs-test.c
++++ b/mt7915/tests/debugfs-test.c
+@@ -8,6 +8,7 @@
+ #include <kunit/test.h>
+ #include <linux/completion.h>
+ #include <linux/workqueue.h>
++#include "../../tests/fake.h"
+ 
+ struct mt7915_debugfs_test_twt {
+ 	struct work_struct work;
+@@ -393,6 +394,52 @@ static void mt7915_debugfs_test_fwlog_close(struct kunit *test)
+ 	clear_bit(MT76_REMOVED, &dev->mphy.state);
+ }
+ 
++static void mt7915_debugfs_test_rf_reply(struct mt76_test_fake *fake,
++					 const struct mt76_test_msg *msg,
++					 struct sk_buff *reply)
++{
++	__le32 data[3] = { 0, 0, cpu_to_le32(0x12345678) };
++
++	if (msg->cmd == MCU_EXT_QUERY(RF_REG_ACCESS))
++		skb_put_data(reply, data, sizeof(data));
++}
++
++/* vow_atf and rf_regval debugfs callbacks send MCU commands and must hold
++ * dev->mt76.mutex so they serialize with full reset and other MCU callers.
++ */
++static void mt7915_debugfs_test_mcu_mutex(struct kunit *test)
++{
++	struct mt76_test_fake *fake = NULL;
++	struct mt76_test_msg *msg;
++	struct mt7915_dev *dev;
++	unsigned int before, idx = 0, seen = 0;
++	u64 val = 0;
++
++	dev = mt7915_init_test_device(test, MT7976_ONE_ADIE_DBDC, &fake);
++	KUNIT_ASSERT_NOT_NULL(test, fake);
++	before = fake->n_msgs;
++	fake->reply = mt7915_debugfs_test_rf_reply;
++
++	KUNIT_EXPECT_EQ(test, mt7915_vow_atf_set(dev, 1), 0);
++	KUNIT_EXPECT_EQ(test, mt7915_vow_atf_get(dev, &val), 0);
++	KUNIT_EXPECT_EQ(test, val, 1ULL);
++
++	KUNIT_EXPECT_EQ(test, mt7915_rf_regval_get(dev, &val), 0);
++	KUNIT_EXPECT_EQ(test, val, 0x12345678ULL);
++	KUNIT_EXPECT_EQ(test, mt7915_rf_regval_set(dev, 0x87654321ULL), 0);
++
++	list_for_each_entry(msg, &fake->msgs, list) {
++		if (idx++ < before)
++			continue;
++		KUNIT_EXPECT_TRUE_MSG(test, msg->locked,
++				      "msg %u cmd 0x%x unlocked",
++				      seen, msg->cmd);
++		seen++;
++	}
++	KUNIT_EXPECT_EQ(test, seen, 4U);
++	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
++}
++
+ static struct kunit_case mt7915_debugfs_test_cases[] = {
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_stats_locked),
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_policy_set),
+@@ -400,6 +447,7 @@ static struct kunit_case mt7915_debugfs_test_cases[] = {
+ 	KUNIT_CASE(mt7915_debugfs_test_muru),
+ 	KUNIT_CASE(mt7915_debugfs_test_rdd_reports),
+ 	KUNIT_CASE(mt7915_debugfs_test_fwlog_close),
++	KUNIT_CASE(mt7915_debugfs_test_mcu_mutex),
+ 	{}
+ };
+ 

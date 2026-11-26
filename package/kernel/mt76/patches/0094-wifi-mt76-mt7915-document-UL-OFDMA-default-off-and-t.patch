@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:21:31 +0100
+Subject: [PATCH] wifi: mt76: mt7915: document UL OFDMA default off and test
+ muru_ofdma_ul
+
+Keep muru_ofdma_ul off by default as in stock mt76 (upstream 75977a85
+disabled UL OFDMA due to firmware hangs), document why in the parameter
+description, and verify both default-off and enabled paths in
+mt7915_test_sta_muru.
+---
+ mt7915/mcu.c            | 5 ++++-
+ mt7915/tests/mcu-test.c | 9 +++++----
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index f73a9ad0..72399f72 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -54,9 +54,12 @@ static bool vow_fw_quanta;
+ module_param(vow_fw_quanta, bool, 0444);
+ MODULE_PARM_DESC(vow_fw_quanta, "Alternative airtime (VoW) values: no WATF with ATF, the firmware's own quantum table, station quanta one level down");
+ 
++/* Off by default, as stock mt76 has it since upstream found UL OFDMA hung
++ * the firmware (75977a85).
++ */
+ static bool muru_ofdma_ul;
+ module_param(muru_ofdma_ul, bool, 0644);
+-MODULE_PARM_DESC(muru_ofdma_ul, "Let the firmware schedule UL OFDMA for HE stations (the firmware keeps the first station's setting per band, so set it before stations join)");
++MODULE_PARM_DESC(muru_ofdma_ul, "Let the firmware schedule UL OFDMA for HE stations (default off, as stock mt76; the firmware keeps the first station's setting per band, so set it before stations join)");
+ 
+ static int muru_platform_type = -1;
+ module_param(muru_platform_type, int, 0444);
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 83654be4..04153e72 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -2823,9 +2823,9 @@ static void mt7915_test_muru_ofdma_ul_off(void *data)
+ 	muru_ofdma_ul = false;
+ }
+ 
+-/* MU settings for APs and stations: DL OFDMA always, UL OFDMA with the
+- * muru_ofdma_ul switch, UL MU-MIMO on this chip, DL MU-MIMO if we can MU
+- * beamform, and the station's HE MU capabilities.
++/* MU settings for APs and stations: DL OFDMA always, UL OFDMA only with
++ * the muru_ofdma_ul switch on, UL MU-MIMO on this chip, DL MU-MIMO if we
++ * can MU beamform, and the station's HE MU capabilities.
+  */
+ static void mt7915_test_sta_muru(struct kunit *test)
+ {
+@@ -2833,13 +2833,14 @@ static void mt7915_test_sta_muru(struct kunit *test)
+ 	struct sta_rec_muru *muru;
+ 	struct mt7915_test_ctx c;
+ 
++	/* by default as stock mt76 sends it: DL OFDMA only */
+ 	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
+ 	muru = mt7915_test_muru_tlv(test, &c);
+ 	KUNIT_ASSERT_NOT_NULL(test, muru);
+ 	KUNIT_EXPECT_TRUE(test, muru->cfg.ofdma_dl_en);
+ 	KUNIT_EXPECT_FALSE(test, muru->cfg.ofdma_ul_en);
+ 
+-	/* for every station */
++	/* switched on: UL OFDMA too */
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+ 			mt7915_test_muru_ofdma_ul_off, NULL), 0);
+ 	muru_ofdma_ul = true;

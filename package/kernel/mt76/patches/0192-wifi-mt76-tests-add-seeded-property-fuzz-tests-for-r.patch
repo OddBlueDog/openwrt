@@ -1,0 +1,590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:27:58 +0000
+Subject: [PATCH] wifi: mt76: tests: add seeded property/fuzz tests for
+ reorder, tokens, tx-free, TWT and MCU events
+
+Add deterministic seeded PRNG property tests covering five hot paths:
+- mt76-agg-rx: mt76_test_reorder_property_fuzz (in-order/out-of-order,
+  duplicates, wrap-around, timeout release and BAR jumps; verifies
+  nframes, strictly advancing sequence order and skb accounting);
+- mt76-tx: mt76_tx_test_tokens_property_fuzz (token consume/release,
+  full range, unknown/double release; verifies token_count and
+  mgmt_tx_pending);
+- mt7915-mac-tx: mt7915_test_tx_free_property_fuzz (v3 and v0 tx-free
+  event parsing mixed with live tokens);
+- mt7915-mac-twt: mt7915_test_twt_property_fuzz (multi-station,
+  dual-band TWT setup, replacement, teardown and reset invariants);
+- mt7915-mcu-fw-events: mt7915_mcu2_events_property_fuzz (random-length
+  MCU events across unsolicited and reply EIDs; verifies zero skb leaks).
+---
+ mt7915/tests/mac-test.c  | 196 +++++++++++++++++++++++++++++++++++++++
+ mt7915/tests/mcu2-test.c |  70 ++++++++++++++
+ tests/agg-rx-test.c      | 105 +++++++++++++++++++++
+ tests/tx-test.c          | 114 +++++++++++++++++++++++
+ 4 files changed, 485 insertions(+)
+
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 3e3b4479..be05ff45 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -6362,6 +6362,200 @@ static void mt7915_test_full_reset_clears_spr(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, phy1->spr_mode, MT7915_SPR_FIXED);
+ }
+ 
++static u32 mt7915_test_prng(u32 *state)
++{
++	u32 x = *state;
++
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	*state = x;
++	return x;
++}
++
++/* Seeded property fuzzer over TX_FREE (v3 and v0) event parsing mixed with
++ * live tokens: checks token_count bounds and clean drain with zero leaks.
++ */
++static void mt7915_test_tx_free_property_fuzz(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct sk_buff *skbs[16] = {};
++	int ids[16];
++	u32 info[16];
++	u32 seed = 0x7915f001;
++	int step, i;
++
++	mt7915_test_sta(test, dev, 9, mvif);
++	for (i = 0; i < ARRAY_SIZE(ids); i++)
++		ids[i] = -1;
++
++	for (step = 0; step < 250; step++) {
++		u32 r = mt7915_test_prng(&seed);
++		int slot = r % ARRAY_SIZE(ids);
++
++		if (ids[slot] < 0) {
++			ids[slot] = mt7915_test_token(test, dev, 9, &skbs[slot]);
++		} else if (mt7915_test_skb_freed(skbs[slot])) {
++			kfree_skb(skbs[slot]);
++			skbs[slot] = NULL;
++			ids[slot] = -1;
++		}
++
++		if (r & BIT(16)) {
++			/* v3 TX_FREE with bounded length so WARN_ON_ONCE stays silent */
++			int n = 1 + ((r >> 8) % 6);
++			__le32 *ev;
++
++			for (i = 0; i < n; i++) {
++				u32 w = mt7915_test_prng(&seed);
++
++				if ((w & 3) == 0 && ids[w % ARRAY_SIZE(ids)] >= 0) {
++					info[i] = FIELD_PREP(MT_TX_FREE_MSDU_ID_V3,
++							     ids[w % ARRAY_SIZE(ids)]);
++				} else if ((w & 3) == 1) {
++					info[i] = MT_TX_FREE_PAIR |
++						  FIELD_PREP(MT_TX_FREE_WLAN_ID,
++							     (w >> 4) % 16);
++				} else {
++					info[i] = FIELD_PREP(MT_TX_FREE_MSDU_ID_V3,
++							     (w >> 4) & 0x1fff);
++				}
++			}
++			ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY,
++					       n, 3, info, n);
++			KUNIT_EXPECT_FALSE(test,
++					   mt7915_test_rx_check(dev, ev,
++								(2 + n) * 4));
++		} else {
++			/* v0 TX_FREE with random bounded count */
++			int n = (r >> 8) % 6;
++			int nwords = DIV_ROUND_UP(n, 2);
++			__le32 *ev;
++
++			for (i = 0; i < nwords; i++) {
++				u32 w = mt7915_test_prng(&seed);
++				u16 a = (w & 1) && ids[w % ARRAY_SIZE(ids)] >= 0 ?
++					ids[w % ARRAY_SIZE(ids)] : (w & 0xfff);
++				u16 b = ((w >> 16) & 0xfff);
++
++				info[i] = a | (b << 16);
++			}
++			ev = mt7915_test_event(test, PKT_TYPE_TXRX_NOTIFY_V0,
++					       n, 0, info, nwords);
++			KUNIT_EXPECT_FALSE(test,
++					   mt7915_test_rx_check(dev, ev,
++								(2 + nwords) * 4));
++		}
++
++		KUNIT_EXPECT_GE(test, dev->mt76.token_count, 0);
++		KUNIT_EXPECT_LE(test, dev->mt76.token_count,
++				(int)ARRAY_SIZE(ids));
++	}
++
++	for (i = 0; i < ARRAY_SIZE(ids); i++) {
++		if (ids[i] >= 0) {
++			struct mt76_txwi_cache *t;
++
++			t = mt76_token_release(&dev->mt76, ids[i], NULL);
++			if (t) {
++				if (t->skb)
++					dev_kfree_skb_any(t->skb);
++				t->skb = NULL;
++			}
++		}
++		if (skbs[i])
++			kfree_skb(skbs[i]);
++	}
++	KUNIT_EXPECT_EQ(test, dev->mt76.token_count, 0);
++}
++
++/* Seeded property fuzzer over TWT setup, replacement, teardown and reset
++ * across multiple stations and both bands. Checks table_mask, n_agrt,
++ * dev->twt_list length and per-station flowid_mask invariants on every step.
++ */
++static void mt7915_test_twt_property_fuzz(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_phy *phy1 = mt7915_test_band1(test, env);
++	struct mt7915_vif *mvif0 = mt7915_test_vif(test, dev, 1);
++	struct mt7915_vif *mvif1 = mt7915_test_vif(test, dev, 2);
++	struct mt7915_sta *stas[3];
++	u32 seed = 0x79157001;
++	int step;
++
++	mvif1->mt76.band_idx = 1;
++	stas[0] = mt7915_test_sta(test, dev, 9, mvif0);
++	stas[1] = mt7915_test_sta(test, dev, 10, mvif0);
++	stas[2] = mt7915_test_sta(test, dev, 11, mvif1);
++	mt7915_test_tsf(dev, 10000000);
++
++	for (step = 0; step < 250; step++) {
++		u32 r = mt7915_test_prng(&seed);
++		struct mt7915_sta *msta = stas[r % ARRAY_SIZE(stas)];
++		struct ieee80211_hw *hw = msta->vif->mt76.band_idx ?
++					  phy1->mt76->hw : dev->mt76.hw;
++		struct mt7915_twt_flow *flow;
++		unsigned int op = (r >> 8) % 10;
++		int list_cnt = 0, sta_cnt = 0, i;
++
++		if (op < 6) {
++			static const u8 cmds[] = {
++				TWT_SETUP_CMD_REQUEST,
++				TWT_SETUP_CMD_SUGGEST,
++				TWT_SETUP_CMD_DEMAND,
++			};
++			u8 exp = ((r >> 12) % 12) + 4;
++			u16 mant = ((r >> 16) % 2) ? 1024 : 0;
++			u8 dur = ((r >> 20) % 2) ? 64 : 0;
++			struct ieee80211_twt_setup *twt;
++			struct ieee80211_twt_params *p;
++
++			twt = mt7915_test_twt_req(test, cmds[(r >> 24) % 3],
++						  exp, mant, dur,
++						  IEEE80211_TWT_REQTYPE_TRIGGER);
++			p = mt7915_test_twt_params(twt);
++			p->req_type |= le16_encode_bits((r >> 4) & 7,
++							IEEE80211_TWT_REQTYPE_FLOWID);
++			mt7915_mac_add_twt_setup(hw, mt7915_test_to_sta(msta),
++						 twt);
++		} else if (op < 9) {
++			u8 flowid = (r >> 4) & 7;
++
++			mutex_lock(&dev->mt76.mutex);
++			mt7915_mac_twt_teardown_flow(dev, msta, flowid);
++			mutex_unlock(&dev->mt76.mutex);
++		} else {
++			mutex_lock(&dev->mt76.mutex);
++			mt7915_mac_twt_reset(dev);
++			mutex_unlock(&dev->mt76.mutex);
++		}
++
++		list_for_each_entry(flow, &dev->twt_list, list)
++			list_cnt++;
++		for (i = 0; i < ARRAY_SIZE(stas); i++)
++			sta_cnt += hweight8(stas[i]->twt.flowid_mask);
++
++		KUNIT_EXPECT_EQ_MSG(test, hweight16(dev->twt.table_mask),
++				    dev->twt.n_agrt,
++				    "step %d: table_mask vs n_agrt", step);
++		KUNIT_EXPECT_EQ_MSG(test, list_cnt, dev->twt.n_agrt,
++				    "step %d: twt_list vs n_agrt", step);
++		KUNIT_EXPECT_EQ_MSG(test, sta_cnt, dev->twt.n_agrt,
++				    "step %d: sta flowid_mask vs n_agrt", step);
++		KUNIT_EXPECT_LE(test, dev->twt.n_agrt, MT7915_MAX_TWT_AGRT);
++	}
++
++	mutex_lock(&dev->mt76.mutex);
++	mt7915_mac_twt_reset(dev);
++	mutex_unlock(&dev->mt76.mutex);
++	KUNIT_EXPECT_EQ(test, dev->twt.table_mask, 0);
++	KUNIT_EXPECT_EQ(test, dev->twt.n_agrt, 0);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->twt_list));
++}
++
+ /* The tx buffers WED sends from on the host's behalf (its token half): one
+  * cut-through 802.3 descriptor each, its single buffer right after the
+  * descriptor and the txp, tagged with the WED's token. The rest of both is
+@@ -6490,6 +6684,7 @@ static struct kunit_case mt7915_mac_tx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_sta_poll_airtime),
+ 	KUNIT_CASE(mt7915_test_sta_poll_no_sta),
+ 	KUNIT_CASE(mt7915_test_sta_poll_group_once),
++	KUNIT_CASE(mt7915_test_tx_free_property_fuzz),
+ 	{}
+ };
+ 
+@@ -6513,6 +6708,7 @@ static struct kunit_case mt7915_mac_twt_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_twt_schedule),
+ 	KUNIT_CASE(mt7915_test_twt_schedule_bands),
+ 	KUNIT_CASE(mt7915_test_twt_teardown),
++	KUNIT_CASE(mt7915_test_twt_property_fuzz),
+ 	{}
+ };
+ 
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index a18dd700..26958566 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -1824,6 +1824,75 @@ static void mt7915_mcu2_events_short(struct kunit *test)
+ 			&rxd, sizeof(rxd)));
+ }
+ 
++static u32 mt7915_mcu2_prng(u32 *state)
++{
++	u32 x = *state;
++
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	*state = x;
++	return x;
++}
++
++/* Seeded property fuzzer over mt7915_mcu_rx_event(): feeds random lengths
++ * (0..144 bytes) across unsolicited and reply EIDs/ext_EIDs and verifies
++ * that every skb is either consumed or cleanly queued on res_q with no leaks.
++ */
++static void mt7915_mcu2_events_property_fuzz(struct kunit *test)
++{
++	static const u8 ext_eids[] = {
++		MCU_EXT_EVENT_THERMAL_PROTECT,
++		MCU_EXT_EVENT_RDD_REPORT,
++		MCU_EXT_EVENT_CSA_NOTIFY,
++		MCU_EXT_EVENT_FW_LOG_2_HOST,
++		MCU_EXT_EVENT_BCC_NOTIFY,
++		MCU_EXT_EVENT_PS_SYNC,
++		MCU_EXT_EVENT_WA_TX_STAT,
++		MCU_EXT_EVENT_MURU_CTRL,
++		0xff,
++	};
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	u32 seed = 0x7915e001;
++	int step;
++
++	mt7915_mcu2_band1_phy(test, dev);
++	for (step = 0; step < 300; step++) {
++		u32 r = mt7915_mcu2_prng(&seed);
++		int len = r % 145;
++		struct sk_buff *skb, *q;
++		u8 *buf;
++		int i;
++
++		skb = alloc_skb(max(len, 1), GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(test, skb);
++		buf = skb_put(skb, len);
++		for (i = 0; i < len; i++)
++			buf[i] = mt7915_mcu2_prng(&seed) & 0xff;
++
++		if (len >= sizeof(struct mt76_connac2_mcu_rxd)) {
++			struct mt76_connac2_mcu_rxd *rxd = (void *)buf;
++
++			rxd->eid = (r & BIT(16)) ? MCU_EVENT_EXT :
++				   ((r & BIT(17)) ? MCU_CMD_EXT_CID :
++				    MCU_CMD_PATCH_SEM_CONTROL);
++			rxd->ext_eid = ext_eids[(r >> 18) % ARRAY_SIZE(ext_eids)];
++			rxd->seq = (r & BIT(24)) ? ((r >> 25) & 7) : 0;
++			/* avoid spamming wiphy_info on random log payloads */
++			if (rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST)
++				rxd->ext_eid = MCU_EXT_EVENT_PS_SYNC;
++		}
++
++		skb_get(skb);
++		mt7915_mcu2_rx(dev, skb);
++		while ((q = skb_dequeue(&dev->mt76.mcu.res_q)) != NULL)
++			kfree_skb(q);
++		KUNIT_EXPECT_EQ_MSG(test, refcount_read(&skb->users), 1,
++				    "step %d len %d leaked skb ref", step, len);
++		kfree_skb(skb);
++	}
++}
++
+ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_replies),
+ 	KUNIT_CASE(mt7915_mcu2_parse_wa_tx_stat),
+@@ -1843,6 +1912,7 @@ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_log),
+ 	KUNIT_CASE(mt7915_mcu2_events_csa_bcc),
+ 	KUNIT_CASE(mt7915_mcu2_events_short),
++	KUNIT_CASE(mt7915_mcu2_events_property_fuzz),
+ 	{}
+ };
+ 
+diff --git a/tests/agg-rx-test.c b/tests/agg-rx-test.c
+index df4fbd44..7817468f 100644
+--- a/tests/agg-rx-test.c
++++ b/tests/agg-rx-test.c
+@@ -735,6 +735,110 @@ static void mt76_test_aggr_timeout_by_tid(struct kunit *test)
+ 	__skb_queue_purge(&frames);
+ }
+ 
++static u32 mt76_test_aggr_prng(u32 *state)
++{
++	u32 x = *state;
++
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	*state = x;
++	return x;
++}
++
++/* Seeded property fuzzer over rx reorder: mixes in-order, out-of-order,
++ * duplicate, stale, wrap-around, timeout-release and BAR-jump operations.
++ * Checks on every step that tid->nframes equals the exact occupied-slot
++ * count, delivered sequence numbers advance strictly in order modulo 4096,
++ * and every allocated skb is accounted for with zero leaks.
++ */
++static void mt76_test_reorder_property_fuzz(struct kunit *test)
++{
++	struct mt76_test_aggr *a = mt76_test_aggr(test, true, 4090, 64);
++	struct mt76_rx_tid *tid = mt76_test_aggr_tid(a, 0);
++	u32 seed = 0x76a99f01;
++	int step, sent = 0, delivered = 0;
++	bool has_last = false;
++	u16 last_sn = 0;
++
++	for (step = 0; step < 500; step++) {
++		u32 r = mt76_test_aggr_prng(&seed);
++		unsigned int op = r % 10;
++		struct sk_buff *skb;
++		int occupied = 0, i;
++
++		if (op < 8) {
++			u16 head = tid->head;
++			u16 sn;
++
++			if (op < 2)
++				sn = head;
++			else if (op < 5)
++				sn = (head + 1 + (r >> 8) % (tid->size - 1)) &
++				     IEEE80211_SN_MASK;
++			else if (op == 5)
++				sn = (head - 1 - (r >> 8) % 8) &
++				     IEEE80211_SN_MASK;
++			else
++				sn = (head + tid->size + (r >> 8) % 24) &
++				     IEEE80211_SN_MASK;
++
++			skb = mt76_test_aggr_skb(test, a->wcid, sn);
++			sent++;
++			mt76_test_aggr_rx(a, skb);
++		} else if (op == 8) {
++			spin_lock_bh(&tid->lock);
++			for (i = 0; i < tid->size; i++) {
++				int idx = (tid->head + i) % tid->size;
++
++				if (tid->reorder_buf[idx]) {
++					mt76_test_aggr_status(tid->reorder_buf[idx])->reorder_time =
++						jiffies - mt76_aggr_tid_to_timeo(0) - 1;
++					break;
++				}
++			}
++			mt76_rx_aggr_check_release(tid, &a->frames);
++			spin_unlock_bh(&tid->lock);
++		} else {
++			u16 jump = (tid->head + 1 + (r >> 8) % 16) &
++				   IEEE80211_SN_MASK;
++
++			spin_lock_bh(&tid->lock);
++			mt76_rx_aggr_release_frames(tid, &a->frames, jump);
++			mt76_rx_aggr_release_head(tid, &a->frames);
++			spin_unlock_bh(&tid->lock);
++		}
++
++		while ((skb = __skb_dequeue(&a->frames)) != NULL) {
++			u16 sn = mt76_test_aggr_status(skb)->seqno;
++
++			if (has_last)
++				KUNIT_EXPECT_TRUE_MSG(test,
++					ieee80211_sn_less(last_sn, sn),
++					"step %d: sn %u not after %u",
++					step, sn, last_sn);
++			last_sn = sn;
++			has_last = true;
++			delivered++;
++			kfree_skb(skb);
++		}
++
++		spin_lock_bh(&tid->lock);
++		for (i = 0; i < tid->size; i++)
++			if (tid->reorder_buf[i])
++				occupied++;
++		KUNIT_EXPECT_EQ_MSG(test, tid->nframes, occupied,
++				    "step %d: nframes mismatch", step);
++		spin_unlock_bh(&tid->lock);
++	}
++
++	/* kfree_skb() on delivered frames also increments mt76_test_aggr_nfreed */
++	KUNIT_EXPECT_GT(test, delivered, 0);
++	KUNIT_EXPECT_EQ(test, sent,
++			atomic_read(&mt76_test_aggr_nfreed) + tid->nframes);
++	cancel_delayed_work_sync(&tid->reorder_work);
++}
++
+ static struct kunit_case mt76_agg_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_reorder_release_at_timeout),
+ 	KUNIT_CASE(mt76_test_reorder_hold_before_timeout),
+@@ -756,6 +860,7 @@ static struct kunit_case mt76_agg_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_aggr_work_rearms_remaining),
+ 	KUNIT_CASE(mt76_test_aggr_work_releases),
+ 	KUNIT_CASE(mt76_test_aggr_timeout_by_tid),
++	KUNIT_CASE(mt76_test_reorder_property_fuzz),
+ 	{}
+ };
+ 
+diff --git a/tests/tx-test.c b/tests/tx-test.c
+index 1ce38862..13c0728f 100644
+--- a/tests/tx-test.c
++++ b/tests/tx-test.c
+@@ -1828,6 +1828,119 @@ static void mt76_tx_test_rx_token(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->rx_token));
+ }
+ 
++static u32 mt76_tx_test_prng(u32 *state)
++{
++	u32 x = *state;
++
++	x ^= x << 13;
++	x ^= x >> 17;
++	x ^= x << 5;
++	*state = x;
++	return x;
++}
++
++/* Seeded property fuzzer over tx token allocation and release: verifies
++ * token_count, mgmt_tx_pending, uniqueness of live IDs, full-range ENOSPC,
++ * idempotence of unknown/double releases, and clean drain to zero.
++ */
++static void mt76_tx_test_tokens_property_fuzz(struct kunit *test)
++{
++	const int nslots = MT76_TOKEN_FREE_THR + 16;
++	struct mt76_tx_test *t = mt76_tx_test_init(test, NULL);
++	struct mt76_dev *dev = t->dev;
++	struct mt76_txwi_cache *txwi, **live;
++	u32 seed = 0x7670be01;
++	int step, n_live = 0, n_mgmt = 0, i;
++
++	txwi = kunit_kcalloc(test, nslots, sizeof(*txwi), GFP_KERNEL);
++	live = kunit_kcalloc(test, nslots, sizeof(*live), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, txwi);
++	KUNIT_ASSERT_NOT_NULL(test, live);
++
++	dev->token_start = 64;
++	dev->token_size = nslots;
++
++	for (step = 0; step < 600; step++) {
++		u32 r = mt76_tx_test_prng(&seed);
++
++		if ((r & 3) < 2) {
++			struct mt76_txwi_cache *p = NULL;
++			int id;
++
++			for (i = 0; i < nslots; i++) {
++				int j;
++				bool used = false;
++
++				for (j = 0; j < nslots; j++) {
++					if (live[j] == &txwi[i]) {
++						used = true;
++						break;
++					}
++				}
++				if (!used) {
++					p = &txwi[i];
++					break;
++				}
++			}
++			if (!p) {
++				p = &txwi[0];
++				KUNIT_EXPECT_LT(test,
++						mt76_token_consume(dev, &p), 0);
++			} else {
++				bool is_mgmt = (r >> 8) & 1;
++
++				p->qid = is_mgmt ? MT_TXQ_PSD : MT_TXQ_BE;
++				p->phy_idx = 0;
++				id = mt76_token_consume(dev, &p);
++				KUNIT_ASSERT_GE(test, id, dev->token_start);
++				KUNIT_ASSERT_LT(test, id,
++						dev->token_start + nslots);
++				KUNIT_EXPECT_NULL(test,
++						  live[id - dev->token_start]);
++				live[id - dev->token_start] = p;
++				n_live++;
++				if (is_mgmt)
++					n_mgmt++;
++			}
++		} else {
++			int idx = (r >> 8) % (nslots + 8);
++			bool wake = false;
++			struct mt76_txwi_cache *got;
++
++			got = mt76_token_release(dev, dev->token_start + idx,
++						 &wake);
++			if (idx < nslots && live[idx]) {
++				KUNIT_EXPECT_PTR_EQ(test, got, live[idx]);
++				if (live[idx]->qid == MT_TXQ_PSD)
++					n_mgmt--;
++				live[idx] = NULL;
++				n_live--;
++			} else {
++				KUNIT_EXPECT_NULL(test, got);
++				KUNIT_EXPECT_FALSE(test, wake);
++			}
++		}
++
++		KUNIT_EXPECT_EQ_MSG(test, dev->token_count, n_live,
++				    "step %d: token_count mismatch", step);
++		KUNIT_EXPECT_EQ_MSG(test, atomic_read(&dev->phy.mgmt_tx_pending),
++				    n_mgmt, "step %d: mgmt_tx_pending mismatch",
++				    step);
++	}
++
++	for (i = 0; i < nslots; i++) {
++		if (!live[i])
++			continue;
++		KUNIT_EXPECT_PTR_EQ(test,
++				    mt76_token_release(dev, dev->token_start + i,
++						       NULL),
++				    live[i]);
++	}
++	KUNIT_EXPECT_EQ(test, dev->token_count, 0);
++	KUNIT_EXPECT_EQ(test, atomic_read(&dev->phy.mgmt_tx_pending), 0);
++	KUNIT_EXPECT_TRUE(test, idr_is_empty(&dev->token));
++}
++
+ static struct kunit_case mt76_tx_test_cases[] = {
+ 	KUNIT_CASE(mt76_tx_test_tx_pending),
+ 	KUNIT_CASE(mt76_tx_test_tx_offchannel),
+@@ -1866,6 +1979,7 @@ static struct kunit_case mt76_tx_test_cases[] = {
+ 	KUNIT_CASE(mt76_tx_test_pace_hold),
+ 	KUNIT_CASE(mt76_tx_test_token),
+ 	KUNIT_CASE(mt76_tx_test_rx_token),
++	KUNIT_CASE(mt76_tx_test_tokens_property_fuzz),
+ 	{}
+ };
+ 

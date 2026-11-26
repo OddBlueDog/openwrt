@@ -61,10 +61,10 @@ index 926fafd8..e76d8b62 100644
  	dev_kfree_skb(skb);
  
 diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
-index 771ea2a8..f2a5ebb7 100644
+index 630b2256..fca823ce 100644
 --- a/mt7915/tests/mcu2-test.c
 +++ b/mt7915/tests/mcu2-test.c
-@@ -2928,15 +2928,14 @@ static void mt7915_mcu2_get_eeprom_free_block(struct kunit *test)
+@@ -2931,15 +2931,14 @@ static void mt7915_mcu2_get_eeprom_free_block(struct kunit *test)
  	KUNIT_EXPECT_EQ(test, n, 0);
  }
  
@@ -82,7 +82,7 @@ index 771ea2a8..f2a5ebb7 100644
  	dev = mt7915_test_dev(test);
  	mt7915_mcu2_eeprom(test, dev);
  	mt7915_mcu2_reply(test, NULL, 0);
-@@ -3406,7 +3405,6 @@ static void mt7915_mcu2_muru_stats_short(struct kunit *test)
+@@ -3409,7 +3408,6 @@ static void mt7915_mcu2_muru_stats_short(struct kunit *test)
  {
  	struct mt7915_dev *dev;
  

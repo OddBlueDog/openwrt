@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 21:15:44 +0000
+Subject: [PATCH] wifi: mt76: tests: update KUnit tests for cherry-picked
+ upstream fixes
+
+Update existing KUnit assertions to match the cherry-picked upstream
+fixes:
+- pass band_idx to mt76_connac_mcu_wtbl_ba_tlv() and assert ba->band_idx
+  (05e54cdbe391);
+- expect rx_check_pn enabled for GCMP/GCMP-256 and preserved across BIP
+  keys (3c17c4d96e58);
+- expect the default 5 s timeout on STA_REC_UPDATE and BSS_INFO_UPDATE
+  (bd95a95177f8).
+---
+ mt7915/tests/mac-test.c  |  4 ++++
+ mt7915/tests/main-test.c |  2 +-
+ mt7915/tests/mcu2-test.c |  4 ++--
+ tests/connac-mcu-test.c  |  3 ++-
+ tests/core-test.c        | 43 ++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 52 insertions(+), 4 deletions(-)
+
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index be05ff45..695d7859 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -991,6 +991,7 @@ static void mt7915_test_rx_decrypted(struct kunit *test)
+ 		{ MT_CIPHER_WEP40, 0, true, false },
+ 		{ MT_CIPHER_AES_CCMP, MT_RXD1_NORMAL_CLM, false, false },
+ 		{ MT_CIPHER_AES_CCMP, MT_RXD1_NORMAL_CM, false, false },
++		{ MT_CIPHER_BIP_CMAC_128, 0, false, false },
+ 		{ MT_CIPHER_NONE, 0, false, false },
+ 	};
+ 	static const u8 pn[6] = { 1, 2, 3, 4, 5, 6 };
+@@ -6349,6 +6350,9 @@ static void mt7915_test_full_reset_clears_spr(struct kunit *test)
+ 	dev->recovery.hw_init_done = true;
+ 	dev->recovery.restart = true;
+ 	dev->recovery.state = MT_MCU_CMD_WM_WDT;
++	dev->rdd2_phy = phy1;
++	dev->fw.debug_wm = 1;
++	dev->fw.debug_wa = 1;
+ 
+ 	mt7915_mac_reset_work(&dev->reset_work);
+ 
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index f2ee6b56..65e67f81 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2205,7 +2205,7 @@ static void mt7915_main_test_set_group_key(struct kunit *test)
+ 	KUNIT_ASSERT_EQ(test, mt7915_set_key(hw, SET_KEY, vif, NULL, key), 0);
+ 	KUNIT_EXPECT_EQ(test, mvif->mt76.cipher, MCU_CIPHER_AES_CCMP);
+ 	KUNIT_EXPECT_EQ(test, mvif->sta.wcid.hw_key_idx, 2);
+-	KUNIT_EXPECT_FALSE(test, mvif->sta.wcid.rx_check_pn);
++	KUNIT_EXPECT_TRUE(test, mvif->sta.wcid.rx_check_pn);
+ 	KUNIT_ASSERT_EQ(test, fake->n_msgs, 1);
+ 	sec = mt7915_main_test_tlv(mt76_test_msg(fake, 0), STA_REC_KEY_V2);
+ 	KUNIT_ASSERT_NOT_NULL(test, sec);
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 26958566..4fa5f889 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -788,8 +788,8 @@ static void mt7915_mcu2_timeouts(struct kunit *test)
+ 		{ MCU_EXT_CMD(THERMAL_CTRL), 2 * HZ },
+ 		{ MCU_EXT_CMD(GET_MIB_INFO), 2 * HZ },
+ 		{ MCU_EXT_CMD(PHY_STAT_INFO), 2 * HZ },
+-		{ MCU_EXT_CMD(STA_REC_UPDATE), 2 * HZ },
+-		{ MCU_EXT_CMD(BSS_INFO_UPDATE), 2 * HZ },
++		{ MCU_EXT_CMD(STA_REC_UPDATE), 5 * HZ },
++		{ MCU_EXT_CMD(BSS_INFO_UPDATE), 5 * HZ },
+ 		{ MCU_EXT_QUERY(THERMAL_CTRL), 2 * HZ },
+ 		{ MCU_EXT_CMD(EFUSE_BUFFER_MODE), 10 * HZ },
+ 		{ MCU_EXT_CMD(SET_SER_TRIGGER), 5 * HZ },
+diff --git a/tests/connac-mcu-test.c b/tests/connac-mcu-test.c
+index b68d68c4..d20322ae 100644
+--- a/tests/connac-mcu-test.c
++++ b/tests/connac-mcu-test.c
+@@ -1616,7 +1616,7 @@ static void mt76_connac_mcu_test_wtbl_ba(struct kunit *test)
+ #define BA(_enable, _tx) do {						\
+ 	skb = mt76_connac_mcu_test_wtbl_skb(test, &sta_wtbl, &wtbl_hdr); \
+ 	mt76_connac_mcu_wtbl_ba_tlv(dev, skb, &params, _enable, _tx,	\
+-				    sta_wtbl, wtbl_hdr);		\
++				    1, sta_wtbl, wtbl_hdr);		\
+ 	ba = mt76_connac_mcu_test_wtbl_tlv(test, sta_wtbl, WTBL_BA);	\
+ 	KUNIT_ASSERT_NOT_NULL(test, ba);				\
+ } while (0)
+@@ -1642,6 +1642,7 @@ static void mt76_connac_mcu_test_wtbl_ba(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, ba->rst_ba_tid, 6);
+ 	KUNIT_EXPECT_EQ(test, ba->rst_ba_sel, RST_BA_MAC_TID_MATCH);
+ 	KUNIT_EXPECT_EQ(test, ba->rst_ba_sb, 1);
++	KUNIT_EXPECT_EQ(test, ba->band_idx, 1);
+ 	KUNIT_EXPECT_EQ(test, le16_to_cpu(ba->ba_winsize), 64);
+ 	KUNIT_EXPECT_EQ(test, ba->ba_en, 0);
+ 
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 5008535e..395be842 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -2914,6 +2914,42 @@ static void mt76_test_rx_poll_complete(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, skb_queue_empty(&frames));
+ 	KUNIT_ASSERT_EQ(test, skb_queue_len(&hwt->rx), 1);
+ 	KUNIT_EXPECT_EQ(test, mt76_test_captured_ta(skb_peek(&hwt->rx)), 9);
++	__skb_queue_purge(&hwt->rx);
++
++	/* replayed 802.3 A-MSDU (RX_FLAG_ONLY_MONITOR) is freed with subframes */
++	{
++		struct sk_buff *head, *sub;
++
++		head = alloc_skb(64, GFP_KERNEL);
++		sub = alloc_skb(64, GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(test, head);
++		KUNIT_ASSERT_NOT_NULL(test, sub);
++		skb_put_zero(head, 32);
++		skb_put_zero(sub, 32);
++		((struct mt76_rx_status *)head->cb)->flag =
++			RX_FLAG_8023 | RX_FLAG_ONLY_MONITOR;
++		skb_shinfo(head)->frag_list = sub;
++		__skb_queue_tail(&frames, head);
++
++		/* 802.11 A-MSDU with RX_FLAG_ONLY_MONITOR propagates to subframes */
++		head = mt76_test_rx_skb(test, MT76_TEST_QOS_DATA,
++					mt76_hwt_addr, 10, 8);
++		sub = mt76_test_rx_skb(test, MT76_TEST_QOS_DATA,
++				       mt76_hwt_addr, 11, 8);
++		((struct mt76_rx_status *)head->cb)->flag |= RX_FLAG_ONLY_MONITOR;
++		skb_shinfo(head)->frag_list = sub;
++		__skb_queue_tail(&frames, head);
++
++		local_bh_disable();
++		rcu_read_lock();
++		mt76_rx_complete(dev, &frames, NULL);
++		rcu_read_unlock();
++		local_bh_enable();
++		KUNIT_EXPECT_TRUE(test, skb_queue_empty(&frames));
++		/* 802.3 dropped; 802.11 head + subframe both delivered to monitor */
++		KUNIT_EXPECT_EQ(test, skb_queue_len(&hwt->rx), 2);
++		__skb_queue_purge(&hwt->rx);
++	}
+ }
+ 
+ static struct kunit_case mt76_core_rx_test_cases[] = {
+@@ -3625,6 +3661,13 @@ static void mt76_test_wcid_key_setup(struct kunit *test)
+ 
+ 	mt76_wcid_key_setup(dev, wcid, mt76_test_key(test,
+ 					WLAN_CIPHER_SUITE_GCMP));
++	KUNIT_EXPECT_TRUE(test, wcid->rx_check_pn);
++	/* BIP keys share the group wcid and leave rx_check_pn untouched */
++	mt76_wcid_key_setup(dev, wcid, mt76_test_key(test,
++					WLAN_CIPHER_SUITE_AES_CMAC));
++	KUNIT_EXPECT_TRUE(test, wcid->rx_check_pn);
++	mt76_wcid_key_setup(dev, wcid, mt76_test_key(test,
++					WLAN_CIPHER_SUITE_TKIP));
+ 	KUNIT_EXPECT_FALSE(test, wcid->rx_check_pn);
+ 	wcid->rx_check_pn = true;
+ 	mt76_wcid_key_setup(dev, wcid, NULL);

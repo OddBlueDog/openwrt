@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:59:50 +0000
+Subject: [PATCH] wifi: mt76: mt7915: keep restart_pending out of the txpower
+ bitfield
+
+phy->restart_pending shares a bitfield byte with sku_limit_en and
+sku_path_en. mt7915_mac_full_reset() sets restart_pending under
+dev->mt76.mutex without the wiphy lock, whereas mt7915_regd_notifier()
+calls mt7915_init_txpower() and writes sku_limit_en and sku_path_en
+under the wiphy lock without dev->mt76.mutex. Concurrent read-modify-write
+updates to the shared byte can lose either write.
+
+Make restart_pending a plain bool so it occupies its own byte, and add
+a KUnit test checking that restart_pending does not share storage with
+sku_limit_en or sku_path_en.
+---
+ mt7915/mt7915.h          |  7 +++++--
+ mt7915/tests/init-test.c | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 3dfd0159..930e937a 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -319,8 +319,11 @@ struct mt7915_phy {
+ 
+ 	bool sku_limit_en:1;
+ 	bool sku_path_en:1;
+-	/* full reset done, mac80211's restart not yet: no new stations */
+-	bool restart_pending:1;
++	/* full reset done, mac80211's restart not yet: no new stations.
++	 * Not a bit field: reset work writes it under dev->mt76.mutex while
++	 * regd_notifier updates sku_limit_en/sku_path_en under the wiphy lock
++	 */
++	bool restart_pending;
+ 
+ #ifdef CONFIG_NL80211_TESTMODE
+ 	struct {
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 4ece1a68..4ea28384 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -1987,6 +1987,35 @@ static void mt7915_init_test_stop_hardware_napi(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, test_bit(NAPI_STATE_LISTED, &napi->state));
+ }
+ 
++/* restart_pending is written by reset work without the wiphy lock while
++ * mt7915_regd_notifier() updates sku_limit_en and sku_path_en under the
++ * wiphy lock alone, so they must not share a bitfield storage byte.
++ */
++static void mt7915_init_test_restart_pending_storage(struct kunit *test)
++{
++	struct mt7915_phy *a, *b;
++	const u8 *pa, *pb;
++	bool overlap = false;
++	size_t i;
++
++	a = kunit_kzalloc(test, sizeof(*a), GFP_KERNEL);
++	b = kunit_kzalloc(test, sizeof(*b), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, a);
++	KUNIT_ASSERT_NOT_NULL(test, b);
++
++	a->sku_limit_en = true;
++	a->sku_path_en = true;
++	b->restart_pending = true;
++
++	pa = (const u8 *)a;
++	pb = (const u8 *)b;
++	for (i = 0; i < sizeof(*a); i++)
++		if (pa[i] && pb[i])
++			overlap = true;
++
++	KUNIT_EXPECT_FALSE(test, overlap);
++}
++
+ static struct kunit_case mt7915_init_test_cases[] = {
+ 	KUNIT_CASE(mt7915_init_test_band_config),
+ 	KUNIT_CASE(mt7915_init_test_alloc_ext_phy),
+@@ -2027,6 +2056,7 @@ static struct kunit_case mt7915_init_test_cases[] = {
+ 	KUNIT_CASE(mt7915_init_test_register_no_firmware),
+ 	KUNIT_CASE(mt7915_init_test_register_no_firmware_cleanup),
+ 	KUNIT_CASE(mt7915_init_test_stop_hardware_napi),
++	KUNIT_CASE(mt7915_init_test_restart_pending_storage),
+ 	{}
+ };
+ 

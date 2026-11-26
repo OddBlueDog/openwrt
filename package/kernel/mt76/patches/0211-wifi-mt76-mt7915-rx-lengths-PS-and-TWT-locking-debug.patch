@@ -1,0 +1,2124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:15:39 +0000
+Subject: [PATCH] wifi: mt76: mt7915: rx lengths, PS and TWT locking, debugfs,
+ teardown order
+
+rx (mt7915_mac_fill_rx):
+- the global wcid (WTBL entry 0) and an interface's entry are no
+  station's: no poll, no 802.11 header rebuilt for them;
+- an 802.11 frame needs all of its header (ieee80211_hdrlen()) before
+  a CCMP header goes in behind it and its fields are read;
+- the C-RXV is copied before a fragment's rebuilt header goes over it,
+  as the HE radiotap fields are read from it afterwards.
+
+Power save and TWT:
+- the PS record's lock is initialised for a new station only, not
+  again when mac80211 re-adds it after a full reset;
+- the firmware's doze events and a TWT agreement's start or end decide
+  the hold under that lock;
+- the L1 recovery's release too.
+- TWT policy: suggested terms are the policy's fixed point (the TU-mode
+  floor capped at what 63 TUs hold; the interval nearest the limits, one
+  fixed fallback where none fits), so a device taking them up gets them
+  accepted;
+- new terms for a flow a station has don't count it twice against the
+  limits, and the old flow stays when they are refused.
+
+debugfs:
+- fw_debug_bin's channel is opened, reset (unpublished meanwhile) and
+  closed under one mutex;
+- a log event shorter than its magic isn't a binary log;
+- the readers and writers that touch WFSYS registers or the MCU take
+  the device mutex (hw-queues and the stations' queues share
+  MT_FL_Q0_CTRL);
+- fixed_rate's bandwidth is checked (its parsing split out);
+- twt_policy takes decimal numbers only;
+- twt_teardown checks its words first and looks the station up under
+  RCU;
+- ps reads silent_ms before the flag.
+
+Teardown and errors:
+- mt7915_unregister_hw() is all of mt7915_unregister_device() but the
+  free, so the MT798x platform driver frees its interrupt in between;
+- the handler leaves the registers alone once mt7915_stop_hardware()
+  has powered WFSYS down;
+- an MCU timeout queues the reset only once the hardware is up;
+- a registration failing late sets MT76_REMOVED and cancels the
+  reset/dump/rc work;
+- set_vow_band is sent under the mutex in add_interface.
+
+KUnit for each, two on a second CPU (the re-add, the TWT update), and
+the fails-before checks done with mutants.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/debugfs.c            | 246 +++++++++++++++++--------
+ mt7915/init.c               |  28 ++-
+ mt7915/mac.c                | 142 ++++++++++-----
+ mt7915/main.c               |  12 +-
+ mt7915/mcu.c                |  59 ++++--
+ mt7915/mmio.c               |   4 +
+ mt7915/mt7915.h             |   8 +
+ mt7915/soc.c                |   8 +-
+ mt7915/tests/debugfs-test.c | 260 ++++++++++++++++++++++++++
+ mt7915/tests/mac-test.c     | 353 +++++++++++++++++++++++++++++++++++-
+ mt7915/tests/main-test.c    |  73 ++++++++
+ mt7915/tests/mcu2-test.c    |  84 ++++++++-
+ mt7915/tests/mmio-test.c    |  13 ++
+ mt7915/tests/replay-test.c  |   8 +
+ mt7915/tests/soc-test.c     |  19 +-
+ 15 files changed, 1163 insertions(+), 154 deletions(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index d755dfbc..067b4dd1 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -23,13 +23,17 @@ static int
+ mt7915_implicit_txbf_set(void *data, u64 val)
+ {
+ 	struct mt7915_dev *dev = data;
++	int ret;
+ 
+ 	/* The existing connected stations shall reconnect to apply
+ 	 * new implicit txbf configuration.
+ 	 */
++	mutex_lock(&dev->mt76.mutex);
+ 	dev->ibf = !!val;
++	ret = mt7915_mcu_set_txbf(dev, MT_BF_TYPE_UPDATE);
++	mutex_unlock(&dev->mt76.mutex);
+ 
+-	return mt7915_mcu_set_txbf(dev, MT_BF_TYPE_UPDATE);
++	return ret;
+ }
+ 
+ static int
+@@ -243,7 +247,7 @@ mt7915_radar_trigger(void *data, u64 val)
+ #define RADAR_BACKGROUND	2
+ 	struct mt7915_phy *phy = data;
+ 	struct mt7915_dev *dev = phy->dev;
+-	int rdd_idx;
++	int rdd_idx, ret;
+ 
+ 	if (!val || val > RADAR_BACKGROUND)
+ 		return -EINVAL;
+@@ -259,8 +263,12 @@ mt7915_radar_trigger(void *data, u64 val)
+ 		return -EINVAL;
+ 	}
+ 
+-	return mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_RADAR_EMULATE,
+-				       rdd_idx, 0, 0);
++	mutex_lock(&dev->mt76.mutex);
++	ret = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_RADAR_EMULATE,
++				      rdd_idx, 0, 0);
++	mutex_unlock(&dev->mt76.mutex);
++
++	return ret;
+ }
+ 
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_radar_trigger, NULL,
+@@ -592,10 +600,9 @@ out:
+ 	return ret;
+ }
+ 
+-static int
+-mt7915_fw_debug_wm_set(void *data, u64 val)
++/* dev->mt76.mutex held */
++static int __mt7915_fw_debug_wm_set(struct mt7915_dev *dev, u64 val)
+ {
+-	struct mt7915_dev *dev = data;
+ 	int ret;
+ 
+ 	dev->fw.debug_wm = val ? MCU_FW_LOG_TO_HOST : 0;
+@@ -607,6 +614,19 @@ mt7915_fw_debug_wm_set(void *data, u64 val)
+ 	return ret;
+ }
+ 
++static int
++mt7915_fw_debug_wm_set(void *data, u64 val)
++{
++	struct mt7915_dev *dev = data;
++	int ret;
++
++	mutex_lock(&dev->mt76.mutex);
++	ret = __mt7915_fw_debug_wm_set(dev, val);
++	mutex_unlock(&dev->mt76.mutex);
++
++	return ret;
++}
++
+ static int
+ mt7915_fw_debug_wm_get(void *data, u64 *val)
+ {
+@@ -626,11 +646,13 @@ mt7915_fw_debug_wa_set(void *data, u64 val)
+ 	struct mt7915_dev *dev = data;
+ 	int ret;
+ 
++	mutex_lock(&dev->mt76.mutex);
+ 	dev->fw.debug_wa = val ? MCU_FW_LOG_TO_HOST : 0;
+ 
+ 	ret = mt7915_mcu_fw_debug_set(dev, MCU_FW_LOG_WA, false);
+ 	if (ret)
+ 		dev->fw.debug_wa = 0;
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return ret;
+ }
+@@ -650,6 +672,18 @@ DEFINE_DEBUGFS_ATTRIBUTE(fops_fw_debug_wa, mt7915_fw_debug_wa_get,
+ 
+ /* dev->relay_fwlog: its writers (firmware log events) and its closing */
+ static DEFINE_SPINLOCK(mt7915_fwlog_lock);
++/* and its opening, resetting and closing, one at a time (they sleep) */
++static DEFINE_MUTEX(mt7915_fwlog_mutex);
++
++static void mt7915_fwlog_publish(struct mt7915_dev *dev, struct rchan *relay)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&mt7915_fwlog_lock, flags);
++	/* read unlocked first, as a hint (mt7915_debugfs_rx_log()) */
++	WRITE_ONCE(dev->relay_fwlog, relay);
++	spin_unlock_irqrestore(&mt7915_fwlog_lock, flags);
++}
+ 
+ static struct dentry *
+ create_buf_file_cb(const char *filename, struct dentry *parent, umode_t mode,
+@@ -684,28 +718,40 @@ mt7915_fw_debug_bin_set(void *data, u64 val)
+ 	};
+ 	struct mt7915_dev *dev = data;
+ 	struct rchan *relay;
+-	unsigned long flags;
++	int ret;
++
++	mutex_lock(&mt7915_fwlog_mutex);
+ 
+ 	/* the device is going: its channel was closed or is about to be */
+-	if (test_bit(MT76_REMOVED, &dev->mphy.state))
+-		return -ENODEV;
++	if (test_bit(MT76_REMOVED, &dev->mphy.state)) {
++		ret = -ENODEV;
++		goto out;
++	}
+ 
+-	if (!dev->relay_fwlog) {
++	relay = dev->relay_fwlog;
++	if (!relay) {
+ 		relay = relay_open("fwlog_data", dev->debugfs_dir, 1500, 512,
+ 				   &relay_cb, NULL);
+-		if (!relay)
+-			return -ENOMEM;
+-
+-		spin_lock_irqsave(&mt7915_fwlog_lock, flags);
+-		dev->relay_fwlog = relay;
+-		spin_unlock_irqrestore(&mt7915_fwlog_lock, flags);
++		if (!relay) {
++			ret = -ENOMEM;
++			goto out;
++		}
++	} else {
++		/* emptied while no log event writes to it */
++		mt7915_fwlog_publish(dev, NULL);
++		relay_reset(relay);
+ 	}
++	mt7915_fwlog_publish(dev, relay);
+ 
++	/* with what a full reset reads of them (mt7915_mcu_fw_debug_set()) */
++	mutex_lock(&dev->mt76.mutex);
+ 	dev->fw.debug_bin = val;
++	ret = __mt7915_fw_debug_wm_set(dev, dev->fw.debug_wm);
++	mutex_unlock(&dev->mt76.mutex);
++out:
++	mutex_unlock(&mt7915_fwlog_mutex);
+ 
+-	relay_reset(dev->relay_fwlog);
+-
+-	return mt7915_fw_debug_wm_set(dev, dev->fw.debug_wm);
++	return ret;
+ }
+ 
+ static int
+@@ -726,6 +772,8 @@ mt7915_fw_util_wm_show(struct seq_file *file, void *data)
+ {
+ 	struct mt7915_dev *dev = file->private;
+ 
++	/* WFSYS registers: not while a full reset has it powered down */
++	mutex_lock(&dev->mt76.mutex);
+ 	seq_printf(file, "Program counter: 0x%x\n", mt76_rr(dev, MT_WM_MCU_PC));
+ 
+ 	if (dev->fw.debug_wm) {
+@@ -736,6 +784,7 @@ mt7915_fw_util_wm_show(struct seq_file *file, void *data)
+ 			   mt76_rr(dev, MT_CPU_UTIL_IDLE_CNT),
+ 			   mt76_rr(dev, MT_CPU_UTIL_PEAK_IDLE_CNT));
+ 	}
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return 0;
+ }
+@@ -746,14 +795,17 @@ static int
+ mt7915_fw_util_wa_show(struct seq_file *file, void *data)
+ {
+ 	struct mt7915_dev *dev = file->private;
++	int ret = 0;
+ 
++	mutex_lock(&dev->mt76.mutex);
+ 	seq_printf(file, "Program counter: 0x%x\n", mt76_rr(dev, MT_WA_MCU_PC));
+ 
+ 	if (dev->fw.debug_wa)
+-		return mt7915_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(QUERY),
+-					 MCU_WA_PARAM_CPU_UTIL, 0, 0);
++		ret = mt7915_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(QUERY),
++					MCU_WA_PARAM_CPU_UTIL, 0, 0);
++	mutex_unlock(&dev->mt76.mutex);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ DEFINE_SHOW_ATTRIBUTE(mt7915_fw_util_wa);
+@@ -966,6 +1018,11 @@ mt7915_hw_queues_show(struct seq_file *file, void *data)
+ 	};
+ 	u32 val, head, tail;
+ 
++	/* WFSYS registers, and MT_FL_Q0_CTRL selects what the next read
++	 * shows (the stations' "queues" use it too)
++	 */
++	mutex_lock(&dev->mt76.mutex);
++
+ 	/* ple queue */
+ 	val = mt76_rr(dev, MT_PLE_FREEPG_CNT);
+ 	head = mt76_get_field(dev, MT_PLE_FREEPG_HEAD_TAIL, GENMASK(11, 0));
+@@ -992,6 +1049,7 @@ mt7915_hw_queues_show(struct seq_file *file, void *data)
+ 	seq_puts(file, "PSE non-empty queue info:\n");
+ 	mt7915_hw_queue_read(file, ARRAY_SIZE(pse_queue_map),
+ 			     &pse_queue_map[0]);
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return 0;
+ }
+@@ -1067,9 +1125,12 @@ mt7915_rate_txpower_get(struct file *file, char __user *user_buf,
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
++	mutex_lock(&dev->mt76.mutex);
+ 	ret = mt7915_mcu_get_txpower_sku(phy, txpwr, sizeof(txpwr), TX_POWER_INFO_RATE);
+-	if (ret)
++	if (ret) {
++		mutex_unlock(&dev->mt76.mutex);
+ 		goto out;
++	}
+ 
+ 	/* Txpower propagation path: TMAC -> TXV -> BBP */
+ 	len += scnprintf(buf + len, sz - len,
+@@ -1118,6 +1179,7 @@ mt7915_rate_txpower_get(struct file *file, char __user *user_buf,
+ 
+ 	len += scnprintf(buf + len, sz - len, "\nTx power (bbp)  : %6ld\n",
+ 			 mt76_get_field(dev, reg, MT_WF_PHY_TPC_POWER));
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+ 
+@@ -1283,10 +1345,15 @@ static int
+ mt7915_txpower_path_show(struct seq_file *file, void *data)
+ {
+ 	struct mt7915_phy *phy = file->private;
++	int ret;
+ 
+ 	seq_printf(file, "\nBand %d\n", phy != &phy->dev->phy);
+ 
+-	return mt7915_path_txpower_show(file);
++	mutex_lock(&phy->dev->mt76.mutex);
++	ret = mt7915_path_txpower_show(file);
++	mutex_unlock(&phy->dev->mt76.mutex);
++
++	return ret;
+ }
+ 
+ DEFINE_SHOW_ATTRIBUTE(mt7915_txpower_path);
+@@ -1498,11 +1565,11 @@ static int mt7915_twt_policy_open(struct inode *inode, struct file *file)
+ int mt7915_twt_policy_set(struct mt7915_phy *phy, const char *buf)
+ {
+ 	struct mt7915_twt_policy *pol = &phy->twt_policy;
+-	char name[16], value[8];
++	char name[16], value[16];
+ 	u32 val = 0;
+ 	int ret = 0, i;
+ 
+-	if (sscanf(buf, "%15s %7s", name, value) != 2)
++	if (sscanf(buf, "%15s %15s", name, value) != 2)
+ 		return -EINVAL;
+ 
+ 	if (!strcmp(name, "trigger")) {
+@@ -1511,7 +1578,8 @@ int mt7915_twt_policy_set(struct mt7915_phy *phy, const char *buf)
+ 		if (i < 0)
+ 			return -EINVAL;
+ 		val = i;
+-	} else if (sscanf(buf, "%*s %u", &val) != 1) {
++	} else if (kstrtou32(value, 10, &val)) {
++		/* a decimal number, all of it */
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1628,30 +1696,33 @@ mt7915_twt_teardown_handler(struct wiphy *wiphy, struct file *file, char *buf,
+ 	struct ieee80211_sta *sta;
+ 	struct mt7915_sta *msta;
+ 	u8 addr[ETH_ALEN];
+-	char which[4];
++	char which[8];
+ 	unsigned long mask;
+ 	unsigned int id;
+ 	int i;
+ 
+-	if (sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx %3s", &addr[0], &addr[1],
++	/* longer than any word it takes: "allX" isn't "all" */
++	if (sscanf(buf, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx %7s", &addr[0], &addr[1],
+ 		   &addr[2], &addr[3], &addr[4], &addr[5], which) != 7)
+ 		return -EINVAL;
+ 
++	if (!strcmp(which, "all"))
++		mask = GENMASK(MT7915_MAX_STA_TWT_AGRT - 1, 0);
++	else if (!kstrtouint(which, 10, &id) && id < MT7915_MAX_STA_TWT_AGRT)
++		mask = BIT(id);
++	else
++		return -EINVAL;
++
++	/* an RCU lookup; the wiphy lock held keeps the station after it */
++	rcu_read_lock();
+ 	sta = ieee80211_find_sta_by_ifaddr(phy->mt76->hw, addr, NULL);
++	rcu_read_unlock();
+ 	if (!sta)
+ 		return -ENOENT;
+ 	msta = (struct mt7915_sta *)sta->drv_priv;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+-	if (!strcmp(which, "all")) {
+-		mask = msta->twt.flowid_mask;
+-	} else if (!kstrtouint(which, 10, &id) &&
+-		   id < MT7915_MAX_STA_TWT_AGRT) {
+-		mask = msta->twt.flowid_mask & BIT(id);
+-	} else {
+-		mutex_unlock(&dev->mt76.mutex);
+-		return -EINVAL;
+-	}
++	mask &= msta->twt.flowid_mask;
+ 	for_each_set_bit(i, &mask, MT7915_MAX_STA_TWT_AGRT)
+ 		mt7915_mac_twt_teardown_flow(dev, msta, i);
+ 	mutex_unlock(&dev->mt76.mutex);
+@@ -1783,15 +1854,13 @@ mt7915_debugfs_write_fwlog(struct mt7915_dev *dev, const void *hdr, int hdrlen,
+ void mt7915_debugfs_fwlog_close(struct mt7915_dev *dev)
+ {
+ 	struct rchan *relay;
+-	unsigned long flags;
+ 
+-	spin_lock_irqsave(&mt7915_fwlog_lock, flags);
++	mutex_lock(&mt7915_fwlog_mutex);
+ 	relay = dev->relay_fwlog;
+-	dev->relay_fwlog = NULL;
+-	spin_unlock_irqrestore(&mt7915_fwlog_lock, flags);
+-
++	mt7915_fwlog_publish(dev, NULL);
+ 	if (relay)
+ 		relay_close(relay);
++	mutex_unlock(&mt7915_fwlog_mutex);
+ }
+ 
+ void mt7915_debugfs_rx_fw_monitor(struct mt7915_dev *dev, const void *data, int len)
+@@ -1806,7 +1875,7 @@ void mt7915_debugfs_rx_fw_monitor(struct mt7915_dev *dev, const void *data, int
+ 		.msg_type = cpu_to_le16(PKT_TYPE_RX_FW_MONITOR),
+ 	};
+ 
+-	if (!dev->relay_fwlog)
++	if (!READ_ONCE(dev->relay_fwlog))
+ 		return;
+ 
+ 	hdr.timestamp = cpu_to_le32(mt76_rr(dev, MT_LPON_FRCR(0)));
+@@ -1816,10 +1885,10 @@ void mt7915_debugfs_rx_fw_monitor(struct mt7915_dev *dev, const void *data, int
+ 
+ bool mt7915_debugfs_rx_log(struct mt7915_dev *dev, const void *data, int len)
+ {
+-	if (get_unaligned_le32(data) != FW_BIN_LOG_MAGIC)
++	if (len < sizeof(u32) || get_unaligned_le32(data) != FW_BIN_LOG_MAGIC)
+ 		return false;
+ 
+-	if (dev->relay_fwlog)
++	if (READ_ONCE(dev->relay_fwlog))
+ 		mt7915_debugfs_write_fwlog(dev, NULL, 0, data, len);
+ 
+ 	return true;
+@@ -1828,6 +1897,47 @@ bool mt7915_debugfs_rx_log(struct mt7915_dev *dev, const void *data, int len)
+ #ifdef MT7915_STA_DEBUGFS
+ /** per-station debugfs **/
+ 
++/* What fixed_rate's line asks for: a rate, or (any other line) the
++ * firmware's choice again.
++ */
++static int mt7915_sta_fixed_rate_parse(struct ieee80211_sta *sta,
++				       const char *buf, struct sta_phy *phy,
++				       u32 *field)
++{
++	u8 i, gi, he_ltf;
++
++	memset(phy, 0, sizeof(*phy));
++
++	/* mode - cck: 0, ofdm: 1, ht: 2, gf: 3, vht: 4, he_su: 8, he_er: 9
++	 * bw - bw20: 0, bw40: 1, bw80: 2, bw160: 3
++	 * nss - vht: 1~4, he: 1~4, others: ignore
++	 * mcs - cck: 0~4, ofdm: 0~7, ht: 0~32, vht: 0~9, he_su: 0~11, he_er: 0~2
++	 * gi - (ht/vht) lgi: 0, sgi: 1; (he) 0.8us: 0, 1.6us: 1, 3.2us: 2
++	 * ldpc - off: 0, on: 1
++	 * stbc - off: 0, on: 1
++	 * he_ltf - 1xltf: 0, 2xltf: 1, 4xltf: 2
++	 */
++	if (sscanf(buf, "%hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu",
++		   &phy->type, &phy->bw, &phy->nss, &phy->mcs, &gi,
++		   &phy->ldpc, &phy->stbc, &he_ltf) != 8) {
++		*field = RATE_PARAM_AUTO;
++		return 0;
++	}
++
++	/* the loop below runs to it: up to 160 MHz */
++	if (phy->bw > IEEE80211_STA_RX_BW_160)
++		return -EINVAL;
++
++	phy->ldpc = (phy->bw || phy->ldpc) * GENMASK(2, 0);
++	for (i = 0; i <= phy->bw; i++) {
++		phy->sgi |= gi << (i << sta->deflink.he_cap.has_he);
++		phy->he_ltf |= he_ltf << (i << sta->deflink.he_cap.has_he);
++	}
++	*field = RATE_PARAM_FIXED;
++
++	return 0;
++}
++
+ static ssize_t mt7915_sta_fixed_rate_set(struct file *file,
+ 					 const char __user *user_buf,
+ 					 size_t count, loff_t *ppos)
+@@ -1836,11 +1946,10 @@ static ssize_t mt7915_sta_fixed_rate_set(struct file *file,
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+ 	struct mt7915_dev *dev = msta->vif->phy->dev;
+ 	struct ieee80211_vif *vif;
+-	struct sta_phy phy = {};
++	struct sta_phy phy;
+ 	char buf[100];
+ 	int ret;
+ 	u32 field;
+-	u8 i, gi, he_ltf;
+ 
+ 	if (count >= sizeof(buf))
+ 		return -EINVAL;
+@@ -1853,34 +1962,17 @@ static ssize_t mt7915_sta_fixed_rate_set(struct file *file,
+ 	else
+ 		buf[count] = '\0';
+ 
+-	/* mode - cck: 0, ofdm: 1, ht: 2, gf: 3, vht: 4, he_su: 8, he_er: 9
+-	 * bw - bw20: 0, bw40: 1, bw80: 2, bw160: 3
+-	 * nss - vht: 1~4, he: 1~4, others: ignore
+-	 * mcs - cck: 0~4, ofdm: 0~7, ht: 0~32, vht: 0~9, he_su: 0~11, he_er: 0~2
+-	 * gi - (ht/vht) lgi: 0, sgi: 1; (he) 0.8us: 0, 1.6us: 1, 3.2us: 2
+-	 * ldpc - off: 0, on: 1
+-	 * stbc - off: 0, on: 1
+-	 * he_ltf - 1xltf: 0, 2xltf: 1, 4xltf: 2
+-	 */
+-	if (sscanf(buf, "%hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu",
+-		   &phy.type, &phy.bw, &phy.nss, &phy.mcs, &gi,
+-		   &phy.ldpc, &phy.stbc, &he_ltf) != 8) {
++	ret = mt7915_sta_fixed_rate_parse(sta, buf, &phy, &field);
++	if (ret)
++		return ret;
++	if (field == RATE_PARAM_AUTO)
+ 		dev_warn(dev->mt76.dev,
+ 			 "format: Mode BW NSS MCS (HE)GI LDPC STBC HE_LTF\n");
+-		field = RATE_PARAM_AUTO;
+-		goto out;
+-	}
+ 
+-	phy.ldpc = (phy.bw || phy.ldpc) * GENMASK(2, 0);
+-	for (i = 0; i <= phy.bw; i++) {
+-		phy.sgi |= gi << (i << sta->deflink.he_cap.has_he);
+-		phy.he_ltf |= he_ltf << (i << sta->deflink.he_cap.has_he);
+-	}
+-	field = RATE_PARAM_FIXED;
+-
+-out:
+ 	vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
++	mutex_lock(&dev->mt76.mutex);
+ 	ret = mt7915_mcu_set_fixed_rate_ctrl(dev, vif, sta, &msta->wcid, &phy, field);
++	mutex_unlock(&dev->mt76.mutex);
+ 	if (ret)
+ 		return -EFAULT;
+ 
+@@ -1898,8 +1990,13 @@ static int
+ mt7915_queues_show(struct seq_file *s, void *data)
+ {
+ 	struct ieee80211_sta *sta = s->private;
++	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	struct mt7915_dev *dev = msta->vif->phy->dev;
+ 
++	/* as hw-queues, whose MT_FL_Q0_CTRL selection it shares */
++	mutex_lock(&dev->mt76.mutex);
+ 	mt7915_sta_hw_queue_read(s, sta);
++	mutex_unlock(&dev->mt76.mutex);
+ 
+ 	return 0;
+ }
+@@ -1921,8 +2018,11 @@ mt7915_sta_ps_show(struct seq_file *s, void *data)
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+ 	struct mt76_wcid *wcid = &msta->wcid;
+ 	struct mt7915_sta_ps_stats st;
+-	bool silent = test_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++	/* the total before the flag: a hold that ends in between is left
++	 * out once, rather than counted twice
++	 */
+ 	u64 silent_ms = READ_ONCE(wcid->silent_ms);
++	bool silent = test_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
+ 
+ 	if (silent)
+ 		silent_ms += jiffies_to_msecs(mt76_tx_silent_now() -
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 255d0052..57dda33e 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -948,8 +948,15 @@ static void mt7915_stop_hardware(struct mt7915_dev *dev)
+ 	mt7915_dma_cleanup(dev);
+ 	tasklet_disable(&dev->mt76.irq_tasklet);
+ 
+-	if (is_mt798x(&dev->mt76))
++	if (is_mt798x(&dev->mt76)) {
++		/* no handler (a shared line's, or CONFIG_DEBUG_SHIRQ's call
++		 * when the interrupt is freed) writes them once it's off
++		 */
++		WRITE_ONCE(dev->wfsys_off, true);
++		if (dev->irq)
++			synchronize_irq(dev->irq);
+ 		mt7986_wmac_disable(dev);
++	}
+ }
+ 
+ static int
+@@ -1413,6 +1420,14 @@ int mt7915_register_device(struct mt7915_dev *dev)
+ 	return 0;
+ 
+ unreg_ext_phy:
++	/* up by now: as mt7915_unregister_hw(), no reset or dump to run
++	 * on the device once it is torn down (the device's workqueue runs
++	 * what's queued when the device is freed)
++	 */
++	set_bit(MT76_REMOVED, &dev->mphy.state);
++	cancel_work_sync(&dev->dump_work);
++	cancel_work_sync(&dev->reset_work);
++	cancel_work_sync(&dev->rc_work);
+ 	if (phy2) {
+ 		mt7915_unregister_ext_phy(dev);
+ 		phy2 = NULL;
+@@ -1429,9 +1444,12 @@ free_phy2:
+ 	return ret;
+ }
+ 
+-void mt7915_unregister_device(struct mt7915_dev *dev)
++/* Everything but freeing the device: the platform driver takes its
++ * interrupt back first (mt798x_wmac_remove()).
++ */
++void mt7915_unregister_hw(struct mt7915_dev *dev)
+ {
+-	KUNIT_STATIC_STUB_REDIRECT(mt7915_unregister_device, dev);
++	KUNIT_STATIC_STUB_REDIRECT(mt7915_unregister_hw, dev);
+ 
+ 	/*
+ 	 * No more resets or dumps: the irq tasklet, and firmware commands
+@@ -1449,7 +1467,11 @@ void mt7915_unregister_device(struct mt7915_dev *dev)
+ 	mt7915_unregister_thermal(&dev->phy);
+ 	mt76_unregister_device(&dev->mt76);
+ 	mt7915_stop_hardware(dev);
++}
+ 
++void mt7915_unregister_device(struct mt7915_dev *dev)
++{
++	mt7915_unregister_hw(dev);
+ 	mt76_free_device(&dev->mt76);
+ }
+ 
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index b2d6ae80..28f5a47f 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -280,6 +280,7 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	struct ieee80211_supported_band *sband;
+ 	__le32 *rxd = (__le32 *)skb->data;
+ 	__le32 *rxv = NULL;
++	__le32 rxv_copy[2 + 18];
+ 	u32 rxd0, rxd1, rxd2, rxd3, rxd4;
+ 	u32 csum_mask = MT_RXD0_NORMAL_IP_SUM | MT_RXD0_NORMAL_UDP_TCP_SUM;
+ 	bool unicast, insert_ccmp_hdr = false;
+@@ -332,7 +333,11 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	idx = FIELD_GET(MT_RXD1_NORMAL_WLAN_IDX, rxd1);
+ 	status->wcid = mt7915_rx_get_wcid(dev, idx, unicast);
+ 
+-	if (status->wcid) {
++	/* a station's: not an interface's own entry, nor the global one,
++	 * which isn't in a mt7915_sta at all (what would be its vif is the
++	 * first slot of the wcid table behind it)
++	 */
++	if (status->wcid && status->wcid->sta) {
+ 		msta = container_of(status->wcid, struct mt7915_sta, wcid);
+ 		mt76_wcid_add_poll(&dev->mt76, &msta->wcid);
+ 	}
+@@ -501,6 +506,14 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 		if (!msta || !msta->vif)
+ 			return -EINVAL;
+ 
++		/* the rebuilt 802.11 header goes where the RX vectors are,
++		 * and the HE radiotap fields are read from them afterwards
++		 */
++		if (rxv && (rxd1 & MT_RXD1_NORMAL_GROUP_5)) {
++			memcpy(rxv_copy, rxv, sizeof(rxv_copy));
++			rxv = rxv_copy;
++		}
++
+ 		vif = container_of((void *)msta->vif, struct ieee80211_vif,
+ 				   drv_priv);
+ 		err = mt76_connac2_reverse_frag0_hdr_trans(vif, skb, hdr_gap);
+@@ -543,7 +556,16 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	}
+ 
+ 	if (!hdr_trans) {
+-		struct ieee80211_hdr *hdr;
++		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++		/* All of its header, whatever the type: the CCMP header goes in
++		 * behind it, and what's read of it (here, and in mac80211 and
++		 * mt76_check_sta() for control frames) has to be in the frame.
++		 * An ACK or CTS is 10 bytes.
++		 */
++		if (skb_headlen(skb) < sizeof(hdr->frame_control) ||
++		    skb_headlen(skb) < ieee80211_hdrlen(hdr->frame_control))
++			return -EINVAL;
+ 
+ 		if (insert_ccmp_hdr) {
+ 			u8 key_id = FIELD_GET(MT_RXD1_NORMAL_KEY_ID, rxd1);
+@@ -1679,11 +1701,10 @@ static void mt7915_mac_ps_release(struct mt7915_dev *dev)
+ 			continue;
+ 
+ 		if (wcid->sta)
+-			mt7915_mcu_sta_ps_record(container_of(wcid,
+-							      struct mt7915_sta,
+-							      wcid),
+-						 false);
+-		if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))
++			mt7915_mcu_sta_ps_wake(dev, container_of(wcid,
++							struct mt7915_sta,
++							wcid));
++		else if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+ 			mt76_sta_ps_transition(&dev->mt76, wcid, false);
+ 	}
+ 	rcu_read_unlock();
+@@ -2609,23 +2630,22 @@ static u64 mt7915_mac_twt_req_interval(struct ieee80211_twt_params *twt_agrt)
+ }
+ 
+ /* The nearest interval the fields can hold on the side the limit needs */
+-static void mt7915_mac_twt_set_interval(struct ieee80211_twt_params *twt_agrt,
+-					u64 interval, bool round_up)
++static u64 mt7915_mac_twt_fit(u64 interval, bool round_up, u16 *mantissa,
++			      u8 *exp)
+ {
+-	u64 mantissa = interval;
+-	u8 exp = 0;
++	u64 m = interval;
++	u8 e = 0;
+ 
+-	while (mantissa > U16_MAX) {
+-		exp++;
+-		mantissa = interval >> exp;
+-		if (round_up && mantissa << exp < interval)
+-			mantissa++;
++	while (m > U16_MAX) {
++		e++;
++		m = interval >> e;
++		if (round_up && m << e < interval)
++			m++;
+ 	}
+ 
+-	twt_agrt->mantissa = cpu_to_le16(mantissa);
+-	twt_agrt->req_type &= ~cpu_to_le16(IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
+-	twt_agrt->req_type |=
+-		le16_encode_bits(exp, IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
++	*mantissa = m;
++	*exp = e;
++	return m << e;
+ }
+ 
+ static int mt7915_mac_check_twt_req(struct ieee80211_twt_setup *twt)
+@@ -2653,41 +2673,64 @@ static int mt7915_mac_check_twt_req(struct ieee80211_twt_setup *twt)
+ 	return 0;
+ }
+ 
+-/* Brings a request within the radio's policy; true if that changed it */
++/*
++ * Brings a request within the radio's policy; true if that changed it. Terms
++ * it suggests come back unchanged when the device takes them up (or it would
++ * suggest them for ever), so they are the policy's own fixed point: the
++ * nearest the fields can hold, and where nothing they hold is in range (the
++ * limits closer than their resolution, or a maximum shorter than the wake
++ * duration), always the same terms.
++ */
+ static bool mt7915_mac_twt_apply_policy(struct mt7915_phy *phy,
+ 					struct ieee80211_twt_setup *twt)
+ {
+ 	struct ieee80211_twt_params *twt_agrt = (void *)twt->params;
+ 	const struct mt7915_twt_policy *pol = &phy->twt_policy;
+ 	bool in_tu = twt->control & IEEE80211_TWT_CONTROL_WAKE_DUR_UNIT;
++	/* the longest the field holds, in 256 us: 63 TUs in TUs */
++	u32 max_dur = in_tu ? (U8_MAX / 4) * 4 : U8_MAX;
+ 	u32 dur = mt7915_mac_twt_req_dur(twt);
+-	u32 floor = max_t(u32, pol->min_wake_dur, MT7915_MIN_TWT_DUR);
++	u32 floor = min(max_t(u32, pol->min_wake_dur, MT7915_MIN_TWT_DUR),
++			max_dur);
+ 	u64 interval = mt7915_mac_twt_req_interval(twt_agrt);
+-	u64 limit;
++	u64 lo, hi, sleep, fit;
+ 	bool changed = false;
++	u16 mantissa;
++	u8 exp;
+ 
+-	if (dur < floor || dur > U8_MAX) {
+-		dur = clamp_t(u32, dur, floor, U8_MAX);
++	if (dur < floor || dur > max_dur) {
++		dur = clamp_t(u32, dur, floor, max_dur);
+ 		twt_agrt->min_twt_dur = in_tu ? DIV_ROUND_UP(dur, 4) : dur;
+-		if (twt_agrt->min_twt_dur * (in_tu ? 4 : 1) > U8_MAX)
+-			twt_agrt->min_twt_dur = U8_MAX / 4;
+ 		dur = mt7915_mac_twt_req_dur(twt);
+ 		changed = true;
+ 	}
+ 
+-	limit = (u64)pol->max_interval_ms * USEC_PER_MSEC;
+-	if (limit && interval > limit) {
+-		interval = limit;
+-		mt7915_mac_twt_set_interval(twt_agrt, interval, false);
+-		changed = true;
+-	}
++	/* it has to leave the device time to sleep */
++	sleep = ((u64)dur << 8) + 1;
++	lo = max_t(u64, (u64)pol->min_interval_ms * USEC_PER_MSEC, sleep);
++	hi = pol->max_interval_ms ?
++	     (u64)pol->max_interval_ms * USEC_PER_MSEC : U64_MAX;
++	if (interval < lo || interval > hi) {
++		fit = interval > hi ?
++		      mt7915_mac_twt_fit(hi, false, &mantissa, &exp) :
++		      mt7915_mac_twt_fit(lo, true, &mantissa, &exp);
++		/* nothing in range: under the maximum if it can sleep */
++		if (fit < lo || fit > hi) {
++			fit = mt7915_mac_twt_fit(hi, false, &mantissa, &exp);
++			if (fit < sleep)
++				mt7915_mac_twt_fit(lo, true, &mantissa, &exp);
++		}
+ 
+-	limit = (u64)pol->min_interval_ms * USEC_PER_MSEC;
+-	/* and it still has to leave the device time to sleep */
+-	limit = max_t(u64, limit, ((u64)dur << 8) + 1);
+-	if (interval < limit) {
+-		mt7915_mac_twt_set_interval(twt_agrt, limit, true);
+-		changed = true;
++		if (le16_to_cpu(twt_agrt->mantissa) != mantissa ||
++		    le16_get_bits(twt_agrt->req_type,
++				  IEEE80211_TWT_REQTYPE_WAKE_INT_EXP) != exp) {
++			twt_agrt->mantissa = cpu_to_le16(mantissa);
++			twt_agrt->req_type &=
++				~cpu_to_le16(IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
++			twt_agrt->req_type |= le16_encode_bits(exp,
++					IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
++			changed = true;
++		}
+ 	}
+ 
+ 	if ((twt_agrt->req_type & cpu_to_le16(IEEE80211_TWT_REQTYPE_TRIGGER)) &&
+@@ -2776,6 +2819,7 @@ void mt7915_mac_add_twt_setup(struct ieee80211_hw *hw,
+ 	struct mt7915_twt_flow *flow;
+ 	u64 interval, curr_tsf;
+ 	int flowid, table_id, flows;
++	bool replace;
+ 
+ 	sta_setup_cmd = FIELD_GET(IEEE80211_TWT_REQTYPE_SETUP_CMD, req_type);
+ 	flowid = FIELD_GET(IEEE80211_TWT_REQTYPE_FLOWID, req_type);
+@@ -2811,25 +2855,29 @@ void mt7915_mac_add_twt_setup(struct ieee80211_hw *hw,
+ 		goto unlock;
+ 	}
+ 
+-	/* new terms for a flow it has replace them */
+-	if (msta->twt.flowid_mask & BIT(flowid)) {
+-		mt7915_mac_twt_teardown_flow(dev, msta, flowid);
+-		phy->twt_counters.replaced++;
+-	}
++	/* New terms for a flow it has replace them, so that flow doesn't count
++	 * against the limits; and it stays, should they still refuse these.
++	 */
++	replace = !!(msta->twt.flowid_mask & BIT(flowid));
+ 
+-	if (dev->twt.n_agrt == MT7915_MAX_TWT_AGRT)
++	if (!replace && dev->twt.n_agrt == MT7915_MAX_TWT_AGRT)
+ 		goto unlock;
+ 
+-	flows = mt7915_mac_twt_count(dev, phy->mt76->band_idx);
++	flows = mt7915_mac_twt_count(dev, phy->mt76->band_idx) - replace;
+ 	if (phy->twt_policy.max_flows && flows >= phy->twt_policy.max_flows)
+ 		goto unlock;
+ 
+-	flows = hweight8(msta->twt.flowid_mask);
++	flows = hweight8(msta->twt.flowid_mask) - replace;
+ 	if (flows == ARRAY_SIZE(msta->twt.flow) ||
+ 	    (phy->twt_policy.max_sta_flows &&
+ 	     flows >= phy->twt_policy.max_sta_flows))
+ 		goto unlock;
+ 
++	if (replace) {
++		mt7915_mac_twt_teardown_flow(dev, msta, flowid);
++		phy->twt_counters.replaced++;
++	}
++
+ 	table_id = ffs(~dev->twt.table_mask) - 1;
+ 
+ 	memset(flow, 0, sizeof(*flow));
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 634bb189..f69035cb 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -296,11 +296,11 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
+ 		mt76_worker_schedule(&dev->mt76.tx_worker);
+ 	}
+ 
+-	mutex_unlock(&dev->mt76.mutex);
+-
+ 	if (!is_mt7915(&dev->mt76) && !mt7915_vow_stock)
+ 		mt7915_mcu_set_vow_band(dev, mvif);
+ 
++	mutex_unlock(&dev->mt76.mutex);
++
+ 	return 0;
+ 
+ err:
+@@ -853,14 +853,18 @@ int mt7915_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 	msta->wcid.phy_idx = ext_phy;
+ 	msta->jiffies = jiffies;
+ 	/* a new station, or the same again after a full reset: the restarted
+-	 * firmware starts with every station awake
++	 * firmware starts with every station awake. The lock only for a new
++	 * one: the station's debugfs "ps" can be read across a reset.
+ 	 */
+-	spin_lock_init(&msta->ps.lock);
++	if (!test_bit(MT_WCID_FLAG_RESET, &msta->wcid.flags))
++		spin_lock_init(&msta->ps.lock);
++	spin_lock_bh(&msta->ps.lock);
+ 	msta->ps.since = jiffies;
+ 	msta->ps.dozing_ms = 0;
+ 	msta->ps.longest_ms = 0;
+ 	msta->ps.dozes = 0;
+ 	msta->ps.dozing = false;
++	spin_unlock_bh(&msta->ps.lock);
+ 
+ 	if (sta->tdls)
+ 		set_bit(MT_WCID_FLAG_TDLS_PEER, &msta->wcid.flags);
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 85887cec..d9ea49a1 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -226,7 +226,12 @@ mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+ 		if (!test_and_set_bit(MT76_MCU_RESET, &dev->mphy.state)) {
+ 			dev->recovery.restart = true;
+ 			wake_up(&dev->mt76.mcu.wait);
+-			if (!test_bit(MT76_REMOVED, &dev->mphy.state))
++			/* a recovery only for a device that is up: during the
++			 * probe the probe fails, and freeing the device would
++			 * run the queued reset on it, torn down
++			 */
++			if (dev->recovery.hw_init_done &&
++			    !test_bit(MT76_REMOVED, &dev->mphy.state))
+ 				queue_work(dev->mt76.wq, &dev->reset_work);
+ 			wake_up(&dev->reset_wait);
+ 		}
+@@ -620,12 +625,11 @@ mt7915_mcu_rx_bcc_notify(struct mt7915_dev *dev, struct sk_buff *skb)
+ 			mt7915_mcu_cca_finish, mphy->hw);
+ }
+ 
+-/* a station dozed or woke: what debugfs "ps" shows */
+-void mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
++/* a station dozed or woke: what debugfs "ps" shows (msta->ps.lock held) */
++static void __mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
+ {
+ 	unsigned long now = jiffies;
+ 
+-	spin_lock_bh(&msta->ps.lock);
+ 	if (dozing != msta->ps.dozing) {
+ 		u32 ms = jiffies_to_msecs(now - msta->ps.since);
+ 
+@@ -638,7 +642,6 @@ void mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
+ 		msta->ps.dozing = dozing;
+ 		msta->ps.since = now;
+ 	}
+-	spin_unlock_bh(&msta->ps.lock);
+ }
+ 
+ /* the record now, the current doze counted in */
+@@ -666,6 +669,40 @@ static bool mt7915_mcu_sta_ps_hold(struct mt7915_sta *msta, bool dozing)
+ 	return READ_ONCE(ps_sync) && dozing && !READ_ONCE(msta->twt.flowid_mask);
+ }
+ 
++/*
++ * The firmware's word on whether a station dozes: recorded, and the driver's
++ * hold set by it. Under the record's lock, as an agreement beginning or
++ * ending decides the hold again from the record (mt7915_mcu_sta_ps_update()):
++ * one deciding from the state before the other's change and applying it
++ * after would leave a TWT station held, or an awake one.
++ */
++static void mt7915_mcu_sta_ps_set(struct mt7915_dev *dev,
++				  struct mt7915_sta *msta, bool dozing)
++{
++	spin_lock_bh(&msta->ps.lock);
++	__mt7915_mcu_sta_ps_record(msta, dozing);
++	mt76_sta_ps_transition(&dev->mt76, &msta->wcid,
++			       mt7915_mcu_sta_ps_hold(msta, dozing));
++	spin_unlock_bh(&msta->ps.lock);
++}
++
++void mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
++{
++	spin_lock_bh(&msta->ps.lock);
++	__mt7915_mcu_sta_ps_record(msta, dozing);
++	spin_unlock_bh(&msta->ps.lock);
++}
++
++/* every station awake, none held: after an L1 SER (mt7915_mac_ps_release()) */
++void mt7915_mcu_sta_ps_wake(struct mt7915_dev *dev, struct mt7915_sta *msta)
++{
++	spin_lock_bh(&msta->ps.lock);
++	__mt7915_mcu_sta_ps_record(msta, false);
++	if (test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags))
++		mt76_sta_ps_transition(&dev->mt76, &msta->wcid, false);
++	spin_unlock_bh(&msta->ps.lock);
++}
++
+ static void
+ mt7915_mcu_rx_ps_sync(struct mt7915_dev *dev, struct sk_buff *skb)
+ {
+@@ -690,11 +727,8 @@ mt7915_mcu_rx_ps_sync(struct mt7915_dev *dev, struct sk_buff *skb)
+ 	if (!wcid || !wcid_to_sta(wcid))
+ 		return;
+ 
+-	mt7915_mcu_sta_ps_record(container_of(wcid, struct mt7915_sta, wcid),
+-				 dozing);
+-
+-	mt76_sta_ps_transition(&dev->mt76, wcid, mt7915_mcu_sta_ps_hold(
+-			       container_of(wcid, struct mt7915_sta, wcid), dozing));
++	mt7915_mcu_sta_ps_set(dev, container_of(wcid, struct mt7915_sta, wcid),
++			      dozing);
+ }
+ 
+ /* An agreement began or ended, which changes whether the station's frames are
+@@ -702,10 +736,13 @@ mt7915_mcu_rx_ps_sync(struct mt7915_dev *dev, struct sk_buff *skb)
+  */
+ void mt7915_mcu_sta_ps_update(struct mt7915_dev *dev, struct mt7915_sta *msta)
+ {
+-	bool hold = mt7915_mcu_sta_ps_hold(msta, READ_ONCE(msta->ps.dozing));
++	bool hold;
+ 
++	spin_lock_bh(&msta->ps.lock);
++	hold = mt7915_mcu_sta_ps_hold(msta, msta->ps.dozing);
+ 	if (hold != test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags))
+ 		mt76_sta_ps_transition(&dev->mt76, &msta->wcid, hold);
++	spin_unlock_bh(&msta->ps.lock);
+ }
+ 
+ static void
+diff --git a/mt7915/mmio.c b/mt7915/mmio.c
+index 9b3fd47d..97cedfc3 100644
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -957,6 +957,10 @@ irqreturn_t mt7915_irq_handler(int irq, void *dev_instance)
+ 	struct mt7915_dev *dev = dev_instance;
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 
++	/* its sources masked, the subsystem powered down: not ours */
++	if (READ_ONCE(dev->wfsys_off))
++		return IRQ_NONE;
++
+ 	if (mtk_wed_device_active(wed))
+ 		mtk_wed_device_irq_set_mask(wed, 0);
+ 	else
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 3497f628..d4e7a2e6 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -395,6 +395,12 @@ struct mt7915_dev {
+ 	};
+ 
+ 	struct mt7915_hif *hif2;
++	/* the platform device's interrupt (MT798x), freed before the device */
++	int irq;
++	/* the WiFi subsystem is powered down (mt7915_stop_hardware()): the
++	 * interrupt handler leaves its registers alone
++	 */
++	bool wfsys_off;
+ 	struct mt7915_reg_desc reg;
+ 	u8 q_id[MT7915_MAX_QUEUE];
+ 	u32 q_int_mask[MT7915_MAX_QUEUE];
+@@ -618,6 +624,7 @@ u32 mt7915_wed_init_buf(void *ptr, dma_addr_t phys, int token_id);
+ 
+ int mt7915_register_device(struct mt7915_dev *dev);
+ void mt7915_late_init(struct mt7915_dev *dev);
++void mt7915_unregister_hw(struct mt7915_dev *dev);
+ void mt7915_unregister_device(struct mt7915_dev *dev);
+ int mt7915_eeprom_init(struct mt7915_dev *dev);
+ void mt7915_eeprom_parse_hw_cap(struct mt7915_dev *dev,
+@@ -824,6 +831,7 @@ void mt7915_mac_twt_send_teardown(struct mt7915_phy *phy,
+ 				  struct ieee80211_sta *sta, u8 flowid);
+ int mt7915_twt_policy_set(struct mt7915_phy *phy, const char *buf);
+ void mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing);
++void mt7915_mcu_sta_ps_wake(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ void mt7915_mcu_sta_ps_update(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ void mt7915_mac_add_twt_setup(struct ieee80211_hw *hw,
+ 			      struct ieee80211_sta *sta,
+diff --git a/mt7915/soc.c b/mt7915/soc.c
+index f2511d52..12950e29 100644
+--- a/mt7915/soc.c
++++ b/mt7915/soc.c
+@@ -1290,6 +1290,7 @@ static int mt798x_wmac_probe(struct platform_device *pdev)
+ 			       IRQF_SHARED, KBUILD_MODNAME, dev);
+ 	if (ret)
+ 		goto free_device;
++	dev->irq = irq;
+ 
+ 	ret = mt798x_wmac_init(dev);
+ 	if (ret)
+@@ -1317,7 +1318,12 @@ static void mt798x_wmac_remove(struct platform_device *pdev)
+ {
+ 	struct mt7915_dev *dev = platform_get_drvdata(pdev);
+ 
+-	mt7915_unregister_device(dev);
++	mt7915_unregister_hw(dev);
++	/* devm would release the (shared) interrupt only after remove()
++	 * returns: its handler must not see the freed device
++	 */
++	devm_free_irq(&pdev->dev, dev->irq, dev);
++	mt76_free_device(&dev->mt76);
+ }
+ 
+ static const struct of_device_id mt798x_wmac_of_match[] = {
+diff --git a/mt7915/tests/debugfs-test.c b/mt7915/tests/debugfs-test.c
+index 3e14862d..5ab2c408 100644
+--- a/mt7915/tests/debugfs-test.c
++++ b/mt7915/tests/debugfs-test.c
+@@ -7,6 +7,7 @@
+  */
+ #include <kunit/test.h>
+ #include <linux/completion.h>
++#include <linux/delay.h>
+ #include <linux/workqueue.h>
+ #include "../../tests/fake.h"
+ 
+@@ -230,6 +231,13 @@ static void mt7915_debugfs_test_twt_policy_set(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "nonsense 1"), -EINVAL);
+ 	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "max_flows"), -EINVAL);
+ 	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "max_flows many"), -EINVAL);
++	/* a decimal number and nothing else */
++	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "min_interval_ms 0x10"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "min_interval_ms 0abc"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "min_interval_ms -1"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "max_interval_ms 10000000"), -ERANGE);
++	KUNIT_EXPECT_EQ(test, mt7915_twt_policy_set(phy, "max_interval_ms 3600000"), 0);
++	KUNIT_EXPECT_EQ(test, phy->twt_policy.max_interval_ms, 3600000);
+ }
+ 
+ /* muru: the band's flags, one "<name> <0|1>" line each, as MilkFlint's rpcd
+@@ -388,6 +396,10 @@ static void mt7915_debugfs_test_fwlog_close(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, mt7915_debugfs_rx_log(dev, log, sizeof(log)));
+ 	mt7915_debugfs_fwlog_close(dev);
+ 
++	/* an event shorter than the magic isn't a binary log */
++	KUNIT_EXPECT_FALSE(test, mt7915_debugfs_rx_log(dev, log, 3));
++	KUNIT_EXPECT_FALSE(test, mt7915_debugfs_rx_log(dev, log, 0));
++
+ 	set_bit(MT76_REMOVED, &dev->mphy.state);
+ 	KUNIT_EXPECT_EQ(test, mt7915_debugfs_test_fwlog_open(dev), -ENODEV);
+ 	KUNIT_EXPECT_NULL(test, dev->relay_fwlog);
+@@ -440,6 +452,248 @@ static void mt7915_debugfs_test_mcu_mutex(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&dev->mt76.mutex));
+ }
+ 
++static ssize_t mt7915_debugfs_test_teardown(struct mt7915_phy *phy,
++					    const char *line)
++{
++	struct wiphy *wiphy = phy->mt76->hw->wiphy;
++	char buf[32];
++	ssize_t ret;
++
++	strscpy(buf, line, sizeof(buf));
++	wiphy_lock(wiphy);
++	ret = mt7915_twt_teardown_handler(wiphy, NULL, buf, strlen(buf), phy);
++	wiphy_unlock(wiphy);
++	return ret;
++}
++
++/* twt_teardown: "<mac> <flow id|all>", the second word all of it ("allX"
++ * isn't "all"), checked before the station is looked up (under RCU: the
++ * write holds the wiphy lock, which isn't it).
++ */
++static void mt7915_debugfs_test_twt_teardown_parse(struct kunit *test)
++{
++	struct mt7915_dev *dev;
++	struct mt7915_phy *phy;
++
++	dev = mt7915_init_test_device(test, MT7976_ONE_ADIE_DBDC, NULL);
++	phy = &dev->phy;
++	KUNIT_EXPECT_EQ(test, mt7915_debugfs_test_teardown(phy,
++			"02:00:00:00:00:01 allX"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_debugfs_test_teardown(phy,
++			"02:00:00:00:00:01 8"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_debugfs_test_teardown(phy,
++			"02:00:00:00:00:01 1x"), -EINVAL);
++	KUNIT_EXPECT_EQ(test, mt7915_debugfs_test_teardown(phy,
++			"02:00:00:00:00:01"), -EINVAL);
++	/* well formed, no such station */
++	KUNIT_EXPECT_EQ(test, mt7915_debugfs_test_teardown(phy,
++			"02:00:00:00:00:01 all"), -ENOENT);
++	KUNIT_EXPECT_EQ(test, mt7915_debugfs_test_teardown(phy,
++			"02:00:00:00:00:01 7"), -ENOENT);
++}
++
++#ifdef MT7915_STA_DEBUGFS
++/* fixed_rate: a bandwidth up to 160 MHz, which the GI and LTF are repeated
++ * for (an out of range one looped for ever, the counter being a u8, or
++ * shifted past 32 bits); a line that isn't one asks for the firmware's
++ * rates.
++ */
++static void mt7915_debugfs_test_fixed_rate_parse(struct kunit *test)
++{
++	static const char * const bad[] = {
++		"8 4 2 7 1 1 0 1", "8 16 2 7 1 1 0 1", "8 32 2 7 1 1 0 1",
++		"8 255 2 7 1 1 0 1",
++	};
++	struct ieee80211_sta *sta;
++	struct sta_phy phy;
++	u32 field;
++	int i;
++
++	sta = kunit_kzalloc(test, sizeof(*sta) + sizeof(struct mt7915_sta),
++			    GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, sta);
++
++	for (i = 0; i < ARRAY_SIZE(bad); i++)
++		KUNIT_EXPECT_EQ_MSG(test, mt7915_sta_fixed_rate_parse(sta,
++				    bad[i], &phy, &field), -EINVAL,
++				    "%s", bad[i]);
++
++	/* HE: two bits per width */
++	sta->deflink.he_cap.has_he = true;
++	KUNIT_ASSERT_EQ(test, mt7915_sta_fixed_rate_parse(sta,
++			"8 3 2 7 1 0 0 2", &phy, &field), 0);
++	KUNIT_EXPECT_EQ(test, field, RATE_PARAM_FIXED);
++	KUNIT_EXPECT_EQ(test, phy.bw, 3);
++	KUNIT_EXPECT_EQ(test, phy.sgi, 0x55);
++	KUNIT_EXPECT_EQ(test, phy.he_ltf, 0xaa);
++	KUNIT_EXPECT_EQ(test, phy.ldpc, 7);
++
++	/* VHT: one */
++	sta->deflink.he_cap.has_he = false;
++	KUNIT_ASSERT_EQ(test, mt7915_sta_fixed_rate_parse(sta,
++			"4 2 2 7 1 0 0 0", &phy, &field), 0);
++	KUNIT_EXPECT_EQ(test, phy.sgi, 0x7);
++
++	KUNIT_ASSERT_EQ(test, mt7915_sta_fixed_rate_parse(sta, "auto", &phy,
++			&field), 0);
++	KUNIT_EXPECT_EQ(test, field, RATE_PARAM_AUTO);
++}
++#endif
++
++struct mt7915_debugfs_test_locked {
++	struct work_struct work;
++	struct completion done;
++	int (*fn)(struct mt7915_debugfs_test_locked *t);
++	struct mt7915_dev *dev;
++	struct seq_file s;
++	char buf[2048];
++	int ret;
++};
++
++static int mt7915_debugfs_test_util_wm(struct mt7915_debugfs_test_locked *t)
++{
++	t->s.private = t->dev;
++	return mt7915_fw_util_wm_show(&t->s, NULL);
++}
++
++static int mt7915_debugfs_test_util_wa(struct mt7915_debugfs_test_locked *t)
++{
++	t->s.private = t->dev;
++	return mt7915_fw_util_wa_show(&t->s, NULL);
++}
++
++static int mt7915_debugfs_test_hw_queues(struct mt7915_debugfs_test_locked *t)
++{
++	t->s.private = &t->dev->phy;
++	return mt7915_hw_queues_show(&t->s, NULL);
++}
++
++static int mt7915_debugfs_test_txbf(struct mt7915_debugfs_test_locked *t)
++{
++	return mt7915_implicit_txbf_set(t->dev, 0);
++}
++
++static int mt7915_debugfs_test_debug_wm(struct mt7915_debugfs_test_locked *t)
++{
++	return mt7915_fw_debug_wm_set(t->dev, 0);
++}
++
++static void mt7915_debugfs_test_locked_fn(struct work_struct *work)
++{
++	struct mt7915_debugfs_test_locked *t =
++		container_of(work, struct mt7915_debugfs_test_locked, work);
++
++	t->ret = t->fn(t);
++	complete(&t->done);
++}
++
++/* What reads WiFi subsystem registers or asks the firmware waits for the
++ * driver mutex, which a full reset holds while that subsystem is down
++ * (a diagnostics script reads hw-queues and fw_util_* on a live router). The
++ * mutex also keeps hw-queues and the stations' queues from changing each
++ * other's MT_FL_Q0_CTRL selection.
++ */
++static void mt7915_debugfs_test_wfsys_locked(struct kunit *test)
++{
++	static int (*const fns[])(struct mt7915_debugfs_test_locked *) = {
++		mt7915_debugfs_test_util_wm, mt7915_debugfs_test_util_wa,
++		mt7915_debugfs_test_hw_queues, mt7915_debugfs_test_txbf,
++		mt7915_debugfs_test_debug_wm,
++	};
++	struct mt7915_debugfs_test_locked *t;
++	struct mt7915_dev *dev;
++	int i;
++
++	dev = mt7915_init_test_device(test, MT7976_ONE_ADIE_DBDC, NULL);
++	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, t);
++	t->dev = dev;
++
++	for (i = 0; i < ARRAY_SIZE(fns); i++) {
++		memset(&t->s, 0, sizeof(t->s));
++		t->s.buf = t->buf;
++		t->s.size = sizeof(t->buf);
++		t->fn = fns[i];
++		init_completion(&t->done);
++		INIT_WORK(&t->work, mt7915_debugfs_test_locked_fn);
++
++		mutex_lock(&dev->mt76.mutex);
++		schedule_work(&t->work);
++		msleep(50);
++		KUNIT_EXPECT_FALSE_MSG(test, completion_done(&t->done),
++				       "reader %d", i);
++		mutex_unlock(&dev->mt76.mutex);
++
++		flush_work(&t->work);
++		KUNIT_EXPECT_TRUE_MSG(test, completion_done(&t->done),
++				      "reader %d", i);
++		KUNIT_EXPECT_EQ_MSG(test, t->ret, 0, "reader %d", i);
++	}
++}
++
++struct mt7915_debugfs_test_fwlog_work {
++	struct work_struct work;
++	struct completion done;
++	struct mt7915_dev *dev;
++	bool close;
++	int ret;
++};
++
++static void mt7915_debugfs_test_fwlog_fn(struct work_struct *work)
++{
++	struct mt7915_debugfs_test_fwlog_work *w =
++		container_of(work, struct mt7915_debugfs_test_fwlog_work, work);
++
++	if (w->close)
++		mt7915_debugfs_fwlog_close(w->dev);
++	else
++		w->ret = mt7915_fw_debug_bin_set(w->dev, 1);
++	complete(&w->done);
++}
++
++/* fw_debug_bin and the channel's closing for the device's removal take
++ * turns: one that set up a channel just as it was closed would leave it
++ * open for good (or reset one being closed), two at once would open two.
++ */
++static void mt7915_debugfs_test_fwlog_serialised(struct kunit *test)
++{
++	struct mt7915_debugfs_test_fwlog_work *w;
++	struct mt7915_dev *dev;
++	int i;
++
++	dev = mt7915_init_test_device(test, MT7976_ONE_ADIE_DBDC, NULL);
++	KUNIT_ASSERT_EQ(test, mt7915_init_debugfs(&dev->phy), 0);
++	w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	w->dev = dev;
++
++	/* opening, resetting the open one, closing */
++	for (i = 0; i < 3; i++) {
++		w->close = i == 2;
++		init_completion(&w->done);
++		INIT_WORK(&w->work, mt7915_debugfs_test_fwlog_fn);
++
++		/* still waiting after 50 ms (a check that doesn't consume
++		 * the completion)
++		 */
++		mutex_lock(&mt7915_fwlog_mutex);
++		schedule_work(&w->work);
++		msleep(50);
++		KUNIT_EXPECT_FALSE(test, completion_done(&w->done));
++		mutex_unlock(&mt7915_fwlog_mutex);
++
++		flush_work(&w->work);
++		KUNIT_EXPECT_TRUE(test, completion_done(&w->done));
++		if (w->close) {
++			KUNIT_EXPECT_NULL(test, dev->relay_fwlog);
++		} else {
++			KUNIT_EXPECT_EQ(test, w->ret, 0);
++			KUNIT_EXPECT_NOT_NULL(test, dev->relay_fwlog);
++		}
++	}
++	KUNIT_EXPECT_FALSE(test, mt7915_debugfs_test_fwlog_file(dev));
++}
++
+ static struct kunit_case mt7915_debugfs_test_cases[] = {
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_stats_locked),
+ 	KUNIT_CASE(mt7915_debugfs_test_twt_policy_set),
+@@ -447,6 +701,12 @@ static struct kunit_case mt7915_debugfs_test_cases[] = {
+ 	KUNIT_CASE(mt7915_debugfs_test_muru),
+ 	KUNIT_CASE(mt7915_debugfs_test_rdd_reports),
+ 	KUNIT_CASE(mt7915_debugfs_test_fwlog_close),
++	KUNIT_CASE(mt7915_debugfs_test_fwlog_serialised),
++	KUNIT_CASE(mt7915_debugfs_test_twt_teardown_parse),
++	KUNIT_CASE(mt7915_debugfs_test_wfsys_locked),
++#ifdef MT7915_STA_DEBUGFS
++	KUNIT_CASE(mt7915_debugfs_test_fixed_rate_parse),
++#endif
+ 	KUNIT_CASE(mt7915_debugfs_test_mcu_mutex),
+ 	{}
+ };
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 695d7859..2a6d05bb 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -45,21 +45,18 @@ static int mt7915_test_twt_check(u16 mantissa, u8 exp, u8 min_dur)
+  */
+ static void mt7915_test_twt_interval_round(struct kunit *test)
+ {
+-	struct ieee80211_twt_params twt = {};
+ 	u64 interval = 2 * 65537 + 1;
++	u16 mantissa;
+ 	u64 got;
+ 	u8 exp;
+ 
+-	mt7915_mac_twt_set_interval(&twt, interval, true);
+-	exp = le16_get_bits(twt.req_type, IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
+-	got = (u64)le16_to_cpu(twt.mantissa) << exp;
++	got = mt7915_mac_twt_fit(interval, true, &mantissa, &exp);
++	KUNIT_EXPECT_EQ(test, got, (u64)mantissa << exp);
+ 	KUNIT_EXPECT_GE(test, got, interval);
+-	KUNIT_EXPECT_LE(test, le16_to_cpu(twt.mantissa), U16_MAX);
+ 	KUNIT_EXPECT_EQ(test, exp, 2);
+ 
+-	mt7915_mac_twt_set_interval(&twt, interval, false);
+-	exp = le16_get_bits(twt.req_type, IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
+-	got = (u64)le16_to_cpu(twt.mantissa) << exp;
++	got = mt7915_mac_twt_fit(interval, false, &mantissa, &exp);
++	KUNIT_EXPECT_EQ(test, got, (u64)mantissa << exp);
+ 	KUNIT_EXPECT_LE(test, got, interval);
+ }
+ 
+@@ -1442,6 +1439,205 @@ static void mt7915_test_rx_8023_fragment(struct kunit *test)
+ 	kfree_skb(skb);
+ }
+ 
++/* Rebuilding the first fragment of a translated frame needs the station's
++ * Ethernet header after the descriptor: 13 bytes aren't one.
++ */
++static void mt7915_test_rx_8023_fragment_short(struct kunit *test)
++{
++	static const u8 eth[13] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 8 };
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_test_rxd d;
++	struct sk_buff *skb;
++
++	mt7915_test_sta(test, dev, 9, mvif);
++	mt7915_test_rxd_init(&d, 9, MT_RXD1_NORMAL_GROUP_4, true);
++	d.rxd[2] |= MT_RXD2_NORMAL_HDR_TRANS;
++	d.g4[0] = IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA |
++		  IEEE80211_FCTL_MOREFRAGS | IEEE80211_FCTL_TODS;
++	skb = mt7915_test_rx_skb(test, &d, eth, sizeof(eth));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	skb = mt7915_test_rx_skb(test, &d, eth, 2);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++}
++
++/* A fragment rebuilt as 802.11 while a monitor interface is up: its HE
++ * radiotap fields come from the C-RXV as the hardware wrote it, not from
++ * what the rebuilt header and the radiotap header went over (BSS colour and
++ * TXOP are in C-RXV dword 14, which they cover).
++ */
++static void mt7915_test_rx_8023_fragment_radiotap(struct kunit *test)
++{
++	static const u8 eth[] = {
++		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x08, 0x00, 0x45, 0x00,
++	};
++	u32 groups = MT_RXD1_NORMAL_GROUP_4 | MT_RXD1_NORMAL_GROUP_3 |
++		     MT_RXD1_NORMAL_GROUP_5;
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct ieee80211_radiotap_he *he;
++	struct mt7915_test_rxd d;
++	struct mt76_rx_status *s;
++	struct sk_buff *skb;
++
++	mt7915_test_sta(test, dev, 9, mvif);
++	mt7915_test_rxd_init(&d, 9, groups, true);
++	d.rxd[2] |= MT_RXD2_NORMAL_HDR_TRANS;
++	d.g4[0] = IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA |
++		  IEEE80211_FCTL_MOREFRAGS | IEEE80211_FCTL_TODS;
++	d.g3[0] = mt7915_test_prxv0(MT_PHY_TYPE_HE_SU, 3, 0, 0, 0);
++	/* C-RXV dword n is g5[n - 2] */
++	d.g5[12] = FIELD_PREP(MT_CRXV_HE_BSS_COLOR, 0x2a) |
++		   FIELD_PREP(MT_CRXV_HE_TXOP_DUR, 0x55);
++	d.g5[9] = FIELD_PREP(MT_CRXV_HE_SR_MASK, 0x9);
++	skb = mt7915_test_rx_skb(test, &d, eth, sizeof(eth));
++	KUNIT_ASSERT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), 0);
++	s = (struct mt76_rx_status *)skb->cb;
++	KUNIT_ASSERT_TRUE(test, s->flag & RX_FLAG_RADIOTAP_HE);
++	KUNIT_EXPECT_FALSE(test, s->flag & RX_FLAG_8023);
++
++	he = (struct ieee80211_radiotap_he *)skb->data;
++	KUNIT_EXPECT_EQ(test, le16_get_bits(he->data3,
++			IEEE80211_RADIOTAP_HE_DATA3_BSS_COLOR), 0x2a);
++	KUNIT_EXPECT_EQ(test, le16_get_bits(he->data6,
++			IEEE80211_RADIOTAP_HE_DATA6_TXOP), 0x55);
++	KUNIT_EXPECT_EQ(test, le16_get_bits(he->data4,
++			IEEE80211_RADIOTAP_HE_DATA4_SU_MU_SPTL_REUSE), 0x9);
++	kfree_skb(skb);
++}
++
++/* WTBL entry 0 holds the global wcid, which isn't part of a mt7915_sta (what
++ * would be its vif is the first slot of the wcid table behind it): a unicast
++ * frame the hardware gives that entry is nobody's, so there's no station to
++ * poll and no interface to rebuild a fragment's 802.11 header for.
++ */
++static void mt7915_test_rx_global_wcid(struct kunit *test)
++{
++	static const u8 eth[] = {
++		1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0x08, 0x00, 0x45, 0x00,
++	};
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_wcid *global = &dev->mt76.global_wcid;
++	struct mt7915_test_frame f;
++	struct mt7915_test_rxd d;
++	struct mt76_rx_status *s;
++	struct sk_buff *skb;
++
++	/* as mt7915_init_hardware() sets it up */
++	global->idx = 0;
++	rcu_assign_pointer(dev->mt76.wcid[0], global);
++
++	mt7915_test_rxd_init(&d, 0, MT_RXD1_NORMAL_GROUP_4, true);
++	d.rxd[2] |= MT_RXD2_NORMAL_HDR_TRANS;
++	d.g4[0] = IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA |
++		  IEEE80211_FCTL_MOREFRAGS | IEEE80211_FCTL_TODS;
++	skb = mt7915_test_rx_skb(test, &d, eth, sizeof(eth));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	/* any other frame of it is handed on, without a station poll */
++	mt7915_test_qos_frame(&f, 0, 1, 0);
++	mt7915_test_rxd_init(&d, 0, 0, true);
++	skb = mt7915_test_rx_skb(test, &d, &f, sizeof(f));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), 0);
++	s = (struct mt76_rx_status *)skb->cb;
++	KUNIT_EXPECT_PTR_EQ(test, s->wcid, global);
++	KUNIT_EXPECT_FALSE(test, mt7915_test_polled(dev, global));
++	kfree_skb(skb);
++
++	RCU_INIT_POINTER(dev->mt76.wcid[0], NULL);
++	global->idx = MT7915_WTBL_STA;
++}
++
++/* An 802.11 frame shorter than what's read of its header: not even a frame
++ * control, or a QoS data header cut before its QoS control (with four
++ * addresses that's at 30, not 24). A 10-byte ACK, all of its header, is
++ * fine.
++ */
++static void mt7915_test_rx_short_headers(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_test_frame f;
++	struct mt7915_test_rxd d;
++	struct sk_buff *skb;
++
++	mt7915_test_rxd_init(&d, 0, 0, true);
++	mt7915_test_qos_frame(&f, 0, 1, 0);
++	skb = mt7915_test_rx_skb(test, &d, &f, 1);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	skb = mt7915_test_rx_skb(test, &d, &f, 25);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	skb = mt7915_test_rx_skb(test, &d, &f, 26);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), 0);
++	kfree_skb(skb);
++
++	mt7915_test_qos_frame(&f, IEEE80211_FCTL_FROMDS, 1, 0);
++	skb = mt7915_test_rx_skb(test, &d, &f, 26);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	skb = mt7915_test_rx_skb(test, &d, &f, 32);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), 0);
++	kfree_skb(skb);
++
++	memset(&f, 0, sizeof(f));
++	f.hdr.frame_control = cpu_to_le16(IEEE80211_FTYPE_CTL |
++					  IEEE80211_STYPE_ACK);
++	skb = mt7915_test_rx_skb(test, &d, &f, 10);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), 0);
++	kfree_skb(skb);
++}
++
++/* A non-QoS frame cut inside its header is no frame either. A CCMP
++ * fragment's header would get the CCMP header in front of what's there,
++ * its PN bytes then read as the frame control (0x88 here: QoS data, with
++ * sequence and QoS control 24 bytes on); a PS-Poll's or BAR's 16 bytes
++ * hold the address mt76_check_sta() reads.
++ */
++static void mt7915_test_rx_short_nonqos(struct kunit *test)
++{
++	static const u8 data[2] = { 0x08, 0x00 };
++	static const u8 pspoll[16] = { 0xa4, 0x00 };
++	static const u8 bar[2] = { 0x84, 0x00 };
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_test_rxd d;
++	struct sk_buff *skb;
++
++	mt7915_test_rxd_init(&d, 0, MT_RXD1_NORMAL_GROUP_1, true);
++	d.rxd[1] |= FIELD_PREP(MT_RXD1_NORMAL_SEC_MODE, MT_CIPHER_AES_CCMP);
++	d.rxd[2] |= MT_RXD2_NORMAL_FRAG;
++	/* PN bytes 5 and 4, which go first */
++	d.g1[0] = 0x00000088;
++	skb = mt7915_test_rx_skb(test, &d, data, sizeof(data));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	mt7915_test_rxd_init(&d, 0, 0, true);
++	skb = mt7915_test_rx_skb(test, &d, pspoll, 2);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	skb = mt7915_test_rx_skb(test, &d, bar, sizeof(bar));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	kfree_skb(skb);
++
++	skb = mt7915_test_rx_skb(test, &d, pspoll, sizeof(pspoll));
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), 0);
++	kfree_skb(skb);
++}
++
+ /* With a monitor interface up, the C-RXV (group 5) is there and HE frames
+  * get an HE radiotap header in front; translated frames and non-HE rates
+  * don't.
+@@ -4228,6 +4424,140 @@ static void mt7915_test_twt_policy(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, phy->twt_counters.rejected, 2);
+ }
+ 
++/* The device taking up the terms in @twt, the radio's answer: as a station
++ * does after an ALTERNATE or DICTATE.
++ */
++static u8 mt7915_test_twt_retake(struct kunit *test, struct ieee80211_hw *hw,
++				 struct ieee80211_sta *sta,
++				 struct ieee80211_twt_setup **twt)
++{
++	struct ieee80211_twt_params *p = mt7915_test_twt_params(*twt);
++	u16 req_type = le16_to_cpu(p->req_type);
++	struct ieee80211_twt_setup *again;
++
++	again = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST,
++				    FIELD_GET(IEEE80211_TWT_REQTYPE_WAKE_INT_EXP,
++					      req_type),
++				    le16_to_cpu(p->mantissa), p->min_twt_dur,
++				    req_type & IEEE80211_TWT_REQTYPE_FLOWID);
++	again->control = (*twt)->control;
++	mt7915_mac_add_twt_setup(hw, sta, again);
++	*twt = again;
++	return mt7915_test_twt_answer(again);
++}
++
++/* Terms the radio suggests are its policy's fixed point: the device taking
++ * them up gets them accepted, not suggested again, also where the limits
++ * are closer together than the fields can say (60 s exactly isn't one of
++ * the intervals they hold), where the maximum is shorter than the wake
++ * duration (the device has to be able to sleep: over it), and where the
++ * floor is more than a duration in TUs can say (63 TUs = 252).
++ */
++static void mt7915_test_twt_policy_converges(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_phy *phy = &dev->phy;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *a = mt7915_test_sta(test, dev, 9, mvif);
++	struct ieee80211_sta *sta = mt7915_test_to_sta(a);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_twt_setup *twt;
++	struct ieee80211_twt_params *p;
++	u8 exp;
++
++	mt7915_test_tsf(dev, 1 << 30);
++
++	phy->twt_policy.min_interval_ms = 60000;
++	phy->twt_policy.max_interval_ms = 60000;
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST, 20, 1024, 64, 0);
++	mt7915_mac_add_twt_setup(hw, sta, twt);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ALTERNATE);
++	p = mt7915_test_twt_params(twt);
++	exp = le16_get_bits(p->req_type, IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
++	/* the longest under the maximum */
++	KUNIT_EXPECT_EQ(test, (u64)le16_to_cpu(p->mantissa) << exp, 59999232);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_retake(test, hw, sta, &twt),
++			TWT_SETUP_CMD_ACCEPT);
++	mutex_lock(&dev->mt76.mutex);
++	mt7915_mac_twt_teardown_flow(dev, a, 0);
++	mutex_unlock(&dev->mt76.mutex);
++	phy->twt_policy.min_interval_ms = 0;
++	phy->twt_policy.max_interval_ms = 0;
++
++	/* a maximum of 65 ms, a floor of 255 x 256 us = 65.28 ms */
++	phy->twt_policy.max_interval_ms = 65;
++	phy->twt_policy.min_wake_dur = U8_MAX;
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST, 10, 1024, 64, 0);
++	mt7915_mac_add_twt_setup(hw, sta, twt);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ALTERNATE);
++	p = mt7915_test_twt_params(twt);
++	exp = le16_get_bits(p->req_type, IEEE80211_TWT_REQTYPE_WAKE_INT_EXP);
++	KUNIT_EXPECT_GT(test, (u64)le16_to_cpu(p->mantissa) << exp,
++			(u64)U8_MAX << 8);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_retake(test, hw, sta, &twt),
++			TWT_SETUP_CMD_ACCEPT);
++	mutex_lock(&dev->mt76.mutex);
++	mt7915_mac_twt_teardown_flow(dev, a, 0);
++	mutex_unlock(&dev->mt76.mutex);
++	phy->twt_policy.max_interval_ms = 0;
++
++	/* in TUs, a floor of 253: 63 TUs is as near as it gets */
++	phy->twt_policy.min_wake_dur = 253;
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST, 10, 1024, 20, 0);
++	twt->control = IEEE80211_TWT_CONTROL_WAKE_DUR_UNIT;
++	mt7915_mac_add_twt_setup(hw, sta, twt);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ALTERNATE);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_params(twt)->min_twt_dur, 63);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_retake(test, hw, sta, &twt),
++			TWT_SETUP_CMD_ACCEPT);
++	KUNIT_EXPECT_EQ(test, a->twt.flow[0].duration, 252);
++	phy->twt_policy.min_wake_dur = 0;
++}
++
++/* New terms for a flow a station has don't make one flow more: with the
++ * band at its limit (lowered under the flows there are) the station keeps
++ * the flow it has; at the limit it doesn't go over, the terms replace it.
++ */
++static void mt7915_test_twt_replace_at_limit(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_phy *phy = &dev->phy;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *a = mt7915_test_sta(test, dev, 9, mvif);
++	struct mt7915_sta *b = mt7915_test_sta(test, dev, 10, mvif);
++	struct ieee80211_hw *hw = dev->mt76.hw;
++	struct ieee80211_twt_setup *twt;
++
++	mt7915_test_tsf(dev, 1 << 30);
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST, 10, 1024, 64, 0);
++	mt7915_mac_add_twt_setup(hw, mt7915_test_to_sta(a), twt);
++	KUNIT_ASSERT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ACCEPT);
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST, 10, 1024, 64, 0);
++	mt7915_mac_add_twt_setup(hw, mt7915_test_to_sta(b), twt);
++	KUNIT_ASSERT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ACCEPT);
++	KUNIT_ASSERT_EQ(test, dev->twt.n_agrt, 2);
++
++	phy->twt_policy.max_flows = 1;
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST, 11, 1024, 64, 0);
++	mt7915_mac_add_twt_setup(hw, mt7915_test_to_sta(a), twt);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_REJECT);
++	KUNIT_EXPECT_EQ(test, a->twt.flowid_mask, BIT(0));
++	KUNIT_EXPECT_EQ(test, a->twt.flow[0].exp, 10);
++	KUNIT_EXPECT_EQ(test, dev->twt.n_agrt, 2);
++	KUNIT_EXPECT_EQ(test, phy->twt_counters.replaced, 0);
++
++	phy->twt_policy.max_flows = 2;
++	twt = mt7915_test_twt_req(test, TWT_SETUP_CMD_REQUEST, 11, 1024, 64, 0);
++	mt7915_mac_add_twt_setup(hw, mt7915_test_to_sta(a), twt);
++	KUNIT_EXPECT_EQ(test, mt7915_test_twt_answer(twt), TWT_SETUP_CMD_ACCEPT);
++	KUNIT_EXPECT_EQ(test, a->twt.flow[0].exp, 11);
++	KUNIT_EXPECT_EQ(test, dev->twt.n_agrt, 2);
++	KUNIT_EXPECT_EQ(test, phy->twt_counters.replaced, 1);
++	phy->twt_policy.max_flows = 0;
++}
++
+ /* The first wake time the device can still make, in phase */
+ static void mt7915_test_twt_next_tsf(struct kunit *test)
+ {
+@@ -6628,6 +6958,11 @@ static struct kunit_case mt7915_mac_rx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_rx_short_rxd),
+ 	KUNIT_CASE(mt7915_test_rx_amsdu),
+ 	KUNIT_CASE(mt7915_test_rx_8023_fragment),
++	KUNIT_CASE(mt7915_test_rx_8023_fragment_short),
++	KUNIT_CASE(mt7915_test_rx_8023_fragment_radiotap),
++	KUNIT_CASE(mt7915_test_rx_global_wcid),
++	KUNIT_CASE(mt7915_test_rx_short_headers),
++	KUNIT_CASE(mt7915_test_rx_short_nonqos),
+ 	KUNIT_CASE(mt7915_test_rx_he_radiotap),
+ 	KUNIT_CASE(mt7915_test_rx_group_addressed),
+ 	KUNIT_CASE(mt7915_test_rx_band1),
+@@ -6707,6 +7042,8 @@ static struct kunit_case mt7915_mac_twt_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_twt_replace),
+ 	KUNIT_CASE(mt7915_test_twt_tu),
+ 	KUNIT_CASE(mt7915_test_twt_policy),
++	KUNIT_CASE(mt7915_test_twt_policy_converges),
++	KUNIT_CASE(mt7915_test_twt_replace_at_limit),
+ 	KUNIT_CASE(mt7915_test_twt_next_tsf),
+ 	KUNIT_CASE(mt7915_test_twt_teardown_frame),
+ 	KUNIT_CASE(mt7915_test_twt_schedule),
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 65e67f81..edfeb2f0 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -17,6 +17,7 @@
+  */
+ #include <kunit/test.h>
+ #include <kunit/static_stub.h>
++#include <linux/delay.h>
+ #include "fake.h"
+ #include "../eeprom.h"
+ #include "../../mt76_connac2_mac.h"
+@@ -2785,6 +2786,77 @@ static void mt7915_main_test_sta_add_full(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, fake->n_msgs, 0);
+ }
+ 
++struct mt7915_main_test_readd {
++	struct work_struct work;
++	struct completion done;
++	struct mt7915_dev *dev;
++	struct ieee80211_vif *vif;
++	struct ieee80211_sta *sta;
++	int ret;
++};
++
++static void mt7915_main_test_readd_fn(struct work_struct *work)
++{
++	struct mt7915_main_test_readd *r =
++		container_of(work, struct mt7915_main_test_readd, work);
++
++	r->ret = mt7915_mac_sta_add(&r->dev->mt76, r->vif, r->sta);
++	complete(&r->done);
++}
++
++/* After a full reset mac80211 adds its stations again, drv_priv as it was,
++ * while a station's debugfs "ps" can be read (under msta->ps.lock): the
++ * re-add starts the record again under that lock, and doesn't initialise
++ * the lock again under the reader's feet.
++ */
++static void mt7915_main_test_sta_readd_ps_lock(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_main_test_dev(test);
++	struct ieee80211_hw *hw2 = mt7915_main_test_hw2(dev);
++	struct mt7915_main_test_readd *r;
++	struct ieee80211_sta *sta;
++	struct mt7915_sta *msta;
++	bool waited;
++	int cpu;
++
++	r = kunit_kzalloc(test, sizeof(*r), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, r);
++	r->dev = dev;
++	r->vif = mt7915_main_test_ap(test, hw2, 1);
++	sta = mt7915_main_test_sta(test, r->vif, 1);
++	r->sta = sta;
++	msta = mt7915_main_test_msta(sta);
++	KUNIT_ASSERT_EQ(test, mt7915_mac_sta_add(&dev->mt76, r->vif, sta), 0);
++	msta->ps.dozing = true;
++	msta->ps.dozes = 3;
++
++	init_completion(&r->done);
++	INIT_WORK(&r->work, mt7915_main_test_readd_fn);
++	/* as mt76_reset_device() leaves it for mt76_sta_add() */
++	set_bit(MT_WCID_FLAG_RESET, &msta->wcid.flags);
++
++	/* a reader has the lock here, the re-add runs on another CPU */
++	spin_lock_bh(&msta->ps.lock);
++	cpu = cpumask_any_but(cpu_online_mask, smp_processor_id());
++	if (cpu >= nr_cpu_ids) {
++		spin_unlock_bh(&msta->ps.lock);
++		kunit_skip(test, "needs a second CPU");
++	}
++	queue_work_on(cpu, system_wq, &r->work);
++	mdelay(100);
++	waited = !completion_done(&r->done);
++	spin_unlock_bh(&msta->ps.lock);
++	flush_work(&r->work);
++
++	KUNIT_EXPECT_TRUE(test, waited);
++	KUNIT_EXPECT_TRUE(test, completion_done(&r->done));
++	KUNIT_EXPECT_EQ(test, r->ret, 0);
++	KUNIT_EXPECT_FALSE(test, msta->ps.dozing);
++	KUNIT_EXPECT_EQ(test, msta->ps.dozes, 0);
++	KUNIT_EXPECT_FALSE(test, spin_is_locked(&msta->ps.lock));
++	clear_bit(MT_WCID_FLAG_RESET, &msta->wcid.flags);
++}
++
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ /* With a WED, each station record goes to its WO too (so it can count the
+  * station's rx), before the firmware gets it; a record the WO refuses isn't
+@@ -5623,6 +5695,7 @@ static struct kunit_case mt7915_main_test_cases[] = {
+ 	KUNIT_CASE(mt7915_main_test_wed_4addr_mt7915),
+ #endif
+ 	KUNIT_CASE(mt7915_main_test_sta_remove_polled),
++	KUNIT_CASE(mt7915_main_test_sta_readd_ps_lock),
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	KUNIT_CASE(mt7915_main_test_wed_sta_add),
+ 	KUNIT_CASE(mt7915_main_test_wed_set_4addr),
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 4fa5f889..884e6e0d 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -13,6 +13,7 @@
+  * finished frames, TXD included, and answers them as the firmware does.
+  */
+ #include <kunit/test.h>
++#include <linux/delay.h>
+ #include <linux/firmware.h>
+ #include "fake.h"
+ 
+@@ -820,7 +821,9 @@ static void mt7915_mcu2_reset_work(struct work_struct *work)
+ 
+ /* A firmware that stops answering: the command fails with -ETIMEDOUT, the
+  * MCU is marked as resetting and one full (restart) recovery is queued.
+- * Timeouts during that recovery don't queue another.
++ * Timeouts during that recovery don't queue another. During the probe
++ * (hardware not up yet) none is: the probe fails, and freeing the device
++ * would run it on the torn-down device.
+  */
+ static void mt7915_mcu2_fw_timeout(struct kunit *test)
+ {
+@@ -832,6 +835,17 @@ static void mt7915_mcu2_fw_timeout(struct kunit *test)
+ 	mt7915_mcu2_resets = 0;
+ 	fake->mcu_silent = true;
+ 
++	dev->recovery.hw_init_done = false;
++	KUNIT_EXPECT_EQ(test, mt7915_mcu_get_temperature(&dev->phy),
++			-ETIMEDOUT);
++	flush_work(&dev->reset_work);
++	KUNIT_EXPECT_EQ(test, mt7915_mcu2_resets, 0);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT76_MCU_RESET, &dev->mphy.state));
++	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
++	dev->recovery.restart = false;
++
++	dev->recovery.hw_init_done = true;
++
+ 	KUNIT_EXPECT_EQ(test, mt7915_mcu_get_temperature(&dev->phy),
+ 			-ETIMEDOUT);
+ 	flush_work(&dev->reset_work);
+@@ -1590,6 +1604,73 @@ static void mt7915_mcu2_events_ps_sync_twt(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
+ }
+ 
++struct mt7915_mcu2_ps_update_work {
++	struct work_struct work;
++	struct completion done;
++	struct mt7915_dev *dev;
++	struct mt7915_sta *msta;
++};
++
++static void mt7915_mcu2_ps_update_fn(struct work_struct *work)
++{
++	struct mt7915_mcu2_ps_update_work *w =
++		container_of(work, struct mt7915_mcu2_ps_update_work, work);
++
++	mt7915_mcu_sta_ps_update(w->dev, w->msta);
++	complete(&w->done);
++}
++
++/* An agreement's start or end decides the hold again from the dozing
++ * record, under the record's lock, which the firmware's events hold while
++ * they record and set the hold: one deciding from the state before the
++ * other's change, and applying it after, would leave a TWT station held
++ * (or an awake one).
++ */
++static void mt7915_mcu2_events_ps_update_locked(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct ieee80211_vif *vif = mt7915_mcu2_vif(test, dev);
++	struct mt7915_mcu2_ps_update_work *w;
++	struct mt7915_sta *msta;
++	bool waited;
++	int cpu;
++
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_ps_sync_default, NULL), 0);
++	ps_sync = true;
++	w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	msta = (void *)mt7915_mcu2_sta(test, vif, 0x23)->drv_priv;
++	rcu_assign_pointer(dev->mt76.wcid[0x23], &msta->wcid);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_mcu2_drop_wcids, dev), 0);
++	mt7915_mcu2_ps_event(test, dev, 0x23, true);
++	KUNIT_ASSERT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++
++	w->dev = dev;
++	w->msta = msta;
++	init_completion(&w->done);
++	INIT_WORK(&w->work, mt7915_mcu2_ps_update_fn);
++	msta->twt.flowid_mask = BIT(0);
++
++	/* an event recording on this CPU, the agreement on another */
++	spin_lock_bh(&msta->ps.lock);
++	cpu = cpumask_any_but(cpu_online_mask, smp_processor_id());
++	if (cpu >= nr_cpu_ids) {
++		spin_unlock_bh(&msta->ps.lock);
++		kunit_skip(test, "needs a second CPU");
++	}
++	queue_work_on(cpu, system_wq, &w->work);
++	mdelay(100);
++	waited = !completion_done(&w->done);
++	spin_unlock_bh(&msta->ps.lock);
++	flush_work(&w->work);
++
++	KUNIT_EXPECT_TRUE(test, waited);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags));
++	msta->twt.flowid_mask = 0;
++}
++
+ /* With the ps_sync switch off (as stock), a station the firmware reports dozing isn't
+  * held, and one already held is let go by its next event, dozing or not.
+  */
+@@ -1906,6 +1987,7 @@ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_rdd_report_dropped),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync_twt),
++	KUNIT_CASE(mt7915_mcu2_events_ps_update_locked),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync_off),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_sync_v2),
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_record),
+diff --git a/mt7915/tests/mmio-test.c b/mt7915/tests/mmio-test.c
+index 4a2719da..df68ff5a 100644
+--- a/mt7915/tests/mmio-test.c
++++ b/mt7915/tests/mmio-test.c
+@@ -968,6 +968,19 @@ static void mt7915_mmio_test_irq_handler(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, mt7915_mmio_test_irq.tasklet_runs, 1);
+ 	clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
+ 
++	/* the subsystem powered down (mt7915_stop_hardware()): no register
++	 * is touched, initialized or not
++	 */
++	dev->wfsys_off = true;
++	mt76_test_set_reg(fake, MT_INT_MASK_CSR, ~0);
++	KUNIT_EXPECT_EQ(test, mt7915_irq_handler(0, dev), IRQ_NONE);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, MT_INT_MASK_CSR), ~0);
++	set_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
++	KUNIT_EXPECT_EQ(test, mt7915_irq_handler(0, dev), IRQ_NONE);
++	KUNIT_EXPECT_EQ(test, mt76_test_reg(fake, MT_INT_MASK_CSR), ~0);
++	clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state);
++	dev->wfsys_off = false;
++
+ 	/* with a second interface, its mask goes off too */
+ 	dev->hif2 = kunit_kzalloc(test, sizeof(*dev->hif2), GFP_KERNEL);
+ 	KUNIT_ASSERT_NOT_NULL(test, dev->hif2);
+diff --git a/mt7915/tests/replay-test.c b/mt7915/tests/replay-test.c
+index cfa056ec..11fb1532 100644
+--- a/mt7915/tests/replay-test.c
++++ b/mt7915/tests/replay-test.c
+@@ -592,6 +592,14 @@ static void mt7915_replay_test_register_fails(struct kunit *test,
+ 					   mt7915_replay_test_debugfs_stub);
+ 
+ 	KUNIT_EXPECT_EQ(test, mt7915_register_device(dev), -ENOMEM);
++	/* past the point where recoveries start: none may run any more */
++	if (!thermal_fail)
++		KUNIT_EXPECT_TRUE(test, test_bit(MT76_REMOVED,
++						 &dev->mphy.state));
++	KUNIT_EXPECT_FALSE(test, work_pending(&dev->reset_work));
++	KUNIT_EXPECT_FALSE(test, work_pending(&dev->dump_work));
++	/* powered down: the interrupt handler stays off its registers */
++	KUNIT_EXPECT_TRUE(test, dev->wfsys_off);
+ 	KUNIT_EXPECT_FALSE(test, dev->mt76.hw->wiphy->registered);
+ 	KUNIT_EXPECT_NULL(test, mt7915_ext_phy(dev));
+ 	KUNIT_EXPECT_EQ(test, mt76_rr(dev, MT_WFDMA0_GLO_CFG) &
+diff --git a/mt7915/tests/soc-test.c b/mt7915/tests/soc-test.c
+index 3343fe7a..2057ba49 100644
+--- a/mt7915/tests/soc-test.c
++++ b/mt7915/tests/soc-test.c
+@@ -1582,6 +1582,7 @@ struct mt7915_soc_test_probe {
+ 	int reg_ret;		/* what mt7915_register_device() returns */
+ 	bool no_sku;		/* the SKU window can't be mapped */
+ 	int n_register, n_unregister;
++	bool irq_at_unregister;
+ 	struct mt7915_dev *dev;
+ };
+ 
+@@ -1620,11 +1621,14 @@ static int mt7915_soc_test_register(struct mt7915_dev *dev)
+ 	return p->reg_ret;
+ }
+ 
+-/* what mt7915_unregister_device() ends with */
++/* mt7915_unregister_hw(): the teardown before the device is freed */
+ static void mt7915_soc_test_unregister(struct mt7915_dev *dev)
+ {
+-	mt7915_soc_test_p->n_unregister++;
+-	mt76_free_device(&dev->mt76);
++	struct mt7915_soc_test_probe *p = mt7915_soc_test_p;
++
++	p->n_unregister++;
++	/* the hardware is still being stopped: the interrupt is there */
++	p->irq_at_unregister = irq_has_action(p->irq);
+ }
+ 
+ static int mt7915_soc_test_reset_op(struct reset_controller_dev *rcdev,
+@@ -1724,7 +1728,7 @@ mt7915_soc_test_probe_env(struct kunit *test)
+ 				   mt7915_soc_test_ioremap);
+ 	kunit_activate_static_stub(test, mt7915_register_device,
+ 				   mt7915_soc_test_register);
+-	kunit_activate_static_stub(test, mt7915_unregister_device,
++	kunit_activate_static_stub(test, mt7915_unregister_hw,
+ 				   mt7915_soc_test_unregister);
+ 	return p;
+ }
+@@ -1803,7 +1807,9 @@ static void mt7915_soc_test_probe_errors(struct kunit *test)
+ }
+ 
+ /* A probe whose registration goes through keeps its interrupt; removing
+- * the platform device unregisters it.
++ * the platform device unregisters it, then frees the interrupt before the
++ * device (devm would only after remove() returns, the handler then running
++ * on freed memory).
+  */
+ static void mt7915_soc_test_probe_remove(struct kunit *test)
+ {
+@@ -1825,7 +1831,8 @@ static void mt7915_soc_test_probe_remove(struct kunit *test)
+ 	OPTIMIZER_HIDE_VAR(remove);
+ 	remove(pdev);
+ 	KUNIT_EXPECT_EQ(test, p->n_unregister, 1);
+-	devm_free_irq(&pdev->dev, p->irq, p->dev);
++	KUNIT_EXPECT_TRUE(test, p->irq_at_unregister);
++	KUNIT_EXPECT_FALSE(test, irq_has_action(p->irq));
+ }
+ 
+ static int mt7915_soc_test_clk_refuse(struct clk_hw *hw)

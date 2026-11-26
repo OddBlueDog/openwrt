@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shiji Yang <yangshiji66@outlook.com>
+Date: Fri, 20 Nov 2026 12:40:56 +0800
+Subject: [PATCH] wifi: mt76: connac: remove useless tx_power calculation
+
+The variable tx_power was calculated but never used.
+
+Fixes: 317bc1a0590e ("wifi: mt76: connac: factor out rate power limit calculation")
+Signed-off-by: Shiji Yang <yangshiji66@outlook.com>
+Link: https://patch.msgid.link/OSCPR01MB15019FDE88A442FBC74081EAABC782@OSCPR01MB15019.jpnprd01.prod.outlook.com
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 41d5d1dd63111870ef74a5b9645416d98979a145)
+---
+ mt76_connac_mcu.c | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/mt76_connac_mcu.c b/mt76_connac_mcu.c
+index 4c79d32a..6790765c 100644
+--- a/mt76_connac_mcu.c
++++ b/mt76_connac_mcu.c
+@@ -2219,7 +2219,7 @@ mt76_connac_mcu_rate_txpower_band(struct mt76_phy *phy,
+ 		209, 211, 213, 215, 217, 219, 221,
+ 		225, 227, 229, 233
+ 	};
+-	int i, n_chan, batch_size, idx = 0, tx_power, last_ch, err = 0;
++	int i, n_chan, batch_size, idx = 0, last_ch, err = 0;
+ 	struct mt76_connac_sku_tlv sku_tlbv;
+ 	struct mt76_power_limits *limits;
+ 	const u8 *ch_list;
+@@ -2229,9 +2229,6 @@ mt76_connac_mcu_rate_txpower_band(struct mt76_phy *phy,
+ 		return -ENOMEM;
+ 
+ 	sku_len = is_connac2(dev) ? sizeof(sku_tlbv) : sizeof(sku_tlbv) - 92;
+-	tx_power = 2 * phy->hw->conf.power_level;
+-	if (!tx_power)
+-		tx_power = 127;
+ 
+ 	if (band == NL80211_BAND_2GHZ) {
+ 		n_chan = ARRAY_SIZE(chan_list_2ghz);

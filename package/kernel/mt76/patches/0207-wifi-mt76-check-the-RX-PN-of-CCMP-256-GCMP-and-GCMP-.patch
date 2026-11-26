@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Tue, 17 Nov 2026 19:01:28 +0100
+Subject: [PATCH] wifi: mt76: check the RX PN of CCMP-256, GCMP and GCMP-256
+ keys
+
+mt76_wcid_key_link_setup() enables the RX PN check for CCMP keys only.
+mac80211 does not check the PN either, because the IV is stripped, so
+on mt7996, whose hardware does not check it, replayed frames of the
+other AES ciphers reach the stack.
+
+Check the PN for all four ciphers. Keep the PN state of a wcid when an
+IGTK or BIGTK is installed on it, since these keys do not use it.
+
+Fixes: 04b8e65922f6 ("mt76: add mac80211 driver for MT7615 PCIe-based chipsets")
+Link: https://patch.msgid.link/20261117180134.2940930-13-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 3c17c4d96e584233334935416abfac23fb0f5617)
+---
+ mac80211.c | 19 ++++++++++---------
+ mt76.h     | 38 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 9 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index 901ba387..abc074e9 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1337,27 +1337,28 @@ void mt76_wcid_key_setup(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 			 struct ieee80211_key_conf *key)
+ {
+ 	struct ieee80211_key_seq seq;
++	u8 *pn;
+ 	int i;
+ 
+-	wcid->rx_check_pn = false;
+-
+-	if (!key)
+-		return;
+-
+-	if (key->cipher != WLAN_CIPHER_SUITE_CCMP)
++	mt76_wcid_key_link_setup(wcid, key);
++	if (!key || !mt76_key_has_rx_pn(key))
+ 		return;
+ 
+-	wcid->rx_check_pn = true;
++	if (key->cipher == WLAN_CIPHER_SUITE_GCMP ||
++	    key->cipher == WLAN_CIPHER_SUITE_GCMP_256)
++		pn = seq.gcmp.pn;
++	else
++		pn = seq.ccmp.pn;
+ 
+ 	/* data frame */
+ 	for (i = 0; i < IEEE80211_NUM_TIDS; i++) {
+ 		ieee80211_get_key_rx_seq(key, i, &seq);
+-		memcpy(wcid->rx_key_pn[i], seq.ccmp.pn, sizeof(seq.ccmp.pn));
++		memcpy(wcid->rx_key_pn[i], pn, sizeof(wcid->rx_key_pn[i]));
+ 	}
+ 
+ 	/* robust management frame */
+ 	ieee80211_get_key_rx_seq(key, -1, &seq);
+-	memcpy(wcid->rx_key_pn[i], seq.ccmp.pn, sizeof(seq.ccmp.pn));
++	memcpy(wcid->rx_key_pn[i], pn, sizeof(wcid->rx_key_pn[i]));
+ 
+ }
+ EXPORT_SYMBOL(mt76_wcid_key_setup);
+diff --git a/mt76.h b/mt76.h
+index 6391651d..539c5858 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1665,6 +1665,44 @@ int mt76_rx_aggr_start(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tid,
+ 		       u16 ssn, u16 size);
+ void mt76_rx_aggr_stop(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tid);
+ 
++static inline bool
++mt76_key_has_rx_pn(struct ieee80211_key_conf *key)
++{
++	switch (key->cipher) {
++	case WLAN_CIPHER_SUITE_CCMP:
++	case WLAN_CIPHER_SUITE_CCMP_256:
++	case WLAN_CIPHER_SUITE_GCMP:
++	case WLAN_CIPHER_SUITE_GCMP_256:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static inline bool
++mt76_key_is_bip(struct ieee80211_key_conf *key)
++{
++	switch (key->cipher) {
++	case WLAN_CIPHER_SUITE_AES_CMAC:
++	case WLAN_CIPHER_SUITE_BIP_CMAC_256:
++	case WLAN_CIPHER_SUITE_BIP_GMAC_128:
++	case WLAN_CIPHER_SUITE_BIP_GMAC_256:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static inline void
++mt76_wcid_key_link_setup(struct mt76_wcid *wcid,
++			 struct ieee80211_key_conf *key)
++{
++	/* an IGTK or BIGTK shares the wcid of the GTK */
++	if (key && mt76_key_is_bip(key))
++		return;
++
++	wcid->rx_check_pn = key && mt76_key_has_rx_pn(key);
++}
+ void mt76_wcid_key_setup(struct mt76_dev *dev, struct mt76_wcid *wcid,
+ 			 struct ieee80211_key_conf *key);
+ 

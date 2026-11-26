@@ -1,0 +1,897 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 22:15:39 +0000
+Subject: [PATCH] wifi: mt76: rx frame lengths, the PN check's lock, the silent
+ hold's list
+
+- A-MSDU: a first subframe too short for frame control or for the
+  subframe header it starts with is dropped rather than compared with an
+  LLC/SNAP header past its end.
+- BAR: mt76_rx_aggr_check_ctl() needs the whole request (20 bytes) for
+  its BAR control and starting sequence, not only the 16-byte header.
+- connac2: the first fragment's 802.11 header is rebuilt only for a
+  station's frame with an Ethernet header after the descriptor, and the
+  MT7915's C-RXV word is read only in its branch of fill_rx_rate.
+- PN: a frame of a TID with a BA session that the session didn't take
+  (no-ack policy, before it started, while it stops) has its PN checked
+  in mt76_rx_complete() under the session's lock, which its own frames
+  are checked under (rx path, reorder work); a session stops and is
+  drained before it is unlisted, so that lock is found until then.
+- Silent hold: mt76_tx_result() orders the hold's fields, its flag and
+  its silent_wait bit; the poll clears a bit before it looks again, at
+  the slot's station now, so a station held (or added at a reused slot)
+  meanwhile stays listed and is probed; with silent_hold off it unlists
+  before it releases.
+- record: the state is checked again after a device's first record
+  (which can fill the buffer), memcpy only with something to copy,
+  channels read under the lock.
+
+KUnit for each, with seams where a window has to be hit
+(mt76_tx_silent_unlisted, mt76_rx_pn_update) and a second CPU for the
+session's stop.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agg-rx.c                |  27 ++++++---
+ mac80211.c              |  61 ++++++++++++++++++--
+ mt76_connac_mac.c       |   8 ++-
+ record.c                |  31 ++++++----
+ tests/agg-rx-test.c     |  80 ++++++++++++++++++++++++++
+ tests/connac-mac-test.c |  27 +++++++++
+ tests/core-test.c       | 122 ++++++++++++++++++++++++++++++++++++++++
+ tests/ps-sim-test.c     | 121 +++++++++++++++++++++++++++++++++++++++
+ tests/record-test.c     |  44 +++++++++++++++
+ tx.c                    |  39 ++++++++++++-
+ 10 files changed, 533 insertions(+), 27 deletions(-)
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 184140e2..a0dab982 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -160,6 +160,10 @@ mt76_rx_aggr_check_ctl(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	if (!ieee80211_is_back_req(bar->frame_control))
+ 		return;
+ 
++	/* its BAR control and starting sequence come after the 16-byte header */
++	if ((u8 *)(bar + 1) > skb_tail_pointer(skb))
++		return;
++
+ 	status->qos_ctl = tidno = le16_to_cpu(bar->control) >> 12;
+ 	seqno = IEEE80211_SEQ_TO_SN(le16_to_cpu(bar->start_seq_num));
+ 	tid = rcu_dereference(wcid->aggr[tidno]);
+@@ -335,14 +339,23 @@ static void mt76_rx_aggr_shutdown(struct mt76_dev *dev, struct mt76_rx_tid *tid)
+ 
+ void mt76_rx_aggr_stop(struct mt76_dev *dev, struct mt76_wcid *wcid, u8 tidno)
+ {
+-	struct mt76_rx_tid *tid = NULL;
++	struct mt76_rx_tid *tid;
+ 
+-	tid = rcu_replace_pointer(wcid->aggr[tidno], tid,
+-				  lockdep_is_held(&dev->mutex));
+-	if (tid) {
+-		mt76_rx_aggr_shutdown(dev, tid);
+-		kfree_rcu(tid, rcu_head);
+-	}
++	tid = rcu_dereference_protected(wcid->aggr[tidno],
++					lockdep_is_held(&dev->mutex));
++	if (!tid)
++		return;
++
++	/*
++	 * Stopped and drained while still listed: a frame of the TID that
++	 * doesn't go through the session takes its lock for the PN check
++	 * (mt76_rx_check_pn()) only while it finds it, and until the
++	 * shutdown is done the session's own frames can be checked under
++	 * that lock (from the rx path or the reorder work).
++	 */
++	mt76_rx_aggr_shutdown(dev, tid);
++	RCU_INIT_POINTER(wcid->aggr[tidno], NULL);
++	kfree_rcu(tid, rcu_head);
+ }
+ EXPORT_SYMBOL_GPL(mt76_rx_aggr_stop);
+ 
+diff --git a/mac80211.c b/mac80211.c
+index e0235433..d139adfd 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -4,6 +4,7 @@
+  */
+ #include <linux/sched.h>
+ #include <linux/of.h>
++#include <kunit/static_stub.h>
+ #include "mt76.h"
+ 
+ #define CHAN2G(_idx, _freq) {			\
+@@ -1009,6 +1010,10 @@ static void mt76_rx_release_amsdu(struct mt76_phy *phy, enum mt76_rxq_id q)
+ 		if (!(status->flag & RX_FLAG_8023)) {
+ 			struct ieee80211_hdr *hdr = mt76_skb_get_hdr(skb);
+ 
++			if ((u8 *)hdr + sizeof(hdr->frame_control) >
++			    skb_tail_pointer(skb))
++				goto drop;
++
+ 			subframe = (u8 *)hdr +
+ 				   ieee80211_hdrlen(hdr->frame_control);
+ 
+@@ -1018,10 +1023,12 @@ static void mt76_rx_release_amsdu(struct mt76_phy *phy, enum mt76_rxq_id q)
+ 				subframe += 8;
+ 		}
+ 
+-		if (ether_addr_equal(subframe, rfc1042_header)) {
+-			dev_kfree_skb(skb);
+-			return;
+-		}
++		/* a first subframe without room for its own subframe header
++		 * isn't one
++		 */
++		if (subframe + ETH_ALEN > skb_tail_pointer(skb) ||
++		    ether_addr_equal(subframe, rfc1042_header))
++			goto drop;
+ 	}
+ 
+ 	/* RRO 3.0 data queue skbs are processed and completed in the context
+@@ -1031,6 +1038,10 @@ static void mt76_rx_release_amsdu(struct mt76_phy *phy, enum mt76_rxq_id q)
+ 		q = MT_RXQ_RRO_IND;
+ 
+ 	__skb_queue_tail(&dev->rx_skb[q], skb);
++	return;
++
++drop:
++	dev_kfree_skb(skb);
+ }
+ 
+ static void mt76_rx_release_burst(struct mt76_phy *phy, enum mt76_rxq_id q,
+@@ -1452,6 +1463,13 @@ mt76_rx_convert(struct mt76_dev *dev, struct sk_buff *skb,
+ 	*hw = mt76_phy_hw(dev, mstat.phy_idx);
+ }
+ 
++/* the TID's last PN moves on to the frame's */
++static void mt76_rx_pn_update(u8 *rx_pn, const u8 *pn)
++{
++	KUNIT_STATIC_STUB_REDIRECT(mt76_rx_pn_update, rx_pn, pn);
++	memcpy(rx_pn, pn, IEEE80211_CCMP_PN_LEN);
++}
++
+ void mt76_check_ccmp_pn(struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+@@ -1507,12 +1525,43 @@ skip_hdr_check:
+ 		return;
+ 	}
+ 
+-	memcpy(wcid->rx_key_pn[security_idx], status->iv, sizeof(status->iv));
++	mt76_rx_pn_update(wcid->rx_key_pn[security_idx], status->iv);
+ 
+ 	if (status->flag & RX_FLAG_IV_STRIPPED)
+ 		status->flag |= RX_FLAG_PN_VALIDATED;
+ }
+ 
++/*
++ * mt76_rx_complete()'s PN check, under rx_lock. A BA session checks the
++ * frames it releases under its own lock (mt76_rx_aggr_pn_check(), from the
++ * rx path or its reorder timeout work) against the same per-TID counter as
++ * the frames of that TID it doesn't take (no-ack policy, sent before the
++ * session started, while it stops), which come here: take its lock for them.
++ */
++static void mt76_rx_check_pn(struct sk_buff *skb)
++{
++	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++	struct mt76_wcid *wcid = status->wcid;
++	struct mt76_rx_tid *tid = NULL;
++
++	if (wcid && wcid->rx_check_pn && !status->skip_pn_check &&
++	    (status->flag & RX_FLAG_DECRYPTED)) {
++		u8 tidno = status->qos_ctl & IEEE80211_QOS_CTL_TID_MASK;
++
++		/* the session mt76_rx_aggr_reorder() looks up */
++		if (wcid->def_wcid)
++			tid = rcu_dereference(wcid->def_wcid->aggr[tidno]);
++		else
++			tid = rcu_dereference(wcid->aggr[tidno]);
++	}
++
++	if (tid)
++		spin_lock_bh(&tid->lock);
++	mt76_check_ccmp_pn(skb);
++	if (tid)
++		spin_unlock_bh(&tid->lock);
++}
++
+ static void
+ mt76_airtime_report(struct mt76_dev *dev, struct mt76_rx_status *status,
+ 		    int len)
+@@ -1742,7 +1791,7 @@ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
+ 		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;
+ 		bool only_monitor;
+ 
+-		mt76_check_ccmp_pn(skb);
++		mt76_rx_check_pn(skb);
+ 		only_monitor = status->flag & RX_FLAG_ONLY_MONITOR;
+ 		if (only_monitor)
+ 			mt76_rx_count_drop(dev, status);
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index b612abb8..81ff0413 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -1041,6 +1041,11 @@ int mt76_connac2_reverse_frag0_hdr_trans(struct ieee80211_vif *vif,
+ 	if (!(le32_to_cpu(rxd[1]) & MT_RXD1_NORMAL_GROUP_4))
+ 		return -EINVAL;
+ 
++	/* a station's frame, with the Ethernet header it was translated to */
++	if (!status->wcid || !status->wcid->sta ||
++	    skb_headlen(skb) < hdr_offset + sizeof(struct ethhdr))
++		return -EINVAL;
++
+ 	sta = container_of((void *)status->wcid, struct ieee80211_sta, drv_priv);
+ 
+ 	/* store the info from RXD and ethhdr to avoid being overridden */
+@@ -1110,7 +1115,6 @@ int mt76_connac2_mac_fill_rx_rate(struct mt76_dev *dev,
+ 	bool cck = false;
+ 
+ 	v0 = le32_to_cpu(rxv[0]);
+-	v2 = le32_to_cpu(rxv[2]);
+ 
+ 	idx = i = FIELD_GET(MT_PRXV_TX_RATE, v0);
+ 	nss = FIELD_GET(MT_PRXV_NSTS, v0) + 1;
+@@ -1125,6 +1129,8 @@ int mt76_connac2_mac_fill_rx_rate(struct mt76_dev *dev,
+ 			dcm = FIELD_GET(MT_PRXV_DCM, v0);
+ 		bw = FIELD_GET(MT_PRXV_FRAME_MODE, v0);
+ 	} else {
++		/* the C-RXV (group 5): only there with it on the MT7915 */
++		v2 = le32_to_cpu(rxv[2]);
+ 		stbc = FIELD_GET(MT_CRXV_HT_STBC, v2);
+ 		gi = FIELD_GET(MT_CRXV_HT_SHORT_GI, v2);
+ 		*mode = FIELD_GET(MT_CRXV_TX_MODE, v2);
+diff --git a/record.c b/record.c
+index b14e48f0..d375704f 100644
+--- a/record.c
++++ b/record.c
+@@ -242,15 +242,23 @@ static int mt76_record_slot(struct mt76_record *rec, struct mt76_dev *dev)
+ static void *mt76_record_put(struct mt76_record *rec, struct mt76_dev *dev,
+ 			     u8 type, u8 space, size_t body)
+ {
+-	if (rec->state == MT76_REC_STOPPED) {
+-		/* how much more room it would have needed */
+-		if (rec->flags & MT76_REC_F_FULL)
+-			rec->dropped++;
+-		return NULL;
+-	}
++	int slot;
++
++	if (rec->state == MT76_REC_STOPPED)
++		goto stopped;
+ 
+-	return __mt76_record_put(rec, mt76_record_slot(rec, dev), type, space,
+-				 body);
++	/* a first record of @dev's (its name) can be what fills the buffer */
++	slot = mt76_record_slot(rec, dev);
++	if (rec->state == MT76_REC_STOPPED)
++		goto stopped;
++
++	return __mt76_record_put(rec, slot, type, space, body);
++
++stopped:
++	/* how much more room it would have needed */
++	if (rec->flags & MT76_REC_F_FULL)
++		rec->dropped++;
++	return NULL;
+ }
+ 
+ /* --- hooks ------------------------------------------------------------------ */
+@@ -325,7 +333,8 @@ void __mt76_record_mcu(struct mt76_dev *dev, u8 type, int cmd, int seq,
+ 		m->flags = mflags;
+ 		m->rsv = 0;
+ 		m->len = cpu_to_le32(len);
+-		memcpy(m + 1, data, keep);
++		if (keep)
++			memcpy(m + 1, data, keep);
+ 	}
+ 	spin_unlock_irqrestore(&rec->lock, flags);
+ }
+@@ -526,14 +535,16 @@ static void mt76_record_work(struct work_struct *work)
+ 					       struct mt76_record, work);
+ 	enum mt76_rec_state state;
+ 	unsigned long flags;
++	unsigned int channels;
+ 
+ 	spin_lock_irqsave(&rec->lock, flags);
+ 	state = rec->state;
++	channels = rec->channels;
+ 	if (state == MT76_REC_TRAFFIC)
+ 		__mt76_record_stop(rec, "stopped: traffic time is up");
+ 	spin_unlock_irqrestore(&rec->lock, flags);
+ 
+-	if (state == MT76_REC_RECORDING && rec->channels)
++	if (state == MT76_REC_RECORDING && channels)
+ 		mt76_record_bringup_done(rec, true);
+ }
+ 
+diff --git a/tests/agg-rx-test.c b/tests/agg-rx-test.c
+index 7817468f..f9b1385f 100644
+--- a/tests/agg-rx-test.c
++++ b/tests/agg-rx-test.c
+@@ -4,6 +4,8 @@
+  * when CONFIG_MT76_KUNIT_TEST is defined (milkflint's QEMU test build only).
+  */
+ #include <kunit/test.h>
++#include <linux/delay.h>
++#include <linux/workqueue.h>
+ #include "core-hw.h"
+ 
+ #define MT76_TEST_REORDER_SIZE	8
+@@ -555,6 +557,82 @@ static struct sk_buff *mt76_test_aggr_bar(struct kunit *test,
+ 	return skb;
+ }
+ 
++/* A request cut after its 16-byte header has no BAR control or starting
++ * sequence to act on: it moves nothing.
++ */
++static void mt76_test_aggr_bar_short(struct kunit *test)
++{
++	struct mt76_test_aggr *a = mt76_test_aggr(test, true, 100, 8);
++	struct mt76_rx_tid *tid = mt76_test_aggr_tid(a, 0);
++	struct sk_buff *skb;
++
++	mt76_test_aggr_rx(a, mt76_test_aggr_skb(test, a->wcid, 102));
++	mt76_test_aggr_rx(a, mt76_test_aggr_skb(test, a->wcid, 103));
++
++	skb = mt76_test_aggr_bar(test, a->wcid, 0, 104);
++	skb_trim(skb, 16);
++	mt76_test_aggr_status(skb)->qos_ctl = 7;
++	mt76_test_aggr_rx(a, skb);
++	KUNIT_EXPECT_EQ(test, mt76_test_aggr_status(skb)->qos_ctl, 7);
++	MT76_TEST_AGGR_EXPECT(test, a, 0xfff);
++	KUNIT_EXPECT_EQ(test, tid->head, 100);
++	KUNIT_EXPECT_EQ(test, tid->nframes, 2);
++}
++
++struct mt76_test_aggr_stop_work {
++	struct work_struct work;
++	struct completion done;
++	struct mt76_test_aggr *a;
++};
++
++static void mt76_test_aggr_stop_fn(struct work_struct *work)
++{
++	struct mt76_test_aggr_stop_work *w =
++		container_of(work, struct mt76_test_aggr_stop_work, work);
++
++	mutex_lock(&w->a->dev->mutex);
++	mt76_rx_aggr_stop(w->a->dev, w->a->wcid, 0);
++	mutex_unlock(&w->a->dev->mutex);
++	complete(&w->done);
++}
++
++/* A session stopping while its lock is held (its reorder work releasing
++ * frames, their PN checked under it) stays listed until it is drained: a
++ * frame of the TID the session doesn't take still finds the lock for its
++ * own PN check meanwhile (mt76_rx_check_pn()).
++ */
++static void mt76_test_aggr_stop_listed(struct kunit *test)
++{
++	struct mt76_test_aggr *a = mt76_test_aggr(test, false, 100, 8);
++	struct mt76_rx_tid *tid = mt76_test_aggr_tid(a, 0);
++	struct mt76_test_aggr_stop_work *w;
++	bool listed, waited;
++	int cpu;
++
++	w = kunit_kzalloc(test, sizeof(*w), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, w);
++	w->a = a;
++	init_completion(&w->done);
++	INIT_WORK(&w->work, mt76_test_aggr_stop_fn);
++
++	spin_lock_bh(&tid->lock);
++	cpu = cpumask_any_but(cpu_online_mask, smp_processor_id());
++	if (cpu >= nr_cpu_ids) {
++		spin_unlock_bh(&tid->lock);
++		kunit_skip(test, "needs a second CPU");
++	}
++	queue_work_on(cpu, system_wq, &w->work);
++	mdelay(100);
++	listed = rcu_access_pointer(a->wcid->aggr[0]) == tid;
++	waited = !completion_done(&w->done);
++	spin_unlock_bh(&tid->lock);
++	flush_work(&w->work);
++
++	KUNIT_EXPECT_TRUE(test, waited);
++	KUNIT_EXPECT_TRUE(test, listed);
++	KUNIT_EXPECT_NULL(test, rcu_access_pointer(a->wcid->aggr[0]));
++}
++
+ /* A block ack request moves the window to its start: frames before it
+  * are given up on, the waiting ones after it are released.
+  */
+@@ -855,6 +933,8 @@ static struct kunit_case mt76_agg_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_aggr_wrap),
+ 	KUNIT_CASE(mt76_test_aggr_link_wcid),
+ 	KUNIT_CASE(mt76_test_aggr_bar_release),
++	KUNIT_CASE(mt76_test_aggr_bar_short),
++	KUNIT_CASE(mt76_test_aggr_stop_listed),
+ 	KUNIT_CASE(mt76_test_aggr_bar_ignored),
+ 	KUNIT_CASE(mt76_test_aggr_work_holds),
+ 	KUNIT_CASE(mt76_test_aggr_work_rearms_remaining),
+diff --git a/tests/connac-mac-test.c b/tests/connac-mac-test.c
+index 4b9f9652..5985f0e7 100644
+--- a/tests/connac-mac-test.c
++++ b/tests/connac-mac-test.c
+@@ -2183,6 +2183,32 @@ static void mt76_connac_test_rx_rate_mt7915(struct kunit *test)
+ 	KUNIT_EXPECT_TRUE(test, status.enc_flags & RX_ENC_FLAG_SHORT_GI);
+ }
+ 
++/* The MT7986 (and MT7916) reads the rate from the P-RXV alone: that's all
++ * there is without the C-RXV (no monitor interface), the buffer here being
++ * just its two words. (The C-RXV word the MT7915 branch reads isn't touched
++ * on this path; GCC at -O2 already sinks that load into the branch, so this
++ * can't show the source fix under KASAN: it pins the P-RXV-only decode.)
++ */
++static void mt76_connac_test_rx_rate_prxv_only(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_connac_test_dev(test);
++	struct mt76_rx_status status = {};
++	__le32 *rxv;
++	u8 mode;
++
++	dev->rev = 0x79860000;
++	rxv = kunit_kmalloc(test, 2 * sizeof(*rxv), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, rxv);
++	rxv[0] = mt76_connac_test_prxv(MT_PHY_TYPE_HE_SU, 5, 2,
++				       IEEE80211_STA_RX_BW_80, 0, 0, false);
++	rxv[1] = 0;
++	KUNIT_ASSERT_EQ(test, mt76_connac2_mac_fill_rx_rate(dev, &status,
++			&dev->phy.sband_5g.sband, rxv, &mode), 0);
++	KUNIT_EXPECT_EQ(test, mode, MT_PHY_TYPE_HE_SU);
++	KUNIT_EXPECT_EQ(test, status.rate_idx, 5);
++	KUNIT_EXPECT_EQ(test, (int)status.nss, 2);
++}
++
+ /* connac2 chips flag DCM in the rate field. */
+ static void mt76_connac_test_rx_rate_connac2(struct kunit *test)
+ {
+@@ -2799,6 +2825,7 @@ static struct kunit_case mt76_connac_mac_test_cases[] = {
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_he),
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_invalid),
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_mt7915),
++	KUNIT_CASE(mt76_connac_test_rx_rate_prxv_only),
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_connac2),
+ 	KUNIT_CASE(mt76_connac_test_rx_rate_stbc_flags),
+ 	KUNIT_CASE(mt76_connac_test_he_radiotap_common),
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 79b28379..2e76a466 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -2250,6 +2250,48 @@ static void mt76_test_rx_amsdu_bad_first_subframe(struct kunit *test)
+ 	skb_queue_purge(&dev->rx_skb[MT_RXQ_MAIN]);
+ }
+ 
++/* A first subframe (of an A-MSDU of more than one frame) too short for the
++ * subframe header it has to start with: dropped, rather than its start
++ * compared with an LLC/SNAP header past the end of the frame.
++ */
++static void mt76_test_rx_amsdu_short_first_subframe(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_hwt_dev(test, &mt76_test_drv_ops);
++	struct sk_buff_head *rxq = &dev->rx_skb[MT_RXQ_MAIN];
++	static const u32 flags[] = { 0, RX_FLAG_8023 };
++	struct sk_buff *a, *b;
++	int i;
++
++	set_bit(MT76_STATE_RUNNING, &dev->phy.state);
++	for (i = 0; i < ARRAY_SIZE(flags); i++) {
++		a = mt76_test_amsdu(test, 1, 5, true, false, mt76_hwt_addr);
++		b = mt76_test_amsdu(test, 2, 5, false, true, mt76_hwt_addr);
++		/* 5 bytes of the subframe header: after the QoS data
++		 * header, or translated to 802.3 at the start
++		 */
++		skb_trim(a, (flags[i] ? 0 : 26) + ETH_ALEN - 1);
++		mt76_test_status(a)->flag = flags[i];
++		mt76_test_status(b)->flag = flags[i];
++		mt76_rx(dev, MT_RXQ_MAIN, a);
++		mt76_rx(dev, MT_RXQ_MAIN, b);
++		KUNIT_EXPECT_TRUE(test, skb_queue_empty(rxq));
++		skb_queue_purge(rxq);
++	}
++
++	/* 802.11 cut inside its header */
++	a = mt76_test_amsdu(test, 1, 5, true, false, mt76_hwt_addr);
++	b = mt76_test_amsdu(test, 2, 5, false, true, mt76_hwt_addr);
++	skb_trim(a, 1);
++	mt76_rx(dev, MT_RXQ_MAIN, a);
++	mt76_rx(dev, MT_RXQ_MAIN, b);
++	KUNIT_EXPECT_TRUE(test, skb_queue_empty(rxq));
++	skb_queue_purge(rxq);
++
++	/* the whole subframe header: kept */
++	KUNIT_EXPECT_TRUE(test, mt76_test_amsdu_kept(test, dev, 26,
++						     mt76_hwt_addr, 0));
++}
++
+ /* With WED's RRO 3.0, frames of an RRO data queue complete in the context
+  * of the indication queue, so they are queued there.
+  */
+@@ -2966,6 +3008,84 @@ static void mt76_test_rx_complete_one(struct mt76_dev *dev, struct sk_buff *skb)
+ 	local_bh_enable();
+ }
+ 
++static spinlock_t *mt76_test_pn_tid_lock;
++static int mt76_test_pn_updates, mt76_test_pn_locked;
++
++static void mt76_test_pn_update(u8 *rx_pn, const u8 *pn)
++{
++	mt76_test_pn_updates++;
++	if (spin_is_locked(mt76_test_pn_tid_lock))
++		mt76_test_pn_locked++;
++	memcpy(rx_pn, pn, IEEE80211_CCMP_PN_LEN);
++}
++
++/* A frame of a TID with a BA session that the reorder buffer didn't take
++ * (no-ack policy here) has its PN checked in mt76_rx_complete(), under
++ * rx_lock. The session checks the frames it releases under its own lock, in
++ * the rx path or in its timeout work on another CPU, against the same
++ * counter: its lock is taken for this one too.
++ */
++static void mt76_test_rx_pn_session_lock(struct kunit *test)
++{
++	struct mt76_hwt *hwt = mt76_hwt_new(test, &mt76_test_drv_ops);
++	struct mt76_dev *dev = hwt->dev;
++	struct mt76_rx_status *status;
++	struct mt76_rx_tid *tid;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++
++	/* mac80211 takes frames only while an interface is up */
++	mt76_hwt_iface(hwt, "monitor");
++	set_bit(MT76_STATE_RUNNING, &dev->phy.state);
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	wcid->rx_check_pn = true;
++	wcid->idx = 5;
++	rcu_assign_pointer(dev->wcid[5], wcid);
++	mt76_test_set_pn(wcid->rx_key_pn[3], 6);
++	mutex_lock(&dev->mutex);
++	KUNIT_ASSERT_EQ(test, mt76_rx_aggr_start(dev, wcid, 3, 100, 8), 0);
++	mutex_unlock(&dev->mutex);
++	tid = rcu_access_pointer(wcid->aggr[3]);
++	mt76_test_pn_tid_lock = &tid->lock;
++	mt76_test_pn_updates = 0;
++	mt76_test_pn_locked = 0;
++
++	kunit_activate_static_stub(test, mt76_rx_pn_update,
++				   mt76_test_pn_update);
++	skb = mt76_test_rx_skb(test, MT76_TEST_QOS_DATA, mt76_hwt_addr, 1, 8);
++	status = mt76_test_status(skb);
++	status->wcid = wcid;
++	status->flag = MT76_TEST_DEC;
++	status->qos_ctl = 3 | IEEE80211_QOS_CTL_ACK_POLICY_NOACK;
++	mt76_test_set_pn(status->iv, 7);
++	mt76_test_rx_complete_one(dev, skb);
++
++	/* without a session on its TID, nothing to take */
++	mt76_test_pn_tid_lock = &dev->rx_lock;
++	skb = mt76_test_rx_skb(test, MT76_TEST_QOS_DATA, mt76_hwt_addr, 1, 8);
++	status = mt76_test_status(skb);
++	status->wcid = wcid;
++	status->flag = MT76_TEST_DEC;
++	status->qos_ctl = 2;
++	mt76_test_set_pn(status->iv, 1);
++	mt76_test_rx_complete_one(dev, skb);
++	kunit_deactivate_static_stub(test, mt76_rx_pn_update);
++
++	KUNIT_EXPECT_EQ(test, mt76_test_pn_updates, 2);
++	/* the session's lock for the first, rx_lock (only) for the second */
++	KUNIT_EXPECT_EQ(test, mt76_test_pn_locked, 2);
++	KUNIT_EXPECT_EQ(test, mt76_test_get_pn(wcid->rx_key_pn[3]), 7);
++	KUNIT_EXPECT_EQ(test, mt76_test_get_pn(wcid->rx_key_pn[2]), 1);
++	KUNIT_EXPECT_FALSE(test, spin_is_locked(&tid->lock));
++
++	mutex_lock(&dev->mutex);
++	mt76_rx_aggr_stop(dev, wcid, 3);
++	mutex_unlock(&dev->mutex);
++	RCU_INIT_POINTER(dev->wcid[5], NULL);
++	synchronize_rcu();
++}
++
+ /* Frames kept from the network stack are counted per phy, once per MPDU:
+  * a PN replay as a replay, one the hardware flagged (ICV/MIC) as ICV.
+  * Frames that go through count nothing.
+@@ -3082,6 +3202,7 @@ static struct kunit_case mt76_core_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_rx_amsdu_stale),
+ 	KUNIT_CASE(mt76_test_rx_amsdu_boundaries),
+ 	KUNIT_CASE(mt76_test_rx_amsdu_bad_first_subframe),
++	KUNIT_CASE(mt76_test_rx_amsdu_short_first_subframe),
+ 	KUNIT_CASE(mt76_test_rx_rro_v3),
+ 	KUNIT_CASE(mt76_test_rx_convert),
+ 	KUNIT_CASE(mt76_test_rx_convert_8023),
+@@ -3096,6 +3217,7 @@ static struct kunit_case mt76_core_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_check_sta_pspoll_unknown),
+ 	KUNIT_CASE(mt76_test_rx_poll_complete),
+ 	KUNIT_CASE(mt76_test_rx_drop_count),
++	KUNIT_CASE(mt76_test_rx_pn_session_lock),
+ 	KUNIT_CASE(mt76_test_rx_drop_report),
+ 	{}
+ };
+diff --git a/tests/ps-sim-test.c b/tests/ps-sim-test.c
+index ab7bae34..14035456 100644
+--- a/tests/ps-sim-test.c
++++ b/tests/ps-sim-test.c
+@@ -2558,6 +2558,125 @@ static void mt76_psim_test_silent(struct kunit *test)
+ 	skb_queue_purge(&psim_skbs);
+ }
+ 
++/* mt76_tx_silent_unlisted() stand-in: the station's frames fail again, as
++ * many as start a hold, just as the poll found it released
++ */
++static void psim_silent_rehold(struct mt76_dev *dev, struct mt76_wcid *wcid)
++{
++	int i;
++
++	for (i = 0; wcid && i < MT76_SILENT_FAILS &&
++		    !test_bit(MT_WCID_FLAG_SILENT, &wcid->flags); i++)
++		mt76_tx_result(dev, wcid, false);
++}
++
++/* A station heard again leaves its bit in silent_wait for the poll to clear.
++ * Held again just as the poll finds it released, it stays listed: with its
++ * bit cleared nothing would probe it, and it stayed held until it sent
++ * something of its own.
++ */
++static void mt76_psim_test_silent_rehold(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 23, .ps_sync = true, .silent = true,
++		.kinds = { PSIM_PHONE }, .n_sta = 1,
++	};
++	struct psim_sta *phone;
++	struct mt76_wcid *wcid;
++	struct mt76_dev *dev;
++	struct psim *s;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	dev = s->dev;
++	phone = &s->sta[0];
++	wcid = psim_wcid(phone);
++
++	psim_mute(s, phone);
++	psim_silent_ticks(s, 40);
++	psim_silent_send(s, phone, 1);
++	psim_silent_tick(s);
++	KUNIT_ASSERT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	psim_unmute(s, phone);
++	KUNIT_ASSERT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_ASSERT_TRUE(test, test_bit(wcid->idx, dev->silent_wait));
++
++	kunit_activate_static_stub(test, mt76_tx_silent_unlisted,
++				   psim_silent_rehold);
++	mt76_tx_silent_poll(dev);
++	kunit_deactivate_static_stub(test, mt76_tx_silent_unlisted);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, test_bit(wcid->idx, dev->silent_wait));
++	KUNIT_EXPECT_EQ(test, wcid->silent_holds, 2);
++
++	/* and probed when its time comes */
++	psim_silent_ticks(s, 10);
++	KUNIT_EXPECT_GE(test, wcid->silent_probes, 1);
++
++	psim_heard(s, phone);
++	psim_silent_ticks(s, 4);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, bitmap_empty(dev->silent_wait, MT76_N_WCIDS));
++	skb_queue_purge(&psim_skbs);
++}
++
++static struct mt76_wcid *psim_silent_new_wcid;
++
++/* mt76_tx_silent_unlisted() stand-in: a new station is added at the slot
++ * the poll found empty, and held at once
++ */
++static void psim_silent_reuse(struct mt76_dev *dev, struct mt76_wcid *wcid)
++{
++	struct mt76_wcid *w = psim_silent_new_wcid;
++
++	rcu_assign_pointer(dev->wcid[w->idx], w);
++	psim_silent_rehold(dev, w);
++}
++
++/* A slot whose station went keeps its bit in silent_wait for the poll to
++ * clear. A new station added there and held just as the poll finds the slot
++ * empty stays listed: the poll looks at the slot's station again, not the
++ * one it read before.
++ */
++static void mt76_psim_test_silent_rehold_reuse(struct kunit *test)
++{
++	static const struct psim_cfg cfg = {
++		.seed = 29, .ps_sync = true, .silent = true,
++		.kinds = { PSIM_PHONE }, .n_sta = 1,
++	};
++	struct psim_sta *phone;
++	struct mt76_wcid *wcid;
++	struct mt76_dev *dev;
++	struct psim *s;
++
++	skb_queue_head_init(&psim_skbs);
++	s = psim_init(test, &cfg);
++	dev = s->dev;
++	phone = &s->sta[0];
++	wcid = psim_wcid(phone);
++	psim_silent_ticks(s, 40);
++
++	/* gone, its bit left over (a hold it had) */
++	set_bit(wcid->idx, dev->silent_wait);
++	rcu_assign_pointer(dev->wcid[wcid->idx], NULL);
++	synchronize_rcu();
++
++	psim_silent_new_wcid = wcid;
++	kunit_activate_static_stub(test, mt76_tx_silent_unlisted,
++				   psim_silent_reuse);
++	mt76_tx_silent_poll(dev);
++	kunit_deactivate_static_stub(test, mt76_tx_silent_unlisted);
++	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(dev->wcid[wcid->idx]),
++			    wcid);
++	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
++	KUNIT_EXPECT_TRUE(test, test_bit(wcid->idx, dev->silent_wait));
++
++	psim_heard(s, phone);
++	psim_silent_ticks(s, 4);
++	KUNIT_EXPECT_TRUE(test, bitmap_empty(dev->silent_wait, MT76_N_WCIDS));
++	skb_queue_purge(&psim_skbs);
++}
++
+ /* The same hours of the same clients, phones' doze notices going missing one
+  * time in five, without the hold and then with it: what those phones lose.
+  * (Two cases: a test has one device.)
+@@ -3003,6 +3122,8 @@ static struct kunit_case mt76_psim_test_cases[] = {
+ 	KUNIT_CASE_PARAM(mt76_psim_test_run, psim_seed_params),
+ 	KUNIT_CASE(mt76_psim_test_pace),
+ 	KUNIT_CASE(mt76_psim_test_silent),
++	KUNIT_CASE(mt76_psim_test_silent_rehold),
++	KUNIT_CASE(mt76_psim_test_silent_rehold_reuse),
+ 	KUNIT_CASE(mt76_psim_test_silent_off),
+ 	KUNIT_CASE(mt76_psim_test_silent_on),
+ 	KUNIT_CASE(mt76_psim_test_release),
+diff --git a/tests/record-test.c b/tests/record-test.c
+index cdbe88aa..2fd909d9 100644
+--- a/tests/record-test.c
++++ b/tests/record-test.c
+@@ -390,6 +390,49 @@ static void mt76_record_test_full(struct kunit *test)
+ 			   le16_to_cpu(last->len));
+ }
+ 
++/* What fills the buffer can be a new device's first record (its name),
++ * which goes before the record asked for: that one isn't added after the
++ * stop note either (a mark would fit in the room the note left), and both
++ * are counted as dropped.
++ */
++static void mt76_record_test_full_new_dev(struct kunit *test)
++{
++	struct mt76_record_test_hw hw = {};
++	const struct mt76_rec_hdr *h, *last = NULL;
++	struct mt76_dev *dev, *other;
++	struct mt76_record *rec;
++	size_t off = 0, len;
++	const void *body;
++	u32 blen;
++	void *data;
++
++	dev = mt76_record_test_dev(test, &hw);
++	other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, other);
++	rec = mt76_record_test_start(test, 512, 0);
++
++	/* to less than the stop note's room and a nameless device record */
++	while (rec->len + 16 + 64 <= rec->size)
++		__mt76_wr(dev, 0x10, 0);
++	if (rec->size - rec->len >= 64 + 8)
++		__mt76_record_mark(dev, "%s", "");
++	KUNIT_ASSERT_NE(test, rec->state, MT76_REC_STOPPED);
++	KUNIT_ASSERT_LT(test, rec->size - rec->len, 64 + 8);
++	KUNIT_ASSERT_EQ(test, rec->dropped, 0);
++
++	__mt76_record_mark(other, "x");
++	KUNIT_EXPECT_EQ(test, rec->state, MT76_REC_STOPPED);
++	KUNIT_EXPECT_EQ(test, rec->dropped, 2);
++
++	data = mt76_record_test_take(test, rec, &len);
++	while ((h = mt76_replay_next(data, &off, &body, &blen)))
++		last = h;
++	KUNIT_ASSERT_NOT_NULL(test, last);
++	KUNIT_EXPECT_EQ(test, last->type, MT76_REC_MARK);
++	KUNIT_EXPECT_MEMEQ(test, last + 1, "stopped: buffer full",
++			   le16_to_cpu(last->len));
++}
++
+ static const char *mt76_record_test_last_mark(struct kunit *test,
+ 					      const void *data, int back)
+ {
+@@ -745,6 +788,7 @@ static struct kunit_case mt76_record_test_cases[] = {
+ 	KUNIT_CASE(mt76_record_test_format),
+ 	KUNIT_CASE(mt76_record_test_detached),
+ 	KUNIT_CASE(mt76_record_test_full),
++	KUNIT_CASE(mt76_record_test_full_new_dev),
+ 	KUNIT_CASE(mt76_record_test_modes),
+ 	KUNIT_CASE(mt76_record_test_fw_download),
+ 	KUNIT_CASE(mt76_record_test_timeout),
+diff --git a/tx.c b/tx.c
+index 174068c9..dee99a3b 100644
+--- a/tx.c
++++ b/tx.c
+@@ -3,6 +3,7 @@
+  * Copyright (C) 2016 Felix Fietkau <nbd@nbd.name>
+  */
+ 
++#include <kunit/static_stub.h>
+ #include "mt76.h"
+ 
+ static int
+@@ -729,7 +730,8 @@ static void mt76_tx_silent_arm(struct mt76_dev *dev, unsigned long delay)
+ 		return;
+ #endif
+ 	if (!delayed_work_pending(&dev->silent_work) ||
+-	    time_before(jiffies + delay, dev->silent_work.timer.expires))
++	    time_before(jiffies + delay,
++			READ_ONCE(dev->silent_work.timer.expires)))
+ 		mod_delayed_work(dev->wq, &dev->silent_work, delay);
+ }
+ 
+@@ -817,7 +819,13 @@ void mt76_tx_result(struct mt76_dev *dev, struct mt76_wcid *wcid, bool acked)
+ 	wcid->silent_probes_sent = 0;
+ 	wcid->silent_probe = now + msecs_to_jiffies(MT76_SILENT_PROBE_MS);
+ 	wcid->silent_holds++;
++	/* the hold's fields before its flag, which mt76_tx_silent_poll()
++	 * reads them after; the flag before the list bit, which the poll
++	 * clears before it looks at the flag again
++	 */
++	smp_mb__before_atomic();
+ 	set_bit(MT_WCID_FLAG_SILENT, &wcid->flags);
++	smp_mb__after_atomic();
+ 	set_bit(wcid->idx, dev->silent_wait);
+ 	mt76_tx_silent_arm(dev, msecs_to_jiffies(MT76_SILENT_PROBE_MS));
+ }
+@@ -881,6 +889,15 @@ static void mt76_tx_silent_probe(struct mt76_dev *dev, struct mt76_wcid *wcid)
+ 	mt76_tx(phy, sta, wcid, skb);
+ }
+ 
++/* mt76_tx_silent_poll() found a listed station no longer held: where a
++ * new hold can start (mt76_tx_result()) just before the bit is cleared
++ */
++static void mt76_tx_silent_unlisted(struct mt76_dev *dev,
++				    struct mt76_wcid *wcid)
++{
++	KUNIT_STATIC_STUB_REDIRECT(mt76_tx_silent_unlisted, dev, wcid);
++}
++
+ /* The held stations' probes whose time has come. Returns the jiffies until
+  * the next one is due, 0 with no station held.
+  */
+@@ -897,13 +914,29 @@ static unsigned long mt76_tx_silent_poll(struct mt76_dev *dev)
+ 		unsigned int ms;
+ 
+ 		if (!wcid || !test_bit(MT_WCID_FLAG_SILENT, &wcid->flags)) {
++			mt76_tx_silent_unlisted(dev, wcid);
+ 			clear_bit(idx, dev->silent_wait);
+-			continue;
++			/* held again meanwhile: mt76_tx_result() set the flag
++			 * before the bit, so either the flag is seen here or
++			 * the bit was set again after the clear
++			 */
++			smp_mb__after_atomic();
++			/* the slot's station now: it can be a new one there */
++			wcid = __mt76_wcid_ptr(dev, idx);
++			if (!wcid || !test_bit(MT_WCID_FLAG_SILENT, &wcid->flags))
++				continue;
++			set_bit(idx, dev->silent_wait);
+ 		}
++		/* the hold's fields as mt76_tx_result() set them */
++		smp_rmb();
+ 
+ 		if (!READ_ONCE(silent_hold)) {
+-			mt76_tx_silent_release(dev, wcid);
++			/* off the list first: a hold started after the
++			 * release lists itself again
++			 */
+ 			clear_bit(idx, dev->silent_wait);
++			smp_mb__after_atomic();
++			mt76_tx_silent_release(dev, wcid);
+ 			continue;
+ 		}
+ 

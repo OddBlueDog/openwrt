@@ -71,10 +71,10 @@ index 05537c20..3e668d65 100644
  	fake = mt76_test_fake;
  	hw = dev->mt76.hw;
 diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
-index ebefc550..771ea2a8 100644
+index ca441ddc..630b2256 100644
 --- a/mt7915/tests/mcu2-test.c
 +++ b/mt7915/tests/mcu2-test.c
-@@ -2471,14 +2471,13 @@ static void mt7915_mcu2_txpower_frame_errors(struct kunit *test)
+@@ -2474,14 +2474,13 @@ static void mt7915_mcu2_txpower_frame_errors(struct kunit *test)
  }
  
  /* Setting a station back to automatic power (0, what mac80211 passes for

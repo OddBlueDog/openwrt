@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eason Lai <eason.lai@mediatek.com>
+Date: Wed, 28 Oct 2026 10:10:53 +0800
+Subject: [PATCH] wifi: mt76: free a partial rx A-MSDU when the phy is
+ unregistered
+
+mt76_rx_release_burst() keeps the first subframes of an A-MSDU in
+phy->rx_amsdu[q] until the last subframe arrives. If the phy or device
+is unregistered in the meantime, nothing frees this skb and it leaks.
+
+Free any parked A-MSDU after ieee80211_unregister_hw(), once rx has
+stopped.
+
+mt7663u and mt7663s also receive A-MSDUs, but call
+ieee80211_unregister_hw() directly. Use mt76_unregister_device() there,
+like mt7615 on PCI.
+
+Fixes: cc4b3c139ad3 ("mt76: mt7915: enable hw rx-amsdu de-aggregation")
+Signed-off-by: Eason Lai <eason.lai@mediatek.com>
+Link: https://patch.msgid.link/20261028021053.2220951-3-eason.lai@mediatek.com
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 9a5227284c5ab94788eb41c2f1474e4111cc9708)
+---
+ mac80211.c    | 22 ++++++++++++++++++++++
+ mt7615/sdio.c |  2 +-
+ mt7615/usb.c  |  2 +-
+ 3 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index ffd942fd..901ba387 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -613,6 +613,26 @@ int mt76_register_phy(struct mt76_phy *phy, bool vht,
+ }
+ EXPORT_SYMBOL_GPL(mt76_register_phy);
+ 
++static void mt76_rx_amsdu_flush_phy(struct mt76_phy *phy)
++{
++	int q;
++
++	for (q = 0; q < ARRAY_SIZE(phy->rx_amsdu); q++) {
++		dev_kfree_skb(phy->rx_amsdu[q].head);
++		phy->rx_amsdu[q].head = NULL;
++		phy->rx_amsdu[q].tail = NULL;
++	}
++}
++
++static void mt76_rx_amsdu_flush_dev(struct mt76_dev *dev)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++)
++		if (dev->phys[i])
++			mt76_rx_amsdu_flush_phy(dev->phys[i]);
++}
++
+ void mt76_unregister_phy(struct mt76_phy *phy)
+ {
+ 	struct mt76_dev *dev = phy->dev;
+@@ -624,6 +644,7 @@ void mt76_unregister_phy(struct mt76_phy *phy)
+ 		mt76_led_cleanup(phy);
+ 	mt76_tx_status_check(dev, true);
+ 	ieee80211_unregister_hw(phy->hw);
++	mt76_rx_amsdu_flush_phy(phy);
+ 	dev->phys[phy->band_idx] = NULL;
+ }
+ EXPORT_SYMBOL_GPL(mt76_unregister_phy);
+@@ -836,6 +857,7 @@ void mt76_unregister_device(struct mt76_dev *dev)
+ 	/* its stations are gone: nothing arms the pacing timer again */
+ 	mt76_tx_pace_stop(dev);
+ 	mt76_tx_silent_stop(dev);
++	mt76_rx_amsdu_flush_dev(dev);
+ }
+ EXPORT_SYMBOL_GPL(mt76_unregister_device);
+ 
+diff --git a/mt7615/sdio.c b/mt7615/sdio.c
+index 46188951..99c64b24 100644
+--- a/mt7615/sdio.c
++++ b/mt7615/sdio.c
+@@ -176,7 +176,7 @@ static void mt7663s_remove(struct sdio_func *func)
+ 	if (!test_and_clear_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
+ 		return;
+ 
+-	ieee80211_unregister_hw(dev->mt76.hw);
++	mt76_unregister_device(&dev->mt76);
+ 	mt76s_deinit(&dev->mt76);
+ 	mt76_free_device(&dev->mt76);
+ }
+diff --git a/mt7615/usb.c b/mt7615/usb.c
+index 3629e3d9..09e63259 100644
+--- a/mt7615/usb.c
++++ b/mt7615/usb.c
+@@ -212,7 +212,7 @@ static void mt7663u_disconnect(struct usb_interface *usb_intf)
+ 	if (!test_bit(MT76_STATE_INITIALIZED, &dev->mphy.state))
+ 		return;
+ 
+-	ieee80211_unregister_hw(dev->mt76.hw);
++	mt76_unregister_device(&dev->mt76);
+ 	mt7663u_cleanup(dev);
+ 
+ 	usb_set_intfdata(usb_intf, NULL);

@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:58:14 +0000
+Subject: [PATCH] wifi: mt76: mt7915: check rx descriptor linear bounds before
+ reading
+
+mt7915_mac_fill_rx() dereferences the base RXD dwords without checking
+that 24 bytes are linear in the skb, and for RXD groups 4, 1 and 2 it
+reads descriptor fields (and updates phy->ampdu_ref and rx_ampdu_ts)
+before checking the length. The group checks also compare against
+skb->len instead of skb_headlen(skb), which does not guard linear reads
+when a frame carries page fragments. mt7915_rx_check(),
+mt7915_queue_rx_skb(), mt7915_mac_tx_free_v0() and
+mt7915_mac_fill_rx_vector() likewise read their leading header words
+before checking the input length.
+
+Verify linear buffer lengths before reading each RXD, group and event
+header, and add a KUnit test covering short descriptors and short linear
+heads with page fragments.
+---
+ mt7915/mac.c            | 54 ++++++++++++++++++-------
+ mt7915/tests/mac-test.c | 90 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 129 insertions(+), 15 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 972ba18b..099be02e 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -280,11 +280,7 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 	struct ieee80211_supported_band *sband;
+ 	__le32 *rxd = (__le32 *)skb->data;
+ 	__le32 *rxv = NULL;
+-	u32 rxd0 = le32_to_cpu(rxd[0]);
+-	u32 rxd1 = le32_to_cpu(rxd[1]);
+-	u32 rxd2 = le32_to_cpu(rxd[2]);
+-	u32 rxd3 = le32_to_cpu(rxd[3]);
+-	u32 rxd4 = le32_to_cpu(rxd[4]);
++	u32 rxd0, rxd1, rxd2, rxd3, rxd4;
+ 	u32 csum_mask = MT_RXD0_NORMAL_IP_SUM | MT_RXD0_NORMAL_UDP_TCP_SUM;
+ 	bool unicast, insert_ccmp_hdr = false;
+ 	u8 remove_pad, amsdu_info;
+@@ -299,6 +295,15 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 
+ 	memset(status, 0, sizeof(*status));
+ 
++	if (skb_headlen(skb) < 6 * sizeof(__le32))
++		return -EINVAL;
++
++	rxd0 = le32_to_cpu(rxd[0]);
++	rxd1 = le32_to_cpu(rxd[1]);
++	rxd2 = le32_to_cpu(rxd[2]);
++	rxd3 = le32_to_cpu(rxd[3]);
++	rxd4 = le32_to_cpu(rxd[4]);
++
+ 	if ((rxd1 & MT_RXD1_NORMAL_BAND_IDX) && !phy->mt76->band_idx) {
+ 		mphy = dev->mt76.phys[MT_BAND1];
+ 		if (!mphy)
+@@ -367,21 +372,27 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 
+ 	rxd += 6;
+ 	if (rxd1 & MT_RXD1_NORMAL_GROUP_4) {
+-		u32 v0 = le32_to_cpu(rxd[0]);
+-		u32 v2 = le32_to_cpu(rxd[2]);
++		u32 v0, v2;
++
++		if ((u8 *)(rxd + 4) - skb->data >= skb_headlen(skb))
++			return -EINVAL;
++
++		v0 = le32_to_cpu(rxd[0]);
++		v2 = le32_to_cpu(rxd[2]);
+ 
+ 		fc = cpu_to_le16(FIELD_GET(MT_RXD6_FRAME_CONTROL, v0));
+ 		qos_ctl = FIELD_GET(MT_RXD8_QOS_CTL, v2);
+ 		seq_ctrl = FIELD_GET(MT_RXD8_SEQ_CTRL, v2);
+ 
+ 		rxd += 4;
+-		if ((u8 *)rxd - skb->data >= skb->len)
+-			return -EINVAL;
+ 	}
+ 
+ 	if (rxd1 & MT_RXD1_NORMAL_GROUP_1) {
+ 		u8 *data = (u8 *)rxd;
+ 
++		if ((u8 *)(rxd + 4) - skb->data >= skb_headlen(skb))
++			return -EINVAL;
++
+ 		if (status->flag & RX_FLAG_DECRYPTED) {
+ 			switch (FIELD_GET(MT_RXD1_NORMAL_SEC_MODE, rxd1)) {
+ 			case MT_CIPHER_AES_CCMP:
+@@ -406,11 +417,12 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 			}
+ 		}
+ 		rxd += 4;
+-		if ((u8 *)rxd - skb->data >= skb->len)
+-			return -EINVAL;
+ 	}
+ 
+ 	if (rxd1 & MT_RXD1_NORMAL_GROUP_2) {
++		if ((u8 *)(rxd + 2) - skb->data >= skb_headlen(skb))
++			return -EINVAL;
++
+ 		status->timestamp = le32_to_cpu(rxd[0]);
+ 		status->flag |= RX_FLAG_MACTIME_START;
+ 
+@@ -428,8 +440,6 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 		}
+ 
+ 		rxd += 2;
+-		if ((u8 *)rxd - skb->data >= skb->len)
+-			return -EINVAL;
+ 	}
+ 
+ 	/* RXD Group 3 - P-RXV */
+@@ -439,7 +449,7 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 
+ 		rxv = rxd;
+ 		rxd += 2;
+-		if ((u8 *)rxd - skb->data >= skb->len)
++		if ((u8 *)rxd - skb->data >= skb_headlen(skb))
+ 			return -EINVAL;
+ 
+ 		v0 = le32_to_cpu(rxv[0]);
+@@ -457,7 +467,7 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 		/* RXD Group 5 - C-RXV */
+ 		if (rxd1 & MT_RXD1_NORMAL_GROUP_5) {
+ 			rxd += 18;
+-			if ((u8 *)rxd - skb->data >= skb->len)
++			if ((u8 *)rxd - skb->data >= skb_headlen(skb))
+ 				return -EINVAL;
+ 		}
+ 
+@@ -582,6 +592,9 @@ mt7915_mac_fill_rx_vector(struct mt7915_dev *dev, struct sk_buff *skb)
+ 	u8 snr;
+ 	int i;
+ 
++	if (skb_headlen(skb) < 26 * sizeof(__le32))
++		goto out;
++
+ 	band_idx = le32_get_bits(rxv_hdr[1], MT_RXV_HDR_BAND_IDX);
+ 	if (band_idx && !phy->mt76->band_idx) {
+ 		phy = mt7915_ext_phy(dev);
+@@ -1065,6 +1078,9 @@ mt7915_mac_tx_free_v0(struct mt7915_dev *dev, void *data, int len)
+ 	bool wake = false;
+ 	u8 i, count;
+ 
++	if (len < sizeof(*free))
++		return;
++
+ 	mt7915_mac_tx_free_prepare(dev);
+ 
+ 	count = FIELD_GET(MT_TX_FREE_MSDU_CNT_V0, le16_to_cpu(free->ctrl));
+@@ -1128,6 +1144,9 @@ bool mt7915_rx_check(struct mt76_dev *mdev, void *data, int len)
+ 	__le32 *end = (__le32 *)&rxd[len / 4];
+ 	enum rx_pkt_type type;
+ 
++	if (len < sizeof(*rxd))
++		return false;
++
+ 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+ 	/* the ones consumed here (the others go to mt7915_queue_rx_skb()) */
+ 	mt76_record_rx_if(mdev, type == PKT_TYPE_TXRX_NOTIFY ||
+@@ -1163,6 +1182,11 @@ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 	__le32 *end;
+ 	enum rx_pkt_type type;
+ 
++	if (skb_headlen(skb) < sizeof(*rxd)) {
++		dev_kfree_skb(skb);
++		return;
++	}
++
+ 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+ 
+ 	/*
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 6c073e5a..2a156496 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -1249,6 +1249,95 @@ static void mt7915_test_rx_short_frames(struct kunit *test)
+ 	kfree_skb(skb);
+ }
+ 
++/* Buffers shorter than the base RXD, group 1 or group 2 descriptors cut off
++ * in the linear head (even with page fragments extending skb->len), or short
++ * rx_check/queue_rx_skb inputs are rejected before reading descriptor fields
++ * or updating status and phy state.
++ */
++static void mt7915_test_rx_short_rxd(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_rx_status *status;
++	struct mt7915_test_rxd d;
++	struct sk_buff *skb;
++	struct page *page;
++	__le32 normal_word = cpu_to_le32(FIELD_PREP(MT_RXD0_PKT_TYPE,
++						    PKT_TYPE_NORMAL));
++
++	/* shorter than the 24-byte base RXD: full descriptor bytes sit in
++	 * tailroom, but skb_headlen(skb) is 12, so mt7915_mac_fill_rx() must
++	 * reject before populating status->freq or status->flag
++	 */
++	mt7915_test_rxd_init(&d, 0, 0, true);
++	d.rxd[1] |= MT_RXD1_NORMAL_FCS_ERR;
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memcpy(skb->data, d.rxd, 6 * sizeof(__le32));
++	skb_put(skb, 12);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	status = (struct mt76_rx_status *)skb->cb;
++	KUNIT_EXPECT_EQ(test, status->freq, (u16)0);
++	KUNIT_EXPECT_EQ(test, status->flag, 0U);
++	kfree_skb(skb);
++
++	/* group 1 announced, headlen stops after the base RXD, tailroom holds
++	 * 0x55 where group 1 would sit, and a page frag pushes skb->len past
++	 * group 1: status->iv must stay zeroed
++	 */
++	mt7915_test_rxd_init(&d, 0, MT_RXD1_NORMAL_GROUP_1, true);
++	d.rxd[1] |= FIELD_PREP(MT_RXD1_NORMAL_SEC_MODE, MT_CIPHER_AES_CCMP);
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memset(skb->data, 0x55, 64);
++	memcpy(skb_put(skb, 6 * sizeof(__le32)), d.rxd, 6 * sizeof(__le32));
++	page = alloc_page(GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, page);
++	skb_add_rx_frag(skb, 0, page, 0, 64, PAGE_SIZE);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	status = (struct mt76_rx_status *)skb->cb;
++	KUNIT_EXPECT_EQ(test, status->iv[0], (u8)0);
++	kfree_skb(skb);
++
++	/* group 2 announced on an A-MPDU frame (NON_AMPDU cleared), headlen
++	 * stops after the base RXD, tailroom holds 0x55555555 where group 2
++	 * would sit, and a page frag pushes skb->len past group 2: ampdu_ref
++	 * and rx_ampdu_ts must stay unchanged
++	 */
++	dev->phy.ampdu_ref = 7;
++	dev->phy.rx_ampdu_ts = 0;
++	mt7915_test_rxd_init(&d, 0, MT_RXD1_NORMAL_GROUP_2, true);
++	d.rxd[2] &= ~MT_RXD2_NORMAL_NON_AMPDU;
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memset(skb->data, 0x55, 64);
++	memcpy(skb_put(skb, 6 * sizeof(__le32)), d.rxd, 6 * sizeof(__le32));
++	page = alloc_page(GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, page);
++	skb_add_rx_frag(skb, 0, page, 0, 64, PAGE_SIZE);
++	KUNIT_EXPECT_EQ(test, mt7915_test_fill_rx(dev, skb, 0), -EINVAL);
++	KUNIT_EXPECT_EQ(test, dev->phy.ampdu_ref, 7U);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_ampdu_ts, 0U);
++	kfree_skb(skb);
++
++	/* rx_check rejects < 4-byte input even when word 0 holds PKT_TYPE_NORMAL */
++	KUNIT_EXPECT_FALSE(test, mt7915_rx_check(&dev->mt76, &normal_word, 2));
++
++	/* queue_rx_skb rejects < 4-byte linear head even with a page fragment
++	 * before inspecting word 0 or counting rx_event_frags
++	 */
++	dev->rx_event_frags = 0;
++	skb = alloc_skb(16, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memset(skb->data, 0, 16);
++	skb_put(skb, 2);
++	page = alloc_page(GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, page);
++	skb_add_rx_frag(skb, 0, page, 0, 16, PAGE_SIZE);
++	mt7915_test_queue_rx(dev, skb);
++	KUNIT_EXPECT_EQ(test, dev->rx_event_frags, 0U);
++}
++
+ /* A-MSDU subframes are marked first/middle/last; the 2 bytes of padding the
+  * hardware puts after the 802.11 header of each subframe are removed.
+  */
+@@ -6270,6 +6359,7 @@ static struct kunit_case mt7915_mac_rx_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_rx_8023),
+ 	KUNIT_CASE(mt7915_test_rx_8023_hdr_trans_error),
+ 	KUNIT_CASE(mt7915_test_rx_short_frames),
++	KUNIT_CASE(mt7915_test_rx_short_rxd),
+ 	KUNIT_CASE(mt7915_test_rx_amsdu),
+ 	KUNIT_CASE(mt7915_test_rx_8023_fragment),
+ 	KUNIT_CASE(mt7915_test_rx_he_radiotap),

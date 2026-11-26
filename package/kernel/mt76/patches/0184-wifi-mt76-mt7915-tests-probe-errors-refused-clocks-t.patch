@@ -1,0 +1,563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 16:27:43 +0000
+Subject: [PATCH] wifi: mt76: mt7915: tests: probe errors, refused clocks, the
+ last setup corners
+
+The last error paths of the MT7986's bring-up that a test can reach:
+
+mt7915_soc_test_probe_errors: a WMAC without an interrupt resource,
+one whose interrupt can't be requested (IRQ_NOREQUEST), and one whose
+SKU window can't be mapped: each probe stops with the device freed,
+the last with its interrupt given back, nothing registered.
+mt7915_soc_test_wmac_init_bad_clocks: mcu and ap2conn clocks whose
+prepare fails are reported and the setup goes on.
+mt7915_soc_test_sku_setup_error: A-die 0 read, A-die 1 not.
+mt7915_soc_test_coninfra_setup: the MT7981's AP peripheral and efuse
+bases.
+mt7915_init_test_wiphy_wed: with a WED, the netdev offers TC offload.
+mt7915 dma WED teardown: a second interface's WED is detached too.
+mt76_eeprom_test_nvmem_read_error: an NVMEM provider that can't read
+gives its error.
+
+mt7915_soc_test_probe_remove calls the remove op through the driver's
+pointer: called directly, the three-line function was inlined into
+the test, where gcov didn't count it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ mt7915/tests/dma-test.c  |   5 +-
+ mt7915/tests/init-test.c |  19 +++++
+ mt7915/tests/mac-test.c  |  50 ++++++++++++-
+ mt7915/tests/main-test.c |  11 +++
+ mt7915/tests/mcu2-test.c |  20 ++++--
+ mt7915/tests/soc-test.c  | 148 ++++++++++++++++++++++++++++++++++++++-
+ tests/eeprom-test.c      |  26 ++++++-
+ 7 files changed, 266 insertions(+), 13 deletions(-)
+
+diff --git a/mt7915/tests/dma-test.c b/mt7915/tests/dma-test.c
+index 3f733f57..e146fccf 100644
+--- a/mt7915/tests/dma-test.c
++++ b/mt7915/tests/dma-test.c
+@@ -502,9 +502,12 @@ static void mt7915_dma_test_init_wed(struct kunit *test)
+ 	/* emptied and handed to WED again */
+ 	KUNIT_EXPECT_EQ(test, w->n_txfree, 2);
+ 
++	/* a second PCIe interface's WED goes too */
++	mdev->mmio.wed_hif2.ops = &w->ops;
+ 	mt7915_dma_test_teardown(dev);
+-	KUNIT_EXPECT_EQ(test, w->n_detach, 1);
++	KUNIT_EXPECT_EQ(test, w->n_detach, 2);
+ 	KUNIT_EXPECT_FALSE(test, mtk_wed_device_active(&mdev->mmio.wed));
++	KUNIT_EXPECT_FALSE(test, mtk_wed_device_active(&mdev->mmio.wed_hif2));
+ }
+ 
+ #endif
+diff --git a/mt7915/tests/init-test.c b/mt7915/tests/init-test.c
+index 18a322c9..829f9d52 100644
+--- a/mt7915/tests/init-test.c
++++ b/mt7915/tests/init-test.c
+@@ -14,6 +14,7 @@
+ #include <kunit/test.h>
+ #include <linux/dma-mapping.h>
+ #include "fake.h"
++#include "../../tests/wed-fake.h"
+ 
+ struct mt7915_dev *mt7915_init_test_device(struct kunit *test, u32 sku,
+ 					   struct mt76_test_fake **fake);
+@@ -1409,6 +1410,21 @@ static void mt7915_init_test_init_work(struct kunit *test)
+ 			   dev->mt76.eeprom.data, 0x400);
+ }
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/* With a WED, flows can be offloaded with TC: the netdev says so. */
++static void mt7915_init_test_wiphy_wed(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_init_test_chip(test,
++						       MT7976_ONE_ADIE_DBDC);
++
++	dev->dbdc_support = mt7915_band_config(dev);
++	mt7915_eeprom_parse_hw_cap(dev, &dev->phy);
++	mt76_test_wed_init(test, &dev->mt76.mmio.wed);
++	mt7915_init_wiphy(&dev->phy);
++	KUNIT_EXPECT_TRUE(test, dev->mt76.hw->netdev_features & NETIF_F_HW_TC);
++}
++#endif
++
+ /* --- thermal ---------------------------------------------------------------- */
+ 
+ static struct device *mt7915_init_test_hwmon_dev(struct kunit *test,
+@@ -1937,6 +1953,9 @@ static struct kunit_case mt7915_init_test_cases[] = {
+ 	KUNIT_CASE(mt7915_init_test_register_mac2),
+ 	KUNIT_CASE(mt7915_init_test_register_single),
+ 	KUNIT_CASE(mt7915_init_test_wiphy),
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	KUNIT_CASE(mt7915_init_test_wiphy_wed),
++#endif
+ 	KUNIT_CASE(mt7915_init_test_he_caps),
+ 	KUNIT_CASE(mt7915_init_test_he_caps_chains),
+ 	KUNIT_CASE(mt7915_init_test_he_caps_shrink),
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 6565c211..6c073e5a 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -5599,9 +5599,10 @@ static int mt7915_test_boot_hook(struct mt76_test_fake *fake,
+  */
+ /* the chip a restart runs on, when not the MT7986 */
+ struct mt7915_test_restart_chip {
+-	u32 rev;
++	u32 rev;	/* 0: the MT7986 */
+ 	bool pcie, hif2;
+ 	u8 wed;		/* WED version attached, 0: none */
++	bool run_main, run_ext;	/* bands running when the reset came */
+ };
+ 
+ static int __mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
+@@ -5626,13 +5627,19 @@ static int __mt7915_test_mac_restart_boot(struct kunit *test, int fail_cmd,
+ 	fake->mcu_hook = mt7915_test_boot_hook;
+ 	set_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
+ 	/* no band running (mt7915_run() has tests of its own, on a wiphy
+-	 * that is registered): none run again
++	 * that is registered): none run again, unless the chip says so for
++	 * a run the firmware refuses (before mac80211 work is queued)
+ 	 */
+ 	clear_bit(MT76_STATE_RUNNING, &dev->mphy.state);
+ 	clear_bit(MT76_STATE_RUNNING, &phy1->mt76->state);
+ 
+ 	if (c) {
+-		dev->mt76.rev = c->rev;
++		if (c->run_main)
++			set_bit(MT76_STATE_RUNNING, &dev->mphy.state);
++		if (c->run_ext)
++			set_bit(MT76_STATE_RUNNING, &phy1->mt76->state);
++		if (c->rev)
++			dev->mt76.rev = c->rev;
+ 		if (c->hif2) {
+ 			dev->hif2 = kunit_kzalloc(test, sizeof(*dev->hif2),
+ 						  GFP_KERNEL);
+@@ -5743,6 +5750,41 @@ static void mt7915_test_mac_restart_eeprom_fails(struct kunit *test)
+ 			MCU_EXT_CMD(TXBF_ACTION)), 0);
+ }
+ 
++/* A band that was running and can't be run again (its firmware refuses
++ * the power state) fails the restart, to be retried, and stays stopped:
++ * the main band first, the second band when only it ran.
++ */
++static void mt7915_test_mac_restart_run_fails(struct kunit *test,
++					      const struct mt7915_test_restart_chip *c)
++{
++	struct mt7915_dev *dev;
++
++	KUNIT_EXPECT_EQ(test, __mt7915_test_mac_restart_boot(test,
++			MCU_EXT_CMD(PM_STATE_CTRL), &dev, c), -EIO);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(mt76_test_fake,
++			MCU_EXT_CMD(PM_STATE_CTRL)), 1);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_RUNNING, &dev->mphy.state));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_STATE_RUNNING,
++					  &dev->mt76.phys[MT_BAND1]->state));
++	KUNIT_EXPECT_FALSE(test, test_bit(MT76_RESET, &dev->mphy.state));
++}
++
++static void mt7915_test_mac_restart_main_run_fails(struct kunit *test)
++{
++	static const struct mt7915_test_restart_chip c = {
++		.run_main = true, .run_ext = true,
++	};
++
++	mt7915_test_mac_restart_run_fails(test, &c);
++}
++
++static void mt7915_test_mac_restart_ext_run_fails(struct kunit *test)
++{
++	static const struct mt7915_test_restart_chip c = { .run_ext = true };
++
++	mt7915_test_mac_restart_run_fails(test, &c);
++}
++
+ /* Plays the firmware crashing while the driver waits for the last SER
+  * step: once the driver reports RESET_DONE, the WDT bit is set and the
+  * waiter woken.
+@@ -6353,6 +6395,8 @@ static struct kunit_case mt7915_mac_reset_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_mac_restart),
+ 	KUNIT_CASE(mt7915_test_mac_restart_ok),
+ 	KUNIT_CASE(mt7915_test_mac_restart_eeprom_fails),
++	KUNIT_CASE(mt7915_test_mac_restart_main_run_fails),
++	KUNIT_CASE(mt7915_test_mac_restart_ext_run_fails),
+ 	KUNIT_CASE(mt7915_test_mac_restart_mt7915),
+ 	KUNIT_CASE(mt7915_test_mac_restart_mt7916),
+ 	{}
+diff --git a/mt7915/tests/main-test.c b/mt7915/tests/main-test.c
+index 48ddadb7..6f25e4b8 100644
+--- a/mt7915/tests/main-test.c
++++ b/mt7915/tests/main-test.c
+@@ -2999,8 +2999,11 @@ static void mt7915_main_test_rx_check_ps(struct kunit *test)
+ 	__skb_queue_tail(q, mt7915_main_test_rx_frame(test, dev, vif, addr,
+ 			 IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_NULLFUNC |
+ 			 IEEE80211_FCTL_PM, wcid));
++	/* as NAPI's mt76_dma_rx_poll() calls it */
+ 	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_rx_poll_complete(&dev->mt76, MT_RXQ_MAIN, NULL);
++	rcu_read_unlock();
+ 	local_bh_enable();
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_SILENT, &wcid->flags));
+ 	KUNIT_EXPECT_TRUE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
+@@ -3008,8 +3011,11 @@ static void mt7915_main_test_rx_check_ps(struct kunit *test)
+ 
+ 	__skb_queue_tail(q, mt7915_main_test_rx_frame(test, dev, vif, addr,
+ 			 IEEE80211_FTYPE_DATA | IEEE80211_STYPE_NULLFUNC, wcid));
++	/* as NAPI's mt76_dma_rx_poll() calls it */
+ 	local_bh_disable();
++	rcu_read_lock();
+ 	mt76_rx_poll_complete(&dev->mt76, MT_RXQ_MAIN, NULL);
++	rcu_read_unlock();
+ 	local_bh_enable();
+ 	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &wcid->flags));
+ 	KUNIT_EXPECT_FALSE(test, test_sta_flag(si, WLAN_STA_PS_STA));
+@@ -3051,14 +3057,19 @@ static void mt7915_main_test_wed_txs(struct kunit *test)
+ 			     FIELD_PREP(MT_TXS7_MPDU_RETRY_CNT, 3));
+ 
+ 	wcid->sta = 1;
++	/* under RCU, as mt7915_mac_add_txs() calls it */
++	rcu_read_lock();
+ 	mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs);
++	rcu_read_unlock();
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bytes, 2000);
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_failed, 2);
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_retries, 3);
+ 
+ 	/* format 1 (per MPDU): not counted here */
+ 	txs[0] = cpu_to_le32(FIELD_PREP(MT_TXS0_TXS_FORMAT, 1));
++	rcu_read_lock();
+ 	mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs);
++	rcu_read_unlock();
+ 	KUNIT_EXPECT_EQ(test, wcid->stats.tx_bytes, 2000);
+ 	wcid->sta = 0;
+ }
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 84481433..54ea1bfe 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -3688,16 +3688,26 @@ static void mt7915_mcu2_fw_handshake_timeouts(struct kunit *test)
+  */
+ static void mt7915_mcu2_dpd_freq_idx_mt7915(struct kunit *test)
+ {
++	int (*idx)(struct mt7915_dev *dev, u16 freq, u8 bw) = mt7915_dpd_freq_idx;
+ 	struct mt7915_dev *dev = mt7915_test_dev(test);
+ 	u32 rev = dev->mt76.rev;
+-	int v2;
+ 
+-	v2 = mt7915_dpd_freq_idx(dev, 5180, 0);
++	/* out of line: inlined here, gcov doesn't count the list chosen */
++	OPTIMIZER_HIDE_VAR(idx);
++
++	/* the others': 6 GHz first, then 5 GHz (channel 144 too); 2.4 GHz
++	 * after the 97 of them
++	 */
++	KUNIT_EXPECT_EQ(test, idx(dev, 5180, NL80211_CHAN_WIDTH_20), 66);
++	KUNIT_EXPECT_EQ(test, idx(dev, 5720, NL80211_CHAN_WIDTH_20), 85);
++	KUNIT_EXPECT_EQ(test, idx(dev, 2412, NL80211_CHAN_WIDTH_20), 97);
++
++	/* the MT7915's 24: 5 GHz only, no channel 144 */
+ 	dev->mt76.rev = 0x79150000;
+-	KUNIT_EXPECT_GE(test, mt7915_dpd_freq_idx(dev, 5180, 0), 0);
+-	KUNIT_EXPECT_GE(test, mt7915_dpd_freq_idx(dev, 2412, 0), 0);
++	KUNIT_EXPECT_EQ(test, idx(dev, 5180, NL80211_CHAN_WIDTH_20), 0);
++	KUNIT_EXPECT_EQ(test, idx(dev, 5720, NL80211_CHAN_WIDTH_20), -1);
++	KUNIT_EXPECT_EQ(test, idx(dev, 2412, NL80211_CHAN_WIDTH_20), 24);
+ 	dev->mt76.rev = rev;
+-	KUNIT_EXPECT_GE(test, v2, 0);
+ }
+ 
+ /* A channel switch with no memory for the message fails cleanly. */
+diff --git a/mt7915/tests/soc-test.c b/mt7915/tests/soc-test.c
+index b2724dd6..3343fe7a 100644
+--- a/mt7915/tests/soc-test.c
++++ b/mt7915/tests/soc-test.c
+@@ -911,6 +911,11 @@ static void mt7915_soc_test_sku_setup_error(struct kunit *test)
+ 	t = mt7915_soc_test_init(test, &dev);
+ 	t->spi_ok = 0;
+ 	KUNIT_EXPECT_EQ(test, mt798x_wmac_sku_setup(dev, &type), -ETIMEDOUT);
++
++	/* A-die 0 read (two busy polls), A-die 1 not */
++	t->spi_ok = 2;
++	KUNIT_EXPECT_EQ(test, mt798x_wmac_sku_setup(dev, &type), -ETIMEDOUT);
++	KUNIT_EXPECT_TRUE(test, mt7915_soc_test_unlocked());
+ }
+ 
+ /* The SKU code (in the TOP POS SKU field and for the firmware) follows the
+@@ -1216,6 +1221,17 @@ static void mt7915_soc_test_coninfra_setup_mem(struct kunit *test)
+ 			mt7915_soc_test_reg(MT_INFRA_CKGEN_BUS)), 1);
+ 	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_TOP_RGU_SYSRAM_PDN), 0);
+ 	KUNIT_EXPECT_EQ(test, mt7915_soc_test_reg(MT_TOP_RGU_SYSRAM_SLP), 1);
++
++	/* the MT7981 is also told where its AP peripherals and efuse are */
++	dev->mt76.rev = 0x79810000;
++	KUNIT_ASSERT_EQ(test, mt798x_wmac_coninfra_setup(dev), 0);
++	dev->mt76.rev = 0x79860000;
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TOP_WF_AP_PERI_BASE_MASK,
++			mt7915_soc_test_reg(MT_TOP_WF_AP_PERI_BASE)),
++			0x300d0000 >> 16);
++	KUNIT_EXPECT_EQ(test, FIELD_GET(MT_TOP_EFUSE_BASE_MASK,
++			mt7915_soc_test_reg(MT_TOP_EFUSE_BASE)),
++			0x11f20000 >> 16);
+ }
+ 
+ /* --- enable and disable --------------------------------------------------- */
+@@ -1564,6 +1580,7 @@ struct mt7915_soc_test_probe {
+ 	struct reset_controller_dev rcdev;
+ 	int irq;
+ 	int reg_ret;		/* what mt7915_register_device() returns */
++	bool no_sku;		/* the SKU window can't be mapped */
+ 	int n_register, n_unregister;
+ 	struct mt7915_dev *dev;
+ };
+@@ -1585,6 +1602,8 @@ mt7915_soc_test_ioremap(struct platform_device *pdev, unsigned int index)
+ 	case 1:
+ 		return (void __force __iomem *)p->dcm;
+ 	default:
++		if (p->no_sku)
++			return IOMEM_ERR_PTR(-ENOMEM);
+ 		return (void __force __iomem *)p->sku;
+ 	}
+ }
+@@ -1711,7 +1730,8 @@ mt7915_soc_test_probe_env(struct kunit *test)
+ }
+ 
+ static struct platform_device *
+-mt7915_soc_test_probe_pdev(struct kunit *test, struct mt7915_soc_test_probe *p)
++__mt7915_soc_test_probe_pdev(struct kunit *test,
++			     struct mt7915_soc_test_probe *p, bool irq)
+ {
+ 	struct resource res[] = {
+ 		DEFINE_RES_MEM(0x0c000000, SZ_8M),
+@@ -1723,7 +1743,7 @@ mt7915_soc_test_probe_pdev(struct kunit *test, struct mt7915_soc_test_probe *p)
+ 
+ 	pdev = platform_device_register_simple("mt7915e-soc-test",
+ 					       MT7915_SOC_TEST_PROBE_ID, res,
+-					       ARRAY_SIZE(res));
++					       ARRAY_SIZE(res) - !irq);
+ 	KUNIT_ASSERT_FALSE(test, IS_ERR(pdev));
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+ 			mt7915_soc_test_pdev_put, pdev), 0);
+@@ -1731,6 +1751,12 @@ mt7915_soc_test_probe_pdev(struct kunit *test, struct mt7915_soc_test_probe *p)
+ 	return pdev;
+ }
+ 
++static struct platform_device *
++mt7915_soc_test_probe_pdev(struct kunit *test, struct mt7915_soc_test_probe *p)
++{
++	return __mt7915_soc_test_probe_pdev(test, p, true);
++}
++
+ /* The MT7986's platform probe: an MT7986 by its device tree node, its
+  * register window, its interrupt requested, the SoC side set up (clocks,
+  * the INFRACFG and SKU windows, the consys reset line) and the WiFi
+@@ -1749,6 +1775,33 @@ static void mt7915_soc_test_probe_register_fails(struct kunit *test)
+ 	KUNIT_EXPECT_FALSE(test, irq_has_action(p->irq));
+ }
+ 
++/* A probe stops, freeing the device, without an interrupt, with one it
++ * can't have, or when the SoC side can't be set up (its SKU window here),
++ * the interrupt then given back.
++ */
++static void mt7915_soc_test_probe_errors(struct kunit *test)
++{
++	struct mt7915_soc_test_probe *p = mt7915_soc_test_probe_env(test);
++	struct platform_device *pdev;
++
++	pdev = __mt7915_soc_test_probe_pdev(test, p, false);
++	KUNIT_EXPECT_LT(test, mt7915_soc_test_probe(pdev), 0);
++	KUNIT_EXPECT_EQ(test, p->n_register, 0);
++	platform_device_unregister(pdev);
++	kunit_remove_action(test, mt7915_soc_test_pdev_put, pdev);
++
++	pdev = mt7915_soc_test_probe_pdev(test, p);
++	irq_set_status_flags(p->irq, IRQ_NOREQUEST);
++	KUNIT_EXPECT_LT(test, mt7915_soc_test_probe(pdev), 0);
++	irq_clear_status_flags(p->irq, IRQ_NOREQUEST);
++	pdev->dev.of_node = p->np;
++
++	p->no_sku = true;
++	KUNIT_EXPECT_EQ(test, mt7915_soc_test_probe(pdev), -ENOMEM);
++	KUNIT_EXPECT_FALSE(test, irq_has_action(p->irq));
++	KUNIT_EXPECT_EQ(test, p->n_register, 0);
++}
++
+ /* A probe whose registration goes through keeps its interrupt; removing
+  * the platform device unregisters it.
+  */
+@@ -1756,6 +1809,7 @@ static void mt7915_soc_test_probe_remove(struct kunit *test)
+ {
+ 	struct mt7915_soc_test_probe *p = mt7915_soc_test_probe_env(test);
+ 	struct platform_device *pdev = mt7915_soc_test_probe_pdev(test, p);
++	void (*remove)(struct platform_device *pdev);
+ 
+ 	KUNIT_ASSERT_EQ(test, mt7915_soc_test_probe(pdev), 0);
+ 	KUNIT_EXPECT_TRUE(test, irq_has_action(p->irq));
+@@ -1763,11 +1817,97 @@ static void mt7915_soc_test_probe_remove(struct kunit *test)
+ 			    (void *)p->dev);
+ 	KUNIT_EXPECT_EQ(test, mt76_chip(&p->dev->mt76), 0x7986);
+ 
+-	mt798x_wmac_remove(pdev);
++	/* through the driver's own pointer, as the platform bus calls it (a
++	 * direct call gets the three-line function inlined here, where gcov
++	 * doesn't count it as run)
++	 */
++	remove = mt798x_wmac_driver.remove;
++	OPTIMIZER_HIDE_VAR(remove);
++	remove(pdev);
+ 	KUNIT_EXPECT_EQ(test, p->n_unregister, 1);
+ 	devm_free_irq(&pdev->dev, p->irq, p->dev);
+ }
+ 
++static int mt7915_soc_test_clk_refuse(struct clk_hw *hw)
++{
++	return -EIO;
++}
++
++static const struct clk_ops mt7915_soc_test_bad_clk_ops = {
++	.prepare = mt7915_soc_test_clk_refuse,
++};
++
++struct mt7915_soc_test_bad_clk {
++	struct clk_hw hw;
++	struct clk_lookup *cl;
++};
++
++static void mt7915_soc_test_bad_clk_del(void *data)
++{
++	struct mt7915_soc_test_bad_clk *c = data;
++
++	clkdev_drop(c->cl);
++	clk_hw_unregister(&c->hw);
++}
++
++/* a clock @con_id of platform device @id that can't be enabled */
++static void mt7915_soc_test_bad_clk(struct kunit *test, const char *name,
++				    const char *con_id, int id)
++{
++	struct clk_init_data init = {
++		.name = name,
++		.ops = &mt7915_soc_test_bad_clk_ops,
++	};
++	struct mt7915_soc_test_bad_clk *c;
++
++	c = kunit_kzalloc(test, sizeof(*c), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, c);
++	c->hw.init = &init;
++	KUNIT_ASSERT_EQ(test, clk_hw_register(NULL, &c->hw), 0);
++	c->cl = clkdev_hw_create(&c->hw, con_id, "mt7915e-soc-test.%d", id);
++	if (!c->cl)
++		clk_hw_unregister(&c->hw);
++	KUNIT_ASSERT_NOT_NULL(test, c->cl);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_bad_clk_del, c), 0);
++}
++
++/* Clocks that refuse to be enabled are reported, and the setup goes on
++ * (here to the missing reset line).
++ */
++static void mt7915_soc_test_wmac_init_bad_clocks(struct kunit *test)
++{
++	static const struct resource res[] = {
++		DEFINE_RES_MEM(0x0c000000, SZ_4K),
++		DEFINE_RES_MEM(0x0c001000, SZ_4K),
++		DEFINE_RES_MEM(0x0c002000, SZ_4K),
++	};
++	struct platform_device *pdev;
++	struct mt7915_soc_test *t;
++	struct mt7915_dev *dev;
++	struct device *kdev;
++	int ret;
++
++	mt7915_soc_test_bad_clk(test, "mt7915e-soc-test-bad-mcu", "mcu", 7989);
++	mt7915_soc_test_bad_clk(test, "mt7915e-soc-test-bad-ap2conn",
++				"ap2conn", 7989);
++	pdev = platform_device_register_simple("mt7915e-soc-test", 7989, res,
++					       ARRAY_SIZE(res));
++	KUNIT_ASSERT_FALSE(test, IS_ERR(pdev));
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			mt7915_soc_test_pdev_put, pdev), 0);
++	t = mt7915_soc_test_init(test, &dev);
++	kdev = dev->mt76.dev;
++	dev->mt76.dev = &pdev->dev;
++	ret = mt798x_wmac_init(dev);
++	dev->mt76.dev = kdev;
++
++	KUNIT_EXPECT_EQ(test, ret, -ENOENT);
++	dev->dcm = (void __force __iomem *)t->dcm;
++	dev->sku = (void __force __iomem *)t->sku;
++	dev->rstc = NULL;
++}
++
+ static struct kunit_case mt7915_soc_test_cases[] = {
+ 	KUNIT_CASE(mt7915_soc_test_spi_access),
+ 	KUNIT_CASE(mt7915_soc_test_spi_busy),
+@@ -1811,6 +1951,8 @@ static struct kunit_case mt7915_soc_test_cases[] = {
+ 	KUNIT_CASE(mt7915_soc_test_probe_unknown_chip),
+ 	KUNIT_CASE(mt7915_soc_test_probe_register_fails),
+ 	KUNIT_CASE(mt7915_soc_test_probe_remove),
++	KUNIT_CASE(mt7915_soc_test_probe_errors),
++	KUNIT_CASE(mt7915_soc_test_wmac_init_bad_clocks),
+ 	KUNIT_CASE(mt7915_soc_test_wmac_init),
+ 	KUNIT_CASE(mt7915_soc_test_wmac_init_windows),
+ 	{}
+diff --git a/tests/eeprom-test.c b/tests/eeprom-test.c
+index 658d6da6..f7b5facd 100644
+--- a/tests/eeprom-test.c
++++ b/tests/eeprom-test.c
+@@ -440,6 +440,14 @@ static int mt76_eeprom_test_nvmem_read(void *priv, unsigned int offset,
+ 	return 0;
+ }
+ 
++/* a provider that can't read: no data given */
++static int mt76_eeprom_test_nvmem_read_fails(void *priv, unsigned int offset,
++					     void *val, size_t bytes)
++{
++	return priv ? mt76_eeprom_test_nvmem_read(priv, offset, val, bytes) :
++		      -EIO;
++}
++
+ static void mt76_eeprom_test_nvmem_unregister(void *nvmem)
+ {
+ 	nvmem_unregister(nvmem);
+@@ -460,7 +468,7 @@ static void mt76_eeprom_test_provider(struct kunit *test, struct mt76_dev *dev,
+ 		.of_node = of_get_parent(cell),
+ 		.ignore_wp = true,
+ 		.read_only = true,
+-		.reg_read = mt76_eeprom_test_nvmem_read,
++		.reg_read = mt76_eeprom_test_nvmem_read_fails,
+ 		.size = size,
+ 		.word_size = 1,
+ 		.stride = 1,
+@@ -512,6 +520,21 @@ static void mt76_eeprom_test_nvmem_cell(struct kunit *test)
+ 	KUNIT_EXPECT_MEMEQ(test, dev->eeprom.data, data, 12);
+ }
+ 
++/* An NVMEM cell whose provider can't read it: its error. */
++static void mt76_eeprom_test_nvmem_read_error(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_eeprom_test_dev(test);
++	struct device_node *np = mt76_eeprom_test_of(test, dev);
++	struct device_node *live = mt76_eeprom_test_live(test);
++	u8 buf[16];
++
++	mt76_eeprom_test_provider(test, dev, live, NULL, 32, 16);
++	MT76_EEPROM_TEST_CELLS(test, np, "nvmem-cells", live->phandle);
++	MT76_EEPROM_TEST_STRS(test, np, "nvmem-cell-names", "eeprom");
++	KUNIT_EXPECT_EQ(test, mt76_get_of_data_from_nvmem(dev, buf, "eeprom",
++			16), -EIO);
++}
++
+ /* An EEPROM cell whose NVMEM provider hasn't probed yet must defer the
+  * probe, not be taken for "no EEPROM in the device tree".
+  */
+@@ -979,6 +1002,7 @@ static struct kunit_case mt76_eeprom_test_cases[] = {
+ 	KUNIT_CASE(mt76_eeprom_test_mtd_short_property),
+ 	KUNIT_CASE(mt76_eeprom_test_nvmem),
+ 	KUNIT_CASE(mt76_eeprom_test_nvmem_cell),
++	KUNIT_CASE(mt76_eeprom_test_nvmem_read_error),
+ 	KUNIT_CASE(mt76_eeprom_test_init_nvmem_defer),
+ 	KUNIT_CASE(mt76_eeprom_test_override_no_dt),
+ 	KUNIT_CASE(mt76_eeprom_test_override_dt),

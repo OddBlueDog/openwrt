@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:55:57 +0000
+Subject: [PATCH] wifi: mt76: mt7915: check unsolicited MCU event lengths
+ before parsing
+
+mt7915_mcu_rx_event() casts skb->data to struct mt76_connac2_mcu_rxd
+without checking that the buffer holds a full descriptor. A short
+buffer reads past skb->len when dispatching on rxd->ext_eid and
+rxd->seq, and in mt7915_mcu_rx_log_message() produces a negative length.
+Likewise, mt7915_mcu_rx_csa_notify(), mt7915_mcu_rx_thermal_notify()
+and mt7915_mcu_rx_bcc_notify() read their notification structures
+without verifying that the skb contains the payload.
+
+Validate linear length with pskb_may_pull() before parsing the MCU RXD
+and each notification payload, and bound log messages to the linear
+tail after the descriptor.
+
+Add a KUnit test covering short MCU RXD and notification buffers.
+---
+ mt7915/mcu.c             | 16 ++++++++++++++-
+ mt7915/tests/mcu2-test.c | 44 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index b9af89f3..98cabe84 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -340,6 +340,9 @@ mt7915_mcu_rx_csa_notify(struct mt7915_dev *dev, struct sk_buff *skb)
+ 	struct mt76_phy *mphy = &dev->mt76.phy;
+ 	struct mt7915_mcu_csa_notify *c;
+ 
++	if (!pskb_may_pull(skb, sizeof(*c)))
++		return;
++
+ 	c = (struct mt7915_mcu_csa_notify *)skb->data;
+ 
+ 	if (c->band_idx > MT_BAND1)
+@@ -361,6 +364,9 @@ mt7915_mcu_rx_thermal_notify(struct mt7915_dev *dev, struct sk_buff *skb)
+ 	struct mt7915_mcu_thermal_notify *t;
+ 	struct mt7915_phy *phy;
+ 
++	if (!pskb_may_pull(skb, sizeof(*t)))
++		return;
++
+ 	t = (struct mt7915_mcu_thermal_notify *)skb->data;
+ 	if (t->ctrl.ctrl_id != THERMAL_PROTECT_ENABLE)
+ 		return;
+@@ -560,7 +566,7 @@ static void
+ mt7915_mcu_rx_log_message(struct mt7915_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt76_connac2_mcu_rxd *rxd;
+-	int len = skb->len - sizeof(*rxd);
++	int len = skb_headlen(skb) - sizeof(*rxd);
+ 	const char *data, *type;
+ 
+ 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
+@@ -599,6 +605,9 @@ mt7915_mcu_rx_bcc_notify(struct mt7915_dev *dev, struct sk_buff *skb)
+ 	struct mt76_phy *mphy = &dev->mt76.phy;
+ 	struct mt7915_mcu_bcc_notify *b;
+ 
++	if (!pskb_may_pull(skb, sizeof(*b)))
++		return;
++
+ 	b = (struct mt7915_mcu_bcc_notify *)skb->data;
+ 
+ 	if (b->band_idx > MT_BAND1)
+@@ -752,6 +761,11 @@ void mt7915_mcu_rx_event(struct mt7915_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt76_connac2_mcu_rxd *rxd;
+ 
++	if (!pskb_may_pull(skb, sizeof(*rxd))) {
++		dev_kfree_skb(skb);
++		return;
++	}
++
+ 	rxd = (struct mt76_connac2_mcu_rxd *)skb->data;
+ 	if ((rxd->ext_eid == MCU_EXT_EVENT_THERMAL_PROTECT ||
+ 	     rxd->ext_eid == MCU_EXT_EVENT_FW_LOG_2_HOST ||
+diff --git a/mt7915/tests/mcu2-test.c b/mt7915/tests/mcu2-test.c
+index 54ea1bfe..a18dd700 100644
+--- a/mt7915/tests/mcu2-test.c
++++ b/mt7915/tests/mcu2-test.c
+@@ -1781,6 +1781,49 @@ static void mt7915_mcu2_events_csa_bcc(struct kunit *test)
+ 	}
+ }
+ 
++/* Events shorter than their descriptor or notification payload are dropped
++ * without queuing on res_q or touching phy state.
++ */
++static void mt7915_mcu2_events_short(struct kunit *test)
++{
++	struct mt7915_dev *dev = mt7915_test_dev(test);
++	struct mt7915_mcu_thermal_notify th = {};
++	struct mt76_connac2_mcu_rxd rxd = {};
++	struct sk_buff *skb;
++
++	/* shorter than the MCU RXD header, with non-zero bytes where seq sits */
++	skb = alloc_skb(sizeof(rxd) - 1, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memset(skb_put(skb, 4), 0x55, 4);
++	mt7915_mcu2_rx_event(test, dev, skb);
++	skb_queue_purge(&dev->mt76.mcu.res_q);
++
++	/* header-only thermal notify: backing buffer holds a non-zero duty
++	 * cycle past skb->len so an unchecked cast would copy it
++	 */
++	th.ctrl.ctrl_id = THERMAL_PROTECT_ENABLE;
++	th.ctrl.band_idx = 0;
++	th.ctrl.duty.duty_cycle = 50;
++	skb = alloc_skb(sizeof(th), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	memcpy(skb->data, &th, sizeof(th));
++	skb_put(skb, sizeof(rxd));
++	((struct mt76_connac2_mcu_rxd *)skb->data)->eid = MCU_EVENT_EXT;
++	((struct mt76_connac2_mcu_rxd *)skb->data)->ext_eid =
++		MCU_EXT_EVENT_THERMAL_PROTECT;
++	((struct mt76_connac2_mcu_rxd *)skb->data)->seq = 0;
++	mt7915_mcu2_rx_event(test, dev, skb);
++	KUNIT_EXPECT_EQ(test, dev->phy.throttle_state, 0);
++
++	/* header-only CSA and BCC notifications */
++	mt7915_mcu2_rx_event(test, dev, mt7915_mcu2_event(test,
++			MCU_EVENT_EXT, MCU_EXT_EVENT_CSA_NOTIFY, 0,
++			&rxd, sizeof(rxd)));
++	mt7915_mcu2_rx_event(test, dev, mt7915_mcu2_event(test,
++			MCU_EVENT_EXT, MCU_EXT_EVENT_BCC_NOTIFY, 0,
++			&rxd, sizeof(rxd)));
++}
++
+ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_replies),
+ 	KUNIT_CASE(mt7915_mcu2_parse_wa_tx_stat),
+@@ -1799,6 +1842,7 @@ static struct kunit_case mt7915_mcu2_event_cases[] = {
+ 	KUNIT_CASE(mt7915_mcu2_events_ps_record),
+ 	KUNIT_CASE(mt7915_mcu2_events_log),
+ 	KUNIT_CASE(mt7915_mcu2_events_csa_bcc),
++	KUNIT_CASE(mt7915_mcu2_events_short),
+ 	{}
+ };
+ 

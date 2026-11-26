@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 09:43:20 +0000
+Subject: [PATCH] wifi: mt76: count the rx frames kept from the network stack
+
+A frame whose PN doesn't advance, or that the hardware flagged with an
+ICV or MIC error, goes to monitor interfaces only, and one in 802.3
+format is freed. Nothing counted these, so a burst of them was
+invisible.
+
+Count them per phy, once per MPDU, under rx_lock: a replay when
+mt76_check_ccmp_pn() marked it, ICV otherwise. debugfs mt76/rx_drops
+shows the totals since the driver loaded. mt76_rx_drop_report() logs
+one line at most once a minute with the frames dropped since its last
+line, and nothing when there were none; mt7915 calls it from mac_work
+with the survey update. Frames that go through count nothing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ debugfs.c         |  12 +++++
+ mac80211.c        |  49 ++++++++++++++++++
+ mt76.h            |  16 +++++-
+ mt7915/mac.c      |   1 +
+ tests/core-test.c | 126 ++++++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 203 insertions(+), 1 deletion(-)
+
+diff --git a/debugfs.c b/debugfs.c
+index 41d1d486..e96f9bd0 100644
+--- a/debugfs.c
++++ b/debugfs.c
+@@ -100,6 +100,17 @@ void mt76_seq_puts_array(struct seq_file *file, const char *str,
+ }
+ EXPORT_SYMBOL_GPL(mt76_seq_puts_array);
+ 
++/* the frames kept from the network stack since the driver loaded */
++static int mt76_rx_drops_show(struct seq_file *s, void *data)
++{
++	struct mt76_phy *phy = s->private;
++
++	seq_printf(s, "replay %llu\nicv %llu\n",
++		   READ_ONCE(phy->rx_drop.replay), READ_ONCE(phy->rx_drop.icv));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt76_rx_drops);
++
+ struct dentry *
+ mt76_register_debugfs_fops(struct mt76_phy *phy,
+ 			   const struct file_operations *ops)
+@@ -120,6 +131,7 @@ mt76_register_debugfs_fops(struct mt76_phy *phy,
+ 		debugfs_create_blob("otp", 0400, dir, &dev->otp);
+ 	debugfs_create_devm_seqfile(dev->dev, "rx-queues", dir,
+ 				    mt76_rx_queues_read);
++	debugfs_create_file("rx_drops", 0400, dir, phy, &mt76_rx_drops_fops);
+ 
+ 	return dir;
+ }
+diff --git a/mac80211.c b/mac80211.c
+index abc074e9..e0235433 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -444,6 +444,7 @@ mt76_phy_init(struct mt76_phy *phy, struct ieee80211_hw *hw)
+ 
+ 	INIT_LIST_HEAD(&phy->tx_list);
+ 	spin_lock_init(&phy->tx_lock);
++	phy->rx_drop.last_report = jiffies;
+ 	INIT_DELAYED_WORK(&phy->roc_work, mt76_roc_complete_work);
+ 	INIT_DELAYED_WORK(&phy->scan_work, mt76_scan_work);
+ 
+@@ -1502,6 +1503,7 @@ skip_hdr_check:
+ 		     sizeof(status->iv));
+ 	if (ret <= 0) {
+ 		status->flag |= RX_FLAG_ONLY_MONITOR;
++		status->pn_replay = true;
+ 		return;
+ 	}
+ 
+@@ -1677,6 +1679,51 @@ mt76_check_sta(struct mt76_dev *dev, struct sk_buff *skb)
+ 	ieee80211_sta_ps_transition(sta, ps);
+ }
+ 
++/* a frame that won't reach the network stack, counted once per MPDU */
++static void
++mt76_rx_count_drop(struct mt76_dev *dev, struct mt76_rx_status *status)
++{
++	struct mt76_phy *phy = mt76_dev_phy(dev, status->phy_idx);
++
++	/* rx_lock is held: the only writer */
++	if (status->pn_replay)
++		WRITE_ONCE(phy->rx_drop.replay, phy->rx_drop.replay + 1);
++	else
++		WRITE_ONCE(phy->rx_drop.icv, phy->rx_drop.icv + 1);
++}
++
++#define MT76_RX_DROP_REPORT	(60 * HZ)
++
++/*
++ * At most once a minute, one kernel log line for the frames dropped since
++ * the last one, and nothing when there were none. Called from the driver's
++ * periodic work; returns whether it logged.
++ */
++bool mt76_rx_drop_report(struct mt76_phy *phy)
++{
++	unsigned long now = jiffies;
++	u64 replay, icv;
++
++	if (time_before(now, phy->rx_drop.last_report + MT76_RX_DROP_REPORT))
++		return false;
++
++	replay = READ_ONCE(phy->rx_drop.replay) - phy->rx_drop.last_replay;
++	icv = READ_ONCE(phy->rx_drop.icv) - phy->rx_drop.last_icv;
++	phy->rx_drop.last_replay += replay;
++	phy->rx_drop.last_icv += icv;
++	phy->rx_drop.last_report = now;
++
++	if (!replay && !icv)
++		return false;
++
++	dev_info(phy->dev->dev,
++		 "%s: %llu rx frames dropped in the last %u s (replay %llu, ICV %llu)\n",
++		 wiphy_name(phy->hw->wiphy), replay + icv,
++		 MT76_RX_DROP_REPORT / HZ, replay, icv);
++	return true;
++}
++EXPORT_SYMBOL_GPL(mt76_rx_drop_report);
++
+ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
+ 		      struct napi_struct *napi)
+ {
+@@ -1697,6 +1744,8 @@ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
+ 
+ 		mt76_check_ccmp_pn(skb);
+ 		only_monitor = status->flag & RX_FLAG_ONLY_MONITOR;
++		if (only_monitor)
++			mt76_rx_count_drop(dev, status);
+ 		if (only_monitor && (status->flag & RX_FLAG_8023)) {
+ 			dev_kfree_skb(skb);
+ 			continue;
+diff --git a/mt76.h b/mt76.h
+index 539c5858..df7ad2e7 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -822,7 +822,7 @@ struct mt76_rx_status {
+ 		} eht;
+ 	};
+ 
+-	u8 amsdu:1, first_amsdu:1, last_amsdu:1, skip_pn_check:1;
++	u8 amsdu:1, first_amsdu:1, last_amsdu:1, skip_pn_check:1, pn_replay:1;
+ 	u8 rate_idx;
+ 	u8 nss:5, band:3;
+ 	u8 chains;
+@@ -983,6 +983,19 @@ struct mt76_phy {
+ 		u16 wcid_idx;	/* the head's station, to check it's still there */
+ 	} rx_amsdu[__MT_RXQ_MAX];
+ 
++	/*
++	 * rx frames kept from the network stack: a PN replay, or one the
++	 * hardware flagged (ICV or MIC error). Written under dev->rx_lock;
++	 * debugfs rx_drops and mt76_rx_drop_report() read them.
++	 */
++	struct {
++		u64 replay;
++		u64 icv;
++		u64 last_replay;
++		u64 last_icv;
++		unsigned long last_report;
++	} rx_drop;
++
+ 	struct mt76_freq_range_power *frp;
+ 
+ 	struct {
+@@ -1950,6 +1963,7 @@ void mt76_rx_poll_complete(struct mt76_dev *dev, enum mt76_rxq_id q,
+ 			   struct napi_struct *napi);
+ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames);
+ void mt76_check_ccmp_pn(struct sk_buff *skb);
++bool mt76_rx_drop_report(struct mt76_phy *phy);
+ void mt76_testmode_tx_pending(struct mt76_phy *phy);
+ void mt76_queue_tx_complete(struct mt76_dev *dev, struct mt76_queue *q,
+ 			    struct mt76_queue_entry *e);
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index c7e3a746..b2d6ae80 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2380,6 +2380,7 @@ void mt7915_mac_work(struct work_struct *work)
+ 		mt76_update_survey(mphy);
+ 		mt7915_mac_update_stats(phy);
+ 		mt7915_mac_severe_check(phy);
++		mt76_rx_drop_report(mphy);
+ 
+ 		if (phy->dev->muru_debug && ++phy->muru_work_count >= 20) {
+ 			phy->muru_work_count = 0;
+diff --git a/tests/core-test.c b/tests/core-test.c
+index 395be842..79b28379 100644
+--- a/tests/core-test.c
++++ b/tests/core-test.c
+@@ -2952,6 +2952,130 @@ static void mt76_test_rx_poll_complete(struct kunit *test)
+ 	}
+ }
+ 
++/* one frame through mt76_rx_complete(), the way an rx poll completes it */
++static void mt76_test_rx_complete_one(struct mt76_dev *dev, struct sk_buff *skb)
++{
++	struct sk_buff_head frames;
++
++	__skb_queue_head_init(&frames);
++	__skb_queue_tail(&frames, skb);
++	local_bh_disable();
++	rcu_read_lock();
++	mt76_rx_complete(dev, &frames, NULL);
++	rcu_read_unlock();
++	local_bh_enable();
++}
++
++/* Frames kept from the network stack are counted per phy, once per MPDU:
++ * a PN replay as a replay, one the hardware flagged (ICV/MIC) as ICV.
++ * Frames that go through count nothing.
++ */
++static void mt76_test_rx_drop_count(struct kunit *test)
++{
++	struct mt76_hwt *hwt = mt76_hwt_new(test, &mt76_test_drv_ops);
++	struct mt76_dev *dev = hwt->dev;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb, *sub;
++
++	mt76_hwt_iface(hwt, "monitor");
++	set_bit(MT76_STATE_RUNNING, &dev->phy.state);
++	wcid = kunit_kzalloc(test, sizeof(*wcid), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, wcid);
++	wcid->rx_check_pn = true;
++	wcid->idx = 5;
++	rcu_assign_pointer(dev->wcid[5], wcid);
++	mt76_test_set_pn(wcid->rx_key_pn[0], 6);
++
++	/* a new PN goes through */
++	skb = mt76_test_rx_skb(test, MT76_TEST_QOS_DATA, mt76_hwt_addr, 1, 8);
++	mt76_test_status(skb)->wcid = wcid;
++	mt76_test_status(skb)->flag = MT76_TEST_DEC;
++	mt76_test_set_pn(mt76_test_status(skb)->iv, 7);
++	mt76_test_rx_complete_one(dev, skb);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.replay, 0ULL);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.icv, 0ULL);
++
++	/* a replay in 802.11 format: mac80211 gives it to monitors only */
++	skb = mt76_test_rx_skb(test, MT76_TEST_QOS_DATA, mt76_hwt_addr, 2, 8);
++	mt76_test_status(skb)->wcid = wcid;
++	mt76_test_status(skb)->flag = MT76_TEST_DEC;
++	mt76_test_set_pn(mt76_test_status(skb)->iv, 7);
++	mt76_test_rx_complete_one(dev, skb);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.replay, 1ULL);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.icv, 0ULL);
++
++	/* a replayed 802.3 A-MSDU, freed with its subframe: one MPDU */
++	skb = alloc_skb(64, GFP_KERNEL);
++	sub = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_ASSERT_NOT_NULL(test, sub);
++	skb_put_zero(skb, 32);
++	skb_put_zero(sub, 32);
++	mt76_test_status(skb)->wcid = wcid;
++	mt76_test_status(skb)->flag = MT76_TEST_DEC | RX_FLAG_8023;
++	mt76_test_set_pn(mt76_test_status(skb)->iv, 5);
++	skb_shinfo(skb)->frag_list = sub;
++	mt76_test_rx_complete_one(dev, skb);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.replay, 2ULL);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.icv, 0ULL);
++
++	/* the hardware's ICV/MIC flag, 802.11 and 802.3 */
++	skb = mt76_test_rx_skb(test, MT76_TEST_QOS_DATA, mt76_hwt_addr, 3, 8);
++	mt76_test_status(skb)->flag = MT76_TEST_DEC | RX_FLAG_ONLY_MONITOR;
++	mt76_test_rx_complete_one(dev, skb);
++	skb = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	skb_put_zero(skb, 32);
++	mt76_test_status(skb)->flag = RX_FLAG_8023 | RX_FLAG_ONLY_MONITOR;
++	mt76_test_rx_complete_one(dev, skb);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.replay, 2ULL);
++	KUNIT_EXPECT_EQ(test, dev->phy.rx_drop.icv, 2ULL);
++
++	/* the PN state didn't move for the replays */
++	KUNIT_EXPECT_EQ(test, mt76_test_get_pn(wcid->rx_key_pn[0]), 7);
++	__skb_queue_purge(&hwt->rx);
++}
++
++/* The report logs at most once a minute, only the drops since the last
++ * window, and nothing for a window without any.
++ */
++static void mt76_test_rx_drop_report(struct kunit *test)
++{
++	struct mt76_hwt *hwt = mt76_hwt_new(test, &mt76_test_drv_ops);
++	struct mt76_phy *phy = &hwt->dev->phy;
++
++	/* the window starts when the phy is set up */
++	KUNIT_EXPECT_FALSE(test, time_before(jiffies,
++					     phy->rx_drop.last_report));
++	phy->rx_drop.last_report = jiffies;
++	phy->rx_drop.replay = 3;
++	KUNIT_EXPECT_FALSE(test, mt76_rx_drop_report(phy));
++	KUNIT_EXPECT_EQ(test, phy->rx_drop.last_replay, 0ULL);
++
++	/* a minute on: the 3 replays and 2 ICV frames are reported */
++	phy->rx_drop.icv = 2;
++	phy->rx_drop.last_report = jiffies - MT76_RX_DROP_REPORT;
++	KUNIT_EXPECT_TRUE(test, mt76_rx_drop_report(phy));
++	KUNIT_EXPECT_EQ(test, phy->rx_drop.last_replay, 3ULL);
++	KUNIT_EXPECT_EQ(test, phy->rx_drop.last_icv, 2ULL);
++
++	/* straight after: too early, even with new drops */
++	phy->rx_drop.replay = 4;
++	KUNIT_EXPECT_FALSE(test, mt76_rx_drop_report(phy));
++	KUNIT_EXPECT_EQ(test, phy->rx_drop.last_replay, 3ULL);
++
++	/* the next minute reports only the new one */
++	phy->rx_drop.last_report = jiffies - MT76_RX_DROP_REPORT;
++	KUNIT_EXPECT_TRUE(test, mt76_rx_drop_report(phy));
++	KUNIT_EXPECT_EQ(test, phy->rx_drop.last_replay, 4ULL);
++
++	/* a minute with nothing new: silent, and the window moves on */
++	phy->rx_drop.last_report = jiffies - MT76_RX_DROP_REPORT;
++	KUNIT_EXPECT_FALSE(test, mt76_rx_drop_report(phy));
++	KUNIT_EXPECT_FALSE(test, time_before(phy->rx_drop.last_report,
++					     jiffies - MT76_RX_DROP_REPORT / 2));
++}
++
+ static struct kunit_case mt76_core_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_rx_needs_running_phy),
+ 	KUNIT_CASE(mt76_test_rx_amsdu_reassembly),
+@@ -2971,6 +3095,8 @@ static struct kunit_case mt76_core_rx_test_cases[] = {
+ 	KUNIT_CASE(mt76_test_check_sta_ps_unchanged),
+ 	KUNIT_CASE(mt76_test_check_sta_pspoll_unknown),
+ 	KUNIT_CASE(mt76_test_rx_poll_complete),
++	KUNIT_CASE(mt76_test_rx_drop_count),
++	KUNIT_CASE(mt76_test_rx_drop_report),
+ 	{}
+ };
+ 

@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 19:59:22 +0000
+Subject: [PATCH] wifi: mt76: mt7915: clear station dozing record on L1
+ recovery
+
+mt7915_mac_ps_release() releases held stations after an L1 recovery by
+clearing MT_WCID_FLAG_PS, but leaves msta->ps.dozing set. Until a new
+PS_SYNC event arrives, debugfs ps stats keep counting doze time and a
+TWT change calling mt7915_mcu_sta_ps_update() re-holds an awake station.
+
+Record every station as awake via mt7915_mcu_sta_ps_record() during
+mt7915_mac_ps_release(), and use spin_lock_bh() in
+mt7915_mcu_sta_ps_record() so it is safe from both NAPI and process
+context. Add a KUnit test covering L1 recovery and subsequent
+mt7915_mcu_sta_ps_update().
+---
+ mt7915/mac.c            | 10 +++++++++-
+ mt7915/mcu.c            |  7 +++----
+ mt7915/mt7915.h         |  1 +
+ mt7915/tests/mac-test.c | 30 ++++++++++++++++++++++++++++++
+ 4 files changed, 43 insertions(+), 5 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 099be02e..9ce2d3ce 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1661,7 +1661,15 @@ static void mt7915_mac_ps_release(struct mt7915_dev *dev)
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.wcid); i++) {
+ 		struct mt76_wcid *wcid = rcu_dereference(dev->mt76.wcid[i]);
+ 
+-		if (wcid && test_bit(MT_WCID_FLAG_PS, &wcid->flags))
++		if (!wcid)
++			continue;
++
++		if (wcid->sta)
++			mt7915_mcu_sta_ps_record(container_of(wcid,
++							      struct mt7915_sta,
++							      wcid),
++						 false);
++		if (test_bit(MT_WCID_FLAG_PS, &wcid->flags))
+ 			mt76_sta_ps_transition(&dev->mt76, wcid, false);
+ 	}
+ 	rcu_read_unlock();
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 98cabe84..63a45624 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -623,12 +623,11 @@ mt7915_mcu_rx_bcc_notify(struct mt7915_dev *dev, struct sk_buff *skb)
+ }
+ 
+ /* a station dozed or woke: what debugfs "ps" shows */
+-static void
+-mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
++void mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
+ {
+ 	unsigned long now = jiffies;
+ 
+-	spin_lock(&msta->ps.lock);
++	spin_lock_bh(&msta->ps.lock);
+ 	if (dozing != msta->ps.dozing) {
+ 		u32 ms = jiffies_to_msecs(now - msta->ps.since);
+ 
+@@ -641,7 +640,7 @@ mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
+ 		msta->ps.dozing = dozing;
+ 		msta->ps.since = now;
+ 	}
+-	spin_unlock(&msta->ps.lock);
++	spin_unlock_bh(&msta->ps.lock);
+ }
+ 
+ /* the record now, the current doze counted in */
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 78700b04..3dfd0159 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -818,6 +818,7 @@ void mt7915_mac_twt_teardown_flow(struct mt7915_dev *dev,
+ void mt7915_mac_twt_send_teardown(struct mt7915_phy *phy,
+ 				  struct ieee80211_sta *sta, u8 flowid);
+ int mt7915_twt_policy_set(struct mt7915_phy *phy, const char *buf);
++void mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing);
+ void mt7915_mcu_sta_ps_update(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ void mt7915_mac_add_twt_setup(struct ieee80211_hw *hw,
+ 			      struct ieee80211_sta *sta,
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 2a156496..25aba6ab 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -561,6 +561,7 @@ static struct mt7915_sta *mt7915_test_sta(struct kunit *test,
+ 	msta->wcid.sta = 1;
+ 	msta->vif = mvif;
+ 	msta->jiffies = jiffies;
++	spin_lock_init(&msta->ps.lock);
+ 	INIT_LIST_HEAD(&msta->rc_list);
+ 	rcu_assign_pointer(dev->mt76.wcid[idx], &msta->wcid);
+ 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+@@ -6294,6 +6295,34 @@ static void mt7915_test_full_reset_wa(struct kunit *test)
+ 	__mt7915_test_full_reset(test, MT_MCU_CMD_WA_WDT);
+ }
+ 
++/* L1 recovery clears the recorded dozing state as well as the hold bit, so
++ * ps stats stop counting doze time and a subsequent TWT state change does
++ * not re-hold an awake station.
++ */
++static void mt7915_test_ps_release_clears_dozing(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_hw_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt7915_sta *held = mt7915_test_sta(test, dev, 9, NULL);
++	struct mt7915_sta_ps_stats st;
++
++	mt7915_mcu_sta_ps_record(held, true);
++	set_bit(MT_WCID_FLAG_PS, &held->wcid.flags);
++
++	mt7915_test_rings(test, dev);
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++	dev->recovery.state = MT_MCU_CMD_STOP_DMA | MT_MCU_CMD_RESET_DONE |
++			      MT_MCU_CMD_RECOVERY_DONE |
++			      MT_MCU_CMD_NORMAL_STATE;
++	mt7915_mac_reset_work(&dev->reset_work);
++
++	mt7915_sta_ps_stats(held, &st);
++	KUNIT_EXPECT_FALSE(test, st.dozing);
++	mt7915_mcu_sta_ps_update(dev, held);
++	KUNIT_EXPECT_FALSE(test, test_bit(MT_WCID_FLAG_PS, &held->wcid.flags));
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++}
++
+ /* The tx buffers WED sends from on the host's behalf (its token half): one
+  * cut-through 802.3 descriptor each, its single buffer right after the
+  * descriptor and the txp, tagged with the WED's token. The rest of both is
+@@ -6505,6 +6534,7 @@ static struct kunit_case mt7915_mac_hw_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_reset_work_no_normal_state),
+ 	KUNIT_CASE(mt7915_test_full_reset),
+ 	KUNIT_CASE(mt7915_test_full_reset_wa),
++	KUNIT_CASE(mt7915_test_ps_release_clears_dozing),
+ 	{}
+ };
+ 
