@@ -1,0 +1,3339 @@
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Subject: [PATCH] net/sched: sch_cake: MilkFlint changes
+
+Generated from cake/ commit 55d740f174c900d25e22a57de52f8936bf4e839f (base..main):
+
+562971b98f81 net/sched: sch_cake: hash the hosts only when a flow queue is allocated
+967e7603fc0d net/sched: sch_cake: cake_mq: redo the rates only when the share changes
+8eccd83ceacd net/sched: sch_cake: no dither for a host's only bulk flow
+01e28cd1cd25 net/sched: sch_cake: a bigger bulk quantum with no-split-gso
+b8f30400d6f8 net/sched: sch_cake: keep the hot fields together
+4fcb2dc94864 net/sched: sch_cake: KUnit tests for the hashing and the quanta
+feb9f70a1e42 net/sched: sch_cake: cake_mq: count only the sub-cakes that had a packet
+9bdf8f08b83a net/sched: sch_cake: cake_mq: share the rate by demand and weight
+79c99eb02b33 net/sched: sch_cake: cake_mq: size the bulk quantum from the whole rate
+571aa3f8386e net/sched: sch_cake: nat mode: no flow dissection for non-IPv4 with an L4 hash
+88de17eac617 net/sched: sch_cake: KUnit test for nat mode with the conntrack entry attached
+9d03ffb4918c net/sched: sch_cake: let the shaper's watchdog wake a little late
+8f711fb19e09 net/sched: sch_cake: cake_mq: a lone flow stays sparse on its sub-cake
+326ba2ad3813 net/sched: sch_cake: drop ECT(0) from a flow that ignores CE marks
+224b402862f6 net/sched: sch_cake: drop sooner from a flow that ignores CE marks
+340b9d5aee06 net/sched: sch_cake: an L4S ramp for ECT(1) packets
+cb72d0b4029b net/sched: sch_cake: where it washes, restore the DSCP from conntrack
+f3d81d294d7b net/sched: sch_cake: a flow that ignores CE marks loses its GSO packets too
+36cbdf2a0516 net/sched: sch_cake: no timer set for every packet of a quiet link
+3a702fbded4b net/sched: sch_cake: fix autorate reconfiguration throttling
+071bfe13b946 net/sched/sch_cake: serialize reconfiguration with the datapath
+49753aa875e4 net/sched/sch_cake: reduce parent backlog when clearing a tin
+2b86fe78752c net: account for encap headers in qdisc pkt len
+146e646a0afa net/sched: sch_cake: KUnit tests for 760-20 to 760-23
+09d84e7e54fc net/sched: sch_cake: cake_mq: a sub-cake held back goes on wanting more
+c0e4a54e2c84 net/sched: sch_cake: cake_mq: a new share rescales the tins' schedules too
+a84653faf805 net/sched: sch_cake: the ACK filter reads a flow's queue only when it holds an ACK
+403280dc851e net/sched: sch_cake: the bulk rotation in constant time
+504ebac5d123 net/sched: sch_cake: flows at rest wait off the dequeue's path
+8648ed74fc36 net/sched: sch_cake: nat mode finds a flow by its L4 hash, IPv4 too
+12a4f00115a1 net/sched: sch_cake: COBALT's count decays in a bounded number of steps
+8771f4359b14 net/sched: sch_cake: small savings on the packet path
+d2945dd19f2b net/sched: sch_cake: the overflow heap sifts a shortened queue all the way down
+084cb7171060 net/sched: sch_cake: the overflow heap holds only the tins in use
+039b951c258f net/sched: sch_cake: cake_mq's published state on a cache line of its own
+e27e897bb1ce net/sched: sch_cake: a download's new flow may go ahead of the shaper
+f32f1f14d692 net/sched: sch_cake: dscp_restore keeps a flow's DSCP for its next packets
+724e9d5c3507 net/sched: sch_cake: cake_mq: a sub-cake whose queue ran empty wants no more
+7691e7d5b0ef net/sched: sch_cake: no watchdog in the past with the failsafe due
+58d2fd12f5ef net/sched: sch_cake: KUnit: ingress drops ahead of the shaper, BLUE, a live cake_mq change, COBALT's edges
+e65dff00fbf7 net/sched: sch_cake: cake_mq: the Bulk tin bids a sixteenth
+6e3d79179ae4 net/sched: sch_cake: walk tins in priority order in cake_sparse_ahead()
+52611d3356ec net/sched: sch_cake: track per-flow host-count membership for live flow_mode changes
+244f98f7fb92 net/sched: sch_cake: cake_mq: read peer last_active before q.qlen
+14842391006f net/sched: sch_cake: skip non-ACK header parsing in the ACK filter
+806fe19feff1 net/sched: sch_cake: extend dscp_restore memo to diffserv modes
+68553a35f8f8 net/sched: sch_cake: use signed sojourn in cake_l4s_mark() and skip already-marked packets
+5995ec1e5e06 net/sched: sch_cake: drop already-CE packets on ecn_ignored flows
+205a4f2bc409 net/sched: sch_cake: cake_mq: fast paths in cake_mq_ewma() and cake_mq_idle_after()
+86de1cc020bd net/sched: sch_cake: add compile-time layout assertions
+558059555341 net/sched: sch_cake: KUnit: add property-based invariant fuzzer
+0ae39a60cf2f net/sched: sch_cake: KUnit: use round rates in L4S multi-flow and GSO tests
+ff47f22545d6 net/sched: sch_cake: keep a queue's tin layout stable across resyncs
+60800cc421b8 net/sched: sch_cake: cap cake_mq_rescale_wait() before multiplying
+8867f2101e7a net/sched: sch_cake: skip empty tins by flow count in cake_clear_tin()
+ef77bf53a825 net/sched: sch_cake: use rcu_dereference_bh() in cake_mq_read_peers()
+aa253b7846ea net/sched: sch_cake: use READ_ONCE() on shared config reads and lock overhead resets
+896ddc35277c net/sched: sch_cake: cake_mq: give bulk weight only to bulk flows
+925953f94430 net/sched: sch_cake: clear cake_mq state and DSCP memo in cake_reset()
+72184e1f92b8 net/sched: sch_cake: cap cake_enqueue() watchdog with cake_mq_wake_by()
+90a1497754e2 net/sched: sch_cake: prevent u32 wraparound of to in cobalt_decay_jump()
+07e0bcbfc08b net/sched: sch_cake: reset sparse-ahead flag at begin: in cake_dequeue()
+9e46fedc3441 net/sched: sch_cake: use child tin_mode in cake_dscp_memo_on()
+6543283374bb net/sched: sch_cake: an ACK the filter drops may be the longer one
+5aa6d9a3f8bf net/sched: sch_cake: COBALT's count jump finds its target by halving
+b05780510427 net/sched: sch_cake: cake_mq: a change keeps each sub-cake at its share
+05305f61f3ed net/sched: sch_cake: the L4S ramp and COBALT judge ECT(1) at one rate
+a4fde8c2e164 net/sched: sch_cake: the ACK filter's fast skip allows for 6in4's headers
+552d91e2b88a net/sched: sch_cake: cake_mq: a reset sub-cake is idle at once
+442327065a98 net/sched: sch_cake: read the fwmark mask once, and the tx queue count
+55d740f174c9 net/sched: sch_cake: KUnit: defaults for every test, and a stronger fuzzer
+---
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 7b0d9cf..e942da4 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -82,10 +82,21 @@
+ #define CAKE_FLOW_MASK 63
+ #define CAKE_FLOW_NAT_FLAG 64
+ 
++/* A flow's deficit is in bytes << CAKE_DEFICIT_SHIFT, so a host's share of
++ * a quantum keeps its fraction instead of being dithered to whole bytes:
++ * +-256 KB, against a quantum of 64 KB at most and a charge of 128 KB at
++ * most (cake_deficit_charge()).
++ */
++#define CAKE_DEFICIT_SHIFT 13
++/* The bulk rotation's passes: cake_bulk_park() */
++#define CAKE_WHEEL_SLOTS 32
++
+ /* struct cobalt_params - contains codel and blue parameters
+  * @interval:	codel initial drop rate
+  * @target:     maximum persistent sojourn time & blue update rate
+  * @mtu_time:   serialisation delay of maximum-size packet
++ * @share_mtu_time: the same at the tin's rate as it is now: on cake_mq at
++ *		the sub-cake's share, where the others stay at the whole rate's
+  * @p_inc:      increment of blue drop probability (0.32 fxp)
+  * @p_dec:      decrement of blue drop probability (0.32 fxp)
+  */
+@@ -93,6 +104,7 @@ struct cobalt_params {
+ 	u64	interval;
+ 	u64	target;
+ 	u64	mtu_time;
++	u64	share_mtu_time;
+ 	u32	p_inc;
+ 	u32	p_dec;
+ };
+@@ -105,6 +117,8 @@ struct cobalt_params {
+  * @p_drop:		BLUE drop probability (0.32 fxp)
+  * @dropping:		set if in dropping state
+  * @ecn_marked:		set if marked
++ * @ecn_strikes:	signals in a row that found the flow's marks ignored
++ * @ecn_ignored:	set when the flow's ECT(0) packets are dropped, not marked
+  */
+ struct cobalt_vars {
+ 	u32	count;
+@@ -114,6 +128,8 @@ struct cobalt_vars {
+ 	u32     p_drop;
+ 	bool	dropping;
+ 	bool    ecn_marked;
++	u8	ecn_strikes;
++	bool	ecn_ignored;
+ };
+ 
+ enum {
+@@ -134,9 +150,16 @@ struct cake_flow {
+ 	struct cobalt_vars cvars;
+ 	u16		  srchost; /* index into cake_host table */
+ 	u16		  dsthost;
+-	u8		  set;
++	u8		  set:5;
++	u8		  mq_host_cnt:3; /* host-count buckets this bulk flow added to */
++	u8		  pure_acks; /* queued, for the ACK filter: cake_ack_filter() */
++	u16		  mq_weight; /* cake_mq: its part of the tin's mq_weight */
+ }; /* please try to keep this structure <= 64 bytes */
+ 
++#define CAKE_MQ_CNT_SRC		BIT(0)
++#define CAKE_MQ_CNT_HOST	BIT(1)
++#define CAKE_MQ_CNT_DST		BIT(2)
++
+ struct cake_host {
+ 	u32 srchost_tag;
+ 	u32 dsthost_tag;
+@@ -148,13 +171,33 @@ struct cake_heap_entry {
+ 	u16 t:3, b:10;
+ };
+ 
++/* What a queue's packets took from conntrack for dscp_restore, kept for its
++ * next CAKE_DSCP_KEEP - 1 packets while it's under CAKE_DSCP_KEEP_TICKS old:
++ * cake_restore_memo()
++ */
++struct cake_dscp_memo {
++	u32	tag;	/* the queue's flow when it was looked up */
++	u32	at;	/* when, in units of 2^CAKE_DSCP_KEEP_SHIFT ns */
++	u8	dscp;
++	u8	left;	/* packets that may still take it */
++};
++
+ struct cake_tin_data {
+ 	struct cake_flow flows[CAKE_QUEUES];
+ 	u32	backlogs[CAKE_QUEUES];
+ 	u32	tags[CAKE_QUEUES]; /* for set association */
+ 	u16	overflow_idx[CAKE_QUEUES];
+ 	struct cake_host hosts[CAKE_QUEUES]; /* for triple isolation */
++	/* cake_mq: every sub-cake's bulk flows per host, in this tin, by host
++	 * tag; NULL for plain cake
++	 */
++	atomic_t *mq_srcload;
++	atomic_t *mq_dstload;
++	/* cake_mq: the bulk rotation's flows, each 65535 / its host load */
++	u32	mq_weight;
+ 	u16	flow_quantum;
++	/* what a bulk flow's host gets back per pass: cake_set_bulk_quantum() */
++	u16	bulk_quantum;
+ 
+ 	struct cobalt_params cparams;
+ 	u32	drop_overlimit;
+@@ -166,8 +209,14 @@ struct cake_tin_data {
+ 	u32	max_skblen;
+ 
+ 	struct list_head new_flows;
+-	struct list_head old_flows;
++	/* empty flows whose AQM state is still decaying, visited one a dequeue */
+ 	struct list_head decaying_flows;
++	/* empty flows at rest, kept until their timeout: cake_flow_emptied() */
++	struct list_head resting_flows;
++	/* the bulk rotation, a slot for each pass to come: cake_bulk_park() */
++	struct list_head old_wheel[CAKE_WHEEL_SLOTS];
++	u32	wheel_mask;	/* the slots that may hold flows */
++	u8	cur_slot;	/* the pass being served */
+ 
+ 	/* time_next = time_this + ((len * rate_ns) >> rate_shft) */
+ 	ktime_t	time_next_packet;
+@@ -203,9 +252,14 @@ struct cake_sched_config {
+ 	u64		interval;
+ 	u64		target;
+ 	u64		sync_time;
++	/* cake_mq: the tx queues whose sub-cake ever had a packet */
++	unsigned long	*used_qs;
++	/* cake_mq: bulk flows per host over all the sub-cakes, for each tin
++	 * a source and a destination table of CAKE_QUEUES
++	 */
++	atomic_t	*mq_hosts;
+ 	u32		buffer_config_limit;
+ 	u32		fwmark_mask;
+-	u16		fwmark_shft;
+ 	s16		rate_overhead;
+ 	u16		rate_mpu;
+ 	u16		rate_flags;
+@@ -221,9 +275,6 @@ struct cake_sched_data {
+ 	struct tcf_block *block;
+ 	struct cake_tin_data *tins;
+ 	struct cake_sched_config *config;
+-	struct cake_sched_config initial_config;
+-
+-	struct cake_heap_entry overflow_heap[CAKE_QUEUES * CAKE_MAX_TINS];
+ 
+ 	/* time_next = time_this + ((len * rate_ns) >> rate_shft) */
+ 	ktime_t		time_next_packet;
+@@ -231,6 +282,7 @@ struct cake_sched_data {
+ 	u64		rate_ns;
+ 	u16		rate_shft;
+ 	u16		overflow_timeout;
++	u16		overflow_heap_len;	/* cake_heap_build() */
+ 	u16		tin_cnt;
+ 
+ 	/* resource tracking */
+@@ -241,6 +293,7 @@ struct cake_sched_data {
+ 	/* indices for dequeue */
+ 	u16		cur_tin;
+ 	u16		cur_flow;
++	u8		tin_mode;	/* last tin mode configured by cake_reconfigure() */
+ 
+ 	struct qdisc_watchdog watchdog;
+ 	const u8	*tin_index;
+@@ -263,10 +316,56 @@ struct cake_sched_data {
+ 
+ 	/* mq sync state */
+ 	u64		last_checked_active;
+-	u64		last_active;
++	u64		synced_rate;
+ 	u32		active_queues;
++	/* What the other sub-cakes read at their resync, on a cache line of
++	 * its own, so that only our writes to it cost them a miss: when we
++	 * last sent a packet (they read it only when our queue is empty; it's
++	 * written then, and while we send at least every half sync_time);
++	 * written at our resync, bytes/s charged to the shaper, all of it
++	 * and the sparse flows' part, averaged over CAKE_MQ_TAU; the bulk
++	 * weight; whether we used (nearly) all of our share
++	 */
++	u64		last_active ____cacheline_aligned_in_smp;
++	u64		mq_usage;
++	u64		mq_sparse;
++	u64		mq_idle;	/* ns without a packet until we count as idle */
++	u32		mq_weight;
++	bool		mq_saturated;
++	/* charged to the shaper since our last resync, a packet at a time, and
++	 * the tins it came from
++	 */
++	u64		mq_bytes ____cacheline_aligned_in_smp;
++	u64		mq_sparse_bytes;
++	u32		mq_packets;
++	u8		mq_seen_tins;
++	/* when the shaper last held packets back, and when a packet sent
++	 * last left our queue empty
++	 */
++	u64		mq_held_at;
++	u64		mq_drained_at;
++	/* wakes a sub-cake gone idle, to retire its rotation: cake_mq_drained() */
++	struct qdisc_watchdog mq_watchdog;
++
++	/* Cold, so last: plain cake's own config (cake_mq's sub-queues share
++	 * their parent's) and the 16 KB heap only used when the buffer limit
++	 * is hit. In the middle, they put the hot fields above 16 KB from
++	 * the ones before them.
++	 */
++	struct cake_sched_config initial_config;
++	struct cake_heap_entry overflow_heap[CAKE_QUEUES * CAKE_MAX_TINS];
++	/* dscp_restore in besteffort: each queue's last lookup */
++	struct cake_dscp_memo dscp_memo[CAKE_QUEUES];
+ };
+ 
++static_assert(sizeof(struct cake_flow) <= 80);
++#ifdef CONFIG_SMP
++static_assert(offsetof(struct cake_sched_data, last_active) % SMP_CACHE_BYTES == 0);
++static_assert(offsetof(struct cake_sched_data, mq_bytes) % SMP_CACHE_BYTES == 0);
++static_assert(offsetof(struct cake_sched_data, mq_bytes) -
++	      offsetof(struct cake_sched_data, last_active) >= SMP_CACHE_BYTES);
++#endif
++
+ enum {
+ 	CAKE_FLAG_OVERHEAD	   = BIT(0),
+ 	CAKE_FLAG_AUTORATE_INGRESS = BIT(1),
+@@ -284,6 +383,7 @@ enum {
+ struct cobalt_skb_cb {
+ 	ktime_t enqueue_time;
+ 	u32     adjusted_len;
++	bool	pure_ack;	/* counted in its flow's pure_acks */
+ };
+ 
+ static u64 us_to_ns(u64 us)
+@@ -308,7 +408,8 @@ static void cobalt_set_enqueue_time(struct sk_buff *skb,
+ 	get_cobalt_cb(skb)->enqueue_time = now;
+ }
+ 
+-static u16 quantum_div[CAKE_QUEUES + 1] = {0};
++/* 65535 / n, filled in once at module init (cake_module_init()) */
++static u16 quantum_div[CAKE_QUEUES + 1] __read_mostly;
+ 
+ /* Diffserv lookup tables */
+ 
+@@ -427,6 +528,101 @@ static void cobalt_vars_init(struct cobalt_vars *vars)
+ 	memset(vars, 0, sizeof(*vars));
+ }
+ 
++/* COBALT marks ECN-capable packets instead of dropping them. Some senders
++ * (BBR-like ones) answer the marks with CWR yet keep their rate, and their
++ * queue then sits far above target while the flow's count climbs into the
++ * thousands; dropped instead, they slow down. A flow whose packets are
++ * ECT(0), whose count has reached ecn_fail_count and that is still over
++ * twice the target at COBALT_ECN_STRIKES signals in a row, has its ECT(0)
++ * packets dropped from then on, from the drop rate a count of
++ * ecn_fail_count gives, until its count decays to 0 and it is marked again.
++ * Signalled without a break, a flow reaches a count of n in about
++ * 2 * interval * sqrt(n): 8 takes about 0.6 s at the default rtt, plus the
++ * strikes, and a flow that slows down for its marks has had over a dozen by
++ * then and left the queue, ECN or not. A sender that ignores them grows its
++ * queue all that while, and again on each new connection: at a count of 256,
++ * for three seconds. ECT(1) (L4S) is dropped this way only under the L4S
++ * ramp below, and from a longer queue. A GSO packet is dropped whole,
++ * whatever its size, as one from a flow without ECN is: the fastest flows
++ * arrive in the largest GRO packets. 0: always mark, as upstream.
++ */
++#define CAKE_ECN_FAIL_COUNT	8
++static unsigned int ecn_fail_count __read_mostly = CAKE_ECN_FAIL_COUNT;
++module_param(ecn_fail_count, uint, 0644);
++MODULE_PARM_DESC(ecn_fail_count, "COBALT count at which a flow that ignores ECN marks is dropped instead (0: always mark)");
++
++#define COBALT_ECN_STRIKES	8
++
++/* L4S senders (ECT(1)) cut their rate a little for each CE mark, in proportion
++ * to the share of their packets marked. COBALT's marks come only after a whole
++ * interval over target, and then at 1/sqrt(count): far too few for such a
++ * sender, which holds a queue of several targets. CAKE gives each flow its own
++ * queue, so its ECT(1) packets can be marked by their own wait at once, with no
++ * effect on any other flow: never up to l4s_ramp percent of the target, always
++ * from twice that, by a linear ramp between them. It leaves COBALT's state alone.
++ *
++ * It starts at the target and not at the millisecond or so usual for L4S, as
++ * packets reach a router in bursts (a Wi-Fi client's aggregates, a sender's
++ * window) and the end of a burst waits some milliseconds however empty the
++ * queue was: a shallower ramp marks those, and the sender slows down with no
++ * queue to show for it.
++ *
++ * Part of a packet's wait isn't a queue its sender can do anything about: the
++ * ramp starts no lower than twice the time the packet itself takes at its
++ * flow's fair share of the rate (its size at the rate, times the bulk flows),
++ * and a flow's last packet isn't marked. Otherwise a slow link, a GSO batch or
++ * many flows would mark every packet, however little the flow sent.
++ *
++ * A sender that ignores even this is dropped by COBALT once its queue is
++ * twice the ramp's end for a full-size packet (see ecn_fail_count). 0: no ramp
++ * and no such drops: COBALT only marks ECT(1), as upstream.
++ */
++#define CAKE_L4S_RAMP	100
++static unsigned int l4s_ramp __read_mostly = CAKE_L4S_RAMP;
++module_param(l4s_ramp, uint, 0644);
++MODULE_PARM_DESC(l4s_ramp, "Where marking ECT(1) packets CE starts, in percent of CAKE's target (0: no L4S ramp)");
++
++/* where the ramp starts for a packet that takes @own at its flow's share */
++static u64 cake_l4s_start(u64 target, u32 ramp, u64 own)
++{
++	return max_t(u64, div_u64(target * ramp, 100), 2 * own);
++}
++
++static u8 cobalt_ecn(struct sk_buff *skb)
++{
++	switch (skb_protocol(skb, true)) {
++	case cpu_to_be16(ETH_P_IP):
++		if (skb_network_header(skb) + sizeof(struct iphdr) <= skb_tail_pointer(skb))
++			return ipv4_get_dsfield(ip_hdr(skb)) & INET_ECN_MASK;
++		break;
++	case cpu_to_be16(ETH_P_IPV6):
++		if (skb_network_header(skb) + sizeof(struct ipv6hdr) <= skb_tail_pointer(skb))
++			return ipv6_get_dsfield(ipv6_hdr(skb)) & INET_ECN_MASK;
++		break;
++	}
++	return INET_ECN_NOT_ECT;
++}
++
++/* count and its 1/sqrt, set outright rather than stepped to */
++static void cobalt_set_count(struct cobalt_vars *vars, u32 count)
++{
++	vars->count = count;
++	if (count < REC_INV_SQRT_CACHE) {
++		vars->rec_inv_sqrt = inv_sqrt_cache[count];
++		return;
++	}
++	vars->rec_inv_sqrt = div64_u64(1ULL << 32, int_sqrt(count) + 1);
++	cobalt_newton_step(vars);
++	cobalt_newton_step(vars);
++}
++
++/* the flow is marked again once its count has decayed to 0 */
++static void cobalt_ecn_reset(struct cobalt_vars *vars)
++{
++	vars->ecn_strikes = 0;
++	vars->ecn_ignored = false;
++}
++
+ /* CoDel control_law is t + interval/sqrt(count)
+  * We maintain in rec_inv_sqrt the reciprocal value of sqrt(count) to avoid
+  * both sqrt() and divide operation.
+@@ -439,6 +635,68 @@ static ktime_t cobalt_control(ktime_t t,
+ 						rec_inv_sqrt));
+ }
+ 
++/* The time COBALT's count takes to step down from @from to @to (0 < @to <
++ * @from) as cobalt_should_drop() steps it, interval / sqrt(c) for each c
++ * from @from - 1 down to @to: 2 * interval * (sqrt(from) - sqrt(to)), plus
++ * half a step at @to's end and less half a step at @from's. The Newton
++ * step's rounding makes a step at c longer by about c / 2^34 of itself,
++ * reciprocal_scale()'s rounding about half a nanosecond shorter. @r_from
++ * and @r_to are the square roots * 65536.
++ */
++static u64 cobalt_decay_time(u64 interval, u32 from, u32 to, u64 r_from, u64 r_to)
++{
++	u64 t = mul_u64_u64_div_u64(interval, 2 * (r_from - r_to), 1 << 16);
++
++	t += div64_u64(interval << 15, r_to) - div64_u64(interval << 15, r_from);
++	t += mul_u64_u64_div_u64(interval, (u64)from * r_from - (u64)to * r_to,
++				 3ULL << 49);
++	return t - min_t(u64, t, (from - to) / 2);
++}
++
++/* COBALT's count steps down once for each interval / sqrt(count) a flow
++ * was away (cobalt_should_drop()): one back after a long pause with a large
++ * count would take as many steps in one dequeue as it has counts to lose,
++ * however many that is. Past a few dozen, the count jumps instead to where
++ * the steps would take it in @elapsed (now - drop_next), by the time they
++ * take (cobalt_decay_time()), two steps short and with a quarter of a step
++ * to spare so as never to go further, and the steps go on from there: at
++ * most about 66 of them. A pause longer than the whole decay jumps to 66.
++ *
++ * Where the steps get to is found by halving: the lowest count from 64 up
++ * whose steps down from @count fit in @elapsed. However large the count, it
++ * takes at most 32 halvings, and the count it finds always fits. Worked out
++ * with Newton's method from 2 * interval * (sqrt(count) - sqrt(to)), as it
++ * was, it stopped short of its target from a count of about 15 million on,
++ * past which the steps' rounding takes longer than that leaves out: it
++ * either went on short of it, millions of steps on, or never jumped and left
++ * them all. @interval as cobalt_control() takes it.
++ */
++static void cobalt_decay_jump(struct cobalt_vars *vars, u32 interval, u64 elapsed)
++{
++	u64 count = vars->count, lo = 64, hi = count, mid, to, r_from, r_to;
++
++	if (!interval || count <= 66)
++		return;
++	r_from = int_sqrt64(count << 32);
++	/* the lowest in [64, count) that fits; @count if none does */
++	while (lo < hi) {
++		mid = lo + (hi - lo) / 2;
++		if (cobalt_decay_time(interval, count, mid, r_from,
++				      int_sqrt64(mid << 32)) <= elapsed)
++			hi = mid;
++		else
++			lo = mid + 1;
++	}
++	to = lo + 2;
++	if (to >= count)
++		return;
++	r_to = int_sqrt64(to << 32);
++	vars->drop_next = ktime_add_ns(vars->drop_next,
++				       cobalt_decay_time(interval, count, to, r_from, r_to) +
++				       div64_u64((u64)interval << 14, r_to));
++	cobalt_set_count(vars, to);
++}
++
+ /* Call this when a packet had to be dropped due to queue overflow.  Returns
+  * true if the BLUE state was quiescent before but active after this call.
+  */
+@@ -490,6 +748,8 @@ static bool cobalt_queue_empty(struct cobalt_vars *vars,
+ 						 p->interval,
+ 						 vars->rec_inv_sqrt);
+ 	}
++	if (!vars->count)
++		cobalt_ecn_reset(vars);
+ 
+ 	return down;
+ }
+@@ -501,7 +761,8 @@ static bool cobalt_should_drop(struct cobalt_vars *vars,
+ 			       struct cobalt_params *p,
+ 			       ktime_t now,
+ 			       struct sk_buff *skb,
+-			       u32 bulk_flows)
++			       u32 bulk_flows,
++			       u32 all_bulk_flows)
+ {
+ 	bool next_due, over_target, drop = false;
+ 	ktime_t schedule;
+@@ -545,8 +806,40 @@ static bool cobalt_should_drop(struct cobalt_vars *vars,
+ 	}
+ 
+ 	if (next_due && vars->dropping) {
+-		/* Use ECN mark if possible, otherwise drop */
+-		drop = !(vars->ecn_marked = INET_ECN_set_ce(skb));
++		u32 fail = READ_ONCE(ecn_fail_count);
++		u32 ramp = READ_ONCE(l4s_ramp);
++		u8 ecn = fail ? cobalt_ecn(skb) : INET_ECN_NOT_ECT;
++		u64 ignored = 2 * p->target;
++		bool ect = ecn == INET_ECN_ECT_0;
++
++		/* at the rate the ramp works from (cake_l4s_mark()): on
++		 * cake_mq, the share's
++		 */
++		if (ecn == INET_ECN_ECT_1 && ramp) {
++			ect = true;
++			ignored = 4 * cake_l4s_start(p->target, ramp, p->share_mtu_time *
++						     max_t(u32, all_bulk_flows, 1));
++		}
++
++		if (ect && !vars->ecn_ignored) {
++			if (vars->count >= fail && sojourn > ignored) {
++				if (++vars->ecn_strikes >= COBALT_ECN_STRIKES) {
++					vars->ecn_ignored = true;
++					cobalt_set_count(vars, fail);
++				}
++			} else {
++				vars->ecn_strikes = 0;
++			}
++		}
++
++		if (vars->ecn_ignored && (ect || ecn == INET_ECN_CE)) {
++			/* the flow ignores marks: drop, as without ECN */
++			vars->ecn_marked = false;
++			drop = true;
++		} else {
++			/* Use ECN mark if possible, otherwise drop */
++			drop = !(vars->ecn_marked = INET_ECN_set_ce(skb));
++		}
+ 
+ 		vars->count++;
+ 		if (!vars->count)
+@@ -557,6 +850,13 @@ static bool cobalt_should_drop(struct cobalt_vars *vars,
+ 						 vars->rec_inv_sqrt);
+ 		schedule = ktime_sub(now, vars->drop_next);
+ 	} else {
++		if (next_due && vars->count > 64 &&
++		    ktime_to_ns(schedule) > 32ULL * reciprocal_scale(p->interval,
++								     vars->rec_inv_sqrt)) {
++			cobalt_decay_jump(vars, p->interval, ktime_to_ns(schedule));
++			schedule = ktime_sub(now, vars->drop_next);
++			next_due = vars->count && ktime_to_ns(schedule) >= 0;
++		}
+ 		while (next_due) {
+ 			vars->count--;
+ 			cobalt_invsqrt(vars);
+@@ -566,6 +866,8 @@ static bool cobalt_should_drop(struct cobalt_vars *vars,
+ 			schedule = ktime_sub(now, vars->drop_next);
+ 			next_due = vars->count && ktime_to_ns(schedule) >= 0;
+ 		}
++		if (!vars->count)
++			cobalt_ecn_reset(vars);
+ 	}
+ 
+ 	/* Simple BLUE implementation.  Lack of ECN is deliberate. */
+@@ -640,102 +942,298 @@ static bool cake_ddst(int flow_mode)
+ 	return (flow_mode & CAKE_FLOW_DUAL_DST) == CAKE_FLOW_DUAL_DST;
+ }
+ 
++/* cake_mq's sub-cakes each count their own hosts' bulk flows, as plain cake
++ * does, but a host's flows can be spread over several of them: its share
++ * has to come from all of them. Each local count is mirrored, change for
++ * change, in the cake_mq's table for its tin, at the bucket of its host
++ * tag; the bucket holds every sub-cake's flows of that host. Hosts whose
++ * tags meet in a bucket are counted together, sharing one host's share
++ * while both have bulk flows. Atomic: the sub-cakes don't share a lock.
++ */
++static atomic_t *cake_mq_host_bucket(atomic_t *load, u32 tag)
++{
++	return &load[tag % CAKE_QUEUES];
++}
++
++/* A host slot taken over by another host's tag with flows still counted:
++ * they move to the new tag's bucket, as they did locally.
++ */
++static void cake_mq_host_retag(atomic_t *load, u32 old_tag, u32 new_tag,
++			       u16 count)
++{
++	if (!load || !count || old_tag == new_tag)
++		return;
++	atomic_sub(count, cake_mq_host_bucket(load, old_tag));
++	atomic_add(count, cake_mq_host_bucket(load, new_tag));
++}
++
++/* In the host-only modes (srchost, dsthost, hosts) each queue is a host's,
++ * or a pair's, and its tag is the host's: a host spread over sub-cakes has
++ * a queue in each. The source table then counts each tag's bulk queues
++ * over all of them, so they share one host's share.
++ */
++static bool cake_mq_host_queues(const struct cake_tin_data *q, int flow_mode)
++{
++	return q->mq_srcload && !(flow_mode & CAKE_FLOW_FLOWS) &&
++	       (flow_mode & CAKE_FLOW_HOSTS);
++}
++
++static atomic_t *cake_mq_queue_bucket(struct cake_tin_data *q,
++				      struct cake_flow *flow)
++{
++	return cake_mq_host_bucket(q->mq_srcload, q->tags[flow - q->flows]);
++}
++
+ static void cake_dec_srchost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
+-	if (likely(cake_dsrc(flow_mode) &&
+-		   q->hosts[flow->srchost].srchost_bulk_flow_count))
+-		q->hosts[flow->srchost].srchost_bulk_flow_count--;
++	struct cake_host *h = &q->hosts[flow->srchost];
++
++	if (flow->mq_host_cnt & CAKE_MQ_CNT_SRC) {
++		flow->mq_host_cnt &= ~CAKE_MQ_CNT_SRC;
++		if (likely(h->srchost_bulk_flow_count)) {
++			h->srchost_bulk_flow_count--;
++			if (q->mq_srcload)
++				atomic_dec(cake_mq_host_bucket(q->mq_srcload,
++							       h->srchost_tag));
++		}
++	} else if (flow->mq_host_cnt & CAKE_MQ_CNT_HOST) {
++		flow->mq_host_cnt &= ~CAKE_MQ_CNT_HOST;
++		if (q->mq_srcload)
++			atomic_dec(cake_mq_queue_bucket(q, flow));
++	}
+ }
+ 
+ static void cake_inc_srchost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
++	struct cake_host *h = &q->hosts[flow->srchost];
++
+ 	if (likely(cake_dsrc(flow_mode) &&
+-		   q->hosts[flow->srchost].srchost_bulk_flow_count < CAKE_QUEUES))
+-		q->hosts[flow->srchost].srchost_bulk_flow_count++;
++		   h->srchost_bulk_flow_count < CAKE_QUEUES)) {
++		h->srchost_bulk_flow_count++;
++		flow->mq_host_cnt |= CAKE_MQ_CNT_SRC;
++		if (q->mq_srcload)
++			atomic_inc(cake_mq_host_bucket(q->mq_srcload,
++						       h->srchost_tag));
++	} else if (cake_mq_host_queues(q, flow_mode)) {
++		flow->mq_host_cnt |= CAKE_MQ_CNT_HOST;
++		atomic_inc(cake_mq_queue_bucket(q, flow));
++	}
+ }
+ 
+ static void cake_dec_dsthost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
+-	if (likely(cake_ddst(flow_mode) &&
+-		   q->hosts[flow->dsthost].dsthost_bulk_flow_count))
+-		q->hosts[flow->dsthost].dsthost_bulk_flow_count--;
++	struct cake_host *h = &q->hosts[flow->dsthost];
++
++	if (flow->mq_host_cnt & CAKE_MQ_CNT_DST) {
++		flow->mq_host_cnt &= ~CAKE_MQ_CNT_DST;
++		if (likely(h->dsthost_bulk_flow_count)) {
++			h->dsthost_bulk_flow_count--;
++			if (q->mq_dstload)
++				atomic_dec(cake_mq_host_bucket(q->mq_dstload,
++							       h->dsthost_tag));
++		}
++	}
+ }
+ 
+ static void cake_inc_dsthost_bulk_flow_count(struct cake_tin_data *q,
+ 					     struct cake_flow *flow,
+ 					     int flow_mode)
+ {
++	struct cake_host *h = &q->hosts[flow->dsthost];
++
+ 	if (likely(cake_ddst(flow_mode) &&
+-		   q->hosts[flow->dsthost].dsthost_bulk_flow_count < CAKE_QUEUES))
+-		q->hosts[flow->dsthost].dsthost_bulk_flow_count++;
++		   h->dsthost_bulk_flow_count < CAKE_QUEUES)) {
++		h->dsthost_bulk_flow_count++;
++		flow->mq_host_cnt |= CAKE_MQ_CNT_DST;
++		if (q->mq_dstload)
++			atomic_inc(cake_mq_host_bucket(q->mq_dstload,
++						       h->dsthost_tag));
++	}
+ }
+ 
+-static u16 cake_get_flow_quantum(struct cake_tin_data *q,
+-				 struct cake_flow *flow,
+-				 int flow_mode)
++/* A host's bulk flows: in this CAKE, or with cake_mq in all its sub-cakes */
++static u16 cake_host_count(atomic_t *load, u32 tag, u16 local)
++{
++	if (!load)
++		return local;
++	return clamp(atomic_read(cake_mq_host_bucket(load, tag)), 1, CAKE_QUEUES);
++}
++
++/* The number of bulk flows a flow's quantum is shared out between: its
++ * source host's, its destination host's, or the larger, by flow mode
++ */
++static u16 cake_host_load(struct cake_tin_data *q, struct cake_flow *flow,
++			  int flow_mode)
+ {
+ 	u16 host_load = 1;
+ 
+-	if (cake_dsrc(flow_mode))
++	if (cake_mq_host_queues(q, flow_mode))
++		return cake_host_count(q->mq_srcload, q->tags[flow - q->flows], 1);
++
++	if (cake_dsrc(flow_mode)) {
++		struct cake_host *h = &q->hosts[flow->srchost];
++
+ 		host_load = max(host_load,
+-				q->hosts[flow->srchost].srchost_bulk_flow_count);
++				cake_host_count(q->mq_srcload, h->srchost_tag,
++						h->srchost_bulk_flow_count));
++	}
++
++	if (cake_ddst(flow_mode)) {
++		struct cake_host *h = &q->hosts[flow->dsthost];
+ 
+-	if (cake_ddst(flow_mode))
+ 		host_load = max(host_load,
+-				q->hosts[flow->dsthost].dsthost_bulk_flow_count);
++				cake_host_count(q->mq_dstload, h->dsthost_tag,
++						h->dsthost_bulk_flow_count));
++	}
++	return host_load;
++}
+ 
+-	/* The get_random_u16() is a way to apply dithering to avoid
+-	 * accumulating roundoff errors
+-	 */
+-	return (q->flow_quantum * quantum_div[host_load] +
+-		get_random_u16()) >> 16;
++/* A flow's part of @quantum, shared out between its host's @host_load bulk
++ * flows, as deficit (CAKE_DEFICIT_SHIFT). The fraction is kept, where whole
++ * bytes needed dithering to share out right.
++ */
++static u32 cake_host_share(u32 quantum, u16 host_load)
++{
++	/* quantum_div[1] stands for 65536, which doesn't fit in a u16 */
++	if (host_load <= 1)
++		return quantum << CAKE_DEFICIT_SHIFT;
++	return (quantum * quantum_div[host_load]) >> (16 - CAKE_DEFICIT_SHIFT);
+ }
+ 
+-static u32 cake_hash(struct cake_tin_data *q, const struct sk_buff *skb,
+-		     int flow_mode, u16 flow_override, u16 host_override)
++/* What a packet of @len costs its flow's deficit. A GSO packet of over
++ * 128 KB (BIG TCP's) costs 128 KB: the deficit has room for that.
++ */
++static s32 cake_deficit_charge(u32 len)
+ {
+-	bool hash_flows = (!flow_override && !!(flow_mode & CAKE_FLOW_FLOWS));
+-	bool hash_hosts = (!host_override && !!(flow_mode & CAKE_FLOW_HOSTS));
+-	bool nat_enabled = !!(flow_mode & CAKE_FLOW_NAT_FLAG);
+-	u32 flow_hash = 0, srchost_hash = 0, dsthost_hash = 0;
+-	u16 reduced_hash, srchost_idx, dsthost_idx;
+-	struct flow_keys keys, host_keys;
+-	bool use_skbhash = skb->l4_hash;
++	return min_t(u32, len, S32_MAX >> (CAKE_DEFICIT_SHIFT + 1)) << CAKE_DEFICIT_SHIFT;
++}
+ 
+-	if (unlikely(flow_mode == CAKE_FLOW_NONE))
+-		return 0;
++static u32 cake_get_flow_quantum(struct cake_tin_data *q,
++				 struct cake_flow *flow,
++				 int flow_mode)
++{
++	return cake_host_share(q->flow_quantum,
++			       cake_host_load(q, flow, flow_mode));
++}
+ 
+-	/* If both overrides are set, or we can use the SKB hash and nat mode is
+-	 * disabled, we can skip packet dissection entirely. If nat mode is
+-	 * enabled there's another check below after doing the conntrack lookup.
+-	 */
+-	if ((!hash_flows || (use_skbhash && !nat_enabled)) && !hash_hosts)
+-		goto skip_hash;
++/* cake_mq: what a flow in the bulk rotation adds to its sub-cake's bid for
++ * the rate. It's the flow's part of a DRR pass, 65535 / its host load, so
++ * the sub-cakes' weights compare as plain cake shares the rate out: per
++ * flow, and with host isolation per host, whichever sub-cakes the flows
++ * are in. Set each time the flow's deficit is refilled (cake_bulk_park()),
++ * cleared when it leaves the rotation.
++ */
++static void cake_mq_set_weight(struct cake_tin_data *b, struct cake_flow *flow,
++			       u16 weight)
++{
++	b->mq_weight += weight;
++	b->mq_weight -= flow->mq_weight;
++	flow->mq_weight = weight;
++}
+ 
+-	skb_flow_dissect_flow_keys(skb, &keys,
+-				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
++/* The bulk rotation. A flow out of deficit used to go to the tail of one
++ * list, to get its host's share of the bulk quantum back each time it came
++ * round again, until its deficit was positive: a packet of length L from a
++ * host with n bulk flows took about n * L / quantum visits, each reading
++ * the host loads and moving the flow, all within one dequeue. Instead the
++ * rotation is a wheel of slots, one for each pass to come: a flow out of
++ * deficit gets at once the shares of the passes it needs, up to
++ * CAKE_WHEEL_SLOTS - 1, and waits in the slot of the pass it would next
++ * have sent in. The flows of a pass are served in the order they joined
++ * it, as on the list; a flow keeps its place at the head of its slot while
++ * it has deficit left. The host load is read once, when the flow is put in
++ * its slot, so a change in it reaches the flow up to that many passes late.
++ */
++static void cake_init_flowchains(struct cake_tin_data *b)
++{
++	int i;
+ 
+-	/* Don't use the SKB hash if we change the lookup keys from conntrack */
+-	if (nat_enabled && cake_update_flowkeys(&keys, skb))
+-		use_skbhash = false;
++	INIT_LIST_HEAD(&b->new_flows);
++	INIT_LIST_HEAD(&b->decaying_flows);
++	INIT_LIST_HEAD(&b->resting_flows);
++	for (i = 0; i < CAKE_WHEEL_SLOTS; i++)
++		INIT_LIST_HEAD(&b->old_wheel[i]);
++	b->wheel_mask = 0;
++	b->cur_slot = 0;
++}
+ 
+-	/* If we can still use the SKB hash and don't need the host hash, we can
+-	 * skip the rest of the hashing procedure
+-	 */
+-	if (use_skbhash && !hash_hosts)
+-		goto skip_hash;
++/* @flow into the slot @skip passes on from the one being served */
++static void cake_bulk_queue(struct cake_tin_data *b, struct cake_flow *flow,
++			    u32 skip)
++{
++	u8 slot = (b->cur_slot + skip) % CAKE_WHEEL_SLOTS;
++
++	list_move_tail(&flow->flowchain, &b->old_wheel[slot]);
++	b->wheel_mask |= BIT(slot);
++}
++
++/* @flow, out of deficit, into the bulk rotation */
++static void cake_bulk_park(struct cake_sched_data *q, struct cake_tin_data *b,
++			   struct cake_flow *flow)
++{
++	u16 load = cake_host_load(b, flow, READ_ONCE(q->config->flow_mode));
++	u32 refill = cake_host_share(b->bulk_quantum, load) ?: 1;
++	u32 skip = min_t(u32, (u32)-flow->deficit / refill + 1,
++			 CAKE_WHEEL_SLOTS - 1);
++
++	flow->deficit += (s32)(skip * refill);
++	if (q->config->is_shared && flow->set == CAKE_SET_BULK)
++		cake_mq_set_weight(b, flow, quantum_div[load]);
++	cake_bulk_queue(b, flow, skip);
++}
++
++/* The flow the bulk rotation serves next: the head of the slot being
++ * served, or once that's empty, of the next slot with flows, whose pass
++ * then begins. NULL if there's none. A slot's bit is cleared when it's
++ * found empty.
++ */
++static struct cake_flow *cake_bulk_head(struct cake_tin_data *b)
++{
++	struct list_head *head = &b->old_wheel[b->cur_slot];
++
++	while (list_empty(head)) {
++		u32 mask = b->wheel_mask & ~BIT(b->cur_slot);
++
++		b->wheel_mask = mask;
++		if (!mask)
++			return NULL;
++		b->cur_slot = (b->cur_slot + __ffs(ror32(mask, b->cur_slot))) %
++			      CAKE_WHEEL_SLOTS;
++		head = &b->old_wheel[b->cur_slot];
++	}
++	return list_first_entry(head, struct cake_flow, flowchain);
++}
++
++/* Whether any flow is left in the bulk rotation: its lists, as the mask may
++ * still have the bits of slots emptied since
++ */
++static bool cake_bulk_any(const struct cake_tin_data *b)
++{
++	unsigned long mask = b->wheel_mask;
++	unsigned int slot;
++
++	for_each_set_bit(slot, &mask, CAKE_WHEEL_SLOTS)
++		if (!list_empty(&b->old_wheel[slot]))
++			return true;
++	return false;
++}
++
++static void cake_keys_host_hashes(const struct flow_keys *keys,
++				  u32 *srchost_hash, u32 *dsthost_hash)
++{
++	struct flow_keys host_keys;
+ 
+ 	/* flow_hash_from_keys() sorts the addresses by value, so we have
+ 	 * to preserve their order in a separate data structure to treat
+ 	 * src and dst host addresses as independently selectable.
+ 	 */
+-	host_keys = keys;
++	host_keys = *keys;
+ 	host_keys.ports.ports     = 0;
+ 	host_keys.basic.ip_proto  = 0;
+ 	host_keys.keyid.keyid     = 0;
+@@ -744,31 +1242,90 @@ static u32 cake_hash(struct cake_tin_data *q, const struct sk_buff *skb,
+ 	switch (host_keys.control.addr_type) {
+ 	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
+ 		host_keys.addrs.v4addrs.src = 0;
+-		dsthost_hash = flow_hash_from_keys(&host_keys);
+-		host_keys.addrs.v4addrs.src = keys.addrs.v4addrs.src;
++		*dsthost_hash = flow_hash_from_keys(&host_keys);
++		host_keys.addrs.v4addrs.src = keys->addrs.v4addrs.src;
+ 		host_keys.addrs.v4addrs.dst = 0;
+-		srchost_hash = flow_hash_from_keys(&host_keys);
++		*srchost_hash = flow_hash_from_keys(&host_keys);
+ 		break;
+ 
+ 	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
+ 		memset(&host_keys.addrs.v6addrs.src, 0,
+ 		       sizeof(host_keys.addrs.v6addrs.src));
+-		dsthost_hash = flow_hash_from_keys(&host_keys);
+-		host_keys.addrs.v6addrs.src = keys.addrs.v6addrs.src;
++		*dsthost_hash = flow_hash_from_keys(&host_keys);
++		host_keys.addrs.v6addrs.src = keys->addrs.v6addrs.src;
+ 		memset(&host_keys.addrs.v6addrs.dst, 0,
+ 		       sizeof(host_keys.addrs.v6addrs.dst));
+-		srchost_hash = flow_hash_from_keys(&host_keys);
++		*srchost_hash = flow_hash_from_keys(&host_keys);
+ 		break;
+ 
+ 	default:
+-		dsthost_hash = 0;
+-		srchost_hash = 0;
++		*dsthost_hash = 0;
++		*srchost_hash = 0;
+ 	}
++}
++
++/* The host hashes from the packet itself, for a flow queue being allocated:
++ * the same keys cake_hash() would have dissected (and looked up in conntrack).
++ */
++static void cake_host_hashes(const struct sk_buff *skb, int flow_mode,
++			     u32 *srchost_hash, u32 *dsthost_hash)
++{
++	struct flow_keys keys;
++
++	skb_flow_dissect_flow_keys(skb, &keys,
++				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
++	if (flow_mode & CAKE_FLOW_NAT_FLAG)
++		cake_update_flowkeys(&keys, skb);
++
++	cake_keys_host_hashes(&keys, srchost_hash, dsthost_hash);
++}
++
++static u32 cake_hash(struct cake_tin_data *q, const struct sk_buff *skb,
++		     int flow_mode, u16 flow_override, u16 host_override)
++{
++	bool hash_flows = (!flow_override && !!(flow_mode & CAKE_FLOW_FLOWS));
++	bool hash_hosts = (!host_override && !!(flow_mode & CAKE_FLOW_HOSTS));
++	bool nat_enabled = !!(flow_mode & CAKE_FLOW_NAT_FLAG);
++	u32 flow_hash = 0, srchost_hash = 0, dsthost_hash = 0;
++	u16 reduced_hash, srchost_idx, dsthost_idx;
++	bool use_skbhash = skb->l4_hash;
++	struct flow_keys keys;
++	/* With per-flow queues the queue is found by the flow hash alone: the
++	 * host hashes (two more SipHash runs) are only needed when a queue is
++	 * allocated to a flow, so they wait until then. Host-only modes build
++	 * the flow hash from them, so need them now.
++	 */
++	bool hosts_now = hash_hosts && !(flow_mode & CAKE_FLOW_FLOWS);
++	bool hosts_later = hash_hosts && (flow_mode & CAKE_FLOW_FLOWS);
++
++	if (unlikely(flow_mode == CAKE_FLOW_NONE))
++		return 0;
++
++	/* If both overrides are set, or we can use the SKB hash, we can skip
++	 * packet dissection entirely. With nat too: the packets of a
++	 * connection before and after NAT are one to one, so its L4 hash tells
++	 * its packets from other connections' as well as the tuple from before
++	 * NAT would, without a dissection and a conntrack lookup for each. The
++	 * host hashes, which do need the addresses from before NAT, are worked
++	 * out when a queue is allocated (cake_host_hashes()).
++	 */
++	if ((!hash_flows || use_skbhash) && !hosts_now)
++		goto skip_hash;
++
++	skb_flow_dissect_flow_keys(skb, &keys,
++				   FLOW_DISSECTOR_F_STOP_AT_FLOW_LABEL);
++
++	if (nat_enabled)
++		cake_update_flowkeys(&keys, skb);
++
++	if (hosts_now)
++		cake_keys_host_hashes(&keys, &srchost_hash, &dsthost_hash);
+ 
+-	/* This *must* be after the above switch, since as a
+-	 * side-effect it sorts the src and dst addresses.
++	/* This *must* be after cake_keys_host_hashes(), since as a
++	 * side-effect it sorts the src and dst addresses. Only per-flow
++	 * modes hash flows, so hosts_now is false here.
+ 	 */
+-	if (hash_flows && !use_skbhash)
++	if (hash_flows)
+ 		flow_hash = flow_hash_from_keys(&keys);
+ 
+ skip_hash:
+@@ -845,12 +1402,21 @@ skip_hash:
+ 		if (q->flows[outer_hash + k].set == CAKE_SET_BULK) {
+ 			cake_dec_srchost_bulk_flow_count(q, &q->flows[outer_hash + k], flow_mode);
+ 			cake_dec_dsthost_bulk_flow_count(q, &q->flows[outer_hash + k], flow_mode);
++			/* a host-only queue's count goes with its tag */
++			if (cake_mq_host_queues(q, flow_mode)) {
++				q->tags[outer_hash + k] = flow_hash;
++				cake_inc_srchost_bulk_flow_count(q, &q->flows[outer_hash + k], flow_mode);
++			}
+ 		}
+ found:
+ 		/* reserve queue for future packets in same flow */
+ 		reduced_hash = outer_hash + k;
+ 		q->tags[reduced_hash] = flow_hash;
+ 
++		if (hosts_later && (allocate_src || allocate_dst))
++			cake_host_hashes(skb, flow_mode, &srchost_hash,
++					 &dsthost_hash);
++
+ 		if (allocate_src) {
+ 			srchost_idx = srchost_hash % CAKE_QUEUES;
+ 			inner_hash = srchost_idx % CAKE_SET_WAYS;
+@@ -866,6 +1432,10 @@ found:
+ 				if (!q->hosts[outer_hash + k].srchost_bulk_flow_count)
+ 					break;
+ 			}
++			cake_mq_host_retag(q->mq_srcload,
++					   q->hosts[outer_hash + k].srchost_tag,
++					   srchost_hash,
++					   q->hosts[outer_hash + k].srchost_bulk_flow_count);
+ 			q->hosts[outer_hash + k].srchost_tag = srchost_hash;
+ found_src:
+ 			srchost_idx = outer_hash + k;
+@@ -890,6 +1460,10 @@ found_src:
+ 				if (!q->hosts[outer_hash + k].dsthost_bulk_flow_count)
+ 					break;
+ 			}
++			cake_mq_host_retag(q->mq_dstload,
++					   q->hosts[outer_hash + k].dsthost_tag,
++					   dsthost_hash,
++					   q->hosts[outer_hash + k].dsthost_bulk_flow_count);
+ 			q->hosts[outer_hash + k].dsthost_tag = dsthost_hash;
+ found_dst:
+ 			dsthost_idx = outer_hash + k;
+@@ -913,12 +1487,14 @@ static struct sk_buff *dequeue_head(struct cake_flow *flow)
+ 	if (skb) {
+ 		flow->head = skb->next;
+ 		skb_mark_not_on_list(skb);
++		if (get_cobalt_cb(skb)->pure_ack)
++			flow->pure_acks--;
+ 	}
+ 
+ 	return skb;
+ }
+ 
+-/* add skb to flow queue (tail add) */
++/* add skb to flow queue (tail add); the ACK filter counts it if it's a pure ACK */
+ 
+ static void flow_queue_add(struct cake_flow *flow, struct sk_buff *skb)
+ {
+@@ -928,6 +1504,7 @@ static void flow_queue_add(struct cake_flow *flow, struct sk_buff *skb)
+ 		flow->tail->next = skb;
+ 	flow->tail = skb;
+ 	skb->next = NULL;
++	get_cobalt_cb(skb)->pure_ack = false;
+ }
+ 
+ static struct iphdr *cake_get_iphdr(const struct sk_buff *skb,
+@@ -1205,17 +1782,23 @@ static bool cake_tcph_may_drop(const struct tcphdr *tcph,
+ 	return true;
+ }
+ 
+-static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
+-				       struct cake_flow *flow)
++/* @iph and @tcph: the headers of the packet at @flow's tail, the one that
++ * may make an ACK queued ahead of it redundant (cake_get_iphdr() and
++ * cake_get_tcphdr(), read once by cake_ack_filter())
++ */
++static struct sk_buff *__cake_ack_filter(struct cake_sched_data *q,
++					 struct cake_flow *flow,
++					 const struct iphdr *iph,
++					 const struct tcphdr *tcph)
+ {
+-	bool aggressive = q->config->ack_filter == CAKE_ACK_AGGRESSIVE;
++	bool aggressive = READ_ONCE(q->config->ack_filter) == CAKE_ACK_AGGRESSIVE;
+ 	struct sk_buff *elig_ack = NULL, *elig_ack_prev = NULL;
+ 	struct sk_buff *skb_check, *skb_prev = NULL;
+ 	const struct ipv6hdr *ipv6h, *ipv6h_check;
+-	unsigned char _tcph[64], _tcph_check[64];
+-	const struct tcphdr *tcph, *tcph_check;
+-	const struct iphdr *iph, *iph_check;
+-	struct ipv6hdr _iph, _iph_check;
++	const struct tcphdr *tcph_check;
++	const struct iphdr *iph_check;
++	unsigned char _tcph_check[64];
++	struct ipv6hdr _iph_check;
+ 	const struct sk_buff *skb;
+ 	int seglen, num_found = 0;
+ 	u32 tstamp = 0, tsecr = 0;
+@@ -1227,10 +1810,6 @@ static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
+ 		return NULL;
+ 
+ 	skb = flow->tail;
+-	tcph = cake_get_tcphdr(skb, _tcph, sizeof(_tcph));
+-	iph = cake_get_iphdr(skb, &_iph);
+-	if (!tcph)
+-		return NULL;
+ 
+ 	cake_tcph_get_tstamp(tcph, &tstamp, &tsecr);
+ 
+@@ -1249,6 +1828,13 @@ static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
+ 	for (skb_check = flow->head;
+ 	     skb_check && skb_check != skb;
+ 	     skb_prev = skb_check, skb_check = skb_check->next) {
++		/* Until we have a candidate ACK whose ECE/CWR could be
++		 * invalidated by a later data packet, non-pure-ACK packets
++		 * cannot be dropped and need no header parse.
++		 */
++		if (!elig_ack && !get_cobalt_cb(skb_check)->pure_ack)
++			continue;
++
+ 		iph_check = cake_get_iphdr(skb_check, &_iph_check);
+ 		tcph_check = cake_get_tcphdr(skb_check, &_tcph_check,
+ 					     sizeof(_tcph_check));
+@@ -1356,10 +1942,77 @@ found:
+ 		flow->head = elig_ack->next;
+ 
+ 	skb_mark_not_on_list(elig_ack);
++	if (get_cobalt_cb(elig_ack)->pure_ack)
++		flow->pure_acks--;
+ 
+ 	return elig_ack;
+ }
+ 
++/* A pure ACK, one a later ACK could make redundant: only the ACK flag
++ * (ECE and CWR aside) and no data, what __cake_ack_filter() asks of each
++ * packet it may drop before it compares it with the new one. @iph and @tcph
++ * are @skb's, from cake_get_iphdr() and cake_get_tcphdr().
++ */
++static bool cake_pure_ack(const struct sk_buff *skb, const struct iphdr *iph,
++			  const struct tcphdr *tcph)
++{
++	int seglen;
++
++	if ((tcp_flag_word(tcph) & cpu_to_be32(0x0F3F0000)) != TCP_FLAG_ACK)
++		return false;
++	if (iph->version == 4)
++		seglen = iph_totlen(skb, iph) - 4 * iph->ihl;
++	else
++		seglen = ipv6_payload_len(skb, (const struct ipv6hdr *)iph);
++	return seglen == __tcp_hdrlen(tcph);
++}
++
++/* Drop a queued ACK that the one just added at @flow's tail makes redundant.
++ * Upstream's filter reads the headers of every packet queued ahead of it,
++ * and any packet with the ACK flag starts that: all of an upload's data
++ * packets, each reading the whole of its flow's queue while that's longest.
++ * The flow counts its queued pure ACKs, the only packets the filter may
++ * drop, so that read happens only when there's one. It counts up to
++ * U8_MAX: an ACK queued beyond that may be passed over and kept, as one is
++ * that no later ACK makes redundant.
++ */
++static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
++				       struct cake_flow *flow)
++{
++	struct sk_buff *skb = flow->tail;
++	unsigned char _tcph[64];
++	const struct tcphdr *tcph;
++	const struct iphdr *iph;
++	struct ipv6hdr _iph;
++	u8 queued = flow->pure_acks;
++	u8 thresh = READ_ONCE(q->config->ack_filter) == CAKE_ACK_AGGRESSIVE ? 1 : 2;
++
++	/* Without enough queued pure ACKs to trigger a drop, a GSO packet or
++	 * one larger than the most headers cake_get_tcphdr() reads cannot be
++	 * a pure ACK and needs no header parse: 6in4's, IPv4 + IPv6 + TCP
++	 * (60 + 40 + 60 B).
++	 */
++	if (queued < thresh &&
++	    (skb_is_gso(skb) || skb->len - skb_network_offset(skb) > 160))
++		return NULL;
++
++	tcph = cake_get_tcphdr(skb, _tcph, sizeof(_tcph));
++	iph = cake_get_iphdr(skb, &_iph);
++	if (!tcph || !iph)
++		return NULL;
++
++	if (cake_pure_ack(skb, iph, tcph) && flow->pure_acks < U8_MAX) {
++		get_cobalt_cb(skb)->pure_ack = true;
++		flow->pure_acks++;
++	}
++	/* the conservative filter drops an ACK only once it has found two it
++	 * may drop, and they're pure ACKs: with fewer queued, there's none
++	 */
++	if (queued < thresh)
++		return NULL;
++	return __cake_ack_filter(q, flow, iph, tcph);
++}
++
+ static u64 cake_ewma(u64 avg, u64 sample, u32 shift)
+ {
+ 	avg -= avg >> shift;
+@@ -1370,8 +2023,9 @@ static u64 cake_ewma(u64 avg, u64 sample, u32 shift)
+ static u32 cake_calc_overhead(struct cake_sched_data *qd, u32 len, u32 off)
+ {
+ 	struct cake_sched_config *q = qd->config;
++	u8 atm_mode = READ_ONCE(q->atm_mode);
+ 
+-	if (q->rate_flags & CAKE_FLAG_OVERHEAD)
++	if (READ_ONCE(q->rate_flags) & CAKE_FLAG_OVERHEAD)
+ 		len -= off;
+ 
+ 	if (qd->max_netlen < len)
+@@ -1379,13 +2033,13 @@ static u32 cake_calc_overhead(struct cake_sched_data *qd, u32 len, u32 off)
+ 	if (qd->min_netlen > len)
+ 		qd->min_netlen = len;
+ 
+-	len = max((s32)len + q->rate_overhead, (s32)q->rate_mpu);
++	len = max((s32)len + READ_ONCE(q->rate_overhead), (s32)READ_ONCE(q->rate_mpu));
+ 
+-	if (q->atm_mode == CAKE_ATM_ATM) {
++	if (atm_mode == CAKE_ATM_ATM) {
+ 		len += 47;
+ 		len /= 48;
+ 		len *= 53;
+-	} else if (q->atm_mode == CAKE_ATM_PTM) {
++	} else if (atm_mode == CAKE_ATM_PTM) {
+ 		/* Add one byte per 64 bytes or part thereof.
+ 		 * This is conservative and easier to calculate than the
+ 		 * precise value.
+@@ -1415,7 +2069,10 @@ static u32 cake_overhead(struct cake_sched_data *q, const struct sk_buff *skb)
+ 		return cake_calc_overhead(q, len, off);
+ 
+ 	/* borrowed from qdisc_pkt_len_init() */
+-	hdr_len = skb_transport_offset(skb);
++	if (!skb->encapsulation)
++		hdr_len = skb_transport_offset(skb);
++	else
++		hdr_len = skb_inner_transport_offset(skb);
+ 
+ 	/* + transport layer */
+ 	if (likely(shinfo->gso_type & (SKB_GSO_TCPV4 |
+@@ -1444,6 +2101,9 @@ static u32 cake_overhead(struct cake_sched_data *q, const struct sk_buff *skb)
+ 	len = shinfo->gso_size + hdr_len;
+ 	last_len = skb->len - shinfo->gso_size * (segs - 1);
+ 
++	/* every segment the same size: one sum for all of them */
++	if (last_len == len)
++		return cake_calc_overhead(q, len, off) * segs;
+ 	return (cake_calc_overhead(q, len, off) * (segs - 1) +
+ 		cake_calc_overhead(q, last_len, off));
+ }
+@@ -1467,11 +2127,12 @@ static u32 cake_heap_get_backlog(const struct cake_sched_data *q, u16 i)
+ 	return q->tins[ii.t].backlogs[ii.b];
+ }
+ 
++/* Sift the queue at @i down the overflow heap, past every queue longer */
+ static void cake_heapify(struct cake_sched_data *q, u16 i)
+ {
+-	static const u32 a = CAKE_MAX_TINS * CAKE_QUEUES;
++	u32 a = q->overflow_heap_len;
+ 	u32 mb = cake_heap_get_backlog(q, i);
+-	u32 m = i;
++	u32 ib = mb, m = i;
+ 
+ 	while (m < a) {
+ 		u32 l = m + m + 1;
+@@ -1498,6 +2159,10 @@ static void cake_heapify(struct cake_sched_data *q, u16 i)
+ 		if (m != i) {
+ 			cake_heap_swap(q, i, m);
+ 			i = m;
++			/* its children are compared with it, not with the one
++			 * that went up in its place
++			 */
++			mb = ib;
+ 		} else {
+ 			break;
+ 		}
+@@ -1506,7 +2171,7 @@ static void cake_heapify(struct cake_sched_data *q, u16 i)
+ 
+ static void cake_heapify_up(struct cake_sched_data *q, u16 i)
+ {
+-	while (i > 0 && i < CAKE_MAX_TINS * CAKE_QUEUES) {
++	while (i > 0 && i < q->overflow_heap_len) {
+ 		u16 p = (i - 1) >> 1;
+ 		u32 ib = cake_heap_get_backlog(q, i);
+ 		u32 pb = cake_heap_get_backlog(q, p);
+@@ -1520,6 +2185,43 @@ static void cake_heapify_up(struct cake_sched_data *q, u16 i)
+ 	}
+ }
+ 
++/* Queue @i's place in the overflow heap after a packet came in: up, as it
++ * grew, or down when it got @shorter (the ACK filter dropped a longer ACK
++ * for the new one)
++ */
++static void cake_heap_moved(struct cake_sched_data *q, u16 i, bool shorter)
++{
++	if (shorter)
++		cake_heapify(q, i);
++	else
++		cake_heapify_up(q, i);
++}
++
++/* The overflow heap, built at the first drop of a spell over the queues of
++ * the tins in use, tin by tin; nothing is ever queued in the others.
++ * Besteffort, the default, uses one tin of eight. The heap is kept from
++ * then on while the spell lasts, as packets come and go.
++ */
++static void cake_heap_build_tins(struct cake_sched_data *q, u16 tin_cnt)
++{
++	u32 n = tin_cnt * CAKE_QUEUES, k;
++	int i;
++
++	for (k = 0; k < n; k++) {
++		q->overflow_heap[k].t = k / CAKE_QUEUES;
++		q->overflow_heap[k].b = k % CAKE_QUEUES;
++		q->tins[k / CAKE_QUEUES].overflow_idx[k % CAKE_QUEUES] = k;
++	}
++	q->overflow_heap_len = n;
++	for (i = n / 2 - 1; i >= 0; i--)
++		cake_heapify(q, i);
++}
++
++static void cake_heap_build(struct cake_sched_data *q)
++{
++	cake_heap_build_tins(q, q->tin_cnt);
++}
++
+ static int cake_advance_shaper(struct cake_sched_data *q,
+ 			       struct cake_tin_data *b,
+ 			       struct sk_buff *skb,
+@@ -1549,25 +2251,29 @@ static int cake_advance_shaper(struct cake_sched_data *q,
+ 			q->failsafe_next_packet = \
+ 				ktime_add_ns(q->failsafe_next_packet,
+ 					     failsafe_dur);
++		if (q->config->is_shared) {
++			q->mq_bytes += len;
++			q->mq_packets++;
++			q->mq_seen_tins |= BIT(b - q->tins);
++		}
+ 	}
+ 	return len;
+ }
+ 
+-static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
++static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free,
++			      ktime_t now)
+ {
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+-	ktime_t now = ktime_get();
+ 	u32 idx = 0, tin = 0, len;
+ 	struct cake_heap_entry qq;
+ 	struct cake_tin_data *b;
+ 	struct cake_flow *flow;
+ 	struct sk_buff *skb;
++	bool rebuilt = false;
+ 
+ 	if (!q->overflow_timeout) {
+-		int i;
+-		/* Build fresh max-heap */
+-		for (i = CAKE_MAX_TINS * CAKE_QUEUES / 2 - 1; i >= 0; i--)
+-			cake_heapify(q, i);
++		cake_heap_build(q);
++		rebuilt = true;
+ 	}
+ 	q->overflow_timeout = 65535;
+ 
+@@ -1580,9 +2286,20 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
+ 	flow = &b->flows[idx];
+ 	skb = dequeue_head(flow);
+ 	if (unlikely(!skb)) {
+-		/* heap has gone wrong, rebuild it next time */
+-		q->overflow_timeout = 0;
+-		return idx + (tin << 16);
++		if (rebuilt && q->overflow_heap_len < CAKE_MAX_TINS * CAKE_QUEUES) {
++			cake_heap_build_tins(q, CAKE_MAX_TINS);
++			qq  = q->overflow_heap[0];
++			tin = qq.t;
++			idx = qq.b;
++			b = &q->tins[tin];
++			flow = &b->flows[idx];
++			skb = dequeue_head(flow);
++		}
++		if (unlikely(!skb)) {
++			/* heap has gone wrong, rebuild it next time */
++			q->overflow_timeout = 0;
++			return idx + (tin << 16);
++		}
+ 	}
+ 
+ 	if (cobalt_queue_full(&flow->cvars, &b->cparams, now))
+@@ -1598,7 +2315,7 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
+ 	b->tin_dropped++;
+ 	sch->qstats.drops++;
+ 
+-	if (q->config->rate_flags & CAKE_FLAG_INGRESS)
++	if (READ_ONCE(q->config->rate_flags) & CAKE_FLAG_INGRESS)
+ 		cake_advance_shaper(q, b, skb, now, true);
+ 
+ 	__qdisc_drop(skb, to_free);
+@@ -1609,7 +2326,10 @@ static unsigned int cake_drop(struct Qdisc *sch, struct sk_buff **to_free)
+ 	return idx + (tin << 16);
+ }
+ 
+-static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash)
++/* @to: what wash writes to the DSCP, ECN bits kept. Returns the DSCP the packet
++ * came with.
++ */
++static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash, u8 to)
+ {
+ 	const int offset = skb_network_offset(skb);
+ 	u16 *buf, buf_;
+@@ -1624,14 +2344,17 @@ static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash)
+ 		/* ToS is in the second byte of iphdr */
+ 		dscp = ipv4_get_dsfield((struct iphdr *)buf) >> 2;
+ 
+-		if (wash && dscp) {
++		if (wash && dscp != to) {
+ 			const int wlen = offset + sizeof(struct iphdr);
+ 
+ 			if (!pskb_may_pull(skb, wlen) ||
+ 			    skb_try_make_writable(skb, wlen))
+ 				return 0;
+ 
+-			ipv4_change_dsfield(ip_hdr(skb), INET_ECN_MASK, 0);
++			/* the header checksum goes with it, so what
++			 * CHECKSUM_COMPLETE covers adds up the same
++			 */
++			ipv4_change_dsfield(ip_hdr(skb), INET_ECN_MASK, to << 2);
+ 		}
+ 
+ 		return dscp;
+@@ -1644,14 +2367,21 @@ static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash)
+ 		/* Traffic class is in the first and second bytes of ipv6hdr */
+ 		dscp = ipv6_get_dsfield((struct ipv6hdr *)buf) >> 2;
+ 
+-		if (wash && dscp) {
++		if (wash && dscp != to) {
+ 			const int wlen = offset + sizeof(struct ipv6hdr);
++			struct ipv6hdr *ip6h;
++			__be32 from;
+ 
+ 			if (!pskb_may_pull(skb, wlen) ||
+ 			    skb_try_make_writable(skb, wlen))
+ 				return 0;
+ 
+-			ipv6_change_dsfield(ipv6_hdr(skb), INET_ECN_MASK, 0);
++			ip6h = ipv6_hdr(skb);
++			from = *(__be32 *)ip6h;
++			ipv6_change_dsfield(ip6h, INET_ECN_MASK, to << 2);
++			if (skb->ip_summed == CHECKSUM_COMPLETE)
++				skb->csum = csum_add(csum_sub(skb->csum, (__force __wsum)from),
++						     (__force __wsum)*(__be32 *)ip6h);
+ 		}
+ 
+ 		return dscp;
+@@ -1665,25 +2395,163 @@ static u8 cake_handle_diffserv(struct sk_buff *skb, bool wash)
+ 	}
+ }
+ 
+-static struct cake_tin_data *cake_select_tin(struct Qdisc *sch,
+-					     struct sk_buff *skb)
+-{
++/* ISPs clear or change the DSCP of what comes in, which is why a download's
++ * CAKE washes it. With dscp_restore, a packet that came in through a device's
++ * ingress (ifb) gets instead the DSCP its connection's other end last sent
++ * with (nf_conntrack's dscp_learn), or 0 with none. Diffserv tins, and on
++ * Wi-Fi the access category, then go by what the LAN device asked for.
++ */
++static bool dscp_restore __read_mostly;
++module_param(dscp_restore, bool, 0644);
++MODULE_PARM_DESC(dscp_restore, "Where CAKE washes what came in through a device's ingress, give packets the DSCP their connection's other end sent with");
++
++/* Not skb->from_ingress alone: nothing clears it once ifb has handed the
++ * packet back, and it may reach another CAKE on its way out.
++ */
++static bool cake_redirected_from_ingress(const struct sk_buff *skb)
++{
++#ifdef CONFIG_NET_REDIRECT
++	return skb->redirected && skb->from_ingress;
++#else
++	return false;
++#endif
++}
++
++/* On a download, CAKE's queue comes after the line's bottleneck: a packet
++ * in it has already crossed the line, and holding it back for the shaper
++ * changes nothing its sender sees. With this set, while the shaper holds
++ * packets back, a new flow's packet that came in through a device's
++ * ingress (an ifb) goes at once if the shaper is due to let the next one
++ * go within this long: the next new flow a tin would serve, with deficit
++ * left (cake_sparse_ahead()). It's charged to the shaper as any packet is,
++ * so the ones held back wait that much longer and the rate holds over
++ * time; at any moment, no more than this much (and a packet) has gone
++ * ahead of it. Bulk flows, and uploads, wait for the shaper as before.
++ * 0: off, as upstream.
++ */
++static unsigned int sparse_ahead_us __read_mostly;
++module_param(sparse_ahead_us, uint, 0644);
++MODULE_PARM_DESC(sparse_ahead_us, "How far ahead of the shaper a new flow's packet may go on a download (us, 0: never)");
++
++/* The DSCP to choose the tin by, for a CAKE that washes */
++static u8 cake_wash_diffserv(struct sk_buff *skb)
++{
++	__be16 proto;
++	u8 to = 0;
++
++	if (!READ_ONCE(dscp_restore) || !cake_redirected_from_ingress(skb))
++		return cake_handle_diffserv(skb, true, 0);
++
++	proto = skb_protocol(skb, true);
++	if (proto != htons(ETH_P_IP) && proto != htons(ETH_P_IPV6))
++		return cake_handle_diffserv(skb, true, 0);
++
++	if (!nf_ct_get_peer_dscp(skb, &to))
++		to = 0;
++	cake_handle_diffserv(skb, true, to);
++
++	return to;
++}
++
++/* In besteffort the tin doesn't depend on the DSCP, so the queue can be
++ * found first, and when it's a flow's own (a per-flow mode, no filter
++ * chose it) what its connection gave is kept for the flow's next packets:
++ * one conntrack lookup in CAKE_DSCP_KEEP packets, or one each
++ * CAKE_DSCP_KEEP_TICKS (about 100 ms) for a slower flow, instead of one a
++ * packet. A DSCP the other end changes reaches the flow's packets that
++ * much later; a lookup that finds no connection isn't kept.
++ */
++#define CAKE_DSCP_KEEP		32
++#define CAKE_DSCP_KEEP_SHIFT	20
++#define CAKE_DSCP_KEEP_TICKS	96
++
++static bool cake_dscp_memo_on(const struct cake_sched_data *qd,
++			      const struct sk_buff *skb, int flow_mode,
++			      u16 flow_override)
++{
++	__be16 proto;
++
++	if (qd->tin_mode != CAKE_DIFFSERV_BESTEFFORT ||
++	    !(READ_ONCE(qd->config->rate_flags) & CAKE_FLAG_WASH) ||
++	    flow_override || !(flow_mode & CAKE_FLOW_FLOWS) ||
++	    !READ_ONCE(dscp_restore) || !cake_redirected_from_ingress(skb))
++		return false;
++
++	proto = skb_protocol(skb, true);
++	return proto == htons(ETH_P_IP) || proto == htons(ETH_P_IPV6);
++}
++
++/* cake_wash_diffserv() through the memo at @idx, tagged by @tag */
++static u8 cake_restore_memo_tag(struct cake_sched_data *q, u32 idx, u32 tag,
++				struct sk_buff *skb, ktime_t now)
++{
++	struct cake_dscp_memo *m = &q->dscp_memo[idx];
++	u32 at = (u64)now >> CAKE_DSCP_KEEP_SHIFT;
++	u8 to = 0;
++
++	if (m->left && m->tag == tag &&
++	    at - m->at < CAKE_DSCP_KEEP_TICKS) {
++		m->left--;
++		cake_handle_diffserv(skb, true, m->dscp);
++		return m->dscp;
++	}
++
++	m->left = 0;
++	if (nf_ct_get_peer_dscp(skb, &to)) {
++		m->tag = tag;
++		m->at = at;
++		m->dscp = to;
++		m->left = CAKE_DSCP_KEEP - 1;
++	} else {
++		to = 0;
++	}
++	cake_handle_diffserv(skb, true, to);
++	return to;
++}
++
++/* cake_wash_diffserv() for queue @idx of tin @b, through its memo */
++static void cake_restore_memo(struct cake_sched_data *q, struct cake_tin_data *b,
++			      u32 idx, struct sk_buff *skb, ktime_t now)
++{
++	cake_restore_memo_tag(q, idx, b->tags[idx], skb, now);
++}
++
++static struct cake_tin_data *cake_select_tin(struct Qdisc *sch,
++					     struct sk_buff *skb,
++					     ktime_t now)
++{
+ 	struct cake_sched_data *qd = qdisc_priv(sch);
+ 	struct cake_sched_config *q = qd->config;
+-	u32 tin, mark;
++	u32 tin, mark, mask;
+ 	bool wash;
+ 	u8 dscp;
+ 
+ 	/* Tin selection: Default to diffserv-based selection, allow overriding
+ 	 * using firewall marks or skb->priority. Call DSCP parsing early if
+ 	 * wash is enabled, otherwise defer to below to skip unneeded parsing.
++	 * The mark's shift comes from the mask read once: a change made while
++	 * a packet goes through can't give it one's mask and the other's shift.
+ 	 */
+-	mark = (skb->mark & q->fwmark_mask) >> q->fwmark_shft;
+-	wash = !!(q->rate_flags & CAKE_FLAG_WASH);
+-	if (wash)
+-		dscp = cake_handle_diffserv(skb, wash);
++	mask = READ_ONCE(q->fwmark_mask);
++	mark = mask ? (skb->mark & mask) >> __ffs(mask) : 0;
++	wash = !!(READ_ONCE(q->rate_flags) & CAKE_FLAG_WASH);
++	if (wash) {
++		if (skb->l4_hash && READ_ONCE(dscp_restore) &&
++		    cake_redirected_from_ingress(skb)) {
++			__be16 proto = skb_protocol(skb, true);
++
++			if (proto == htons(ETH_P_IP) || proto == htons(ETH_P_IPV6))
++				dscp = cake_restore_memo_tag(qd,
++							     skb->hash & (CAKE_QUEUES - 1),
++							     skb->hash, skb, now);
++			else
++				dscp = cake_handle_diffserv(skb, true, 0);
++		} else {
++			dscp = cake_wash_diffserv(skb);
++		}
++	}
+ 
+-	if (q->tin_mode == CAKE_DIFFSERV_BESTEFFORT)
++	if (qd->tin_mode == CAKE_DIFFSERV_BESTEFFORT)
+ 		tin = 0;
+ 
+ 	else if (mark && mark <= qd->tin_cnt)
+@@ -1696,7 +2564,7 @@ static struct cake_tin_data *cake_select_tin(struct Qdisc *sch,
+ 
+ 	else {
+ 		if (!wash)
+-			dscp = cake_handle_diffserv(skb, wash);
++			dscp = cake_handle_diffserv(skb, false, 0);
+ 		tin = qd->tin_index[dscp];
+ 
+ 		if (unlikely(tin >= qd->tin_cnt))
+@@ -1707,7 +2575,8 @@ static struct cake_tin_data *cake_select_tin(struct Qdisc *sch,
+ }
+ 
+ static u32 cake_classify(struct Qdisc *sch, struct cake_tin_data **t,
+-			 struct sk_buff *skb, int flow_mode, int *qerr)
++			 struct sk_buff *skb, int flow_mode, int *qerr,
++			 ktime_t now)
+ {
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+ 	struct tcf_proto *filter;
+@@ -1740,17 +2609,379 @@ static u32 cake_classify(struct Qdisc *sch, struct cake_tin_data **t,
+ 			host = TC_H_MAJ(res.classid) >> 16;
+ 	}
+ hash:
+-	*t = cake_select_tin(sch, skb);
++	if (cake_dscp_memo_on(q, skb, flow_mode, flow)) {
++		u32 idx;
++
++		*t = &q->tins[0];
++		idx = cake_hash(*t, skb, flow_mode, flow, host);
++		cake_restore_memo(q, *t, idx, skb, now);
++		return idx + 1;
++	}
++	*t = cake_select_tin(sch, skb, now);
+ 	return cake_hash(*t, skb, flow_mode, flow, host) + 1;
+ }
+ 
+ static void cake_reconfigure(struct Qdisc *sch);
+ 
++/* cake_mq's sub-cakes share the rate between the active ones, and each
++ * counts them again every sync_time. Only one that has had a packet can be
++ * active, so a sub-cake marks its tx queue in the shared used_qs when a
++ * packet finds it empty, and the count reads only the marked ones: a NIC
++ * often carries all the traffic on one or two of its tx queues. A mark is
++ * never cleared, so a sub-cake back from idle is counted again. Lockless,
++ * like the queue lengths: a mark set during another sub-cake's count shows
++ * at its next one.
++ */
++static void cake_mq_mark_used(struct Qdisc *sch, struct cake_sched_data *q)
++{
++	unsigned long *used = q->config->used_qs;
++	unsigned int ntx = sch->dev_queue - netdev_get_tx_queue(qdisc_dev(sch), 0);
++
++	if (!test_bit(ntx, used))
++		set_bit(ntx, used);
++}
++
++/* cake_mq's share of the rate. At each resync, a busy sub-cake reads the
++ * other active ones and takes
++ *
++ *	share = sparse + (rate - used) * bid / (bid + the saturated's bids)
++ *
++ * - An unsaturated sub-cake, one that used less than its share lately
++ *   (averaged over cake_mq_idle_after()), keeps what it uses: that's taken off the rate
++ *   ("used"), and the others share out the rest. So a share one can't use
++ *   goes to those that can, within a few milliseconds.
++ * - The saturated ones, and this one, split what's left by their bulk
++ *   weights (cake_mq_set_weight(); a Bulk tin's at a sixteenth,
++ *   cake_mq_tins_weight()), after each one's sparse flows, which are
++ *   served first as in one CAKE. The flows then get what one CAKE would
++ *   give them.
++ * - A sub-cake with no bulk flow bids as one host's only flow, so it can
++ *   grow into a share; what it doesn't use stays with the others.
++ *
++ * Each sub-cake takes its own share; together they add up to the rate,
++ * give or take how far the averages lag. A share is never above the rate,
++ * and never below what it would be if every sub-cake wanted more: its
++ * sparse flows and its bid's part of what everyone's sparse flows leave.
++ * That's the least one CAKE would give the same flows, and holds a share
++ * up while another sub-cake's average catches up with it slowing down.
++ * Everything is read lockless, as the queue lengths are.
++ */
++#define CAKE_MQ_UNIT	65535			/* a host's only bulk flow */
++#define CAKE_MQ_TAU	(2 * NSEC_PER_MSEC)	/* the shortest time scale */
++
++struct cake_mq_peers {
++	u64	unsat_usage;	/* bytes/s the unsaturated use */
++	u64	sat_sparse;	/* bytes/s of the saturated's sparse flows */
++	u64	sparse;		/* everyone's, for the floor */
++	u64	sat_bids;
++	u64	bids;		/* everyone's, for the floor */
++	u32	count;		/* active sub-cakes, ours included */
++};
++
++static u64 cake_mq_bid(u32 weight)
++{
++	return weight ?: CAKE_MQ_UNIT;
++}
++
++static u64 cake_mq_share(u64 rate, u32 weight, u64 sparse,
++			 const struct cake_mq_peers *p)
++{
++	u64 bid = cake_mq_bid(weight);
++	u64 used = p->unsat_usage + p->sat_sparse + sparse;
++	u64 all_sparse = p->sparse + sparse;
++	u64 share = sparse, floor = sparse;
++
++	if (p->count <= 1 || !rate)
++		return rate;
++	if (used < rate)
++		share += mul_u64_u64_div_u64(rate - used, bid, bid + p->sat_bids);
++	/* With no more used than everyone's sparse flows, the share is at
++	 * least the floor: more of the rate left, shared out between fewer
++	 * bids (the saturated ones are some of everyone's).
++	 */
++	if (all_sparse < rate && used > all_sparse)
++		floor += mul_u64_u64_div_u64(rate - all_sparse, bid, bid + p->bids);
++	return clamp(max(share, floor), 1ULL, rate);
++}
++
++/* @bytes over the last @dt ns, as bytes/s, folded into @avg: an average
++ * over @tau ns, which a gap that long starts again.
++ */
++static u64 cake_mq_ewma(u64 avg, u64 bytes, u64 dt, u64 tau)
++{
++	s64 delta;
++
++	if (!avg && !bytes)
++		return 0;
++	if (dt >= tau)
++		return mul_u64_u64_div_u64(bytes, NSEC_PER_SEC, dt);
++	/* avg += (bytes / dt - avg) * dt / tau */
++	delta = (s64)(bytes * NSEC_PER_SEC) - (s64)(avg * dt);
++	return avg + div64_s64(delta, tau);
++}
++
++/* A sub-cake's time scale: four of its packet intervals, from 2 ms to
++ * 100 ms. A flow of 2 Mbit/s sends a full-sized packet every 6 ms: its use
++ * of the rate is averaged over that long (a rate needs a few packets to
++ * be seen), and it counts as idle only after that long without one.
++ * Counting it after it stops holds back at most four packets' worth.
++ */
++#define CAKE_MQ_TAU_MAX	(100 * NSEC_PER_MSEC)
++
++static u64 cake_mq_idle_after(u64 idle, u64 bytes, u32 packets, u64 usage)
++{
++	if (!packets || !usage)
++		return idle ?: CAKE_MQ_TAU;
++	/* Fast path: 4 * (bytes / packets) * 1e9 / usage <= 2 ms (CAKE_MQ_TAU)
++	 * iff 2000 * bytes <= packets * usage; avoids two 64-bit divisions on
++	 * fast sub-cake resyncs.
++	 */
++	if (2000 * bytes <= (u64)packets * usage)
++		return CAKE_MQ_TAU;
++	idle = mul_u64_u64_div_u64(4 * div_u64(bytes, packets), NSEC_PER_SEC, usage);
++	return clamp_t(u64, idle, CAKE_MQ_TAU, CAKE_MQ_TAU_MAX);
++}
++
++/* Whether @q's tin 1 is the Bulk tin (LE, CS1) of diffserv3 or diffserv4:
++ * a sixteenth of the rate as its threshold, and of the quantum
++ */
++static bool cake_has_bulk_tin(const struct cake_sched_data *q)
++{
++	return q->tin_order == bulk_order;
++}
++
++/* The weight @q bids with at a resync (cake_mq_share()): its tins' bulk
++ * weights, the Bulk tin's at a sixteenth. In one CAKE the Bulk tin gets a
++ * sixteenth of the rate, by its threshold and its quantum, while the other
++ * tins want more; across cake_mq's sub-cakes it's their bids that share the
++ * rate, and a sub-cake of Bulk flows alone bid as much as one of Best
++ * Effort's, so it took half the rate, or more with more hosts. With its
++ * hosts at a sixteenth, a saturated Bulk sub-cake gets a sixteenth next to a
++ * saturated Best Effort one, half next to another Bulk one, and all of the
++ * rate alone (the share's split is between those that want more). 0, as
++ * one host's only flow (cake_mq_bid()), unless what it sent since its last
++ * resync, and holds, is the Bulk tin's alone: then a sixteenth of that.
++ */
++static u32 cake_mq_tins_weight(const struct cake_sched_data *q)
++{
++	bool bulk = cake_has_bulk_tin(q);
++	u8 tins = q->mq_seen_tins;
++	u32 weight = 0;
++	u16 tin;
++
++	for (tin = 0; tin < q->tin_cnt; tin++) {
++		u32 w = q->tins[tin].mq_weight;
++
++		if (w && bulk && tin == 1)
++			w = max(w >> 4, 1U);
++		weight += w;
++		if (q->tins[tin].tin_backlog)
++			tins |= BIT(tin);
++	}
++	if (!weight && bulk && tins == BIT(1))
++		weight = CAKE_MQ_UNIT >> 4;
++	return weight;
++}
++
++/* At a resync: what @q used since the last one and its bulk weight, for
++ * the other sub-cakes to read, and whether it wants more than its share:
++ * it used 31/32 of it, or 7/8 with its shaper holding packets back lately.
++ * A TCP flow held back by its share averages 85-95% of it; a stream below
++ * its share never waits.
++ *
++ * Once it wants more, it goes on wanting more for as long as its shaper
++ * holds packets back between one resync and the next, and its queue never
++ * runs empty in between. Its average lags its share: when the share grows
++ * (another sub-cake used less), it can count as using well under 7/8 of
++ * it, and so as wanting no more, while it sends at all of it. The others
++ * would then share out what it doesn't use, as they read it, and take the
++ * part it does: together they'd send more than the rate, as long as its
++ * average took to catch up, and do it again each time the share moves.
++ *
++ * A sub-cake whose shaper stops holding packets back (its flows slowed
++ * down) drops out at its next resync, and so does one whose queue ran
++ * empty since its last: it had less to send than its share let through,
++ * and only its bursts waited. A stream at a quarter of its share, its
++ * packets arriving two at a time, has the second wait for the first
++ * almost every time; counted as wanting more, the others would leave it
++ * its bid's part of the rate rather than what it uses, and the rate would
++ * go unused.
++ */
++static void cake_mq_publish(struct cake_sched_data *q, u64 now)
++{
++	u64 dt = now - q->last_checked_active;
++	u64 tau = q->mq_idle ?: CAKE_MQ_TAU;
++	u64 usage, sparse, idle;
++	u32 weight;
++
++	weight = cake_mq_tins_weight(q);
++	usage = cake_mq_ewma(q->mq_usage, q->mq_bytes, dt, tau);
++	sparse = cake_mq_ewma(q->mq_sparse, q->mq_sparse_bytes, dt, tau);
++	idle = cake_mq_idle_after(q->mq_idle, q->mq_bytes, q->mq_packets, usage);
++	if (q->mq_packets)
++		WRITE_ONCE(q->last_active, now);
++	q->mq_bytes = 0;
++	q->mq_sparse_bytes = 0;
++	q->mq_packets = 0;
++	q->mq_seen_tins = 0;
++
++	WRITE_ONCE(q->mq_usage, usage);
++	WRITE_ONCE(q->mq_sparse, min(sparse, usage));
++	WRITE_ONCE(q->mq_idle, idle);
++	WRITE_ONCE(q->mq_weight, weight);
++	WRITE_ONCE(q->mq_saturated,
++		   usage >= q->synced_rate - (q->synced_rate >> 5) ||
++		   (now - q->mq_held_at < tau &&
++		    usage >= q->synced_rate - (q->synced_rate >> 3)) ||
++		   (q->mq_saturated && q->mq_held_at >= q->last_checked_active &&
++		    q->mq_drained_at < q->last_checked_active));
++}
++
++/* The sub-cakes sharing the rate with @q, @q included: those on the
++ * device's real tx queues with packets queued, or not yet idle
++ * (cake_mq_idle_after()). A stream alone on its tx queue often has none
++ * queued between packets; it's still using its part of the rate. Their
++ * count, and what they use and bid, go in @p.
++ */
++static void cake_mq_read_peers(struct Qdisc *sch, struct cake_sched_data *q,
++			       u64 now, struct cake_mq_peers *p)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	/* netif_set_real_num_tx_queues() may change it meanwhile */
++	unsigned int ntx, real_txqs = READ_ONCE(dev->real_num_tx_queues);
++	struct cake_sched_data *other_priv;
++	u64 other_last_active, other_idle;
++	struct Qdisc *other_sch;
++
++	memset(p, 0, sizeof(*p));
++	p->count = 1;
++	for_each_set_bit(ntx, q->config->used_qs, real_txqs) {
++		u64 bid, sparse;
++
++		other_sch = rcu_dereference_bh(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
++		other_priv = qdisc_priv(other_sch);
++
++		if (other_priv == q)
++			continue;
++
++		/* Read the isolated published cache line first: for an active
++		 * peer, last_active is fresh so we never pull other_sch->q.qlen
++		 * (written on every enqueue and dequeue) across cores.
++		 */
++		other_last_active = READ_ONCE(other_priv->last_active);
++		other_idle = READ_ONCE(other_priv->mq_idle) ?: CAKE_MQ_TAU;
++
++		/* signed: another CPU's last send can be later than our now */
++		if ((s64)(now - other_last_active) >= (s64)other_idle &&
++		    !READ_ONCE(other_sch->q.qlen))
++			continue;
++
++		p->count++;
++		bid = cake_mq_bid(READ_ONCE(other_priv->mq_weight));
++		sparse = READ_ONCE(other_priv->mq_sparse);
++		p->bids += bid;
++		p->sparse += sparse;
++		if (READ_ONCE(other_priv->mq_saturated)) {
++			p->sat_bids += bid;
++			p->sat_sparse += sparse;
++		} else {
++			p->unsat_usage += READ_ONCE(other_priv->mq_usage);
++		}
++	}
++}
++
++/* Whether the share moved enough to redo the tins' rates (a division and a
++ * shift loop each): the averages wobble from one resync to the next. The
++ * whole rate is always taken back exactly.
++ */
++static bool cake_mq_share_moved(u64 share, u64 synced, u64 rate)
++{
++	u64 band = synced >> 8;
++
++	if (share == synced)
++		return false;
++	return share == rate || share > synced + band || share + band < synced;
++}
++
++/* A new share also applies to what the shaper still waits for, both ways:
++ * a packet sent while the share was small may have pushed the next send
++ * far ahead, and one sent at a larger share must not keep its short wait
++ * (that would let a share that moves up and down send at the higher one).
++ * A second at most: the sub-cake wakes within CAKE_MQ_TAU anyway
++ * (cake_mq_wake_by()) and works it out again.
++ */
++static ktime_t cake_mq_rescale_wait(ktime_t next, ktime_t now, u64 old, u64 share)
++{
++	s64 left = ktime_to_ns(ktime_sub(next, now));
++
++	if (left <= 0 || share == old || !share)
++		return next;
++	/* Cap before scaling so the 128-by-64 quotient never exceeds 64 bits */
++	if (old > share && (u64)left > mul_u64_u64_div_u64(NSEC_PER_SEC, share, old))
++		return ktime_add_ns(now, NSEC_PER_SEC);
++	return ktime_add_ns(now, min_t(u64, mul_u64_u64_div_u64(left, old, share),
++				       NSEC_PER_SEC));
++}
++
++/* A new share for every wait running: the shaper's, and each tin's
++ * schedule against its threshold, which decides whether it goes before the
++ * tins below it. Rescaled with the shaper's, a tin keeps its place as the
++ * share moves: one that sent a packet while the share was small would
++ * otherwise count as over its threshold, and lose its priority, for as many
++ * times longer as the share then grew.
++ */
++static void cake_mq_rescale_waits(struct cake_sched_data *q, ktime_t now,
++				  u64 old, u64 share)
++{
++	u16 tin;
++
++	q->time_next_packet = cake_mq_rescale_wait(q->time_next_packet, now, old, share);
++	q->failsafe_next_packet = cake_mq_rescale_wait(q->failsafe_next_packet, now,
++						       old, share);
++	for (tin = 0; tin < q->tin_cnt; tin++)
++		q->tins[tin].time_next_packet =
++			cake_mq_rescale_wait(q->tins[tin].time_next_packet, now, old, share);
++}
++
++/* While a sub-cake waits for its shaper it also wakes every CAKE_MQ_TAU,
++ * so its share is worked out again: one that grows is then used.
++ */
++static u64 cake_mq_wake_by(struct cake_sched_data *q, u64 next, ktime_t now)
++{
++	if (!q->config->is_shared)
++		return next;
++	return min_t(u64, next, ktime_to_ns(now) + CAKE_MQ_TAU);
++}
++
++/* How late the shaper's watchdog may wake, in microseconds (hrtimer slack).
++ * A shaper held back for each packet in turn takes a timer interrupt and a
++ * qdisc run per packet: cake_mq's sub-cakes, each at a share of the rate,
++ * wait for almost every one. Woken a little late, a qdisc run sends every
++ * packet that came due meanwhile. The shaper never sends ahead of its
++ * schedule, so the rate and cake_mq's share hold: a packet just waits up to
++ * this much longer (twice, if a later hold finds the timer already set
++ * within its range). 0: on time, as upstream.
++ */
++#define CAKE_WAKE_SLACK_US	300
++static unsigned int wake_slack_us __read_mostly = CAKE_WAKE_SLACK_US;
++module_param(wake_slack_us, uint, 0644);
++MODULE_PARM_DESC(wake_slack_us, "how late the shaper's watchdog may wake (us, 0: on time)");
++
++/* Wake when the shaper lets the next packet go, give or take the slack */
++static void cake_watchdog(struct cake_sched_data *q, u64 expires)
++{
++	qdisc_watchdog_schedule_range_ns(&q->watchdog, expires,
++					 (u64)READ_ONCE(wake_slack_us) * NSEC_PER_USEC);
++}
++
+ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			struct sk_buff **to_free)
+ {
+-	u32 idx, tin, prev_qlen, prev_backlog, drop_id;
++	u32 idx, tin, prev_qlen, prev_backlog, drop_id, arrived;
+ 	struct cake_sched_data *q = qdisc_priv(sch);
++	bool shorter = false;
++	u8 flow_mode = READ_ONCE(q->config->flow_mode);
++	u16 rate_flags = READ_ONCE(q->config->rate_flags);
+ 	int len = qdisc_pkt_len(skb), ret;
+ 	struct sk_buff *ack = NULL;
+ 	ktime_t now = ktime_get();
+@@ -1759,7 +2990,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 	bool same_flow = false;
+ 
+ 	/* choose flow to insert into */
+-	idx = cake_classify(sch, &b, skb, q->config->flow_mode, &ret);
++	idx = cake_classify(sch, &b, skb, flow_mode, &ret, now);
+ 	if (idx == 0) {
+ 		if (ret & __NET_XMIT_BYPASS)
+ 			qdisc_qstats_drop(sch);
+@@ -1776,6 +3007,9 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			b->time_next_packet = now;
+ 
+ 		if (!sch->q.qlen) {
++			if (q->config->is_shared)
++				cake_mq_mark_used(sch, q);
++
+ 			if (ktime_before(q->time_next_packet, now)) {
+ 				q->failsafe_next_packet = now;
+ 				q->time_next_packet = now;
+@@ -1786,7 +3020,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 					    ktime_to_ns(
+ 						   q->failsafe_next_packet));
+ 				sch->qstats.overlimits++;
+-				qdisc_watchdog_schedule_ns(&q->watchdog, next);
++				cake_watchdog(q, cake_mq_wake_by(q, next, now));
+ 			}
+ 		}
+ 	}
+@@ -1794,7 +3028,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 	if (unlikely(len > b->max_skblen))
+ 		b->max_skblen = len;
+ 
+-	if (skb_is_gso(skb) && q->config->rate_flags & CAKE_FLAG_SPLIT_GSO) {
++	if (skb_is_gso(skb) && rate_flags & CAKE_FLAG_SPLIT_GSO) {
+ 		struct sk_buff *segs, *nskb;
+ 		netdev_features_t features = netif_skb_features(skb);
+ 		unsigned int slen = 0, numsegs = 0;
+@@ -1823,7 +3057,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 		b->backlogs[idx]    += slen;
+ 		b->tin_backlog      += slen;
+ 		sch->qstats.backlog += slen;
+-		q->avg_window_bytes += slen;
++		arrived = slen;
+ 
+ 		qdisc_tree_reduce_backlog(sch, 1-numsegs, len-slen);
+ 		consume_skb(skb);
+@@ -1835,7 +3069,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 		get_cobalt_cb(skb)->adjusted_len = cake_overhead(q, skb);
+ 		flow_queue_add(flow, skb);
+ 
+-		if (q->config->ack_filter)
++		if (READ_ONCE(q->config->ack_filter))
+ 			ack = cake_ack_filter(q, flow);
+ 
+ 		if (ack) {
+@@ -1844,7 +3078,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			ack_pkt_len = qdisc_pkt_len(ack);
+ 			b->bytes += ack_pkt_len;
+ 			q->buffer_used += skb->truesize - ack->truesize;
+-			if (q->config->rate_flags & CAKE_FLAG_INGRESS)
++			if (rate_flags & CAKE_FLAG_INGRESS)
+ 				cake_advance_shaper(q, b, ack, now, true);
+ 
+ 			qdisc_tree_reduce_backlog(sch, 1, ack_pkt_len);
+@@ -1860,17 +3094,27 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 		b->backlogs[idx]    += len - ack_pkt_len;
+ 		b->tin_backlog      += len - ack_pkt_len;
+ 		sch->qstats.backlog += len - ack_pkt_len;
+-		q->avg_window_bytes += len - ack_pkt_len;
++		/* an ACK the filter dropped can be the longer one: one with
++		 * more SACK blocks than the ACK that covers them
++		 */
++		shorter = ack_pkt_len > len;
++		arrived = len;
+ 	}
+ 
+ 	if (q->overflow_timeout)
+-		cake_heapify_up(q, b->overflow_idx[idx]);
++		cake_heap_moved(q, b->overflow_idx[idx], shorter);
+ 
+-	/* incoming bandwidth capacity estimate */
+-	if (q->config->rate_flags & CAKE_FLAG_AUTORATE_INGRESS) {
++	/* incoming bandwidth capacity estimate, kept only while it's in use:
++	 * cake_change() starts it afresh when autorate-ingress is turned on.
++	 * It counts what arrived, an ACK the filter dropped for this packet
++	 * included (it was counted when it came in): both crossed the link.
++	 */
++	if (rate_flags & CAKE_FLAG_AUTORATE_INGRESS) {
+ 		u64 packet_interval = \
+ 			ktime_to_ns(ktime_sub(now, q->last_packet_time));
+ 
++		q->avg_window_bytes += arrived;
++
+ 		if (packet_interval > NSEC_PER_SEC)
+ 			packet_interval = NSEC_PER_SEC;
+ 
+@@ -1899,13 +3143,12 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 			if (ktime_after(now,
+ 					ktime_add_ms(q->last_reconfig_time,
+ 						     250))) {
+-				q->config->rate_bps = (q->avg_peak_bandwidth * 15) >> 4;
++				WRITE_ONCE(q->config->rate_bps,
++					   (q->avg_peak_bandwidth * 15) >> 4);
++				q->last_reconfig_time = now;
+ 				cake_reconfigure(sch);
+ 			}
+ 		}
+-	} else {
+-		q->avg_window_bytes = 0;
+-		q->last_packet_time = now;
+ 	}
+ 
+ 	/* flowchain */
+@@ -1919,7 +3162,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 		flow->set = CAKE_SET_SPARSE;
+ 		b->sparse_flow_count++;
+ 
+-		flow->deficit = cake_get_flow_quantum(b, flow, q->config->flow_mode);
++		flow->deficit = cake_get_flow_quantum(b, flow, flow_mode);
+ 	} else if (flow->set == CAKE_SET_SPARSE_WAIT) {
+ 		/* this flow was empty, accounted as a sparse flow, but actually
+ 		 * in the bulk rotation.
+@@ -1928,8 +3171,11 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 		b->sparse_flow_count--;
+ 		b->bulk_flow_count++;
+ 
+-		cake_inc_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
+-		cake_inc_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
++		cake_inc_srchost_bulk_flow_count(b, flow, flow_mode);
++		cake_inc_dsthost_bulk_flow_count(b, flow, flow_mode);
++		if (q->config->is_shared)
++			cake_mq_set_weight(b, flow,
++					   quantum_div[cake_host_load(b, flow, flow_mode)]);
+ 	}
+ 
+ 	if (q->buffer_used > q->buffer_max_used)
+@@ -1941,11 +3187,24 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 	prev_qlen = sch->q.qlen;
+ 	prev_backlog = sch->qstats.backlog;
+ 
+-	while (q->buffer_used > q->buffer_limit) {
+-		drop_id = cake_drop(sch, to_free);
+-		if ((drop_id >> 16) == tin &&
+-		    (drop_id & 0xFFFF) == idx)
+-			same_flow = true;
++	{
++		u32 last_used = q->buffer_used;
++		bool retried = false;
++
++		while (q->buffer_used > q->buffer_limit) {
++			drop_id = cake_drop(sch, to_free, now);
++			if (q->buffer_used < last_used) {
++				if ((drop_id >> 16) == tin &&
++				    (drop_id & 0xFFFF) == idx)
++					same_flow = true;
++				last_used = q->buffer_used;
++				retried = false;
++			} else {
++				if (retried)
++					break;
++				retried = true;
++			}
++		}
+ 	}
+ 
+ 	prev_qlen -= sch->q.qlen;
+@@ -1988,61 +3247,297 @@ static struct sk_buff *cake_dequeue_one(struct Qdisc *sch)
+ static void cake_clear_tin(struct Qdisc *sch, u16 tin)
+ {
+ 	struct cake_sched_data *q = qdisc_priv(sch);
++	struct cake_tin_data *b = &q->tins[tin];
+ 	struct sk_buff *skb;
+ 
+ 	q->cur_tin = tin;
++	/* Every flow holding packets is sparse or bulk, so zero active flows
++	 * means none of the 1024 queues has any packet to dequeue.
++	 */
++	if (!(b->sparse_flow_count + b->bulk_flow_count)) {
++		q->cur_flow = CAKE_QUEUES;
++		return;
++	}
+ 	for (q->cur_flow = 0; q->cur_flow < CAKE_QUEUES; q->cur_flow++)
+ 		while (!!(skb = cake_dequeue_one(sch)))
+ 			kfree_skb(skb);
+ }
+ 
++/* A flow found with no packets leaves its rotation: to the decaying flows
++ * while its AQM state is still active, or out of the flowchain.
++ *
++ * A flow with no AQM state left still waits one interval after its last
++ * packet (cobalt_should_drop() sets drop_next then), keeping its queue and
++ * host slots for its next packet. It waits with the resting flows, which
++ * cake_dequeue() doesn't visit: it only lets them go once their time is up
++ * (cake_expire_resting()). Visited with the decaying flows, as before,
++ * each would have cost every dequeue a detour, and on any busy queue
++ * there's always one.
++ */
++static void cake_flow_emptied(struct cake_sched_data *q,
++			      struct cake_tin_data *b,
++			      struct cake_flow *flow, ktime_t now)
++{
++	u8 flow_mode = READ_ONCE(q->config->flow_mode);
++
++	if (flow->mq_weight)
++		cake_mq_set_weight(b, flow, 0);
++
++	if (cobalt_queue_empty(&flow->cvars, &b->cparams, now))
++		b->unresponsive_flow_count--;
++
++	if (flow->cvars.p_drop || flow->cvars.count ||
++	    ktime_before(now, flow->cvars.drop_next)) {
++		/* keep in the flowchain until the state has
++		 * decayed to rest
++		 */
++		list_move_tail(&flow->flowchain,
++			       flow->cvars.p_drop || flow->cvars.count ?
++			       &b->decaying_flows : &b->resting_flows);
++		if (flow->set == CAKE_SET_BULK) {
++			b->bulk_flow_count--;
++
++			cake_dec_srchost_bulk_flow_count(b, flow, flow_mode);
++			cake_dec_dsthost_bulk_flow_count(b, flow, flow_mode);
++
++			b->decaying_flow_count++;
++		} else if (flow->set == CAKE_SET_SPARSE ||
++			   flow->set == CAKE_SET_SPARSE_WAIT) {
++			b->sparse_flow_count--;
++			b->decaying_flow_count++;
++		}
++		flow->set = CAKE_SET_DECAYING;
++	} else {
++		/* remove empty queue from the flowchain */
++		list_del_init(&flow->flowchain);
++		if (flow->set == CAKE_SET_SPARSE ||
++		    flow->set == CAKE_SET_SPARSE_WAIT)
++			b->sparse_flow_count--;
++		else if (flow->set == CAKE_SET_BULK) {
++			b->bulk_flow_count--;
++
++			cake_dec_srchost_bulk_flow_count(b, flow, flow_mode);
++			cake_dec_dsthost_bulk_flow_count(b, flow, flow_mode);
++		} else
++			b->decaying_flow_count--;
++
++		flow->set = CAKE_SET_NONE;
++	}
++}
++
++/* The resting flows whose time is up leave the flowchain, two at most each
++ * time: they're in about the order their times are up, and one that's a
++ * little out of order waits for the one ahead of it
++ */
++static void cake_expire_resting(struct cake_tin_data *b, ktime_t now)
++{
++	struct cake_flow *flow;
++	int i;
++
++	for (i = 0; i < 2 && !list_empty(&b->resting_flows); i++) {
++		flow = list_first_entry(&b->resting_flows, struct cake_flow,
++					flowchain);
++		if (ktime_before(now, flow->cvars.drop_next))
++			return;
++		list_del_init(&flow->flowchain);
++		flow->set = CAKE_SET_NONE;
++		b->decaying_flow_count--;
++	}
++}
++
++/* cake_mq: retire a tin's bulk rotation, every flow in it empty, as the
++ * next dequeue would find each one
++ */
++static void cake_mq_retire_tin(struct cake_sched_data *q,
++			       struct cake_tin_data *b, ktime_t now)
++{
++	struct cake_flow *flow;
++
++	while ((flow = cake_bulk_head(b))) {
++		if (flow->head)
++			break;
++		cake_flow_emptied(q, b, flow, now);
++	}
++}
++
++/* cake_mq: look at a sub-cake out of packets again once it's idle, at some
++ * time from @idle_at to @idle after it. A sub-cake below its share runs out
++ * of packets after almost every one, and @idle_at moves with each: a timer
++ * already set in that range stays as it is. So it's set once in @idle of
++ * traffic, not for every packet, and goes off only when the packets have
++ * stopped. It's a timer of its own, as the shaper's watchdog is set again
++ * for every packet held back.
++ */
++static void cake_mq_watch_idle(struct cake_sched_data *q, u64 idle_at, u64 idle)
++{
++	struct hrtimer *timer = &q->mq_watchdog.timer;
++
++	if (hrtimer_is_queued(timer) &&
++	    (u64)hrtimer_get_expires_tv64(timer) - idle_at <= idle)
++		return;
++	qdisc_watchdog_schedule_ns(&q->mq_watchdog, idle_at + idle);
++}
++
++/* cake_mq: a sub-cake out of packets. A flow between bursts stays in the
++ * bulk rotation, as in one CAKE: a lone TCP flow empties its sub-cake
++ * often. Once it has sent nothing for a while (cake_mq_idle_after()), the
++ * sub-cake is idle and might not dequeue again for a long time: it retires
++ * its rotation then, or up to as long again later (cake_mq_watch_idle()
++ * wakes it), so its flows leave the host loads the busy sub-cakes share out
++ * by.
++ *
++ * The new flows go at once, as the next dequeue would find each of them
++ * in one CAKE with other traffic queued: a sparse flow alone on its
++ * sub-cake, which drains after each of its packets, would otherwise never
++ * be found empty, spend its quantum and turn bulk, counted against its
++ * host in the busy sub-cakes for as long as it keeps sending.
++ */
++static void cake_mq_drained(struct cake_sched_data *q, ktime_t now)
++{
++	u64 idle = q->mq_idle ?: CAKE_MQ_TAU;
++	u64 idle_at = q->last_active + idle;
++	bool bulk = false;
++	u16 tin;
++
++	for (tin = 0; tin < q->tin_cnt; tin++) {
++		struct cake_tin_data *b = &q->tins[tin];
++
++		while (!list_empty(&b->new_flows))
++			cake_flow_emptied(q, b, list_first_entry(&b->new_flows,
++								 struct cake_flow,
++								 flowchain),
++					  now);
++		bulk |= cake_bulk_any(b);
++	}
++	if (!bulk)
++		return;
++	if (ktime_to_ns(now) < idle_at) {
++		cake_mq_watch_idle(q, idle_at, idle);
++		return;
++	}
++	for (tin = 0; tin < q->tin_cnt; tin++)
++		cake_mq_retire_tin(q, &q->tins[tin], now);
++}
++
++/* How far down a tin's new flows cake_sparse_ahead() looks */
++#define CAKE_AHEAD_LOOK 8
++
++/* sparse_ahead_us: the flow whose packet goes now, with the shaper due to
++ * let one go in @left ns. From the highest tin (in priority order, tin_order),
++ * the new flow it would serve next: past those on their way out of the new
++ * flows, out of packets or of deficit, which its next look at them would let
++ * go (a few at most). Only if its packet came in through a device's ingress.
++ * Selects it for cake_dequeue_one().
++ */
++static struct cake_flow *cake_sparse_ahead(struct cake_sched_data *q, u64 left)
++{
++	u32 ahead = READ_ONCE(sparse_ahead_us);
++	int i;
++
++	if (likely(!ahead) || left > (u64)ahead * NSEC_PER_USEC)
++		return NULL;
++	for (i = q->tin_cnt - 1; i >= 0; i--) {
++		int tin = q->tin_order ? q->tin_order[i] : i;
++		struct cake_tin_data *b = &q->tins[tin];
++		struct cake_flow *flow;
++		int n = 0;
++
++		list_for_each_entry(flow, &b->new_flows, flowchain) {
++			if (++n > CAKE_AHEAD_LOOK)
++				break;
++			if (!flow->head || flow->deficit <= 0)
++				continue;
++			if (!cake_redirected_from_ingress(flow->head))
++				break;
++			q->cur_tin = tin;
++			q->cur_flow = flow - b->flows;
++			return flow;
++		}
++	}
++	return NULL;
++}
++
++/* The L4S ramp (l4s_ramp) for @skb, leaving its flow. @last: no packet of the
++ * flow is left behind it.
++ */
++static bool cake_l4s_mark(const struct cake_tin_data *b, struct sk_buff *skb,
++			  ktime_t now, bool last)
++{
++	u32 ramp = READ_ONCE(l4s_ramp);
++	u64 start, own, over;
++	s64 sojourn;
++	u32 shift;
++
++	if (!ramp || last)
++		return false;
++	sojourn = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
++	start = div_u64(b->cparams.target * ramp, 100);
++	if (sojourn <= (s64)start || cobalt_ecn(skb) != INET_ECN_ECT_1)
++		return false;
++
++	own = (get_cobalt_cb(skb)->adjusted_len * b->tin_rate_ns) >> b->tin_rate_shft;
++	own *= max_t(u32, b->bulk_flow_count, 1);
++	start = cake_l4s_start(b->cparams.target, ramp, own);
++	if ((u64)sojourn <= start)
++		return false;
++	/* always marked at twice the start: from here, it's as long again. A
++	 * start past U32_MAX ns (4.3 s: a slow link, many flows) is scaled
++	 * down to the random number's range, and what's over it with it.
++	 */
++	over = (u64)sojourn - start;
++	if (over < start) {
++		shift = fls64(start >> 32);
++		if (reciprocal_scale(get_random_u32(), start >> shift) >= over >> shift)
++			return false;
++	}
++	return INET_ECN_set_ce(skb);
++}
++
+ static struct sk_buff *cake_dequeue(struct Qdisc *sch)
+ {
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+ 	struct cake_tin_data *b = &q->tins[q->cur_tin];
+-	ktime_t now = ktime_get();
+ 	struct cake_flow *flow;
+ 	struct list_head *head;
+-	bool first_flow = true;
++	bool first_flow = true, ahead = false;
+ 	struct sk_buff *skb;
++	ktime_t now;
+ 	u64 delay;
+ 	u32 len;
+ 
++	/* plain cake with nothing queued has nothing to do: no clock read.
++	 * cake_mq's sub-cakes go on to resync and to cake_mq_drained().
++	 */
++	if (!sch->q.qlen && !q->config->is_shared)
++		return NULL;
++	now = ktime_get();
++
+ 	if (q->config->is_shared && q->rate_ns &&
+ 	    now - q->last_checked_active >= q->config->sync_time) {
+-		struct net_device *dev = qdisc_dev(sch);
+-		struct cake_sched_data *other_priv;
+-		u64 new_rate = q->config->rate_bps;
+-		u64 other_qlen, other_last_active;
+-		struct Qdisc *other_sch;
+-		u32 num_active_qs = 1;
+-		unsigned int ntx;
+-
+-		for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
+-			other_sch = rcu_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+-			other_priv = qdisc_priv(other_sch);
+-
+-			if (other_priv == q)
+-				continue;
+-
+-			other_qlen = READ_ONCE(other_sch->q.qlen);
+-			other_last_active = READ_ONCE(other_priv->last_active);
+-
+-			if (other_qlen || other_last_active > q->last_checked_active)
+-				num_active_qs++;
++		u64 rate = READ_ONCE(q->config->rate_bps);
++		struct cake_mq_peers peers;
++		u64 new_rate;
++
++		cake_mq_publish(q, now);
++		cake_mq_read_peers(sch, q, now, &peers);
++		new_rate = cake_mq_share(rate, q->mq_weight, q->mq_sparse, &peers);
++
++		if (cake_mq_share_moved(new_rate, q->synced_rate, rate)) {
++			cake_mq_rescale_waits(q, now, q->synced_rate, new_rate);
++			cake_configure_rates(sch, new_rate, true);
++			q->synced_rate = new_rate;
+ 		}
+-
+-		if (num_active_qs > 1)
+-			new_rate = div64_u64(q->config->rate_bps, num_active_qs);
+-
+-		cake_configure_rates(sch, new_rate, true);
+ 		q->last_checked_active = now;
+-		q->active_queues = num_active_qs;
++		q->active_queues = peers.count;
+ 	}
+ 
+ begin:
+-	if (!sch->q.qlen)
++	ahead = false;
++	if (!sch->q.qlen) {
++		if (q->config->is_shared)
++			cake_mq_drained(q, now);
+ 		return NULL;
++	}
+ 
+ 	/* global hard shaper */
+ 	if (ktime_after(q->time_next_packet, now) &&
+@@ -2050,8 +3545,16 @@ begin:
+ 		u64 next = min(ktime_to_ns(q->time_next_packet),
+ 			       ktime_to_ns(q->failsafe_next_packet));
+ 
++		if (q->config->is_shared)
++			q->mq_held_at = ktime_to_ns(now);
++		flow = cake_sparse_ahead(q, next - ktime_to_ns(now));
++		if (flow) {
++			b = &q->tins[q->cur_tin];
++			ahead = true;
++			goto ahead;
++		}
+ 		sch->qstats.overlimits++;
+-		qdisc_watchdog_schedule_ns(&q->watchdog, next);
++		cake_watchdog(q, cake_mq_wake_by(q, next, now));
+ 		return NULL;
+ 	}
+ 
+@@ -2118,37 +3621,46 @@ begin:
+ 			return NULL;
+ 	}
+ 
++	cake_expire_resting(b, now);
++
+ retry:
+ 	/* service this class */
+ 	head = &b->decaying_flows;
+ 	if (!first_flow || list_empty(head)) {
+ 		head = &b->new_flows;
+ 		if (list_empty(head)) {
+-			head = &b->old_flows;
+-			if (unlikely(list_empty(head))) {
+-				head = &b->decaying_flows;
+-				if (unlikely(list_empty(head)))
+-					goto begin;
+-			}
++			flow = cake_bulk_head(b);
++			if (flow)
++				goto found;
++			head = &b->decaying_flows;
++			if (unlikely(list_empty(head)))
++				goto begin;
+ 		}
+ 	}
+ 	flow = list_first_entry(head, struct cake_flow, flowchain);
+-	q->cur_flow = flow - b->flows;
++found:
+ 	first_flow = false;
++	if (head == &b->decaying_flows) {
++		/* it has no packets: its AQM state decays a step, and it goes
++		 * nowhere near the bulk rotation, whatever its deficit
++		 */
++		cake_flow_emptied(q, b, flow, now);
++		goto begin;
++	}
++	q->cur_flow = flow - b->flows;
+ 
+ 	/* flow isolation (DRR++) */
+ 	if (flow->deficit <= 0) {
+-		/* Keep all flows with deficits out of the sparse and decaying
+-		 * rotations.  No non-empty flow can go into the decaying
+-		 * rotation, so they can't get deficits
+-		 */
++		/* Keep all flows with deficits out of the sparse rotation */
+ 		if (flow->set == CAKE_SET_SPARSE) {
+ 			if (flow->head) {
++				u8 flow_mode = READ_ONCE(q->config->flow_mode);
++
+ 				b->sparse_flow_count--;
+ 				b->bulk_flow_count++;
+ 
+-				cake_inc_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
+-				cake_inc_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
++				cake_inc_srchost_bulk_flow_count(b, flow, flow_mode);
++				cake_inc_dsthost_bulk_flow_count(b, flow, flow_mode);
+ 
+ 				flow->set = CAKE_SET_BULK;
+ 			} else {
+@@ -2160,72 +3672,36 @@ retry:
+ 			}
+ 		}
+ 
+-		flow->deficit += cake_get_flow_quantum(b, flow, q->config->flow_mode);
+-		list_move_tail(&flow->flowchain, &b->old_flows);
+-
++		cake_bulk_park(q, b, flow);
+ 		goto retry;
+ 	}
+ 
++ahead:
+ 	/* Retrieve a packet via the AQM */
+ 	while (1) {
++		bool ingress;
++
+ 		skb = cake_dequeue_one(sch);
+ 		if (!skb) {
+ 			/* this queue was actually empty */
+-			if (cobalt_queue_empty(&flow->cvars, &b->cparams, now))
+-				b->unresponsive_flow_count--;
+-
+-			if (flow->cvars.p_drop || flow->cvars.count ||
+-			    ktime_before(now, flow->cvars.drop_next)) {
+-				/* keep in the flowchain until the state has
+-				 * decayed to rest
+-				 */
+-				list_move_tail(&flow->flowchain,
+-					       &b->decaying_flows);
+-				if (flow->set == CAKE_SET_BULK) {
+-					b->bulk_flow_count--;
+-
+-					cake_dec_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
+-					cake_dec_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
+-
+-					b->decaying_flow_count++;
+-				} else if (flow->set == CAKE_SET_SPARSE ||
+-					   flow->set == CAKE_SET_SPARSE_WAIT) {
+-					b->sparse_flow_count--;
+-					b->decaying_flow_count++;
+-				}
+-				flow->set = CAKE_SET_DECAYING;
+-			} else {
+-				/* remove empty queue from the flowchain */
+-				list_del_init(&flow->flowchain);
+-				if (flow->set == CAKE_SET_SPARSE ||
+-				    flow->set == CAKE_SET_SPARSE_WAIT)
+-					b->sparse_flow_count--;
+-				else if (flow->set == CAKE_SET_BULK) {
+-					b->bulk_flow_count--;
+-
+-					cake_dec_srchost_bulk_flow_count(b, flow, q->config->flow_mode);
+-					cake_dec_dsthost_bulk_flow_count(b, flow, q->config->flow_mode);
+-				} else
+-					b->decaying_flow_count--;
+-
+-				flow->set = CAKE_SET_NONE;
+-			}
++			cake_flow_emptied(q, b, flow, now);
+ 			goto begin;
+ 		}
+ 
++		ingress = !!(READ_ONCE(q->config->rate_flags) & CAKE_FLAG_INGRESS);
++
+ 		/* Last packet in queue may be marked, shouldn't be dropped */
+ 		if (!cobalt_should_drop(&flow->cvars, &b->cparams, now, skb,
+-					(b->bulk_flow_count *
+-					 !!(q->config->rate_flags &
+-					    CAKE_FLAG_INGRESS))) ||
++					b->bulk_flow_count * ingress,
++					b->bulk_flow_count) ||
+ 		    !flow->head)
+ 			break;
+ 
+ 		/* drop this packet, get another one */
+-		if (q->config->rate_flags & CAKE_FLAG_INGRESS) {
++		if (ingress) {
+ 			len = cake_advance_shaper(q, b, skb,
+ 						  now, true);
+-			flow->deficit -= len;
++			flow->deficit -= cake_deficit_charge(len);
+ 			b->tin_deficit -= len;
+ 		}
+ 		flow->dropped++;
+@@ -2233,13 +3709,29 @@ retry:
+ 		qdisc_tree_reduce_backlog(sch, 1, qdisc_pkt_len(skb));
+ 		qdisc_qstats_drop(sch);
+ 		kfree_skb(skb);
+-		if (q->config->rate_flags & CAKE_FLAG_INGRESS)
++		if (ingress) {
++			/* the shaper again, before anything else goes early */
++			if (ahead)
++				goto begin;
+ 			goto retry;
++		}
+ 	}
+ 
++	if (!flow->cvars.ecn_marked && cake_l4s_mark(b, skb, now, !flow->head))
++		flow->cvars.ecn_marked = true;
+ 	b->tin_ecn_mark += !!flow->cvars.ecn_marked;
+ 	qdisc_bstats_update(sch, skb);
+-	WRITE_ONCE(q->last_active, now);
++	/* The other sub-cakes read last_active first: written exactly as our
++	 * queue empties, on first send, and at least every CAKE_MQ_TAU / 2
++	 * while busy (cake_mq_publish() also updates it every sync_time).
++	 */
++	if (q->config->is_shared) {
++		if (!sch->q.qlen)
++			q->mq_drained_at = ktime_to_ns(now);
++		if (!sch->q.qlen || !q->last_active ||
++		    (s64)(now - q->last_active) >= (s64)(CAKE_MQ_TAU / 2))
++			WRITE_ONCE(q->last_active, now);
++	}
+ 
+ 	/* collect delay stats */
+ 	delay = ktime_to_ns(ktime_sub(now, cobalt_get_enqueue_time(skb)));
+@@ -2250,29 +3742,30 @@ retry:
+ 				  delay < b->base_delay ? 2 : 8);
+ 
+ 	len = cake_advance_shaper(q, b, skb, now, false);
+-	flow->deficit -= len;
++	flow->deficit -= cake_deficit_charge(len);
+ 	b->tin_deficit -= len;
+-
+-	if (ktime_after(q->time_next_packet, now) && sch->q.qlen) {
++	if (q->config->is_shared && q->rate_ns && flow->set == CAKE_SET_SPARSE)
++		q->mq_sparse_bytes += len;
++
++	/* Held back only as the hard shaper above decides: by both times. In
++	 * ingress mode a drop moves the shaper on and not the failsafe, and
++	 * with the failsafe due the next packet goes at once: a watchdog set
++	 * for it then went off as soon as it was set, for every packet sent
++	 * until the failsafe caught up.
++	 */
++	if (ktime_after(q->time_next_packet, now) &&
++	    ktime_after(q->failsafe_next_packet, now) && sch->q.qlen) {
+ 		u64 next = min(ktime_to_ns(q->time_next_packet),
+ 			       ktime_to_ns(q->failsafe_next_packet));
+ 
+-		qdisc_watchdog_schedule_ns(&q->watchdog, next);
+-	} else if (!sch->q.qlen) {
+-		int i;
+-
+-		for (i = 0; i < q->tin_cnt; i++) {
+-			if (q->tins[i].decaying_flow_count) {
+-				ktime_t next = \
+-					ktime_add_ns(now,
+-						     q->tins[i].cparams.target);
+-
+-				qdisc_watchdog_schedule_ns(&q->watchdog,
+-							   ktime_to_ns(next));
+-				break;
+-			}
+-		}
++		if (q->config->is_shared)
++			q->mq_held_at = ktime_to_ns(now);
++		cake_watchdog(q, cake_mq_wake_by(q, next, now));
+ 	}
++	/* No watchdog for the decaying flows of a queue that's now empty:
++	 * woken with nothing queued, cake_dequeue() returns before it looks
++	 * at a flow. Their state decays when the next packet comes.
++	 */
+ 
+ 	if (q->overflow_timeout)
+ 		q->overflow_timeout--;
+@@ -2288,8 +3781,25 @@ static void cake_reset(struct Qdisc *sch)
+ 	if (!q->tins)
+ 		return;
+ 
+-	for (c = 0; c < CAKE_MAX_TINS; c++)
++	for (c = 0; c < CAKE_MAX_TINS; c++) {
+ 		cake_clear_tin(sch, c);
++		if (q->config->is_shared)
++			cake_mq_retire_tin(q, &q->tins[c], ktime_get());
++	}
++	/* idle now: the other sub-cakes no longer count it (cake_mq_read_peers()) */
++	WRITE_ONCE(q->last_active, 0);
++	WRITE_ONCE(q->mq_idle, 0);
++	q->mq_held_at = 0;
++	q->mq_drained_at = 0;
++	WRITE_ONCE(q->mq_usage, 0);
++	WRITE_ONCE(q->mq_sparse, 0);
++	WRITE_ONCE(q->mq_weight, 0);
++	WRITE_ONCE(q->mq_saturated, false);
++	q->mq_bytes = 0;
++	q->mq_sparse_bytes = 0;
++	q->mq_packets = 0;
++	q->mq_seen_tins = 0;
++	memset(q->dscp_memo, 0, sizeof(q->dscp_memo));
+ }
+ 
+ static const struct nla_policy cake_policy[TCA_CAKE_MAX + 1] = {
+@@ -2323,6 +3833,7 @@ static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
+ 	u64 byte_target_ns;
+ 	u8  rate_shft = 0;
+ 	u64 rate_ns = 0;
++	int k;
+ 
+ 	b->flow_quantum = 1514;
+ 	if (rate) {
+@@ -2330,10 +3841,10 @@ static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
+ 		rate_shft = 34;
+ 		rate_ns = ((u64)NSEC_PER_SEC) << rate_shft;
+ 		rate_ns = div64_u64(rate_ns, max(MIN_RATE, rate));
+-		while (!!(rate_ns >> 34)) {
+-			rate_ns >>= 1;
+-			rate_shft--;
+-		}
++		/* down to 34 bits: as many shifts as rate_ns >> 34 has bits */
++		k = fls64(rate_ns >> 34);
++		rate_ns >>= k;
++		rate_shft -= k;
+ 	} /* else unlimited, ie. zero delay */
+ 
+ 	b->tin_rate_bps  = rate;
+@@ -2351,6 +3862,7 @@ static void cake_set_rate(struct cake_tin_data *b, u64 rate, u32 mtu,
+ 		   max(rtt_est_ns + b->cparams.target - target_ns,
+ 		       b->cparams.target * 2));
+ 	b->cparams.mtu_time = byte_target_ns;
++	b->cparams.share_mtu_time = byte_target_ns;
+ 	b->cparams.p_inc = 1 << 24; /* 1/256 */
+ 	b->cparams.p_dec = 1 << 20; /* 1/4096 */
+ }
+@@ -2366,7 +3878,8 @@ static int cake_config_besteffort(struct Qdisc *sch, u64 rate, u32 mtu)
+ 	q->tin_order = normal_order;
+ 
+ 	cake_set_rate(b, rate, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
++		      us_to_ns(READ_ONCE(q->config->target)),
++		      us_to_ns(READ_ONCE(q->config->interval)));
+ 	b->tin_quantum = 65535;
+ 
+ 	return 0;
+@@ -2386,8 +3899,9 @@ static int cake_config_precedence(struct Qdisc *sch, u64 rate, u32 mtu)
+ 	for (i = 0; i < q->tin_cnt; i++) {
+ 		struct cake_tin_data *b = &q->tins[i];
+ 
+-		cake_set_rate(b, rate, mtu, us_to_ns(q->config->target),
+-			      us_to_ns(q->config->interval));
++		cake_set_rate(b, rate, mtu,
++			      us_to_ns(READ_ONCE(q->config->target)),
++			      us_to_ns(READ_ONCE(q->config->interval)));
+ 
+ 		b->tin_quantum = max_t(u16, 1U, quantum);
+ 
+@@ -2476,8 +3990,9 @@ static int cake_config_diffserv8(struct Qdisc *sch, u64 rate, u32 mtu)
+ 	for (i = 0; i < q->tin_cnt; i++) {
+ 		struct cake_tin_data *b = &q->tins[i];
+ 
+-		cake_set_rate(b, rate, mtu, us_to_ns(q->config->target),
+-			      us_to_ns(q->config->interval));
++		cake_set_rate(b, rate, mtu,
++			      us_to_ns(READ_ONCE(q->config->target)),
++			      us_to_ns(READ_ONCE(q->config->interval)));
+ 
+ 		b->tin_quantum = max_t(u16, 1U, quantum);
+ 
+@@ -2514,14 +4029,15 @@ static int cake_config_diffserv4(struct Qdisc *sch, u64 rate, u32 mtu)
+ 	q->tin_order = bulk_order;
+ 
+ 	/* class characteristics */
+-	cake_set_rate(&q->tins[0], rate, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
+-	cake_set_rate(&q->tins[1], rate >> 4, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
+-	cake_set_rate(&q->tins[2], rate >> 1, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
+-	cake_set_rate(&q->tins[3], rate >> 2, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
++	{
++		u64 target = us_to_ns(READ_ONCE(q->config->target));
++		u64 interval = us_to_ns(READ_ONCE(q->config->interval));
++
++		cake_set_rate(&q->tins[0], rate, mtu, target, interval);
++		cake_set_rate(&q->tins[1], rate >> 4, mtu, target, interval);
++		cake_set_rate(&q->tins[2], rate >> 1, mtu, target, interval);
++		cake_set_rate(&q->tins[3], rate >> 2, mtu, target, interval);
++	}
+ 
+ 	/* bandwidth-sharing weights */
+ 	q->tins[0].tin_quantum = quantum;
+@@ -2549,12 +4065,14 @@ static int cake_config_diffserv3(struct Qdisc *sch, u64 rate, u32 mtu)
+ 	q->tin_order = bulk_order;
+ 
+ 	/* class characteristics */
+-	cake_set_rate(&q->tins[0], rate, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
+-	cake_set_rate(&q->tins[1], rate >> 4, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
+-	cake_set_rate(&q->tins[2], rate >> 2, mtu,
+-		      us_to_ns(q->config->target), us_to_ns(q->config->interval));
++	{
++		u64 target = us_to_ns(READ_ONCE(q->config->target));
++		u64 interval = us_to_ns(READ_ONCE(q->config->interval));
++
++		cake_set_rate(&q->tins[0], rate, mtu, target, interval);
++		cake_set_rate(&q->tins[1], rate >> 4, mtu, target, interval);
++		cake_set_rate(&q->tins[2], rate >> 2, mtu, target, interval);
++	}
+ 
+ 	/* bandwidth-sharing weights */
+ 	q->tins[0].tin_quantum = quantum;
+@@ -2564,6 +4082,38 @@ static int cake_config_diffserv3(struct Qdisc *sch, u64 rate, u32 mtu)
+ 	return 0;
+ }
+ 
++/* The bulk rotation's quantum, before a host's flows share it out. With
++ * no-split-gso, packets of up to 64 KB are scheduled whole, and with host
++ * isolation a host's bulk flows share one quantum: at 1514 bytes, a host
++ * with 12 bulk flows got 126 bytes per pass, and each 5 KB GRO packet took
++ * some 40 passes round the flow list. Give them ~244 us at the tin's rate
++ * instead (24 KB at 800 Mbit/s). DRR shares out the same for any quantum;
++ * new flows keep the MTU-sized one, so what counts as sparse is unchanged.
++ *
++ * With cake_mq, @rate is this sub-cake's share, while host loads count a
++ * host's bulk flows in every sub-cake: sized from the share, a pass shrank
++ * with the number of busy sub-cakes (636 bytes for 12 flows over three,
++ * ~5.5 passes per GRO packet instead of ~1.9). Sized from the whole rate,
++ * each sub-cake turns its flows over in the same ~244 us as one CAKE. The
++ * sub-cakes' shares come from their weights, which don't depend on it.
++ */
++static void cake_set_bulk_quantum(struct cake_sched_config *q,
++				  struct cake_tin_data *b, u64 rate)
++{
++	u64 tin_rate = b->tin_rate_bps;
++	u64 rate_bps;
++
++	b->bulk_quantum = b->flow_quantum;
++	if (READ_ONCE(q->rate_flags) & CAKE_FLAG_SPLIT_GSO)
++		return;
++
++	rate_bps = READ_ONCE(q->rate_bps);
++	if (q->is_shared && rate && rate < rate_bps)
++		tin_rate = mul_u64_u64_div_u64(tin_rate, rate_bps, rate);
++	b->bulk_quantum = max_t(u64, b->flow_quantum,
++				min_t(u64, tin_rate >> 12, U16_MAX));
++}
++
+ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+ {
+ 	u32 mtu = likely(rate_adjust) ? 0 : psched_mtu(qdisc_dev(sch));
+@@ -2571,7 +4121,10 @@ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+ 	struct cake_sched_config *q = qd->config;
+ 	int c, ft;
+ 
+-	switch (q->tin_mode) {
++	if (!rate_adjust)
++		qd->tin_mode = READ_ONCE(q->tin_mode);
++
++	switch (qd->tin_mode) {
+ 	case CAKE_DIFFSERV_BESTEFFORT:
+ 		ft = cake_config_besteffort(sch, rate, mtu);
+ 		break;
+@@ -2594,11 +4147,31 @@ static void cake_configure_rates(struct Qdisc *sch, u64 rate, bool rate_adjust)
+ 		break;
+ 	}
+ 
++	for (c = 0; c < qd->tin_cnt; c++) {
++		struct cake_tin_data *b = &qd->tins[c];
++
++		cake_set_bulk_quantum(q, b, rate);
++		/* the share's: cake_set_rate() leaves cparams at the whole rate */
++		if (rate_adjust)
++			b->cparams.share_mtu_time = ((u64)psched_mtu(qdisc_dev(sch)) *
++						     b->tin_rate_ns) >> b->tin_rate_shft;
++	}
++
+ 	if (!rate_adjust) {
++		u32 backlog = sch->qstats.backlog, qlen = sch->q.qlen;
++
+ 		for (c = qd->tin_cnt; c < CAKE_MAX_TINS; c++) {
+ 			cake_clear_tin(sch, c);
++			if (q->is_shared)
++				cake_mq_retire_tin(qd, &qd->tins[c], ktime_get());
+ 			qd->tins[c].cparams.mtu_time = qd->tins[ft].cparams.mtu_time;
++			qd->tins[c].cparams.share_mtu_time = qd->tins[ft].cparams.mtu_time;
+ 		}
++
++		backlog -= sch->qstats.backlog;
++		qlen -= sch->q.qlen;
++		if (qlen)
++			qdisc_tree_reduce_backlog(sch, qlen, backlog);
+ 	}
+ 
+ 	qd->rate_ns   = qd->tins[ft].tin_rate_ns;
+@@ -2609,13 +4182,19 @@ static void cake_reconfigure(struct Qdisc *sch)
+ {
+ 	struct cake_sched_data *qd = qdisc_priv(sch);
+ 	struct cake_sched_config *q = qd->config;
++	u64 rate_bps = READ_ONCE(q->rate_bps);
++	u32 buffer_config_limit = READ_ONCE(q->buffer_config_limit);
+ 
+-	cake_configure_rates(sch, qd->config->rate_bps, false);
++	cake_configure_rates(sch, rate_bps, false);
++	qd->synced_rate = rate_bps;
++	/* another tin count: the next drop builds the heap over the new tins */
++	if (qd->overflow_heap_len != qd->tin_cnt * CAKE_QUEUES)
++		qd->overflow_timeout = 0;
+ 
+-	if (q->buffer_config_limit) {
+-		qd->buffer_limit = q->buffer_config_limit;
+-	} else if (q->rate_bps) {
+-		u64 t = q->rate_bps * q->interval;
++	if (buffer_config_limit) {
++		qd->buffer_limit = buffer_config_limit;
++	} else if (rate_bps) {
++		u64 t = rate_bps * READ_ONCE(q->interval);
+ 
+ 		do_div(t, USEC_PER_SEC / 4);
+ 		qd->buffer_limit = max_t(u32, t, 4U << 20);
+@@ -2627,7 +4206,35 @@ static void cake_reconfigure(struct Qdisc *sch)
+ 
+ 	qd->buffer_limit = min(qd->buffer_limit,
+ 			       max(sch->limit * psched_mtu(qdisc_dev(sch)),
+-				   q->buffer_config_limit));
++				   buffer_config_limit));
++}
++
++/* cake_mq_change() on a sub-cake: configured afresh at the whole rate as
++ * cake_reconfigure() does, then back at the share of it it had, scaled to
++ * the new rate, until its next resync works out another; the waits it has
++ * running, worked out at the share it had, go on at that one. Left at the
++ * whole rate, it sent at all of it until that resync, which then took
++ * those waits as worked out at the whole rate and stretched them by as
++ * many times as the share was smaller, the tins' with them; and it judged
++ * by the whole rate whether it had wanted more than its share.
++ */
++static void cake_mq_reconfigure(struct Qdisc *sch, u64 old_rate)
++{
++	struct cake_sched_data *qd = qdisc_priv(sch);
++	u64 old_share = qd->synced_rate, rate, share;
++
++	cake_reconfigure(sch);
++	rate = qd->synced_rate;
++	if (!old_share || !rate)
++		return;
++	share = rate;
++	if (old_rate && old_share < old_rate)
++		share = clamp(mul_u64_u64_div_u64(old_share, rate, old_rate), 1ULL, rate);
++	if (share != rate) {
++		cake_configure_rates(sch, share, true);
++		qd->synced_rate = share;
++	}
++	cake_mq_rescale_waits(qd, ktime_get(), old_share, share);
+ }
+ 
+ static int cake_config_change(struct cake_sched_config *q, struct nlattr *opt,
+@@ -2742,11 +4349,8 @@ static int cake_config_change(struct cake_sched_config *q, struct nlattr *opt,
+ 			rate_flags &= ~CAKE_FLAG_SPLIT_GSO;
+ 	}
+ 
+-	if (tb[TCA_CAKE_FWMARK]) {
++	if (tb[TCA_CAKE_FWMARK])
+ 		WRITE_ONCE(q->fwmark_mask, nla_get_u32(tb[TCA_CAKE_FWMARK]));
+-		WRITE_ONCE(q->fwmark_shft,
+-			   q->fwmark_mask ? __ffs(q->fwmark_mask) : 0);
+-	}
+ 
+ 	WRITE_ONCE(q->rate_flags, rate_flags);
+ 	WRITE_ONCE(q->flow_mode, flow_mode);
+@@ -2760,6 +4364,7 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
+ 	struct cake_sched_data *qd = qdisc_priv(sch);
+ 	struct cake_sched_config *q = qd->config;
+ 	bool overhead_changed = false;
++	u16 flags = q->rate_flags;
+ 	int ret;
+ 
+ 	if (q->is_shared) {
+@@ -2767,9 +4372,16 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	/* Once the qdisc is live, commit and reconfigure under the lock that
++	 * serializes the datapath, so a concurrent 'tc qdisc change' and the
++	 * autorate update cannot lose the configured rate.
++	 */
++	if (qd->tins)
++		sch_tree_lock(sch);
++
+ 	ret = cake_config_change(q, opt, extack, &overhead_changed);
+ 	if (ret)
+-		return ret;
++		goto unlock;
+ 
+ 	if (overhead_changed) {
+ 		qd->max_netlen = 0;
+@@ -2778,13 +4390,22 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
+ 		qd->min_adjlen = ~0;
+ 	}
+ 
+-	if (qd->tins) {
+-		sch_tree_lock(sch);
++	/* the capacity estimate starts afresh: cake_enqueue() keeps no
++	 * account of the traffic while autorate-ingress is off
++	 */
++	if (q->rate_flags & ~flags & CAKE_FLAG_AUTORATE_INGRESS) {
++		qd->avg_window_bytes = 0;
++		qd->avg_window_begin = ktime_get();
++		qd->last_packet_time = qd->avg_window_begin;
++	}
++
++	if (qd->tins)
+ 		cake_reconfigure(sch);
++unlock:
++	if (qd->tins)
+ 		sch_tree_unlock(sch);
+-	}
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void cake_destroy(struct Qdisc *sch)
+@@ -2792,6 +4413,7 @@ static void cake_destroy(struct Qdisc *sch)
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+ 
+ 	qdisc_watchdog_cancel(&q->watchdog);
++	qdisc_watchdog_cancel(&q->mq_watchdog);
+ 	tcf_block_put(q->block);
+ 	kvfree(q->tins);
+ }
+@@ -2827,6 +4449,7 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 	qd->config = q;
+ 
+ 	qdisc_watchdog_init(&qd->watchdog, sch);
++	qdisc_watchdog_init(&qd->mq_watchdog, sch);
+ 
+ 	if (opt) {
+ 		err = cake_change(sch, opt, extack);
+@@ -2838,10 +4461,6 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 	if (err)
+ 		return err;
+ 
+-	quantum_div[0] = ~0;
+-	for (i = 1; i <= CAKE_QUEUES; i++)
+-		quantum_div[i] = 65535 / i;
+-
+ 	qd->tins = kvcalloc(CAKE_MAX_TINS, sizeof(struct cake_tin_data),
+ 			    GFP_KERNEL);
+ 	if (!qd->tins)
+@@ -2850,23 +4469,16 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 	for (i = 0; i < CAKE_MAX_TINS; i++) {
+ 		struct cake_tin_data *b = qd->tins + i;
+ 
+-		INIT_LIST_HEAD(&b->new_flows);
+-		INIT_LIST_HEAD(&b->old_flows);
+-		INIT_LIST_HEAD(&b->decaying_flows);
++		cake_init_flowchains(b);
+ 		b->sparse_flow_count = 0;
+ 		b->bulk_flow_count = 0;
+ 		b->decaying_flow_count = 0;
+ 
+ 		for (j = 0; j < CAKE_QUEUES; j++) {
+ 			struct cake_flow *flow = b->flows + j;
+-			u32 k = j * CAKE_MAX_TINS + i;
+ 
+ 			INIT_LIST_HEAD(&flow->flowchain);
+ 			cobalt_vars_init(&flow->cvars);
+-
+-			qd->overflow_heap[k].t = i;
+-			qd->overflow_heap[k].b = j;
+-			b->overflow_idx[j] = k;
+ 		}
+ 	}
+ 
+@@ -2880,11 +4492,23 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
+ 	return 0;
+ }
+ 
++/* cake_mq's host table for each tin's sources and destinations, or NULL */
++static void cake_mq_set_host_tables(struct cake_sched_data *qd, atomic_t *hosts)
++{
++	int i;
++
++	for (i = 0; i < CAKE_MAX_TINS; i++) {
++		qd->tins[i].mq_srcload = hosts ? hosts + (2 * i) * CAKE_QUEUES : NULL;
++		qd->tins[i].mq_dstload = hosts ? hosts + (2 * i + 1) * CAKE_QUEUES : NULL;
++	}
++}
++
+ static void cake_config_replace(struct Qdisc *sch, struct cake_sched_config *cfg)
+ {
+ 	struct cake_sched_data *qd = qdisc_priv(sch);
+ 
+ 	qd->config = cfg;
++	cake_mq_set_host_tables(qd, cfg->mq_hosts);
+ 	cake_reconfigure(sch);
+ }
+ 
+@@ -3155,7 +4779,7 @@ static int cake_dump_class_stats(struct Qdisc *sch, unsigned long cl,
+ 			goto nla_put_failure;			       \
+ 	} while (0)
+ 
+-		PUT_STAT_S32(DEFICIT, flow->deficit);
++		PUT_STAT_S32(DEFICIT, flow->deficit >> CAKE_DEFICIT_SHIFT);
+ 		PUT_STAT_U32(DROPPING, flow->cvars.dropping);
+ 		PUT_STAT_U32(COBALT_COUNT, flow->cvars.count);
+ 		PUT_STAT_U32(P_DROP, flow->cvars.p_drop);
+@@ -3239,9 +4863,48 @@ struct cake_mq_sched {
+ 	struct cake_sched_config cake_config;
+ };
+ 
++/* Replacing a cake_mq with another multi-queue qdisc destroys it before its
++ * sub-cakes: they stay on the device's tx queues until the new one's attach
++ * puts them, and resetting them then would reach the shared config and host
++ * table freed with it. Each gets a copy of the config to go with, as a
++ * plain cake with no host table, no longer counted with the others.
++ */
++static void cake_mq_orphan_children(struct Qdisc *sch)
++{
++	struct cake_mq_sched *priv = qdisc_priv(sch);
++	struct net_device *dev = qdisc_dev(sch);
++	unsigned int ntx;
++
++	for (ntx = 0; ntx < dev->num_tx_queues; ntx++) {
++		struct Qdisc *chld = rtnl_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
++		struct cake_sched_data *qd;
++
++		if (!chld || chld->ops != &cake_qdisc_ops)
++			continue;
++		qd = qdisc_priv(chld);
++		if (qd->config != &priv->cake_config)
++			continue;
++
++		sch_tree_lock(chld);
++		qd->initial_config = priv->cake_config;
++		qd->initial_config.is_shared = 0;
++		qd->initial_config.used_qs = NULL;
++		qd->initial_config.mq_hosts = NULL;
++		qd->config = &qd->initial_config;
++		if (qd->tins)
++			cake_mq_set_host_tables(qd, NULL);
++		sch_tree_unlock(chld);
++	}
++}
++
+ static void cake_mq_destroy(struct Qdisc *sch)
+ {
++	struct cake_mq_sched *priv = qdisc_priv(sch);
++
+ 	mq_destroy_common(sch);
++	cake_mq_orphan_children(sch);
++	bitmap_free(priv->cake_config.used_qs);
++	kvfree(priv->cake_config.mq_hosts);
+ }
+ 
+ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+@@ -3259,6 +4922,15 @@ static int cake_mq_init(struct Qdisc *sch, struct nlattr *opt,
+ 			return ret;
+ 	}
+ 
++	/* freed by cake_mq_destroy(), which also runs if init fails */
++	priv->cake_config.used_qs = bitmap_zalloc(dev->num_tx_queues, GFP_KERNEL);
++	if (!priv->cake_config.used_qs)
++		return -ENOMEM;
++	priv->cake_config.mq_hosts = kvcalloc(2 * CAKE_MAX_TINS * CAKE_QUEUES,
++					      sizeof(atomic_t), GFP_KERNEL);
++	if (!priv->cake_config.mq_hosts)
++		return -ENOMEM;
++
+ 	ret = mq_init_common(sch, opt, extack, &cake_qdisc_ops);
+ 	if (ret)
+ 		return ret;
+@@ -3281,6 +4953,7 @@ static int cake_mq_change(struct Qdisc *sch, struct nlattr *opt,
+ 			  struct netlink_ext_ack *extack)
+ {
+ 	struct cake_mq_sched *priv = qdisc_priv(sch);
++	u64 old_rate = READ_ONCE(priv->cake_config.rate_bps);
+ 	struct net_device *dev = qdisc_dev(sch);
+ 	bool overhead_changed = false;
+ 	unsigned int ntx;
+@@ -3294,16 +4967,15 @@ static int cake_mq_change(struct Qdisc *sch, struct nlattr *opt,
+ 		struct Qdisc *chld = rtnl_dereference(netdev_get_tx_queue(dev, ntx)->qdisc_sleeping);
+ 		struct cake_sched_data *qd = qdisc_priv(chld);
+ 
+-		if (overhead_changed) {
+-			qd->max_netlen = 0;
+-			qd->max_adjlen = 0;
+-			qd->min_netlen = ~0;
+-			qd->min_adjlen = ~0;
+-		}
+-
+ 		if (qd->tins) {
+ 			sch_tree_lock(chld);
+-			cake_reconfigure(chld);
++			if (overhead_changed) {
++				qd->max_netlen = 0;
++				qd->max_adjlen = 0;
++				qd->min_netlen = ~0;
++				qd->min_adjlen = ~0;
++			}
++			cake_mq_reconfigure(chld, old_rate);
+ 			sch_tree_unlock(chld);
+ 		}
+ 	}
+@@ -3344,7 +5016,11 @@ MODULE_ALIAS_NET_SCH("cake_mq");
+ 
+ static int __init cake_module_init(void)
+ {
+-	int ret;
++	int ret, i;
++
++	quantum_div[0] = ~0;
++	for (i = 1; i <= CAKE_QUEUES; i++)
++		quantum_div[i] = 65535 / i;
+ 
+ 	ret = register_qdisc(&cake_qdisc_ops);
+ 	if (ret)
+@@ -3369,3 +5045,7 @@ MODULE_AUTHOR("Jonathan Morton");
+ MODULE_LICENSE("Dual BSD/GPL");
+ MODULE_DESCRIPTION("The CAKE shaper.");
+ MODULE_IMPORT_NS(NET_SCHED_INTERNAL);
++
++#if IS_ENABLED(CONFIG_NET_SCH_CAKE_KUNIT_TEST)
++#include "sch_cake_test.c"
++#endif
