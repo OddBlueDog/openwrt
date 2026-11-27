@@ -1,27 +1,41 @@
 #!/bin/sh
 # AdGuard Home (ui feature "adguardhome"): in the image, off until it's
-# turned on on its page. Its updates come from MilkFlint's own package feed:
-# a repository tagged @milkflint, next to the kmod feed's (same site, same
-# signing key), and apk's world asks for adguardhome@milkflint, so OpenWrt's
-# feed (which has a package of the same name, built another way) can't
-# replace it. Safe to run again (it is, after every upgrade).
+# turned on on its page. Its updates come from MilkFlint's own package feed,
+# through the package updater (ui feature "pkg-update", whose first-boot
+# defaults write the feed's repository line). apk's world pins
+# adguardhome=<version> (via apk-pins, without @milkflint) so OpenWrt's feed
+# can't replace it and offline apk commands (such as `apk del` after a reboot
+# before `apk update`) never fail on a missing repository tag. Safe to run
+# again (it is, after every upgrade).
 [ -x /usr/bin/AdGuardHome ] || exit 0
 
-list=/etc/apk/repositories.d/milkflint.list
-arch=$(head -n 1 /etc/apk/arch 2> /dev/null)
-# the kmod feed's site (patch 0055 writes kmods.list from the build's
-# CONFIG_VERSION_KMODS_REPO), else MilkFlint's own
-site=$(sed -n 's#^\(https\{0,1\}://[^/]*\)/targets/.*#\1#p' /etc/apk/repositories.d/kmods.list 2> /dev/null | head -n 1)
-[ -n "$site" ] || site=https://milkflint-packages.pages.dev
-if [ -n "$arch" ] && ! grep -q '^@milkflint ' "$list" 2> /dev/null; then
-	cat > "$list" <<-EOF
-	# MilkFlint's own packages (AdGuard Home), tagged: only what asks for
-	# @milkflint comes from here
-	@milkflint $site/packages/$arch/milkflint/packages.adb
-	EOF
+# Earlier releases put adguardhome@milkflint in /etc/apk/world, which makes
+# apk refuse offline commits when the feed index isn't cached. Replace any
+# leftover tag with a plain version pin (91-milkflint-apk-pins pins bare
+# adguardhome entries too).
+ver=$(awk '/^P:adguardhome$/ { f = 1; next } f && /^V:/ { print substr($0, 3); exit } /^$/ { f = 0 }' /lib/apk/db/installed 2> /dev/null)
+if grep -q '^adguardhome@milkflint' /etc/apk/world 2> /dev/null; then
+	if [ -n "$ver" ]; then
+		sed -i "s/^adguardhome@milkflint.*$/adguardhome=$ver/" /etc/apk/world
+	else
+		sed -i 's/^adguardhome@milkflint.*$/adguardhome/' /etc/apk/world
+	fi
 fi
-if grep -q '^@milkflint ' "$list" 2> /dev/null && grep -q '^adguardhome\(><.*\)\{0,1\}$' /etc/apk/world; then
-	sed -i 's/^adguardhome\(><.*\)\{0,1\}$/adguardhome@milkflint/' /etc/apk/world
+
+# Releases before MilkFlint's own numbering (-r1001 and up) pinned
+# adguardhome=<version>-r<small number>; OpenWrt's build of the same version
+# has such a number, so the pin follows the installed (MilkFlint) version.
+if [ -n "$ver" ]; then
+	pin=$(grep '^adguardhome=' /etc/apk/world 2> /dev/null | head -n 1)
+	rel=${pin##*-r}
+	case "$rel" in
+	'' | *[!0-9]*) ;;
+	*)
+		if [ "$rel" -lt 1000 ] && [ "$pin" != "adguardhome=$ver" ]; then
+			sed -i "s/^adguardhome=.*$/adguardhome=$ver/" /etc/apk/world
+		fi
+		;;
+	esac
 fi
 
 # what devices' lookups do while it's down, once it has started (the

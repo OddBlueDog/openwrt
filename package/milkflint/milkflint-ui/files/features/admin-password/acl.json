@@ -1,6 +1,25 @@
 {
 	"milkflint-admin-password": {
-		"description": "MilkFlint web interface: Admin Password",
-		"read": { "ubus": { "milkflint.adminpassword": [ "status" ] } }
+		"description": "MilkFlint web interface: Router access (whether root has a password; SSH's settings and the keys that may sign in, and the package manager's keys, as LuCI's SSH Access, SSH-Keys and Repository Public Keys pages read and write them)",
+		"read": {
+			"ubus": {
+				"milkflint.adminpassword": [ "status" ],
+				"file": [ "read", "list" ]
+			},
+			"uci": [ "dropbear" ],
+			"file": {
+				"/etc/dropbear/authorized_keys": [ "read" ],
+				"/etc/apk/keys": [ "list" ],
+				"/etc/apk/keys/*": [ "read" ]
+			}
+		},
+		"write": {
+			"ubus": { "file": [ "write", "remove" ] },
+			"uci": [ "dropbear" ],
+			"file": {
+				"/etc/dropbear/authorized_keys": [ "write" ],
+				"/etc/apk/keys/*": [ "write" ]
+			}
+		}
 	}
 }

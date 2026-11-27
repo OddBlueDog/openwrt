@@ -1,0 +1,1 @@
+function e(e,t,n){if(!(e===void 0||t===void 0||n<.5||t<e))return(t-e)*8/n}function t(t,n,r){if(t?.kind!==n.kind)return{};let i=(n.at-t.at)/1e3,a=(t,n)=>r&&i>=.5&&n<t?0:e(t,n,i);return{down:a(t.down,n.down),up:a(t.up,n.up)}}export{t as n,e as t};

@@ -1,0 +1,1 @@
+function e(e){return e===`server`||e===`hybrid`?`server`:e===`relay`?`relay`:`off`}export{e as t};

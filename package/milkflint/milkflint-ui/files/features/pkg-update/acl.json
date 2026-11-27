@@ -1,0 +1,11 @@
+{
+	"milkflint-pkg-update": {
+		"description": "MilkFlint web interface: package updates (status, check, install)",
+		"read": {
+			"ubus": { "milkflint.packages": [ "status" ] }
+		},
+		"write": {
+			"ubus": { "milkflint.packages": [ "check", "install" ] }
+		}
+	}
+}

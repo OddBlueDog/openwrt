@@ -1,0 +1,8 @@
+{
+	"milkflint-connections": {
+		"description": "MilkFlint web interface: Connections",
+		"read": {
+			"ubus": { "milkflint.connections": [ "list" ] }
+		}
+	}
+}

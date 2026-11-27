@@ -5,17 +5,28 @@
 # and loads nftables table inet milkflint_vpn_dns to redirect marked VPN
 # devices' port-53 lookups to it and mark its outbound traffic into wg_out.
 # Other devices and the router itself keep using the main dnsmasq on port 53.
+# While wg_out is enabled with devices marked for it, it also runs the tunnel
+# watcher (instance watch, /usr/libexec/milkflint/vpn-watch): it writes
+# /var/run/milkflint/vpn-tunnel.json and loads table inet milkflint_vpn_down
+# while the server isn't answering. If the watcher dies, its table stays
+# (procd respawns it, and it carries on from the state file); the table and
+# the state file only go when the service stops or the watcher isn't wanted.
+# At every start and reload it first keeps the sites that go direct in step
+# with their list (vpn-direct.uc): a name taken off it, by the VPN page, LuCI
+# or uci, has fw4's sets flushed after dnsmasq has the new list.
 
 START=95
 STOP=06
 USE_PROCD=1
 
 TABLE=milkflint_vpn_dns
+DOWN_TABLE=milkflint_vpn_down
+TUNNEL_STATE=/var/run/milkflint/vpn-tunnel.json
 
 vpn_dns_args() {
 	ucode -e '
 		import * as v from "/usr/libexec/milkflint/vpn-dns.uc";
-		const args = v.dnsmasq_args();
+		const args = v.dnsmasq_args(null, v.forwarder_mode());
 		if (args)
 			print(join("\n", args), "\n");
 	' 2> /dev/null
@@ -32,8 +43,41 @@ clear_nft() {
 	nft delete table inet $TABLE 2> /dev/null
 }
 
+watch_wanted() {
+	ucode -e '
+		import { cursor } from "uci";
+		import * as w from "/usr/libexec/milkflint/vpn-watch.uc";
+		exit(w.wanted(cursor()) ? 0 : 1);
+	' 2> /dev/null
+}
+
+# fd 1000 is procd's lock for this service (reload holds it): closed here,
+# so dnsmasq's own reload, which vpn-direct.uc can call, takes its own
+direct_sync() {
+	ucode -e '
+		import { sync } from "/usr/libexec/milkflint/vpn-direct.uc";
+		sync();
+	' 1000>&- > /dev/null 2>&1
+}
+
+clear_down() {
+	nft delete table inet $DOWN_TABLE 2> /dev/null
+	rm -f $TUNNEL_STATE $TUNNEL_STATE.tmp
+}
+
 start_service() {
 	local args
+	[ ! -f /usr/libexec/milkflint/vpn-direct.uc ] || direct_sync
+	WATCH=
+	if [ -x /usr/libexec/milkflint/vpn-watch ] && watch_wanted; then
+		WATCH=1
+		procd_open_instance watch
+		procd_set_param command /usr/libexec/milkflint/vpn-watch
+		procd_set_param respawn 3600 5 0
+		procd_set_param stderr 1
+		procd_close_instance
+	fi
+
 	if [ -x /usr/sbin/dnsmasq ] && grep -q '^adguardvpn:' /etc/passwd; then
 		args=$(vpn_dns_args)
 	fi
@@ -55,8 +99,16 @@ start_service() {
 	apply_nft
 }
 
+# the watcher stopped by this start (the VPN turned off, or no device marked
+# any more): its table and state file go with it
+service_started() {
+	[ -n "$WATCH" ] || clear_down
+	return 0
+}
+
 service_stopped() {
 	clear_nft
+	clear_down
 	return 0
 }
 
@@ -66,8 +118,10 @@ service_triggers() {
 
 # Never call `stop` here: `stop` deletes the service and its reload triggers
 # from procd, so a later UCI change wouldn't start it again. Calling `start`
-# replaces the service in place (stopping `dns` if no longer wanted and
-# clearing the nftables table) while keeping its triggers registered.
+# replaces the service in place (stopping `dns` or `watch` if no longer
+# wanted and clearing their nftables tables) while keeping its triggers
+# registered. An instance whose command is unchanged keeps running, so the
+# watcher's own reloads (for the forwarder's mode) don't restart it.
 reload_service() {
 	start
 }

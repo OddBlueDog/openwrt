@@ -22,6 +22,7 @@ import { readfile, writefile, rename, open, access, mkdir, unlink, stat, popen }
 import * as socket from 'socket';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
+import { killswitch as vpn_killswitch } from '/usr/libexec/milkflint/vpn-watch.uc';
 
 export const CONFIG = '/etc/adguardhome/AdGuardHome.yaml';
 export const KEY = '/etc/milkflint/adguardhome.key';
@@ -899,6 +900,36 @@ export function addresses_of(macs) {
 			add(m[1]);
 	}
 	return sort(out);
+};
+
+// The VPN tunnel is down (the watcher's state file, vpn-tunnel.json) with the
+// kill switch off (vpn-watch.uc's killswitch: no network.wg_out_kill, or one
+// turned off, as the VPN page reads it): the VPN devices' lookups may use the
+// router's own DNS meanwhile. With the kill switch on, the watcher's down
+// table catches them before AdGuard Home, so nothing changes here. The file
+// is state_file in tests.
+export function tunnel_direct(c, state_file) {
+	if (!c)
+		c = cursor();
+	if (vpn_killswitch(c))
+		return false;
+	let st = null;
+	try {
+		st = json(readfile(state_file ?? '/var/run/milkflint/vpn-tunnel.json') ?? 'null');
+	}
+	catch (e) {
+		// unreadable: as if none
+	}
+	return type(st) == 'object' && st.up == false;
+};
+
+// The VPN client's upstreams in AdGuard Home: the router's dnsmasq for the
+// home domain, and the VPN's forwarder (w.port), or while the tunnel is down
+// with no kill switch (w.state 'direct') the router's own DNS. The sites that
+// go direct (the VPN page) are asked of the router's own DNS too, which fills
+// their fw4 sets.
+export function vpn_client_upstreams(w, domain, direct) {
+	return [ `[/${domain}/]${DNSMASQ}`, ...map(direct ?? [], (d) => `[/${d}/]${DNSMASQ}`), (w.state == 'direct') ? DNSMASQ : `127.0.0.1:${w.port ?? VPN_PORT}` ];
 };
 
 // The DNS page's servers, for the VPN's dnsproxy: { upstream, fallback,

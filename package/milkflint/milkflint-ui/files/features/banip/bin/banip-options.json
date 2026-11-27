@@ -41,7 +41,6 @@
 		"ban_feedout": { "type": "list", "item": "feed", "apply": "restart" },
 		"ban_feedinout": { "type": "list", "item": "feed", "apply": "restart" },
 		"ban_feedreset": { "type": "list", "item": "feed", "apply": "restart" },
-		"ban_feedcomplete": { "type": "list", "item": "feed", "apply": "restart" },
 		"ban_nftloglevel": { "type": "enum", "default": "warn", "values": [ "emerg", "alert", "crit", "err", "warn", "notice", "info", "debug" ], "apply": "restart" },
 		"ban_logprerouting": { "type": "bool", "default": "0", "apply": "restart" },
 		"ban_loginbound": { "type": "bool", "default": "0", "apply": "restart" },

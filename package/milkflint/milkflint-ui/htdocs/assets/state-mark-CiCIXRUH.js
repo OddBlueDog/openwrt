@@ -1,0 +1,1 @@
+import{a as e,u as t}from"./button-BeAJDuEO.js";var n=t();function r({className:t}){return(0,n.jsx)(`span`,{"aria-hidden":`true`,className:e(`inline-flex size-[1.15em] shrink-0 items-center justify-center rounded-full border-[0.1em] border-current text-[0.75em] leading-none font-bold`,t),children:`!`})}export{r as t};

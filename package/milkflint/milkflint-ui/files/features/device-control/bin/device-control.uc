@@ -14,6 +14,7 @@
 
 import { readfile, writefile, open, rename, mkdir, popen } from 'fs';
 import { cursor } from 'uci';
+import { addresses_of, cut as ct_cut } from '/usr/libexec/milkflint/conntrack.uc';
 
 export const STATE = '/etc/milkflint/device-control.json';
 export const RUN = '/var/run/milkflint';
@@ -153,51 +154,10 @@ export function cmd(c) {
 
 const as_list = (v) => (type(v) == 'array') ? v : (v != null && v != '') ? split(trim(v), /[ \t]+/) : [];
 
-// The addresses the devices with these MACs use now: IPv4 from dnsmasq's
-// leases, the fixed ones (dhcp host sections) and the neighbour table, IPv6
-// from the neighbour table (link-local ones too: a connection to the router
-// itself can use one).
-export function addresses(macs) {
-	const want = {};
-	for (let m in macs)
-		want[lc(m)] = true;
-	const out = {};
-	for (let line in split(readfile('/tmp/dhcp.leases') ?? '', '\n')) {
-		const f = split(trim(line), /[ \t]+/);
-		if (length(f) >= 3 && want[lc(f[1])] && index(f[2], '.') > 0)
-			out[f[2]] = true;
-	}
-	cursor().foreach('dhcp', 'host', (h) => {
-		for (let m in as_list(h.mac))
-			if (want[lc(m)] && h.ip && index(h.ip, '.') > 0)
-				out[h.ip] = true;
-	});
-	for (let line in split(cmd('ip neigh show') ?? '', '\n')) {
-		const f = split(line, ' ');
-		const i = index(f, 'lladdr');
-		if (i > 0 && want[lc(f[i + 1] ?? '')])
-			out[f[0]] = true;
-	}
-	return sort(keys(out));
-};
-
-// Ends every connection of these devices that's open now, as conntrack
-// tracks them: OpenWrt's kernel drops each connection with an address
-// written to /proc/net/nf_conntrack. A connection the flow table had sped
-// past the firewall goes with its conntrack entry (the flow table lets go of
-// a flow whose entry is gone), so the next packet is a new connection, which
-// the rules then refuse. Returns how many addresses it cleared.
+// Ends every connection of these devices that's open now (conntrack.uc's
+// cut, on the addresses they use).
 export function cut(macs) {
-	let n = 0;
-	for (let a in addresses(macs)) {
-		const f = open('/proc/net/nf_conntrack', 'w');
-		if (!f)
-			break;
-		if (f.write(`${a}\n`) != null)
-			n++;
-		f.close();
-	}
-	return n;
+	return ct_cut(addresses_of(macs));
 };
 
 // ---- the rules, as fw4 runs them ----

@@ -1,0 +1,1 @@
+import{a as e,u as t}from"./button-BeAJDuEO.js";var n=t();function r({className:t,...r}){return(0,n.jsx)(`div`,{"data-slot":`skeleton`,className:e(`rounded-lg bg-muted motion-safe:animate-pulse`,t),...r})}export{r as t};

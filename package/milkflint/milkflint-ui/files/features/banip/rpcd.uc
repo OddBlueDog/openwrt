@@ -24,16 +24,16 @@ const REPLY = 900 * 1024;
 // the license texts the image carries (features/banip/licenses, gawk's package), served at /licenses/
 const LICENSES = '/www/licenses';
 
-// banIP's package version, read again only when apk's database changes (an
-// upgrade from a package feed, without a restart of rpcd)
+// banIP's package version and source, read again only when apk's database
+// changes (an upgrade from a package feed, without a restart of rpcd)
 const APK_DB = '/lib/apk/db/installed';
 let version_cache = null;
 
-function package_version() {
+function package_info() {
 	const mtime = stat(APK_DB)?.mtime ?? null;
 	if (version_cache?.mtime !== mtime)
-		version_cache = { mtime, version: b.package_version() };
-	return version_cache.version;
+		version_cache = { mtime, version: b.package_version(), source: b.package_source() };
+	return version_cache;
 }
 
 const ok = (x) => ({ ok: true, ...(x ?? {}) });
@@ -184,7 +184,8 @@ function status() {
 	const st = b.read_state() ?? {};
 	const loaded = b.table_loaded();
 	const running = service_running();
-	const version = package_version();
+	// (ucode has no destructuring)
+	const pkg = package_info(), version = pkg.version, source = pkg.source;
 	let state;
 	if (!enabled)
 		state = 'off';
@@ -208,6 +209,8 @@ function status() {
 	return {
 		installed: true,
 		version,
+		// openwrt/packages at the commit this build is from (null before 1.9.2-r1001)
+		source,
 		// linked from the page when this image carries them (0.81a and earlier don't)
 		licenses: {
 			banip: access(`${LICENSES}/banip/COPYING`) ? '/licenses/banip/COPYING' : null,

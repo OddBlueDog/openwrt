@@ -1,0 +1,1 @@
+import{i as e,t}from"./react-DB-4Zxce.js";import{p as n}from"./router-CCkFW3lp.js";var r=e(t(),1);function i(e){let t=n();return r.useCallback(n=>t.navigate({...n,from:n.from??e?.from}),[e?.from,t])}export{i as t};

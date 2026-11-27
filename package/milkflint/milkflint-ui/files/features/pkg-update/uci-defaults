@@ -1,0 +1,49 @@
+#!/bin/sh
+# The package updater (ui feature "pkg-update"): updates of AdGuard Home and
+# banIP come from MilkFlint's own package feed, a repository tagged
+# @milkflint, next to the kmod feed's (same site, same signing key), written
+# whatever is installed. apk's world pins each of them as <name>=<version>
+# (via apk-pins, without @milkflint) so OpenWrt's feed can't replace them and
+# offline apk commands (such as `apk del` after a reboot before `apk update`)
+# never fail on a missing repository tag; pkg-update uses @milkflint only
+# while fetching from the feed. Safe to run again (it is, after every
+# upgrade).
+list=/etc/apk/repositories.d/milkflint.list
+arch=$(head -n 1 /etc/apk/arch 2> /dev/null)
+# the kmod feed's site (patch 0055 writes kmods.list from the build's
+# CONFIG_VERSION_KMODS_REPO), else MilkFlint's own
+site=$(sed -n 's#^\(https\{0,1\}://[^/]*\)/targets/.*#\1#p' /etc/apk/repositories.d/kmods.list 2> /dev/null | head -n 1)
+[ -n "$site" ] || site=https://milkflint-packages.pages.dev
+if [ -n "$arch" ] && ! grep -q '^@milkflint ' "$list" 2> /dev/null; then
+	cat > "$list" <<-EOF
+	# MilkFlint's own packages (AdGuard Home, banIP), tagged: only what asks
+	# for @milkflint comes from here
+	@milkflint $site/packages/$arch/milkflint/packages.adb
+	EOF
+fi
+
+# The versions kept back from the page (milkflint.pkgupdate.<name>_pinned, a
+# '-' in the name as '_'): AdGuard Home's from before the updater was
+# shared, milkflint.adguardhome.pinned, moved there once; then each dropped
+# when a different version is installed (e.g. after a firmware upgrade
+# shipping a newer one).
+old=$(uci -q get milkflint.adguardhome.pinned)
+if [ -n "$old" ]; then
+	uci -q get milkflint.pkgupdate > /dev/null || uci set milkflint.pkgupdate=pkgupdate
+	uci set milkflint.pkgupdate.adguardhome_pinned="$old"
+	uci delete milkflint.adguardhome.pinned
+	uci commit milkflint
+fi
+for hook in /usr/libexec/milkflint/pkg-update.d/*.uc; do
+	[ -f "$hook" ] || continue
+	name=$(basename "$hook" .uc)
+	opt=milkflint.pkgupdate.$(echo "$name" | tr - _)_pinned
+	pinned=$(uci -q get "$opt")
+	[ -n "$pinned" ] || continue
+	ver=$(awk -v p="P:$name" '$0 == p { f = 1; next } f && /^V:/ { print substr($0, 3); exit } /^$/ { f = 0 }' /lib/apk/db/installed 2> /dev/null)
+	if [ -n "$ver" ] && [ "$pinned" != "$ver" ]; then
+		uci -q delete "$opt"
+		uci commit milkflint
+	fi
+done
+exit 0

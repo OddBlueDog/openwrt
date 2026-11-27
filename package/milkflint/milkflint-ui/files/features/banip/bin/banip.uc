@@ -119,6 +119,26 @@ export function package_version() {
 	return m ? m[2] : null;
 };
 
+// Where the installed banIP's source is, as its package says (U:, the
+// Makefile's URL: openwrt/packages at the commit it's built from, since
+// 1.9.2-r1001); null for a build that names none or names another address.
+export function package_source() {
+	const db = readfile('/lib/apk/db/installed') ?? '';
+	const at = substr(db, 0, 8) == 'P:banip\n' ? 0 : index(db, '\nP:banip\n');
+	if (at < 0)
+		return null;
+	const rest = substr(db, at);
+	const end = index(rest, '\n\n');
+	const block = end < 0 ? rest : substr(rest, 0, end + 1);
+	const u = index(block, '\nU:');
+	if (u < 0)
+		return null;
+	const line = substr(block, u + 3);
+	const nl = index(line, '\n');
+	const url = nl < 0 ? line : substr(line, 0, nl);
+	return match(url, /^https:\/\/github\.com\/openwrt\/packages\/tree\/[0-9a-f]{7,40}\/net\/banip$/) ? url : null;
+};
+
 export function meminfo() {
 	const t = readfile('/proc/meminfo') ?? '';
 	const kb = (k) => +(match(t, regexp(`(^|\n)${k}:[ \t]+([0-9]+)`))?.[2] ?? 0);

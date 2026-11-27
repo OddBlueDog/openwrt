@@ -1,0 +1,1 @@
+import{c as e,o as t}from"./dist-ejUggI2m.js";function n(n,r){return t(n,e,r)}export{n as t};

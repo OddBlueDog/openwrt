@@ -1,0 +1,8 @@
+{
+	"milkflint-devices-seen": {
+		"description": "MilkFlint web interface: when each device was first seen by the router",
+		"read": {
+			"ubus": { "milkflint.devices": [ "seen" ] }
+		}
+	}
+}

@@ -1,0 +1,1 @@
+import{i as e,t}from"./react-DB-4Zxce.js";import{t as n}from"./useQuery-D7biHzLf.js";import{A as r,k as i,n as a}from"./wed-notice-CCocxqYY.js";var o=e(t(),1);function s(){let{data:e,refetch:t}=n(a.wed()),s=(0,o.useCallback)(t=>e===void 0?[]:i(e,t),[e]),c=(0,o.useCallback)(()=>{t()},[t]);return{on:e!==void 0&&r(e.milkflint),offChanges:s,reload:c}}export{s as t};

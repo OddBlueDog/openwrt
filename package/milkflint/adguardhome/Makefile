@@ -5,13 +5,20 @@
 # settings, jail, and paths, and off until turned on (adguardhome.config.enabled).
 # Updating is a PKG_VERSION + PKG_HASH bump — no Go or Node host build needed.
 #
+# Why r1001: PKG_RELEASE is upstream's + 1000, MilkFlint's own build number.
+# Routers update AdGuard Home from MilkFlint's own package feed, and apk's
+# world pins it as adguardhome=<version> without the feed's tag; OpenWrt's
+# builds never have an r1000 or higher, so that pin can only match
+# MilkFlint's build, and OpenWrt's same-named adguardhome (1.0.0-r1 in 25.12.6)
+# can't replace it.
+#
 # Copyright (C) the openwrt/packages authors (net/adguardhome)
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=adguardhome
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=1001
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-linux-arm64.tar.gz
 PKG_SOURCE_URL:=https://github.com/AdguardTeam/AdGuardHome/releases/download/v$(PKG_VERSION)/AdGuardHome_linux_arm64.tar.gz?

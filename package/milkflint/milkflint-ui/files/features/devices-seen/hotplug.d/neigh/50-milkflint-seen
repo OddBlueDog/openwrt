@@ -1,0 +1,1 @@
+[ -n "$MACADDR" ] && exec /usr/bin/ucode /usr/libexec/milkflint/devices-seen "$ACTION" "$MACADDR" neigh

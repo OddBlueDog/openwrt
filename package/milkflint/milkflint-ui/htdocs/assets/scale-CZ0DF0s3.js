@@ -1,0 +1,1 @@
+function e(e){if(e<=0)return 1;let t=10**Math.floor(Math.log10(e));for(let n of[1,1.5,2,2.5,3,4,5,6,8,10])if(e<=n*t)return n*t;return 10*t}export{e as t};

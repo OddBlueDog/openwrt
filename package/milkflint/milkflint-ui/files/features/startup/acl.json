@@ -1,0 +1,19 @@
+{
+	"milkflint-startup": {
+		"description": "MilkFlint web interface: Startup (the services in /etc/init.d and /etc/rc.local, as LuCI's Startup page lists, runs and writes them)",
+		"read": {
+			"ubus": {
+				"rc": [ "list" ],
+				"file": [ "read" ]
+			},
+			"file": { "/etc/rc.local": [ "read" ] }
+		},
+		"write": {
+			"ubus": {
+				"rc": [ "init" ],
+				"file": [ "write" ]
+			},
+			"file": { "/etc/rc.local": [ "write" ] }
+		}
+	}
+}

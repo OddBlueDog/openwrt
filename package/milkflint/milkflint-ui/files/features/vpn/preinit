@@ -1,0 +1,11 @@
+# MilkFlint VPN (ui feature "vpn"), installed as /lib/preinit/81_milkflint-vpn:
+# /etc/config/milkflint can hold VPN profile keys, so it is readable by root
+# only, like /etc/config/network. A sysupgrade or a restored backup brings the
+# file back with the mode it had, so the mode is set at every boot. Runs after
+# 80_mount_root has restored the kept config.
+
+milkflint_vpn_preinit() {
+	[ ! -f /etc/config/milkflint ] || chmod 600 /etc/config/milkflint
+}
+
+boot_hook_add preinit_main milkflint_vpn_preinit

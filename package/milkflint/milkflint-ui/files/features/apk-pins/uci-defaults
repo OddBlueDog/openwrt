@@ -9,29 +9,31 @@
 # modules out too). MilkFlint's own upgrades bring new builds: sysupgrade
 # starts from the new image's world, and this runs again.
 #
-# Only a bare name is pinned: one with a repository tag (AdGuard Home's
-# adguardhome@milkflint) or a version asked for is left as it is. One that's
-# installed as another package's dependency, not in the world, is added.
-# Safe to run again.
+# Only a bare name is pinned: one with a repository tag or a version asked
+# for is left as it is. One that's installed as another package's dependency,
+# not in the world, is added. Safe to run again.
 world=/etc/apk/world
 db=/lib/apk/db/installed
 [ -s "$world" ] && [ -s "$db" ] || exit 0
 
 # The packages: by origin, the OpenWrt tree's package folders MilkFlint's
 # patches change (kernel modules aside); by name, the packages-feed packages
-# MilkFlint builds itself (AdGuard Home aside: its updates come from
-# MilkFlint's own feed), and banIP, which its page drives in detail.
+# MilkFlint builds itself (including adguardhome: pinned by version rather
+# than @milkflint so offline apk commands like `apk del` work without a
+# cached feed index), and banIP, which its page drives in detail.
 # BEGIN generated
 origins='
 feeds/base/base-files
 feeds/base/network/config/firewall4
 feeds/base/network/config/wifi-scripts
 feeds/base/network/services/dnsmasq
+feeds/base/network/services/dropbear
 feeds/base/network/services/hostapd
 feeds/base/network/utils/wireguard-tools
 feeds/base/system/ca-certificates
 '
 names='
+adguardhome
 banip
 dnsproxy
 gawk

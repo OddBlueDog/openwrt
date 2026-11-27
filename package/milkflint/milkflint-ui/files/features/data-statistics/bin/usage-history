@@ -1,0 +1,166 @@
+#!/usr/bin/ucode
+// MilkFlint per-device history (procd instance "history" of
+// milkflint-data-statistics, ui feature "data-statistics"): while
+// milkflint.datastats.history is '1' (and Data usage is on) it reads
+// nlbwmon's per-device totals every 5 minutes and appends what each device
+// moved since the last reading to the hour's file under /root/milkflint-usage
+// (usage-history.uc). The first reading is only a baseline, kept in RAM
+// (/tmp/milkflint/usage-history.json) so a respawn or `--once` carries on;
+// a gap of more than 15 minutes, or a clock that went backwards, starts a
+// new baseline. Nothing is written while the clock is before 2026-01-01
+// (NTP not set yet). An hour's file is deleted 24 h after the hour ends, and
+// the whole directory is removed as soon as the switch is found off (the
+// loop then sleeps on until the service's next reload removes the instance).
+//
+//   usage-history          the loop
+//   usage-history --once   one tick, for tests
+//
+// For tests: USAGE_NOW (the clock), USAGE_NLBW (a command standing in for
+// nlbw), USAGE_STATE (the baseline file), USAGE_CLOCK (ntpd's state file).
+'use strict';
+
+import { cursor } from 'uci';
+import { readfile, writefile, rename, mkdir, popen, open, lsdir, unlink, rmdir } from 'fs';
+import * as uh from '/usr/libexec/milkflint/usage-history.uc';
+import { CLOCK as DEVICE_CLOCK } from '/usr/libexec/milkflint/device-control.uc';
+
+const STATE = getenv('USAGE_STATE') ?? '/tmp/milkflint/usage-history.json';
+// what ntpd last said (device-control's hotplug): { synced, stratum, at }
+const CLOCK = getenv('USAGE_CLOCK') ?? DEVICE_CLOCK;
+const NLBW = getenv('USAGE_NLBW') ?? 'nlbw';
+const EVERY = 300;
+const MAX_GAP = 900;
+const CLOCK_SET = 1767225600;	// 2026-01-01 00:00 UTC
+
+function clock_now() {
+	const n = getenv('USAGE_NOW');
+	return (n != null) ? +n : time();
+}
+
+function is_on() {
+	const c = cursor();
+	return c.get('milkflint', 'datastats', 'enabled') != '0'
+		&& c.get('milkflint', 'datastats', 'history') == '1';
+}
+
+// the figures are gone while it's off (quiet when they already are)
+function remove_dir() {
+	const files = lsdir(uh.DIR);
+	if (files != null) {
+		for (let f in files)
+			unlink(`${uh.DIR}/${f}`);
+		rmdir(uh.DIR);
+	}
+	unlink(STATE);
+}
+
+// whether ntpd has said the clock is right: a clock set from a file's time at
+// boot can be hours behind, which makes real files look like the future
+function clock_synced() {
+	try {
+		return json(readfile(CLOCK) ?? 'null')?.synced == true;
+	}
+	catch (e) {
+		return false;
+	}
+}
+
+function run(args) {
+	const fd = popen(`${NLBW} ${args} 2>/dev/null`, 'r');
+	if (!fd)
+		return null;
+	const out = fd.read('all');
+	fd.close();
+	return out;
+}
+
+function read_totals() {
+	let parsed = null;
+	try {
+		parsed = json(run('-c json -g mac') ?? 'null');
+	}
+	catch (e) {
+		parsed = null;
+	}
+	return parsed ? uh.columns(parsed) : null;
+}
+
+// nlbwmon's newest accounting period (YYYY-MM-DD), or null
+function newest_period() {
+	let best = null;
+	for (let l in split(trim(run('-c list') ?? ''), '\n'))
+		if (length(l) == 10 && substr(l, 4, 1) == '-' && substr(l, 7, 1) == '-' && (best == null || l > best))
+			best = l;
+	return best;
+}
+
+// one pass: with the switch off it removes the figures (and the baseline) and
+// does nothing else; with it on, it keeps the files, reads the totals and
+// appends what moved. The loop below ignores the return value.
+function tick() {
+	if (!is_on()) {
+		remove_dir();
+		return false;
+	}
+	const now = clock_now();
+	if (now < CLOCK_SET)
+		return true;
+	// old files go every tick, with or without nlbwmon answering; ones from
+	// the future only once the clock is known to be right
+	const synced = clock_synced();
+	for (let f in lsdir(uh.DIR) ?? [])
+		if (uh.expired(f, now, synced))
+			unlink(`${uh.DIR}/${f}`);
+	const cur = read_totals();
+	if (cur == null)
+		return true;
+	let prev = null, prev_period = null;
+	try {
+		const s = json(readfile(STATE) ?? 'null');
+		if (type(s?.t) == 'int' && s.t <= now && now - s.t <= MAX_GAP && type(s.totals) == 'object') {
+			prev = s.totals;
+			prev_period = s.period;
+		}
+	}
+	catch (e) {
+		prev = null;
+	}
+	// totals fell: a new accounting period (count what's new) or nlbwmon
+	// reloaded an older database (count nothing). The period is asked for only
+	// at the first reading and when a total fell; else the baseline's is kept.
+	const period = (prev == null || prev_period == null || uh.fell(prev, cur)) ? newest_period() : prev_period;
+	const new_period = uh.fell(prev, cur) && prev_period != null && period != null && period != prev_period;
+	mkdir('/tmp/milkflint');
+	writefile(STATE + '.tmp', sprintf('%J', { t: now, totals: cur, period }));
+	rename(STATE + '.tmp', STATE);
+	if (prev != null) {
+		const d = uh.delta(prev, cur, new_period);
+		const moved = {};
+		for (let mac, v in d)
+			if (v[0] > 0 || v[1] > 0)
+				moved[mac] = v;
+		// the switch may have been turned off while nlbw was read
+		if (length(moved) && is_on()) {
+			mkdir(uh.DIR);
+			const fd = open(uh.hour_file(now), 'a');
+			if (fd) {
+				fd.write(sprintf('%J', { t: now, d: moved }) + '\n');
+				fd.close();
+			}
+		}
+	}
+	return true;
+}
+
+if (index(ARGV, '--once') >= 0) {
+	tick();
+	exit(0);
+}
+
+// While it's off the loop only keeps the directory away: the next reload of
+// the service removes the instance, and exiting would have procd start it
+// again every few seconds.
+while (true) {
+	tick();
+	sleep(EVERY * 1000);
+}

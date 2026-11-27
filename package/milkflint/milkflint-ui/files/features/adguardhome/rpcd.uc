@@ -1,9 +1,9 @@
 // rpcd plugin for the "adguardhome" feature (ubus milkflint.adguardhome):
 // AdGuard Home's state for its page and the Dashboard, its first settings,
 // on and off, its sign-in (MilkFlint's router login or its own password),
-// putting back the settings the DNS chain needs, and its updates from
-// MilkFlint's package feed. The filtering itself is set in AdGuard Home's own
-// web interface. Shared code: bin/adguardhome.uc.
+// and putting back the settings the DNS chain needs. The filtering itself is
+// set in AdGuard Home's own web interface. Its updates are the package
+// updater's (features/pkg-update). Shared code: bin/adguardhome.uc.
 'use strict';
 
 import { readfile, writefile, access, mkdir, unlink, lsdir, stat } from 'fs';
@@ -11,11 +11,6 @@ import { cursor } from 'uci';
 import * as agh from '/usr/libexec/milkflint/adguardhome.uc';
 
 const PAUSE = '/var/run/milkflint/adguardhome.pause';
-const UPDATE = '/var/run/milkflint/adguardhome-update.json';
-const UPDATER = '/usr/libexec/milkflint/adguardhome-update';
-// its own pid file: start-stop-daemon would otherwise take the monitor (also
-// ucode) for it already running
-const UPDATE_PID = '/var/run/milkflint/adguardhome-update.pid';
 const LICENSES = '/licenses/adguardhome/';
 
 const USER = /^[A-Za-z0-9._@-]{1,64}$/;
@@ -146,15 +141,6 @@ function networks() {
 		push(out, { interface: i.interface, zone: inside[i.interface], ipv4: v4, ipv6: v6 });
 	}
 	return out;
-}
-
-function update_info() {
-	try {
-		return json(readfile(UPDATE) ?? 'null');
-	}
-	catch (e) {
-		return null;
-	}
 }
 
 function pause(on) {
@@ -305,7 +291,6 @@ return {
 					stats: st,
 					settings: text ? agh.check_settings(tree, agh.web_address(), rlogin) : [],
 					networks: networks(),
-					update: update_info(),
 					licenses: {
 						license: `${LICENSES}LICENSE.txt`,
 						notices: access(`/www${LICENSES}THIRD-PARTY-NOTICES.txt`) ? `${LICENSES}THIRD-PARTY-NOTICES.txt` : null
@@ -488,31 +473,6 @@ return {
 					const left = agh.check_settings(agh.yaml_parse(fixed), agh.web_address(), rlogin);
 					return { ok: true, left: map(filter(left, (f) => f.breaks), (f) => f.key) };
 				});
-			}
-		},
-
-		// the versions MilkFlint's package feed has, in the background
-		update_check: {
-			call: function() {
-				if (!agh.installed())
-					return { error: 'not_installed' };
-				system(`start-stop-daemon -S -b -m -p ${UPDATE_PID} -x /usr/bin/ucode -- ${UPDATER} check`);
-				return { ok: true };
-			}
-		},
-
-		// that version installed from it ('' for the newest), in the background;
-		// AdGuard Home restarts on it (the monitor's redirect off meanwhile)
-		update: {
-			args: { version: '' },
-			call: function(req) {
-				const v = req.args.version ?? '';
-				if (type(v) != 'string' || (v != '' && !match(v, /^[0-9][0-9a-z.]*-r[0-9]+$/)))
-					return { error: 'version' };
-				if (update_info()?.busy)
-					return { error: 'busy' };
-				system(`start-stop-daemon -S -b -m -p ${UPDATE_PID} -x /usr/bin/ucode -- ${UPDATER} install ${agh.sh_quote(v)}`);
-				return { ok: true };
 			}
 		}
 	}

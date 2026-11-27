@@ -9,12 +9,23 @@ case " $(uci -q get uhttpd.main.index_page) " in
 		;;
 esac
 
+# LuCI's footer names the firmware ("MilkFlint 0.9a (OpenWrt 25.12.6)") as a
+# link to os-release's HOME_URL in a new tab: it takes this tab to MilkFlint
+# instead, as LuCI's logo does and as MilkFlint's Open LuCI does the other
+# way. Each theme's template, every boot after an upgrade (the image's own
+# come back); a template that has changed is left as it is.
+for f in /usr/share/ucode/luci/template/themes/*/footer.ut; do
+	[ -f "$f" ] && sed -i 's|href="{{ entityencode(version.disturl[^"]*" target="_blank" rel="noreferrer"|href="/milkflint/"|' "$f"
+done
+
 # Don't answer pings from the internet: OpenWrt's Allow-Ping rule only tells
 # scanners the address is in use (ShieldsUP's TruStealth fails on it). IPv4
 # only; IPv6 needs its ICMP rules. Once, marked in /etc/config/milkflint
 # (kept over upgrades), because uci-defaults run again after every upgrade
 # and turning it back on in LuCI should stick.
 [ -f /etc/config/milkflint ] || touch /etc/config/milkflint
+# It can hold VPN profile keys: readable by root only, like /etc/config/network.
+chmod 600 /etc/config/milkflint
 if [ -z "$(uci -q get milkflint.defaults.ping_off)" ]; then
 	for rule in $(uci -q show firewall | sed -n "s/^firewall\.\([^.]*\)\.name='Allow-Ping'$/\1/p"); do
 		uci set "firewall.$rule.enabled=0"

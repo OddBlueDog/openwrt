@@ -1,0 +1,330 @@
+#!/usr/bin/ucode
+// Devices seen (ui feature "devices-seen"): when each device was first and last
+// seen by the router, for the first-seen date on the Devices page. Run by
+// dnsmasq's DHCP and neighbour events through /etc/hotplug.d/{dhcp,neigh}:
+//
+//   devices-seen <add|update|remove> <mac> [dhcp|neigh]
+//
+// /etc/milkflint/devices-seen.json = { since, devices: { <mac>: [ first, last ] } }
+// (kept across upgrades). dnsmasq runs no script on a lease's renewal and
+// reports a neighbour only as it appears or goes, so a device that never
+// leaves would send no events. So each run also marks every device present
+// at that moment as seen: an unexpired lease, a Wi-Fi station on any AP, a
+// neighbour that answered lately. A device is written at most once a local
+// day, and the file only when something changed; a device unseen for 30 days
+// is dropped. Where the file starts, the devices present then are given
+// [since, since]: "on or before" that day.
+//
+// The sweep of who is present costs a few netlink dumps, and dnsmasq fires an
+// event per lease and neighbour as it starts, so it runs only when the event
+// device is new or not yet marked today, or an hour after the last sweep
+// (the stamp file); other events handle their own device alone. It runs
+// before the lock is taken. A neighbour event for a device not recorded yet is
+// taken only if the kernel's neighbour table has that MAC on an inside
+// network: dnsmasq tracks the whole table, WAN gateway and WAN hosts included.
+// Where the file starts, it is also seeded with the DHCP host reservations
+// and the devices nlbwmon has counted this period, as "on or before". Until the clock is set (before 2026-01-01) a run
+// does nothing: dnsmasq starts before NTP, and a first seen of 1970 is wrong.
+//
+// For tests: SEEN_FILE, SEEN_LEASES (the leases file), SEEN_STAMP, SEEN_NOW (the
+// clock), SEEN_LOCK=dir (the mkdir lock, which an fs lock would otherwise
+// replace), SEEN_NLBW (a command standing in for nlbw) and
+// SEEN_ONLY=<leases,nl80211,rtnl,dhcp,nlbw> (the sources of presence used).
+'use strict';
+
+import { readfile, writefile, rename, unlink, mkdir, rmdir, stat, open, popen } from 'fs';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import * as zones from '/usr/libexec/milkflint/zones.uc';
+
+const FILE = getenv('SEEN_FILE') ?? '/etc/milkflint/devices-seen.json';
+const LEASES = getenv('SEEN_LEASES') ?? '/tmp/dhcp.leases';
+const LOCK_DIR = '/var/run/milkflint/seen.lock';
+const LOCK_STALE = 10;
+const DROP_AFTER = 30 * 86400;
+const STAMP = getenv('SEEN_STAMP') ?? '/var/run/milkflint/seen.stamp';
+const SWEEP_EVERY = 3600;
+// 2026-01-01: a clock before it isn't set yet
+const CLOCK_FLOOR = 1767225600;
+const ONLY = getenv('SEEN_ONLY');
+const NLBW = getenv('SEEN_NLBW') ?? 'nlbw';
+
+const now = +(getenv('SEEN_NOW') ?? time());
+
+// A device's own MAC, lower case; null for anything else: not a MAC, a
+// multicast group (first byte odd) or all zeros.
+function clean(mac) {
+	mac = lc(mac ?? '');
+	if (length(mac) != 17)
+		return null;
+	for (let i = 0; i < 17; i++) {
+		const c = substr(mac, i, 1);
+		if (i % 3 == 2 ? c != ':' : index('0123456789abcdef', c) < 0)
+			return null;
+	}
+	if ((hex(substr(mac, 0, 2)) & 1) || mac == '00:00:00:00:00:00')
+		return null;
+	return mac;
+}
+
+// An exclusive lock, waited for up to 5 s (a hung holder would stall procd's
+// hotplug queue for the dhcp or neigh subsystem). An fs lock on a lock file where this ucode
+// has one, else mkdir, which is atomic; a lock directory older than 10 s was
+// left by a run that died. Returns what unlock() takes, or null.
+function lock() {
+	mkdir('/var/run/milkflint');
+	const f = open('/var/run/milkflint/seen.flock', 'a');
+	const fs_lock = f && type(f.lock) == 'function' && getenv('SEEN_LOCK') != 'dir';
+	for (let i = 0; i < 100; i++) {
+		if (fs_lock) {
+			if (f.lock('xn'))
+				return f;
+		}
+		else if (mkdir(LOCK_DIR))
+			return LOCK_DIR;
+		else {
+			const st = stat(LOCK_DIR);
+			if (st && time() - st.mtime > LOCK_STALE) {
+				rmdir(LOCK_DIR);
+				continue;
+			}
+		}
+		sleep(50);
+	}
+	return null;
+}
+
+function unlock(l) {
+	if (type(l) == 'string')
+		rmdir(l);
+	else
+		l.lock('u');
+}
+
+function complain(what, e) {
+	system([ 'logger', '-t', 'milkflint-devices-seen', `${what}: ${e}` ]);
+}
+
+// The devices of the inside networks: those of the zones that don't
+// masquerade (LAN, guests, Remote access), as the connections reader takes
+// them; never the WAN's neighbours (the ISP's router, a modem).
+function inside_devices() {
+	const nets = zones.inside_networks();
+	const devs = {};
+	const u = connect();
+	const dump = u?.call('network.interface', 'dump');
+	u?.disconnect();
+	for (let i in dump?.interface ?? [])
+		if (nets[i.interface] && i.l3_device)
+			devs[i.l3_device] = true;
+	return devs;
+}
+
+// The kernel's neighbours on the inside networks, as { <mac>: <state mask> }
+// (the states OR-ed when a MAC has several entries).
+function inside_neighbours() {
+	const out = {};
+	const rt = require('rtnl'), c = rt.const;
+	const inside = inside_devices();
+	for (let family in [ c.AF_INET, c.AF_INET6 ]) {
+		for (let n in rt.request(c.RTM_GETNEIGH, c.NLM_F_DUMP, { family }) ?? []) {
+			const mac = clean(n.lladdr);
+			if (mac && inside[n.dev])
+				out[mac] = (out[mac] ?? 0) | n.state;
+		}
+	}
+	return out;
+}
+
+// Whether an event's MAC is on an inside network now: any state of neighbour
+// entry counts, since the event is about it appearing.
+function inside_now(mac) {
+	try {
+		return inside_neighbours()[mac] != null;
+	}
+	catch (e) {
+		complain('neighbours not read', e);
+		return false;
+	}
+}
+
+// The devices here now, as { <mac>: true }.
+function present() {
+	const out = {};
+	const use = (s) => !ONLY || index(split(ONLY, ','), s) >= 0;
+	// unexpired leases ("<expiry> <mac> <ip> <name> <clientid>"; 0 = no end, no evidence)
+	if (use('leases')) {
+		for (let line in split(readfile(LEASES) ?? '', '\n')) {
+			const f = split(line, ' ');
+			const mac = clean(f[1]);
+			if (mac && +f[0] > now)
+				out[mac] = true;
+		}
+	}
+	if (use('nl80211')) {
+		try {
+			const nl = require('nl80211'), c = nl.const;
+			for (let i in nl.request(c.NL80211_CMD_GET_INTERFACE, c.NLM_F_DUMP) ?? []) {
+				// access points only: a station interface's "stations" are the
+				// network it joined (a repeater's or WISP's upstream router)
+				if (!i.ifname || !(i.iftype in [ c.NL80211_IFTYPE_AP, c.NL80211_IFTYPE_AP_VLAN ]))
+					continue;
+				for (let s in nl.request(c.NL80211_CMD_GET_STATION, c.NLM_F_DUMP, { dev: i.ifname }) ?? []) {
+					const mac = clean(s.mac);
+					if (mac)
+						out[mac] = true;
+				}
+			}
+		}
+		catch (e) {
+			complain('Wi-Fi stations not read', e);
+		}
+	}
+	if (use('rtnl')) {
+		try {
+			// REACHABLE, DELAY, PROBE
+			for (let mac, state in inside_neighbours())
+				if (state & (0x02 | 0x08 | 0x10))
+					out[mac] = true;
+		}
+		catch (e) {
+			complain('neighbours not read', e);
+		}
+	}
+	return out;
+}
+
+// DHCP host reservations' MACs (uci dhcp host sections; `mac` may hold several)
+function reserved() {
+	const out = {};
+	cursor().foreach('dhcp', 'host', (h) => {
+		for (let m in (type(h.mac) == 'array' ? h.mac : split(h.mac ?? '', ' '))) {
+			const mac = clean(m);
+			if (mac)
+				out[mac] = true;
+		}
+	});
+	return out;
+}
+
+// The devices nlbwmon has counted in its current period (nlbw -c json -g mac)
+function counted() {
+	const out = {};
+	const fd = popen(`${NLBW} -c json -g mac 2>/dev/null`, 'r');
+	if (!fd)
+		return out;
+	let d = null;
+	try {
+		d = json(fd.read('all') ?? 'null');
+	}
+	catch (e) {
+	}
+	fd.close();
+	const col = type(d?.columns) == 'array' ? index(d.columns, 'mac') : -1;
+	if (col >= 0 && type(d.data) == 'array') {
+		for (let row in d.data) {
+			const mac = clean(row[col]);
+			if (mac)
+				out[mac] = true;
+		}
+	}
+	return out;
+}
+
+// A number for the local day of a time.
+function day(t) {
+	const d = localtime(t);
+	return d.year * 1000 + d.yday;
+}
+
+function read() {
+	let d = null;
+	try {
+		d = json(readfile(FILE) ?? '');
+	}
+	catch (e) {
+	}
+	return type(d?.devices) == 'object' && type(d.since) == 'int' ? d : null;
+}
+
+// Whether the sweep is due: no file yet, the event device unknown or not yet
+// marked today, or an hour since the last one.
+function sweep_due(ev) {
+	const st = read();
+	if (!st)
+		return true;
+	const e = ev ? st.devices[ev] : null;
+	if (ev && (!e || day(e[1]) != day(now)))
+		return true;
+	const last = +(readfile(STAMP) ?? '0');
+	return now - last >= SWEEP_EVERY || now < last;
+}
+
+function main(action, mac, source) {
+	if (now < CLOCK_FLOOR)
+		return 0;
+	const ev = clean(mac);
+	const sweep = sweep_due(ev);
+	const here = sweep ? present() : {};
+	// a new file starts with who is known to exist: reserved addresses and what
+	// nlbwmon has counted this period
+	if (read() == null) {
+		const use = (s) => !ONLY || index(split(ONLY, ','), s) >= 0;
+		for (let m in (use('dhcp') ? reserved() : {}))
+			here[m] = true;
+		for (let m in (use('nlbw') ? counted() : {}))
+			here[m] = true;
+	}
+	// a neighbour event about a device not recorded yet: only one that is on an
+	// inside network (dnsmasq reports the WAN's neighbours too)
+	const known = ev != null && read()?.devices?.[ev] != null;
+	const take = ev != null && action in [ 'add', 'update', 'remove' ] && (source != 'neigh' || known || inside_now(ev));
+	const l = lock();
+	if (!l)
+		return 1;
+	let st = read(), changed = false;
+	if (!st) {
+		// a file that exists but can't be read is kept for a look, not overwritten
+		if (stat(FILE)) {
+			rename(FILE, `${FILE}.bad`);
+			complain('record unreadable, kept as devices-seen.json.bad', FILE);
+		}
+		st = { since: now, devices: {} };
+		for (let m in here)
+			st.devices[m] = [ now, now ];
+		changed = true;
+	}
+	if (take)
+		here[ev] = true;
+	const today = day(now);
+	for (let m in here) {
+		const e = st.devices[m];
+		if (!e) {
+			st.devices[m] = [ now, now ];
+			changed = true;
+		}
+		else if (day(e[1]) != today && now > e[1]) {
+			e[1] = now;
+			changed = true;
+		}
+	}
+	for (let m, e in st.devices) {
+		if (e[1] < now - DROP_AFTER) {
+			delete st.devices[m];
+			changed = true;
+		}
+	}
+	if (changed) {
+		mkdir('/etc/milkflint');
+		if (writefile(`${FILE}.tmp`, sprintf('%J', st)) != null)
+			rename(`${FILE}.tmp`, FILE);
+		else
+			unlink(`${FILE}.tmp`);
+	}
+	if (sweep)
+		writefile(STAMP, `${now}`);
+	unlock(l);
+	return 0;
+}
+
+exit(main(ARGV[0], ARGV[1], ARGV[2]));

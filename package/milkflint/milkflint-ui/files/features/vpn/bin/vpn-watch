@@ -1,0 +1,357 @@
+#!/usr/bin/ucode
+// The VPN client's tunnel watcher (ui feature "vpn"): the loop around
+// vpn-watch.uc's logic, run as procd instance `watch` of
+// /etc/init.d/milkflint-vpn while wg_out is on with devices marked for it.
+// Every INTERVAL (10 s) it:
+//   1. samples `wg show wg_out dump` and netifd's up flag for wg_out;
+//   2. judges, and when suspect or down sends one probe through the tunnel
+//      (a DNS query, SO_MARK + SO_BINDTODEVICE wg_out) and samples again
+//      after it, for the probe's window. A working tunnel's own DNS is also
+//      asked every DNS_CHECK, for dns_ok only;
+//   3. steps the state, and writes STATE_FILE (tmp + rename) whenever what
+//      it says differs from the file;
+//   4. on a change (plan), in this order, so no lookup ever reaches the
+//      router's own DNS on the way:
+//      - going down, or the kill switch changed while down: loads the table
+//        inet milkflint_vpn_down (replacing the old one in one go);
+//      - the state file;
+//      - reloads milkflint-vpn so the DNS forwarder's mode follows (its own
+//        table, inet milkflint_vpn_dns, stays loaded in both modes); a
+//        failed or timed-out reload is tried again at the next check;
+//      - back up: only now deletes the down table;
+//      - tells AdGuard Home's monitor (SIGHUP), so its VPN client's upstream
+//        follows at once rather than at its next 10 s look;
+//      - cuts the devices' connections as ruled, and logs one line (logger
+//        -t milkflint-vpn).
+// While down it keeps the table in step with the inside interfaces and the
+// kill switch (read when /etc/config changes), and loads it again when it's
+// gone (a firewall flush, by hand): one `nft list` a check, only while down.
+// Failing closed: at start it resumes down when the state file says down or
+// the table is there (a respawn after a crash or SIGKILL), rebuilding the
+// table in one nft transaction, so it's never briefly gone, and reloading the
+// forwarder at its first check (the old watcher may have died before it
+// did). Otherwise it starts up with no table. Only the init script removes
+// the table and the state file (the service stopped, or the watcher no
+// longer wanted).
+//
+//   vpn-watch                  the loop
+//   vpn-watch probe [server]   one probe now, printed as JSON
+'use strict';
+
+import { readfile, writefile, rename, mkdir, popen, stat } from 'fs';
+import * as socket from 'socket';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+import * as w from '/usr/libexec/milkflint/vpn-watch.uc';
+import * as v from '/usr/libexec/milkflint/vpn-dns.uc';
+import { cut } from '/usr/libexec/milkflint/conntrack.uc';
+
+const RUN_DIR = '/var/run/milkflint';
+const TABLE_FILE = `${RUN_DIR}/vpn-down.nft`;
+const CONFIGS = [ 'network', 'firewall', 'milkflint', 'dhcp' ];
+
+function mono_ms() {
+	const c = clock(true);
+	return c[0] * 1000 + c[1] / 1000000.0;
+}
+
+function log(msg) {
+	system([ 'logger', '-t', 'milkflint-vpn', msg ]);
+}
+
+function wg_dump() {
+	const p = popen(`wg show ${w.IFACE} dump 2> /dev/null`, 'r');
+	if (!p)
+		return '';
+	const out = p.read('all');
+	p.close();
+	return out;
+}
+
+// The ubus module leaves libubox's uloop catching SIGTERM, which then only
+// cuts a sleep short, so procd's stop would wait 5 s and SIGKILL the
+// watcher, which could check once more meanwhile. Each use of ubus (here,
+// and in vpn-dns.uc's zone_devices and vpn_device_addresses) is followed by
+// this: SIGTERM ends the watcher at once again.
+function term_default() {
+	signal('SIGTERM', 'default');
+}
+
+function iface_up() {
+	const bus = connect();
+	const r = bus?.call(`network.interface.${w.IFACE}`, 'status', {});
+	bus?.disconnect();
+	term_default();
+	return r?.up == true;
+}
+
+// one DNS query to `server` that can only go through the tunnel: marked for
+// the VPN's routing rule and bound to wg_out (with wg_out gone the bind
+// fails, so it's never answered over the WAN). Whether its reply came within
+// PROBE_TIMEOUT.
+function probe(server, id) {
+	const s = socket.create(index(server, ':') >= 0 ? socket.AF_INET6 : socket.AF_INET,
+		socket.SOCK_DGRAM | socket.SOCK_NONBLOCK, 0);
+	if (!s)
+		return false;
+	let got = false;
+	if (s.setopt(socket.SOL_SOCKET, socket.SO_MARK, hex(w.VPN_MARK)) &&
+	    s.setopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, w.IFACE) &&
+	    s.send(w.probe_query(id), 0, { address: server, port: 53 }) != null) {
+		const end = mono_ms() + w.PROBE_TIMEOUT * 1000;
+		while (!got) {
+			const left = int(end - mono_ms());
+			if (left <= 0)
+				break;
+			// on a timeout poll gives [[s, 0]], never []
+			const r = socket.poll(left, [ s, socket.POLLIN ]);
+			if (!r?.[0]?.[1])
+				break;
+			const m = s.recvmsg(1500);
+			if (!m)
+				break;
+			got = w.probe_reply(m.data, id);
+		}
+	}
+	s.close();
+	return got;
+}
+
+let next_id = clock(true)[1] & 0xffff;
+
+// a probe and its window: the sample before it, and one taken after it
+function probe_window(server, before) {
+	next_id = (next_id + 1) & 0xffff;
+	const replied = probe(server, next_id);
+	const after = w.sample(wg_dump(), before.up_if, time());
+	return { replied, answered: w.answered(before, after, replied) };
+}
+
+if (ARGV[0] == 'probe') {
+	const server = ARGV[1] ?? w.probe_server(v.vpn_dns_servers(cursor()), 0);
+	const t0 = mono_ms();
+	const r = probe_window(server, w.sample(wg_dump(), iface_up(), time()));
+	print(sprintf('%J', { server, dns: r.replied, answered: r.answered, ms: int(mono_ms() - t0) }), '\n');
+	exit(0);
+}
+
+// what the loop knows
+let st = null, dns_ok = null, hist = [], nprobe = 0, dns_due = 0;
+// the config: a cursor read again when a file in /etc/config changes
+let conf_key = null, c = null, ks = false, servers = null;
+// the kill switch at the last check, and the down table this watcher loaded
+let last_ks = false, table_text = null;
+// a reload of milkflint-vpn still owed (the last one failed or timed out),
+// and whether the failing table load and reload have been logged
+let reload_owed = false, load_failing = false, reload_failing = false;
+
+function refresh() {
+	let key = '';
+	for (let f in CONFIGS) {
+		const s = stat(`/etc/config/${f}`);
+		key += `${s?.inode}:${s?.mtime}:${s?.size} `;
+	}
+	if (key == conf_key)
+		return;
+	conf_key = key;
+	c = cursor();
+	ks = w.killswitch(c);
+	const was = servers;
+	servers = v.vpn_dns_servers(c);
+	if (sprintf('%J', was) != sprintf('%J', servers)) {
+		dns_ok = null;
+		dns_due = 0;
+	}
+}
+
+// the state file, whenever what it says differs from the file there (a
+// change, a failed write, or the file removed meanwhile)
+function save() {
+	const text = sprintf('%J', { up: st.up, since: st.since, reason: st.reason, dns_ok });
+	if (readfile(w.STATE_FILE) == text)
+		return;
+	mkdir(RUN_DIR, 0o755);
+	if (writefile(`${w.STATE_FILE}.tmp`, text) != null)
+		rename(`${w.STATE_FILE}.tmp`, w.STATE_FILE);
+}
+
+function table_for(on) {
+	const direct = (type(v.direct_domains) == 'function') ? v.direct_domains(c) : [];
+	const t = w.down_ruleset(on, v.zone_devices(c).home, direct);
+	term_default();
+	return t;
+}
+
+// the down table, replacing any loaded one in the same transaction. A
+// failure is logged once (with nft's own words, through stderr) and tried
+// again at each check, quietly, until it loads.
+function load_table(text) {
+	mkdir(RUN_DIR, 0o755);
+	writefile(TABLE_FILE, text);
+	if (system(load_failing ? `nft -f ${TABLE_FILE} 2> /dev/null` : [ 'nft', '-f', TABLE_FILE ]) == 0) {
+		table_text = text;
+		if (load_failing)
+			log(`the VPN's down table (inet ${w.TABLE}) loaded at last`);
+		load_failing = false;
+		return true;
+	}
+	table_text = null;
+	if (!load_failing)
+		log(`couldn't load the VPN's down table (inet ${w.TABLE}); trying again every ${w.INTERVAL} s`);
+	load_failing = true;
+	return false;
+}
+
+function delete_table() {
+	system(`nft delete table inet ${w.TABLE} 2> /dev/null`);
+	table_text = null;
+}
+
+function table_there() {
+	return system(`nft list table inet ${w.TABLE} > /dev/null 2>&1`) == 0;
+}
+
+// milkflint-vpn reloaded, so the forwarder's mode follows the state file
+// (procd keeps this watcher, its command unchanged); one that fails or
+// times out is owed, and tried again at the next check
+function reload() {
+	reload_owed = system([ '/etc/init.d/milkflint-vpn', 'reload' ], 60000) != 0;
+	if (reload_owed && !reload_failing)
+		log(`couldn't reload milkflint-vpn for the DNS forwarder's mode; trying again every ${w.INTERVAL} s`);
+	else if (!reload_owed && reload_failing)
+		log('milkflint-vpn reloaded at last');
+	reload_failing = reload_owed;
+}
+
+// AdGuard Home's monitor reads the state file again at once (its SIGHUP, as
+// its own init sends it), not at its next 10 s look; nothing if it isn't
+// running
+function tell_agh() {
+	const bus = connect();
+	bus?.call('service', 'signal', { name: 'milkflint-adguardhome', instance: 'monitor', signal: 1 });
+	bus?.disconnect();
+	term_default();
+}
+
+function resume(now) {
+	let saved = null;
+	try {
+		saved = json(readfile(w.STATE_FILE) ?? 'null');
+	}
+	catch (e) {
+		// unreadable: as if none
+	}
+	const has_table = system(`nft list table inet ${w.TABLE} > /dev/null 2>&1`) == 0;
+	last_ks = ks;
+	if (type(saved) == 'object' && saved.up == false || has_table) {
+		st = { up: false, fails: 0, oks: 0, since: +(saved?.since ?? 0) || now, reason: saved?.reason ?? 'no-answer' };
+		if (type(saved?.dns_ok) == 'bool')
+			dns_ok = saved.dns_ok;
+		if (has_table) {
+			// the kill switch it was loaded for: the "on" table has the dstnat chain
+			last_ks = system(`nft list chain inet ${w.TABLE} dstnat > /dev/null 2>&1`) == 0;
+			// rebuilt at the first check
+			table_text = '';
+		}
+		// the forwarder's mode, at the first check: the old watcher may
+		// have died between the state file and its reload
+		reload_owed = true;
+		log(`the VPN tunnel watcher started while the tunnel was down (since ${st.since}): its devices' rules stay until it answers again`);
+	}
+	else
+		st = w.start(now);
+	save();
+}
+
+function check() {
+	const was_dns = dns_ok;
+	refresh();
+	const now = time();
+	const cur = w.sample(wg_dump(), iface_up(), now);
+	push(hist, cur);
+	const suspect = w.judge(hist, now);
+	const counted = suspect != null || !st.up;
+	let replied = null, answered = false, server = null;
+	if (counted || servers && now >= dns_due) {
+		server = w.probe_server(servers, nprobe++);
+		const r = probe_window(server, cur);
+		answered = r.answered;
+		if (servers) {
+			replied = r.replied;
+			dns_due = now + w.DNS_CHECK;
+		}
+	}
+	const was = st;
+	st = w.step(st, { suspect, probed: counted, answered, now });
+	dns_ok = w.dns_state(dns_ok, servers != null, replied, answered || !suspect && st.up);
+	const a = w.plan({ up: was.up, ks: last_ks }, { up: st.up, ks });
+	last_ks = ks;
+
+	// going down, or the kill switch changed while down: the new table first
+	if (a.table == 'on' || a.table == 'off')
+		load_table(table_for(a.table == 'on'));
+	else if (!st.up) {
+		// still down: follow the inside interfaces (a guest network come up),
+		// load it again after a failed load, and put it back when something
+		// took it away (a firewall flush, by hand)
+		const t = table_for(ks);
+		if (t != table_text)
+			load_table(t);
+		else if (!table_there()) {
+			log(`the VPN's down table (inet ${w.TABLE}) was gone while the tunnel is down: loading it again`);
+			load_table(t);
+		}
+	}
+	save();
+	if (a.reload || reload_owed)
+		reload();
+	// back up: the table goes only now, with the forwarder back in its normal
+	// mode behind its own redirect (loaded all along in refuse mode too), so
+	// with Use VPN's DNS on no lookup meanwhile reaches the router's own DNS
+	if (a.table == 'delete')
+		delete_table();
+	if (a.table)
+		tell_agh();
+	let cuts = '';
+	if (a.cut) {
+		const addrs = v.vpn_device_addresses(c);
+		term_default();
+		const n = cut(addrs);
+		cuts = `; the connections of ${n} device address${n == 1 ? '' : 'es'} cut`;
+	}
+
+	if (was.up && !st.up)
+		log(`the VPN tunnel is down (${st.reason}): ` + (ks ?
+			"kill switch on, its devices stay off the internet and only the direct sites' names answer" :
+			"its devices go out directly, with this router's DNS") + cuts);
+	else if (!was.up && st.up)
+		log(`the VPN tunnel is up again after ${now - was.since} s` + cuts);
+	else if (a.table)
+		log(`the kill switch was turned ${ks ? 'on' : 'off'} while the VPN tunnel is down: ` +
+			(ks ? 'its devices are held off the internet' : 'its devices go out directly') + cuts);
+	if (dns_ok === false && was_dns !== false)
+		log(`the VPN's DNS (${server}) isn't answering, though the tunnel is up`);
+	else if (dns_ok === true && was_dns === false)
+		log("the VPN's DNS answers again");
+}
+
+refresh();
+resume(time());
+let last_err = null;
+for (;;) {
+	const t0 = mono_ms();
+	try {
+		check();
+		last_err = null;
+	}
+	catch (e) {
+		// a bad check is logged once and the loop carries on: a crash would
+		// only respawn into the same state
+		const m = `${e.message}`;
+		if (m != last_err)
+			log(`the VPN tunnel watcher: ${m}`);
+		last_err = m;
+	}
+	term_default();
+	sleep(max(100, int(w.INTERVAL * 1000 - (mono_ms() - t0))));
+}

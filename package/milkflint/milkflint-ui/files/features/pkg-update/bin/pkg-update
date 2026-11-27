@@ -1,0 +1,385 @@
+#!/usr/bin/ucode
+// Updates of the packages MilkFlint's own package feed carries (ui feature
+// "pkg-update"), from that feed only: its repository is tagged @milkflint
+// (/etc/apk/repositories.d/milkflint.list, which this feature's first-boot
+// defaults write) and requested with <name>@milkflint=<version> during
+// install, then rewritten to a plain version pin (<name>=<version>) in
+// /etc/apk/world so OpenWrt's feed never replaces it and offline apk
+// commands (such as `apk del` after a reboot before `apk update`) never fail
+// on a missing repository tag. The feed keeps earlier versions: going back
+// to one records milkflint.pkgupdate.<name>_pinned=<version> (a '-' in the
+// name as '_') until the next update from the page.
+//
+// The feed offers a router only the versions MilkFlint has tested with its
+// release (DISTRIB_RELEASE in /etc/openwrt_release): tested.json, beside the
+// feed's index, is { "<name>": { "<version>": [ "<release>", ... ] } }, and
+// without one the feed offers nothing.
+//
+// What each package needs around an install is in its hook module,
+// /usr/libexec/milkflint/pkg-update.d/<name>.uc: only the names with one can
+// be updated. It may export these, each called with the version, the one
+// installed before it (null for none), whether that's going back, and
+// whether it's a rollback:
+//   before        before apk installs it
+//   settings_ok   once it's installed: false if it can't use the settings
+//   after         then: false if it doesn't work
+// A false from either, or apk failing, sets `error` ('install', 'settings'
+// or 'after') and puts the version that was there back on, without its
+// before. Then settings_ok and after run for whatever is installed, as a
+// rollback: the package's own settings from before this run go back with it
+// (`back_on` true), or, when it couldn't go back on (`back_on` false), those
+// the installed version had, so it still works. Each hook runs in a ucode of
+// its own, so one that fails counts as a false; what it prints goes in `log`.
+//
+//   pkg-update <name> check              the versions the feed has for this release
+//   pkg-update <name> install [VERSION]  that one ('' or none: the newest)
+//
+// One install at a time, whichever the package: the second waits for the
+// lock (/var/run/milkflint/pkg-update.lock), `waiting` meanwhile. A second
+// run for a package while one is busy exits at once.
+//
+// What it's doing and how it went: /var/run/milkflint/pkg-update-<name>.json
+//   { busy, waiting, action, started, checked, installed, latest,
+//     versions: [newest first], pinned, ok, error, back_on, log, finished }
+// A status left busy for STALE seconds is a run that died (rpcd.uc's STALE
+// is the same).
+'use strict';
+
+import { readfile, writefile, open, rename, access, mkdir, unlink, popen } from 'fs';
+import { cursor } from 'uci';
+
+const HOOKS = '/usr/libexec/milkflint/pkg-update.d';
+const RUN = '/var/run/milkflint';
+const LOCK = `${RUN}/pkg-update.lock`;
+const LIST = '/etc/apk/repositories.d/milkflint.list';
+const WORLD = '/etc/apk/world';
+const VERSION = /^[0-9][0-9a-z.]*-r[0-9]+$/;
+// a hook taking longer is stopped (and counts as a false), so the lock is
+// never held for good
+const HOOK_MS = 300000;
+const STALE = 600;
+
+const name = ARGV[0] ?? '', action = ARGV[1] ?? '', want = ARGV[2] ?? '';
+// hooks are files: a name is a file name, never a path
+if (!match(name, /^[a-z0-9][a-z0-9_-]*$/) || !access(`${HOOKS}/${name}.uc`)) {
+	warn(`pkg-update: no updates for '${name}'\n`);
+	exit(2);
+}
+if (!(action in [ 'check', 'install' ]) || (want != '' && !match(want, VERSION))) {
+	warn('usage: pkg-update <name> check | install [VERSION]\n');
+	exit(2);
+}
+const STATUS = `${RUN}/pkg-update-${name}.json`;
+const PIN = replace(name, '-', '_') + '_pinned';
+
+function sh_quote(s) {
+	return "'" + replace(`${s}`, "'", "'\\''") + "'";
+}
+
+// a command's stdout, trimmed (stderr dropped)
+function cmd(c) {
+	const p = popen(`${c} 2>/dev/null`, 'r');
+	if (!p)
+		return null;
+	const out = p.read('all');
+	p.close();
+	return trim(out ?? '');
+}
+
+// a command's exit code and its output, stdout and stderr together
+function run(c) {
+	const p = popen(`${c} 2>&1`, 'r');
+	if (!p)
+		return { code: -1, out: '' };
+	const out = p.read('all') ?? '';
+	const code = p.close();
+	return { code, out };
+}
+
+function write_atomic(path, data, mode) {
+	const tmp = `${path}.milkflint-tmp`;
+	const f = open(tmp, 'w', mode ?? 0o600);
+	if (!f)
+		return false;
+	f.write(data);
+	f.close();
+	return rename(tmp, path);
+}
+
+let status = {};
+try {
+	status = json(readfile(STATUS) ?? '{}') ?? {};
+}
+catch (e) {
+	status = {};
+}
+if (type(status) != 'object')
+	status = {};
+
+function save() {
+	mkdir(RUN, 0o755);
+	write_atomic(STATUS, sprintf('%J', status), 0o644);
+}
+
+// to the log, which keeps its last 2000 characters
+function note(text) {
+	text = trim(text ?? '');
+	if (text != '')
+		status.log = substr(trim(`${status.log ?? ''}\n${text}`), -2000);
+}
+
+function feed_url() {
+	for (let line in split(readfile(LIST) ?? '', '\n')) {
+		line = trim(line);
+		if (substr(line, 0, 10) == '@milkflint' && index(' \t', substr(line, 10, 1)) >= 0)
+			return trim(substr(line, 11)) || null;
+	}
+	return null;
+}
+
+// "0.107.80-r1" before "0.107.79-r3": apk's own order would do, but this
+// needs no apk call (numbers compared as numbers, part by part)
+function vcmp(a, b) {
+	const pa = split(replace(a, /-r/, '.'), '.'), pb = split(replace(b, /-r/, '.'), '.');
+	for (let i = 0; i < max(length(pa), length(pb)); i++) {
+		const x = +(pa[i] ?? 0), y = +(pb[i] ?? 0);
+		if (x != y)
+			return (x < y) ? -1 : 1;
+	}
+	return 0;
+}
+
+// the installed package's version ("0.107.80-r1"), from apk's database
+function package_version() {
+	const db = '\n' + (readfile('/lib/apk/db/installed') ?? '');
+	const key = `\nP:${name}\nV:`;
+	const at = index(db, key);
+	if (at < 0)
+		return null;
+	const rest = substr(db, at + length(key));
+	const end = index(rest, '\n');
+	return trim((end < 0) ? rest : substr(rest, 0, end)) || null;
+}
+
+// this router's MilkFlint release ("0.87a")
+function release() {
+	for (let line in split(readfile('/etc/openwrt_release') ?? '', '\n'))
+		if (substr(line, 0, 16) == 'DISTRIB_RELEASE=')
+			return trim(substr(line, 16), "'\" ") || null;
+	return null;
+}
+
+function pinned() {
+	const p = cursor().get('milkflint', 'pkgupdate', PIN);
+	return (type(p) == 'string' && p != '') ? p : null;
+}
+
+function set_pinned(ver) {
+	if (!access('/etc/config/milkflint'))
+		writefile('/etc/config/milkflint', '');
+	const c = cursor();
+	if (c.get('milkflint', 'pkgupdate') == null) {
+		if (!ver)
+			return;
+		c.set('milkflint', 'pkgupdate', 'pkgupdate');
+	}
+	if (ver)
+		c.set('milkflint', 'pkgupdate', PIN, ver);
+	else
+		c.delete('milkflint', 'pkgupdate', PIN);
+	c.commit('milkflint');
+}
+
+// Keep <name>=<ver> in /etc/apk/world without a @milkflint tag so offline
+// apk commands (such as `apk del` before `apk update`) never fail on a
+// missing repository tag.
+function pin_world(ver) {
+	if (!ver)
+		return;
+	const raw = readfile(WORLD);
+	if (raw == null)
+		return;
+	let replaced = false;
+	const out = [];
+	for (let line in split(raw, '\n')) {
+		if (line == '')
+			continue;
+		if (line == name || (substr(line, 0, length(name)) == name && index('@=<>~', substr(line, length(name), 1)) >= 0)) {
+			if (!replaced) {
+				push(out, `${name}=${ver}`);
+				replaced = true;
+			}
+		}
+		else {
+			push(out, line);
+		}
+	}
+	if (!replaced)
+		push(out, `${name}=${ver}`);
+	write_atomic(WORLD, join('\n', out) + '\n', 0o644);
+}
+
+// a file of the feed's, saved as `file` (false if it can't be fetched)
+function download(url, file) {
+	unlink(file);
+	if (system(`uclient-fetch -q -T 20 -O ${sh_quote(file)} ${sh_quote(url)} 2>/dev/null`) == 0)
+		return true;
+	unlink(file);
+	return false;
+}
+
+// the versions of this package tested with this release, from the feed's
+// tested.json beside its index (none without one)
+function tested(url) {
+	const at = rindex(url, '/'), file = `/tmp/milkflint-tested-${name}.json`;
+	const text = (at >= 0 && download(substr(url, 0, at + 1) + 'tested.json', file)) ? readfile(file) : null;
+	unlink(file);
+	let t = null;
+	try {
+		t = json(text ?? 'null');
+	}
+	catch (e) {
+		t = null;
+	}
+	const here = release(), out = [];
+	if (here != null && type(t?.[name]) == 'object')
+		for (let v, releases in t[name])
+			if (type(releases) == 'array' && (here in releases))
+				push(out, v);
+	return out;
+}
+
+// The feed's versions of the package that this release may have, newest
+// first (null if the feed can't be read), from its index itself: apk's own
+// search would count the installed package and OpenWrt's feed too.
+// (Installing checks the index's signature.)
+function versions() {
+	const url = feed_url();
+	if (!url)
+		return null;
+	const idx = `/tmp/milkflint-feed-${name}.adb`;
+	if (!download(url, idx))
+		return null;
+	const dump = cmd(`apk adbdump ${sh_quote(idx)}`);
+	unlink(idx);
+	if (dump == null || index(dump, 'packages:') < 0)
+		return null;
+	const vs = [];
+	let pkg = null;
+	for (let line in split(dump, '\n')) {
+		if (substr(line, 0, 10) == '  - name: ') {
+			pkg = trim(substr(line, 10));
+			continue;
+		}
+		if (pkg == name && substr(line, 0, 13) == '    version: ') {
+			const v = trim(substr(line, 13));
+			if (match(v, VERSION) && !(v in vs))
+				push(vs, v);
+		}
+	}
+	const ok = tested(url);
+	return sort(filter(vs, (v) => (v in ok)), (a, b) => vcmp(b, a));
+}
+
+// One of the package's hooks, in a ucode of its own (its output to the
+// log): false when it says so, fails or takes too long; true when it says
+// anything else or the module has no such hook.
+function hook(fn, ver, from, rollback) {
+	const back = (from != null && vcmp(ver, from) < 0);
+	const out = `${RUN}/pkg-update-${name}.out`;
+	const code = `import * as h from '${HOOKS}/${name}.uc'; const f = h.${fn}; ` +
+		`exit((type(f) != 'function' || f(getenv('PKG_VER'), getenv('PKG_FROM') || null, ${back}, ${rollback == true}) !== false) ? 0 : 1);`;
+	const r = system(`PKG_VER=${sh_quote(ver)} PKG_FROM=${sh_quote(from ?? '')} /usr/bin/ucode -e ${sh_quote(code)} > ${sh_quote(out)} 2>&1`, HOOK_MS);
+	note(readfile(out));
+	unlink(out);
+	if (r != 0)
+		note((r == 1) ? `${name} ${ver}: its ${fn} said no` : `${name} ${ver}: its ${fn} ended with ${r}`);
+	return r == 0;
+}
+
+// apk's indexes first (a repository it can't reach doesn't stop it), then
+// that version from the feed; true when it's installed
+function apk_add(ver) {
+	run('apk update');
+	const r = run(`apk add ${sh_quote(`${name}@milkflint=${ver}`)}`);
+	note(r.out);
+	status.installed = package_version();
+	pin_world(status.installed);
+	return status.installed == ver;
+}
+
+if (status.busy && time() - (status.started ?? 0) < STALE)
+	exit(1);
+status.busy = true;
+status.waiting = (action == 'install');
+status.action = action;
+status.started = time();
+status.error = null;
+status.ok = null;
+status.back_on = null;
+if (action == 'install')
+	status.log = null;
+save();
+
+let lock = null;
+if (action == 'install') {
+	// closed on exec: nothing the install starts keeps it
+	lock = open(LOCK, 'we', 0o644);
+	if (lock)
+		lock.lock('x');
+	status.waiting = false;
+	save();
+}
+
+const vs = versions();
+status.checked = time();
+status.installed = package_version();
+status.pinned = pinned();
+if (vs == null) {
+	status.error = 'feed';
+}
+else {
+	status.versions = vs;
+	status.latest = vs[0] ?? null;
+}
+
+if (action == 'install' && status.error == null) {
+	const target = (want == '') ? status.latest : want;
+	if (target == null || !(target in vs)) {
+		status.error = 'version';
+	}
+	else {
+		const was = status.installed;
+		hook('before', target, was, false);
+		if (!apk_add(target))
+			status.error = 'install';
+		else if (!hook('settings_ok', target, was, false))
+			status.error = 'settings';
+		else if (!hook('after', target, was, false))
+			status.error = 'after';
+		// the version that was there back on, without its before; then the
+		// hooks of the version installed now (that one, or the new one when
+		// it didn't go back on), as a rollback (a package that wasn't there
+		// stays as apk left it)
+		if (status.error != null && was != null) {
+			const from = status.installed;
+			status.back_on = (from == was) || apk_add(was);
+			const now = status.installed;
+			const settings = (now == null) || hook('settings_ok', now, from, true);
+			const works = (now == null) || hook('after', now, from, true);
+			const but = (settings && works) ? '' : ', but its hooks said no';
+			note(status.back_on ? `${was} is back on${but}` : `${was} didn't go back on: ${now ?? 'nothing'} stays installed${but}`);
+		}
+		if (status.error == null)
+			set_pinned((target == status.latest) ? null : target);
+		status.pinned = pinned();
+	}
+}
+
+status.ok = (status.error == null);
+status.busy = false;
+status.waiting = false;
+status.finished = time();
+save();
+if (lock)
+	lock.close();

@@ -1,0 +1,1 @@
+import{i as e,t}from"./react-DB-4Zxce.js";import{r as n}from"./router-CCkFW3lp.js";import{t as r}from"./useNavigate-BFWar4AL.js";var i=e(t(),1);function a(){let e=r();return(0,i.useEffect)(()=>{e({...n(`admin-password`,`https`),replace:!0})},[e]),null}export{a as HttpsPage};

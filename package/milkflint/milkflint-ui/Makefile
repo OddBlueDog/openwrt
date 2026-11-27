@@ -12,7 +12,7 @@ define Package/milkflint-ui
   CATEGORY:=LuCI
   TITLE:=MilkFlint web interface (dashboard and main settings)
   DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +rpcd-mod-iwinfo +uhttpd +uhttpd-mod-ubus \
-	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-resolv +ucode-mod-nl80211 +ucode-mod-socket +ethtool +milkflint-rtprio
+	+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-resolv +ucode-mod-nl80211 +ucode-mod-socket +ucode-mod-rtnl +ethtool +milkflint-rtprio
   PKGARCH:=all
   # the account the dnsproxy for devices sent through a VPN runs as (feature
   # adguardhome): its traffic is marked for the tunnel by its owner
@@ -29,6 +29,7 @@ define Package/milkflint-ui/conffiles
 /etc/config/milkflint
 /etc/milkflint/adguardhome.key
 /etc/milkflint/banip-feeds.json
+/etc/milkflint/devices-seen.json
 /etc/milkflint/home.json
 /etc/milkflint/themes.json
 endef
@@ -38,7 +39,8 @@ endef
 
 # Core files, then each feature's router side by convention
 # (files/features/<id>/: rpcd.uc, acl.json, init, uci-defaults, preinit, cgi,
-# bin/*, nftables.d/<position>/<chain>/*.nft for fw4's includes,
+# bin/*, bin/pkg-update.d/<package>.uc for the package updater's hooks,
+# nftables.d/<position>/<chain>/*.nft for fw4's includes,
 # hotplug.d/<subsystem>/* for /etc/hotplug.d, licenses/*:
 # the license texts of what the feature installs, served at /licenses/<id>/
 # for its page to link to and in /usr/share/licenses/<id>). A preinit
@@ -70,7 +72,8 @@ define Package/milkflint-ui/install
 		[ ! -f $$$$f/uci-defaults ] || $(INSTALL_BIN) $$$$f/uci-defaults $(1)/etc/uci-defaults/91-milkflint-$$$$id; \
 		[ ! -f $$$$f/preinit ] || $(INSTALL_DATA) $$$$f/preinit $(1)/lib/preinit/81_milkflint-$$$$id; \
 		[ ! -f $$$$f/cgi ] || $(INSTALL_BIN) $$$$f/cgi $(1)/www/cgi-bin/milkflint-$$$$id; \
-		[ ! -d $$$$f/bin ] || $(INSTALL_BIN) $$$$f/bin/* $(1)/usr/libexec/milkflint/; \
+		for b in $$$$f/bin/*; do [ ! -f $$$$b ] || $(INSTALL_BIN) $$$$b $(1)/usr/libexec/milkflint/; done; \
+		[ ! -d $$$$f/bin/pkg-update.d ] || { $(INSTALL_DIR) $(1)/usr/libexec/milkflint/pkg-update.d && $(INSTALL_DATA) $$$$f/bin/pkg-update.d/* $(1)/usr/libexec/milkflint/pkg-update.d/; }; \
 		[ ! -d $$$$f/nftables.d ] || { $(INSTALL_DIR) $(1)/usr/share/nftables.d && $(CP) $$$$f/nftables.d/* $(1)/usr/share/nftables.d/; }; \
 		[ ! -d $$$$f/hotplug.d ] || { $(INSTALL_DIR) $(1)/etc/hotplug.d && $(CP) $$$$f/hotplug.d/* $(1)/etc/hotplug.d/; }; \
 		[ ! -d $$$$f/licenses ] || { $(INSTALL_DIR) $(1)/www/licenses/$$$$id $(1)/usr/share/licenses && $(INSTALL_DATA) $$$$f/licenses/* $(1)/www/licenses/$$$$id/ && $(LN) /www/licenses/$$$$id $(1)/usr/share/licenses/$$$$id; }; \
