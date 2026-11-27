@@ -1,7 +1,7 @@
 From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
 Subject: [PATCH] net/sched: sch_cake: KUnit tests
 
-Generated from cake/ commit 55d740f174c900d25e22a57de52f8936bf4e839f (base..main):
+Generated from cake/ commit 220adc625b549ed85d5034931b93fae271185e90 (base..main):
 
 562971b98f81 net/sched: sch_cake: hash the hosts only when a flow queue is allocated
 967e7603fc0d net/sched: sch_cake: cake_mq: redo the rates only when the share changes
@@ -74,6 +74,7 @@ a4fde8c2e164 net/sched: sch_cake: the ACK filter's fast skip allows for 6in4's h
 552d91e2b88a net/sched: sch_cake: cake_mq: a reset sub-cake is idle at once
 442327065a98 net/sched: sch_cake: read the fwmark mask once, and the tx queue count
 55d740f174c9 net/sched: sch_cake: KUnit: defaults for every test, and a stronger fuzzer
+220adc625b54 net/sched: sch_cake: split-gso queues a batch's segments without per-segment repeats
 ---
 diff --git a/net/sched/Kconfig b/net/sched/Kconfig
 index 8180d0c..7ecaf35 100644
@@ -101,10 +102,10 @@ index 8180d0c..7ecaf35 100644
  	help
 diff --git a/net/sched/sch_cake_test.c b/net/sched/sch_cake_test.c
 new file mode 100644
-index 0000000..c4fbb3b
+index 0000000..edbb9fe
 --- /dev/null
 +++ b/net/sched/sch_cake_test.c
-@@ -0,0 +1,7888 @@
+@@ -0,0 +1,8050 @@
 +// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 +/* KUnit tests for sch_cake's flow hashing, DRR quanta, COBALT's drops for
 + * flows that ignore ECN marks, the L4S ramp, and cake_mq's count of active sub-cakes,
@@ -5716,6 +5717,167 @@ index 0000000..c4fbb3b
 +	KUNIT_EXPECT_EQ(test, q->min_adjlen, ref->min_adjlen);
 +}
 +
++/* A TCP GSO packet from host @host's port @sport to 1.1.1.1:443 that really
++ * segments: Ethernet, IPv4 and TCP headers, then @segs - 1 segments of @mss
++ * bytes and one of @tail, as cake_enqueue() gets it on a device's egress
++ */
++static struct sk_buff *cake_test_tcp_gso(struct kunit *test, u8 host, u16 sport,
++					 u16 mss, u16 segs, u16 tail)
++{
++	const unsigned int hdr = ETH_HLEN + sizeof(struct iphdr) + sizeof(struct tcphdr);
++	const unsigned int data = mss * (segs - 1) + tail;
++	struct sk_buff *skb = alloc_skb(hdr + data, GFP_KERNEL);
++	struct ethhdr *eth;
++	struct tcphdr *th;
++	struct iphdr *ip;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_free_skb, skb));
++	skb->dev = init_net.loopback_dev;
++	eth = skb_put_zero(skb, hdr + data);
++	eth->h_proto = htons(ETH_P_IP);
++	skb->protocol = eth->h_proto;
++	skb_reset_mac_header(skb);
++	skb_set_network_header(skb, ETH_HLEN);
++	skb_set_transport_header(skb, ETH_HLEN + sizeof(*ip));
++	ip = ip_hdr(skb);
++	ip->version = 4;
++	ip->ihl = 5;
++	ip->ttl = 64;
++	ip->protocol = IPPROTO_TCP;
++	ip->saddr = htonl(0xc0a80100 | host);	/* 192.168.1.host, as cake_test_skb() */
++	ip->daddr = htonl(0x01010101);
++	ip->tot_len = htons(skb->len - ETH_HLEN);
++	th = tcp_hdr(skb);
++	th->source = htons(sport);
++	th->dest = htons(443);
++	th->doff = sizeof(*th) / 4;
++	th->ack = 1;
++	skb_shinfo(skb)->gso_size = mss;
++	skb_shinfo(skb)->gso_segs = segs;
++	skb_shinfo(skb)->gso_type = SKB_GSO_TCPV4;
++	/* as qdisc_pkt_len_init() gives it: each segment's headers counted */
++	qdisc_skb_cb(skb)->pkt_len = skb->len + (segs - 1) * hdr;
++	return skb;
++}
++
++/* split-gso through cake_enqueue() and cake_dequeue(), behind a packet of
++ * the same connection already queued: the segments follow it in their
++ * order, each charged what cake_overhead() charges it as a single packet,
++ * in every framing; the network offset's average and the packet sizes
++ * recorded are as one cake_overhead() call per segment leaves them; the
++ * counts and the memory used take each segment; and they all come out
++ * again, in order.
++ */
++static void cake_test_split_gso_enqueue(struct kunit *test)
++{
++	static const struct {
++		u8 atm_mode;
++		bool overhead;
++		u16 tail;
++	} cases[] = {
++		{ CAKE_ATM_NONE, false, 1000 },	/* raw: every segment the same */
++		{ CAKE_ATM_NONE, true, 300 },	/* overhead 44, mpu 84: a short last one */
++		{ CAKE_ATM_ATM, true, 300 },
++		{ CAKE_ATM_PTM, true, 1 },	/* a last segment of one byte */
++	};
++	struct cake_test_mq *mq = cake_test_mq_alloc(test);
++	const u16 mss = 1000, segs = 5;
++	int c;
++
++	for (c = 0; c < ARRAY_SIZE(cases); c++) {
++		struct cake_sched_data *q = cake_test_cake_live(test, mq, c, 100000000,
++								CAKE_DIFFSERV_BESTEFFORT);
++		struct cake_sched_data *ref = cake_test_alloc(test, sizeof(*ref));
++		struct cake_tin_data *b = &q->tins[0];
++		struct sk_buff *first, *gso, *s, *in[8];
++		struct sk_buff *to_free = NULL;
++		struct Qdisc *sch = mq->sch[c];
++		u32 n = 0, len = 0, truesize, i;
++		struct cake_flow *flow;
++		int ret;
++
++		KUNIT_ASSERT_TRUE(test, q->config->rate_flags & CAKE_FLAG_SPLIT_GSO);
++		q->config->atm_mode = cases[c].atm_mode;
++		if (cases[c].overhead) {
++			q->config->rate_flags |= CAKE_FLAG_OVERHEAD;
++			q->config->rate_overhead = 44;
++			q->config->rate_mpu = 84;
++		}
++		/* the shaper and COBALT out of the way: everything comes out */
++		q->rate_ns = 0;
++		b->cparams.target = 10ULL * NSEC_PER_SEC;
++		b->cparams.interval = 100ULL * NSEC_PER_SEC;
++		KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, cake_test_reset, sch));
++
++		first = cake_test_skb(test, false, IPPROTO_TCP, 5, 41000, 0);
++		kunit_remove_action(test, cake_test_free_skb, first);
++		qdisc_skb_cb(first)->pkt_len = first->len;
++		gso = cake_test_tcp_gso(test, 5, 41000, mss, segs, cases[c].tail);
++		kunit_remove_action(test, cake_test_free_skb, gso);
++
++		rcu_read_lock_bh();
++		ret = cake_enqueue(first, sch, &to_free);
++		KUNIT_ASSERT_EQ(test, ret, NET_XMIT_SUCCESS);
++		flow = cake_test_flow_of(b, first);
++		KUNIT_ASSERT_NOT_NULL(test, flow);
++		/* what one cake_overhead() call per segment would start from */
++		ref->config = q->config;
++		ref->avg_netoff = q->avg_netoff;
++		ref->min_netlen = q->min_netlen;
++		ref->max_netlen = q->max_netlen;
++		ref->min_adjlen = q->min_adjlen;
++		ref->max_adjlen = q->max_adjlen;
++		truesize = first->truesize;
++
++		ret = cake_enqueue(gso, sch, &to_free);
++		rcu_read_unlock_bh();
++		KUNIT_ASSERT_EQ(test, ret, NET_XMIT_SUCCESS);
++		KUNIT_ASSERT_NULL(test, to_free);
++
++		KUNIT_EXPECT_PTR_EQ(test, flow->head, first);
++		for (s = first->next; s; s = s->next, n++) {
++			KUNIT_ASSERT_LT(test, n, ARRAY_SIZE(in));
++			in[n] = s;
++			KUNIT_EXPECT_FALSE(test, skb_is_gso(s));
++			KUNIT_EXPECT_EQ(test, qdisc_pkt_len(s), s->len);
++			KUNIT_EXPECT_EQ_MSG(test, get_cobalt_cb(s)->adjusted_len,
++					    cake_overhead(ref, s), "case %d, segment %u", c, n);
++			KUNIT_EXPECT_FALSE(test, get_cobalt_cb(s)->pure_ack);
++			len += s->len;
++			truesize += s->truesize;
++		}
++		KUNIT_EXPECT_EQ(test, n, segs);
++		KUNIT_EXPECT_PTR_EQ(test, flow->tail, in[n - 1]);
++		KUNIT_EXPECT_EQ(test, in[0]->len, ETH_HLEN + 40 + mss);
++		KUNIT_EXPECT_EQ(test, in[n - 1]->len, ETH_HLEN + 40 + cases[c].tail);
++		KUNIT_EXPECT_EQ(test, q->avg_netoff, ref->avg_netoff);
++		KUNIT_EXPECT_EQ(test, q->min_netlen, ref->min_netlen);
++		KUNIT_EXPECT_EQ(test, q->max_netlen, ref->max_netlen);
++		KUNIT_EXPECT_EQ(test, q->min_adjlen, ref->min_adjlen);
++		KUNIT_EXPECT_EQ(test, q->max_adjlen, ref->max_adjlen);
++		KUNIT_EXPECT_EQ(test, sch->q.qlen, 1 + segs);
++		KUNIT_EXPECT_EQ(test, b->packets, 1 + segs);
++		KUNIT_EXPECT_EQ(test, q->buffer_used, truesize);
++		KUNIT_EXPECT_EQ(test, b->tin_backlog, first->len + len);
++		KUNIT_EXPECT_EQ(test, sch->qstats.backlog, first->len + len);
++
++		rcu_read_lock_bh();
++		s = cake_dequeue(sch);
++		KUNIT_EXPECT_PTR_EQ(test, s, first);
++		kfree_skb(s);
++		for (i = 0; i < n; i++) {
++			s = cake_dequeue(sch);
++			KUNIT_EXPECT_PTR_EQ_MSG(test, s, in[i], "case %d, segment %u", c, i);
++			kfree_skb(s);
++		}
++		rcu_read_unlock_bh();
++		KUNIT_EXPECT_EQ(test, sch->q.qlen, 0);
++		KUNIT_EXPECT_EQ(test, q->buffer_used, 0);
++		KUNIT_EXPECT_EQ(test, b->tin_backlog, 0);
++	}
++}
++
 +/* A tin's time per byte, as the shift loop worked it out */
 +static void cake_test_set_rate(struct kunit *test)
 +{
@@ -7961,6 +8123,7 @@ index 0000000..c4fbb3b
 +	KUNIT_CASE(cake_test_autorate_starts_afresh),
 +	KUNIT_CASE(cake_test_overhead_tunnel),
 +	KUNIT_CASE(cake_test_overhead_segments),
++	KUNIT_CASE(cake_test_split_gso_enqueue),
 +	KUNIT_CASE(cake_test_ack_filter_counts),
 +	KUNIT_CASE(cake_test_ack_filter_saturates),
 +	KUNIT_CASE(cake_test_ack_filter_matches),
