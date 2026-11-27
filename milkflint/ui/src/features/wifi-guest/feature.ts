@@ -1,6 +1,7 @@
 import { UsersIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { guestQueries } from './queries';
 
 export const feature = {
   id: 'wifi-guest',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.GuestWifiPage,
   ),
+  prefetch: (client) => {
+    client.query(guestQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

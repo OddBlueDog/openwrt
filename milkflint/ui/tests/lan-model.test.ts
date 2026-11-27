@@ -1,19 +1,23 @@
 // The LAN page's settings: the DHCP pool's range, the checks on the router's
-// address and pool, the UCI changes (netmask or address/prefix, as the
-// config already had it), and the line More settings shows when folded.
+// address and pool (the form's schema), the UCI changes (netmask or
+// address/prefix, as the config already had it), and the line More settings
+// shows when folded.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   hostCount,
   type LanForm,
+  lanFormSchema,
   leaseLabel,
   moreSummary,
   moves,
   netmaskOf,
   range,
   toChanges,
-  validate,
 } from '../src/features/lan/model.ts';
+import { formErrors } from '../src/lib/form/errors.ts';
+
+const validate = (f: LanForm): Partial<Record<keyof LanForm, string>> => formErrors(lanFormSchema, f);
 
 const form = (over: Partial<LanForm> = {}): LanForm => ({
   ipaddr: '192.168.1.1',

@@ -1,46 +1,13 @@
 // Target Wake Time on each band now: which devices can ask for it, the agreements
 // the radio has, and how requests have gone. Its settings are above it, on the
 // Wi-Fi driver page's Target Wake Time card.
-import { type ReactElement, useState } from 'react';
+import type { ReactElement } from 'react';
 import { Button } from '@/components/ui/button';
-import { usePoll } from '@/hooks/use-poll';
-import { getLeases } from '@/lib/api/network';
-import { endTwt, getTwt, getWirelessStatus, type TwtStatus } from '@/lib/api/wireless';
+import type { TwtStatus } from '@/lib/api/wireless';
+import { useLive } from '@/lib/query/use-live';
+import type { TwtBand as Band } from './api';
+import { useEndTwt, wifiQueries } from './queries';
 import { twtScheduleLabel } from './twt';
-
-interface Band {
-  radio: string;
-  band: string;
-  device: string | undefined;
-  twt: TwtStatus | undefined;
-}
-
-interface Loaded {
-  bands: Band[];
-  names: Map<string, string>;
-}
-
-async function load(): Promise<Loaded> {
-  const [status, leases] = await Promise.all([getWirelessStatus(), getLeases().catch(() => [])]);
-  const bands = await Promise.all(
-    // a radio that's turned off has nothing to report
-    Object.entries(status)
-      .filter(([, r]) => r.disabled !== true)
-      .map(async ([radio, r]): Promise<Band> => {
-        const device = r.iwinfo?.phy;
-        return {
-          radio,
-          band: r.config?.band ?? '',
-          device,
-          twt: device === undefined ? undefined : await getTwt(device).catch(() => undefined),
-        };
-      }),
-  );
-  return {
-    bands,
-    names: new Map(leases.flatMap((l) => (l.hostname === undefined ? [] : [[l.macaddr.toLowerCase(), l.hostname]]))),
-  };
-}
 
 function bandLabel(band: string): string {
   return band === '2g' ? '2.4 GHz' : band === '5g' ? '5 GHz' : band === '6g' ? '6 GHz' : band;
@@ -59,16 +26,8 @@ function requests(t: TwtStatus): string | undefined {
   return parts.length === 0 ? 'No device has asked since the radio started.' : `Since the radio started: ${parts.join(', ')}.`;
 }
 
-function BandStatus({
-  band,
-  names,
-  reload,
-}: {
-  band: Band;
-  names: ReadonlyMap<string, string>;
-  reload: () => void;
-}): ReactElement {
-  const [error, setError] = useState<string>();
+function BandStatus({ band, names }: { band: Band; names: ReadonlyMap<string, string> }): ReactElement {
+  const endAgreement = useEndTwt();
   const t = band.twt;
 
   if (t === undefined || band.device === undefined) {
@@ -84,11 +43,14 @@ function BandStatus({
 
   const device = band.device;
   const end = (mac: string, flow: number): void => {
-    setError(undefined);
-    endTwt(device, mac, String(flow)).then(reload, (e: unknown) => {
-      setError(e instanceof Error ? e.message : 'The radio didn’t end it.');
-    });
+    endAgreement.mutate({ device, mac, flow });
   };
+  const error =
+    endAgreement.error === null
+      ? undefined
+      : endAgreement.error.message === ''
+        ? 'The radio didn’t end it.'
+        : endAgreement.error.message;
   const line = requests(t);
 
   return (
@@ -131,7 +93,7 @@ function BandStatus({
 
 /** Target Wake Time on each band now, for the card on the Wi-Fi driver page, under its settings. */
 export function TwtLive(): ReactElement {
-  const { data, refresh } = usePoll(load, 15_000);
+  const { data } = useLive(wifiQueries.twt());
   if (data === undefined) return <p className="text-sm text-muted-foreground">Reading the radios…</p>;
   const order = (band: string): number => ['2g', '5g', '6g'].indexOf(band);
   const bands = [...data.bands].sort((a, b) => order(a.band) - order(b.band));
@@ -142,7 +104,7 @@ export function TwtLive(): ReactElement {
         {bands.map((b) => (
           <div key={b.radio} className="flex min-w-0 flex-col gap-2">
             <h4 className="border-b pb-2 text-sm font-semibold">{bandLabel(b.band)}</h4>
-            <BandStatus band={b} names={data.names} reload={refresh} />
+            <BandStatus band={b} names={data.names} />
           </div>
         ))}
       </div>

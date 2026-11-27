@@ -5,7 +5,7 @@ import type { Feature } from '../types';
 export const feature = {
   id: 'admin-password',
   title: 'Router access',
-  description: 'The admin password for these pages, LuCI and SSH, and HTTPS with its certificate.',
+  description: 'The admin password, HTTPS and its certificate, SSH and its keys, and the package manager’s keys.',
   icon: KeyRoundIcon,
   group: 'security',
   order: 60,

@@ -1,14 +1,18 @@
 // What the VPN client page reads: OpenWrt's config for the WireGuard
-// interface, its peer, its routing rules, its firewall sections and its
-// Smart Queue; the guest networks there are; and the devices the router
-// knows, to pick from.
+// interface, its peer, its routing rules, its firewall sections, its Smart
+// Queue and its sites that go direct; the guest networks there are; and the
+// devices the router knows, to pick from. A site taken off the list needs
+// nothing more from here: the router flushes the sets itself
+// (features/vpn's vpn-direct.uc), however the list changed.
 import { getHostHints, getInterfaces, getLeases, ipToInt, type NetworkInterface, prefixLength } from '@/lib/api/network';
 import { bool, getConfig, list, type Section, str } from '@/lib/api/uci';
 import { getWgStatus } from '@/lib/api/wireguard';
 import { lanZone, parseFirewall, wanZone } from '../firewall/model';
 import { GUEST_IDS, type GuestId, guestLabels, isGuestShaper } from '../wifi-guest/guest';
 import { type AdGuardStatus, getAdGuardStatus } from '../adguardhome/api';
-import { blankForm, type ClientData, DEFAULT_KEEPALIVE, DEFAULT_PORT, homeDevices } from './model';
+import { homeDhcp, readDeviceDns, splitAddresses } from '../dns/device-dns';
+import { sectionToProfile } from './profiles';
+import { blankForm, type ClientData, DEFAULT_KEEPALIVE, DEFAULT_PORT, directOf, homeDevices } from './model';
 
 /** Which way the VPN's devices' lookups go with AdGuard Home on (its monitor sends them through the tunnel when the DNS page has servers of its own). */
 function aghPath(agh: AdGuardStatus | undefined, milkflint: readonly Section[]): ClientData['adguard'] {
@@ -28,19 +32,22 @@ import {
   CLIENT_SKIP,
   isVpnShaper,
   markSection,
+  PROFILES_POINTER,
+  PROFILE_TYPE,
 } from './sections';
 
 export async function loadClient(): Promise<ClientData> {
-  const [network, firewall, sqm, milkflint, interfaces, status, leases, hints, agh] = await Promise.all([
+  const [network, firewall, sqm, milkflint, interfaces, status, leases, hints, agh, dhcp] = await Promise.all([
     getConfig('network'),
     getConfig('firewall'),
     getConfig('sqm').catch(() => undefined),
     getConfig('milkflint').catch((): Section[] => []),
     getInterfaces().catch((): NetworkInterface[] => []),
-    getWgStatus().catch(() => ({ installed: false, now: 0, interfaces: [] })),
+    getWgStatus().catch(() => ({ installed: false, now: 0, interfaces: [], tunnel: null, nftset: false })),
     getLeases().catch(() => []),
     getHostHints().catch(() => ({})),
     getAdGuardStatus().catch(() => undefined),
+    getConfig('dhcp').catch((): Section[] => []),
   ]);
   const cfg = parseFirewall(firewall);
   const iface = network.find((s) => s['.type'] === 'interface' && s['.name'] === CLIENT);
@@ -92,12 +99,21 @@ export async function loadClient(): Promise<ClientData> {
     ...interfaces.flatMap((i) => (i['ipv4-address'] ?? []).flatMap((a) => ipToInt(a.address) ?? [])),
   ];
 
+  const profiles = milkflint
+    .filter((s) => s['.type'] === PROFILE_TYPE)
+    .map((s) => sectionToProfile(s, { guestZones, wanRates, sqm: sqm !== undefined }));
+  const pointed = str(
+    milkflint.find((s) => s['.name'] === PROFILES_POINTER),
+    'active',
+  );
+
   const data: ClientData = {
     installed: status.installed,
     exists: iface !== undefined,
-    form: blankForm({ wanRates, sqm: sqm !== undefined }),
+    // the list is dhcp's, whether or not the tunnel is there: a LuCI edit is part of it
+    form: { ...blankForm({ wanRates, sqm: sqm !== undefined }), direct: directOf(dhcp) },
     peerSection: peer?.['.name'] ?? CLIENT_PEER,
-    present: { network, firewall, sqm, milkflint },
+    present: { network, firewall, sqm, milkflint, dhcp },
     wanZone: wanZone(cfg)?.name ?? 'wan',
     lanZone: lanZone(cfg)?.name ?? 'lan',
     guestZones,
@@ -107,6 +123,11 @@ export async function loadClient(): Promise<ClientData> {
     lan,
     taken,
     adguard: aghPath(agh, milkflint),
+    deviceDns: splitAddresses(readDeviceDns(homeDhcp(dhcp)).ipv4),
+    profiles,
+    // without the tunnel nothing runs: no profile is the active one, so a lone profile can rebuild it
+    active: iface === undefined ? undefined : profiles.find((p) => p.id === pointed)?.id,
+    nftset: status.nftset === true,
   };
   if (iface !== undefined) {
     const markLan = firewall.find((s) => s['.name'] === markSection('lan'));

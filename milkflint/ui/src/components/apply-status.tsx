@@ -84,7 +84,7 @@ export function ApplyStatus({ state }: { state: ApplyState }): ReactElement | nu
         <Toast
           tone="success"
           icon={<CheckCircle2Icon />}
-          title={state.nothingChanged ? 'Nothing to change' : 'Saved and applied'}
+          title={state.title ?? (state.nothingChanged ? 'Nothing to change' : 'Saved and applied')}
           onClose={close}
         >
           {state.note}
@@ -104,7 +104,7 @@ export function ApplyStatus({ state }: { state: ApplyState }): ReactElement | nu
       break;
     case 'failed':
       toast = (
-        <Toast tone="destructive" icon={<TriangleAlertIcon />} title="Couldn’t save" onClose={close}>
+        <Toast tone="destructive" icon={<TriangleAlertIcon />} title={state.title ?? 'Couldn’t save'} onClose={close}>
           {state.message}
         </Toast>
       );

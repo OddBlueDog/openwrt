@@ -1,10 +1,11 @@
 // The way from the internet to the devices, one step at a time, each with
 // what the router measures there and a link to its page. Shared steps first,
 // then the last hop (each device uses one of them).
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ChevronRightIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
-import type { Poll } from '@/hooks/use-poll';
-import { href } from '@/lib/router';
+import type { Live as Polled } from '@/lib/query/use-live';
 import { cn } from '@/lib/utils';
 import { type Live, WINDOW_SECONDS } from '../network-quality/live';
 import { summarize } from '../network-quality/score';
@@ -19,8 +20,8 @@ const tone = { ok: 'success', busy: 'warning', down: 'destructive', off: 'off' }
 function Step({ s, last, full }: { s: PathStep; last: boolean; full: boolean }): ReactElement {
   return (
     <li className="relative flex min-w-0">
-      <a
-        href={href(s.route)}
+      <Link
+        {...pageLink(s.route)}
         className={cn(
           'group flex min-w-0 flex-1 flex-col gap-2 rounded-lg border p-3 transition-colors duration-fast hover:border-rule',
           s.state === 'busy' && 'border-warning/40 bg-warning-subtle',
@@ -77,7 +78,7 @@ function Step({ s, last, full }: { s: PathStep; last: boolean; full: boolean }):
               ))}
             </span>
           ))}
-      </a>
+      </Link>
       {/* from one shared step to the next, on a wide card */}
       {!last && (
         <ChevronRightIcon
@@ -127,7 +128,7 @@ function Group({
   );
 }
 
-export function PathCard({ d, ap, live }: { d: Dashboard; ap: boolean; live: Poll<Live> }): ReactElement {
+export function PathCard({ d, ap, live }: { d: Dashboard; ap: boolean; live: Polled<Live> }): ReactElement {
   // the whole width and two rows: each step in full; smaller, each its name, state and readings
   const { size } = useWidgetInfo();
   const full = size.w === 4 && size.h === 2;

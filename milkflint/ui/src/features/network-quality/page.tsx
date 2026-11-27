@@ -2,38 +2,30 @@
 // internet ping, its jitter and loss, each probe's typical time), then the
 // latency and route charts with their tables, loss strip and CSV, then what
 // to measure. Its on/off sits in the page header, as on Smart Queue.
-import { type ReactElement, type ReactNode, useCallback, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { type ReactElement, type ReactNode, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
-import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
-import { SaveBar } from '@/components/save-bar';
+import { FormSaveBar, SelectField, SwitchField, TextField } from '@/components/form';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { bool, type Change, getConfig, str } from '@/lib/api/uci';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { useLive } from '@/lib/query/use-live';
 import { formatNumber } from '@/lib/format';
 import { PowerSwitch } from '@/components/power-switch';
 import { QualityNow, QualityOff } from './answer';
 import { type Bucket, getHistory, type History, type Route, type Sample } from './api';
+import { pingTargets, type QualityForm, qualityFormSchema, toChanges } from './model';
+import { qualityQueries } from './queries';
 import { type ChartLine, csvName, historyLine, type LineSpec, linesToCsv, liveLine } from './chart-data';
 import { type DnsLine, dnsLines } from './dns-lines';
 import { ms } from './format';
 import { LatencyChart } from './latency-chart';
-import { type Live, useLive, WINDOW_SECONDS } from './live';
+import { type Live, useLive as useLiveQuality, WINDOW_SECONDS } from './live';
 import { summarize } from './score';
-
-const pingTargets = [
-  { value: '1.1.1.1', label: 'Cloudflare (1.1.1.1)' },
-  { value: '8.8.8.8', label: 'Google (8.8.8.8)' },
-  { value: '9.9.9.9', label: 'Quad9 (9.9.9.9)' },
-] as const;
 
 const routeColors = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)'];
 // the DNS servers asked now: the theme's series 2, 4, 5 and 6 (the probe
@@ -246,11 +238,10 @@ function Results({ live }: { live: Live }): ReactElement {
   const targets = status.targets;
   const interval = status.interval ?? 5;
   const [span, setSpan] = useState<Span>(spans[0]);
-  const history = usePoll(
-    async (): Promise<History | undefined> => (span.step === undefined ? undefined : getHistory(span.seconds, span.step)),
-    60_000,
-    span.key,
-  );
+  const history = useLive({
+    ...qualityQueries.history(span.seconds, span.step ?? 0),
+    enabled: span.step !== undefined,
+  });
   const dnsOrder = (targets?.dns_servers ?? []).map((d) => d.key);
   const chart =
     span.step === undefined
@@ -312,247 +303,171 @@ function Results({ live }: { live: Live }): ReactElement {
 
 // ---- settings -------------------------------------------------------------
 
-interface QualityForm {
-  enabled: boolean;
-  interval: string;
-  pingTarget: string;
-  customTarget: string;
-  dnsDomain: string;
-  /** A DNS server to time instead of the ones devices use; '' for those. */
-  dnsServer: string;
-  routes: boolean;
-}
-
-async function loadForm(): Promise<QualityForm> {
-  const s = (await getConfig('milkflint')).find((x) => x['.name'] === 'netquality');
-  const target = str(s, 'ping_target') ?? '1.1.1.1';
-  const preset = pingTargets.some((p) => p.value === target);
-  return {
-    enabled: bool(s, 'enabled', true),
-    interval: str(s, 'interval') ?? '5',
-    pingTarget: preset ? target : 'custom',
-    customTarget: preset ? '' : target,
-    dnsDomain: str(s, 'dns_domain') ?? 'openwrt.org',
-    dnsServer: str(s, 'dns_server') ?? '',
-    routes: bool(s, 'routes', true),
-  };
-}
-
-const HOST = /^[A-Za-z0-9.:-]+$/;
-// an IPv4 address, #port optional (the probe's dns-path.uc takes the same)
-const DNS_SERVER = /^(\d{1,3}\.){3}\d{1,3}(#\d{1,5})?$/;
-
 export function NetworkQualityPage(): ReactElement {
-  const live = useLive(2000);
-  const { data, error, loading, reload } = useLoad(loadForm);
-  const [edit, setEdit] = useState<QualityForm>();
-  const onApplied = useCallback(() => {
-    setEdit(undefined);
-    reload();
-  }, [reload]);
-  const { state, apply } = useApply(onApplied);
-  const form = edit ?? data;
-  const set = <K extends keyof QualityForm>(key: K, value: QualityForm[K]): void => {
-    setEdit((current) => {
-      const base = current ?? data;
-      return base === undefined ? undefined : { ...base, [key]: value };
-    });
-  };
+  const live = useLiveQuality(2000);
+  const settings = useQuery(qualityQueries.settings());
+  const results =
+    live.data === undefined ? (
+      live.error === undefined ? (
+        <FormSkeleton />
+      ) : (
+        <LoadError error={live.error} retry={live.refresh} />
+      )
+    ) : live.data.status.enabled ? (
+      <Results live={live.data} />
+    ) : (
+      <QualityOff />
+    );
+  if (settings.data === undefined) {
+    return (
+      <QualityLayout
+        results={results}
+        settings={settings.error === null ? null : <LoadError error={settings.error} retry={() => void settings.refetch()} />}
+      />
+    );
+  }
+  return <QualityWithSettings saved={settings.data} results={results} />;
+}
 
-  const errors: Partial<Record<keyof QualityForm, string>> = {};
-  if (form?.pingTarget === 'custom' && !HOST.test(form.customTarget)) errors.customTarget = 'An IP address or host name.';
-  if (form !== undefined && !/^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(form.dnsDomain))
-    errors.dnsDomain = 'A domain name, e.g. openwrt.org.';
-  if (form !== undefined && form.dnsServer !== '' && !DNS_SERVER.test(form.dnsServer))
-    errors.dnsServer = 'An IPv4 address, with #port when it isn’t 53, e.g. 127.0.0.1#5354.';
-  const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data);
-
-  const toChanges = (f: QualityForm): Change[] => [
-    {
-      op: 'set',
-      config: 'milkflint',
-      section: 'netquality',
-      values: {
-        enabled: f.enabled ? '1' : '0',
-        interval: f.interval,
-        ping_target: f.pingTarget === 'custom' ? f.customTarget : f.pingTarget,
-        dns_domain: f.dnsDomain,
-        ...(f.dnsServer === '' ? {} : { dns_server: f.dnsServer }),
-        routes: f.routes ? '1' : '0',
-      },
-    },
-    ...(f.dnsServer === '' && data?.dnsServer !== undefined && data.dnsServer !== ''
-      ? [{ op: 'unset' as const, config: 'milkflint', section: 'netquality', options: ['dns_server'] }]
-      : []),
-  ];
-
+/** The page: its header (with the on/off once the settings are read), the results, the settings, the save bar. */
+function QualityLayout({
+  power,
+  results,
+  status,
+  settings,
+  saveBar,
+}: {
+  power?: ReactNode;
+  results: ReactNode;
+  status?: ReactNode;
+  settings: ReactNode;
+  saveBar?: ReactNode;
+}): ReactElement {
   return (
     <>
       <PageHeader
         title="Network quality"
         description="Latency to your gateway, the internet and DNS, measured continuously."
-        actions={
-          form !== undefined && (
-            <PowerSwitch
-              name="Network quality"
-              on={form.enabled}
-              saved={data?.enabled}
-              onChange={(v) => {
-                set('enabled', v);
-              }}
-            />
-          )
-        }
+        actions={power}
       />
       <div className="flex flex-col gap-4">
-        <ApplyStatus state={state} />
-        {live.data === undefined ? (
-          live.error === undefined ? (
-            <FormSkeleton />
-          ) : (
-            <LoadError error={live.error} retry={live.refresh} />
-          )
-        ) : live.data.status.enabled ? (
-          <Results live={live.data} />
-        ) : (
-          <QualityOff />
-        )}
+        {status}
+        {results}
+        {settings}
+      </div>
+      {saveBar}
+    </>
+  );
+}
 
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading || form === undefined ? null : (
-          <Card>
-            <CardHeading title="Settings" description="What to measure, and how often." />
-            <CardContent className="divide-y">
-              <Field
-                id="nq-target"
-                label="Internet target"
-                hint="Pinged every round."
-                why="An IP address avoids timing a DNS lookup as well as the ping. Saved as milkflint.netquality.ping_target."
-              >
-                <Select
-                  value={form.pingTarget}
-                  onValueChange={(v) => {
-                    set('pingTarget', v);
-                  }}
-                >
-                  <SelectTrigger id="nq-target">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {pingTargets.map((p) => (
-                      <SelectItem key={p.value} value={p.value}>
-                        {p.label}
-                      </SelectItem>
-                    ))}
-                    <SelectItem value="custom">Custom</SelectItem>
-                  </SelectContent>
-                </Select>
-              </Field>
-              {form.pingTarget === 'custom' && (
-                <Field id="nq-custom" label="Custom target" error={errors.customTarget}>
-                  <Input
-                    id="nq-custom"
-                    className="font-mono"
-                    value={form.customTarget}
-                    aria-invalid={errors.customTarget !== undefined}
-                    onChange={(e) => {
-                      set('customTarget', e.target.value.trim());
-                    }}
-                  />
-                </Field>
-              )}
-              <Field
-                id="nq-dns"
-                label="DNS test domain"
-                hint="Looked up at each DNS server your devices’ lookups go to."
-                why="The DNS page’s servers, your internet provider’s when DNS is Automatic, or a DNS program on the router set up outside MilkFlint (ctrld, AdGuard Home, Unbound…). Saved as milkflint.netquality.dns_domain."
-                error={errors.dnsDomain}
-              >
-                <Input
-                  id="nq-dns"
-                  className="font-mono"
-                  value={form.dnsDomain}
-                  aria-invalid={errors.dnsDomain !== undefined}
-                  onChange={(e) => {
-                    set('dnsDomain', e.target.value.trim());
-                  }}
+function QualityWithSettings({ saved, results }: { saved: QualityForm; results: ReactNode }): ReactElement {
+  const { state, apply } = useApply();
+  const settings = useSettingsForm({
+    schema: qualityFormSchema,
+    saved,
+    onSave: (values) => apply(toChanges(values, saved)),
+  });
+  const { form } = settings;
+  const values = useFormValues(form);
+  const intervals = ['2', '5', '10', '30'];
+
+  return (
+    <QualityLayout
+      power={
+        <PowerSwitch
+          name="Network quality"
+          on={values.enabled}
+          saved={saved.enabled}
+          onChange={(v) => {
+            form.setFieldValue('enabled', v);
+          }}
+        />
+      }
+      status={<ApplyStatus state={state} />}
+      results={results}
+      settings={
+        <Card>
+          <CardHeading title="Settings" description="What to measure, and how often." />
+          <CardContent className="divide-y">
+            <form.Field name="pingTarget">
+              {(field) => (
+                <SelectField
+                  field={field}
+                  id="nq-target"
+                  label="Internet target"
+                  hint="Pinged every round."
+                  why="An IP address avoids timing a DNS lookup as well as the ping. Saved as milkflint.netquality.ping_target."
+                  options={[
+                    ...pingTargets.map((p) => ({ value: p.value, label: p.label })),
+                    { value: 'custom', label: 'Custom' },
+                  ]}
                 />
-              </Field>
-              <Field
-                id="nq-dns-server"
-                label="DNS server to test"
-                hint="Leave empty to test the servers your devices’ lookups go to."
-                why="For a setup the router can’t follow by itself. An IPv4 address, with #port when it isn’t 53: 127.0.0.1#5354 for a program on the router. Saved as milkflint.netquality.dns_server."
-                error={errors.dnsServer}
-              >
-                <Input
+              )}
+            </form.Field>
+            {values.pingTarget === 'custom' && (
+              <form.Field name="customTarget">
+                {(field) => <TextField field={field} id="nq-custom" label="Custom target" className="font-mono" trim />}
+              </form.Field>
+            )}
+            <form.Field name="dnsDomain">
+              {(field) => (
+                <TextField
+                  field={field}
+                  id="nq-dns"
+                  label="DNS test domain"
+                  hint="Looked up at each DNS server your devices’ lookups go to."
+                  why="The DNS page’s servers, your internet provider’s when DNS is Automatic, or a DNS program on the router set up outside MilkFlint (ctrld, AdGuard Home, Unbound…). Saved as milkflint.netquality.dns_domain."
+                  className="font-mono"
+                  trim
+                />
+              )}
+            </form.Field>
+            <form.Field name="dnsServer">
+              {(field) => (
+                <TextField
+                  field={field}
                   id="nq-dns-server"
+                  label="DNS server to test"
+                  hint="Leave empty to test the servers your devices’ lookups go to."
+                  why="For a setup the router can’t follow by itself. An IPv4 address, with #port when it isn’t 53: 127.0.0.1#5354 for a program on the router. Saved as milkflint.netquality.dns_server."
                   className="font-mono"
                   placeholder="Automatic"
-                  value={form.dnsServer}
-                  aria-invalid={errors.dnsServer !== undefined}
-                  onChange={(e) => {
-                    set('dnsServer', e.target.value.trim());
-                  }}
+                  trim
                 />
-              </Field>
-              <Field
-                id="nq-interval"
-                label="Measure every"
-                hint="How often a round of measurements runs."
-                why="Saved as milkflint.netquality.interval."
-              >
-                <Select
-                  value={form.interval}
-                  onValueChange={(v) => {
-                    set('interval', v);
-                  }}
-                >
-                  <SelectTrigger id="nq-interval">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {['2', '5', '10', '30'].map((s) => (
-                      <SelectItem key={s} value={s}>
-                        {s} seconds
-                      </SelectItem>
-                    ))}
-                    {!['2', '5', '10', '30'].includes(form.interval) && (
-                      <SelectItem value={form.interval}>{form.interval} seconds</SelectItem>
-                    )}
-                  </SelectContent>
-                </Select>
-              </Field>
-              <Field
-                id="nq-routes"
-                label="Compare routes"
-                hint="Once a minute, one ping each to test servers in London, Frankfurt and New Jersey."
-                why="Vultr’s, made for latency tests. They’re not part of the score. Saved as milkflint.netquality.routes."
-              >
-                <Switch
+              )}
+            </form.Field>
+            <form.Field name="interval">
+              {(field) => (
+                <SelectField
+                  field={field}
+                  id="nq-interval"
+                  label="Measure every"
+                  hint="How often a round of measurements runs."
+                  why="Saved as milkflint.netquality.interval."
+                  options={[
+                    ...intervals.map((s) => ({ value: s, label: `${s} seconds` })),
+                    ...(intervals.includes(values.interval)
+                      ? []
+                      : [{ value: values.interval, label: `${values.interval} seconds` }]),
+                  ]}
+                />
+              )}
+            </form.Field>
+            <form.Field name="routes">
+              {(field) => (
+                <SwitchField
+                  field={field}
                   id="nq-routes"
-                  checked={form.routes}
-                  onCheckedChange={(v) => {
-                    set('routes', v);
-                  }}
+                  label="Compare routes"
+                  hint="Once a minute, one ping each to test servers in London, Frankfurt and New Jersey."
+                  why="Vultr’s, made for latency tests. They’re not part of the score. Saved as milkflint.netquality.routes."
                 />
-              </Field>
-            </CardContent>
-          </Card>
-        )}
-      </div>
-      <SaveBar
-        visible={dirty}
-        busy={state.phase === 'applying'}
-        invalid={Object.keys(errors).length > 0}
-        onSave={() => {
-          if (form !== undefined) void apply(toChanges(form));
-        }}
-        onRevert={() => {
-          setEdit(undefined);
-        }}
-      />
-    </>
+              )}
+            </form.Field>
+          </CardContent>
+        </Card>
+      }
+      saveBar={<FormSaveBar settings={settings} busy={state.phase === 'applying'} />}
+    />
   );
 }

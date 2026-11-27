@@ -1,6 +1,7 @@
 import { BrickWallIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { firewallQueries } from './queries';
 
 export const feature = {
   id: 'firewall',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.FirewallPage,
   ),
+  prefetch: (client) => {
+    client.query(firewallQueries.config()).catch(() => undefined);
+  },
 } satisfies Feature;

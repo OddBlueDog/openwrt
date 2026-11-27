@@ -1,12 +1,11 @@
-import { type ReactElement, useId } from 'react';
-import { cn } from '@/lib/utils';
-import { ChartHover } from './chart-hover';
-import { paths, toPoints } from './path';
+// A small filled line of recent values, e.g. CPU use over the last minutes:
+// TimeChart at a glance (no scale or times), its values right-aligned in
+// `slots`. With `format` (and `label`), hovering it shows the value there,
+// in a card above it.
+import type { ReactElement } from 'react';
+import { clockText, type TimePoint } from './time-axis';
+import { TimeChart } from './time-chart';
 
-/**
- * A small filled line of recent values, e.g. CPU use over the last minutes.
- * With `format` (and `label`), hovering it shows the value there.
- */
 export function Sparkline({
   values,
   max,
@@ -28,37 +27,26 @@ export function Sparkline({
   /** Epoch seconds of a slot, shown when hovering it. */
   timeOf?: ((slot: number) => number | undefined) | undefined;
 }): ReactElement {
-  const id = useId();
-  const { line, area } = paths(toPoints(values, max, slots));
-  const svg = (
-    <svg
-      viewBox="0 0 100 100"
-      preserveAspectRatio="none"
-      aria-hidden="true"
-      className={cn('h-10 w-full', format !== undefined && 'h-full', format === undefined && className)}
-    >
-      <defs>
-        <linearGradient id={id} x1="0" x2="0" y1="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="0.28" />
-          <stop offset="100%" stopColor={color} stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      <path d={area} fill={`url(#${id})`} />
-      <path d={line} fill="none" stroke={color} strokeWidth="1.6" vectorEffect="non-scaling-stroke" strokeLinejoin="round" />
-    </svg>
-  );
-  if (format === undefined) return svg;
+  const offset = slots - values.length;
+  // a slot's own number when no time is known (or a slot has none)
+  const at = (slot: number): number => (timeOf === undefined ? slot : (timeOf(slot) ?? slot));
+  const points: TimePoint[] = values.map((v, i) => [at(offset + i), v ?? null]);
+  const from = at(0);
+  const to = at(slots - 1);
+  const step = slots > 1 ? (to - from) / (slots - 1) : 1;
   return (
-    <div className={cn('relative h-10 w-full', className)}>
-      {svg}
-      <ChartHover
-        series={[{ label: label ?? '', color, values }]}
-        slots={slots}
-        max={max}
-        format={format}
-        timeOf={timeOf}
-        above
-      />
-    </div>
+    <TimeChart
+      lines={[{ label: label ?? '', color, points, area: true }]}
+      from={from}
+      to={Math.max(to, from + 1)}
+      max={max}
+      step={step}
+      format={format ?? String}
+      timeText={timeOf === undefined ? () => '' : (t) => clockText(t, step < 60)}
+      label={label ?? ''}
+      className={className ?? 'h-10 w-full'}
+      bare
+      hover={format !== undefined}
+    />
   );
 }

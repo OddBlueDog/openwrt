@@ -2,7 +2,15 @@
 // and a run's state, each as a status word.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AWAY_MS, devicesStatus, namesText, presence, runOn, runStatus } from '../src/features/test-bench/summary.ts';
+import {
+  AWAY_MS,
+  devicesStatus,
+  distinctNames,
+  namesText,
+  presence,
+  runOn,
+  runStatus,
+} from '../src/features/test-bench/summary.ts';
 
 const ready = { seen_ms: 500, visible: true };
 const away = { seen_ms: AWAY_MS + 1, visible: true };
@@ -55,4 +63,20 @@ test('names: a list in British English, cut short past the maximum', () => {
   assert.equal(namesText(['Mac', 'iPhone', 'PC']), 'Mac, iPhone and PC');
   assert.equal(namesText(['A', 'B', 'C', 'D']), 'A, B, C and D');
   assert.equal(namesText(['A', 'B', 'C', 'D', 'E', 'F']), 'A, B, C and 3 more');
+});
+
+test('distinct names: a name two devices share gets each one’s id', () => {
+  const names = distinctNames([
+    { id: 'm1', name: 'Mac' },
+    { id: 'm2', name: 'iPhone' },
+    { id: 'm3', name: 'Mac' },
+  ]);
+  assert.deepEqual(
+    [...names],
+    [
+      ['m1', 'Mac (m1)'],
+      ['m2', 'iPhone'],
+      ['m3', 'Mac (m3)'],
+    ],
+  );
 });

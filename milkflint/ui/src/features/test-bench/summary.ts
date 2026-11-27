@@ -62,3 +62,10 @@ export function namesText(names: readonly string[], max = 4): string {
   const shown = names.length > max ? [...names.slice(0, max - 1), `${String(names.length - max + 1)} more`] : [...names];
   return new Intl.ListFormat('en-GB', { style: 'long', type: 'conjunction' }).format(shown);
 }
+
+/** Each device's name by its id, a name two share with the id after it ("Mac (m3)"): a matrix's columns, which must differ. */
+export function distinctNames(members: readonly { id: string; name: string }[]): Map<string, string> {
+  const seen = new Map<string, number>();
+  for (const m of members) seen.set(m.name, (seen.get(m.name) ?? 0) + 1);
+  return new Map(members.map((m) => [m.id, (seen.get(m.name) ?? 0) > 1 ? `${m.name} (${m.id})` : m.name]));
+}

@@ -32,6 +32,30 @@ function seconds(by: ReadonlyMap<number, number | null>): TPoint[] {
   return out;
 }
 
+/** The charts' common grid: a point in the middle of each second, where the per-second ones already sit. */
+export const GRID_MS = 1000;
+
+/**
+ * A series on the grid, up to `to`: at each second's middle the nearest
+ * point (a value or a gap) less than `within` ms away, else a gap; of two as
+ * near, the later (a router sample covers the second before it). Every
+ * chart's points then share their times, so a hover at one moment reads each
+ * series of every chart (a shared cursor matches times exactly), and a series
+ * sampled less often (the Wi-Fi stations' every 2 s, the connection scans')
+ * holds its value to the next. Points each second are on it already.
+ */
+export function onGrid(points: readonly TPoint[], to: number, within: number = GRID_MS): TPoint[] {
+  const out: TPoint[] = [];
+  let i = 0;
+  for (let g = mid(0); g < to; g += GRID_MS) {
+    const off = (j: number): number => Math.abs((points[j]?.[0] ?? Number.POSITIVE_INFINITY) - g);
+    // in time order: on to the next point while it's no further away
+    while (i + 1 < points.length && off(i + 1) <= off(i)) i++;
+    out.push([g, off(i) < within ? (points[i]?.[1] ?? null) : null]);
+  }
+  return out;
+}
+
 /** The worst answered probe in each second (null: none answered), and when probes went unanswered. */
 export function worstEachSecond(samples: readonly RttSample[], t0: number): { points: TPoint[]; lost: number[] } {
   const by = new Map<number, number | null>();
@@ -177,11 +201,16 @@ export function cakeSeconds(lines: readonly RouterLine[], t0: number, dir: 'down
   return out;
 }
 
-/** Each CPU's busy share (and its softirq share) per sample, a row per CPU; each sample covers `spans` (the time since the one before). */
-export function cpuRows(
-  lines: readonly RouterLine[],
-  t0: number,
-): { spans: [number, number][]; busy: (number | null)[][]; softirq: (number | null)[][] } {
+export interface CpuRows {
+  /** each sample's start and end: the time since the one before */
+  spans: [number, number][];
+  /** a row per CPU, a share (0..1) per sample; null: no figure */
+  busy: (number | null)[][];
+  softirq: (number | null)[][];
+}
+
+/** Each CPU's busy share (and its softirq share) per sample, a row per CPU. */
+export function cpuRows(lines: readonly RouterLine[], t0: number): CpuRows {
   const spans: [number, number][] = [];
   const busy: (number | null)[][] = [];
   const softirq: (number | null)[][] = [];

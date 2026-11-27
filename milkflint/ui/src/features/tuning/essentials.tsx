@@ -1,6 +1,8 @@
 // Performance tuning's essentials: how what the ports receive is spread over
 // the CPUs (packet steering), and the shortcut for established connections
 // (flow offloading, in software or in the chip with WED).
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import type { ReactElement } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
@@ -11,7 +13,6 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import type { NetworkLive } from '@/hooks/use-network-live';
-import { href } from '@/lib/router';
 import { splitHint } from '@/lib/hint';
 import { RotateCwIcon } from 'lucide-react';
 import { explain } from '@/components/explain';
@@ -171,7 +172,7 @@ export function OffloadCard({
         {data.firewall === undefined ? (
           <p className="py-3.5 text-sm text-muted-foreground">
             The firewall has no defaults section to set it in.{' '}
-            <a href="/cgi-bin/luci/admin/network/firewall" target="_blank" rel="noreferrer" className="font-medium link">
+            <a href="/cgi-bin/luci/admin/network/firewall" className="font-medium link">
               Look at it in LuCI
             </a>
             .
@@ -240,9 +241,9 @@ export function OffloadCard({
             {!data.form.wed && data.firewall.hardware && (
               <p className="py-3.5 text-sm text-muted-foreground">
                 Hardware offloading without WED is on in the{' '}
-                <a href={href('firewall')} className="font-medium link">
+                <Link {...pageLink('firewall')} className="font-medium link">
                   Firewall
-                </a>
+                </Link>
                 : wired connections are forwarded in hardware, past Smart Queue.
               </p>
             )}

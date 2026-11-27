@@ -1,6 +1,7 @@
+import { Link } from '@tanstack/react-router';
+import { pageLink } from '@/lib/router';
 import { KeyRoundIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { href } from '@/lib/router';
 
 /**
  * A slim reminder above every page while the router has no admin password
@@ -16,12 +17,12 @@ export function PasswordBar({ password }: { password: 'none' | 'old-default' }):
         <span className="font-semibold">{password === 'none' ? 'No admin password.' : 'Still the default admin password.'}</span>
         <span className="hidden sm:inline"> Anyone on your network can change these settings.</span>
       </p>
-      <a
-        href={href('admin-password')}
+      <Link
+        {...pageLink('admin-password')}
         className="shrink-0 font-semibold text-foreground underline underline-offset-2 hover:no-underline"
       >
         {password === 'none' ? 'Set one' : 'Change it'}
-      </a>
+      </Link>
     </div>
   );
 }

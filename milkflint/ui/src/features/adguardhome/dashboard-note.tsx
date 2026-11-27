@@ -1,11 +1,14 @@
 import { LoaderCircleIcon, ShieldAlertIcon, WrenchIcon } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
+import { pageLink } from '@/lib/router';
 import { type ReactElement, useState } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
-import { usePoll } from '@/hooks/use-poll';
+import { useLive } from '@/lib/query/use-live';
 import { errorMessage } from '@/lib/utils';
-import { getAdGuardStatus, repairAdGuard } from './api';
+import { repairAdGuard } from './api';
 import { needsAttention } from './model';
+import { adguardQueries, useAdGuardWrite } from './queries';
 
 /**
  * The Dashboard's warning while AdGuard Home is on but lookups go round it
@@ -15,8 +18,10 @@ import { needsAttention } from './model';
  * Nothing otherwise, nor where there's no AdGuard Home.
  */
 export function AdGuardHomeNote(): ReactElement | null {
-  // a firmware without it answers "not found": then nothing, quietly
-  const { data, refresh } = usePoll(() => getAdGuardStatus().catch(() => undefined), 15000);
+  // a firmware without it answers "not found": then no data, and nothing shows
+  const { data } = useLive(adguardQueries.statusEvery15s());
+  // asks the status again once it went through
+  const write = useAdGuardWrite();
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string>();
   const { fallback, blocking, broken } = needsAttention(data);
@@ -48,10 +53,9 @@ export function AdGuardHomeNote(): ReactElement | null {
               onClick={() => {
                 setBusy(true);
                 setFailed(undefined);
-                repairAdGuard().then(
+                write.mutateAsync(repairAdGuard).then(
                   () => {
                     setBusy(false);
-                    refresh();
                   },
                   (err: unknown) => {
                     setBusy(false);
@@ -64,7 +68,7 @@ export function AdGuardHomeNote(): ReactElement | null {
             </Button>
           )}
           <Button size="sm" variant="outline" asChild>
-            <a href="#/adguardhome">AdGuard Home page</a>
+            <Link {...pageLink('adguardhome')}>AdGuard Home page</Link>
           </Button>
         </div>
       </AlertDescription>

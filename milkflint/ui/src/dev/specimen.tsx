@@ -4,6 +4,7 @@
 import { CircleCheckIcon, InfoIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { CardHeading, InfoRow } from '@/components/card-heading';
+import { type Column, DataTable } from '@/components/data-table';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
 import { Logo, Wordmark } from '@/components/layout/sidebar';
@@ -28,7 +29,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { HomeSpecimen } from '@/dev/home-specimen';
 import { pickableThemes, setThemeId, useTheme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
@@ -47,6 +47,31 @@ function Section({ title, children }: { title: string; children: ReactNode }): R
 
 const SERIES = [1, 2, 3, 4, 5, 6] as const;
 const RAMP = [1, 2, 3, 4, 5] as const;
+
+interface SampleDevice {
+  name: string;
+  band: string;
+  mbit: number;
+  signal: string;
+}
+const DEVICES: readonly SampleDevice[] = [
+  { name: 'Smart TV', band: '5 GHz', mbit: 312, signal: '−58 dBm' },
+  { name: 'Laptop', band: '5 GHz', mbit: 41, signal: '−49 dBm' },
+  { name: 'Old tablet', band: '2.4 GHz', mbit: 0.4, signal: '−71 dBm' },
+];
+// a table as every list draws one: the device and its download sort from their headings
+const DEVICE_COLUMNS: readonly Column<SampleDevice>[] = [
+  { label: 'Device', cell: (d) => d.name, sort: (d) => d.name, className: 'font-medium' },
+  { label: 'Band', cell: (d) => d.band },
+  {
+    label: 'Download',
+    cell: (d) => `${String(d.mbit)} Mbit/s`,
+    sort: (d) => d.mbit,
+    sortDescFirst: true,
+    className: 'text-right tabular',
+  },
+  { label: 'Signal', cell: (d) => d.signal, className: 'text-right text-muted-foreground' },
+];
 
 /** A small sample of everything, drawn inside whatever theme and scheme wrap it. */
 function Sample(): ReactElement {
@@ -299,34 +324,7 @@ export function SpecimenPage(): ReactElement {
 
       <Section title="Data">
         <div className="grid gap-4 lg:grid-cols-[2fr_1fr]">
-          <Card className="gap-0 py-0">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Device</TableHead>
-                  <TableHead>Band</TableHead>
-                  <TableHead className="text-right">Download</TableHead>
-                  <TableHead className="text-right">Signal</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {(
-                  [
-                    ['Smart TV', '5 GHz', '312 Mbit/s', '−58 dBm'],
-                    ['Laptop', '5 GHz', '41 Mbit/s', '−49 dBm'],
-                    ['Old tablet', '2.4 GHz', '0.4 Mbit/s', '−71 dBm'],
-                  ] as const
-                ).map(([d, b, r, s]) => (
-                  <TableRow key={d}>
-                    <TableCell className="font-medium">{d}</TableCell>
-                    <TableCell>{b}</TableCell>
-                    <TableCell className="text-right">{r}</TableCell>
-                    <TableCell className="text-right text-muted-foreground">{s}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </Card>
+          <DataTable label="Devices" columns={DEVICE_COLUMNS} rows={DEVICES} rowKey={(d) => d.name} empty="No devices." />
           <Card className="gap-3">
             <CardHeading title="Internet" description="Live, from the WAN port" />
             <CardContent>

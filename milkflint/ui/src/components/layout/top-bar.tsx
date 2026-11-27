@@ -1,8 +1,9 @@
+import { Link } from '@tanstack/react-router';
 import { ChevronDownIcon, EllipsisIcon, LogOutIcon, type LucideIcon, SearchIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useCallback, useEffect, useId, useRef, useState } from 'react';
 import { menuFor, type MenuGroup } from '@/features';
 import type { Board } from '@/lib/api/system';
-import { href, type Route } from '@/lib/router';
+import { pageLink, type Route } from '@/lib/router';
 import { useRouterMode } from '@/lib/router-mode';
 import { logout } from '@/lib/session';
 import { cn } from '@/lib/utils';
@@ -58,9 +59,9 @@ function GroupMenu({ group, active }: { group: MenuGroup; active: Route }): Reac
         className="absolute top-full left-0 z-50 mt-1 min-w-56 animate-[mf-pop-in_var(--mf-duration-base)_var(--mf-ease-enter)] rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
       >
         {group.features.map((f) => (
-          <a
+          <Link
             key={f.id}
-            href={href(f.id)}
+            {...pageLink(f.id)}
             aria-current={active === f.id ? 'page' : undefined}
             onClick={() => {
               setOpen(false);
@@ -72,7 +73,7 @@ function GroupMenu({ group, active }: { group: MenuGroup; active: Route }): Reac
           >
             {icons && <f.icon aria-hidden="true" className="size-4 text-muted-foreground" />}
             {f.title}
-          </a>
+          </Link>
         ))}
       </div>
     </div>
@@ -87,14 +88,14 @@ function MenuEntries({ active }: { active: Route }): ReactElement {
     <>
       {menu.map((entry) =>
         entry.kind === 'page' ? (
-          <a
+          <Link
             key={entry.feature.id}
-            href={href(entry.feature.id)}
+            {...pageLink(entry.feature.id)}
             aria-current={active === entry.feature.id ? 'page' : undefined}
             className={cn(barItem, currentClass(active === entry.feature.id))}
           >
             {entry.feature.title}
-          </a>
+          </Link>
         ) : (
           <GroupMenu key={entry.group.id} group={entry.group} active={active} />
         ),

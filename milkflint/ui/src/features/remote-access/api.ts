@@ -36,7 +36,7 @@ function peerOf(s: Section, subnet: string): PeerForm {
 }
 
 export async function loadServer(): Promise<ServerData> {
-  const noStatus: WgStatus = { installed: false, now: Date.now() / 1000, interfaces: [] };
+  const noStatus: WgStatus = { installed: false, now: Date.now() / 1000, interfaces: [], tunnel: null };
   const [network, firewall, milkflint, interfaces, status, ports] = await Promise.all([
     getConfig('network'),
     getConfig('firewall'),

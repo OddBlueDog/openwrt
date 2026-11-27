@@ -3,21 +3,21 @@
 // log's counters and snapshot, the memory error checker) are on
 // Performance tuning, under Diagnostics; they write the same milkflint.logs
 // section, so a save here writes them back as they were loaded.
-import { type ReactElement, useCallback, useState } from 'react';
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
+import type { ReactElement } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
-import { Field } from '@/components/field';
-import { LoadError } from '@/components/page-states';
-import { SaveBar } from '@/components/save-bar';
-import { Card, CardContent } from '@/components/ui/card';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
-import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { href } from '@/lib/router';
 import { explain } from '@/components/explain';
+import { FormSaveBar, SelectField, SwitchField } from '@/components/form';
 import { MoreSettings } from '@/components/more-settings';
-import { getLogSettings, type LogSettings, logSettingsChanges } from './api';
+import { Card, CardContent } from '@/components/ui/card';
+import { useApply } from '@/hooks/use-apply';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { pageLink } from '@/lib/router';
+import { logSettingsChanges } from './api';
+import { logSettingsSchema } from './model';
+import { logsQueries } from './queries';
 
 const sizes = ['1', '3', '10'];
 const intervals = ['5', '10', '30', '60'];
@@ -52,27 +52,26 @@ const wifiParts: { key: 'channel' | 'mu' | 'rrm' | 'net'; option: string; title:
 
 const uci = (option: string): string => `milkflint.logs.${option}`;
 
-export function LogSettingsCard({ onApplied }: { onApplied: () => void }): ReactElement | null {
-  const { data, error, loading, reload } = useLoad(getLogSettings);
-  const [edit, setEdit] = useState<LogSettings>();
-  const applied = useCallback(() => {
-    setEdit(undefined);
-    reload();
-    onApplied();
-  }, [reload, onApplied]);
-  const { state, apply } = useApply(applied);
-  const form = edit ?? data;
-  const set = <K extends keyof LogSettings>(key: K, value: LogSettings[K]): void => {
-    setEdit((current) => {
-      const base = current ?? data;
-      return base === undefined ? undefined : { ...base, [key]: value };
-    });
-  };
-  const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(data);
-
-  if (error !== undefined && data === undefined) return <LoadError error={error} retry={reload} />;
-  if (loading || form === undefined) return null;
-  const partsOff = wifiParts.filter((p) => !form[p.key]).map((p) => p.title);
+/** What gets logged: inside a PageBoundary (nothing shows while it loads). */
+export function LogSettingsCard(): ReactElement {
+  const { data } = useSuspenseQuery(logsQueries.settings());
+  const { state, apply } = useApply();
+  const settings = useSettingsForm({
+    schema: logSettingsSchema,
+    saved: data,
+    onSave: (values) => apply(logSettingsChanges(values, data)),
+  });
+  const { form } = settings;
+  const values = useFormValues(form);
+  const partsOff = wifiParts.filter((p) => !values[p.key]).map((p) => p.title);
+  const sizeOptions = [...sizes, ...(sizes.includes(values.size) ? [] : [values.size])].map((v) => ({
+    value: v,
+    label: `${v} MB`,
+  }));
+  const intervalOptions = [...intervals, ...(intervals.includes(values.interval) ? [] : [values.interval])].map((v) => ({
+    value: v,
+    label: `${v} seconds`,
+  }));
   return (
     <>
       <ApplyStatus state={state} />
@@ -85,54 +84,45 @@ export function LogSettingsCard({ onApplied }: { onApplied: () => void }): React
                 Which logs
               </h3>
               <div className="divide-y">
-                <Field
-                  id="logs-wifi"
-                  label="Wi-Fi log"
-                  {...explain(
-                    'Wi-Fi events from the system log, and a line for each connected device: signal, packets, retries, failures, speeds and queued airtime. NO TX marks a device that sent to the router but got nothing back.',
-                    [uci('wifi')],
+                <form.Field name="wifi">
+                  {(field) => (
+                    <SwitchField
+                      field={field}
+                      id="logs-wifi"
+                      label="Wi-Fi log"
+                      {...explain(
+                        'Wi-Fi events from the system log, and a line for each connected device: signal, packets, retries, failures, speeds and queued airtime. NO TX marks a device that sent to the router but got nothing back.',
+                        [uci('wifi')],
+                      )}
+                    />
                   )}
-                >
-                  <Switch
-                    id="logs-wifi"
-                    checked={form.wifi}
-                    onCheckedChange={(v) => {
-                      set('wifi', v);
-                    }}
-                  />
-                </Field>
-                <Field
-                  id="logs-radar"
-                  label="Radar log"
-                  {...explain(
-                    'The 5 GHz radar checks, radar heard and the moves after it, always on the router’s storage (/root/milkflint-wifi, 64 KB). Networks & radios shows them too.',
-                    [uci('radar')],
+                </form.Field>
+                <form.Field name="radar">
+                  {(field) => (
+                    <SwitchField
+                      field={field}
+                      id="logs-radar"
+                      label="Radar log"
+                      {...explain(
+                        'The 5 GHz radar checks, radar heard and the moves after it, always on the router’s storage (/root/milkflint-wifi, 64 KB). Networks & radios shows them too.',
+                        [uci('radar')],
+                      )}
+                    />
                   )}
-                >
-                  <Switch
-                    id="logs-radar"
-                    checked={form.radar}
-                    onCheckedChange={(v) => {
-                      set('radar', v);
-                    }}
-                  />
-                </Field>
-                <Field
-                  id="logs-dns"
-                  label="DNS log"
-                  {...explain(
-                    'For chasing slow pages or apps: each lookup that takes over 500 ms, fails or gets no answer, with the site and the device, a summary every minute, and the DNS services’ errors. To time them, the router notes every lookup in memory for a moment and keeps only the slow ones. Turning it on or off restarts the DNS service: a second without lookups.',
-                    [uci('dns'), 'dhcp.@dnsmasq[0].logqueries'],
+                </form.Field>
+                <form.Field name="dns">
+                  {(field) => (
+                    <SwitchField
+                      field={field}
+                      id="logs-dns"
+                      label="DNS log"
+                      {...explain(
+                        'For chasing slow pages or apps: each lookup that takes over 500 ms, fails or gets no answer, with the site and the device, a summary every minute, and the DNS services’ errors. To time them, the router notes every lookup in memory for a moment and keeps only the slow ones. Turning it on or off restarts the DNS service: a second without lookups.',
+                        [uci('dns'), 'dhcp.@dnsmasq[0].logqueries'],
+                      )}
+                    />
                   )}
-                >
-                  <Switch
-                    id="logs-dns"
-                    checked={form.dns}
-                    onCheckedChange={(v) => {
-                      set('dns', v);
-                    }}
-                  />
-                </Field>
+                </form.Field>
               </div>
             </section>
             <section aria-labelledby="logs-where" className="flex min-w-0 flex-col max-xl:mt-4">
@@ -140,121 +130,83 @@ export function LogSettingsCard({ onApplied }: { onApplied: () => void }): React
                 Where they’re kept, and how often
               </h3>
               <div className="divide-y">
-                <Field
-                  id="logs-persist"
-                  label="Keep after a restart"
-                  {...explain(
-                    'Saves the system log, the kernel’s lines included, the Wi-Fi, debug and DNS logs on the router’s storage (/root/milkflint-logs). Otherwise they’re only in memory, and a restart or crash clears them.',
-                    [uci('persist')],
-                  )}
-                >
-                  <Switch
-                    id="logs-persist"
-                    checked={form.persist}
-                    onCheckedChange={(v) => {
-                      set('persist', v);
-                    }}
-                  />
-                </Field>
-                <Field
-                  id="logs-size"
-                  label="Size per log"
-                  {...explain('When a log reaches this, its older half is deleted.', [uci('size')])}
-                >
-                  <Select
-                    value={form.size}
-                    onValueChange={(v) => {
-                      set('size', v);
-                    }}
-                  >
-                    <SelectTrigger id="logs-size" className="w-40">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {sizes.map((s) => (
-                        <SelectItem key={s} value={s}>
-                          {s} MB
-                        </SelectItem>
-                      ))}
-                      {!sizes.includes(form.size) && <SelectItem value={form.size}>{form.size} MB</SelectItem>}
-                    </SelectContent>
-                  </Select>
-                </Field>
-                <Field
-                  id="logs-interval"
-                  label="Sample every"
-                  {...explain('The Wi-Fi log’s devices (idle ones once a minute) and the debug counters.', [
-                    uci('wifi_interval'),
-                  ])}
-                >
-                  <Select
-                    value={form.interval}
-                    disabled={!form.wifi && !form.counters && !form.snapshot}
-                    onValueChange={(v) => {
-                      set('interval', v);
-                    }}
-                  >
-                    <SelectTrigger id="logs-interval" className="w-40">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {intervals.map((s) => (
-                        <SelectItem key={s} value={s}>
-                          {s} seconds
-                        </SelectItem>
-                      ))}
-                      {!intervals.includes(form.interval) && (
-                        <SelectItem value={form.interval}>{form.interval} seconds</SelectItem>
+                <form.Field name="persist">
+                  {(field) => (
+                    <SwitchField
+                      field={field}
+                      id="logs-persist"
+                      label="Keep after a restart"
+                      {...explain(
+                        'Saves the system log, the kernel’s lines included, the Wi-Fi, debug and DNS logs on the router’s storage (/root/milkflint-logs). Otherwise they’re only in memory, and a restart or crash clears them.',
+                        [uci('persist')],
                       )}
-                    </SelectContent>
-                  </Select>
-                </Field>
+                    />
+                  )}
+                </form.Field>
+                <form.Field name="size">
+                  {(field) => (
+                    <SelectField
+                      field={field}
+                      id="logs-size"
+                      label="Size per log"
+                      {...explain('When a log reaches this, its older half is deleted.', [uci('size')])}
+                      options={sizeOptions}
+                      triggerClassName="w-40"
+                    />
+                  )}
+                </form.Field>
+                <form.Field name="interval">
+                  {(field) => (
+                    <SelectField
+                      field={field}
+                      id="logs-interval"
+                      label="Sample every"
+                      {...explain('The Wi-Fi log’s devices (idle ones once a minute) and the debug counters.', [
+                        uci('wifi_interval'),
+                      ])}
+                      options={intervalOptions}
+                      disabled={!values.wifi && !values.counters && !values.snapshot}
+                      triggerClassName="w-40"
+                    />
+                  )}
+                </form.Field>
               </div>
             </section>
           </div>
           <MoreSettings
-            summary={!form.wifi ? 'Wi-Fi log off' : partsOff.length === 0 ? undefined : `Off: ${partsOff.join(', ')}`}
+            summary={!values.wifi ? 'Wi-Fi log off' : partsOff.length === 0 ? undefined : `Off: ${partsOff.join(', ')}`}
           >
             <p className="py-3 text-sm text-muted-foreground">
-              {form.wifi
+              {values.wifi
                 ? 'What the Wi-Fi log adds to each device’s line.'
                 : 'What the Wi-Fi log adds to each device’s line, once the Wi-Fi log is on.'}
             </p>
             <div className="grid gap-x-10 divide-y xl:grid-cols-2 xl:divide-y-0">
               {wifiParts.map((p) => (
-                <Field key={p.key} id={`logs-${p.key}`} label={p.title} {...explain(p.hint, [uci(p.option)])}>
-                  <Switch
-                    id={`logs-${p.key}`}
-                    checked={form[p.key]}
-                    disabled={!form.wifi}
-                    onCheckedChange={(v) => {
-                      set(p.key, v);
-                    }}
-                  />
-                </Field>
+                <form.Field key={p.key} name={p.key}>
+                  {(field) => (
+                    <SwitchField
+                      field={field}
+                      id={`logs-${p.key}`}
+                      label={p.title}
+                      {...explain(p.hint, [uci(p.option)])}
+                      disabled={!values.wifi}
+                    />
+                  )}
+                </form.Field>
               ))}
             </div>
           </MoreSettings>
           <p className="border-t pt-4 text-sm text-muted-foreground">
             The debug log’s counters and snapshot, and the memory error checker, change how the router runs, so they’re on{' '}
-            <a href={`${href('tuning')}/diagnostics`} className="font-medium link">
+            <Link {...pageLink('tuning', 'diagnostics')} className="font-medium link">
               Performance tuning, under Diagnostics
-            </a>
+            </Link>
             .
           </p>
         </CardContent>
       </Card>
-      <SaveBar
-        visible={dirty}
-        busy={state.phase === 'applying'}
-        invalid={false}
-        onSave={() => {
-          if (data !== undefined) void apply(logSettingsChanges(form, data));
-        }}
-        onRevert={() => {
-          setEdit(undefined);
-        }}
-      />
+      <FormSaveBar settings={settings} busy={state.phase === 'applying'} />
     </>
   );
 }

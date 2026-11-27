@@ -4,13 +4,16 @@
 // it leaves those channels for 30 minutes. What it has heard and done, from
 // hostapd's radar events (the router's radar-log service keeps them on its
 // storage), and the radar channels' state now.
+import { Link } from '@tanstack/react-router';
+import { pageLink } from '@/lib/router';
 import { CheckCircle2Icon, LoaderCircleIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { CardHeading } from '@/components/card-heading';
 import { Card, CardContent } from '@/components/ui/card';
-import { usePoll } from '@/hooks/use-poll';
-import { getRadar, getWirelessStatus, type Radar, type RadarEvent } from '@/lib/api/wireless';
+import { useLive } from '@/lib/query/use-live';
+import type { Radar, RadarEvent } from '@/lib/api/wireless';
+import { wifiQueries } from './queries';
 import { cn } from '@/lib/utils';
 import { blockAround, describeChannels } from './channels';
 import { Note } from '@/components/note';
@@ -20,22 +23,6 @@ const NOP_S = 1800;
 /** hostapd's events from the driver give the width as enum chan_width: 20 (no HT), 20, 40, 80, 80+80, 160. */
 const DRIVER_WIDTHS = [20, 20, 40, 80, 80, 160];
 const SHOWN = 8;
-
-interface Band {
-  radio: string;
-  radar: Radar | undefined;
-}
-
-async function loadBands(): Promise<Band[]> {
-  const status = await getWirelessStatus();
-  const bands = Object.entries(status).filter(([, r]) => r.config?.band === '5g');
-  return Promise.all(
-    bands.map(async ([radio, r]): Promise<Band> => {
-      const phy = r.iwinfo?.phy;
-      return { radio, radar: phy === undefined ? undefined : await getRadar(phy).catch(() => undefined) };
-    }),
-  );
-}
 
 const channelOf = (mhz: number): number => (mhz - 5000) / 5;
 
@@ -276,9 +263,9 @@ function Log({ radar }: { radar: Radar }): ReactElement {
     radar.logging === false ? (
       <p className="text-sm text-muted-foreground">
         The radar log is off, so new radar checks and radar aren&apos;t kept. Turn it on on the{' '}
-        <a href="#/logs/radar" className="font-medium text-foreground underline underline-offset-2">
+        <Link {...pageLink('logs', 'radar')} className="font-medium text-foreground underline underline-offset-2">
           Logs
-        </a>{' '}
+        </Link>{' '}
         page.
       </p>
     ) : undefined;
@@ -313,7 +300,7 @@ function Log({ radar }: { radar: Radar }): ReactElement {
 }
 
 export function RadarCard({ id, className }: { id?: string; className?: string }): ReactElement | null {
-  const bands = usePoll(loadBands, 15_000).data;
+  const bands = useLive(wifiQueries.radar()).data;
   if (bands === undefined || bands.length === 0) return null;
 
   return (

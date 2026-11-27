@@ -18,6 +18,7 @@ test('a series alone, in a chart whose dashes mean something, or not a chart col
 test('a series the theme draws solid gets no dash, so its key stays as the theme draws it', () => {
   const none = { 1: 'none', 2: 'none', 3: 'none', 4: 'none', 5: 'none', 6: 'none' } as const;
   assert.equal(seriesDash('var(--chart-1)', 3, false, none), undefined);
-  assert.equal(seriesDash('var(--chart-1)', 3, false, { ...none, 1: '5 3' }), 'var(--mf-chart-1-dash)');
+  // the dash itself, for a chart that writes it as the SVG attribute
+  assert.equal(seriesDash('var(--chart-1)', 3, false, { ...none, 1: '5 3' }), '5 3');
   assert.equal(seriesDash('var(--chart-2)', 3, false, { ...none, 1: '5 3' }), undefined);
 });

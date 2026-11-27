@@ -3,6 +3,7 @@
 // what a save writes. Networks & radios (page.tsx) edits a band's network and
 // radio; the Wi-Fi driver page (features/wifi-driver) its driver settings.
 // Each page writes only its own part, so one never rewrites the other's.
+import { z } from 'zod';
 import type { Change, Section } from '@/lib/api/uci';
 import type { Country, Frequency, MuruStatus, RegRule, SpatialReuse } from '@/lib/api/wireless';
 import {
@@ -13,6 +14,7 @@ import {
   airtimeOption,
   airtimeValue,
 } from './airtime';
+import { formErrors } from '@/lib/form/errors';
 import { blockOf } from './channels';
 import { type HoldBack, holdBackValues } from './hold-back';
 import { type MuruSetting, muruDriverOptions } from './muru';
@@ -432,12 +434,33 @@ export function bandOrder(band: string): number {
 type NetworkErrors = Partial<Record<'ssid' | 'key', string>>;
 type DriverErrors = Partial<Record<AirtimeBandKey, string>>;
 
-export function validateNetwork(f: RadioForm): NetworkErrors {
+function networkChecks(f: RadioForm): NetworkErrors {
   const errors: NetworkErrors = {};
   const bytes = new TextEncoder().encode(f.ssid).length;
   if (f.iface !== undefined && (bytes < 1 || bytes > 32)) errors.ssid = 'Use 1 to 32 characters.';
   const keyBad = f.iface === undefined ? undefined : keyError(f.encryption, f.key);
   if (keyBad !== undefined) errors.key = keyBad;
+  return errors;
+}
+
+/** A band's network as the Networks & radios form holds it, with its name's and password's checks. */
+const radioNetwork = z
+  .custom<RadioForm>((v) => typeof v === 'object' && v !== null && 'radio' in v)
+  .superRefine((f, ctx) => {
+    for (const [path, message] of Object.entries(networkChecks(f))) ctx.addIssue({ code: 'custom', path: [path], message });
+  });
+
+/** Networks & radios' form: the country every radio gets, and each band's network and radio. */
+export const wifiFormSchema = z.object({ country: z.string(), radios: z.array(radioNetwork) });
+
+export type WifiForm = z.infer<typeof wifiFormSchema>;
+
+/** A band's network's errors (its name, its password), from the schema. */
+export function networkErrors(f: RadioForm): NetworkErrors {
+  const found = formErrors(radioNetwork, f);
+  const errors: NetworkErrors = {};
+  if (found['ssid'] !== undefined) errors.ssid = found['ssid'];
+  if (found['key'] !== undefined) errors.key = found['key'];
   return errors;
 }
 

@@ -1,5 +1,7 @@
 // The Wi-Fi driver page's cards: each of the driver's settings for every band,
 // side by side, with what it's doing now where the router can tell.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { TriangleAlertIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { CardHeading } from '@/components/card-heading';
@@ -54,7 +56,6 @@ import {
 } from '../wifi/twt';
 import { TwtLive } from '../wifi/twt-card';
 import { BandColumns, NeedsWifi6, NoNetwork, NotHere, NowSection } from './band-columns';
-import { href } from '@/lib/router';
 
 type Set = (f: RadioForm) => <K extends keyof RadioForm>(key: K, value: RadioForm[K]) => void;
 
@@ -444,9 +445,9 @@ export function MuruSection({ forms, options, set }: SectionProps): ReactElement
               return (
                 <NotHere>
                   Needs Wi-Fi 5 or newer: this band runs an older Wi-Fi mode.{' '}
-                  <a href={href('wifi')} className="font-medium link">
+                  <Link {...pageLink('wifi')} className="font-medium link">
                     Change it on Networks &amp; radios
-                  </a>
+                  </Link>
                   .
                 </NotHere>
               );

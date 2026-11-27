@@ -1,4 +1,5 @@
 import { ArrowRightIcon, LoaderCircleIcon, LogOutIcon, SmartphoneIcon } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
 import { type ReactElement, type SyntheticEvent, useEffect, useRef, useState } from 'react';
 import { Logo, Wordmark } from '@/components/layout/sidebar';
 import { ThemeToggle } from '@/components/layout/theme-toggle';
@@ -7,7 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { TooltipProvider } from '@/components/ui/tooltip';
-import { useSubPath } from '@/lib/router';
+import { pageLink, useSubPath } from '@/lib/router';
 import { BenchView } from './bench-view';
 import { HistoryCard } from './history-card';
 import { benchMember, type MemberState, useMember } from './member';
@@ -106,9 +107,9 @@ function JoinForm({
         <li>Nothing runs until the person coordinating presses Start, and every run stops by itself.</li>
       </ul>
       <div className="mt-6 flex items-center justify-between gap-4 text-xs text-muted-foreground">
-        <a href="#/" className="inline-block py-1 hover:text-foreground">
+        <Link {...pageLink('dashboard')} className="inline-block py-1 hover:text-foreground">
           Sign in as admin
-        </a>
+        </Link>
         <ThemeToggle className="w-28" />
       </div>
     </div>
@@ -181,7 +182,9 @@ export function JoinPage(): ReactElement {
               </AlertDescription>
             </Alert>
             <BenchView member={member} state={state} />
-            {member.session !== undefined && <HistoryCard reader={{ session: member.session }} />}
+            {member.session !== undefined && state.me !== undefined && (
+              <HistoryCard reader={{ session: member.session, member: state.me }} />
+            )}
           </main>
         </div>
       ) : (

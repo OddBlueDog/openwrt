@@ -5,11 +5,12 @@
 import 'virtual:milkflint-themes.css';
 import '@/styles.css';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { cleanup, render } from 'vitest-browser-react';
+import { cleanup } from 'vitest-browser-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import type * as Api from '@/features/banip/api';
 import { PRESETS } from '@/features/banip/feeds';
 import { BanipPage } from '@/features/banip/page';
+import { renderWithProviders } from './render';
 
 /** The pretend router's banIP: off, with no list chosen yet, as a fresh install has it. */
 interface PretendBanip {
@@ -70,9 +71,9 @@ const savedFeeds = (): string[] => {
   return (Array.isArray(v) ? [...v] : []).sort();
 };
 
-async function drawPage(): Promise<Awaited<ReturnType<typeof render>>> {
+async function drawPage(): Promise<Awaited<ReturnType<typeof renderWithProviders>>> {
   window.location.hash = '#/banip';
-  const screen = await render(
+  const screen = await renderWithProviders(
     <TooltipProvider>
       <BanipPage />
     </TooltipProvider>,

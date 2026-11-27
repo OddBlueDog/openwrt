@@ -72,34 +72,26 @@ test('names cut at 15 characters come back whole from the command line', () => {
   assert.equal(displayName(proc({ name: 'kworker/0:0-eve', kernel: true, cmd: '' })), 'kworker/0:0-eve');
 });
 
-test('the list filters by kind and typed letters, and sorts busiest first with ties by memory', () => {
+test('the list filters by kind and typed letters, biggest in memory first, then by name and pid', () => {
   const a = list({}, [
     proc({ pid: 2, name: 'kthreadd', kernel: true, cmd: '' }),
     proc({ pid: 23, name: 'ksoftirqd/1', kernel: true, cmd: '', ticks: 100 }),
     proc({ pid: 100, name: 'hostapd', user: 'network', rss: 400, cmd: '/usr/sbin/hostapd -s -g /var/run/hostapd/global' }),
     proc({ pid: 101, name: 'dnsmasq', user: 'dnsmasq', rss: 900, cmd: '/usr/sbin/dnsmasq -C /var/etc/dnsmasq.conf' }),
+    proc({ pid: 300, name: 'udhcpc', rss: 400, cmd: 'udhcpc -i wan' }),
+    proc({ pid: 200, name: 'udhcpc', rss: 400, cmd: 'udhcpc -i wan6' }),
   ]);
-  const b = list({ uptime: 103, cpu: { total: 41_200, idle: 36_000 } }, [
-    proc({ pid: 2, name: 'kthreadd', kernel: true, cmd: '' }),
-    proc({ pid: 23, name: 'ksoftirqd/1', kernel: true, cmd: '', ticks: 340 }),
-    proc({ pid: 100, name: 'hostapd', user: 'network', rss: 400, cmd: '/usr/sbin/hostapd -s -g /var/run/hostapd/global' }),
-    proc({ pid: 101, name: 'dnsmasq', user: 'dnsmasq', rss: 900, cmd: '/usr/sbin/dnsmasq -C /var/etc/dnsmasq.conf' }),
-  ]);
-  const rows = snapshot(a, b).rows;
-  const names = (r: readonly { name: string }[]): string[] => r.map((x) => x.name);
+  const rows = snapshot(undefined, a).rows;
+  const shown = (view: 'all' | 'programs' | 'kernel', query = ''): string[] =>
+    shownRows(rows, view, query).map((r) => `${r.name} ${String(r.p.pid)}`);
 
-  assert.deepEqual(names(shownRows(rows, 'all', '', { key: 'cpu', desc: true })), [
-    'ksoftirqd/1',
-    'dnsmasq',
-    'hostapd',
-    'kthreadd',
-  ]);
-  assert.deepEqual(names(shownRows(rows, 'programs', '', { key: 'name', desc: false })), ['dnsmasq', 'hostapd']);
-  assert.deepEqual(names(shownRows(rows, 'kernel', '', { key: 'pid', desc: true })), ['ksoftirqd/1', 'kthreadd']);
-  assert.deepEqual(names(shownRows(rows, 'all', 'NETWORK', { key: 'cpu', desc: true })), ['hostapd'], 'by user');
-  assert.deepEqual(names(shownRows(rows, 'all', 'dnsmasq.conf', { key: 'cpu', desc: true })), ['dnsmasq'], 'by command');
-  assert.deepEqual(names(shownRows(rows, 'all', '23', { key: 'cpu', desc: true })), ['ksoftirqd/1'], 'by the whole pid');
-  assert.deepEqual(names(shownRows(rows, 'all', '', { key: 'memory', desc: true })).slice(0, 2), ['dnsmasq', 'hostapd']);
+  // the table's sort keeps this order among rows it can't tell apart (idle under CPU, kernel threads under Memory)
+  assert.deepEqual(shown('all'), ['dnsmasq 101', 'hostapd 100', 'udhcpc 200', 'udhcpc 300', 'ksoftirqd/1 23', 'kthreadd 2']);
+  assert.deepEqual(shown('programs'), ['dnsmasq 101', 'hostapd 100', 'udhcpc 200', 'udhcpc 300']);
+  assert.deepEqual(shown('kernel'), ['ksoftirqd/1 23', 'kthreadd 2']);
+  assert.deepEqual(shown('all', 'NETWORK'), ['hostapd 100'], 'by user');
+  assert.deepEqual(shown('all', 'dnsmasq.conf'), ['dnsmasq 101'], 'by command');
+  assert.deepEqual(shown('all', '23'), ['ksoftirqd/1 23'], 'by the whole pid');
 });
 
 test('shares keep small figures visible, and states read in words', () => {

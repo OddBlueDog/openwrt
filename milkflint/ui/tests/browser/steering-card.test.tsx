@@ -4,11 +4,12 @@
 import 'virtual:milkflint-themes.css';
 import '@/styles.css';
 import { afterEach, expect, test } from 'vitest';
-import { cleanup, render } from 'vitest-browser-react';
+import { cleanup } from 'vitest-browser-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { SteeringCard } from '@/features/tuning/essentials';
 import { defaults, type Steering, type TuningData } from '@/features/tuning/model';
 import type { NetworkLive } from '@/hooks/use-network-live';
+import { renderWithProviders } from './render';
 
 afterEach(async () => {
   await cleanup();
@@ -42,8 +43,8 @@ function data(steering: Steering, pppoe: boolean): TuningData {
   };
 }
 
-async function card(steering: Steering, pppoe: boolean): Promise<Awaited<ReturnType<typeof render>>> {
-  return render(
+async function card(steering: Steering, pppoe: boolean): Promise<Awaited<ReturnType<typeof renderWithProviders>>> {
+  return renderWithProviders(
     <TooltipProvider>
       <SteeringCard form={{ ...defaults, steering }} data={data(steering, pppoe)} live={live} set={() => undefined} />
     </TooltipProvider>,

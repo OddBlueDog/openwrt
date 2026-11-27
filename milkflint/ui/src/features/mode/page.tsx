@@ -17,10 +17,11 @@ import {
   Undo2Icon,
   WifiIcon,
 } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
 import { type ReactElement, useCallback, useEffect, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
-import { Field } from '@/components/field';
+import { SelectField, TextField } from '@/components/form';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -28,21 +29,31 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { href } from '@/lib/router';
+import { formErrors } from '@/lib/form/errors';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { useLive } from '@/lib/query/use-live';
+import { pageLink } from '@/lib/router';
 import { refreshRouterMode, type RouterMode } from '@/lib/router-mode';
 import { routerUrl } from '@/lib/router-url';
 import { errorMessage } from '@/lib/utils';
 import { Answer, AnswerCell, ChoiceCards, Figure, GoLink } from '@/components/page-kit';
 import { MoreSettings } from '@/components/more-settings';
-import { bridgeOffloadChange, getModeStatus, type LastSwitch, type ModeStatus, switchMode } from './api';
-import { addressText, type ApForm, apAddress, initialForm, modeName, netmaskOf, prefixes, toRequest, validate } from './model';
+import { bridgeOffloadChange, type LastSwitch, type ModeStatus } from './api';
+import {
+  addressText,
+  type ApForm,
+  apAddress,
+  apFormSchema,
+  initialForm,
+  modeName,
+  netmaskOf,
+  prefixes,
+  toRequest,
+} from './model';
+import { FOLLOW_MS, modeQueries, useSwitchMode } from './queries';
 import { BridgeField, ChangeItem, ModeChoice } from './parts';
 
-const POLL_MS = 2000;
 // a failed switch is worth a word on the page for this long afterwards
 const RECENT_S = 15 * 60;
 
@@ -87,7 +98,7 @@ function ModeAnswer({ status }: { status: ModeStatus }): ReactElement {
       <AnswerCell
         title="Internet (WAN port)"
         value={wan?.up === true ? <Badge variant="success">Connected</Badge> : <Badge variant="destructive">Not connected</Badge>}
-        action={<GoLink href={href('internet')}>Internet</GoLink>}
+        action={<GoLink to={pageLink('internet')}>Internet</GoLink>}
       >
         {addressText(wan) === undefined ? (
           'No address on it yet.'
@@ -106,7 +117,7 @@ function ModeAnswer({ status }: { status: ModeStatus }): ReactElement {
       <AnswerCell
         title="Its address"
         value={<Figure>{lanAddress ?? '—'}</Figure>}
-        action={<GoLink href={href('lan')}>LAN</GoLink>}
+        action={<GoLink to={pageLink('lan')}>LAN & DHCP</GoLink>}
       >
         Where your devices find it, and this page.
       </AnswerCell>
@@ -124,11 +135,13 @@ function ToAccessPoint({
   busy: boolean;
   onSwitch: (form: ApForm) => void;
 }): ReactElement {
-  const [form, setForm] = useState(() => initialForm(status.uplink, status.bridge_offload));
-  const errors = validate(form);
-  const set = <K extends keyof ApForm>(key: K, value: ApForm[K]): void => {
-    setForm((f) => ({ ...f, [key]: value }));
-  };
+  // where it starts: kept as it was first drawn, so a status read meanwhile doesn't move it
+  const [start] = useState(() => initialForm(status.uplink, status.bridge_offload));
+  const settings = useSettingsForm({ schema: apFormSchema, saved: start, onSave: onSwitch });
+  const { form: fields } = settings;
+  const form = useFormValues(fields);
+  // the checks as they stand: the switch stays off until they pass
+  const valid = Object.keys(formErrors(apFormSchema, form)).length === 0;
   const port = status.wan_port ?? 'WAN';
   const network = status.uplink?.up === true ? addressText(status.uplink) : undefined;
   return (
@@ -163,7 +176,7 @@ function ToAccessPoint({
             value={form.proto}
             disabled={busy}
             onChange={(v) => {
-              set('proto', v);
+              fields.setFieldValue('proto', v);
             }}
             options={[
               {
@@ -180,69 +193,58 @@ function ToAccessPoint({
           />
           {form.proto === 'static' && (
             <div className="divide-y">
-              <Field id="ap-ipaddr" label="IP address" error={errors.ipaddr}>
-                <Input
-                  id="ap-ipaddr"
-                  className="font-mono"
-                  placeholder="192.168.0.2"
-                  value={form.ipaddr}
-                  aria-invalid={errors.ipaddr !== undefined}
-                  onChange={(e) => {
-                    set('ipaddr', e.target.value.trim());
-                  }}
-                />
-              </Field>
-              <Field id="ap-prefix" label="Network size">
-                <Select
-                  value={form.prefix}
-                  onValueChange={(v) => {
-                    set('prefix', v);
-                  }}
-                >
-                  <SelectTrigger id="ap-prefix">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {prefixes.map((p) => (
-                      <SelectItem key={p} value={p}>
-                        /{p} · {netmaskOf(Number(p))}
-                      </SelectItem>
-                    ))}
-                    {!(prefixes as readonly string[]).includes(form.prefix) && (
-                      <SelectItem value={form.prefix}>/{form.prefix}</SelectItem>
-                    )}
-                  </SelectContent>
-                </Select>
-              </Field>
-              <Field id="ap-gateway" label="Main router" hint="Its address on this network." error={errors.gateway}>
-                <Input
-                  id="ap-gateway"
-                  className="font-mono"
-                  placeholder="192.168.0.1"
-                  value={form.gateway}
-                  aria-invalid={errors.gateway !== undefined}
-                  onChange={(e) => {
-                    set('gateway', e.target.value.trim());
-                  }}
-                />
-              </Field>
-              <Field
-                id="ap-dns"
-                label="DNS servers"
-                hint="For MilkFlint’s own lookups. Blank: your main router."
-                error={errors.dns}
-              >
-                <Input
-                  id="ap-dns"
-                  className="font-mono"
-                  placeholder={form.gateway === '' ? '192.168.0.1' : form.gateway}
-                  value={form.dns}
-                  aria-invalid={errors.dns !== undefined}
-                  onChange={(e) => {
-                    set('dns', e.target.value);
-                  }}
-                />
-              </Field>
+              <fields.Field name="ipaddr">
+                {(field) => (
+                  <TextField
+                    field={field}
+                    id="ap-ipaddr"
+                    label="IP address"
+                    className="font-mono"
+                    placeholder="192.168.0.2"
+                    trim
+                  />
+                )}
+              </fields.Field>
+              <fields.Field name="prefix">
+                {(field) => (
+                  <SelectField
+                    field={field}
+                    id="ap-prefix"
+                    label="Network size"
+                    options={[
+                      ...prefixes.map((p) => ({ value: p, label: `/${p} · ${netmaskOf(Number(p))}` })),
+                      ...((prefixes as readonly string[]).includes(form.prefix)
+                        ? []
+                        : [{ value: form.prefix, label: `/${form.prefix}` }]),
+                    ]}
+                  />
+                )}
+              </fields.Field>
+              <fields.Field name="gateway">
+                {(field) => (
+                  <TextField
+                    field={field}
+                    id="ap-gateway"
+                    label="Main router"
+                    hint="Its address on this network."
+                    className="font-mono"
+                    placeholder="192.168.0.1"
+                    trim
+                  />
+                )}
+              </fields.Field>
+              <fields.Field name="dns">
+                {(field) => (
+                  <TextField
+                    field={field}
+                    id="ap-dns"
+                    label="DNS servers"
+                    hint="For MilkFlint’s own lookups. Blank: your main router."
+                    className="font-mono"
+                    placeholder={form.gateway === '' ? '192.168.0.1' : form.gateway}
+                  />
+                )}
+              </fields.Field>
             </div>
           )}
         </section>
@@ -275,19 +277,14 @@ function ToAccessPoint({
               available={status.bridge_offload_available}
               disabled={busy}
               onChange={(on) => {
-                set('bridgeOffload', on);
+                fields.setFieldValue('bridgeOffload', on);
               }}
             />
           </MoreSettings>
         </div>
       </CardContent>
       <CardFooter className="flex-wrap gap-x-4 gap-y-2">
-        <Button
-          disabled={busy || Object.keys(errors).length > 0}
-          onClick={() => {
-            onSwitch(form);
-          }}
-        >
+        <Button disabled={busy || !valid} onClick={settings.save}>
           <RadioTowerIcon />
           Switch to access point mode
         </Button>
@@ -347,11 +344,9 @@ function ToRouter({ status, busy, onSwitch }: { status: ModeStatus; busy: boolea
 }
 
 /** Access point mode as it is: the bridge fast path, applied as it's switched. */
-function Bridging({ status, onReload }: { status: ModeStatus; onReload: () => void }): ReactElement {
-  const onApplied = useCallback(() => {
-    onReload();
-  }, [onReload]);
-  const { state, apply } = useApply(onApplied);
+function Bridging({ status }: { status: ModeStatus }): ReactElement {
+  // a change reads the status again (useApply refreshes every query)
+  const { state, apply } = useApply();
   const section = status.firewall_defaults;
   const toggle = (on: boolean): void => {
     if (section !== undefined && section !== null) void apply([bridgeOffloadChange(section, on)]);
@@ -469,41 +464,40 @@ function SwitchStatus({
 }
 
 export function ModePage(): ReactElement {
-  const { data, error, loading, reload } = useLoad(getModeStatus);
+  const query = useQuery(modeQueries.status());
+  const { data, refetch } = query;
+  const error = query.error ?? undefined;
+  const reload = useCallback(() => {
+    void refetch();
+  }, [refetch]);
+  const switching = useSwitchMode();
   const [choice, setChoice] = useState<RouterMode>();
   const [pending, setPending] = useState<{ target: RouterMode; form?: ApForm }>();
   const [progress, setProgress] = useState<Progress>({ phase: 'idle' });
-  const [live, setLive] = useState<{ status?: ModeStatus; reachable: boolean }>({ reachable: true });
   const [now, setNow] = useState(() => Date.now());
 
   // while a switch runs: follow it as long as the router answers
   const following = progress.phase === 'started';
+  const live = useLive(modeQueries.following(following));
+  const reachable = live.error === undefined;
   useEffect(() => {
     if (!following) return undefined;
-    let cancelled = false;
     const t = window.setInterval(() => {
       setNow(Date.now());
-      getModeStatus().then(
-        (s) => {
-          if (cancelled) return;
-          setLive({ status: s, reachable: true });
-          if (!s.switching && s.last?.state !== 'switching') {
-            void refreshRouterMode();
-            reload();
-          }
-        },
-        () => {
-          if (!cancelled) setLive((l) => ({ ...l, reachable: false }));
-        },
-      );
-    }, POLL_MS);
+    }, FOLLOW_MS);
     return () => {
-      cancelled = true;
       window.clearInterval(t);
     };
-  }, [following, reload]);
+  }, [following]);
+  // once it has ended: the menu follows the mode, and the page reads it again
+  const ended = following && live.data !== undefined && !live.data.switching && live.data.last?.state !== 'switching';
+  useEffect(() => {
+    if (!ended) return;
+    void refreshRouterMode();
+    reload();
+  }, [ended, live.at, reload]);
 
-  const status = following ? (live.status ?? data) : data;
+  const status = following ? (live.data ?? data) : data;
   const current = status?.mode ?? 'router';
   const selected = choice ?? current;
   const busy = progress.phase === 'starting' || progress.phase === 'started' || status?.switching === true;
@@ -513,7 +507,7 @@ export function ModePage(): ReactElement {
     setProgress({ phase: 'starting', target });
     const address =
       target === 'ap' ? (form === undefined ? undefined : apAddress(form)) : (status?.router_address ?? '192.168.1.1');
-    switchMode(target === 'ap' && form !== undefined ? toRequest(form) : { mode: 'router' }).then(
+    switching.mutateAsync(target === 'ap' && form !== undefined ? toRequest(form) : { mode: 'router' }).then(
       ({ at, seconds }) => {
         setNow(Date.now());
         setProgress({
@@ -538,10 +532,10 @@ export function ModePage(): ReactElement {
         description="MilkFlint as your main router, or as an access point that adds its Wi-Fi to another router’s network."
       />
       <div className="flex flex-col gap-4">
-        {status !== undefined && <SwitchStatus progress={progress} status={status} reachable={live.reachable} now={now} />}
+        {status !== undefined && <SwitchStatus progress={progress} status={status} reachable={reachable} now={now} />}
         {error !== undefined && data === undefined ? (
           <LoadError error={error} retry={reload} />
-        ) : loading || status === undefined ? (
+        ) : status === undefined ? (
           <FormSkeleton />
         ) : (
           <>
@@ -573,7 +567,7 @@ export function ModePage(): ReactElement {
                 }}
               />
             )}
-            {selected === 'ap' && current === 'ap' && <Bridging status={status} onReload={reload} />}
+            {selected === 'ap' && current === 'ap' && <Bridging status={status} />}
           </>
         )}
       </div>

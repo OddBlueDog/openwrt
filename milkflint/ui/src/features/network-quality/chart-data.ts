@@ -73,24 +73,6 @@ export function pointStep(points: readonly LinePoint[], fallback = 60): number {
 /** Points further apart than this many steps have nothing recorded between them. */
 const GAP_STEPS = 2.5;
 
-/** The line's points as runs: split where it got no answer and where nothing was recorded. */
-export function runs(points: readonly LinePoint[], step = pointStep(points)): (LinePoint & { v: number })[][] {
-  const out: (LinePoint & { v: number })[][] = [];
-  let run: (LinePoint & { v: number })[] = [];
-  let lastT: number | undefined;
-  for (const p of points) {
-    const broken = p.v === undefined || (lastT !== undefined && p.t - lastT > step * GAP_STEPS);
-    if (broken && run.length > 0) {
-      out.push(run);
-      run = [];
-    }
-    if (p.v !== undefined) run.push({ ...p, v: p.v });
-    lastT = p.t;
-  }
-  if (run.length > 0) out.push(run);
-  return out;
-}
-
 export interface LineStats {
   /** The latest result; null when it got no answer, undefined with no points. */
   now: number | null | undefined;
@@ -253,7 +235,7 @@ export function unrecorded(lines: readonly ChartLine[], start: number, end: numb
 }
 
 /** The loss strip's slices of the span. */
-const LOSS_BINS = 240;
+export const LOSS_BINS = 240;
 
 /** The share of probes lost, in `bins` slices of the span; only the slices with loss. */
 export function lossBins(

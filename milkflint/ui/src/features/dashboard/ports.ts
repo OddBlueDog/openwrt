@@ -23,6 +23,15 @@ export interface Port {
   /** Its traffic now, bit/s, as the household sees it: towards the devices (from the internet, on the WAN port), and back. */
   down: number | undefined;
   up: number | undefined;
+  mac: string | undefined;
+  /** The fastest the device at the other end offered, Mbit/s (while there's a link). */
+  partnerMbit: number | undefined;
+  /** Bytes since it started, the same way round as down and up. */
+  totalDown: number | undefined;
+  totalUp: number | undefined;
+  /** Frames it couldn't receive or send whole, and frames dropped, since it started. */
+  errors: number | undefined;
+  dropped: number | undefined;
 }
 
 /** "1000F" (netifd's) as Mbit/s and duplex; undefined for anything else. */
@@ -110,6 +119,7 @@ export function portsOf(
     const link = d?.carrier === true;
     const speed = link ? linkSpeed(d.speed) : undefined;
     const wan = p.role === 'wan';
+    const st = d?.statistics;
     return {
       device: p.device,
       label: portLabel(p),
@@ -122,6 +132,22 @@ export function portsOf(
       // the WAN port receives what the household downloads; a LAN port sends it to the devices
       down: rate(p.device, wan ? 'rx' : 'tx'),
       up: rate(p.device, wan ? 'tx' : 'rx'),
+      mac: d?.macaddr,
+      partnerMbit: link ? fastest(d['link-partner-advertising']) : undefined,
+      totalDown: wan ? st?.rx_bytes : st?.tx_bytes,
+      totalUp: wan ? st?.tx_bytes : st?.rx_bytes,
+      errors: st === undefined ? undefined : (st.rx_errors ?? 0) + (st.tx_errors ?? 0),
+      dropped: st === undefined ? undefined : (st.rx_dropped ?? 0) + (st.tx_dropped ?? 0),
     };
   });
+}
+
+/** Why a link is slower than its port can go: the device at the other end, or (both could go faster) the cable. */
+export function speedNote(p: Pick<Port, 'link' | 'mbit' | 'maxMbit' | 'partnerMbit'>): string | undefined {
+  if (!p.link || p.mbit === undefined || p.maxMbit === undefined || p.mbit >= p.maxMbit) return undefined;
+  if (p.partnerMbit !== undefined && p.partnerMbit <= p.mbit)
+    return `Slower than the port: the device at the other end goes up to ${speedText(p.partnerMbit)}.`;
+  if (p.partnerMbit !== undefined)
+    return 'Both ends could go faster: the cable is often why (a damaged one, or an old one with only four wires).';
+  return 'Slower than the port: the device at the other end, or the cable.';
 }

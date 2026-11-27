@@ -1,8 +1,8 @@
 import { ChevronDownIcon, RotateCcwIcon, SlidersHorizontalIcon } from 'lucide-react';
 import { type ReactElement, useId, useState } from 'react';
+import { NumberInput } from '@/components/number-input';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 import { cn } from '@/lib/utils';
@@ -16,48 +16,10 @@ import {
   thresholdKeys,
   type Thresholds,
 } from './checks';
-import { Arrowed } from './dir';
+import { Arrowed } from '@/components/dir';
 import { saveThresholds, useThresholds } from './thresholds';
 
 // ---- The panel ----
-
-function LevelInput({
-  id,
-  value,
-  step,
-  onChange,
-}: {
-  id: string;
-  value: number;
-  step: number;
-  onChange: (v: number) => void;
-}): ReactElement {
-  const [text, setText] = useState(String(value));
-  // another change (Reset) since it was typed
-  const [was, setWas] = useState(value);
-  if (was !== value) {
-    setWas(value);
-    setText(String(value));
-  }
-  return (
-    <Input
-      id={id}
-      type="number"
-      inputMode="decimal"
-      step={step}
-      value={text}
-      className="h-8 w-24 tabular"
-      onChange={(e) => {
-        setText(e.target.value);
-        const v = Number(e.target.value);
-        if (e.target.value.trim() !== '' && Number.isFinite(v)) {
-          setWas(v);
-          onChange(v);
-        }
-      }}
-    />
-  );
-}
 
 function ThresholdRow({ k, t }: { k: ThresholdKey; t: Thresholds }): ReactElement {
   const d: ThresholdDef = THRESHOLDS[k];
@@ -75,10 +37,11 @@ function ThresholdRow({ k, t }: { k: ThresholdKey; t: Thresholds }): ReactElemen
           <Label htmlFor={`th-${k}-pass`} className="font-normal text-muted-foreground">
             Pass {word}
           </Label>
-          <LevelInput
+          <NumberInput
             id={`th-${k}-pass`}
             value={level.pass}
             step={d.step}
+            className="h-8 w-24 tabular"
             onChange={(v) => {
               set('pass', v);
             }}
@@ -90,10 +53,11 @@ function ThresholdRow({ k, t }: { k: ThresholdKey; t: Thresholds }): ReactElemen
             <Label htmlFor={`th-${k}-warn`} className="font-normal text-muted-foreground">
               Warn {word}
             </Label>
-            <LevelInput
+            <NumberInput
               id={`th-${k}-warn`}
               value={level.warn}
               step={d.step}
+              className="h-8 w-24 tabular"
               onChange={(v) => {
                 set('warn', v);
               }}

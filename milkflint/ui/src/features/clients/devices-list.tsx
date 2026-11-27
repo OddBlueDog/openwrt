@@ -1,26 +1,18 @@
 // The devices as a table on a wide screen and a card each on a phone, with
 // the same facts and the same action: a click on a row (or its edit button)
-// opens the device's side sheet; on a phone, its edit button.
+// opens the device's side sheet; on a phone, its edit button. They come
+// online first, then by address; each column but the button sorts.
 import { CableIcon, MonitorSmartphoneIcon, PinIcon, SquarePenIcon, WifiIcon } from 'lucide-react';
-import type { MouseEvent, ReactElement } from 'react';
+import { type ReactElement, useCallback, useMemo } from 'react';
 import { SignalReading } from '@/components/charts/signal-bars';
+import { type Column, DataTable } from '@/components/data-table';
 import { Badge } from '@/components/ui/badge';
-import { Card } from '@/components/ui/card';
 import { formatBitrate, formatDuration } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { rowClick } from '../firewall/forms';
-import { HeadRow, RowButton } from '../firewall/table-parts';
+import { RowButton } from '../firewall/table-parts';
 import type { Device } from './api';
 import { connectionText, deviceLabel, reservedIp } from './model';
-
-const columns = [
-  { label: 'Device', className: 'pl-5' },
-  { label: 'Connection' },
-  { label: 'Signal' },
-  { label: 'Link speed', className: 'text-right' },
-  { label: 'Connected', className: 'text-right' },
-  { label: 'Edit', className: 'w-14 pr-4', hidden: true },
-] as const;
 
 function KindIcon({ d }: { d: Device }): ReactElement {
   const Icon = d.wifi !== undefined ? WifiIcon : d.online ? CableIcon : MonitorSmartphoneIcon;
@@ -64,6 +56,58 @@ function Address({ d }: { d: Device }): ReactElement {
   );
 }
 
+/** The columns, with the edit button's action; a missing figure (a wired device's signal) sorts last. */
+function deviceColumns(edit: (d: Device) => ReactElement): Column<Device>[] {
+  return [
+    {
+      label: 'Device',
+      cell: (d) => (
+        <span className="flex min-w-0 items-center gap-3">
+          <KindIcon d={d} />
+          <span className="flex min-w-0 flex-col gap-0.5">
+            <Name d={d} />
+            <Address d={d} />
+          </span>
+        </span>
+      ),
+      sort: (d) => d.name,
+      sortLabel: 'By name',
+      className: 'w-2/5 max-w-0',
+    },
+    // offline ones last either way
+    { label: 'Connection', cell: (d) => <Connection d={d} />, sort: (d) => (d.online ? connectionText(d) : undefined) },
+    {
+      label: 'Signal',
+      cell: (d) =>
+        d.wifi === undefined ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          <SignalReading dbm={d.wifi.signal} snr={d.wifi.snr} />
+        ),
+      sort: (d) => d.wifi?.signal,
+      sortDescFirst: true,
+      sortLabel: 'Strongest signal first',
+    },
+    {
+      label: 'Link speed',
+      cell: (d) => (d.wifi?.rate === undefined ? '—' : formatBitrate(d.wifi.rate)),
+      sort: (d) => d.wifi?.rate,
+      sortDescFirst: true,
+      sortLabel: 'Fastest link first',
+      className: 'text-right whitespace-nowrap tabular',
+    },
+    {
+      label: 'Connected',
+      cell: (d) => (d.wifi?.connected === undefined ? '—' : formatDuration(d.wifi.connected)),
+      sort: (d) => d.wifi?.connected,
+      sortDescFirst: true,
+      sortLabel: 'Longest connected first',
+      className: 'text-right whitespace-nowrap text-muted-foreground tabular',
+    },
+    { label: 'Edit', hidden: true, cell: edit, className: 'w-14 py-1.5 pr-4 pl-2 text-right' },
+  ];
+}
+
 export function DevicesList({
   devices,
   busy,
@@ -73,93 +117,60 @@ export function DevicesList({
   busy: boolean;
   onEdit: (mac: string) => void;
 }): ReactElement {
-  const edit = (d: Device): ReactElement => (
-    <RowButton
-      label={`Edit ${d.name ?? d.mac}`}
-      icon={SquarePenIcon}
-      disabled={busy}
-      onClick={() => {
-        onEdit(d.mac);
-      }}
-    />
+  const edit = useCallback(
+    (d: Device): ReactElement => (
+      <RowButton
+        label={`Edit ${d.name ?? d.mac}`}
+        icon={SquarePenIcon}
+        disabled={busy}
+        onClick={() => {
+          onEdit(d.mac);
+        }}
+      />
+    ),
+    [busy, onEdit],
   );
-  const open = (d: Device): ((e: MouseEvent<HTMLElement>) => void) =>
-    rowClick(() => {
-      if (!busy) onEdit(d.mac);
-    });
+  const columns = useMemo(() => deviceColumns(edit), [edit]);
   return (
-    <Card className="gap-0 overflow-hidden py-0">
-      {/* wide screens: a table */}
-      <div className="hidden lg:block">
-        <table className="w-full border-collapse text-sm">
-          <thead className="border-b">
-            <HeadRow columns={columns} />
-          </thead>
-          <tbody>
-            {devices.map((d) => (
-              <tr
-                key={d.mac}
-                onClick={open(d)}
-                className="cursor-pointer border-b transition-colors duration-fast last:border-b-0 hover:bg-muted/60"
-              >
-                <td className="w-2/5 max-w-0 py-2.5 pr-3 pl-5">
-                  <span className="flex min-w-0 items-center gap-3">
-                    <KindIcon d={d} />
-                    <span className="flex min-w-0 flex-col gap-0.5">
-                      <Name d={d} />
-                      <Address d={d} />
-                    </span>
-                  </span>
-                </td>
-                <td className="px-3 py-2.5">
-                  <Connection d={d} />
-                </td>
-                <td className="px-3 py-2.5">
-                  {d.wifi === undefined ? (
-                    <span className="text-muted-foreground">—</span>
-                  ) : (
-                    <SignalReading dbm={d.wifi.signal} snr={d.wifi.snr} />
-                  )}
-                </td>
-                <td className="px-3 py-2.5 text-right whitespace-nowrap tabular">
-                  {d.wifi?.rate === undefined ? '—' : formatBitrate(d.wifi.rate)}
-                </td>
-                <td className="px-3 py-2.5 text-right whitespace-nowrap text-muted-foreground tabular">
-                  {d.wifi?.connected === undefined ? '—' : formatDuration(d.wifi.connected)}
-                </td>
-                <td className="py-1.5 pr-4 pl-2 text-right">{edit(d)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {/* phones and narrow windows: a card per device */}
-      <ul className="divide-y lg:hidden">
-        {devices.map((d) => (
-          <li key={d.mac} className="flex flex-col gap-2 px-4 py-3">
-            <span className="flex items-start justify-between gap-3">
-              <span className="flex min-w-0 items-start gap-2.5 pt-1">
-                <KindIcon d={d} />
-                <span className="flex min-w-0 flex-col gap-0.5">
-                  <Name d={d} />
-                  <Address d={d} />
-                </span>
+    <DataTable
+      label="Devices"
+      columns={columns}
+      rows={devices}
+      rowKey={(d) => d.mac}
+      // the page says why there are none
+      empty={null}
+      defaultOrder="Online first"
+      wide="md"
+      rowProps={(d) => ({
+        onClick: rowClick(() => {
+          if (!busy) onEdit(d.mac);
+        }),
+        className: 'cursor-pointer',
+      })}
+      card={(d) => (
+        <div className="flex flex-col gap-2 px-4 py-3">
+          <span className="flex items-start justify-between gap-3">
+            <span className="flex min-w-0 items-start gap-2.5 pt-1">
+              <KindIcon d={d} />
+              <span className="flex min-w-0 flex-col gap-0.5">
+                <Name d={d} />
+                <Address d={d} />
               </span>
-              <span className="-mr-1 shrink-0">{edit(d)}</span>
             </span>
-            <span className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 pl-6.5 text-sm">
-              <Connection d={d} />
-              {d.wifi !== undefined && <SignalReading dbm={d.wifi.signal} snr={d.wifi.snr} />}
+            <span className="-mr-1 shrink-0">{edit(d)}</span>
+          </span>
+          <span className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 pl-6.5 text-sm">
+            <Connection d={d} />
+            {d.wifi !== undefined && <SignalReading dbm={d.wifi.signal} snr={d.wifi.snr} />}
+          </span>
+          {d.wifi !== undefined && (d.wifi.rate !== undefined || d.wifi.connected !== undefined) && (
+            <span className="flex flex-wrap gap-x-4 pl-6.5 text-xs text-muted-foreground tabular">
+              {d.wifi.rate !== undefined && <span>Link {formatBitrate(d.wifi.rate)}</span>}
+              {d.wifi.connected !== undefined && <span>Connected {formatDuration(d.wifi.connected)}</span>}
             </span>
-            {d.wifi !== undefined && (d.wifi.rate !== undefined || d.wifi.connected !== undefined) && (
-              <span className="flex flex-wrap gap-x-4 pl-6.5 text-xs text-muted-foreground tabular">
-                {d.wifi.rate !== undefined && <span>Link {formatBitrate(d.wifi.rate)}</span>}
-                {d.wifi.connected !== undefined && <span>Connected {formatDuration(d.wifi.connected)}</span>}
-              </span>
-            )}
-          </li>
-        ))}
-      </ul>
-    </Card>
+          )}
+        </div>
+      )}
+    />
   );
 }

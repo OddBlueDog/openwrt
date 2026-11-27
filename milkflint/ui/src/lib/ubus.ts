@@ -38,6 +38,19 @@ export class UbusError extends Error {
   }
 }
 
+/** A reply that doesn't have the shape its schema expects: names the call, so a drifted schema says which. */
+export class UbusReplyError extends Error {
+  readonly object: string;
+  readonly method: string;
+
+  constructor(object: string, method: string, details: string) {
+    super(`${object}.${method}: ${details}`);
+    this.name = 'UbusReplyError';
+    this.object = object;
+    this.method = method;
+  }
+}
+
 /** The session is unknown or expired: the user has to log in again. */
 export class SessionExpiredError extends Error {
   constructor() {
@@ -175,6 +188,12 @@ async function settleDenied(denied: readonly Pending[]): Promise<void> {
   if (!alive) for (const listener of expiredListeners) listener();
 }
 
+function checked<S extends z.ZodType>(object: string, method: string, schema: S, data: unknown): z.output<S> {
+  const parsed = schema.safeParse(data);
+  if (!parsed.success) throw new UbusReplyError(object, method, z.prettifyError(parsed.error));
+  return parsed.data;
+}
+
 function enqueue(object: string, method: string, params: Record<string, unknown>, session: string): Promise<unknown> {
   return new Promise((resolve, reject) => {
     if (queue.length === 0) queueMicrotask(() => void flush());
@@ -196,7 +215,7 @@ export async function call<S extends z.ZodType>(
   options: CallOptions = {},
 ): Promise<z.output<S>> {
   const data = await enqueue(object, method, params, options.session ?? sessionId);
-  return schema.parse(data);
+  return checked(object, method, schema, data);
 }
 
 /** Like `call`, for methods that return nothing useful. */
@@ -217,7 +236,7 @@ export async function callAnonymous<S extends z.ZodType>(
   schema: S,
 ): Promise<z.output<S>> {
   const data = await enqueue(object, method, params, NULL_SESSION);
-  return schema.parse(data);
+  return checked(object, method, schema, data);
 }
 
 /**

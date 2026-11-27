@@ -1,10 +1,11 @@
 // What the pages whose settings hardware offloading with Wireless Ethernet
 // Dispatch (./wed.ts) turns off or passes by show while it's on (./use-wed.ts
 // tells them, and gives them what turns it off again with their own save).
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ZapIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
-import { href } from '@/lib/router';
 
 /**
  * The notice a page shows while WED is on: what it did to this page's
@@ -30,9 +31,9 @@ export function WedNotice({
           {turningOff ? (
             'What it had turned off comes back as it was. The Wi-Fi driver lets go of WED when the router next restarts.'
           ) : (
-            <a href={href('tuning')} className="font-medium text-primary underline">
+            <Link {...pageLink('tuning')} className="font-medium text-primary underline">
               Performance tuning
-            </a>
+            </Link>
           )}
         </span>
       </AlertDescription>

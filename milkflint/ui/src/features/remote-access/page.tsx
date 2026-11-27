@@ -4,6 +4,8 @@
 // the router at all), then the devices, a side sheet each with its QR code
 // and .conf file, then the settings. "What this sets up" says in words what
 // a save will do; the save result says what it did.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import {
   ChevronRightIcon,
   DownloadIcon,
@@ -14,14 +16,17 @@ import {
   TriangleAlertIcon,
   Undo2Icon,
 } from 'lucide-react';
-import { type ReactElement, type ReactNode, useCallback, useRef, useState } from 'react';
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { evaluate } from '@tanstack/react-form';
+import { type ReactElement, type ReactNode, useCallback, useMemo, useRef, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
+import { type Column, DataTable } from '@/components/data-table';
 import { EditorSheet } from '@/components/editor-sheet';
 import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
 import { Note } from '@/components/note';
-import { FormSkeleton, LoadError } from '@/components/page-states';
+import { PageBoundary } from '@/components/page-boundary';
 import { QrCode } from '@/components/qr-code';
 import { SaveBar } from '@/components/save-bar';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -32,14 +37,13 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { getWgStatus, isConnected, newKeys, renewInterface, type WgInterface, type WgPeer } from '@/lib/api/wireguard';
+import { isConnected, type WgInterface, type WgPeer } from '@/lib/api/wireguard';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { useLive } from '@/lib/query/use-live';
 import { formatDuration } from '@/lib/format';
-import { href } from '@/lib/router';
 import { cn, errorMessage } from '@/lib/utils';
 import { MoreSettings } from '@/components/more-settings';
-import { loadServer } from './api';
+import { remoteAccessQueries, useNewKeys, useRenewServer } from './queries';
 import {
   confFileName,
   describe,
@@ -57,9 +61,11 @@ import {
   type ServerData,
   type ServerForm,
   subnetOf,
+  serverErrors,
+  serverFormKeys,
+  serverFormSchema,
   summary,
   toChanges,
-  validate,
 } from './model';
 import { CheckItem, Cell, NoWireGuard, Traffic } from './parts';
 import { PEER_TYPE, SERVER } from './sections';
@@ -96,7 +102,57 @@ interface Row {
   state: ReturnType<typeof peerState>;
 }
 
-/** The devices: a table on a wide screen, a list on a phone; a row opens its sheet. */
+/** The columns; the last is a row's open button (the row opens it too). */
+function peerColumns(onOpen: (section: string) => void): Column<Row>[] {
+  return [
+    {
+      label: 'Device',
+      cell: ({ peer }) => <span className="block truncate">{peerLabel(peer)}</span>,
+      className: 'max-w-64 font-medium',
+    },
+    { label: 'Address', cell: ({ peer }) => <span className="font-mono text-xs">{peer.ip}</span> },
+    {
+      label: 'Now',
+      cell: ({ state }) => (
+        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <StateBadge tone={state.tone} text={state.text} />
+          {state.from !== undefined && (
+            <span className="text-xs text-muted-foreground">
+              from <span className="font-mono">{state.from}</span>
+            </span>
+          )}
+        </span>
+      ),
+    },
+    {
+      label: 'Carried',
+      cell: ({ status }) =>
+        status === undefined || status.latest_handshake === 0 ? '–' : <Traffic down={status.tx_bytes} up={status.rx_bytes} />,
+      className: 'text-xs text-muted-foreground',
+    },
+    {
+      label: 'Open',
+      hidden: true,
+      cell: ({ peer }) => (
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={`Open ${peerLabel(peer)}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen(peer.section);
+          }}
+        >
+          <QrCodeIcon />
+          <ChevronRightIcon />
+        </Button>
+      ),
+      className: 'py-1.5 text-right',
+    },
+  ];
+}
+
+/** The devices, in the config's order: a table on a wide screen, a list on a phone; a row opens its sheet. */
 function Devices({
   rows,
   onOpen,
@@ -106,6 +162,7 @@ function Devices({
   onOpen: (section: string) => void;
   onAdd: () => void;
 }): ReactElement {
+  const columns = useMemo(() => peerColumns(onOpen), [onOpen]);
   const add = (
     <Button variant="outline" size="sm" onClick={onAdd}>
       <PlusIcon />
@@ -123,108 +180,44 @@ function Devices({
         }
         action={add}
       />
-      {rows.length === 0 ? (
-        <CardContent className="border-t py-5">
-          <p className="text-sm text-muted-foreground">
-            No device is set up. Add one, save, then scan its QR code in the WireGuard app.
-          </p>
-        </CardContent>
-      ) : (
-        <>
-          <div className="hidden border-t lg:block">
-            <table className="w-full border-collapse text-sm">
-              <thead>
-                <tr className="border-b text-left text-xs text-muted-foreground">
-                  <th className="py-2.5 pr-3 pl-5 font-medium">Device</th>
-                  <th className="px-3 py-2.5 font-medium">Address</th>
-                  <th className="px-3 py-2.5 font-medium">Now</th>
-                  <th className="px-3 py-2.5 font-medium">Carried</th>
-                  <th className="py-2.5 pr-5 pl-3">
-                    <span className="sr-only">Open</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map(({ peer, status, state }) => (
-                  <tr
-                    key={peer.section}
-                    onClick={() => {
-                      onOpen(peer.section);
-                    }}
-                    className={cn(
-                      'cursor-pointer border-b last:border-b-0 hover:bg-muted/60',
-                      !peer.enabled && 'text-muted-foreground',
-                    )}
-                  >
-                    <td className="max-w-64 py-2.5 pr-3 pl-5 font-medium">
-                      <span className="block truncate">{peerLabel(peer)}</span>
-                    </td>
-                    <td className="px-3 py-2.5 font-mono text-xs">{peer.ip}</td>
-                    <td className="px-3 py-2.5">
-                      <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                        <StateBadge tone={state.tone} text={state.text} />
-                        {state.from !== undefined && (
-                          <span className="text-xs text-muted-foreground">
-                            from <span className="font-mono">{state.from}</span>
-                          </span>
-                        )}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2.5 text-xs text-muted-foreground">
-                      {status === undefined || status.latest_handshake === 0 ? (
-                        '–'
-                      ) : (
-                        <Traffic down={status.tx_bytes} up={status.rx_bytes} />
-                      )}
-                    </td>
-                    <td className="py-1.5 pr-5 pl-3 text-right">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        aria-label={`Open ${peerLabel(peer)}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onOpen(peer.section);
-                        }}
-                      >
-                        <QrCodeIcon />
-                        <ChevronRightIcon />
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          <ul className="divide-y border-t lg:hidden">
-            {rows.map(({ peer, status, state }) => (
-              <li key={peer.section}>
-                <button
-                  type="button"
-                  onClick={() => {
-                    onOpen(peer.section);
-                  }}
-                  className="flex w-full cursor-pointer items-center gap-3 px-5 py-3 text-left hover:bg-muted/60"
-                >
-                  <span className="flex min-w-0 flex-1 flex-col gap-1.5">
-                    <span className="flex min-w-0 items-baseline gap-2">
-                      <span className="truncate text-sm font-medium">{peerLabel(peer)}</span>
-                      <span className="shrink-0 font-mono text-xs text-muted-foreground">{peer.ip}</span>
-                    </span>
-                    <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-                      <StateBadge tone={state.tone} text={state.text} />
-                      {status !== undefined && status.latest_handshake > 0 && (
-                        <Traffic down={status.tx_bytes} up={status.rx_bytes} />
-                      )}
-                    </span>
-                  </span>
-                  <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-                </button>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
+      <div className="border-t">
+        <DataTable
+          label="Devices"
+          columns={columns}
+          rows={rows}
+          rowKey={(r) => r.peer.section}
+          empty="No device is set up. Add one, save, then scan its QR code in the WireGuard app."
+          framed={false}
+          wide="md"
+          rowProps={({ peer }) => ({
+            onClick: () => {
+              onOpen(peer.section);
+            },
+            className: cn('cursor-pointer', !peer.enabled && 'text-muted-foreground'),
+          })}
+          card={({ peer, status, state }) => (
+            <button
+              type="button"
+              onClick={() => {
+                onOpen(peer.section);
+              }}
+              className="flex w-full cursor-pointer items-center gap-3 px-5 py-3 text-left hover:bg-muted/60"
+            >
+              <span className="flex min-w-0 flex-1 flex-col gap-1.5">
+                <span className="flex min-w-0 items-baseline gap-2">
+                  <span className="truncate text-sm font-medium">{peerLabel(peer)}</span>
+                  <span className="shrink-0 font-mono text-xs text-muted-foreground">{peer.ip}</span>
+                </span>
+                <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+                  <StateBadge tone={state.tone} text={state.text} />
+                  {status !== undefined && status.latest_handshake > 0 && <Traffic down={status.tx_bytes} up={status.rx_bytes} />}
+                </span>
+              </span>
+              <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+            </button>
+          )}
+        />
+      </div>
     </Card>
   );
 }
@@ -592,55 +585,78 @@ function Answer({
 }
 
 export function RemoteAccessPage(): ReactElement {
-  const { data, error, loading, reload } = useLoad(loadServer);
+  return (
+    <>
+      <PageHeader
+        title="Remote access"
+        description="Reach home from anywhere: phones and laptops connect to this router with WireGuard."
+      />
+      <PageBoundary>
+        <RemoteAccess />
+      </PageBoundary>
+    </>
+  );
+}
+
+function RemoteAccess(): ReactElement {
+  const { data } = useSuspenseQuery(remoteAccessQueries.settings());
   // a static IP from the provider doesn't change; DHCP and PPPoE addresses can
-  const fixedAddress = data?.wan.proto === 'static';
-  const [edit, setEdit] = useState<ServerForm>();
+  const fixedAddress = data.wan.proto === 'static';
   const [open, setOpen] = useState<string>();
   const [adding, setAdding] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [keyError, setKeyError] = useState<string>();
   const showAfter = useRef<string | undefined>(undefined);
   const renew = useRef(false);
+  const { mutateAsync: makeKeys } = useNewKeys();
+  const { mutate: renewServer } = useRenewServer();
   const onApplied = useCallback(() => {
-    setEdit(undefined);
     // a device added and saved: its sheet opens on its QR code
     if (showAfter.current !== undefined) setOpen(showAfter.current);
     showAfter.current = undefined;
     // devices added, changed or removed on a server that was already up
-    if (renew.current)
-      void renewInterface(SERVER)
-        .catch(() => undefined)
-        .finally(reload);
-    else reload();
+    if (renew.current) renewServer();
     renew.current = false;
-  }, [reload]);
+  }, [renewServer]);
   const { state, apply } = useApply(onApplied);
-  const status = usePoll(getWgStatus, 5000).data;
+  const status = useLive(remoteAccessQueries.status()).data;
 
-  const saved = data?.form;
-  const form = edit ?? saved;
-  const errors = form === undefined || data === undefined ? {} : validate(form, data);
-  const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(saved);
+  const saved = data.form;
+  const schema = useMemo(() => serverFormSchema(data), [data]);
+  const settings = useSettingsForm({
+    schema,
+    saved,
+    onSave: async (values) => {
+      await save(values);
+    },
+  });
+  const { form: formApi } = settings;
+  const form = useFormValues(formApi);
+  const dirty = settings.dirty;
+  // errors once a change or a save has checked the form
+  const errors = dirty || settings.invalid ? serverErrors(form, data) : {};
   const invalid = Object.keys(errors).length > 0;
-  const fix = data === undefined || dirty ? [] : drift(data);
+  const fix = dirty ? [] : drift(data);
   const running = status?.interfaces.find((i) => i.name === SERVER);
   // the router's clock, which the handshakes are on
   const now = status?.now ?? 0;
 
-  const set = <K extends keyof ServerForm>(key: K, value: ServerForm[K]): void => {
-    if (form !== undefined) setEdit({ ...form, [key]: value });
+  // several fields at once (a first device turns it on): each one that changes, as typed
+  const update = (next: ServerForm): void => {
+    for (const key of serverFormKeys) if (!evaluate(form[key], next[key])) formApi.setFieldValue(key, next[key]);
   };
-  const savedPeer = (p: PeerForm): boolean => saved?.peers.some((s) => JSON.stringify(s) === JSON.stringify(p)) === true;
+  const set = <K extends keyof ServerForm>(key: K, value: ServerForm[K]): void => {
+    update({ ...form, [key]: value });
+  };
+  const savedPeer = (p: PeerForm): boolean => saved.peers.some((s) => evaluate(s, p));
 
-  const save = async (): Promise<void> => {
-    if (data === undefined || form === undefined) return;
-    let f = form;
+  const save = async (values: ServerForm): Promise<void> => {
+    let f = values;
     setKeyError(undefined);
     // the server's own key, made the first time there's something to save
     if (f.privateKey === '' && (f.enabled || f.peers.length > 0)) {
       try {
-        f = { ...f, privateKey: (await newKeys()).privateKey };
+        f = { ...f, privateKey: (await makeKeys()).privateKey };
       } catch (err) {
         setKeyError(errorMessage(err));
         return;
@@ -661,10 +677,9 @@ export function RemoteAccessPage(): ReactElement {
   };
 
   const addPeer = async (name: string): Promise<void> => {
-    if (data === undefined || form === undefined) return;
     const ip = nextPeerIp(form);
     if (ip === undefined) throw new Error('The tunnel’s network has no address left.');
-    const keys = await newKeys();
+    const keys = await makeKeys();
     const peer: PeerForm = {
       section: newPeerSection(form, data),
       name,
@@ -676,25 +691,20 @@ export function RemoteAccessPage(): ReactElement {
       presharedKey: keys.presharedKey,
     };
     // a first device turns it on: that's what it's for
-    setEdit({ ...form, enabled: form.enabled || (!data.exists && form.peers.length === 0), peers: [...form.peers, peer] });
+    update({ ...form, enabled: form.enabled || (!data.exists && form.peers.length === 0), peers: [...form.peers, peer] });
   };
 
-  const rows: Row[] =
-    form?.peers.map((p) => {
-      const st = running?.peers.find((x) => x.public_key === p.publicKey);
-      // added here and not saved yet: nothing to say about it
-      if (saved?.peers.some((x) => x.section === p.section) !== true)
-        return { peer: p, status: undefined, state: { tone: 'never', text: 'Not saved yet' } };
-      return { peer: p, status: st, state: peerState(p, st, now, running !== undefined) };
-    }) ?? [];
-  const openPeer = form?.peers.find((p) => p.section === open);
+  const rows: Row[] = form.peers.map((p) => {
+    const st = running?.peers.find((x) => x.public_key === p.publicKey);
+    // added here and not saved yet: nothing to say about it
+    if (!saved.peers.some((x) => x.section === p.section))
+      return { peer: p, status: undefined, state: { tone: 'never', text: 'Not saved yet' } };
+    return { peer: p, status: st, state: peerState(p, st, now, running !== undefined) };
+  });
+  const openPeer = form.peers.find((p) => p.section === open);
 
   return (
     <>
-      <PageHeader
-        title="Remote access"
-        description="Reach home from anywhere: phones and laptops connect to this router with WireGuard."
-      />
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
         {keyError !== undefined && (
@@ -704,11 +714,7 @@ export function RemoteAccessPage(): ReactElement {
             <AlertDescription>{keyError}</AlertDescription>
           </Alert>
         )}
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading || data === undefined || form === undefined || saved === undefined ? (
-          <FormSkeleton />
-        ) : !data.installed ? (
+        {!data.installed ? (
           <NoWireGuard />
         ) : (
           <>
@@ -888,7 +894,7 @@ export function RemoteAccessPage(): ReactElement {
                           className="max-w-48 font-mono"
                           aria-invalid={errors['address'] !== undefined}
                           onChange={(e) => {
-                            setEdit(moveTo(form, e.target.value.trim()));
+                            update(moveTo(form, e.target.value.trim()));
                           }}
                         />
                       </Field>
@@ -911,13 +917,13 @@ export function RemoteAccessPage(): ReactElement {
                     <p className="border-t pt-3 text-xs text-muted-foreground">
                       It’s OpenWrt’s own WireGuard setup, so LuCI shows it too: Network → Interfaces ({SERVER}, with a peer per
                       device) and Network → Firewall. On the{' '}
-                      <a href={`${href('firewall')}/zones`} className="font-medium link underline-offset-4">
+                      <Link {...pageLink('firewall', 'zones')} className="font-medium link underline-offset-4">
                         Firewall page
-                      </a>{' '}
+                      </Link>{' '}
                       it’s zone {SERVER}; DNS follows the{' '}
-                      <a href={href('dns')} className="font-medium link underline-offset-4">
+                      <Link {...pageLink('dns')} className="font-medium link underline-offset-4">
                         DNS page
-                      </a>
+                      </Link>
                       .
                     </p>
                   </CardContent>
@@ -944,14 +950,10 @@ export function RemoteAccessPage(): ReactElement {
         visible={dirty}
         busy={state.phase === 'applying'}
         invalid={invalid}
-        onSave={() => {
-          void save();
-        }}
-        onRevert={() => {
-          setEdit(undefined);
-        }}
+        onSave={settings.save}
+        onRevert={settings.discard}
       />
-      {data !== undefined && saved !== undefined && form !== undefined && openPeer !== undefined && (
+      {openPeer !== undefined && (
         <DeviceSheet
           key={openPeer.section}
           peer={openPeer}
@@ -1010,8 +1012,7 @@ export function RemoteAccessPage(): ReactElement {
               variant="destructive"
               onClick={() => {
                 setConfirmRemove(false);
-                if (data === undefined) return;
-                setEdit(undefined);
+                settings.discard();
                 void apply(removal(data), {
                   note: `${data.form.enabled ? `Closed UDP port ${data.form.port}.` : 'Nothing was open.'} Deleted the WireGuard interface, its devices and its firewall zone and rules.`,
                 });

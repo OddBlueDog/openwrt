@@ -1,6 +1,7 @@
 import { ShieldUserIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { deviceControlQueries } from './queries';
 
 export const feature = {
   id: 'device-control',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.DeviceControlPage,
   ),
+  prefetch: (client) => {
+    client.query(deviceControlQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

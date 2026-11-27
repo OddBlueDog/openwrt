@@ -2,13 +2,14 @@
 // mode, width, channel and power, then the rarely changed (a hidden name, a
 // random address, a forced cipher, beamforming), all shown; the card's foot
 // points to the Wi-Fi driver page for the rest.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { TriangleAlertIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { Field } from '@/components/field';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import type { RegRule } from '@/lib/api/wireless';
-import { href } from '@/lib/router';
 import { blockOf, describeBlock } from './channels';
 import { explain } from '@/components/explain';
 import {
@@ -379,9 +380,9 @@ export function RadioFields({
       {/* the card's foot: where the rest of the radio's settings are */}
       <p className="col-span-full self-end border-t pt-4 text-sm text-muted-foreground">
         For further settings, see the{' '}
-        <a href={href('wifi-driver')} className="font-medium link">
+        <Link {...pageLink('wifi-driver')} className="font-medium link">
           Wi-Fi driver page
-        </a>
+        </Link>
         .
       </p>
     </>

@@ -5,22 +5,24 @@
 // opened through UPnP. Opening a port starts from the device, in a side
 // sheet. Saves go through the firewall's apply with rollback, as on the
 // Firewall page; the hit counts come from the running ruleset.
+import { pageLink } from '@/lib/router';
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { DoorOpenIcon, MonitorIcon, RouterIcon } from 'lucide-react';
-import { type ReactElement, useCallback } from 'react';
+import type { ReactElement } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { PageHeader } from '@/components/layout/page-header';
-import { FormSkeleton, LoadError } from '@/components/page-states';
+import { PageBoundary } from '@/components/page-boundary';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { href } from '@/lib/router';
-import { type FirewallData, getCounters, getUpnpMappings, getWarnings, loadFirewall, type UpnpMapping } from '../firewall/api';
+import { useLive } from '@/lib/query/use-live';
+import type { FirewallData, UpnpMapping } from '../firewall/api';
 import { FirewallDialogs } from '../firewall/dialogs';
 import type { Actions } from '../firewall/forms';
 import { CheckWarnings } from '../firewall/warnings';
 import { useFirewallActions } from '../firewall/use-actions';
+import { firewallQueries } from '../firewall/queries';
 import { plural } from '../firewall/summary';
 import { ForwardsTable } from './forwards-table';
 import { type ForwardsSummary, forwardsSummary, headline } from './summary';
@@ -44,9 +46,9 @@ function Reachable({ s }: { s: ForwardsSummary }): ReactElement {
             text: (
               <>
                 The router has no IPv4 internet address right now, so nothing from the internet reaches it.{' '}
-                <a href={href('internet')} className="font-medium link underline-offset-4">
+                <Link {...pageLink('internet')} className="font-medium link underline-offset-4">
                   Check the internet connection
-                </a>
+                </Link>
               </>
             ),
           }
@@ -164,62 +166,53 @@ function Answer({
   );
 }
 
-export function PortForwardsPage(): ReactElement {
-  const { data, error, loading, reload } = useLoad(loadFirewall);
-  const counters = usePoll(
-    async () => (data === undefined ? undefined : getCounters()),
-    10_000,
-    data === undefined ? '' : 'loaded',
-  );
-  const mappings = usePoll(getUpnpMappings, 15_000);
-  const warnings = usePoll(getWarnings, 60_000);
-  const refreshCounters = counters.refresh;
-  const refreshWarnings = warnings.refresh;
-  const onApplied = useCallback(() => {
-    reload();
-    refreshCounters();
-    refreshWarnings();
-  }, [reload, refreshCounters, refreshWarnings]);
-  const { state, actions, dialog, setDialog, save } = useFirewallActions(onApplied);
+const noop = (): void => undefined;
 
+export function PortForwardsPage(): ReactElement {
   return (
     <>
       <PageHeader
         title="Port forwards"
         description="Let something on the internet reach a device at home, such as a game console or a camera."
       />
-      <div className="flex flex-col gap-4">
-        <ApplyStatus state={state} />
-        <CheckWarnings warnings={warnings.data} />
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading && data === undefined ? (
-          <FormSkeleton />
-        ) : (
-          data !== undefined && (
-            <>
-              <Answer data={data} mappings={mappings.data} actions={actions} />
-              <ForwardsTable data={data} counters={counters.data} mappings={mappings.data} actions={actions} />
-              <p className="text-sm text-muted-foreground">
-                Rules for what may reach the router and your devices are on the{' '}
-                <a href={href('firewall')} className="font-medium link underline-offset-4">
-                  Firewall
-                </a>{' '}
-                page.
-              </p>
-              <FirewallDialogs
-                dialog={dialog}
-                data={data}
-                confirm={actions.confirm}
-                onClose={() => {
-                  setDialog(undefined);
-                }}
-                onSave={save}
-              />
-            </>
-          )
-        )}
-      </div>
+      <PageBoundary>
+        <PortForwards />
+      </PageBoundary>
     </>
+  );
+}
+
+function PortForwards(): ReactElement {
+  const { data } = useSuspenseQuery(firewallQueries.config());
+  const counters = useLive(firewallQueries.counters());
+  const mappings = useLive(firewallQueries.upnpMappings());
+  const warnings = useLive(firewallQueries.warnings());
+  // a save refreshes every read (useApply): nothing more to do here
+  const { state, actions, dialog, setDialog, save, submit } = useFirewallActions(noop);
+
+  return (
+    <div className="flex flex-col gap-4">
+      <ApplyStatus state={state} />
+      <CheckWarnings warnings={warnings.data} />
+      <Answer data={data} mappings={mappings.data} actions={actions} />
+      <ForwardsTable data={data} counters={counters.data} mappings={mappings.data} actions={actions} />
+      <p className="text-sm text-muted-foreground">
+        Rules for what may reach the router and your devices are on the{' '}
+        <Link {...pageLink('firewall')} className="font-medium link underline-offset-4">
+          Firewall
+        </Link>{' '}
+        page.
+      </p>
+      <FirewallDialogs
+        dialog={dialog}
+        data={data}
+        confirm={actions.confirm}
+        onClose={() => {
+          setDialog(undefined);
+        }}
+        onSave={save}
+        onSubmit={submit}
+      />
+    </div>
   );
 }

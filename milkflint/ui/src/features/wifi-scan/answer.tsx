@@ -1,6 +1,8 @@
 // The Nearby networks page's opening answer: for each of this router's bands,
 // how crowded its channel is and where it's quietest, by the last scan; then
 // the scan itself (every band, or one) and what it costs.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ChevronRightIcon, ClockIcon, InfoIcon, LoaderCircleIcon, RadarIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { CardHeading } from '@/components/card-heading';
@@ -10,7 +12,6 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import type { RegRule } from '@/lib/api/wireless';
-import { href } from '@/lib/router';
 import type { ScannedNetwork } from './api';
 import { type BandAnswer, bandAnswer, type BandState, type Block, blockLabel, howLong, type Radio } from './model';
 import { bandLabel } from './spectrum';
@@ -29,12 +30,12 @@ function blocksText(blocks: readonly Block[]): string {
   return blocks.map((b) => `${blockLabel(b.channels)}${b.dfs ? RADAR_NOTE : ''}`).join(' or ');
 }
 
-function Link({ children }: { children: ReactNode }): ReactElement {
+function WifiLink({ children }: { children: ReactNode }): ReactElement {
   return (
-    <a href={href('wifi')} className="inline-flex items-center gap-0.5 font-medium link underline-offset-4">
+    <Link {...pageLink('wifi')} className="inline-flex items-center gap-0.5 font-medium link underline-offset-4">
       {children}
       <ChevronRightIcon className="size-4" aria-hidden />
-    </a>
+    </Link>
   );
 }
 
@@ -45,7 +46,7 @@ function BandText({ radio, a }: { radio: Radio; a: BandAnswer }): ReactElement {
   if (a.state === 'off')
     return (
       <p className="text-sm text-muted-foreground">
-        Not on air now, so it has no channel to share. <Link>Networks &amp; radios</Link>
+        Not on air now, so it has no channel to share. <WifiLink>Networks &amp; radios</WifiLink>
       </p>
     );
   if (a.state === 'unscanned') return <p className="text-sm text-muted-foreground">Scan it to see who shares {yours}.</p>;
@@ -66,7 +67,7 @@ function BandText({ radio, a }: { radio: Radio; a: BandAnswer }): ReactElement {
       {a.move !== undefined ? (
         <p className="text-sm">
           Quieter at {radio.width} MHz: channel {blockLabel(a.move.channels)}
-          {a.move.dfs ? RADAR_NOTE : ''}. <Link>Change it</Link>
+          {a.move.dfs ? RADAR_NOTE : ''}. <WifiLink>Change it</WifiLink>
         </p>
       ) : (
         a.heard > 0 && (

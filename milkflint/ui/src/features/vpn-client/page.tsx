@@ -4,277 +4,74 @@
 // server, who goes through it), then who uses it, protection and speed, and
 // the provider's server details from their config file. "What this sets up"
 // says in words what a save will do; the save result says what it did.
-import {
-  ArrowDownIcon,
-  ArrowUpIcon,
-  ChevronDownIcon,
-  EyeIcon,
-  EyeOffIcon,
-  FileUpIcon,
-  InfoIcon,
-  PlusIcon,
-  Trash2Icon,
-  TriangleAlertIcon,
-  Undo2Icon,
-  XIcon,
-} from 'lucide-react';
-import { type ReactElement, type ReactNode, useCallback, useId, useRef, useState } from 'react';
+// Profiles ("USA", "France") sit above the settings once there's a tunnel or
+// a profile: the active one is what the page edits, kept in step on every
+// save; Activate switches to another, and the page watches its server answer.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
+import { BookmarkPlusIcon, Trash2Icon, TriangleAlertIcon, Undo2Icon } from 'lucide-react';
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { evaluate } from '@tanstack/react-form';
+import { type ReactElement, useCallback, useMemo, useRef, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
-import { Field } from '@/components/field';
 import { PageHeader } from '@/components/layout/page-header';
-import { Note } from '@/components/note';
-import { FormSkeleton, LoadError } from '@/components/page-states';
+import { PageBoundary } from '@/components/page-boundary';
+import { LoadError } from '@/components/page-states';
 import { SaveBar } from '@/components/save-bar';
-import { SearchSelect } from '@/components/search-select';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Input, inputClass } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { getWgStatus, isConnected, parseConf, renewInterface, type WgInterface, type WgPeer } from '@/lib/api/wireguard';
+import type { Change } from '@/lib/api/uci';
+import { isConnected, type Tunnel, type WgInterface, type WgPeer } from '@/lib/api/wireguard';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { useLive } from '@/lib/query/use-live';
 import { formatDuration } from '@/lib/format';
-import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
-import { isMac } from '../firewall/model';
-import { Choice } from '../firewall/parts';
 import { Cell, CheckItem, NoWireGuard, Traffic } from '../remote-access/parts';
-import { loadClient } from './api';
+import { useRenewTunnel, vpnClientQueries } from './queries';
 import {
   activeDnsOf,
   type ClientForm,
+  clientErrors,
+  clientFormKeys,
+  clientFormSchema,
   describe,
-  type Device,
   drift,
   type Errors,
-  fromConf,
-  pickerLabel,
+  readConf,
   removal,
+  serverNeedsFixing,
   serverText,
   summary,
   toChanges,
-  TUNNEL_SHARE,
-  validate,
-  type Who,
+  tunnelLine,
   whoSummary,
 } from './model';
-import { CLIENT, CLIENT_META, CLIENT_PEER, CLIENT_TABLE } from './sections';
+import { CLIENT, CLIENT_TABLE } from './sections';
+import { ClientFormCards, ConfigButton, ImportDialog } from './form-cards';
+import { ProfileNameDialog, ProfilesCard } from './profiles-card';
+import { activateChanges, formOf, type Profile, saveAsChanges, saveWithProfile, updateChanges } from './profiles';
 
-function ImportDialog({
-  open,
-  onClose,
-  onUse,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onUse: (text: string) => string | undefined;
-}): ReactElement {
-  const [text, setText] = useState('');
-  const [error, setError] = useState<string>();
-  const use = (t: string): void => {
-    const err = onUse(t);
-    setError(err);
-    if (err === undefined) {
-      setText('');
-      onClose();
-    }
-  };
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(o) => {
-        if (!o) onClose();
-      }}
-    >
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Use a provider’s WireGuard config</DialogTitle>
-          <DialogDescription>
-            From your VPN provider’s website (Mullvad, Proton VPN, IVPN, AzireVPN and others make them): pick a server, download
-            its WireGuard file for a router or Linux, and open or paste it here. Its keys stay on this router.
-          </DialogDescription>
-        </DialogHeader>
-        <textarea
-          value={text}
-          rows={10}
-          spellCheck={false}
-          placeholder={'[Interface]\nPrivateKey = …\nAddress = …\nDNS = …\n\n[Peer]\nPublicKey = …\nEndpoint = …'}
-          aria-label="The WireGuard config"
-          aria-invalid={error !== undefined}
-          className={cn(inputClass, 'h-auto py-2 font-mono text-xs')}
-          onChange={(e) => {
-            setText(e.target.value);
-          }}
-        />
-        {error !== undefined && <p className="text-xs text-destructive">{error}</p>}
-        <DialogFooter>
-          <label className="mr-auto inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border bg-card px-3 text-sm font-medium shadow-xs hover:bg-accent has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring">
-            <FileUpIcon className="size-4" />
-            Open a .conf file
-            <input
-              type="file"
-              accept=".conf,text/plain"
-              className="sr-only"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file !== undefined) void file.text().then(use);
-                e.target.value = '';
-              }}
-            />
-          </label>
-          <Button variant="ghost" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            disabled={text.trim() === ''}
-            onClick={() => {
-              use(text);
-            }}
-          >
-            Use it
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
+/** The page's settings, where a profile's Edit goes while it's the active one. */
+const SETTINGS = 'vpn-settings';
+/** How long after an Activate the new server has to answer before the card says it hasn't, seconds. */
+const ANSWER_WAIT = 30;
 
-function KeyInput({
-  id,
-  value,
-  error,
-  onChange,
-}: {
+/** An Activate being watched: the profile, the one before it (and whether the VPN was on), and when (the router's clock). */
+interface Watch {
   id: string;
-  value: string;
-  error: string | undefined;
-  onChange: (v: string) => void;
-}): ReactElement {
-  const [show, setShow] = useState(false);
-  return (
-    <div className="relative">
-      <Input
-        id={id}
-        type={show ? 'text' : 'password'}
-        autoComplete="off"
-        value={value}
-        className="pr-10 font-mono text-xs"
-        aria-invalid={error !== undefined}
-        onChange={(e) => {
-          onChange(e.target.value.trim());
-        }}
-      />
-      <button
-        type="button"
-        onClick={() => {
-          setShow((v) => !v);
-        }}
-        className="absolute inset-y-0 right-0 flex w-10 cursor-pointer items-center justify-center rounded-r-md text-muted-foreground hover:text-foreground"
-        aria-label={show ? 'Hide the key' : 'Show the key'}
-      >
-        {show ? <EyeOffIcon className="size-4" /> : <EyeIcon className="size-4" />}
-      </button>
-    </div>
-  );
+  previous: string | undefined;
+  wasOn: boolean;
+  since: number;
 }
 
-function DevicePicker({
-  macs,
-  devices,
-  error,
-  onChange,
-}: {
-  macs: string[];
-  devices: readonly Device[];
-  error: string | undefined;
-  onChange: (m: string[]) => void;
-}): ReactElement {
-  const [typed, setTyped] = useState('');
-  const known = new Map(devices.map((d) => [d.mac, d]));
-  const add = (mac: string): void => {
-    const m = mac.trim().toLowerCase().replace(/-/g, ':');
-    if (m !== '' && !macs.includes(m)) onChange([...macs, m]);
-  };
-  return (
-    <div className="flex flex-col gap-2">
-      {macs.length > 0 && (
-        <ul className="flex flex-col divide-y border-y">
-          {macs.map((m) => {
-            const d = known.get(m);
-            return (
-              <li key={m} className="flex items-center gap-2 py-1.5">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm">{d?.name ?? 'Unknown device'}</div>
-                  <div className="font-mono text-xs text-muted-foreground">
-                    {[m, d?.ip].filter((x) => x !== undefined).join(' · ')}
-                  </div>
-                </div>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={`Take ${d?.name ?? m} off the list`}
-                  onClick={() => {
-                    onChange(macs.filter((x) => x !== m));
-                  }}
-                >
-                  <XIcon />
-                </Button>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-      <SearchSelect
-        id="vpn-device"
-        options={devices
-          .filter((d) => !macs.includes(d.mac))
-          .map((d) => ({ value: d.mac, label: pickerLabel(d, devices), keywords: `${d.mac} ${d.ip ?? ''}` }))}
-        value=""
-        placeholder="Add a device the router knows…"
-        onChange={add}
-      />
-      <div className="flex gap-2">
-        <Input
-          value={typed}
-          placeholder="or its MAC address"
-          className="font-mono placeholder:font-sans"
-          aria-label="A device’s MAC address"
-          onChange={(e) => {
-            setTyped(e.target.value);
-          }}
-        />
-        <Button
-          variant="outline"
-          disabled={!isMac(typed.trim().replace(/-/g, ':'))}
-          onClick={() => {
-            add(typed);
-            setTyped('');
-          }}
-        >
-          <PlusIcon />
-          Add
-        </Button>
-      </div>
-      {error !== undefined && <p className="text-xs text-destructive">{error}</p>}
-    </div>
-  );
-}
-
-const whoOptions: { value: Who; label: string; hint: string }[] = [
-  { value: 'all', label: 'Every home device', hint: 'Everything on your home network goes through the VPN.' },
-  { value: 'only', label: 'Only these', hint: 'Only the devices listed go through the VPN.' },
-  {
-    value: 'except',
-    label: 'All but these',
-    hint: 'Everything on your home network but the devices listed: a games console, a work laptop, a TV app that blocks VPNs.',
-  },
-  { value: 'none', label: 'No home devices', hint: 'Only the guest networks switched on below go through it.' },
-];
+/** A save's words, without the "Saved." it says when nothing else changed. */
+const said = (lines: readonly string[]): string[] => lines.filter((l) => l !== 'Saved.');
 
 interface Connection {
   tone: 'ok' | 'warn' | 'off';
@@ -282,9 +79,28 @@ interface Connection {
   headline: string;
   text: string;
   peer?: WgPeer;
+  /** the watcher's word on the tunnel, when it has one: when the server stopped answering and what the devices get */
+  note?: string;
 }
 
-function connectionState(form: ClientForm, running: WgInterface | undefined, now: number): Connection {
+const clockText = (epoch: number): string =>
+  new Date(epoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+function connectionState(form: ClientForm, running: WgInterface | undefined, now: number, tunnel: Tunnel | null): Connection {
+  const note = form.enabled ? tunnelLine(tunnel, form.killSwitch, clockText) : undefined;
+  const c = connectionBase(form, running, now);
+  // the stale-handshake text already says what the devices get: the watcher's line replaces it
+  if (
+    note !== undefined &&
+    c.peer !== undefined &&
+    c.badge === 'No answer' &&
+    c.headline.startsWith('No answer from the server for')
+  )
+    return { ...c, text: note };
+  return note === undefined ? c : { ...c, note };
+}
+
+function connectionBase(form: ClientForm, running: WgInterface | undefined, now: number): Connection {
   if (!form.enabled)
     return {
       tone: 'off',
@@ -330,307 +146,198 @@ function connectionState(form: ClientForm, running: WgInterface | undefined, now
   };
 }
 
-/** A fold that opens itself while something in it needs fixing. */
-function Fold({
-  title,
-  summary,
-  mono = false,
-  open,
-  onToggle,
-  children,
-}: {
-  title: string;
-  summary: string;
-  mono?: boolean;
-  open: boolean;
-  onToggle: () => void;
-  children: ReactNode;
-}): ReactElement {
-  const panel = useId();
-  return (
-    <div className="border-t">
-      <button
-        type="button"
-        aria-expanded={open}
-        aria-controls={panel}
-        onClick={onToggle}
-        className="flex min-h-11 w-full cursor-pointer items-center gap-2 rounded-sm py-2 text-left text-sm font-medium hover:text-primary"
-      >
-        <ChevronDownIcon
-          className={cn('size-4 shrink-0 text-muted-foreground transition-transform duration-fast', open && 'rotate-180')}
-          aria-hidden
-        />
-        {title}
-        <span className={cn('min-w-0 flex-1 truncate text-right text-xs font-normal text-muted-foreground', mono && 'font-mono')}>
-          {summary}
-        </span>
-      </button>
-      <div id={panel} hidden={!open} className="divide-y border-t">
-        {children}
-      </div>
-    </div>
-  );
-}
-
-const opt = (name: string): ReactElement => <span className="font-mono">{name}</span>;
-
-/** The provider's server and this router's keys and addresses, as their config file gives them. */
-function ServerFields({
-  form,
-  errors,
-  set,
-}: {
-  form: ClientForm;
-  errors: Errors;
-  set: <K extends keyof ClientForm>(key: K, value: ClientForm[K]) => void;
-}): ReactElement {
-  return (
-    <>
-      <Field
-        id="vpn-host"
-        label="Server"
-        hint="The provider’s server: a hostname or address."
-        why={
-          <>
-            The config’s [Peer] Endpoint. It’s {opt('endpoint_host')} on peer {opt(CLIENT_PEER)}.
-          </>
-        }
-        error={errors['host']}
-      >
-        <Input
-          id="vpn-host"
-          value={form.endpointHost}
-          aria-invalid={errors['host'] !== undefined}
-          onChange={(e) => {
-            set('endpointHost', e.target.value.trim());
-          }}
-        />
-      </Field>
-      <Field
-        id="vpn-port"
-        label="Port"
-        hint="UDP, from the same Endpoint."
-        why={
-          <>
-            It’s {opt('endpoint_port')} on peer {opt(CLIENT_PEER)}.
-          </>
-        }
-        error={errors['port']}
-      >
-        <Input
-          id="vpn-port"
-          inputMode="numeric"
-          value={form.endpointPort}
-          className="max-w-32 tabular"
-          aria-invalid={errors['port'] !== undefined}
-          onChange={(e) => {
-            set('endpointPort', e.target.value.trim());
-          }}
-        />
-      </Field>
-      <Field
-        id="vpn-public"
-        label="Server’s public key"
-        hint="The config’s [Peer] PublicKey."
-        why={
-          <>
-            It’s {opt('public_key')} on peer {opt(CLIENT_PEER)}.
-          </>
-        }
-        error={errors['public']}
-      >
-        <Input
-          id="vpn-public"
-          value={form.publicKey}
-          className="font-mono text-xs"
-          aria-invalid={errors['public'] !== undefined}
-          onChange={(e) => {
-            set('publicKey', e.target.value.trim());
-          }}
-        />
-      </Field>
-      <Field
-        id="vpn-private"
-        label="This router’s private key"
-        hint="What the provider knows this router by."
-        why={
-          <>
-            The config’s [Interface] PrivateKey: {opt('private_key')} on interface {opt(CLIENT)}.
-          </>
-        }
-        error={errors['private']}
-      >
-        <KeyInput
-          id="vpn-private"
-          value={form.privateKey}
-          error={errors['private']}
-          onChange={(v) => {
-            set('privateKey', v);
-          }}
-        />
-      </Field>
-      <Field
-        id="vpn-psk"
-        label="Preshared key"
-        hint="Only if the config has one."
-        why={
-          <>
-            {opt('preshared_key')} on peer {opt(CLIENT_PEER)}.
-          </>
-        }
-        error={errors['psk']}
-      >
-        <KeyInput
-          id="vpn-psk"
-          value={form.presharedKey}
-          error={errors['psk']}
-          onChange={(v) => {
-            set('presharedKey', v);
-          }}
-        />
-      </Field>
-      <Field
-        id="vpn-addresses"
-        label="Addresses"
-        hint="This router’s in the provider’s network, separated by commas."
-        why={
-          <>
-            The config’s [Interface] Address. An IPv6 one carries IPv6 too. It’s {opt('addresses')} on interface {opt(CLIENT)}.
-          </>
-        }
-        error={errors['addresses']}
-      >
-        <Input
-          id="vpn-addresses"
-          value={form.addresses.join(', ')}
-          className="font-mono"
-          aria-invalid={errors['addresses'] !== undefined}
-          onChange={(e) => {
-            set('addresses', e.target.value.split(/,\s*/));
-          }}
-        />
-      </Field>
-      <Field
-        id="vpn-mtu"
-        label="MTU"
-        hint="Empty for WireGuard’s 1420."
-        why={
-          <>
-            Lower it only if the provider says so. It’s {opt('mtu')} on interface {opt(CLIENT)}.
-          </>
-        }
-        error={errors['mtu']}
-      >
-        <Input
-          id="vpn-mtu"
-          inputMode="numeric"
-          value={form.mtu}
-          placeholder="1420"
-          className="max-w-32 tabular"
-          aria-invalid={errors['mtu'] !== undefined}
-          onChange={(e) => {
-            set('mtu', e.target.value.trim());
-          }}
-        />
-      </Field>
-    </>
-  );
-}
-
-const SERVER_ERRORS = ['host', 'port', 'public', 'private', 'psk', 'addresses', 'mtu'];
-
 export function VpnClientPage(): ReactElement {
-  const { data, error, loading, reload } = useLoad(loadClient);
-  const [edit, setEdit] = useState<ClientForm>();
-  const [importing, setImporting] = useState(false);
-  const [imported, setImported] = useState<string[]>();
-  const [details, setDetails] = useState(false);
-  const [confirmRemove, setConfirmRemove] = useState(false);
-  const renew = useRef(false);
-  const onApplied = useCallback(() => {
-    setEdit(undefined);
-    setImported(undefined);
-    // a new server, keys or port on a tunnel that was already up
-    if (renew.current)
-      void renewInterface(CLIENT)
-        .catch(() => undefined)
-        .finally(reload);
-    else reload();
-    renew.current = false;
-  }, [reload]);
-  const { state, apply } = useApply(onApplied);
-  const status = usePoll(getWgStatus, 5000).data;
-
-  const saved = data?.form;
-  const form = edit ?? saved;
-  const errors: Errors = form === undefined || data === undefined ? {} : validate(form, data);
-  const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(saved);
-  const invalid = Object.keys(errors).length > 0;
-  const fix = data === undefined || dirty ? [] : drift(data);
-  const running = status?.interfaces.find((i) => i.name === CLIENT);
-  // the router's clock, which the handshakes are on
-  const now = status?.now ?? 0;
-  const blank = form?.privateKey === '' && form.publicKey === '';
-  const serverWrong = SERVER_ERRORS.some((k) => errors[k] !== undefined);
-
-  const set = <K extends keyof ClientForm>(key: K, value: ClientForm[K]): void => {
-    if (form !== undefined) setEdit({ ...form, [key]: value });
-  };
-  const useConf = (text: string): string | undefined => {
-    if (form === undefined) return 'Not loaded yet.';
-    const conf = parseConf(text);
-    if ('error' in conf) return `That isn’t a WireGuard config this page can use: ${conf.error}`;
-    // a first config turns it on: that's what it's for
-    const next = { ...fromConf(form, conf), enabled: form.enabled || blank };
-    const notes: string[] = [];
-    const skippedDns = conf.dns.filter((x) => !next.dns.includes(x));
-    if (skippedDns.length > 0)
-      notes.push(`Its search domain${skippedDns.length === 1 ? '' : 's'} (${skippedDns.join(', ')}) aren’t used.`);
-    if (next.dns.length === 0 && next.useVpnDns)
-      notes.push(
-        'It didn’t list a DNS server: enter one under “Use VPN’s DNS”, or turn that switch off to keep this router’s DNS.',
-      );
-    else if (next.dns.length > 0 && !next.useVpnDns)
-      notes.push(`Its DNS server (${next.dns.join(', ')}) was saved, ready if you turn “Use VPN’s DNS” back on.`);
-    const all =
-      conf.peer.allowedIps.length === 0 || (conf.peer.allowedIps.includes('0.0.0.0/0') && conf.peer.allowedIps.includes('::/0'));
-    if (!all)
-      notes.push(
-        `Its AllowedIPs (${conf.peer.allowedIps.join(', ')}) are replaced: this page sends all of a device’s traffic through the VPN.`,
-      );
-    setImported(notes);
-    setEdit(next);
-    // what it read in, to check before saving
-    setDetails(true);
-    return undefined;
-  };
-  const conn = form === undefined ? undefined : connectionState(saved ?? form, running, now);
-  const importButton = (
-    <Button
-      variant={blank ? 'default' : 'outline'}
-      size="sm"
-      onClick={() => {
-        setImporting(true);
-      }}
-    >
-      <FileUpIcon />
-      {blank ? 'Use a config' : 'New config'}
-    </Button>
-  );
-
   return (
     <>
       <PageHeader
         title="Send through a VPN"
         description="Send chosen devices’ internet traffic through a VPN provider’s WireGuard server, with a kill switch."
       />
+      <PageBoundary>
+        <VpnClient />
+      </PageBoundary>
+    </>
+  );
+}
+
+function VpnClient(): ReactElement {
+  // a refresh keeps what's drawn until the new answer is in, so the profiles card keeps its place (its focus, its open sheet)
+  const settingsRead = useSuspenseQuery(vpnClientQueries.settings());
+  const data = settingsRead.data;
+  const loading = settingsRead.isFetching;
+  const [importing, setImporting] = useState(false);
+  const [imported, setImported] = useState<string[]>();
+  const [details, setDetails] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [savingAs, setSavingAs] = useState(false);
+  const [watch, setWatch] = useState<Watch>();
+  const renew = useRef(false);
+  // what a profiles-only change does once it's applied
+  const after = useRef<(() => void) | undefined>(undefined);
+  // a change to the profiles alone: the page's unsaved edits stay
+  const keep = useRef(false);
+  const poll = useLive(vpnClientQueries.status());
+  const status = poll.data;
+  const { mutate: renewTunnel } = useRenewTunnel();
+  const saved = data.form;
+  const schema = useMemo(() => clientFormSchema(data), [data]);
+  const settings = useSettingsForm({
+    schema,
+    saved,
+    onSave: async (values) => {
+      await saveForm(values);
+    },
+  });
+  const { form: formApi, discard } = settings;
+  const form = useFormValues(formApi);
+  const onApplied = useCallback(() => {
+    if (!keep.current) {
+      discard();
+      setImported(undefined);
+    }
+    keep.current = false;
+    const then = after.current;
+    after.current = undefined;
+    then?.();
+    // a new server, keys or port on a tunnel that was already up (every read is fresh already)
+    if (renew.current) renewTunnel();
+    renew.current = false;
+  }, [discard, renewTunnel]);
+  const { state, apply: applyNow } = useApply(onApplied);
+  const apply: typeof applyNow = (changes, options) => {
+    after.current = undefined;
+    return applyNow(changes, options);
+  };
+
+  // an apply, or the refresh after it: until the new answer is in, what's drawn is stale and takes no new edits
+  const working = state.phase === 'applying' || loading;
+  const dirty = settings.dirty;
+  // errors once a change or a save has checked the form
+  const errors: Errors = dirty || settings.invalid ? clientErrors(form, data) : {};
+  const invalid = Object.keys(errors).length > 0;
+  const fix = dirty ? [] : drift(data);
+  const running = status?.interfaces.find((i) => i.name === CLIENT);
+  // the router's clock, which the handshakes are on
+  const now = status?.now ?? 0;
+  const blank = form.privateKey === '' && form.publicKey === '';
+  const serverWrong = serverNeedsFixing(errors);
+
+  // several fields at once (a config read in): each one that changes, as typed
+  const update = (next: ClientForm): void => {
+    for (const key of clientFormKeys) if (!evaluate(form[key], next[key])) formApi.setFieldValue(key, next[key]);
+  };
+  const set = <K extends keyof ClientForm>(key: K, value: ClientForm[K]): void => {
+    update({ ...form, [key]: value });
+  };
+  const useConf = (text: string): string | undefined => {
+    const read = readConf(form, text);
+    if ('error' in read) return read.error;
+    setImported(read.notes);
+    // a first config turns it on: that's what it's for
+    update({ ...read.form, enabled: form.enabled || blank });
+    // what it read in, to check before saving
+    setDetails(true);
+    return undefined;
+  };
+
+  const activeProfile = data.profiles.find((p) => p.id === data.active);
+  const touchesPeer = (changes: readonly Change[]): boolean =>
+    changes.some((c) => c.config === 'network' && 'section' in c && c.section === data.peerSection);
+  // the router's clock now, from its last answer (and the time since, while the tab is in view)
+  const routerNow = (): number | undefined =>
+    status === undefined ? undefined : status.now + (poll.at === undefined ? 0 : (Date.now() - poll.at) / 1000);
+  const applyProfiles = (changes: Change[], note: string, then?: () => void): void => {
+    keep.current = true;
+    renew.current = false;
+    void apply(changes, { note });
+    after.current = then;
+  };
+  /** Switches the live config to the profile; `watchIt`: say so if its server doesn't answer; `enabled`: false to leave the VPN off. */
+  const activate = (p: Profile, watchIt: boolean, enabled = true): void => {
+    const before = data.exists ? data.form : undefined;
+    const target: ClientForm = { ...p.form, enabled };
+    const changes = activateChanges(p, data, enabled);
+    renew.current = touchesPeer(changes);
+    keep.current = false;
+    // only a tunnel that comes up afresh owes a handshake soon
+    const moved =
+      before?.enabled !== true ||
+      serverText(before) !== serverText(target) ||
+      before.publicKey !== target.publicKey ||
+      before.privateKey !== target.privateKey;
+    const since = routerNow();
+    setWatch(
+      watchIt && moved && since !== undefined
+        ? { id: p.id, previous: data.active, wasOn: before?.enabled === true, since }
+        : undefined,
+    );
+    void apply(changes, { note: [`Switched the VPN to ${p.name}.`, ...said(summary(before, target, data))].join(' ') });
+  };
+  const saveAs = (name: string): void => {
+    // with unsaved changes, they're saved too, in the same apply
+    const own = dirty ? toChanges(form, data) : [];
+    renew.current = form.enabled && touchesPeer(own);
+    keep.current = false;
+    setWatch(undefined);
+    setSavingAs(false);
+    void apply([...own, ...saveAsChanges(name, form, data)], {
+      note: [
+        ...(dirty ? said(summary(data.exists ? data.form : undefined, form, data)) : []),
+        `Saved these settings as ${name}, now the active profile.`,
+      ].join(' '),
+    });
+  };
+  const toSettings = (): void => {
+    const el = document.getElementById(SETTINGS);
+    const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    el?.scrollIntoView({ behavior: still ? 'auto' : 'smooth', block: 'start' });
+    el?.focus({ preventScroll: true });
+  };
+
+  // an Activate whose server hasn't answered: no handshake from it since, after ANSWER_WAIT
+  const watched = watch === undefined ? undefined : data.profiles.find((p) => p.id === watch.id);
+  const peer = running?.peers[0];
+  const answered =
+    watch !== undefined &&
+    peer !== undefined &&
+    peer.public_key === watched?.form.publicKey &&
+    peer.latest_handshake >= Math.floor(watch.since);
+  const unanswered =
+    watch !== undefined &&
+    watched !== undefined &&
+    data.active === watch.id &&
+    state.phase === 'done' &&
+    !answered &&
+    now - watch.since >= ANSWER_WAIT
+      ? { profile: watched, previous: data.profiles.find((p) => p.id === watch.previous && p.id !== watch.id) }
+      : undefined;
+  const conn = connectionState(saved, running, now, status?.tunnel ?? null);
+  const importButton = (
+    <ConfigButton
+      blank={blank}
+      onClick={() => {
+        setImporting(true);
+      }}
+    />
+  );
+
+  // the save bar's Save: the active profile is kept in step, in the same apply
+  const saveForm = async (values: ClientForm): Promise<void> => {
+    const applied = summary(data.exists ? data.form : undefined, values, data);
+    const changes = saveWithProfile(values, data, activeProfile);
+    renew.current = values.enabled && touchesPeer(changes);
+    keep.current = false;
+    setWatch(undefined);
+    const kept = activeProfile !== undefined && updateChanges(activeProfile, formOf(values)).length > 0;
+    await apply(changes, { note: [...applied, ...(kept ? [`${activeProfile.name} is updated too.`] : [])].join(' ') });
+  };
+
+  return (
+    <>
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading || data === undefined || form === undefined || saved === undefined || conn === undefined ? (
-          <FormSkeleton />
-        ) : !data.installed ? (
+        {settingsRead.error !== null && <LoadError error={settingsRead.error} retry={() => void settingsRead.refetch()} />}
+        {!data.installed ? (
           <NoWireGuard />
         ) : (
           <>
@@ -668,6 +375,7 @@ export function VpnClientPage(): ReactElement {
                     <Traffic down={conn.peer.rx_bytes} up={conn.peer.tx_bytes} />
                   )}
                 </p>
+                {!blank && conn.note !== undefined && <p className="max-w-prose text-sm text-muted-foreground">{conn.note}</p>}
               </div>
               {!blank && (
                 <div className="grid divide-y border-t md:grid-cols-3 md:divide-x md:divide-y-0">
@@ -713,7 +421,7 @@ export function VpnClientPage(): ReactElement {
             {fix.length > 0 && (
               <Alert variant="warning">
                 <TriangleAlertIcon />
-                <AlertTitle>Changed outside this page</AlertTitle>
+                <AlertTitle>Settings changed outside this page</AlertTitle>
                 <AlertDescription>
                   Some of its parts were edited in LuCI or on another page (
                   {[...new Set(fix.map((c) => ('section' in c ? c.section : c.config)))].join(', ')}). Saving here puts them back
@@ -722,8 +430,10 @@ export function VpnClientPage(): ReactElement {
                     variant="outline"
                     size="sm"
                     className="mt-2"
-                    disabled={state.phase === 'applying'}
+                    disabled={working}
                     onClick={() => {
+                      keep.current = false;
+                      renew.current = false;
                       void apply(fix, { note: 'Put its parts back as this page sets them.' });
                     }}
                   >
@@ -733,203 +443,50 @@ export function VpnClientPage(): ReactElement {
                 </AlertDescription>
               </Alert>
             )}
+            {(data.exists || data.profiles.length > 0) && (
+              <ProfilesCard
+                data={data}
+                dirty={dirty}
+                busy={working}
+                unanswered={unanswered}
+                onApply={applyProfiles}
+                onActivate={(p) => {
+                  activate(p, true);
+                }}
+                onGoBack={(p) => {
+                  // back to how it was, the VPN off too if it was
+                  activate(p, false, watch?.wasOn ?? true);
+                }}
+                onEditActive={toSettings}
+                onSaveAs={() => {
+                  setSavingAs(true);
+                }}
+              />
+            )}
             <div className={cn('grid items-start gap-4', !blank && 'xl:grid-cols-[minmax(0,1fr)_22rem]')}>
-              <div className="flex min-w-0 flex-col gap-4">
-                <Card>
-                  <CardHeading title="Who uses it" description="The rest, and the router itself, go out directly as before." />
-                  <CardContent className="flex flex-col gap-4">
-                    <Choice
-                      label="Home-network devices"
-                      value={form.who}
-                      options={whoOptions}
-                      columns={2}
-                      onChange={(v) => {
-                        set('who', v);
-                      }}
-                    />
-                    {errors['who'] !== undefined && <p className="text-xs font-medium text-destructive">{errors['who']}</p>}
-                    {(form.who === 'only' || form.who === 'except') && (
-                      <DevicePicker
-                        macs={form.macs}
-                        devices={data.devices}
-                        error={errors['macs']}
-                        onChange={(m) => {
-                          set('macs', m);
-                        }}
-                      />
-                    )}
-                    {data.guestZones.length > 0 && (
-                      <div className="divide-y border-t">
-                        {data.guestZones.map((g) => (
-                          <Field
-                            key={g.id}
-                            id={`vpn-guest-${g.id}`}
-                            label={`Everything on ${g.label}`}
-                            hint="Every device on this guest network goes through it."
-                          >
-                            <Switch
-                              id={`vpn-guest-${g.id}`}
-                              checked={form.guests.includes(g.id)}
-                              onCheckedChange={(v) => {
-                                set('guests', v ? [...form.guests, g.id] : form.guests.filter((x) => x !== g.id));
-                              }}
-                            />
-                          </Field>
-                        ))}
-                      </div>
-                    )}
-                  </CardContent>
-                </Card>
-
-                <Card>
-                  <CardHeading title="Protection and speed" />
-                  <CardContent>
-                    <div className="divide-y border-t">
-                      <Field
-                        id="vpn-kill"
-                        label="Kill switch"
-                        hint="If the tunnel drops, its devices get no internet rather than going out unprotected."
-                        why={
-                          <>
-                            A routing rule ({opt(`${CLIENT}_kill`)}) sends their traffic nowhere when the tunnel’s routes are
-                            gone, and a firewall rule per network ({opt(`${CLIENT}_leak_lan`)}
-                            …) drops what would leave by the internet port.
-                          </>
-                        }
-                      >
-                        <Switch
-                          id="vpn-kill"
-                          checked={form.killSwitch}
-                          onCheckedChange={(v) => {
-                            set('killSwitch', v);
-                          }}
-                        />
-                      </Field>
-                      <Field
-                        id="vpn-dns"
-                        label="Use VPN’s DNS"
-                        hint="Devices sent through the VPN use its DNS server through the tunnel; other devices keep this router’s DNS."
-                        why={
-                          <>
-                            Lookups from marked devices go to a local forwarder ({opt('milkflint-vpn')}) that asks the provider’s
-                            DNS through the tunnel ({opt(`milkflint.${CLIENT_META}`)}), while names on your network still come
-                            from dnsmasq. Other devices and the router itself keep the DNS page’s servers.
-                          </>
-                        }
-                        error={errors['dns']}
-                      >
-                        <div className="flex flex-col gap-2">
-                          <Switch
-                            id="vpn-dns"
-                            checked={form.useVpnDns}
-                            onCheckedChange={(v) => {
-                              set('useVpnDns', v);
-                            }}
-                          />
-                          {form.useVpnDns && (
-                            <Input
-                              aria-label="VPN DNS servers"
-                              value={form.dns.join(', ')}
-                              placeholder="10.64.0.1"
-                              className="font-mono"
-                              aria-invalid={errors['dns'] !== undefined}
-                              onChange={(e) => {
-                                set('dns', e.target.value.split(/,\s*/));
-                              }}
-                            />
-                          )}
-                        </div>
-                      </Field>
-                      {data.sqm && (
-                        <Field
-                          id="vpn-shaper"
-                          label="Smart Queue in the tunnel"
-                          hint="Keeps the tunnel’s devices apart, so one download doesn’t slow the rest."
-                          why={
-                            <>
-                              The internet port’s queue sees the tunnel as one connection, so it can’t keep its devices apart:
-                              this one can. Start {String(Math.round((1 - TUNNEL_SHARE) * 100))}% under the internet port’s rates
-                              {data.wanRates === undefined ? '' : ` (${String(data.wanRates.down)}/${String(data.wanRates.up)})`},
-                              and lower them if latency still climbs while one device downloads. It’s SQM’s queue{' '}
-                              {opt(`sqm.${CLIENT}`)}.
-                            </>
-                          }
-                          error={errors['shaper']}
-                        >
-                          <div className="flex flex-col gap-2">
-                            <Switch
-                              id="vpn-shaper"
-                              checked={form.shaper}
-                              onCheckedChange={(v) => {
-                                set('shaper', v);
-                              }}
-                            />
-                            {form.shaper && (
-                              <div className="grid grid-cols-2 gap-2">
-                                {(
-                                  [
-                                    ['downMbit', 'Download', ArrowDownIcon],
-                                    ['upMbit', 'Upload', ArrowUpIcon],
-                                  ] as const
-                                ).map(([key, label, Icon]) => (
-                                  <div key={key} className="relative">
-                                    <Input
-                                      aria-label={`${label}, Mbit/s`}
-                                      inputMode="decimal"
-                                      value={form[key]}
-                                      className="pr-20"
-                                      aria-invalid={errors['shaper'] !== undefined}
-                                      onChange={(e) => {
-                                        set(key, e.target.value.trim());
-                                      }}
-                                    />
-                                    <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center gap-1 text-xs text-muted-foreground">
-                                      Mbit/s
-                                      <Icon className="size-3.5" aria-hidden />
-                                    </span>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        </Field>
-                      )}
-                    </div>
-                  </CardContent>
-                </Card>
-
-                {!blank && (
-                  <Card>
-                    <CardHeading
-                      title="The provider’s server"
-                      description="As the config file gave it; change it here only if the provider says so."
-                      action={importButton}
-                    />
-                    <CardContent className="flex flex-col gap-3">
-                      {imported !== undefined && imported.length > 0 && (
-                        <Note tone="info" icon={<InfoIcon />} title="Read in, apart from:">
-                          <ul className="list-disc pl-4">
-                            {imported.map((n) => (
-                              <li key={n}>{n}</li>
-                            ))}
-                          </ul>
-                        </Note>
-                      )}
-                      <Fold
-                        title="Server, keys and addresses"
-                        summary={serverWrong ? 'Something to fix here' : serverText(form)}
-                        mono={!serverWrong && form.endpointHost.trim() !== ''}
-                        open={details || serverWrong}
-                        onToggle={() => {
-                          setDetails((d) => !(d || serverWrong));
-                        }}
-                      >
-                        <ServerFields form={form} errors={errors} set={set} />
-                      </Fold>
-                    </CardContent>
-                  </Card>
-                )}
-              </div>
+              <fieldset
+                id={SETTINGS}
+                tabIndex={-1}
+                disabled={loading}
+                className="m-0 flex min-w-0 scroll-mt-4 flex-col gap-4 border-0 p-0 outline-none"
+              >
+                <ClientFormCards
+                  form={form}
+                  set={set}
+                  errors={errors}
+                  data={data}
+                  mode="live"
+                  importButton={importButton}
+                  imported={imported}
+                  live={{
+                    blank,
+                    details: details,
+                    onToggleDetails: () => {
+                      setDetails((d) => !(d || serverWrong));
+                    },
+                  }}
+                />
+              </fieldset>
 
               <div className="flex flex-col gap-4">
                 {!blank && (
@@ -947,10 +504,13 @@ export function VpnClientPage(): ReactElement {
                         It’s OpenWrt’s own setup, so LuCI shows each part: Network → Interfaces ({CLIENT}, with the server as its
                         peer, routes in table {CLIENT_TABLE}), Network → Routing (the rules that send marked devices there),
                         Network → Firewall (zone {CLIENT}, the MARK rules, the kill switch’s block)
+                        {data.nftset === true && form.direct.length > 0
+                          ? ', Network → DHCP and DNS → IP Sets (the sites that go direct)'
+                          : ''}
                         {data.sqm ? ' and Network → SQM QoS' : ''}. The{' '}
-                        <a href={`${href('firewall')}/rules`} className="font-medium link underline-offset-4">
+                        <Link {...pageLink('firewall', 'rules')} className="font-medium link underline-offset-4">
                           Firewall page
-                        </a>{' '}
+                        </Link>{' '}
                         labels its rules.
                       </p>
                     </CardContent>
@@ -960,7 +520,7 @@ export function VpnClientPage(): ReactElement {
                   <Button
                     variant="ghost"
                     className="self-start text-destructive hover:bg-destructive-subtle hover:text-destructive"
-                    disabled={state.phase === 'applying'}
+                    disabled={working}
                     onClick={() => {
                       setConfirmRemove(true);
                     }}
@@ -976,21 +536,46 @@ export function VpnClientPage(): ReactElement {
       </div>
       <SaveBar
         visible={dirty}
-        busy={state.phase === 'applying'}
+        busy={working}
         invalid={invalid}
-        onSave={() => {
-          if (data === undefined || form === undefined) return;
-          const applied = summary(data.exists ? data.form : undefined, form, data);
-          const changes = toChanges(form, data);
-          renew.current =
-            form.enabled && changes.some((c) => c.config === 'network' && 'section' in c && c.section === data.peerSection);
-          void apply(changes, { note: applied.join(' ') });
-        }}
+        onSave={settings.save}
         onRevert={() => {
-          setEdit(undefined);
+          discard();
           setImported(undefined);
         }}
+        extra={
+          activeProfile === undefined && !blank ? (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={working || invalid}
+              onClick={() => {
+                setSavingAs(true);
+              }}
+            >
+              <BookmarkPlusIcon />
+              Save these settings as a profile
+            </Button>
+          ) : undefined
+        }
       />
+      {savingAs && (
+        <ProfileNameDialog
+          title="Save these settings as a profile"
+          description={
+            dirty
+              ? 'Your changes are saved, and kept under a name, like “USA”, as the active profile: you can switch back to them any time.'
+              : 'They stay as they are and get a name, like “USA”, as the active profile: you can switch back to them any time.'
+          }
+          action="Save"
+          profiles={data.profiles}
+          busy={working}
+          onSave={saveAs}
+          onClose={() => {
+            setSavingAs(false);
+          }}
+        />
+      )}
       <ImportDialog
         open={importing}
         onClose={() => {
@@ -1004,8 +589,11 @@ export function VpnClientPage(): ReactElement {
             <DialogTitle>Remove the VPN?</DialogTitle>
             <DialogDescription>
               The WireGuard interface and its keys, its routing rules, its firewall zone, marks and kill switch
-              {data?.sqm === true ? ', and its Smart Queue' : ''} all go, here and in LuCI, and every device goes out directly. To
-              only pause it, turn it off instead.{dirty ? ' Changes you haven’t saved are dropped too.' : ''}
+              {data.sqm ? ', and its Smart Queue' : ''} all go, here and in LuCI, and every device goes out directly. To only
+              pause it, turn it off instead.
+              {data.form.direct.length > 0 ? ' The list of sites that go direct goes too.' : ''}
+              {dirty ? ' Changes you haven’t saved are dropped too.' : ''}
+              {data.profiles.length > 0 ? ' Your profiles stay, ready to activate.' : ''}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1021,8 +609,10 @@ export function VpnClientPage(): ReactElement {
               variant="destructive"
               onClick={() => {
                 setConfirmRemove(false);
-                if (data === undefined) return;
-                setEdit(undefined);
+                discard();
+                setWatch(undefined);
+                keep.current = false;
+                renew.current = false;
                 void apply(removal(data), {
                   note: 'Deleted the VPN’s interface and keys, its routing rules, its firewall zone and rules: every device goes out directly.',
                 });

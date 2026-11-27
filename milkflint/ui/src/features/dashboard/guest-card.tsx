@@ -4,28 +4,24 @@
 // password behind "Show" (a secret on screen) and its join code a press away.
 // Reads the networks' settings once, and their devices every 30 s, only while
 // it's on Home.
+import { dashboardQueries } from './queries';
+import { useLive } from '@/lib/query/use-live';
+import { useRead } from '@/lib/query/use-read';
+import { Link } from '@tanstack/react-router';
 import { ChevronLeftIcon, ChevronRightIcon, EyeIcon, EyeOffIcon, QrCodeIcon } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
 import { QrCode } from '@/components/qr-code';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
 import { formatNumber } from '@/lib/format';
 import { wifiQrText } from '@/lib/qr';
-import { href } from '@/lib/router';
-import { sharedCall } from '@/lib/shared-call';
+import { pageLink } from '@/lib/router';
 import { cn } from '@/lib/utils';
-import { loadAllGuests, loadGuest } from '../wifi-guest/api';
 import { type GuestData, joinCodes } from '../wifi-guest/model';
 import { Dot, OffNote, StateBadge, Widget, WidgetLink } from './widget';
 import { useWidgetInfo } from './widget-info';
 
-const DEVICES_MS = 30_000;
-
 // one call for every Guest Wi-Fi widget on Home
-const readGuests = sharedCall(loadGuest);
-const readDevices = sharedCall(loadAllGuests);
 
 type Net = GuestData['nets'][number];
 type Code = ReturnType<typeof joinCodes>[number];
@@ -36,13 +32,13 @@ function byName(nets: readonly Net[]): Net[] {
 }
 
 export function GuestCard(): ReactElement {
-  const { data, error } = useLoad(readGuests);
-  const { data: guests } = usePoll(readDevices, DEVICES_MS);
+  const { data, error } = useRead(dashboardQueries.guest());
+  const { data: guests } = useLive(dashboardQueries.guestDevices());
   // one at a time in one column; two side by side wider
   const page = useWidgetInfo().size.w === 1 ? 1 : 2;
   const [start, setStart] = useState(0);
   const [joining, setJoining] = useState<{ label: string; code: Code }>();
-  const link = <WidgetLink href={href('wifi-guest')}>Guest Wi-Fi</WidgetLink>;
+  const link = <WidgetLink to={pageLink('wifi-guest')}>Guest Wi-Fi</WidgetLink>;
   if (data === undefined) {
     return (
       <Widget aside={error === undefined ? undefined : link}>
@@ -56,7 +52,7 @@ export function GuestCard(): ReactElement {
   if (nets.length === 0) {
     return (
       <Widget aside={<StateBadge tone="off">None</StateBadge>}>
-        <OffNote action={<WidgetLink href={href('wifi-guest')}>Set one up</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('wifi-guest')}>Set one up</WidgetLink>}>
           A network of its own for visitors, kept apart from your devices.
         </OffNote>
       </Widget>
@@ -168,9 +164,9 @@ function Network({
   return (
     <li className="flex min-w-0 flex-col gap-2 text-sm">
       <div className="flex min-w-0 items-center justify-between gap-2">
-        <a href={href('wifi-guest')} className="truncate text-base font-semibold link" title={f.label}>
+        <Link {...pageLink('wifi-guest')} className="truncate text-base font-semibold link" title={f.label}>
           {f.label}
-        </a>
+        </Link>
         <span className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted-foreground">
           <Dot tone={f.enabled ? 'success' : 'off'} />
           {f.enabled ? 'On' : 'Off'}

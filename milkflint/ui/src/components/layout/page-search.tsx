@@ -1,4 +1,6 @@
 import { CornerDownLeftIcon, SearchIcon } from 'lucide-react';
+import { useNavigate } from '@tanstack/react-router';
+import { addressLink } from '@/lib/router';
 import { type ReactElement, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { inputClass } from '@/components/ui/input';
 import { groupOf, menuFor } from '@/features';
@@ -25,6 +27,7 @@ export function PageSearch({
   /** Focus the box when it appears (the compact bar's search opens it on demand). */
   focusOnOpen?: boolean;
 }): ReactElement {
+  const navigate = useNavigate();
   const menu = menuFor(useRouterMode());
   const icons = useDecorativeIcons();
   const pages = useMemo(() => menu.flatMap((e): Feature[] => (e.kind === 'page' ? [e.feature] : [...e.group.features])), [menu]);
@@ -59,7 +62,7 @@ export function PageSearch({
   }, [focusOnOpen]);
 
   const go = (hit: PageMatch): void => {
-    window.location.hash = hit.href;
+    void navigate(addressLink(hit.href));
     setQuery('');
     input.current?.blur();
     onNavigate?.();

@@ -7,15 +7,23 @@
 // guest networks, remote access, stay reachable), then into the tunnel's
 // table, and with the kill switch to nowhere, when the tunnel has no route.
 // The router's own traffic isn't marked, so it goes out as before. The
-// zone masquerades, as the internet's does. Everything is read back from
-// those sections, so a change made in LuCI shows here.
-import { type HostHint, hintName, intToIp, ipToInt, type Lease } from '@/lib/api/network';
+// zone masquerades, as the internet's does. Sites that go direct are a list
+// of names in dhcp's ipset section: dnsmasq puts their addresses in two fw4
+// sets as it answers, and a MARK rule per zone, after the marks, takes the
+// VPN's bits off traffic to them, so it goes out by the internet port.
+// Everything is read back from those sections, so a change made in LuCI
+// shows here.
+import { z } from 'zod';
+import { type HostHint, hintName, inSubnet, intToIp, ipToInt, type Lease } from '@/lib/api/network';
+import { formErrors } from '@/lib/form/errors';
 import { type Owned, reconcile, type Wanted } from '@/lib/api/owned';
-import type { Section } from '@/lib/api/uci';
-import { isKey, joinEndpoint, type WgConf } from '@/lib/api/wireguard';
+import { list, type Section } from '@/lib/api/uci';
+import { isKey, joinEndpoint, parseConf, type Tunnel, type WgConf } from '@/lib/api/wireguard';
+import { validHost } from '@/lib/hostnames';
 import { isMac } from '../firewall/model';
-import type { GuestId } from '../wifi-guest/guest';
+import { GUEST_IDS, type GuestId } from '../wifi-guest/guest';
 import { overlaps } from '../wifi-guest/model';
+import type { Profile } from './profiles';
 import {
   CLIENT,
   CLIENT_FIREWALL,
@@ -27,7 +35,12 @@ import {
   CLIENT_RULES6,
   CLIENT_SKIP,
   CLIENT_TABLE,
+  DIRECT_DNS,
+  DIRECT_SET4,
+  DIRECT_SET6,
+  directRuleSection,
   forwardSection,
+  PROFILES_POINTER,
   leakSection,
   markSection,
   type SourceZone,
@@ -37,36 +50,45 @@ export const DEFAULT_PORT = '51820';
 export const DEFAULT_KEEPALIVE = '25';
 /** The tunnel's rates start this far under the internet port's: its own headers (60–80 bytes a packet) have to fit. */
 export const TUNNEL_SHARE = 0.92;
+/** Sites that go direct, at most. */
+export const MAX_DIRECT = 64;
 
 /** Which home-network devices use it; guest networks are all or nothing. */
 export type Who = 'all' | 'only' | 'except' | 'none';
 
-export interface ClientForm {
-  enabled: boolean;
-  privateKey: string;
+const clientFields = z.object({
+  enabled: z.boolean(),
+  privateKey: z.string(),
   /** its addresses in the provider's network, e.g. 10.64.12.7/32 and an IPv6 one */
-  addresses: string[];
-  mtu: string;
+  addresses: z.array(z.string()),
+  mtu: z.string(),
   /** the provider's server */
-  publicKey: string;
-  presharedKey: string;
-  endpointHost: string;
-  endpointPort: string;
-  keepalive: string;
-  who: Who;
+  publicKey: z.string(),
+  presharedKey: z.string(),
+  endpointHost: z.string(),
+  endpointPort: z.string(),
+  keepalive: z.string(),
+  who: z.enum(['all', 'only', 'except', 'none']),
   /** the devices "only" or "except" means, by MAC (lower case) */
-  macs: string[];
-  guests: GuestId[];
-  killSwitch: boolean;
+  macs: z.array(z.string()),
+  guests: z.array(z.enum(GUEST_IDS)),
+  killSwitch: z.boolean(),
   /** whether the tunnel's devices use the VPN provider's DNS instead of the router's */
-  useVpnDns: boolean;
+  useVpnDns: z.boolean(),
   /** the provider's DNS servers, from [Interface] DNS (e.g. 10.64.0.1) */
-  dns: string[];
+  dns: z.array(z.string()),
   /** a Smart Queue inside the tunnel */
-  shaper: boolean;
-  downMbit: string;
-  upMbit: string;
-}
+  shaper: z.boolean(),
+  downMbit: z.string(),
+  upMbit: z.string(),
+  /** sites that go direct, by name (lower case, everything under each included): dhcp.wg_out_direct's domain list */
+  direct: z.array(z.string()),
+});
+
+export type ClientForm = z.infer<typeof clientFields>;
+
+/** The form's top-level fields, for setting several at once. */
+export const clientFormKeys = clientFields.keyof().options;
 
 export interface Device {
   mac: string;
@@ -117,7 +139,14 @@ export interface ClientData {
   form: ClientForm;
   /** the peer's section: wg_out_server, or one LuCI made */
   peerSection: string;
-  present: { network: Section[]; firewall: Section[]; sqm: Section[] | undefined; milkflint: Section[] };
+  present: {
+    network: Section[];
+    firewall: Section[];
+    sqm: Section[] | undefined;
+    milkflint: Section[];
+    /** for the sites that go direct; undefined: none of it is there */
+    dhcp?: Section[] | undefined;
+  };
   wanZone: string;
   lanZone: string;
   guestZones: { id: GuestId; label: string }[];
@@ -135,6 +164,20 @@ export interface ClientData {
    * through a VPN); undefined: it's off, or not in this firmware.
    */
   adguard?: 'tunnel' | 'automatic' | undefined;
+  /** the IPv4 DNS servers the DNS page's device-DNS card tells the home network's devices to use (dhcp_option 6); none: the router */
+  deviceDns?: string[] | undefined;
+  /** the saved profiles (milkflint vpnp_*), in file order */
+  profiles: Profile[];
+  /** the active profile's id: undefined when none, or when the pointer names one that's gone */
+  active: string | undefined;
+  /**
+   * The router's dnsmasq can fill nftables sets (dnsmasq-full), which sites
+   * that go direct need: the basic build starts without them (OpenWrt's
+   * dnsmasq init leaves out an option the binary doesn't have), so the list
+   * would quietly do nothing. Not true (an older image): the list isn't
+   * offered, written or checked.
+   */
+  nftset?: boolean | undefined;
 }
 
 export type Errors = Partial<Record<string, string>>;
@@ -160,6 +203,7 @@ export function blankForm(d: Pick<ClientData, 'wanRates' | 'sqm'>): ClientForm {
     shaper: d.sqm && d.wanRates !== undefined,
     downMbit: d.wanRates === undefined ? '' : String(Math.floor(d.wanRates.down * TUNNEL_SHARE)),
     upMbit: d.wanRates === undefined ? '' : String(Math.floor(d.wanRates.up * TUNNEL_SHARE)),
+    direct: [],
   };
 }
 
@@ -197,6 +241,30 @@ export function fromConf(f: ClientForm, c: WgConf): ClientForm {
   };
 }
 
+/** A provider's .conf text into the form, with what of it isn't used; or why it can't be read. */
+export function readConf(f: ClientForm, text: string): { form: ClientForm; notes: string[] } | { error: string } {
+  const conf = parseConf(text);
+  if ('error' in conf) return { error: `That isn’t a WireGuard config this page can use: ${conf.error}` };
+  const next = fromConf(f, conf);
+  const notes: string[] = [];
+  const skippedDns = conf.dns.filter((x) => !next.dns.includes(x));
+  if (skippedDns.length > 0)
+    notes.push(`Its search domain${skippedDns.length === 1 ? '' : 's'} (${skippedDns.join(', ')}) aren’t used.`);
+  if (next.dns.length === 0 && next.useVpnDns)
+    notes.push(
+      'It didn’t list a DNS server: enter one under “Use VPN’s DNS”, or turn that switch off to keep this router’s DNS.',
+    );
+  else if (next.dns.length > 0 && !next.useVpnDns)
+    notes.push(`Its DNS server (${next.dns.join(', ')}) was saved, ready if you turn “Use VPN’s DNS” back on.`);
+  const all =
+    conf.peer.allowedIps.length === 0 || (conf.peer.allowedIps.includes('0.0.0.0/0') && conf.peer.allowedIps.includes('::/0'));
+  if (!all)
+    notes.push(
+      `Its AllowedIPs (${conf.peer.allowedIps.join(', ')}) are replaced: this page sends all of a device’s traffic through the VPN.`,
+    );
+  return { form: next, notes };
+}
+
 /** Its addresses as typed (the field keeps a trailing comma while typing), without the blanks. */
 export function addressesOf(f: ClientForm): string[] {
   return f.addresses.map((a) => a.trim()).filter((a) => a !== '');
@@ -219,7 +287,46 @@ function portOk(v: string, lo: number): boolean {
   return /^\d+$/.test(v) && Number(v) >= lo && Number(v) <= 65535;
 }
 
-export function validate(f: ClientForm, d: ClientData): Errors {
+/** Where each check's message goes in the form, by the key the page shows it under. */
+const FIELD_OF = {
+  private: 'privateKey',
+  public: 'publicKey',
+  psk: 'presharedKey',
+  host: 'endpointHost',
+  port: 'endpointPort',
+  addresses: 'addresses',
+  mtu: 'mtu',
+  keepalive: 'keepalive',
+  dns: 'dns',
+  macs: 'macs',
+  who: 'who',
+  shaper: 'shaper',
+  direct: 'direct',
+} as const satisfies Record<string, keyof ClientForm>;
+
+const isCheckKey = (key: string): key is keyof typeof FIELD_OF => Object.hasOwn(FIELD_OF, key);
+
+/** The form's checks against the router as loaded (its own networks, whether it has nftset for the direct sites). */
+export function clientFormSchema(d: ClientData): z.ZodType<ClientForm, ClientForm> {
+  return clientFields.superRefine((f, ctx) => {
+    for (const [key, message] of Object.entries(checks(f, d))) {
+      if (message !== undefined && isCheckKey(key)) ctx.addIssue({ code: 'custom', path: [FIELD_OF[key]], message });
+    }
+  });
+}
+
+/** The schema's verdict by the keys the page shows them under: private, public, host, port, addresses… */
+export function clientErrors(f: ClientForm, d: ClientData): Errors {
+  const found = formErrors(clientFormSchema(d), f);
+  const e: Errors = {};
+  for (const [key, field] of Object.entries(FIELD_OF)) {
+    const message = found[field];
+    if (message !== undefined) e[key] = message;
+  }
+  return e;
+}
+
+function checks(f: ClientForm, d: ClientData): Errors {
   const e: Errors = {};
   // a tunnel that was never filled in can stay empty while it's off
   const blank = f.privateKey === '' && f.publicKey === '' && f.endpointHost === '' && addressesOf(f).length === 0;
@@ -262,6 +369,12 @@ export function validate(f: ClientForm, d: ClientData): Errors {
     const rate = (v: string): boolean => /^\d+(\.\d+)?$/.test(v) && Number(v) > 0;
     if (!rate(f.downMbit) || !rate(f.upMbit)) e['shaper'] = 'Both rates, in Mbit/s.';
   }
+  // the field cleans what's typed; this is for a list edited in LuCI
+  if (d.nftset === true) {
+    const bad = f.direct.filter((s) => !validHost(s));
+    if (bad.length > 0) e['direct'] = `Not a site’s name as this list takes it: ${bad.join(', ')}.`;
+    else if (f.direct.length > MAX_DIRECT) e['direct'] = `At most ${String(MAX_DIRECT)} sites.`;
+  }
   return e;
 }
 
@@ -275,7 +388,21 @@ function owned(d: ClientData): Owned[] {
     ...CLIENT_FIREWALL.map((name) => ({ config: 'firewall', name })),
     ...(d.present.sqm === undefined ? [] : [{ config: 'sqm', name: CLIENT_QUEUE }]),
     { config: 'milkflint', name: CLIENT_META },
+    { config: 'dhcp', name: DIRECT_DNS },
   ];
+}
+
+/** The sites that go direct as the router has them: dhcp.wg_out_direct's domain list, LuCI's additions included. */
+export function directOf(dhcp: readonly Section[]): string[] {
+  return list(
+    dhcp.find((s) => s['.name'] === DIRECT_DNS),
+    'domain',
+  );
+}
+
+/** The sites a save writes: none where dnsmasq can't fill the sets. */
+function directIn(f: ClientForm, d: Pick<ClientData, 'nftset'>): string[] {
+  return d.nftset === true ? f.direct : [];
 }
 
 /** The zones whose devices use it, home network first. */
@@ -291,6 +418,9 @@ export function wanted(f: ClientForm, d: ClientData): Wanted[] {
   const disabled = on ? undefined : '1';
   const v6 = hasIpv6(f);
   const zoneOf = (z: SourceZone): string => (z === 'lan' ? d.lanZone : z);
+  // the mark's bits cleared, whatever else is set
+  const unmark = `0x0/${CLIENT_MARK.split('/')[1] ?? ''}`;
+  const direct = directIn(f, d);
   const label = (z: SourceZone): string =>
     z === 'lan' ? 'Home' : (d.guestZones.find((g) => g.id === z)?.label ?? z).replace(/[^A-Za-z0-9]+/g, '-');
   const rule = (name: string, type: 'rule' | 'rule6', values: Record<string, string>): Wanted => ({
@@ -360,6 +490,21 @@ export function wanted(f: ClientForm, d: ClientData): Wanted[] {
       enabled,
     },
   });
+  if (direct.length > 0) {
+    for (const [name, family] of [
+      [DIRECT_SET4, 'ipv4'],
+      [DIRECT_SET6, 'ipv6'],
+    ] as const) {
+      // no timeout: an address that ran out mid-connection would send its later packets into the tunnel
+      w.push({ config: 'firewall', type: 'ipset', name, values: { name, family, match: ['dest_ip'], timeout: undefined } });
+    }
+    w.push({
+      config: 'dhcp',
+      type: 'ipset',
+      name: DIRECT_DNS,
+      values: { name: [DIRECT_SET4, DIRECT_SET6], domain: direct, table: 'fw4', table_family: 'inet' },
+    });
+  }
   for (const z of sources(f)) {
     const src = zoneOf(z);
     w.push({ config: 'firewall', type: 'forwarding', name: forwardSection(z), values: { src, dest: CLIENT, enabled } });
@@ -393,10 +538,34 @@ export function wanted(f: ClientForm, d: ClientData): Wanted[] {
           family: 'any',
           src_mac: f.macs,
           target: 'MARK',
-          set_xmark: `0x0/${CLIENT_MARK.split('/')[1] ?? ''}`,
+          set_xmark: unmark,
           enabled,
         },
       });
+    }
+    if (direct.length > 0) {
+      // after the mark and the skip: traffic to those sites has its mark taken off again
+      for (const [family, set] of [
+        [4, DIRECT_SET4],
+        [6, DIRECT_SET6],
+      ] as const) {
+        w.push({
+          config: 'firewall',
+          type: 'rule',
+          name: directRuleSection(z, family),
+          values: {
+            name: `Direct-VPN-${label(z)}`,
+            src,
+            dest: '*',
+            proto: 'all',
+            family: `ipv${String(family)}`,
+            ipset: `${set} dest`,
+            target: 'MARK',
+            set_xmark: unmark,
+            enabled,
+          },
+        });
+      }
     }
     if (f.killSwitch) {
       w.push({
@@ -459,9 +628,13 @@ export function toChanges(f: ClientForm, d: ClientData): ReturnType<typeof recon
   return reconcile(wanted(f, d), owned(d), d.present);
 }
 
-/** Everything the VPN client is made of, for Remove. */
+/** Everything the VPN client is made of, for Remove. The profiles stay; none is active any more. */
 export function removal(d: ClientData): ReturnType<typeof reconcile> {
-  return reconcile([], owned(d), d.present);
+  const changes = reconcile([], owned(d), d.present);
+  const pointer = d.present.milkflint.find((s) => s['.name'] === PROFILES_POINTER);
+  if (pointer?.['active'] !== undefined)
+    changes.push({ op: 'unset', config: 'milkflint', section: PROFILES_POINTER, options: ['active'] });
+  return changes;
 }
 
 /** What saving now would change although the settings didn't: someone edited its sections elsewhere. */
@@ -502,6 +675,11 @@ export function whoSummary(f: ClientForm, d: Pick<ClientData, 'guestZones'>): st
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+/** "bbc.co.uk, itv.com", or the first three and how many more. */
+export function directText(sites: readonly string[]): string {
+  return sites.length <= 3 ? sites.join(', ') : `${sites.slice(0, 3).join(', ')} and ${String(sites.length - 3)} more`;
+}
+
 export function serverText(f: ClientForm): string {
   return f.endpointHost.trim() === '' ? 'the VPN server' : joinEndpoint(f.endpointHost.trim(), f.endpointPort);
 }
@@ -515,18 +693,18 @@ function dnsLine(f: ClientForm, d: ClientData): Line {
     if (d.adguard !== undefined) {
       return {
         ok: true,
-        text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the VPN’s DNS (${list})${f.killSwitch ? ', and nowhere else' : ' (directly while the tunnel is down, as the rest of their traffic)'}. Other devices keep this router’s DNS.`,
+        text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the VPN’s DNS (${list})${f.killSwitch ? ', and nowhere else' : ' (this router’s DNS while the tunnel is down, while the rest of their traffic goes out directly)'}. Other devices keep this router’s DNS.`,
       };
     }
     return {
       ok: true,
-      text: `Their DNS lookups go through the tunnel to the VPN’s DNS (${list})${f.killSwitch ? ', and nowhere else' : ''}. Names on your network still work, and other devices keep this router’s DNS.`,
+      text: `Their DNS lookups go through the tunnel to the VPN’s DNS (${list})${f.killSwitch ? ', and nowhere else' : ' (this router’s DNS while the tunnel is down)'}. Names on your network still work, and other devices keep this router’s DNS.`,
     };
   }
   if (d.adguard === 'tunnel') {
     return {
       ok: true,
-      text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the DNS page’s servers${f.killSwitch ? ', and nowhere else' : ' (directly while the tunnel is down, as the rest of their traffic)'}.`,
+      text: `Their DNS lookups go through AdGuard Home, then through the tunnel to the DNS page’s servers${f.killSwitch ? ', and nowhere else' : ' (this router’s DNS while the tunnel is down, while the rest of their traffic goes out directly)'}.`,
     };
   }
   if (d.adguard === 'automatic') {
@@ -541,9 +719,31 @@ function dnsLine(f: ClientForm, d: ClientData): Line {
   };
 }
 
+/** The tunnel's state in words: when the server stopped answering and what the devices get; undefined when there's nothing to say. */
+export function tunnelLine(t: Tunnel | null, killSwitch: boolean, clock: (epoch: number) => string): string | undefined {
+  if (t === null) return undefined;
+  if (!t.up) {
+    const stopped = `The server stopped answering at ${clock(t.since)}.`;
+    return killSwitch
+      ? `${stopped} With the kill switch on, those devices have no internet until it’s back.`
+      : `${stopped} Those devices are going out directly, with this router’s DNS, until it’s back.`;
+  }
+  return t.dns_ok === false ? 'The VPN’s DNS isn’t answering.' : undefined;
+}
+
+/** The device-DNS servers inside the home network: the VPN's devices ask them directly, not through the tunnel. */
+export function sameLanDns(d: ClientData): string[] {
+  const lan = d.lan;
+  if (lan === undefined) return [];
+  const router = intToIp(lan.ip);
+  return (d.deviceDns ?? []).filter((ip) => inSubnet(ip, router, lan.prefix));
+}
+
 /** What the settings set up, one line per part, for "What this sets up". */
 export function describe(f: ClientForm, d: ClientData): Line[] {
   if (!f.enabled) return [{ ok: false, text: 'Off: every device goes out to the internet directly.' }];
+  const direct = directIn(f, d);
+  const some = direct.length > 0;
   const lines: Line[] = [
     { ok: true, text: `Connects to ${serverText(f)} and sends ${whoText(f, d)} through it.` },
     {
@@ -553,14 +753,39 @@ export function describe(f: ClientForm, d: ClientData): Line[] {
     f.killSwitch
       ? {
           ok: true,
-          text: 'Kill switch: if the tunnel drops, those devices get no internet rather than going out unprotected. Nothing of theirs leaves by the internet port, so they don’t reach its own network directly either (an upstream router’s page, say).',
+          text: some
+            ? 'Kill switch: if the tunnel drops, those devices get no internet but the sites that go direct, rather than going out unprotected. Nothing else of theirs leaves by the internet port, so they don’t reach its own network directly either (an upstream router’s page, say).'
+            : 'Kill switch: if the tunnel drops, those devices get no internet rather than going out unprotected. Nothing of theirs leaves by the internet port, so they don’t reach its own network directly either (an upstream router’s page, say).',
         }
-      : { ok: false, text: 'No kill switch: if the tunnel drops, those devices go out directly until it’s back.' },
+      : {
+          ok: false,
+          text: some
+            ? 'No kill switch: if the tunnel drops, those devices go out directly until it’s back. Their connections are cut when it drops and again when it’s back, even those to the sites that go direct: a stream from one of them restarts twice in each outage.'
+            : 'No kill switch: if the tunnel drops, those devices go out directly until it’s back.',
+        },
     hasIpv6(f)
       ? { ok: true, text: 'Their IPv6 goes through the tunnel too.' }
-      : { ok: true, text: 'The VPN has no IPv6, so their IPv6 is blocked rather than going out directly: their apps use IPv4.' },
+      : {
+          ok: true,
+          text: some
+            ? 'The VPN has no IPv6, so their IPv6 is blocked rather than going out directly, except to the sites that go direct: their apps use IPv4 for the rest.'
+            : 'The VPN has no IPv6, so their IPv6 is blocked rather than going out directly: their apps use IPv4.',
+        },
     dnsLine(f, d),
   ];
+  if (some) {
+    lines.push({
+      ok: true,
+      text: `Sites that go direct (${directText(direct)}), and everything under them, skip the VPN: those devices reach them over your normal line, with this router’s DNS.`,
+    });
+  }
+  const sameLan = sameLanDns(d);
+  if (sameLan.length > 0) {
+    lines.push({
+      ok: false,
+      text: `Devices told to use ${sameLan.join(', ')} look names up there directly, not through the VPN, and the kill switch can’t stop that on your own network.`,
+    });
+  }
   if (d.sqm) {
     lines.push(
       f.shaper
@@ -615,6 +840,15 @@ export function summary(before: ClientForm | undefined, after: ClientForm, d: Cl
         : 'Took the Smart Queue out of the tunnel.',
     );
   }
+  const direct = directIn(after, d);
+  if (d.nftset === true && JSON.stringify(before?.direct ?? []) !== JSON.stringify(direct)) {
+    out.push(direct.length === 0 ? 'No sites go direct any more.' : `Sites that go direct: ${directText(direct)}.`);
+  }
   if (out.length === 0) out.push('Saved.');
   return out;
 }
+
+const SERVER_ERRORS = ['host', 'port', 'public', 'private', 'psk', 'addresses', 'mtu'];
+
+/** True when something in the server's fields needs fixing. */
+export const serverNeedsFixing = (errors: Errors): boolean => SERVER_ERRORS.some((k) => errors[k] !== undefined);

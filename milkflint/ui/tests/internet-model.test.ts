@@ -3,10 +3,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { fromStored, hexToText, textToHex, toStored } from '../src/features/internet/client-id.ts';
-import { type InternetForm, sqmQueueTo, toChanges, validate, wanPort } from '../src/features/internet/model.ts';
+import { type InternetForm, internetFormSchema, sqmQueueTo, toChanges, wanPort } from '../src/features/internet/model.ts';
+import { formErrors } from '../src/lib/form/errors.ts';
 import { sqmData } from '../src/features/sqm/model.ts';
 import type { Change, Section } from '../src/lib/api/uci.ts';
 import { applied, section } from './uci-fixture.ts';
+
+const validate = (f: InternetForm): Partial<Record<keyof InternetForm, string>> => formErrors(internetFormSchema, f);
 
 const form = (over: Partial<InternetForm> = {}): InternetForm => ({
   proto: 'dhcp',

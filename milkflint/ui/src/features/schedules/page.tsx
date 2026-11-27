@@ -5,13 +5,16 @@
 // common ones' time and days edited in place; and Crontab, the file as text,
 // a line numbered and checked as cron reads it. An edit in either shows in
 // the other; one save writes the file, if nothing else changed it meanwhile.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
+import { useQuery } from '@tanstack/react-query';
 import { MoonIcon, PlusIcon, RotateCwIcon, Trash2Icon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useMemo, useRef, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
-import { SaveBar } from '@/components/save-bar';
+import { FormSaveBar } from '@/components/form';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -19,11 +22,13 @@ import { Segmented } from '@/components/ui/segmented';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import type { ApplyState } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { href } from '@/lib/router';
+import { formErrors } from '@/lib/form/errors';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
 import { cn, errorMessage } from '@/lib/utils';
-import { CRONTAB, readCrontab, saveCrontab } from './api';
+import { CRONTAB } from './api';
 import { crontabText, parseCrontab } from './cron';
+import { schedulesQueries, useSaveCrontab } from './queries';
+import { crontabFormSchema } from './model';
 import {
   type Action,
   actions,
@@ -191,9 +196,9 @@ function TaskRow({
             {banip ? (
               <>
                 Set on the{' '}
-                <a href={href('banip')} className="font-medium link">
+                <Link {...pageLink('banip')} className="font-medium link">
                   banIP page
-                </a>
+                </Link>
               </>
             ) : (
               <>
@@ -242,9 +247,9 @@ function TaskRow({
 const timeZoneNote = (
   <>
     Times are the router’s clock, in the time zone set on{' '}
-    <a href={href('time')} className="font-medium link">
+    <Link {...pageLink('time')} className="font-medium link">
       Name &amp; time
-    </a>
+    </Link>
     .
   </>
 );
@@ -453,9 +458,9 @@ function CrontabView({ text, setText, before }: { text: string; setText: (text: 
           {lines.some((l) => l.text.startsWith('# milkflint-banip begin')) && (
             <>
               banIP’s update, between its <code className="font-mono text-xs"># milkflint-banip</code> lines, is set on the{' '}
-              <a href={href('banip')} className="font-medium link">
+              <Link {...pageLink('banip')} className="font-medium link">
                 banIP page
-              </a>
+              </Link>
               : a change to it here comes back.{' '}
             </>
           )}
@@ -466,84 +471,103 @@ function CrontabView({ text, setText, before }: { text: string; setText: (text: 
   );
 }
 
-export function SchedulesPage(): ReactElement {
-  const { data, error, loading, reload } = useLoad(readCrontab);
-  // the file as saved last (by this page, or as it was read), and the edit in progress
-  const [saved, setSaved] = useState<string>();
-  const [draft, setDraft] = useState<string>();
-  const [view, setView] = useState<View>('tasks');
-  const [state, setState] = useState<ApplyState>({ phase: 'idle' });
-  const before = saved ?? data ?? '';
-  const text = draft ?? before;
-  const dirty = draft !== undefined && draft !== before;
-  // a line cron won't read blocks the save, unless it was there already
-  const old = new Set(parseCrontab(before).flatMap((l) => (l.error === undefined ? [] : [l.text])));
-  const invalid = parseCrontab(text).some((l) => l.error !== undefined && !old.has(l.text));
+const TITLE = 'Scheduled tasks';
+const DESCRIPTION =
+  'Restart the router, turn Wi-Fi off and on, or run your own commands, at set times on the router’s clock. They’re root’s crontab, which LuCI’s Scheduled Tasks edits too.';
 
-  const save = async (): Promise<void> => {
-    setState({ phase: 'applying' });
-    // each line ended by a newline, the last too (cron may skip a last line without one)
-    const file = crontabText(parseCrontab(text).map((l) => l.text));
-    try {
-      await saveCrontab(file, before);
-      setSaved(file);
-      setDraft(undefined);
-      setState({ phase: 'done', nothingChanged: false });
-    } catch (err) {
-      setState({ phase: 'failed', message: errorMessage(err) });
-    }
-  };
+export function SchedulesPage(): ReactElement {
+  const { data, error, refetch } = useQuery(schedulesQueries.crontab());
+  if (data !== undefined) return <Schedules before={data} />;
+  return (
+    <>
+      <PageHeader title={TITLE} description={DESCRIPTION} />
+      <div className="flex flex-col gap-4">
+        {error === null ? (
+          <FormSkeleton />
+        ) : (
+          <LoadError
+            error={error}
+            retry={() => {
+              void refetch();
+            }}
+          />
+        )}
+      </div>
+    </>
+  );
+}
+
+/** The crontab as saved (`before`), edited in the Tasks or the Crontab view. */
+function Schedules({ before }: { before: string }): ReactElement {
+  const [view, setView] = useState<View>('tasks');
+  const saveCrontab = useSaveCrontab();
+  const schema = useMemo(() => crontabFormSchema(before), [before]);
+  const settings = useSettingsForm({
+    schema,
+    saved: { text: before },
+    onSave: async ({ text }) => {
+      // each line ended by a newline, the last too (cron may skip a last line without one)
+      const file = crontabText(parseCrontab(text).map((l) => l.text));
+      try {
+        await saveCrontab.mutateAsync({ text: file, before });
+        // the file as written is the form now, as it's read back
+        settings.form.reset({ text: file });
+      } catch {
+        // the failure shows above, from the mutation
+      }
+    },
+  });
+  const { form } = settings;
+  const { text } = useFormValues(form);
+  const invalid = formErrors(schema, { text })['text'] !== undefined;
+  const state: ApplyState = saveCrontab.isPending
+    ? { phase: 'applying' }
+    : saveCrontab.isError
+      ? { phase: 'failed', message: errorMessage(saveCrontab.error) }
+      : saveCrontab.isSuccess
+        ? { phase: 'done', nothingChanged: false }
+        : { phase: 'idle' };
 
   return (
     <>
       <PageHeader
-        title="Scheduled tasks"
-        description="Restart the router, turn Wi-Fi off and on, or run your own commands, at set times on the router’s clock. They’re root’s crontab, which LuCI’s Scheduled Tasks edits too."
+        title={TITLE}
+        description={DESCRIPTION}
         actions={
-          data !== undefined && (
-            <Segmented<View>
-              label="Show"
-              value={view}
-              options={[
-                { value: 'tasks', label: 'Tasks' },
-                { value: 'crontab', label: 'Crontab' },
-              ]}
-              onChange={setView}
-            />
-          )
+          <Segmented<View>
+            label="Show"
+            value={view}
+            options={[
+              { value: 'tasks', label: 'Tasks' },
+              { value: 'crontab', label: 'Crontab' },
+            ]}
+            onChange={setView}
+          />
         }
       />
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading && data === undefined ? (
-          <FormSkeleton />
-        ) : view === 'tasks' ? (
+        {view === 'tasks' ? (
           <TasksView
             text={text}
             setText={(fn) => {
-              setDraft((d) => fn(d ?? before));
+              form.setFieldValue('text', fn);
             }}
             onCrontab={() => {
               setView('crontab');
             }}
           />
         ) : (
-          <CrontabView text={text} setText={setDraft} before={before} />
+          <CrontabView
+            text={text}
+            setText={(t) => {
+              form.setFieldValue('text', t);
+            }}
+            before={before}
+          />
         )}
       </div>
-      <SaveBar
-        visible={dirty}
-        busy={state.phase === 'applying'}
-        invalid={invalid}
-        onSave={() => {
-          void save();
-        }}
-        onRevert={() => {
-          setDraft(undefined);
-        }}
-      />
+      <FormSaveBar settings={{ ...settings, invalid }} busy={saveCrontab.isPending} />
     </>
   );
 }

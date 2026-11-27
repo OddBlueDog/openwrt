@@ -8,8 +8,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import type { BanipStatus, Drop, Meta } from '../src/features/banip/api.ts';
-import { checkFeedForm, definitionOf, type FeedForm } from '../src/features/banip/feed-form.ts';
-import { PRESETS } from '../src/features/banip/feeds.ts';
+import { definitionOf, type FeedForm, feedFormSchema } from '../src/features/banip/feed-form.ts';
+import { FEED_INFO, PRESETS, SPECIAL_FEEDS } from '../src/features/banip/feeds.ts';
 import {
   countryWarnings,
   daySeries,
@@ -49,6 +49,10 @@ import {
   type Options,
   optionChanges,
 } from '../src/features/banip/options.ts';
+import { formErrors } from '../src/lib/form/errors.ts';
+
+const checkFeedForm = (f: FeedForm, taken: readonly string[], editing: boolean): Partial<Record<keyof FeedForm, string>> =>
+  formErrors(feedFormSchema(taken, editing), f);
 
 const routerSpec = JSON.parse(
   readFileSync(
@@ -433,4 +437,36 @@ test('a list that needs a personal key (urlhaus since banIP 1.9.1-r3): found by 
   assert.equal(checkValue('ban_authkey', ''), 'format');
   assert.equal(needsRestart({ ban_authkey: 'abc' }), true);
   assert.match(RESULTS['nokey'] ?? '', /Auth-Key/);
+});
+
+test('the banIP override names its source: the header’s openwrt/packages commit is URL’s, and the release is MilkFlint’s (+1000)', () => {
+  const mk = readFileSync(new URL('../../../package/milkflint/banip/Makefile', import.meta.url), 'utf8');
+  const header = /\(commit ([0-9a-f]{7,40})\)/.exec(mk)?.[1];
+  const url = /^\tURL:=(.+)$/m.exec(mk)?.[1];
+  assert.ok(header !== undefined, 'the header names a commit');
+  assert.equal(url, `https://github.com/openwrt/packages/tree/${header}/net/banip`);
+  const version = /^PKG_VERSION:=(.+)$/m.exec(mk)?.[1];
+  const release = Number(/^PKG_RELEASE:=(.+)$/m.exec(mk)?.[1]);
+  assert.ok(release > 1000, 'MilkFlint’s build number');
+  assert.match(
+    mk,
+    new RegExp(`banIP ${String(version).replace(/\./g, '\\.')}-${String(release - 1000)}, from its openwrt-25\\.12`),
+  );
+  // the router passes on only an openwrt/packages address of this form (banip.uc package_source)
+  assert.match(url, /^https:\/\/github\.com\/openwrt\/packages\/tree\/[0-9a-f]{7,40}\/net\/banip$/);
+});
+
+test('the page’s lists are the banIP it ships: every described and preset list is one of its feeds, and “on web ports” only where the feed is limited to them', () => {
+  const feeds = JSON.parse(
+    readFileSync(new URL('../../../package/milkflint/banip/files/banip.feeds', import.meta.url), 'utf8'),
+  ) as Record<string, { flag?: string }>;
+  const known = new Set<string>([...Object.keys(feeds), ...SPECIAL_FEEDS]);
+  for (const name of Object.keys(FEED_INFO)) assert.ok(known.has(name), `${name} is described but banIP has no such feed`);
+  for (const p of PRESETS)
+    for (const name of p.feeds) assert.ok(known.has(name), `preset ${p.id} has ${name}, which banIP lacks`);
+  for (const [name, info] of Object.entries(FEED_INFO)) {
+    const web = info.text.includes(' on web ports.');
+    const limited = /(^| )80 443( |$)/.test(feeds[name]?.flag ?? '');
+    assert.equal(web, limited, `${name}: the text and the feed’s port limit (${feeds[name]?.flag ?? 'none'}) disagree`);
+  }
 });

@@ -3,9 +3,13 @@
 // network's own DNS server (a Pi-hole's lookups would come back to the router).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { type DnsData, type DnsForm, plan, toChanges, validate } from '../src/features/dns/model.ts';
+import { type DnsData, dnsErrors, type DnsForm, plan, toChanges } from '../src/features/dns/model.ts';
+
 import type { Change } from '../src/lib/api/uci.ts';
 import { section } from './uci-fixture.ts';
+
+// the form's checks, as the page reads them
+const validate = dnsErrors;
 
 const form = (over: Partial<DnsForm> = {}): DnsForm => ({
   mode: 'auto',

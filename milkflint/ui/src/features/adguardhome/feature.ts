@@ -1,6 +1,7 @@
 import { ShieldBanIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { adguardQueries } from './queries';
 
 export const feature = {
   id: 'adguardhome',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.AdGuardHomePage,
   ),
+  prefetch: (client) => {
+    client.query(adguardQueries.around()).catch(() => undefined);
+  },
 } satisfies Feature;

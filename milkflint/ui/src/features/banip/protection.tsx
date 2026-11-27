@@ -32,6 +32,7 @@ import type { ApplyState } from '@/hooks/use-apply';
 import { formatBytes, formatNumber } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
 import { type BanipConfig, type BanipStatus, enableBanip, type Feed, saveOptions } from './api';
+import { useBanipWrite } from './queries';
 import { CATEGORIES, type Category, infoOf, PRESETS, type PresetId, type Risk } from './feeds';
 import { FeedSheet } from './feed-sheet';
 import {
@@ -882,6 +883,8 @@ export function ProtectionTab({
     return () => onPick?.(undefined);
   }, [picked, onPick]);
   const [state, setState] = useState<ApplyState>({ phase: 'idle' });
+  // banIP's reads are asked again once the save went through
+  const write = useBanipWrite();
   const saved = initialDraft(c);
   const enabled = c.enabled === true;
   const ap = c.mode === 'ap';
@@ -920,32 +923,34 @@ export function ProtectionTab({
   };
   const save = (): void => {
     setState({ phase: 'applying' });
-    (async () => {
-      if (Object.keys(changes).length > 0 || Object.keys(mchanges).length > 0) await saveOptions(changes, mchanges);
-      if (turnOn) await enableBanip(true);
-      if (turnOff) await enableBanip(false);
-    })().then(
-      () => {
-        setState({
-          phase: 'done',
-          nothingChanged: false,
-          note: turnOn
-            ? 'banIP is on: it’s downloading and loading the lists now.'
-            : turnOff
-              ? 'banIP is off: nothing is blocked.'
-              : enabled && Object.keys(changes).length > 0
-                ? 'banIP is loading the lists again: the ones it has stay as they are, new ones are downloaded.'
-                : !enabled && Object.keys(changes).length > 0
-                  ? 'Saved. banIP is off: choose a preset or turn it on at the top to start blocking.'
-                  : undefined,
-        });
-        setPicked(undefined);
-        onSaved();
-      },
-      (err: unknown) => {
-        setState({ phase: 'failed', message: errorMessage(err) });
-      },
-    );
+    write
+      .mutateAsync(async () => {
+        if (Object.keys(changes).length > 0 || Object.keys(mchanges).length > 0) await saveOptions(changes, mchanges);
+        if (turnOn) await enableBanip(true);
+        if (turnOff) await enableBanip(false);
+      })
+      .then(
+        () => {
+          setState({
+            phase: 'done',
+            nothingChanged: false,
+            note: turnOn
+              ? 'banIP is on: it’s downloading and loading the lists now.'
+              : turnOff
+                ? 'banIP is off: nothing is blocked.'
+                : enabled && Object.keys(changes).length > 0
+                  ? 'banIP is loading the lists again: the ones it has stay as they are, new ones are downloaded.'
+                  : !enabled && Object.keys(changes).length > 0
+                    ? 'Saved. banIP is off: choose a preset or turn it on at the top to start blocking.'
+                    : undefined,
+          });
+          setPicked(undefined);
+          onSaved();
+        },
+        (err: unknown) => {
+          setState({ phase: 'failed', message: errorMessage(err) });
+        },
+      );
   };
   return (
     <div className="flex flex-col gap-4">

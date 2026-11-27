@@ -1,6 +1,7 @@
 import { GlobeIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { internetQueries } from './queries';
 
 export const feature = {
   id: 'internet',
@@ -13,4 +14,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.InternetPage,
   ),
+  prefetch: (client) => {
+    client.query(internetQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

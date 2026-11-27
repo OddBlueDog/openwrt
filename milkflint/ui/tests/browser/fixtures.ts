@@ -8,7 +8,7 @@
 //   ap:    an access point behind a main router.
 // The widgets that read the router themselves get theirs from router.ts.
 import type { Live } from '@/features/network-quality/live';
-import type { Poll } from '@/hooks/use-poll';
+import type { Live as Polled } from '@/lib/query/use-live';
 import type { Client, Dashboard, Radio, Sample } from '@/features/dashboard/use-dashboard';
 import type { Port } from '@/features/dashboard/ports';
 import { HISTORY, POLL_MS } from '@/features/dashboard/use-dashboard';
@@ -152,6 +152,12 @@ function ports(s: Scenario): Port[] {
     networks: [device === 'eth1' ? 'Internet' : 'LAN'],
     down: undefined,
     up: undefined,
+    mac: undefined,
+    partnerMbit: undefined,
+    totalDown: undefined,
+    totalUp: undefined,
+    errors: undefined,
+    dropped: undefined,
     ...over,
   });
   return [
@@ -274,7 +280,7 @@ export function dashboard(s: Scenario): Dashboard {
 }
 
 /** Network Quality's pings over the last hour, as Home polls them. */
-export function live(s: Scenario): Poll<Live> {
+export function live(s: Scenario): Polled<Live> {
   const on = s !== 'quiet';
   const samples = on
     ? Array.from({ length: 720 }, (_, i) => {

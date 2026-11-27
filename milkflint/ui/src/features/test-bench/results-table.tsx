@@ -1,5 +1,5 @@
 import type { ReactElement, ReactNode } from 'react';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { type Column, DataTable, type Group } from '@/components/data-table';
 import { formatNumber, formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type { RunMember, Schedule } from './api';
@@ -16,7 +16,7 @@ import {
 } from './analysis';
 import { deviceSites, deviceSummary, routerSites, siteMedian } from './dns-pages';
 import { linkStatus, memberPeerRtts, peerThroughput, schedulePairs } from './pairs';
-import { Arrowed, Dir } from './dir';
+import { Arrowed, Dir } from '@/components/dir';
 import { phaseStyle } from './phases';
 import type { RunData } from './run-data';
 
@@ -57,7 +57,8 @@ function PingCell({ s }: { s: RttStats }): ReactElement {
 const rate = (v: number): string => formatNumber(v, v < 10 ? 1 : 0);
 
 interface Row {
-  id: string;
+  /** the phase's and the device's: a device has a row in each phase */
+  key: string;
   name: string;
   router: ReactNode;
   internet: ReactNode;
@@ -66,17 +67,8 @@ interface Row {
   speed: ReactNode;
 }
 
-interface Block {
-  key: string;
-  icon: ReactElement;
-  name: string;
-  /** what the router did meanwhile, in one line */
-  router: ReactNode;
-  rows: Row[];
-}
-
-/** The phases' figures, worked out once for both layouts. */
-function blocks(data: RunData, run: ReportRun, schedule: Schedule, members: readonly RunMember[]): Block[] {
+/** Each phase's figures: a heading with what the router did meanwhile, in one line, and a row a device. */
+function phaseGroups(data: RunData, run: ReportRun, schedule: Schedule, members: readonly RunMember[]): Group<Row>[] {
   const end = run.ended?.at ?? run.end;
   const windows = phaseWindows(run.t0, schedule.phases).filter((w) => w.phase.kind !== 'cooldown' && w.from < end);
   const names = new Map(members.map((m) => [m.id, m.name]));
@@ -190,7 +182,7 @@ function blocks(data: RunData, run: ReportRun, schedule: Schedule, members: read
           </span>
         );
       return {
-        id,
+        key: `${String(w.index)}-${id}`,
         name: names.get(id) ?? id,
         router: <RttCell s={rttStats(memberRtts(recs, 'r', win))} />,
         internet: <RttCell s={rttStats(memberRtts(recs, 'w', win))} />,
@@ -199,30 +191,44 @@ function blocks(data: RunData, run: ReportRun, schedule: Schedule, members: read
         speed,
       };
     });
+    const name = w.phase.label ?? style.name;
     return {
-      key: String(w.index),
-      icon: <style.icon className={cn('size-3.5 shrink-0', style.tone)} aria-hidden="true" />,
-      name: w.phase.label ?? style.name,
-      router,
+      key: `${String(w.index + 1)} ${name}`,
+      header: (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+          <span className="inline-flex items-center gap-2 font-medium">
+            <style.icon className={cn('size-3.5 shrink-0', style.tone)} aria-hidden="true" />
+            <Arrowed text={name} />
+          </span>
+          <span className="text-xs text-muted-foreground tabular">{router}</span>
+        </div>
+      ),
       rows,
     };
   });
 }
 
-/** A figure in a device's stacked block on a phone: its label left, the figure right. */
-function Pair({ label, children }: { label: string; children: ReactNode }): ReactElement {
-  return (
-    <div className="flex items-start justify-between gap-4">
-      <dt className="text-xs text-muted-foreground">{label}</dt>
-      <dd className="text-right text-sm tabular">{children}</dd>
-    </div>
-  );
-}
+const figure = (label: string, cell: (r: Row) => ReactNode): Column<Row> => ({
+  label,
+  cell,
+  className: 'text-right whitespace-nowrap tabular',
+});
+// per phase in time order, each device in the run's order: nothing sorts
+const withPeers: readonly Column<Row>[] = [
+  { label: 'Device', cell: (r) => r.name, className: 'font-medium' },
+  figure('To the router', (r) => r.router),
+  figure('Internet', (r) => r.internet),
+  figure('To its peers', (r) => r.peers),
+  figure('Router’s ping', (r) => r.ping),
+  figure('Speed', (r) => r.speed),
+];
+// a column for latency to the device's partners only when the run pairs devices
+const withoutPeers = withPeers.filter((c) => c.label !== 'To its peers');
 
 /**
  * Each phase's figures, per device and for the router: latency typical /
- * p95, the router's pings, throughput. A table on a wide screen; on a
- * narrower one each device's figures stack under its phase.
+ * p95, the router's pings, throughput. A table when there's room; when not,
+ * each device's figures stack under its phase.
  */
 export function ResultsTable({
   data,
@@ -235,78 +241,14 @@ export function ResultsTable({
   schedule: Schedule;
   members: readonly RunMember[];
 }): ReactElement {
-  const list = blocks(data, run, schedule, members);
-  // a column for latency to the device's partners, when the run pairs devices
-  const peers = schedulePairs(schedule.phases).length > 0;
-  const cols = peers ? 6 : 5;
   return (
-    <>
-      <div className="hidden lg:block">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Device</TableHead>
-              <TableHead className="text-right">To the router</TableHead>
-              <TableHead className="text-right">Internet</TableHead>
-              {peers && <TableHead className="text-right">To its peers</TableHead>}
-              <TableHead className="text-right">Router&apos;s ping</TableHead>
-              <TableHead className="text-right">Speed</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {list.map((b) => [
-              <TableRow key={`p${b.key}`} className="bg-muted/40 hover:bg-muted/40">
-                <TableCell colSpan={cols} className="py-2 whitespace-normal">
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-                    <span className="inline-flex items-center gap-2 font-medium">
-                      {b.icon}
-                      <Arrowed text={b.name} />
-                    </span>
-                    <span className="text-xs text-muted-foreground tabular">{b.router}</span>
-                  </div>
-                </TableCell>
-              </TableRow>,
-              ...b.rows.map((r) => (
-                <TableRow key={`${b.key}-${r.id}`}>
-                  <TableCell className="font-medium">{r.name}</TableCell>
-                  <TableCell className="text-right tabular">{r.router}</TableCell>
-                  <TableCell className="text-right tabular">{r.internet}</TableCell>
-                  {peers && <TableCell className="text-right tabular">{r.peers}</TableCell>}
-                  <TableCell className="text-right tabular">{r.ping}</TableCell>
-                  <TableCell className="text-right tabular">{r.speed}</TableCell>
-                </TableRow>
-              )),
-            ])}
-          </TableBody>
-        </Table>
-      </div>
-      <div className="flex flex-col lg:hidden">
-        {list.map((b) => (
-          <div key={b.key} className="flex flex-col">
-            <div className="flex flex-col gap-0.5 border-y bg-muted/40 px-3 py-2">
-              <span className="inline-flex items-center gap-2 text-sm font-medium">
-                {b.icon}
-                <Arrowed text={b.name} />
-              </span>
-              <span className="text-xs text-muted-foreground tabular">{b.router}</span>
-            </div>
-            <ul className="divide-y">
-              {b.rows.map((r) => (
-                <li key={r.id} className="flex flex-col gap-1.5 px-3 py-3">
-                  <span className="text-sm font-medium">{r.name}</span>
-                  <dl className="flex flex-col gap-1.5">
-                    <Pair label="To the router">{r.router}</Pair>
-                    <Pair label="Internet">{r.internet}</Pair>
-                    {peers && <Pair label="To its peers">{r.peers}</Pair>}
-                    <Pair label="Router’s ping">{r.ping}</Pair>
-                    <Pair label="Speed">{r.speed}</Pair>
-                  </dl>
-                </li>
-              ))}
-            </ul>
-          </div>
-        ))}
-      </div>
-    </>
+    <DataTable
+      label="Phase by phase"
+      columns={schedulePairs(schedule.phases).length > 0 ? withPeers : withoutPeers}
+      groups={phaseGroups(data, run, schedule, members)}
+      rowKey={(r) => r.key}
+      empty="No phase ran."
+      framed={false}
+    />
   );
 }

@@ -1,11 +1,12 @@
 // The Firewall page's opening answer, in plain words from the live config:
 // whether the internet can start connections to the router and to your
 // devices, and whose rules there are.
+import { Link } from '@tanstack/react-router';
 import { ChevronRightIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Card } from '@/components/ui/card';
-import { href } from '@/lib/router';
+import { pageLink, type PageLink } from '@/lib/router';
 import type { FirewallData } from './api';
 import { zoneTitle } from './model';
 import { firewallSummary, namesText, plural, type Reach } from './summary';
@@ -19,7 +20,7 @@ function Cell({
   title: string;
   status: ReactNode;
   children: ReactNode;
-  link?: { href: string; label: string };
+  link?: { to: PageLink; label: string };
 }): ReactElement {
   return (
     <div className="flex min-w-0 flex-col gap-2 p-5">
@@ -27,13 +28,10 @@ function Cell({
       <div className="flex min-h-6 items-center">{status}</div>
       <p className="text-sm text-foreground">{children}</p>
       {link !== undefined && (
-        <a
-          href={link.href}
-          className="mt-auto inline-flex w-fit items-center gap-0.5 text-sm font-medium link underline-offset-4"
-        >
+        <Link {...link.to} className="mt-auto inline-flex w-fit items-center gap-0.5 text-sm font-medium link underline-offset-4">
           {link.label}
           <ChevronRightIcon className="size-4" />
-        </a>
+        </Link>
       )}
     </div>
   );
@@ -49,7 +47,7 @@ const openwrtTail = (n: number): string => (n === 0 ? '.' : `, apart from ${plur
 
 export function FirewallAnswer({ data, upnp }: { data: FirewallData; upnp: number }): ReactElement {
   const s = firewallSummary(data.cfg, data.upnp === true ? upnp : 0);
-  const zones = `${href('firewall')}/zones`;
+  const zones = pageLink('firewall', 'zones');
   const { router, devices, rules } = s;
 
   const routerText =
@@ -88,7 +86,7 @@ export function FirewallAnswer({ data, upnp }: { data: FirewallData; upnp: numbe
         <Cell
           title="The router, from the internet"
           status={reachBadge[router.reach]}
-          {...(router.reach === 'open' ? { link: { href: zones, label: 'Zones' } } : {})}
+          {...(router.reach === 'open' ? { link: { to: zones, label: 'Zones' } } : {})}
         >
           {routerText}
         </Cell>
@@ -101,7 +99,7 @@ export function FirewallAnswer({ data, upnp }: { data: FirewallData; upnp: numbe
               reachBadge[devices.reach]
             )
           }
-          {...(devices.reach === 'open' ? { link: { href: zones, label: 'Zones' } } : {})}
+          {...(devices.reach === 'open' ? { link: { to: zones, label: 'Zones' } } : {})}
         >
           {devicesText}
         </Cell>

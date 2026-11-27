@@ -1,11 +1,13 @@
 // The DNS page's settings and the UCI changes that make them: what dnsmasq
 // and dnsproxy forward to, the devices' DNS server, and the redirects that
 // catch devices with their own DNS.
+import { z } from 'zod';
 import { ipToInt } from '@/lib/api/network';
+import { formErrors } from '@/lib/form/errors';
 import type { Change, Section } from '@/lib/api/uci';
 import { type DeviceDns, deviceDnsChanges, validateDeviceDns } from './device-dns';
 import { addIntercept, type InterceptZone, interceptSection } from './intercept';
-import { protoOf, type Proto, type ProviderId } from './providers';
+import { isProviderId, protoOf, type ProviderId } from './providers';
 import {
   type BackupUse,
   type Pair,
@@ -34,42 +36,51 @@ const MAX_CACHE_SIZE = 100_000;
 export const cacheRrTypes = (values: readonly string[]): string[] => values.flatMap((v) => v.split(',')).filter((t) => t !== '');
 export const isHttpsRr = (type: string): boolean => type.toLowerCase() === 'https' || type === '65';
 
-export interface DnsRecord {
-  key: string;
-  section: string | undefined;
-  name: string;
-  ip: string;
-}
+const dnsRecordFields = z.object({
+  key: z.string(),
+  section: z.union([z.string(), z.undefined()]),
+  name: z.string(),
+  ip: z.string(),
+});
 
-export interface DnsForm {
-  mode: Mode;
-  provider: ProviderId | 'custom';
-  server: string;
-  proto: Proto;
-  custom: string;
+export type DnsRecord = z.infer<typeof dnsRecordFields>;
+
+const providerOrCustom = z.custom<ProviderId | 'custom'>((v) => v === 'custom' || (typeof v === 'string' && isProviderId(v)));
+
+const dnsFields = z.object({
+  mode: z.enum(['auto', 'static', 'encrypted']),
+  provider: providerOrCustom,
+  server: z.string(),
+  proto: z.enum(['doh', 'dot', 'doq']),
+  custom: z.string(),
   /** One server, or two and how they're used (milkflint.dns.backup 'none', else backup_use). */
-  pair: Pair;
+  pair: z.enum(['one', 'parallel', 'fallback']),
   /** The second server: from another provider, or custom; a suggestion while there's one server. */
-  backup: ProviderId | 'custom';
-  backupServer: string;
-  backupCustom: string;
+  backup: providerOrCustom,
+  backupServer: z.string(),
+  backupCustom: z.string(),
   /** Whether the router caches at all: off is dnsmasq's size 0, and no dnsproxy cache. */
-  cacheOn: boolean;
+  cacheOn: z.boolean(),
   /** dnsmasq's cache, in answers; empty for the default. */
-  cacheSize: string;
+  cacheSize: z.string(),
   /** Whether dnsmasq keeps HTTPS records too (cache_rr). */
-  cacheHttps: boolean;
+  cacheHttps: z.boolean(),
   /** Expired answers given out at once and refreshed behind: dnsproxy's optimistic cache for encrypted DNS, dnsmasq's use_stale_cache otherwise. */
-  quick: boolean;
+  quick: z.boolean(),
   /** how long after expiring an answer may still be given out, in hours (optimistic_max_age; use_stale_cache is in seconds) */
-  keepHours: string;
-  intercept: boolean;
-  rebind: boolean;
-  domain: string;
-  records: DnsRecord[];
+  keepHours: z.string(),
+  intercept: z.boolean(),
+  rebind: z.boolean(),
+  domain: z.string(),
+  records: z.array(dnsRecordFields),
   /** The DNS server the home network's devices are told to use. */
-  devices: DeviceDns;
-}
+  devices: z.object({ own: z.boolean(), ipv4: z.string(), ipv6: z.string() }) satisfies z.ZodType<DeviceDns>,
+});
+
+export type DnsForm = z.infer<typeof dnsFields>;
+
+/** The form's top-level fields, for setting several at once. */
+export const dnsFormKeys = dnsFields.keyof().options;
 
 export interface DnsData {
   form: DnsForm;
@@ -124,36 +135,58 @@ type FormErrors = Partial<Record<'custom' | 'backup' | 'backupCustom' | 'domain'
 const ADDRESS_LIST = 'One or more IP addresses, separated by commas.';
 const ENCRYPTED_URL = 'An address starting https://, tls://, quic:// or sdns://.';
 
-export function validate(f: DnsForm, data: DnsData): { form: FormErrors; records: Record<string, string> } {
-  const own = validateDeviceDns(f.devices, data.routerIp, data.prefix);
-  const form: FormErrors = {
-    ...(own.ipv4 === undefined ? {} : { ownIpv4: own.ipv4 }),
-    ...(own.ipv6 === undefined ? {} : { ownIpv6: own.ipv6 }),
-  };
-  const records: Record<string, string> = {};
-  if (f.mode !== 'auto') {
-    const ok = f.mode === 'static' ? isAddressList : isEncryptedUrl;
-    const message = f.mode === 'static' ? ADDRESS_LIST : ENCRYPTED_URL;
-    if (f.provider === 'custom' && !ok(f.custom)) form.custom = message;
-    if (f.pair !== 'one') {
-      if (f.backup === 'custom' && !ok(f.backupCustom)) form.backupCustom = message;
-      if (f.backup !== 'custom' && f.backup === f.provider) {
-        form.backup = 'Pick another provider: an outage usually takes all of one provider’s servers down together.';
+/** The form's checks against the settings as loaded (the router's address and network, for your own DNS server). */
+export function dnsFormSchema(data: DnsData): z.ZodType<DnsForm, DnsForm> {
+  return dnsFields.superRefine((f, ctx) => {
+    const issue = (path: (string | number)[], message: string): void => {
+      ctx.addIssue({ code: 'custom', path, message });
+    };
+    const own = validateDeviceDns(f.devices, data.routerIp, data.prefix);
+    if (own.ipv4 !== undefined) issue(['devices', 'ipv4'], own.ipv4);
+    if (own.ipv6 !== undefined) issue(['devices', 'ipv6'], own.ipv6);
+    if (f.mode !== 'auto') {
+      const ok = f.mode === 'static' ? isAddressList : isEncryptedUrl;
+      const message = f.mode === 'static' ? ADDRESS_LIST : ENCRYPTED_URL;
+      if (f.provider === 'custom' && !ok(f.custom)) issue(['custom'], message);
+      if (f.pair !== 'one') {
+        if (f.backup === 'custom' && !ok(f.backupCustom)) issue(['backupCustom'], message);
+        if (f.backup !== 'custom' && f.backup === f.provider) {
+          issue(['backup'], 'Pick another provider: an outage usually takes all of one provider’s servers down together.');
+        }
       }
     }
+    if (!/^[A-Za-z0-9-]{1,63}$/.test(f.domain)) issue(['domain'], 'One word: letters, digits and hyphens.');
+    if (
+      f.cacheOn &&
+      f.cacheSize !== '' &&
+      (!/^\d+$/.test(f.cacheSize) || Number(f.cacheSize) < 1 || Number(f.cacheSize) > MAX_CACHE_SIZE)
+    ) {
+      issue(['cacheSize'], `A whole number from 1 to ${String(MAX_CACHE_SIZE)}, or empty for ${DEFAULT_CACHE_SIZE}.`);
+    }
+    f.records.forEach((r, i) => {
+      if (!NAME.test(r.name)) issue(['records', i], 'Enter a host name, e.g. nas or printer.home.');
+      else if (ipToInt(r.ip) === undefined) issue(['records', i], 'Enter an IPv4 address.');
+    });
+  });
+}
+
+/** The schema's verdict as the page shows it: the form's fields by name, and each custom name's by its key. */
+export function dnsErrors(f: DnsForm, data: DnsData): { form: FormErrors; records: Record<string, string> } {
+  const e = formErrors(dnsFormSchema(data), f);
+  const form: FormErrors = {};
+  for (const key of ['custom', 'backup', 'backupCustom', 'domain', 'cacheSize'] as const) {
+    const message = e[key];
+    if (message !== undefined) form[key] = message;
   }
-  if (!/^[A-Za-z0-9-]{1,63}$/.test(f.domain)) form.domain = 'One word: letters, digits and hyphens.';
-  if (
-    f.cacheOn &&
-    f.cacheSize !== '' &&
-    (!/^\d+$/.test(f.cacheSize) || Number(f.cacheSize) < 1 || Number(f.cacheSize) > MAX_CACHE_SIZE)
-  ) {
-    form.cacheSize = `A whole number from 1 to ${String(MAX_CACHE_SIZE)}, or empty for ${DEFAULT_CACHE_SIZE}.`;
-  }
-  for (const r of f.records) {
-    if (!NAME.test(r.name)) records[r.key] = 'Enter a host name, e.g. nas or printer.home.';
-    else if (ipToInt(r.ip) === undefined) records[r.key] = 'Enter an IPv4 address.';
-  }
+  const own4 = e['devices.ipv4'];
+  const own6 = e['devices.ipv6'];
+  if (own4 !== undefined) form.ownIpv4 = own4;
+  if (own6 !== undefined) form.ownIpv6 = own6;
+  const records: Record<string, string> = {};
+  f.records.forEach((r, i) => {
+    const message = e[`records[${String(i)}]`];
+    if (message !== undefined) records[r.key] = message;
+  });
   return { form, records };
 }
 

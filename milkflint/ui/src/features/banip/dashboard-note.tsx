@@ -1,10 +1,12 @@
 import { ShieldAlertIcon } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
+import { pageLink } from '@/lib/router';
 import type { ReactElement } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
-import { usePoll } from '@/hooks/use-poll';
-import { getStatusShared } from './api';
+import { useLive } from '@/lib/query/use-live';
 import { describeState } from './model';
+import { banipQueries } from './queries';
 
 /**
  * Home's warning when banIP is on but stopped or failed, whether or not its
@@ -12,8 +14,8 @@ import { describeState } from './model';
  * it's doing), while it's off, nor where there's no banIP.
  */
 export function BanipNote(): ReactElement | null {
-  // a firmware without it answers "not found": then nothing, quietly
-  const { data } = usePoll(() => getStatusShared().catch(() => undefined), 30000);
+  // a firmware without it answers "not found": then no data, and nothing shows
+  const { data } = useLive(banipQueries.statusEvery30s());
   if (data?.installed !== true || data.enabled !== true || data.state === 'ap' || data.state === undefined) return null;
   const words = describeState(data);
   if (data.state === 'error' || data.state === 'stopped') {
@@ -25,7 +27,7 @@ export function BanipNote(): ReactElement | null {
           {words.text}
           <div className="mt-2">
             <Button size="sm" variant="outline" asChild>
-              <a href="#/banip">banIP page</a>
+              <Link {...pageLink('banip')}>banIP page</Link>
             </Button>
           </div>
         </AlertDescription>

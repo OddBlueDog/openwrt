@@ -4,17 +4,11 @@
 // is open: once, again a second later (CPU use needs two readings), then
 // every 3 s; never while it's paused or the tab is hidden. A row opens to
 // its command line, parent, state, threads and age.
-import {
-  ArrowDownIcon,
-  ArrowUpIcon,
-  ChevronRightIcon,
-  ListIcon,
-  PauseIcon,
-  PlayIcon,
-  SearchIcon,
-  TriangleAlertIcon,
-} from 'lucide-react';
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
+import { ChevronRightIcon, ListIcon, PauseIcon, PlayIcon, SearchIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { type Column, DataTable } from '@/components/data-table';
 import { Note } from '@/components/note';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -23,20 +17,16 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/
 import { Skeleton } from '@/components/ui/skeleton';
 import { getProcesses, type ProcessList } from '@/lib/api/processes';
 import { formatBytes, formatDuration, formatNumber, formatPercent } from '@/lib/format';
-import { href } from '@/lib/router';
 import { UbusError, UbusStatus } from '@/lib/ubus';
 import { cn, errorMessage } from '@/lib/utils';
 import {
   CLOCK_TICKS,
-  firstDirection,
   formatShare,
   type ProcessRow,
   type ProcessView,
   shownRows,
   type Snapshot,
   snapshot,
-  type Sort,
-  type SortKey,
   stateLabel,
 } from './model';
 
@@ -118,47 +108,6 @@ const views: readonly { value: ProcessView; label: string }[] = [
   { value: 'kernel', label: 'Kernel threads' },
 ];
 
-function SortHead({
-  label,
-  sortKey,
-  sort,
-  onSort,
-  className,
-}: {
-  label: string;
-  sortKey: SortKey;
-  sort: Sort;
-  onSort: (key: SortKey) => void;
-  className?: string;
-}): ReactElement {
-  const active = sort.key === sortKey;
-  const Arrow = sort.desc ? ArrowDownIcon : ArrowUpIcon;
-  return (
-    <th
-      scope="col"
-      aria-sort={active ? (sort.desc ? 'descending' : 'ascending') : undefined}
-      className={cn(
-        'sticky top-0 z-10 h-10 border-b bg-popover px-3 text-left align-middle text-xs font-medium whitespace-nowrap text-muted-foreground first:pl-5 last:pr-5',
-        className,
-      )}
-    >
-      <button
-        type="button"
-        onClick={() => {
-          onSort(sortKey);
-        }}
-        className={cn(
-          'inline-flex min-h-6 cursor-pointer items-center gap-1 rounded-sm hover:text-foreground',
-          active && 'text-foreground',
-        )}
-      >
-        {label}
-        {active && <Arrow className="size-3" aria-hidden />}
-      </button>
-    </th>
-  );
-}
-
 /** One of the figures above the list: a label over its value. */
 function Figure({ label, children }: { label: string; children: ReactNode }): ReactElement {
   return (
@@ -184,58 +133,59 @@ function Details({ r, snap, id }: { r: ProcessRow; snap: Snapshot; id: string })
   const parent = p.ppid === 0 ? undefined : snap.names.get(p.ppid);
   const age = Math.max(0, snap.uptime - p.start / CLOCK_TICKS);
   return (
-    <tr id={id}>
-      <td colSpan={5} className="border-b bg-muted/50 px-5 py-3">
-        <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3">
-          <Detail label="Command" wide>
-            {p.kernel ? (
-              <span className="text-muted-foreground">None: a kernel thread runs inside the kernel itself.</span>
-            ) : (
-              <span className="font-mono text-xs break-all whitespace-pre-wrap">{p.cmd === '' ? p.name : p.cmd}</span>
-            )}
-          </Detail>
-          <Detail label="User">{p.user}</Detail>
-          <Detail label="Process ID">
-            <span className="tabular">{p.pid}</span>
-          </Detail>
-          <Detail label="Started by">
-            {p.ppid === 0 ? (
-              <span className="text-muted-foreground">The kernel, at boot</span>
-            ) : (
-              <span className="tabular">
-                {parent ?? 'A process that has ended'} <span className="text-muted-foreground">({p.ppid})</span>
-              </span>
-            )}
-          </Detail>
-          <Detail label="State">{stateLabel(p.state)}</Detail>
-          <Detail label="Threads">
-            <span className="tabular">{formatNumber(p.threads)}</span>
-          </Detail>
-          <Detail label="Started">
-            <span className="tabular">{age < 1 ? 'Just now' : `${formatDuration(age)} ago`}</span>
-          </Detail>
-          <Detail label="CPU time so far">
-            <span className="tabular">{formatDuration(p.ticks / CLOCK_TICKS)}</span>
-          </Detail>
-        </dl>
-      </td>
-    </tr>
+    <dl id={id} data-details className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-3">
+      <Detail label="Command" wide>
+        {p.kernel ? (
+          <span className="text-muted-foreground">None: a kernel thread runs inside the kernel itself.</span>
+        ) : (
+          <span className="font-mono text-xs break-all whitespace-pre-wrap">{p.cmd === '' ? p.name : p.cmd}</span>
+        )}
+      </Detail>
+      <Detail label="User">{p.user}</Detail>
+      <Detail label="Process ID">
+        <span className="tabular">{p.pid}</span>
+      </Detail>
+      <Detail label="Started by">
+        {p.ppid === 0 ? (
+          <span className="text-muted-foreground">The kernel, at boot</span>
+        ) : (
+          <span className="tabular">
+            {parent ?? 'A process that has ended'} <span className="text-muted-foreground">({p.ppid})</span>
+          </span>
+        )}
+      </Detail>
+      <Detail label="State">{stateLabel(p.state)}</Detail>
+      <Detail label="Threads">
+        <span className="tabular">{formatNumber(p.threads)}</span>
+      </Detail>
+      <Detail label="Started">
+        <span className="tabular">{age < 1 ? 'Just now' : `${formatDuration(age)} ago`}</span>
+      </Detail>
+      <Detail label="CPU time so far">
+        <span className="tabular">{formatDuration(p.ticks / CLOCK_TICKS)}</span>
+      </Detail>
+    </dl>
   );
 }
 
-function Row({ r, snap, open, onToggle }: { r: ProcessRow; snap: Snapshot; open: boolean; onToggle: () => void }): ReactElement {
-  const id = useId();
-  const { p } = r;
-  const idle = r.cpu === 0;
-  return (
-    <>
-      <tr className={cn('transition-colors duration-fast hover:bg-muted/60', open && 'bg-muted/50 hover:bg-muted/50')}>
-        <td className="w-full max-w-0 border-b py-0 pr-3 pl-5">
+/** The list's columns: figures sort busiest first, words A to Z; a name opens its row. */
+function processColumns(opened: ReadonlySet<string>, ids: string, onToggle: (key: string) => void): Column<ProcessRow>[] {
+  return [
+    {
+      label: 'Name',
+      // in line with the names, past the arrows
+      header: <span className="pl-6">Name</span>,
+      cell: (r) => {
+        const open = opened.has(r.key);
+        const { p } = r;
+        return (
           <button
             type="button"
             aria-expanded={open}
-            aria-controls={open ? id : undefined}
-            onClick={onToggle}
+            aria-controls={open ? `${ids}-${r.key}` : undefined}
+            onClick={() => {
+              onToggle(r.key);
+            }}
             className="flex w-full min-w-0 cursor-pointer items-center gap-2 py-2 text-left"
           >
             <ChevronRightIcon
@@ -253,45 +203,66 @@ function Row({ r, snap, open, onToggle }: { r: ProcessRow; snap: Snapshot; open:
               </span>
             </span>
           </button>
-        </td>
-        <td className="hidden border-b px-3 whitespace-nowrap text-muted-foreground sm:table-cell">{p.user}</td>
-        <td className="hidden border-b px-3 text-right whitespace-nowrap text-muted-foreground tabular sm:table-cell">{p.pid}</td>
-        <td
-          className={cn(
-            'border-b px-3 text-right font-medium whitespace-nowrap tabular',
-            (idle || r.cpu === undefined) && 'font-normal text-muted-foreground',
-          )}
-        >
-          {r.cpu === undefined ? '—' : formatShare(r.cpu)}
-        </td>
-        <td className="border-b pr-5 pl-3 text-right whitespace-nowrap tabular">
-          {p.kernel ? <span className="text-muted-foreground">—</span> : formatBytes(p.rss)}
-        </td>
-      </tr>
-      {open && <Details r={r} snap={snap} id={id} />}
-    </>
-  );
+        );
+      },
+      sort: (r) => r.name,
+      className: 'w-full max-w-0 py-0',
+    },
+    {
+      label: 'User',
+      cell: (r) => r.p.user,
+      sort: (r) => r.p.user,
+      className: 'hidden whitespace-nowrap text-muted-foreground sm:table-cell',
+    },
+    {
+      label: 'PID',
+      cell: (r) => r.p.pid,
+      sort: (r) => r.p.pid,
+      className: 'hidden text-right whitespace-nowrap text-muted-foreground tabular sm:table-cell',
+    },
+    {
+      label: 'CPU',
+      // not yet measured: last, with a dash
+      cell: (r) =>
+        r.cpu === undefined ? (
+          <span className="text-muted-foreground">—</span>
+        ) : (
+          <span className={r.cpu === 0 ? 'text-muted-foreground' : 'font-medium'}>{formatShare(r.cpu)}</span>
+        ),
+      sort: (r) => r.cpu,
+      sortDescFirst: true,
+      className: 'text-right whitespace-nowrap tabular',
+    },
+    {
+      label: 'Memory',
+      cell: (r) => (r.p.kernel ? <span className="text-muted-foreground">—</span> : formatBytes(r.p.rss)),
+      sort: (r) => r.p.rss,
+      sortDescFirst: true,
+      className: 'text-right whitespace-nowrap tabular',
+    },
+  ];
 }
 
 function Body(): ReactElement {
   const [paused, setPaused] = useState(false);
   const [view, setView] = useState<ProcessView>('all');
   const [query, setQuery] = useState('');
-  const [sort, setSort] = useState<Sort>({ key: 'cpu', desc: true });
   const [opened, setOpened] = useState<ReadonlySet<string>>(new Set());
   const { snap, error, retry } = useProcesses(paused);
+  const ids = useId();
 
-  const rows = useMemo(() => (snap === undefined ? [] : shownRows(snap.rows, view, query, sort)), [snap, view, query, sort]);
-  const onSort = (key: SortKey): void => {
-    setSort((s) => (s.key === key ? { key, desc: !s.desc } : { key, desc: firstDirection(key) }));
-  };
-  const toggle = (key: string): void => {
-    setOpened((was) => {
-      const next = new Set(was);
-      if (!next.delete(key)) next.add(key);
-      return next;
-    });
-  };
+  const rows = useMemo(() => (snap === undefined ? [] : shownRows(snap.rows, view, query)), [snap, view, query]);
+  const columns = useMemo(
+    () =>
+      processColumns(opened, ids, (key) => {
+        setOpened((was) => {
+          const next = new Set(was);
+          if (!next.delete(key)) next.add(key);
+          return next;
+        });
+      }),
+    [opened, ids],
+  );
   const kernel = snap?.rows.filter((r) => r.p.kernel).length ?? 0;
 
   return (
@@ -375,9 +346,9 @@ function Body(): ReactElement {
           ) : unsupported(error) ? (
             <Note tone="info" icon={<TriangleAlertIcon />} className="px-5 py-4">
               This router’s firmware can’t list its processes yet: it comes with a newer MilkFlint.{' '}
-              <a href={href('upgrade')} className="font-medium link">
+              <Link {...pageLink('upgrade')} className="font-medium link">
                 Upgrade
-              </a>
+              </Link>
             </Note>
           ) : (
             <Note tone="destructive" icon={<TriangleAlertIcon />} title="Couldn’t read the process list" className="px-5 py-4">
@@ -388,38 +359,21 @@ function Body(): ReactElement {
             </Note>
           )
         ) : (
-          <table className="w-full border-separate border-spacing-0 text-sm">
-            <caption className="sr-only">Processes</caption>
-            <thead>
-              <tr>
-                <SortHead label="Name" sortKey="name" sort={sort} onSort={onSort} className="w-full first:pl-11" />
-                <SortHead label="User" sortKey="user" sort={sort} onSort={onSort} className="hidden sm:table-cell" />
-                <SortHead label="PID" sortKey="pid" sort={sort} onSort={onSort} className="hidden text-right sm:table-cell" />
-                <SortHead label="CPU" sortKey="cpu" sort={sort} onSort={onSort} className="text-right" />
-                <SortHead label="Memory" sortKey="memory" sort={sort} onSort={onSort} className="text-right" />
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <Row
-                  key={r.key}
-                  r={r}
-                  snap={snap}
-                  open={opened.has(r.key)}
-                  onToggle={() => {
-                    toggle(r.key);
-                  }}
-                />
-              ))}
-              {rows.length === 0 && (
-                <tr>
-                  <td colSpan={5} className="px-5 py-8 text-center text-muted-foreground">
-                    No process matches.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+          <DataTable
+            label="Processes"
+            columns={columns}
+            rows={rows}
+            rowKey={(r) => r.key}
+            empty="No process matches."
+            initialSort={{ id: 'CPU', desc: true }}
+            framed={false}
+            cards={false}
+            stickyHeader
+            rowProps={(r) => (opened.has(r.key) ? { className: 'bg-muted/50 hover:bg-muted/50' } : {})}
+            detail={(r) => opened.has(r.key) && <Details r={r} snap={snap} id={`${ids}-${r.key}`} />}
+            // an opened row's details share its shade
+            className="[&_tr:has(>td>[data-details])]:bg-muted/50"
+          />
         )}
       </div>
 

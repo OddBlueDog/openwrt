@@ -1,6 +1,6 @@
 import type { ReactElement } from 'react';
 import { formatBitrate, formatNumber } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import type { Dashboard } from './use-dashboard';
 import { cn } from '@/lib/utils';
 import { Dot, OffNote, Way, Widget, WidgetLink } from './widget';
@@ -15,7 +15,7 @@ export function RadiosCard({ d }: { d: Dashboard }): ReactElement {
   const on = radios.filter((r) => !r.off).length;
   // one column: each band's channel and devices on a line; wider: the bands side by side, in full
   const narrow = useWidgetInfo().size.w === 1;
-  const link = <WidgetLink href={href('wifi')}>Wi-Fi settings</WidgetLink>;
+  const link = <WidgetLink to={pageLink('wifi')}>Wi-Fi settings</WidgetLink>;
   return (
     <Widget
       status={on === radios.length ? `${String(on)} turned on` : `${String(on)} of ${String(radios.length)} turned on`}

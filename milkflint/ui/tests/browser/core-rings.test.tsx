@@ -3,11 +3,13 @@
 // figure a core can show, one digit to three.
 import 'virtual:milkflint-themes.css';
 import '@/styles.css';
-import { describe, expect, test, vi } from 'vitest';
-import { cleanup, render } from 'vitest-browser-react';
+import { afterAll, describe, expect, test, vi } from 'vitest';
+import { cleanup } from 'vitest-browser-react';
 import { CoreRings } from '@/features/dashboard/core-rings';
 import { pickableThemes, setThemeId } from '@/lib/theme';
+import { DEFAULT_THEME_ID } from '@/theme/themes';
 import type * as Ubus from '@/lib/ubus';
+import { renderWithProviders } from './render';
 
 // the pretend router in place of lib/ubus.ts's call (choosing a theme saves it), loaded when a call is made: see
 // home-fit.test.tsx
@@ -24,13 +26,17 @@ vi.mock('@/lib/ubus', async (importOriginal) => {
   };
 });
 
+// (the theme each test chooses is kept in localStorage, which the test files run after this one in the same
+// browser read as theirs: the default goes back after the last, as its explanations show inline)
+afterAll(() => setThemeId(DEFAULT_THEME_ID));
+
 /** Idle to flat out, and the widest two digits. */
 const CORES = [0, 0.06, 0.12, 0.88, 0.92, 1];
 
 describe.each(pickableThemes().map((t) => ({ name: t.name, id: t.id })))('$name', ({ id }) => {
   test('every figure is inside its ring', async () => {
     await setThemeId(id);
-    const screen = await render(<CoreRings cores={CORES} />);
+    const screen = await renderWithProviders(<CoreRings cores={CORES} />);
     const rings = [...screen.container.querySelectorAll('li')];
     expect(rings.length).toBe(CORES.length);
     const out = rings.flatMap((li) => {

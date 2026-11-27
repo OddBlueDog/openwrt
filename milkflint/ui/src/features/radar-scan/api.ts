@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { getRadar, getWirelessStatus, type Radar } from '@/lib/api/wireless';
 import { call } from '@/lib/ubus';
 
 const pulse = z.object({
@@ -107,4 +108,20 @@ export function getChipReports(phy: string): Promise<ChipReport[] | null> {
   return call('milkflint.radarscan', 'reports', { phy }, z.object({ reports: z.array(report).nullable() })).then(
     (r) => r.reports,
   );
+}
+
+/** The 5 GHz radio a scan listens with, and its radar state; null when there is none. */
+export interface Radio {
+  radio: string;
+  phy: string;
+  radar: Radar | undefined;
+}
+
+export async function loadRadio(): Promise<Radio | null> {
+  const status = await getWirelessStatus();
+  const entry = Object.entries(status).find(([, r]) => r.config?.band === '5g' && r.iwinfo?.phy !== undefined);
+  if (entry === undefined) return null;
+  const [radio, r] = entry;
+  const phy = r.iwinfo?.phy ?? '';
+  return { radio, phy, radar: await getRadar(phy).catch(() => undefined) };
 }

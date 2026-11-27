@@ -10,6 +10,7 @@
 // These sites send no Timing-Allow-Origin, so a fetch's Resource Timing is
 // one lumped duration: nothing finer can be told apart. The router looks up
 // the same names itself (bin/bench-dns, the same list).
+import { parseSites as parseHostList, validHost } from '@/lib/hostnames';
 import type { Clock } from './clock';
 import type { RunRecord } from './member';
 import { sleep } from './probes';
@@ -39,28 +40,15 @@ export const SITES: readonly Site[] = [
 /** A plan's own sites, at most this many, as the router takes them. */
 export const MAX_CUSTOM_SITES = 8;
 
-const HOST = /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/;
+export { validHost };
 
-export function validHost(s: string): boolean {
-  return s.length <= 253 && HOST.test(s);
-}
-
-/** Host names typed into a list (commas, spaces or new lines between them): the good ones, once each, and the rest. */
-export function parseSites(text: string): { sites: string[]; bad: string[] } {
-  const sites: string[] = [];
-  const bad: string[] = [];
-  for (const raw of text.split(/[\s,]+/)) {
-    const name = raw
-      .trim()
-      .toLowerCase()
-      .replace(/^https?:\/\//, '')
-      .replace(/\/.*$/, '')
-      .replace(/\.$/, '');
-    if (name === '') continue;
-    if (!validHost(name)) bad.push(raw.trim());
-    else if (!sites.includes(name) && !SITES.some((s) => s.site === name || s.host === name)) sites.push(name);
-  }
-  return { sites, bad };
+/** A plan's own sites as typed: the first MAX_CUSTOM_SITES good ones not in the fixed list (`over` when there were more), and the rest. */
+export function parseSites(text: string): ReturnType<typeof parseHostList> {
+  return parseHostList(
+    text,
+    MAX_CUSTOM_SITES,
+    SITES.flatMap((s) => [s.site, s.host]),
+  );
 }
 
 /** The fixed list and a plan's own sites (loaded as they're named). */

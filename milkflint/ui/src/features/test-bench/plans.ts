@@ -71,6 +71,38 @@ export const defaultCustom: CustomPlan = {
 export const MIN_PHASE_S = 3;
 export const MAX_PHASE_S = 60;
 export const MAX_RUN_S = 600;
+/** The longest a run's name can be; the router refuses more. */
+export const MAX_RUN_NAME = 48;
+
+/** `s` cut to at most `max` UTF-8 bytes (the router counts bytes), at a code-point boundary. */
+function cutBytes(s: string, max: number): string {
+  const enc = new TextEncoder();
+  let out = '';
+  let n = 0;
+  for (const ch of s) {
+    n += enc.encode(ch).length;
+    if (n > max) break;
+    out += ch;
+  }
+  return out;
+}
+
+/** `s` with each control character (U+0000 to U+001F, U+007F) replaced by a space. */
+function noControls(s: string): string {
+  return Array.from(s, (ch) => {
+    const c = ch.charCodeAt(0);
+    return c < 0x20 || c === 0x7f ? ' ' : ch;
+  }).join('');
+}
+
+/** The run's name: what was typed, trimmed and cut to MAX_RUN_NAME, or the plan's title when that's blank. */
+export function runName(typed: string | undefined, planTitle: string): string {
+  const t = cutBytes(noControls(typed ?? '').trim(), MAX_RUN_NAME).trim();
+  return t === '' ? planTitle : t;
+}
+/** The data limit each device may use, in MB; 0 in the options means follow the plan's own figure. */
+export const MIN_BUDGET_MB = 10;
+export const MAX_BUDGET_MB = 100_000;
 
 /** Streams a loader opens: a download, an upload, each of several loaders. */
 const STREAMS = { down: 6, up: 4, shared: 3 } as const;

@@ -1,12 +1,13 @@
 // Pieces both VPN pages use: a line of what a setting does (a tick or a
 // cross), the data a tunnel has carried each way, an answer cell, and what
 // shows when the image has no WireGuard.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ArrowDownIcon, ArrowUpIcon, CheckIcon, ChevronRightIcon, PackageXIcon, XIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { formatBytes } from '@/lib/format';
-import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 
 export function CheckItem({ yes, children }: { yes: boolean; children: ReactNode }): ReactElement {
@@ -65,9 +66,9 @@ export function NoWireGuard(): ReactElement {
           interface. MilkFlint’s releases include both: upgrade to get them.
         </p>
         <Button size="sm" className="mt-2" asChild>
-          <a href={href('upgrade')}>
+          <Link {...pageLink('upgrade')}>
             Upgrade <ChevronRightIcon />
-          </a>
+          </Link>
         </Button>
       </AlertDescription>
     </Alert>

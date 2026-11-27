@@ -5,19 +5,22 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { usePoll } from '@/hooks/use-poll';
+import { useLive } from '@/lib/query/use-live';
 import { formatBytes } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
-import { deleteRun, getRuns, memberRuns, type RunSummary } from './api';
+import { deleteRun, type RunSummary } from './api';
 import { parseExport } from './export';
 import { clockText } from './phases';
-import { type RunData, type RunReader, useRunData } from './run-data';
+import { benchQueries, useBenchWrite, useRunData } from './queries';
+import type { RunData, RunReader } from './run-data';
 import { RunReport } from './run-report';
 
 const when = (epoch: number): string =>
   new Date(epoch * 1000).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 
 function DeleteButton({ run, onDeleted }: { run: RunSummary; onDeleted: () => void }): ReactElement {
+  // the list of runs is asked again once it went through
+  const write = useBenchWrite();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -61,17 +64,19 @@ function DeleteButton({ run, onDeleted }: { run: RunSummary; onDeleted: () => vo
               disabled={busy}
               onClick={() => {
                 setBusy(true);
-                deleteRun(run.id).then(
-                  () => {
-                    setBusy(false);
-                    setOpen(false);
-                    onDeleted();
-                  },
-                  (err: unknown) => {
-                    setBusy(false);
-                    setError(errorMessage(err));
-                  },
-                );
+                write
+                  .mutateAsync(() => deleteRun(run.id))
+                  .then(
+                    () => {
+                      setBusy(false);
+                      setOpen(false);
+                      onDeleted();
+                    },
+                    (err: unknown) => {
+                      setBusy(false);
+                      setError(errorMessage(err));
+                    },
+                  );
               }}
             >
               Delete
@@ -90,8 +95,7 @@ function DeleteButton({ run, onDeleted }: { run: RunSummary; onDeleted: () => vo
  */
 export function HistoryCard({ reader }: { reader: RunReader }): ReactElement {
   const admin = 'admin' in reader;
-  const key = admin ? 'admin' : reader.session;
-  const { data: runs, error, refresh } = usePoll(() => (admin ? getRuns() : memberRuns(reader.session)), 15000, key);
+  const { data: runs, error } = useLive(benchQueries.runs(reader));
   const [openId, setOpenId] = useState<string>();
   const [file, setFile] = useState<{ data: RunData; name: string; exported: string }>();
   const [fileError, setFileError] = useState<string>();
@@ -150,7 +154,7 @@ export function HistoryCard({ reader }: { reader: RunReader }): ReactElement {
                 <li key={r.id} className={cn('flex flex-wrap items-center gap-x-4 gap-y-2 px-5 py-2.5', shown && 'bg-muted/40')}>
                   <div className="flex min-w-0 flex-1 flex-col">
                     <span className="flex flex-wrap items-center gap-2 text-sm font-medium">
-                      {r.plan ?? 'Run'}
+                      <span className="min-w-0 break-all">{r.plan ?? 'Run'}</span>
                       {r.dry === true && <Badge variant="secondary">Rehearsal</Badge>}
                       {on && <Badge variant="success">On now</Badge>}
                       {!on && r.ended !== 'completed' && <Badge variant="warning">Ended early</Badge>}
@@ -179,7 +183,6 @@ export function HistoryCard({ reader }: { reader: RunReader }): ReactElement {
                         run={r}
                         onDeleted={() => {
                           if (shown) setOpenId(undefined);
-                          refresh();
                         }}
                       />
                     )}

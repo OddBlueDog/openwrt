@@ -1,5 +1,5 @@
 import { LoaderCircleIcon } from 'lucide-react';
-import type { ReactElement } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 
@@ -10,12 +10,15 @@ export function SaveBar({
   invalid,
   onSave,
   onRevert,
+  extra,
 }: {
   visible: boolean;
   busy: boolean;
   invalid: boolean;
   onSave: () => void;
   onRevert: () => void;
+  /** another way to save, beside Save: "Save these settings as a profile" */
+  extra?: ReactNode;
 }): ReactElement | null {
   if (!visible && !busy) return null;
   return (
@@ -27,10 +30,11 @@ export function SaveBar({
       <p aria-live="polite" className={cn('text-sm', invalid ? 'font-medium text-destructive' : 'text-muted-foreground')}>
         {invalid ? 'Fix the highlighted fields to save.' : busy ? 'Applying your changes…' : 'You have unsaved changes.'}
       </p>
-      <div className="flex gap-2">
+      <div className="flex flex-wrap gap-2">
         <Button variant="ghost" size="sm" onClick={onRevert} disabled={busy}>
           Discard
         </Button>
+        {extra}
         <Button size="sm" onClick={onSave} disabled={busy || invalid}>
           {busy && <LoaderCircleIcon className="animate-spin" />}
           Save &amp; apply

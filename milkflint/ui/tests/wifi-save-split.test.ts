@@ -18,7 +18,7 @@ import {
   type RadioForm,
   radarNote,
   validateDriver,
-  validateNetwork,
+  networkErrors,
 } from '../src/features/wifi/model.ts';
 import { twtOf } from '../src/features/wifi/twt.ts';
 import type { Change } from '../src/lib/api/uci.ts';
@@ -135,7 +135,7 @@ test('each page sees only its own edits as unsaved', () => {
 
 test('validation is split the same way', () => {
   const f = band('radio0', '2g', { key: 'short', airtimeBands: { ...airtimeBandDefaults('2g'), full: 'x', auto: 'manual' } });
-  assert.deepEqual(Object.keys(validateNetwork(f)), ['key']);
+  assert.deepEqual(Object.keys(networkErrors(f)), ['key']);
   assert.ok(Object.keys(validateDriver(f)).includes('full'));
   // with the policy off its settings aren't saved, so they can't block a save
   assert.deepEqual(validateDriver({ ...f, airtime: false }), {});

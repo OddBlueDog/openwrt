@@ -14,7 +14,7 @@ export const keywords: Partial<Readonly<Record<FeatureId, string>>> = {
   'wifi-scan': 'scan neighbours nearby interference channel survey radar dfs weather',
   clients: 'devices dhcp leases reserve block rename hostname mac',
   'device-control': 'parental controls kids children family bedtime schedule pause internet block screen time safesearch youtube',
-  lan: 'lan dhcp range subnet router address ip',
+  lan: 'lan dhcp range subnet router address ip leases dhcpv6 duid connections conntrack',
   ipv6: 'ipv6 slaac dhcpv6 prefix delegation ula',
   'remote-access': 'wireguard vpn server phone laptop away from home',
   'vpn-client': 'wireguard vpn client provider privacy',
@@ -31,10 +31,12 @@ export const keywords: Partial<Readonly<Record<FeatureId, string>>> = {
   'wifi-driver':
     'airtime fairness twt target wake time spatial reuse bss colour mu edca mu-mimo mimo ofdma muru downlink uplink multicast dscp qos map beamforming driver',
   'system-overview': 'hardware model firmware memory storage about',
-  'admin-password': 'root login password ssh luci https certificate tls ssl router access',
+  'admin-password':
+    'root login password ssh luci https certificate tls ssl router access dropbear keys authorized_keys ed25519 apk repository package keys',
   upgrade: 'firmware update sysupgrade flash image',
   time: 'hostname name time zone ntp clock',
   schedules: 'cron crontab reboot restart schedule wifi off command job timer',
+  startup: 'init initscripts init.d services daemons boot rc.local local startup start stop restart enable disable',
   themes: 'theme appearance look colour color colours colors palette dark light mode honey plain custom accent contrast',
   logs: 'syslog kernel log crash kfence debug',
   'backup-reset': 'backup restore factory reset restart reboot',

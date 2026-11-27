@@ -1,10 +1,10 @@
 import { type ReactElement, useState } from 'react';
-import { niceCeil } from '@/components/charts/path';
+import { niceCeil } from '@/components/charts/scale';
 import { formatBitrate } from '@/lib/format';
 import { Segmented } from '@/components/ui/segmented';
 import { cn } from '@/lib/utils';
 import { agoLabels } from './model';
-import { TimeChart } from './time-chart';
+import { TimeChart } from '@/components/charts/time-chart';
 import { type Dashboard, HISTORY, POLL_MS } from './use-dashboard';
 import { Widget } from './widget';
 import { useWidgetInfo } from './widget-info';

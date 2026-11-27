@@ -1,8 +1,8 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog';
+import { componentQueries } from '@/components/queries';
+import { useLive } from '@/lib/query/use-live';
 import { MenuIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useEffect, useRef, useState } from 'react';
-import { usePoll } from '@/hooks/use-poll';
-import { getBoard } from '@/lib/api/system';
 import type { Route } from '@/lib/router';
 import { refreshRouterMode } from '@/lib/router-mode';
 import { useSession } from '@/lib/session';
@@ -20,7 +20,7 @@ import { syncThemes } from '@/lib/theme';
  * On a phone it's always a bar naming the page, with the menu in a drawer.
  */
 export function AppShell({ route, title, children }: { route: Route; title: string; children: ReactNode }): ReactElement {
-  const board = usePoll(getBoard, 60_000).data;
+  const board = useLive(componentQueries.board()).data;
   const [menuOpen, setMenuOpen] = useState(false);
   const phoneBar = useRef<HTMLElement>(null);
   useStickyOffset(phoneBar);

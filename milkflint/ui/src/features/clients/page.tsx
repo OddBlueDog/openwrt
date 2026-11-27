@@ -11,14 +11,14 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { useApply } from '@/hooks/use-apply';
-import { usePoll } from '@/hooks/use-poll';
-import { href } from '@/lib/router';
+import { useLive } from '@/lib/query/use-live';
+import { pageLink } from '@/lib/router';
 import { useRouterMode } from '@/lib/router-mode';
 import { Answer, AnswerCell, Figure, GoLink } from '@/components/page-kit';
-import { loadClients } from './api';
 import { DeviceSheet } from './device-sheet';
 import { DevicesList } from './devices-list';
 import { type DeviceCounts, deviceCounts, matches } from './model';
+import { clientsQueries } from './queries';
 
 const plural = (n: number, one: string, many: string): string => `${String(n)} ${n === 1 ? one : many}`;
 
@@ -42,7 +42,7 @@ function DevicesAnswer({ counts }: { counts: DeviceCounts }): ReactElement {
       <AnswerCell
         title="On Wi-Fi"
         value={<Figure>{counts.wifi}</Figure>}
-        action={<GoLink href={href('wifi')}>Wi-Fi networks</GoLink>}
+        action={<GoLink to={pageLink('wifi')}>Wi-Fi networks</GoLink>}
       >
         {counts.bands.length === 0 ? 'None right now.' : counts.bands.map((b) => `${String(b.count)} on ${b.band}`).join(' · ')}
       </AnswerCell>
@@ -54,8 +54,9 @@ function DevicesAnswer({ counts }: { counts: DeviceCounts }): ReactElement {
 }
 
 export function ClientsPage(): ReactElement {
-  const { data, error, loading, refresh } = usePoll(loadClients, 5000);
-  const { state, apply } = useApply(refresh);
+  const { data, error, loading, refresh } = useLive(clientsQueries.devices());
+  // a save refreshes the list (useApply invalidates every read)
+  const { state, apply } = useApply();
   const mode = useRouterMode();
   const [editing, setEditing] = useState<string>();
   const [query, setQuery] = useState('');
@@ -119,7 +120,7 @@ export function ClientsPage(): ReactElement {
                       <p className="text-muted-foreground">
                         No devices yet. They show up here when they join the Wi-Fi or plug into a LAN port.
                       </p>
-                      <GoLink href={href('wifi')}>Wi-Fi networks</GoLink>
+                      <GoLink to={pageLink('wifi')}>Wi-Fi networks</GoLink>
                     </>
                   ) : (
                     <>

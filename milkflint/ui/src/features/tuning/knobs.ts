@@ -22,21 +22,24 @@
 //   limit, from the high limit to 50,000 µs; unset 1.2 times the high limit,
 //   or mac80211's own with its limits.
 // No imports from the app, so the tests (ui/tests) load it as it is.
+import { z } from 'zod';
 
-export interface Knobs {
-  wifiAll: boolean;
-  ringsRt: boolean;
+export const knobFields = z.object({
+  wifiAll: z.boolean(),
+  ringsRt: z.boolean(),
   /** µs as text; '' for the default, 40 */
-  rxDelay: string;
+  rxDelay: z.string(),
   /** ignored marks as text; '' for the default, 8; '0' never drops */
-  ecnDrop: string;
+  ecnDrop: z.string(),
   /** percent of the target as text; '' for the default, 100; '0' off */
-  l4s: string;
+  l4s: z.string(),
   /** sends as text; '' for the default, 15 */
-  retries: string;
+  retries: z.string(),
   /** '1' on, '0' off; '' for automatic, on with Smart Queue's restored DSCP */
-  voAggr: string;
-}
+  voAggr: z.string(),
+});
+
+export type Knobs = z.infer<typeof knobFields>;
 
 export const knobDefaults: Knobs = { wifiAll: true, ringsRt: true, rxDelay: '', ecnDrop: '', l4s: '', retries: '', voAggr: '' };
 

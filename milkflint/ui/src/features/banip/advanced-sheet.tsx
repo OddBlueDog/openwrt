@@ -16,7 +16,8 @@ import {
   ShieldIcon,
   UploadIcon,
 } from 'lucide-react';
-import { type ChangeEvent, type ReactElement, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { type ChangeEvent, type ReactElement, type ReactNode, useId, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -28,7 +29,6 @@ import { Opt } from '../firewall/sheet-parts';
 import {
   type BanipConfig,
   customFile,
-  getMail,
   importFeeds,
   installPackage,
   type MailAccount,
@@ -36,6 +36,7 @@ import {
   saveMail,
   testMail,
 } from './api';
+import { banipQueries, useBanipWrite } from './queries';
 import {
   checkValue,
   effective,
@@ -340,7 +341,6 @@ const FIELDS: Record<TabId, readonly { title: string; fields: readonly Def[] }[]
           label: 'Remove duplicates',
           hint: 'An address in two lists is kept in the first only: less memory. On by default.',
         },
-        { name: 'ban_feedcomplete', label: 'Keep whole', hint: 'Lists left out of that, so each shows all its own entries.' },
         {
           name: 'ban_nicelimit',
           label: 'CPU priority',
@@ -643,12 +643,14 @@ function LogTerms({ o, set }: { o: Options; set: (n: OptionName, v: OptionValue)
 function CustomFile({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): ReactElement {
   const [busy, setBusy] = useState<string>();
   const [note, setNote] = useState<string>();
+  // banIP's reads are asked again once a write went through
+  const write = useBanipWrite();
   const file = useRef<HTMLInputElement>(null);
   const own = (c.catalogue ?? []).filter((f) => f.own);
   const run = (what: string, fn: () => Promise<unknown>, done: string): void => {
     setBusy(what);
     setNote(undefined);
-    fn().then(
+    write.mutateAsync(fn).then(
       () => {
         setBusy(undefined);
         setNote(done);
@@ -749,33 +751,31 @@ function CustomFile({ c, onChanged }: { c: BanipConfig; onChanged: () => void })
 }
 
 function MailAccountForm({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): ReactElement {
-  const [m, setM] = useState<MailAccount>();
   const [f, setF] = useState<MailSettings>({ host: '', port: 587, tls: 'starttls', user: '', password: '', from: '' });
   const [busy, setBusy] = useState<string>();
   const [note, setNote] = useState<string>();
+  // banIP's reads are asked again once a write went through
+  const write = useBanipWrite();
   const installed = c.tools?.msmtp === true;
   const install = c.install;
-  useEffect(() => {
-    if (!installed) return;
-    getMail().then(
-      (x) => {
-        setM(x);
-        setF({
-          host: x.host ?? '',
-          port: x.port ?? 587,
-          tls: x.tls ?? 'starttls',
-          user: x.user ?? '',
-          password: '',
-          from: x.from ?? '',
-        });
-      },
-      () => undefined,
-    );
-  }, [installed]);
+  // the account as saved (read once msmtp is there): the form starts from the first read
+  const m = useQuery({ ...banipQueries.mail(), enabled: installed }).data;
+  const [base, setBase] = useState<MailAccount>();
+  if (m !== undefined && base === undefined) {
+    setBase(m);
+    setF({
+      host: m.host ?? '',
+      port: m.port ?? 587,
+      tls: m.tls ?? 'starttls',
+      user: m.user ?? '',
+      password: '',
+      from: m.from ?? '',
+    });
+  }
   const run = (what: string, fn: () => Promise<unknown>, done: string): void => {
     setBusy(what);
     setNote(undefined);
-    fn().then(
+    write.mutateAsync(fn).then(
       () => {
         setBusy(undefined);
         setNote(done);

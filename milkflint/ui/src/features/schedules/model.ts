@@ -4,6 +4,7 @@
 // own) and when; the edits the Tasks view makes, each to its own line of the
 // file, leaving every other line as it was; and the next one to run. Plain
 // data, so the tests check it.
+import { z } from 'zod';
 import {
   clock,
   crontabText,
@@ -198,4 +199,19 @@ export function whenText(r: NextRun): string {
             ? `next ${name}`
             : `on ${d.toLocaleDateString('en-GB', { timeZone: 'UTC', day: 'numeric', month: 'long' })}`;
   return `${on} at ${time}`;
+}
+
+// The page's form: the crontab's text, as the Tasks and Crontab views edit
+// it. A line cron won't read blocks the save, unless it was there already
+// (in the file as saved, `before`): cron skips that one as it did.
+const crontabFields = z.object({ text: z.string() });
+
+export type CrontabForm = z.infer<typeof crontabFields>;
+
+export function crontabFormSchema(before: string): z.ZodType<CrontabForm, CrontabForm> {
+  const old = new Set(parseCrontab(before).flatMap((l) => (l.error === undefined ? [] : [l.text])));
+  return crontabFields.superRefine((f, ctx) => {
+    const bad = parseCrontab(f.text).find((l) => l.error !== undefined && !old.has(l.text));
+    if (bad?.error !== undefined) ctx.addIssue({ code: 'custom', path: ['text'], message: bad.error });
+  });
 }

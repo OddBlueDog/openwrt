@@ -3,6 +3,10 @@
 // is the layout (layout.ts): the theme's, until the user arranges their own
 // with the pencil at the top right, which is kept on the router for every
 // device and used in every theme. The widgets are in widgets.tsx.
+import { dashboardQueries } from './queries';
+import { useRead } from '@/lib/query/use-read';
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import {
   ActivityIcon,
   ClockIcon,
@@ -21,10 +25,7 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
-import { useLoad } from '@/hooks/use-load';
 import { firmwareName } from '@/lib/api/system';
-import { getConfig } from '@/lib/api/uci';
-import { href } from '@/lib/router';
 import { useRouterMode } from '@/lib/router-mode';
 import { useOnRequest } from '@/lib/presentation';
 import { useTheme } from '@/lib/theme';
@@ -32,7 +33,6 @@ import { cn, errorMessage } from '@/lib/utils';
 import { AdGuardHomeNote } from '../adguardhome/dashboard-note';
 import { BanipNote } from '../banip/dashboard-note';
 import { type Live, useLive } from '../network-quality/live';
-import { zoneChosen } from '../time/zone';
 import { AddWidgetSheet } from './add-widget-sheet';
 import { type Editing, HomeGrid } from './home-grid';
 import {
@@ -71,11 +71,9 @@ function Live({ stale }: { stale: boolean }): ReactElement {
   );
 }
 
-const loadSystem = async (): Promise<boolean> => zoneChosen((await getConfig('system')).find((s) => s['.type'] === 'system'));
-
 /** Shown until a time zone is picked, on the Name & time page or in LuCI. */
 function SetupNote(): ReactElement | null {
-  const { data: chosen } = useLoad(loadSystem);
+  const { data: chosen } = useRead(dashboardQueries.timeZoneChosen());
   if (chosen !== false) return null;
   return (
     <Alert variant="info" className="py-2.5">
@@ -85,9 +83,9 @@ function SetupNote(): ReactElement | null {
           <span className="font-medium">Name your router and choose its time zone.</span> Schedules and logs follow its clock,
           which is on UTC until you choose.
         </span>
-        <a href={href('time')} className="inline-flex min-h-6 items-center font-medium link">
+        <Link {...pageLink('time')} className="inline-flex min-h-6 items-center font-medium link">
           Name &amp; time
-        </a>
+        </Link>
       </AlertDescription>
     </Alert>
   );

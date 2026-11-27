@@ -5,7 +5,7 @@ import 'virtual:milkflint-themes.css';
 import '@/styles.css';
 import { type ReactElement, useState } from 'react';
 import { afterEach, expect, test } from 'vitest';
-import { cleanup, render } from 'vitest-browser-react';
+import { cleanup } from 'vitest-browser-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import type { MuruStatus } from '@/lib/api/wireless';
 import { airtimeBandDefaults } from '@/features/wifi/airtime';
@@ -13,6 +13,7 @@ import type { RadioForm } from '@/features/wifi/model';
 import { MURU_DEFAULTS } from '@/features/wifi/muru';
 import { twtOf } from '@/features/wifi/twt';
 import { MuruSection } from '@/features/wifi-driver/sections';
+import { renderWithProviders } from './render';
 
 function sampleBand(more: Partial<RadioForm> = {}): RadioForm {
   return {
@@ -89,7 +90,7 @@ afterEach(async () => {
 });
 
 test('master toggle reveals download (on) and upload (off with warning), and collapses when turned off', async () => {
-  const screen = await render(<Harness />);
+  const screen = await renderWithProviders(<Harness />);
   const master = screen.getByRole('switch', { name: 'MU-MIMO & OFDMA' });
   const mimoDl = screen.getByRole('switch', { name: 'Downlink MU-MIMO' });
   const ofdmaDl = screen.getByRole('switch', { name: 'Downlink OFDMA' });
@@ -129,7 +130,7 @@ test('master toggle reveals download (on) and upload (off with warning), and col
 });
 
 test('the last flag switched off turns the master off too', async () => {
-  const screen = await render(<Harness />);
+  const screen = await renderWithProviders(<Harness />);
   await screen.getByRole('switch', { name: 'Downlink MU-MIMO' }).click();
   await screen.getByRole('switch', { name: 'Downlink OFDMA' }).click();
   await expect.element(screen.getByRole('switch', { name: 'MU-MIMO & OFDMA' })).toHaveAttribute('aria-checked', 'false');
@@ -137,13 +138,13 @@ test('the last flag switched off turns the master off too', async () => {
 });
 
 test('MU-MIMO off in Networks & radios: the switch says so and "In use now" leaves it out', async () => {
-  const screen = await render(<Harness band={{ muMimo: false }} />);
+  const screen = await renderWithProviders(<Harness band={{ muMimo: false }} />);
   await expect.element(screen.getByText(/Needs beamforming and MU-MIMO on/)).toBeVisible();
   await expect.element(screen.getByText('In use now: download OFDMA.')).toBeVisible();
 });
 
 test('a Wi-Fi 5 band has one switch, downlink MU-MIMO', async () => {
-  const screen = await render(<Harness band={{ modePrefix: 'VHT', width: '80' }} />);
+  const screen = await renderWithProviders(<Harness band={{ modePrefix: 'VHT', width: '80' }} />);
   const mimoDl = screen.getByRole('switch', { name: 'Downlink MU-MIMO' });
   await expect.element(mimoDl).toHaveAttribute('aria-checked', 'true');
   await expect.element(screen.getByRole('switch', { name: 'MU-MIMO & OFDMA' })).not.toBeInTheDocument();
@@ -165,17 +166,17 @@ test('a Wi-Fi 5 band has one switch, downlink MU-MIMO', async () => {
 });
 
 test('an older Wi-Fi mode gets a pointer to Networks & radios, no switches', async () => {
-  const screen = await render(<Harness band={{ modePrefix: 'HT', width: '40' }} />);
+  const screen = await renderWithProviders(<Harness band={{ modePrefix: 'HT', width: '40' }} />);
   await expect.element(screen.getByText(/Needs Wi-Fi 5 or newer/)).toBeVisible();
   await expect.element(screen.getByRole('link', { name: 'Change it on Networks & radios' })).toBeVisible();
   await expect.element(screen.getByRole('switch', { name: 'Downlink MU-MIMO' })).not.toBeInTheDocument();
 });
 
 test('nothing "in use" is shown while the radio is off or the driver has no such file', async () => {
-  const off = await render(<Harness now={{ ...DEFAULT_NOW, running: false }} />);
+  const off = await renderWithProviders(<Harness now={{ ...DEFAULT_NOW, running: false }} />);
   await expect.element(off.getByText(/In use now/)).not.toBeInTheDocument();
   await cleanup();
-  const unsupported = await render(
+  const unsupported = await renderWithProviders(
     <Harness now={{ running: true, supported: false, ofdma_dl: null, ofdma_ul: null, mimo_dl: null, mimo_ul: null }} />,
   );
   await expect.element(unsupported.getByText(/In use now/)).not.toBeInTheDocument();

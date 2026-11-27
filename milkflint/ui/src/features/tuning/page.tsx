@@ -5,8 +5,10 @@
 // the diagnostics that change how the router runs while chasing a problem,
 // and the live views of where the work runs. One save bar saves them all;
 // what each writes is in ./model.ts and ../logs/api.ts.
+import { useQuery } from '@tanstack/react-query';
 import { ChevronDownIcon, LoaderCircleIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useCallback, useEffect, useId, useRef, useState } from 'react';
+import { z } from 'zod';
 import { ApplyStatus } from '@/components/apply-status';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
@@ -14,24 +16,50 @@ import { SaveBar } from '@/components/save-bar';
 import { Alert, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
 import { useNetworkLive } from '@/hooks/use-network-live';
-import { usePoll } from '@/hooks/use-poll';
+import { evaluate } from '@tanstack/react-form';
 import { reboot } from '@/lib/api/system';
 import type { Change } from '@/lib/api/uci';
+import { formErrors } from '@/lib/form/errors';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { useLive } from '@/lib/query/use-live';
 import { useSubPath } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { waitForRouterAndReload } from '../backup-reset/api';
-import { getLogSettings, type LogSettings, logSettingsChanges } from '../logs/api';
-import { getTuningStatus } from './api';
+import { type LogSettings, logSettingsChanges } from '../logs/api';
 import { DiagnosticsCard } from './diagnostics';
 import { RestoreDialog, WedDialog } from './dialogs';
 import { OffloadCard, SteeringCard } from './essentials';
 import { AqlCard, CpuCard, EcnCard, GroCard } from './expert';
 import { WaitsCard, WorkCard } from './live';
-import { changedSettings, defaults, loadTuning, meaning, steeringInUse, toChanges, type TuningForm, validate } from './model';
+import {
+  changedSettings,
+  defaults,
+  type Errors,
+  meaning,
+  steeringInUse,
+  toChanges,
+  type TuningData,
+  type TuningForm,
+  tuningFieldNames,
+  tuningFormSchema,
+} from './model';
 import { InEffectNow } from './now';
+import { tuningQueries } from './queries';
 import { WedNotice } from './wed-notice';
+
+const TITLE = 'Performance tuning';
+const DESCRIPTION =
+  'How the router handles heavy traffic. Changes apply at once and Wi-Fi and the internet stay up, except hardware offloading (WED), which takes a restart.';
+
+/** The diagnostics' switches this page edits, of the Logs page's settings. */
+const diagnosticsSchema = z.object({ counters: z.boolean(), snapshot: z.boolean(), kfence: z.boolean() });
+type Diagnostics = z.infer<typeof diagnosticsSchema>;
+const diagnosticsOf = (logs: LogSettings | undefined): Diagnostics => ({
+  counters: logs?.counters ?? false,
+  snapshot: logs?.snapshot ?? false,
+  kfence: logs?.kfence ?? false,
+});
 
 /** A group of the page's cards under its own heading. */
 function Section({
@@ -63,15 +91,34 @@ function Section({
 }
 
 export function TuningPage(): ReactElement {
-  const { data, error, loading, reload } = useLoad(loadTuning);
-  const status = usePoll(getTuningStatus, 5000);
+  const { data, error, refetch } = useQuery(tuningQueries.settings());
+  if (data !== undefined) return <TuningSettings data={data} />;
+  return (
+    <>
+      <PageHeader title={TITLE} description={DESCRIPTION} />
+      <div className="flex flex-col gap-8">
+        {error === null ? (
+          <FormSkeleton />
+        ) : (
+          <LoadError
+            error={error}
+            retry={() => {
+              void refetch();
+            }}
+          />
+        )}
+      </div>
+    </>
+  );
+}
+
+function TuningSettings({ data }: { data: TuningData }): ReactElement {
+  const status = useLive(tuningQueries.status());
   const live = useNetworkLive(2000);
   // the diagnostics' switches, which live with the Logs page's settings
-  const { data: logs, error: logsError, reload: reloadLogs } = useLoad(getLogSettings);
+  const logsQuery = useQuery(tuningQueries.logSettings());
+  const logs = logsQuery.data;
   const subPath = useSubPath();
-  const refreshStatus = status.refresh;
-  const [edit, setEdit] = useState<TuningForm>();
-  const [diagEdit, setDiagEdit] = useState<LogSettings>();
   const [restoring, setRestoring] = useState(false);
   const [expertOpen, setExpertOpen] = useState(false);
   const expertPanel = useId();
@@ -90,79 +137,80 @@ export function TuningPage(): ReactElement {
     await waitForRouterAndReload();
   }, []);
   const onApplied = useCallback(() => {
-    setEdit(undefined);
-    setDiagEdit(undefined);
-    reload();
-    reloadLogs();
-    refreshStatus();
     if (restartAfter.current) {
       restartAfter.current = false;
       void restart();
     }
-  }, [reload, reloadLogs, refreshStatus, restart]);
+  }, [restart]);
   const { state, apply } = useApply(onApplied);
-  const form = edit ?? data?.form;
-  const diag = diagEdit ?? logs;
-  const errors = form === undefined ? {} : validate(form);
-  // Functional update: several edits in one render can't overwrite each other.
+  const diagSettings = useSettingsForm({ schema: diagnosticsSchema, saved: diagnosticsOf(logs), onSave: () => undefined });
+  const diag = useFormValues(diagSettings.form);
+  const diagDirty = logs !== undefined && !evaluate(diag, diagnosticsOf(logs));
+
+  // a save goes ahead, unless it turns WED on or off: that one says first what it changes
+  const save = (f: TuningForm, withDiagnostics: boolean): Promise<unknown> | undefined => {
+    const diagnostics = withDiagnostics && diagDirty ? logSettingsChanges({ ...logs, ...diag }, logs) : [];
+    const changes = [...toChanges(f, data), ...diagnostics];
+    if (f.wed !== data.form.wed) {
+      setWedSave({ to: f.wed, changes });
+      return undefined;
+    }
+    return apply(changes);
+  };
+  const settings = useSettingsForm({
+    schema: tuningFormSchema,
+    saved: data.form,
+    onSave: (values) => save(values, true),
+  });
+  const { form } = settings;
+  const values = useFormValues(form);
+  // the cards change the form through this, a field at a time
   const set = <K extends keyof TuningForm>(key: K, value: TuningForm[K]): void => {
-    setEdit((current) => {
-      const base = current ?? data?.form;
-      return base === undefined ? undefined : { ...base, [key]: value };
-    });
+    const current = form.store.state.values;
+    const next = { ...current, [key]: value };
+    for (const name of tuningFieldNames) {
+      if (!evaluate(current[name], next[name])) form.setFieldValue(name, next[name]);
+    }
   };
-  const setDiag = (key: 'counters' | 'snapshot' | 'kfence', value: boolean): void => {
-    setDiagEdit((current) => {
-      const base = current ?? logs;
-      return base === undefined ? undefined : { ...base, [key]: value };
-    });
+  const setDiag = (key: keyof Diagnostics, value: boolean): void => {
+    diagSettings.form.setFieldValue(key, value);
   };
-  const tuningDirty = edit !== undefined && data !== undefined && meaning(edit, data) !== meaning(data.form, data);
-  const diagDirty = diagEdit !== undefined && logs !== undefined && JSON.stringify(diagEdit) !== JSON.stringify(logs);
+  // the checks as they stand, shown as they're typed, as before
+  const errors: Errors = formErrors(tuningFormSchema, values);
+  // forms that mean the same are the same: a custom limit typed while it's off isn't a change
+  const tuningDirty = meaning(values, data) !== meaning(data.form, data);
   const dirty = tuningDirty || diagDirty;
-  const atDefaults = data !== undefined && meaning(data.form, data) === meaning(defaults, data);
+  const atDefaults = meaning(data.form, data) === meaning(defaults, data);
   const applying = state.phase === 'applying';
-  const changed = data === undefined ? [] : changedSettings(data.form, data);
-  const expertChanged =
-    form === undefined || data === undefined ? [] : changedSettings(form, data).filter((c) => c.tier === 'expert');
+  const changed = changedSettings(data.form, data);
+  const expertChanged = changedSettings(values, data).filter((c) => c.tier === 'expert');
+  const discard = (): void => {
+    settings.discard();
+    diagSettings.discard();
+  };
 
   // #/tuning/diagnostics (from the Logs page) lands on the diagnostics
   useEffect(() => {
-    if (subPath === 'diagnostics' && data !== undefined && logs !== undefined)
+    if (subPath === 'diagnostics' && logs !== undefined)
       document.getElementById('diagnostics')?.scrollIntoView({ block: 'start' });
-  }, [subPath, data, logs]);
-
-  // a save goes ahead, unless it turns WED on or off: that one says first what it changes
-  const save = (f: TuningForm, withDiagnostics: boolean): void => {
-    if (data === undefined) return;
-    const diagnostics = withDiagnostics && diagDirty ? logSettingsChanges(diagEdit, logs) : [];
-    const changes = [...toChanges(f, data), ...diagnostics];
-    if (f.wed !== data.form.wed) setWedSave({ to: f.wed, changes });
-    else void apply(changes);
-  };
+  }, [subPath, logs]);
 
   const restore = (): void => {
     setRestoring(false);
-    setEdit(undefined);
-    setDiagEdit(undefined);
-    if (data !== undefined && !atDefaults) save(defaults, false);
+    discard();
+    if (!atDefaults) void save(defaults, false);
   };
 
   // folded unless opened, or holding a field to fix
   const expertShown = expertOpen || Object.keys(errors).length > 0;
   // the RSS settings apply where RSS runs: not on a PPPoE line with Automatic, nor without the rings
   const rss =
-    form !== undefined &&
-    data !== undefined &&
-    steeringInUse(form.steering, { pppoe: data.pppoe, rssMissing: live.data !== undefined && live.data.rss === undefined }) ===
-      'rss';
+    steeringInUse(values.steering, { pppoe: data.pppoe, rssMissing: live.data !== undefined && live.data.rss === undefined }) ===
+    'rss';
 
   return (
     <>
-      <PageHeader
-        title="Performance tuning"
-        description="How the router handles heavy traffic. Changes apply at once and Wi-Fi and the internet stay up, except hardware offloading (WED), which takes a restart."
-      />
+      <PageHeader title={TITLE} description={DESCRIPTION} />
       <div className="flex flex-col gap-8">
         <ApplyStatus state={state} />
         {restarting && (
@@ -171,135 +219,124 @@ export function TuningPage(): ReactElement {
             <AlertTitle>Restarting the router…</AlertTitle>
           </Alert>
         )}
-        {data?.form.wed === true && (
+        {data.form.wed && (
           <WedNotice title="Hardware offloading (WED) is on">
             Smart Queue and the guest speed limits were turned off for it, and connections the hardware forwards pass by the Wi-Fi
             queue limits, airtime fairness, packet steering and GRO settings below. Turning it off under Flow offloading puts
             everything back.
           </WedNotice>
         )}
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading || form === undefined || data === undefined ? (
-          <FormSkeleton />
-        ) : (
-          <>
-            <InEffectNow
-              data={data}
-              status={status.data}
-              live={live.data}
-              diagnostics={logs}
-              changed={changed}
-              restoreDisabled={applying || (atDefaults && !dirty)}
-              onRestore={() => {
-                setRestoring(true);
+        <>
+          <InEffectNow
+            data={data}
+            status={status.data}
+            live={live.data}
+            diagnostics={logs}
+            changed={changed}
+            restoreDisabled={applying || (atDefaults && !dirty)}
+            onRestore={() => {
+              setRestoring(true);
+            }}
+          />
+
+          <Section title="Essentials" description="The two settings that decide most of how traffic moves through the router.">
+            <div className="grid items-start gap-4 xl:grid-cols-2">
+              <SteeringCard form={values} data={data} live={live.data} set={set} />
+              <OffloadCard
+                form={values}
+                data={data}
+                status={status.data}
+                set={set}
+                onRestart={() => {
+                  void restart();
+                }}
+              />
+            </div>
+          </Section>
+
+          <Section
+            title="Expert options"
+            description={
+              <>
+                Threads and interrupts, receive grouping, ECN and the Wi-Fi driver’s queue. Each one’s Why? names the option it
+                writes.{' '}
+                <span className="text-foreground">
+                  {expertChanged.length === 0
+                    ? 'All at their defaults.'
+                    : `Changed: ${expertChanged.map((c) => c.label).join(', ')}.`}
+                </span>
+              </>
+            }
+            aside={
+              <Button
+                variant="outline"
+                size="sm"
+                aria-expanded={expertShown}
+                aria-controls={expertPanel}
+                onClick={() => {
+                  setExpertOpen(!expertShown);
+                }}
+              >
+                {expertShown ? 'Hide' : 'Show'} expert options
+                <ChevronDownIcon className={cn('transition-transform duration-fast', expertShown && 'rotate-180')} aria-hidden />
+              </Button>
+            }
+          >
+            <div id={expertPanel} hidden={!expertShown} className="grid items-start gap-4 xl:grid-cols-2">
+              <div className="flex min-w-0 flex-col gap-4">
+                <CpuCard form={values} status={status.data} rss={rss} set={set} />
+                <GroCard form={values} data={data} port={status.data?.gro[0]} set={set} />
+              </div>
+              <div className="flex min-w-0 flex-col gap-4">
+                <EcnCard
+                  form={values}
+                  status={status.data}
+                  targetMs={data.sqm?.targetMs ?? null}
+                  set={set}
+                  wedOn={data.form.wed}
+                />
+                <AqlCard form={values} errors={errors} status={status.data} set={set} wedOn={data.form.wed} />
+              </div>
+            </div>
+          </Section>
+
+          {logsQuery.error !== null && logs === undefined ? (
+            <LoadError
+              error={logsQuery.error}
+              retry={() => {
+                void logsQuery.refetch();
               }}
             />
+          ) : (
+            logs !== undefined && <DiagnosticsCard form={{ ...logs, ...diag }} set={setDiag} />
+          )}
 
-            <Section title="Essentials" description="The two settings that decide most of how traffic moves through the router.">
-              <div className="grid items-start gap-4 xl:grid-cols-2">
-                <SteeringCard form={form} data={data} live={live.data} set={set} />
-                <OffloadCard
-                  form={form}
-                  data={data}
-                  status={status.data}
-                  set={set}
-                  onRestart={() => {
-                    void restart();
-                  }}
-                />
-              </div>
-            </Section>
-
-            <Section
-              title="Expert options"
-              description={
-                <>
-                  Threads and interrupts, receive grouping, ECN and the Wi-Fi driver’s queue. Each one’s Why? names the option it
-                  writes.{' '}
-                  <span className="text-foreground">
-                    {expertChanged.length === 0
-                      ? 'All at their defaults.'
-                      : `Changed: ${expertChanged.map((c) => c.label).join(', ')}.`}
-                  </span>
-                </>
-              }
-              aside={
-                <Button
-                  variant="outline"
-                  size="sm"
-                  aria-expanded={expertShown}
-                  aria-controls={expertPanel}
-                  onClick={() => {
-                    setExpertOpen(!expertShown);
-                  }}
-                >
-                  {expertShown ? 'Hide' : 'Show'} expert options
-                  <ChevronDownIcon
-                    className={cn('transition-transform duration-fast', expertShown && 'rotate-180')}
-                    aria-hidden
-                  />
-                </Button>
-              }
-            >
-              <div id={expertPanel} hidden={!expertShown} className="grid items-start gap-4 xl:grid-cols-2">
-                <div className="flex min-w-0 flex-col gap-4">
-                  <CpuCard form={form} status={status.data} rss={rss} set={set} />
-                  <GroCard form={form} data={data} port={status.data?.gro[0]} set={set} />
-                </div>
-                <div className="flex min-w-0 flex-col gap-4">
-                  <EcnCard
-                    form={form}
-                    status={status.data}
-                    targetMs={data.sqm?.targetMs ?? null}
-                    set={set}
-                    wedOn={data.form.wed}
-                  />
-                  <AqlCard form={form} errors={errors} status={status.data} set={set} wedOn={data.form.wed} />
-                </div>
-              </div>
-            </Section>
-
-            {logsError !== undefined && logs === undefined ? (
-              <LoadError error={logsError} retry={reloadLogs} />
-            ) : (
-              diag !== undefined && <DiagnosticsCard form={diag} set={setDiag} />
-            )}
-
-            <Section title="Live" description="What the settings lead to, read every 2 s.">
-              <WorkCard live={live} />
-              <WaitsCard status={status.data} live={live.data} />
-            </Section>
-          </>
-        )}
+          <Section title="Live" description="What the settings lead to, read every 2 s.">
+            <WorkCard live={live} />
+            <WaitsCard status={status.data} live={live.data} />
+          </Section>
+        </>
       </div>
       <SaveBar
         visible={dirty}
         busy={applying}
         invalid={Object.keys(errors).length > 0}
-        onSave={() => {
-          if (form !== undefined) save(form, true);
+        onSave={settings.save}
+        onRevert={discard}
+      />
+      <WedDialog
+        to={wedSave?.to}
+        data={data}
+        onCancel={() => {
+          setWedSave(undefined);
         }}
-        onRevert={() => {
-          setEdit(undefined);
-          setDiagEdit(undefined);
+        onSave={(andRestart) => {
+          const changes = wedSave?.changes ?? [];
+          setWedSave(undefined);
+          restartAfter.current = andRestart;
+          void apply(changes);
         }}
       />
-      {data !== undefined && (
-        <WedDialog
-          to={wedSave?.to}
-          data={data}
-          onCancel={() => {
-            setWedSave(undefined);
-          }}
-          onSave={(andRestart) => {
-            const changes = wedSave?.changes ?? [];
-            setWedSave(undefined);
-            restartAfter.current = andRestart;
-            void apply(changes);
-          }}
-        />
-      )}
       <RestoreDialog
         open={restoring}
         data={data}

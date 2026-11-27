@@ -10,9 +10,12 @@ import {
   initialForm,
   modeName,
   netmaskOf,
+  apFormSchema,
   toRequest,
-  validate,
 } from '../src/features/mode/model.ts';
+import { formErrors } from '../src/lib/form/errors.ts';
+
+const validate = (f: ApForm): Partial<Record<'ipaddr' | 'gateway' | 'dns', string>> => formErrors(apFormSchema, f);
 
 const fixed = (over: Partial<ApForm> = {}): ApForm => ({
   proto: 'static',

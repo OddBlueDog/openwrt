@@ -40,7 +40,7 @@ export const ALEX = { id: 'devctl_a1ex', devices: ['aa:00:00:00:00:03'] } as con
 function milkflint(s: Scenario): unknown {
   return uci([
     ['mode', 'mode', { mode: s === 'ap' ? 'ap' : 'router' }],
-    ['datastats', 'datastats', { enabled: s === 'quiet' ? '0' : '1' }],
+    ['datastats', 'datastats', { enabled: s === 'quiet' ? '0' : '1', ...(usageHistory.on ? { history: '1' } : {}) }],
     ...(s === 'busy' ? [...GUESTS.map((g) => [g.id, 'guest_network', { label: g.label }] as const)] : []),
     ...(s === 'busy'
       ? ([
@@ -102,6 +102,96 @@ function deviceControl(s: Scenario): unknown {
     seen: { [SAM.devices[1]]: 7_200 },
     clock: { ntp: true, synced: true, stratum: 2, at: NOW - 600, uptime: 90_000 },
     adguard: { installed: true, enabled: false, state: null },
+  };
+}
+
+/** Two DHCPv6 leases on the busy router: one that ends, one that never does. */
+function dhcp6Leases(): unknown[] {
+  return [
+    {
+      hostname: 'studio-mac',
+      macaddr: 'aa:00:00:00:01:20',
+      duid: '00010001' + '2a3b4c5d' + 'aa0000000120',
+      ip6addrs: ['fd00:1::20/128'],
+      expires: 40000,
+    },
+    { hostname: 'printer', duid: '00030001aa0000000130', ip6addrs: ['fd00:1::31/128'], expires: false },
+    { duid: '00030001aa0000000140', ip6addrs: ['fd00:1::40/128'], expires: 3000 },
+  ];
+}
+
+/** The busy router's Mac: one device with three addresses. */
+const MAC = 'aa:00:00:00:01:20';
+const MAC4 = '192.168.1.20';
+const MAC6A = '2001:db8:1:1::20';
+const MAC6B = 'fd00:1::20';
+const conn = (
+  owner: string,
+  remote: string,
+  rport: number | null,
+  out_bytes: number,
+  in_bytes: number,
+  extra: Record<string, unknown> = {},
+) => ({
+  l3: remote.includes(':') ? 'ipv6' : 'ipv4',
+  l4: 'tcp',
+  state: 'ESTABLISHED',
+  owner,
+  remote,
+  rport,
+  lport: 40000 + (out_bytes % 20000),
+  out_bytes,
+  in_bytes,
+  offloaded: false,
+  inbound: false,
+  ...extra,
+});
+
+/** milkflint.connections list on the busy router: one Mac (IPv4 and two IPv6 addresses), a phone, a port forward and two of the router's own. The summary is the whole table; family, addrs and rows choose the rows. */
+function connections(s: Scenario, params: Record<string, unknown>): unknown {
+  if (growth.on) growth.n += 1;
+  const grown = growth.on ? growth.n * 1_000_000 : 0;
+  const all =
+    s === 'busy'
+      ? [
+          conn(MAC4, '142.250.180.14', 443, 5_200_000 + grown, 91_000_000 + grown),
+          conn(MAC6A, '2a00:1450:4009:820::200e', 443, 1_100_000, 22_000_000, { offloaded: true, state: null }),
+          conn(MAC6B, 'fd00:1::1', 53, 900, 1_400, { l4: 'udp', state: null }),
+          conn('192.168.1.31', '151.101.1.1', 443, 80_000, 1_900_000, { offloaded: true, state: null }),
+          conn('192.168.1.50', '203.0.113.9', 40000, 8_100, 700, { lport: 80, inbound: true }),
+          conn('router', '9.9.9.9', 853, 4_200, 6_100),
+          conn('router', '203.0.113.9', 51820, 148, 92, { l4: 'udp', state: null, inbound: true }),
+        ]
+      : [];
+  const family = params['family'] === 'ipv4' || params['family'] === 'ipv6' ? params['family'] : null;
+  const addrs = Array.isArray(params['addrs']) ? (params['addrs'] as unknown[]) : null;
+  const wanted = all.filter((c) => (family === null || c.l3 === family) && (addrs === null || addrs.includes(c.owner)));
+  const asked = typeof params['rows'] === 'number' ? params['rows'] : 200;
+  const rows = wanted
+    .toSorted((a, b) => b.out_bytes + b.in_bytes - (a.out_bytes + a.in_bytes))
+    .slice(0, Math.max(0, Math.min(500, asked)));
+  const owners = [...new Set(all.map((c) => c.owner))].map((addr) => {
+    const own = all.filter((c) => c.owner === addr);
+    const out = own.reduce((n, c) => n + c.out_bytes, 0);
+    const inn = own.reduce((n, c) => n + c.in_bytes, 0);
+    return { addr, n: own.length, bytes: out + inn, out, in: inn };
+  });
+  return {
+    total: all.length,
+    count: all.length,
+    max: 31232,
+    offloaded: all.filter((c) => c.offloaded).length,
+    partial: false,
+    cost_ms: 10,
+    family: { ipv4: all.filter((c) => c.l3 === 'ipv4').length, ipv6: all.filter((c) => c.l3 === 'ipv6').length },
+    proto: {
+      tcp: all.filter((c) => c.l4 === 'tcp').length,
+      udp: all.filter((c) => c.l4 === 'udp').length,
+      other: 0,
+    },
+    devices: owners.sort((a, b) => b.bytes - a.bytes),
+    rows,
+    cut: wanted.length - rows.length,
   };
 }
 
@@ -204,9 +294,22 @@ function firewall(s: Scenario): unknown {
   ]);
 }
 
+/** What the DHCPv6 setting of the lan dhcp section is, for the tests that look at its meaning (unset = off). */
+export const dhcpv6Setting: { value: string | undefined } = { value: 'server' };
+
 function dhcp(s: Scenario): unknown {
   return uci([
-    ['lan', 'dhcp', { interface: 'lan', start: '100', limit: '150', leasetime: '12h' }],
+    [
+      'lan',
+      'dhcp',
+      {
+        interface: 'lan',
+        start: '100',
+        limit: '150',
+        leasetime: '12h',
+        ...(dhcpv6Setting.value === undefined ? {} : { dhcpv6: dhcpv6Setting.value }),
+      },
+    ],
     ['tv', 'host', { name: 'lounge-apple-tv-4k', mac: ['5c:e9:1e:00:00:a0'], ip: '192.168.1.100' }],
     ...(s === 'busy'
       ? GUESTS.map((g) => [g.id, 'dhcp', { interface: g.id, start: '100', limit: '150', leasetime: '1h' }] as const)
@@ -259,20 +362,79 @@ function wirelessDevices(s: Scenario): unknown {
   };
 }
 
+/** A test can turn this on to make the counters grow between calls (1 MB a call), for the live speed. */
+export const growth = { on: false, n: 0, macOnWifi: false, apDown: false };
+
 /** Devices on an access point (only the busy router's first two guest networks have any). */
 function stations(s: Scenario, device: unknown): unknown {
+  if (growth.apDown && device === 'phy1-ap1') throw new Error('hostapd is not answering');
+  if (growth.on && device === 'phy1-ap2') growth.n += 1;
+  const grown = growth.on ? growth.n * 1_000_000 : 0;
   const n = s === 'busy' ? (({ 'phy1-ap1': 2, 'phy1-ap2': 1 } as Record<string, number>)[String(device)] ?? 0) : 0;
+  const mac = growth.macOnWifi && device === 'phy1-ap1';
   return {
-    results: Array.from({ length: n }, (_, i) => ({
-      mac: `aa:bb:cc:00:0${String(i)}:0${String(n)}`,
-      signal: -55 - i * 7,
-      noise: -92,
-      connected_time: 3_600 + i * 100,
-      authorized: true,
-      rx: { bytes: 1e8, packets: 1e5, rate: 576_000, mhz: 80, nss: 2 },
-      tx: { bytes: 4e8, packets: 3e5, rate: 1_200_900, mhz: 80, nss: 2 },
-    })),
+    results: [
+      ...(mac
+        ? [
+            {
+              mac: 'AA:00:00:00:01:20',
+              signal: -50,
+              rx: { bytes: 5e9 + grown, rate: 576_000 },
+              tx: { bytes: 9e9 + grown, rate: 576_000 },
+            },
+          ]
+        : []),
+      ...Array.from({ length: n }, (_, i) => ({
+        mac: `aa:bb:cc:00:0${String(i)}:0${String(n)}`,
+        signal: -55 - i * 7,
+        noise: -92,
+        connected_time: 3_600 + i * 100,
+        authorized: true,
+        rx: { bytes: 1e8 + grown, packets: 1e5, rate: 576_000, mhz: 80, nss: 2 },
+        tx: { bytes: 4e8 + grown, packets: 3e5, rate: 1_200_900, mhz: 80, nss: 2 },
+      })),
+    ],
   };
+}
+
+/** Whether the 24-hour history is switched on (milkflint.datastats.history), on the busy router. */
+export const usageHistory: { on: boolean; shape: 'busy' | 'fresh' | 'idle' } = { on: false, shape: 'busy' };
+
+/** What milkflint.devices seen answers on the busy router: the recorder's file, by lower-case MAC. */
+export const seenRecord: { since: number | null; devices: Record<string, [number, number]> } = {
+  since: NOW - 40 * 86400,
+  devices: {},
+};
+
+/** The 24-hour history: the busy router's eight devices (busiest last, so the page has to sort) and an all-zero bucket. */
+function trafficHistory(s: Scenario, params: Record<string, unknown>): unknown {
+  if (s !== 'busy' || !usageHistory.on) return { on: false, since: null, windows: {}, series: [] };
+  const now = Math.floor(Date.now() / 1000);
+  // just turned on: nothing sampled yet; or running for an hour with nothing moved
+  if (usageHistory.shape === 'fresh') return { on: true, since: null, windows: {}, series: [] };
+  if (usageHistory.shape === 'idle') return { on: true, since: now - 3600, windows: {}, series: [] };
+  const macs = Array.from({ length: 8 }, (_, i) => `5c:e9:1e:00:0${String(i)}:a${String(i)}`);
+  const windows: Record<string, unknown> = {
+    '00:00:00:00:00:00': { h1: [9e9, 9e9], h4: [9e9, 9e9], h8: [9e9, 9e9], h24: [9e9, 9e9] },
+  };
+  macs.forEach((mac, i) => {
+    const day = (i + 1) * 40_000_000;
+    windows[mac] = {
+      h1: [day / 24, day / 240],
+      h4: [day / 6, day / 60],
+      h8: [day / 3, day / 30],
+      h24: [day, day / 10],
+    };
+  });
+  const mac = typeof params['mac'] === 'string' ? params['mac'] : '';
+  const scale = mac === '' ? 8 : 1;
+  const step = Math.floor(now / 300) * 300;
+  const series = Array.from({ length: 60 }, (_, i) => [
+    step - (i * 3 + 1) * 300,
+    scale * 5_000_000 * (1 + (i % 5)),
+    scale * 600_000,
+  ]);
+  return { on: true, since: now - 20 * 3600, windows, series: series.reverse() };
 }
 
 function usage(s: Scenario): unknown {
@@ -329,6 +491,46 @@ function adguard(s: Scenario): unknown {
     state: 'active',
     stats: { queries: 148_213, blocked: 29_934, hours: 24, avg_ms: 12.4 },
   };
+}
+
+/** What AdGuard Home is seeing: a day by the hour, and its top lists (made-up names). */
+function adguardInsights(): unknown {
+  const queries = Array.from({ length: 24 }, (_, i) => (i > 7 && i < 23 ? 4_000 + ((i * 937) % 2_500) : 300));
+  const ranked = (names: readonly string[], top: number): unknown[] =>
+    names.map((name, i) => ({ name, count: Math.round(top / (i + 1)) }));
+  return {
+    running: true,
+    at: NOW,
+    unit: 'hours',
+    queries,
+    blocked: queries.map((n) => Math.round(n / 5)),
+    total: 148_213,
+    total_blocked: 29_934,
+    top_queried: ranked(
+      [
+        'example.com',
+        'cdn.example.net',
+        'api.example.org',
+        'video.example.com',
+        'news.example',
+        'mail.example.com',
+        'maps.example.net',
+        'shop.example',
+        'music.example.org',
+        'docs.example.com',
+      ],
+      9_000,
+    ),
+    top_blocked: ranked(['ads.example', 'tracker.example.net', 'metrics.example.com', 'pixel.example.org'], 4_000),
+    top_clients: ranked([MAC4, '192.168.1.31', '192.168.1.32', '192.168.1.33', 'fd00::40'], 40_000),
+  };
+}
+
+/** milkflint.packages status: banIP and AdGuard Home on MilkFlint's own release numbers, nothing newer tested. */
+function packageUpdates(params: Record<string, unknown>): unknown {
+  const name = params['name'];
+  const installed = name === 'banip' ? '1.9.1-r1005' : '1.0.0-r1001';
+  return { busy: false, installed, latest: installed, versions: [installed], checked: NOW - 3600 };
 }
 
 function vpn(s: Scenario): unknown {
@@ -417,25 +619,38 @@ export function answer(s: Scenario, object: string, method: string, params: Reco
     case 'iwinfo assoclist':
       return stations(s, params['device']);
     case 'luci-rpc getDHCPLeases':
-      return { dhcp_leases: [], dhcp6_leases: [] };
+      return {
+        dhcp_leases: s === 'busy' ? [{ hostname: 'studio-mac', macaddr: MAC, ipaddr: MAC4, expires: 39000 }] : [],
+        dhcp6_leases: s === 'busy' ? dhcp6Leases() : [],
+      };
+    case 'milkflint.connections list':
+      return connections(s, params);
     case 'luci-rpc getHostHints':
-      return {};
+      return s === 'busy' ? { [MAC]: { name: 'studio-mac', ipaddrs: [MAC4], ip6addrs: [MAC6A, MAC6B] } } : {};
     case 'milkflint.traffic periods':
       return s === 'busy'
         ? { installed: true, enabled: true, periods: ['2026-11-01'] }
         : { installed: true, enabled: false, periods: [] };
+    case 'milkflint.traffic history':
+      return trafficHistory(s, params);
     case 'milkflint.traffic usage':
       return usage(s);
     case 'milkflint.banip status':
       return banip(s);
     case 'milkflint.adguardhome status':
       return adguard(s);
+    case 'milkflint.adguardhome insights':
+      return adguardInsights();
+    case 'milkflint.packages status':
+      return packageUpdates(params);
     case 'milkflint.vpn status':
       return vpn(s);
     case 'milkflint.sensors history':
       return sensorHistory(s);
     case 'milkflint.devicecontrol status':
       return deviceControl(s);
+    case 'milkflint.devices seen':
+      return seenRecord;
     case 'milkflint neighbors':
       return { neighbors: [] };
     default:

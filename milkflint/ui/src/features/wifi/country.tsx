@@ -2,13 +2,16 @@
 // do (Linux's regulatory database, read on the router for any country).
 import { TriangleAlertIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
+import { type Column, DataTable } from '@/components/data-table';
 import { Field } from '@/components/field';
 import { type SearchOption, SearchSelect } from '@/components/search-select';
 import { Card, CardContent, CardTitle } from '@/components/ui/card';
-import { usePoll } from '@/hooks/use-poll';
-import { type Country, getRegulatory, type RegRule } from '@/lib/api/wireless';
+import { useLive } from '@/lib/query/use-live';
+import type { Country, RegRule } from '@/lib/api/wireless';
+import { wifiQueries } from './queries';
 import { explain } from '@/components/explain';
 import { Note } from '@/components/note';
+import { cn } from '@/lib/utils';
 import { bandLabel, type RadioCountry } from './model';
 
 /** Names people search by that aren't in the list's own names. */
@@ -77,79 +80,77 @@ const regionNames: Record<string, string> = {
   JP: 'Japan’s own standard',
 };
 
+/** A rule of a country's, on the band it's listed under (a rule can reach into two). */
+interface BandRule {
+  band: string;
+  rule: RegRule;
+}
+
+// one compact table for every band, a group each: channels, the most power, the widest width, and what's special;
+// its cells tight, for a phone
+const CELL = 'px-2 py-1.5 first:pl-3 last:pr-3';
+const columns: readonly Column<BandRule>[] = [
+  {
+    label: 'Channels',
+    className: CELL,
+    cell: ({ band, rule: r }) => (
+      <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="whitespace-nowrap tabular">{channelRanges(band, r)}</span>
+        {r.indoor_only && <span className="text-xs whitespace-nowrap text-muted-foreground">indoors only</span>}
+        {r.dfs && (
+          <span className="inline-flex items-center gap-1 text-xs font-medium whitespace-nowrap text-warning">
+            <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
+            radar check
+          </span>
+        )}
+        {r.no_ir && <span className="text-xs whitespace-nowrap text-muted-foreground">can’t start a network</span>}
+      </span>
+    ),
+  },
+  {
+    label: 'Max power',
+    className: cn(CELL, 'whitespace-nowrap tabular'),
+    cell: ({ rule: r }) => (
+      <>
+        {r.eirp} dBm {/* the milliwatts only where there's room: a phone keeps the dBm */}
+        <span className="hidden text-muted-foreground @md:inline">({Math.round(10 ** (r.eirp / 10))} mW)</span>
+      </>
+    ),
+  },
+  {
+    label: 'Max width',
+    className: cn(CELL, 'text-right whitespace-nowrap tabular'),
+    cell: ({ rule: r }) => `${String(r.max_bw)} MHz`,
+  },
+];
+
 function Rules({ country, bandsHere }: { country: string; bandsHere: readonly string[] }): ReactElement | null {
-  const reg = usePoll(() => getRegulatory(country), 3_600_000, country).data;
+  const reg = useLive(wifiQueries.regulatory(country)).data;
   if (country === '' || reg === undefined) return null;
-  const rows = bandsHere.flatMap((band) => {
+  const groups = bandsHere.flatMap((band) => {
     const b = bands[band];
     if (b === undefined) return [];
     const rules = reg.rules.filter((r) => r.end > b.from && r.start < b.to && channelRanges(band, r) !== '');
-    return [{ band, label: b.label, rules }];
+    return [
+      {
+        key: b.label,
+        header: <span className="font-medium">{b.label}</span>,
+        rows: rules.map((rule) => ({ band, rule })),
+        empty: <span className="text-destructive">Not allowed in this country</span>,
+      },
+    ];
   });
   return (
-    // one compact table for every band: channels, the most power, the widest width, and what's special
-    <div className="@container flex min-w-0 flex-col gap-2">
-      <table className="w-full text-sm">
-        <caption className="sr-only">What {country} allows on each band</caption>
-        <thead>
-          <tr className="border-b text-left text-xs whitespace-nowrap text-muted-foreground">
-            <th scope="col" className="pr-3 pb-1.5 font-medium">
-              Band
-            </th>
-            <th scope="col" className="pr-3 pb-1.5 font-medium">
-              Channels
-            </th>
-            <th scope="col" className="pr-3 pb-1.5 font-medium">
-              Max power
-            </th>
-            <th scope="col" className="pb-1.5 text-right font-medium">
-              Max width
-            </th>
-          </tr>
-        </thead>
-        {rows.map(({ band, label, rules }) => (
-          <tbody key={band} className="border-b last:border-b-0">
-            {rules.length === 0 ? (
-              <tr>
-                <th scope="row" className="py-1.5 pr-3 text-left font-medium whitespace-nowrap">
-                  {label}
-                </th>
-                <td colSpan={3} className="py-1.5 text-destructive">
-                  Not allowed in this country
-                </td>
-              </tr>
-            ) : (
-              rules.map((r, i) => (
-                <tr key={`${String(r.start)}-${String(r.end)}`} className="align-top">
-                  {i === 0 && (
-                    <th scope="rowgroup" rowSpan={rules.length} className="py-1.5 pr-3 text-left font-medium whitespace-nowrap">
-                      {label}
-                    </th>
-                  )}
-                  <td className="py-1.5 pr-3">
-                    <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                      <span className="whitespace-nowrap tabular">{channelRanges(band, r)}</span>
-                      {r.indoor_only && <span className="text-xs whitespace-nowrap text-muted-foreground">indoors only</span>}
-                      {r.dfs && (
-                        <span className="inline-flex items-center gap-1 text-xs font-medium whitespace-nowrap text-warning">
-                          <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
-                          radar check
-                        </span>
-                      )}
-                      {r.no_ir && <span className="text-xs whitespace-nowrap text-muted-foreground">can’t start a network</span>}
-                    </span>
-                  </td>
-                  <td className="py-1.5 pr-3 whitespace-nowrap tabular">
-                    {r.eirp} dBm {/* the milliwatts only where there's room: a phone keeps the dBm */}
-                    <span className="hidden text-muted-foreground @md:inline">({Math.round(10 ** (r.eirp / 10))} mW)</span>
-                  </td>
-                  <td className="py-1.5 text-right whitespace-nowrap tabular">{r.max_bw} MHz</td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        ))}
-      </table>
+    <div className="flex min-w-0 flex-col gap-2">
+      <DataTable
+        label={`What ${country} allows on each band`}
+        columns={columns}
+        groups={groups}
+        rowKey={({ band, rule: r }) => `${band}:${String(r.start)}-${String(r.end)}`}
+        empty="No Wi-Fi band here."
+        framed={false}
+        cards={false}
+      />
       <p className="text-xs text-muted-foreground">
         From wireless-regdb, the country rules OpenWrt and Linux use.
         {reg.dfs_region in regionNames ? ` Radar detection follows ${regionNames[reg.dfs_region] ?? ''}.` : ''}

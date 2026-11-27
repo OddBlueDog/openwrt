@@ -1,4 +1,8 @@
 import { z } from 'zod';
+import { getConfig, type Section, str } from '@/lib/api/uci';
+import { homeDhcp, readDeviceDns } from '../dns/device-dns';
+import { SERVER } from '../remote-access/sections';
+import { guestLabels, isGuestNetwork } from '../wifi-guest/guest';
 import { call } from '@/lib/ubus';
 
 /** A setting the DNS chain needs that's not as MilkFlint wrote it (changed in AdGuard Home's own web interface, or by hand). */
@@ -11,23 +15,6 @@ const settingSchema = z.object({
   what: z.string(),
 });
 export type Setting = z.output<typeof settingSchema>;
-
-const updateSchema = z.object({
-  busy: z.boolean().nullish(),
-  action: z.string().nullish(),
-  checked: z.number().nullish(),
-  installed: z.string().nullish(),
-  latest: z.string().nullish(),
-  /** The feed's versions, newest first. */
-  versions: z.array(z.string()).nullish(),
-  /** Installed as an earlier one (adguardhome@milkflint=<version> in apk's world). */
-  pinned: z.string().nullish(),
-  ok: z.boolean().nullish(),
-  error: z.string().nullish(),
-  log: z.string().nullish(),
-  finished: z.number().nullish(),
-});
-export type UpdateInfo = z.output<typeof updateSchema>;
 
 const networkSchema = z.object({ interface: z.string(), zone: z.string(), ipv4: z.array(z.string()), ipv6: z.array(z.string()) });
 export type Network = z.output<typeof networkSchema>;
@@ -67,7 +54,6 @@ const statusSchema = z.object({
   stats: z.object({ queries: z.number(), blocked: z.number(), hours: z.number(), avg_ms: z.number().nullish() }).nullish(),
   settings: z.array(settingSchema).optional(),
   networks: z.array(networkSchema).optional(),
-  update: updateSchema.nullish(),
   licenses: z.object({ license: z.string(), notices: z.string().nullish() }).optional(),
 });
 export type AdGuardStatus = z.output<typeof statusSchema>;
@@ -124,8 +110,6 @@ const errors: Record<string, string> = {
   password: 'The password: 8 to 72 characters, on one line.',
   hash: 'The router couldn’t make the password’s hash.',
   write: 'The router couldn’t write AdGuard Home’s settings.',
-  version: 'That version isn’t in MilkFlint’s package feed.',
-  busy: 'An update is running already.',
 };
 
 async function act(method: string, params: Record<string, unknown>): Promise<z.output<typeof resultSchema>> {
@@ -195,11 +179,26 @@ export async function repairAdGuard(): Promise<string[]> {
   return (await act('repair', {})).left ?? [];
 }
 
-export async function checkUpdates(): Promise<void> {
-  await act('update_check', {});
+/** What around AdGuard Home the page speaks of: the DNS page's choice, Remote access, guest networks. */
+export interface Around {
+  /** Devices on the home network are told to use another DNS server (the DNS page). */
+  ownServer: boolean;
+  /** Remote access's devices may open the router's pages (its zone accepts input). */
+  remoteAdmin: boolean | undefined;
+  guestLabel: (zone: string) => string | undefined;
 }
 
-/** Installs that version from MilkFlint's feed ('' for the newest), in the background. */
-export async function installVersion(version: string): Promise<void> {
-  await act('update', { version });
+export async function loadAround(): Promise<Around> {
+  const [dhcp, firewall, milkflint] = await Promise.all([
+    getConfig('dhcp'),
+    getConfig('firewall'),
+    getConfig('milkflint').catch((): Section[] => []),
+  ]);
+  const zone = firewall.find((s) => s['.type'] === 'zone' && str(s, 'name') === SERVER);
+  const labels = guestLabels(milkflint);
+  return {
+    ownServer: readDeviceDns(homeDhcp(dhcp)).own,
+    remoteAdmin: zone === undefined ? undefined : str(zone, 'input') === 'ACCEPT',
+    guestLabel: (z) => (isGuestNetwork(z) ? labels[z] : undefined),
+  };
 }

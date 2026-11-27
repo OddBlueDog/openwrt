@@ -7,6 +7,7 @@
 import {
   ActivityIcon,
   ArrowDownUpIcon,
+  ArrowLeftRightIcon,
   CableIcon,
   CalendarClockIcon,
   ChartBarDecreasingIcon,
@@ -18,11 +19,14 @@ import {
   type LucideIcon,
   MemoryStickIcon,
   MonitorSmartphoneIcon,
+  NetworkIcon,
   RadioTowerIcon,
   RouteIcon,
   RouterIcon,
+  ScanSearchIcon,
   ShieldBanIcon,
   ShieldUserIcon,
+  ServerIcon,
   ShieldXIcon,
   SmartphoneIcon,
   ThermometerIcon,
@@ -31,12 +35,14 @@ import {
   WifiIcon,
 } from 'lucide-react';
 import type { ReactElement } from 'react';
-import type { Poll } from '@/hooks/use-poll';
+import type { Live as Polled } from '@/lib/query/use-live';
 import type { Live } from '../network-quality/live';
-import { ClientsCard } from './clients-card';
+import { BusiestCard } from './clients-card';
+import { ConnectionsCard } from './connections-card';
 import { DeviceControlCard } from './device-control-card';
 import { GuestCard } from './guest-card';
 import { InternetDetailsCard } from './internet-details-card';
+import { LeasesCard } from './leases-card';
 import { type Catalog, type Height, type Layout, parseLayout, type Size, type Width } from './layout';
 import { PathCard } from './path-card';
 import { PortsCard } from './ports-card';
@@ -44,7 +50,7 @@ import { RadiosCard } from './radios-card';
 import { CpuCard, MemoryCard } from './resources-cards';
 import { ResponsivenessCard } from './responsiveness-card';
 import { ScheduleCard } from './schedule-card';
-import { AdGuardCard, BanipCard } from './security-cards';
+import { AdGuardCard, AdGuardInsightsCard, BanipCard } from './security-cards';
 import { SqmCard } from './sqm-card';
 import { SystemCard } from './system-card';
 import { TemperaturesCard } from './temperatures-card';
@@ -58,7 +64,7 @@ import { RemoteAccessCard, VpnCard } from './vpn-cards';
 export interface HomeData {
   d: Dashboard;
   /** Network Quality's samples, shared by the widgets that show them. */
-  live: Poll<Live>;
+  live: Polled<Live>;
   /** Access point mode: the way out is the main router. */
   ap: boolean;
 }
@@ -154,12 +160,12 @@ export const widgets = {
     render: ({ d }) => <RadiosCard d={d} />,
   },
   'busiest-devices': {
-    title: 'Busiest Wi-Fi devices',
-    description: 'The Wi-Fi devices moving the most data now, with their signal.',
+    title: 'Busiest devices',
+    description: 'The devices moving the most data now, on the Wi-Fi (with their signal) and on a cable.',
     icon: ChartBarDecreasingIcon,
     group: 'Devices',
     sizes: [size(3, 2), size(2, 2), size(4, 1), size(4, 2), size(1, 1)],
-    render: ({ d, size: s }) => (s.w === 1 ? <BusiestTile d={d} /> : <ClientsCard d={d} rows={s.h} />),
+    render: ({ d, size: s }) => (s.w === 1 ? <BusiestTile d={d} /> : <BusiestCard d={d} rows={s.h} />),
   },
   devices: {
     title: 'Devices',
@@ -186,6 +192,33 @@ export const widgets = {
     group: 'Devices',
     sizes: [size(2, 1), size(1, 1)],
     render: ({ ap }) => <UsageCard ap={ap} />,
+  },
+  'leases-v4': {
+    title: 'IPv4 leases',
+    description: 'The devices holding an IPv4 address from the router: their MAC, and how long each lease has left.',
+    icon: NetworkIcon,
+    group: 'Devices',
+    sizes: [size(2, 1), size(1, 1), size(2, 2), size(3, 2), size(4, 1), size(4, 2)],
+    render: ({ size: s }) => <LeasesCard family="v4" size={s} />,
+    hidden: ({ ap }) => ap,
+  },
+  'leases-v6': {
+    title: 'IPv6 leases',
+    description: 'The devices holding an IPv6 address from the router’s DHCPv6 server: their MAC and DUID.',
+    icon: ServerIcon,
+    group: 'Devices',
+    sizes: [size(2, 1), size(1, 1), size(2, 2), size(3, 2), size(4, 1), size(4, 2)],
+    render: ({ size: s }) => <LeasesCard family="v6" size={s} />,
+    hidden: ({ ap }) => ap,
+  },
+  connections: {
+    title: 'Connections',
+    description: 'How many connections the router is tracking, and which devices have the most.',
+    icon: ArrowLeftRightIcon,
+    group: 'Devices',
+    sizes: [size(1, 1), size(2, 1), size(2, 2)],
+    render: ({ size: s }) => <ConnectionsCard size={s} />,
+    hidden: ({ ap }) => ap,
   },
   ports: {
     title: 'Ethernet ports',
@@ -265,6 +298,15 @@ export const widgets = {
     sizes: [size(1, 1)],
     render: () => <AdGuardCard />,
     // the main router answers lookups
+    hidden: ({ ap }) => ap,
+  },
+  'adguardhome-insights': {
+    title: 'AdGuard Home lookups',
+    description: 'Lookups and blocks over the day, the names asked for and blocked most, and the devices asking most.',
+    icon: ScanSearchIcon,
+    group: 'Security',
+    sizes: [size(4, 2), size(3, 2)],
+    render: () => <AdGuardInsightsCard />,
     hidden: ({ ap }) => ap,
   },
   vpn: {

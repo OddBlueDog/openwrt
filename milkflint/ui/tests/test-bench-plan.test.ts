@@ -8,6 +8,7 @@ import {
   fitLabel,
   MAX_PHASE_S,
   MAX_RUN_S,
+  runName,
   MIN_PHASE_S,
   phaseAt,
   type PlanMember,
@@ -262,4 +263,19 @@ test('timing: typical and worst start error, phases missed, hidden and lost page
   assert.equal(t.lost, true);
   assert.equal(t.ended, 'stopped by Mac');
   assert.equal(memberTiming([], 2).skewMedian, undefined);
+});
+
+test('a run is named by what was typed, trimmed and cut, or else by the plan', () => {
+  assert.equal(runName(undefined, 'Quick check'), 'Quick check');
+  assert.equal(runName('   ', 'Full'), 'Full');
+  assert.equal(runName('  Before CAKE  ', 'Full'), 'Before CAKE');
+  assert.equal(runName('x'.repeat(60), 'Full').length, 48);
+});
+
+test('a run name is cut by UTF-8 bytes at a character boundary and has no control characters', () => {
+  const cjk = runName('名'.repeat(20), 'Full');
+  assert.ok(new TextEncoder().encode(cjk).length <= 48);
+  assert.equal(cjk, '名'.repeat(16));
+  assert.equal(runName('a\tb', 'Full'), 'a b');
+  assert.equal(runName('\t\n', 'Full'), 'Full');
 });

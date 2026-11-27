@@ -5,11 +5,12 @@
 import 'virtual:milkflint-themes.css';
 import '@/styles.css';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { cleanup, render } from 'vitest-browser-react';
+import { cleanup } from 'vitest-browser-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import type * as Api from '@/features/adguardhome/api';
 import { InsightsCard } from '@/features/adguardhome/insights';
 import type * as Network from '@/lib/api/network';
+import { renderWithProviders } from './render';
 
 const AT = Date.UTC(2026, 10, 22, 13, 20) / 1000;
 
@@ -70,8 +71,8 @@ afterEach(async () => {
   await cleanup();
 });
 
-async function draw(): Promise<Awaited<ReturnType<typeof render>>> {
-  return render(
+async function draw(): Promise<Awaited<ReturnType<typeof renderWithProviders>>> {
+  return renderWithProviders(
     <TooltipProvider>
       <InsightsCard />
     </TooltipProvider>,
@@ -81,8 +82,7 @@ async function draw(): Promise<Awaited<ReturnType<typeof render>>> {
 test('the window, when it was read and how often, the totals, and the chart', async () => {
   const screen = await draw();
   await expect.element(screen.getByText('What it’s seeing, last 24 hours')).toBeVisible();
-  const clock = new Date(AT * 1000).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-  await expect.element(screen.getByText(`Updated ${clock} · refreshes every minute`)).toBeVisible();
+  await expect.element(screen.getByText(/^Updated \d+ s ago · next in \d+ s$/)).toBeVisible();
   await expect.element(screen.getByText('6,000', { exact: true })).toBeVisible();
   await expect.element(screen.getByText('540 · 9.0%')).toBeVisible();
   await expect

@@ -2,10 +2,11 @@
 // receive rings and RSS table, its send side, the Wi-Fi driver, RPS and
 // Smart Queue's queues, and which CPU each one runs on. Shared by the
 // Performance Tuning and Smart Queue pages.
-import { useRef } from 'react';
-import { usePoll } from '@/hooks/use-poll';
-import { getPipeline, type NetThread, type Pipeline } from '@/lib/api/pipeline';
-import { type CakeQdisc, type CakeTin, getSqmStatus } from '@/lib/api/stats';
+import { useState } from 'react';
+import type { NetThread, Pipeline } from '@/lib/api/pipeline';
+import type { CakeQdisc, CakeTin } from '@/lib/api/stats';
+import { useLive } from '@/lib/query/use-live';
+import { hookQueries } from './queries';
 import { queueCpu } from '@/lib/network-lanes';
 import { isVpnShaper } from '@/features/vpn-client/sections';
 import { isGuestShaper } from '@/features/wifi-guest/guest';
@@ -300,20 +301,24 @@ function compute(now: Sample, before: Sample | undefined, qdiscs: CakeQdisc[]): 
   };
 }
 
-async function fetchSample(): Promise<{ pipeline: Pipeline; qdiscs: CakeQdisc[] }> {
-  const [pipeline, sqm] = await Promise.all([getPipeline(), getSqmStatus().catch(() => ({ qdiscs: [] as CakeQdisc[] }))]);
-  return { pipeline, qdiscs: sqm.qdiscs };
-}
-
-/** Polls every `intervalMs`; rates need two samples, so the first result has none. */
+/**
+ * Asks every `intervalMs`; rates need two samples, so the first result has
+ * none. Each answer is paired with the one before it once, by when it came.
+ */
 export function useNetworkLive(intervalMs = 2000): { data: NetworkLive | undefined; error: unknown } {
-  const prev = useRef<Sample>(undefined);
-  const { data, error } = usePoll(async (): Promise<NetworkLive> => {
-    const { pipeline, qdiscs } = await fetchSample();
-    const sample: Sample = { at: performance.now(), pipeline, bytes: new Map(qdiscs.map((q) => [queueKey(q), q.bytes ?? 0])) };
-    const live = compute(sample, prev.current, qdiscs);
-    prev.current = sample;
-    return live;
-  }, intervalMs);
-  return { data, error };
+  const { data, error, at } = useLive(hookQueries.networkSample(intervalMs));
+  const [pair, setPair] = useState<{ at: number | undefined; sample: Sample | undefined; live: NetworkLive | undefined }>({
+    at: undefined,
+    sample: undefined,
+    live: undefined,
+  });
+  if (data !== undefined && at !== pair.at) {
+    const sample: Sample = {
+      at: data.at,
+      pipeline: data.pipeline,
+      bytes: new Map(data.qdiscs.map((q) => [queueKey(q), q.bytes ?? 0])),
+    };
+    setPair({ at, sample, live: compute(sample, pair.sample, data.qdiscs) });
+  }
+  return { data: pair.live, error };
 }

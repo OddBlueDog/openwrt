@@ -4,89 +4,33 @@
 // will be in /etc/config/firewall before saving. Options it doesn't show
 // stay as they are.
 import { BanIcon, CheckIcon, EarOffIcon, PlusIcon, Trash2Icon, TriangleAlertIcon, XIcon } from 'lucide-react';
-import { type KeyboardEvent, type ReactElement, useId, useState } from 'react';
+import { type KeyboardEvent, type ReactElement, useId, useMemo, useState } from 'react';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
-import { type Change, list, type Section, str } from '@/lib/api/uci';
+import type { Change } from '@/lib/api/uci';
+import { formErrors } from '@/lib/form/errors';
+import { useSheetForm } from '@/lib/form/use-sheet-form';
 import { cn } from '@/lib/utils';
 import type { FirewallData } from './api';
-import { bedtime, type RulePreset, type ScheduleForm, scheduleError, scheduleForm, scheduleValues } from './forms';
-import { isGuestNetwork } from '../wifi-guest/guest';
+import type { RulePreset } from './forms';
+import { builtInRules, editSection, isBuiltIn, type Rule, ruleVerb, wanZone } from './model';
 import {
-  builtInRules,
-  editSection,
-  type Family,
-  type FirewallConfig,
-  isAddress,
-  isBuiltIn,
-  isInternetZone,
-  isMac,
-  isShortName,
-  logPrefixError,
-  portError,
-  type Rule,
-  ruleVerb,
-  type Values,
-  wanZone,
-  type Zone,
-  zonePhrase,
-} from './model';
+  ANY,
+  type CondKey,
+  type Cond,
+  conditions,
+  type Errors,
+  formOf,
+  opensEverything,
+  ROUTER,
+  ruleFormSchema,
+  valuesOf,
+} from './rule-form';
 import { Choice, ScheduleFields, Segmented, SwitchRow } from './parts';
 import { FieldLabel, Opt, UciPreview } from './sheet-parts';
-
-const ROUTER = '@router';
-const ANY = '*';
-
-type CondKey = 'dest_port' | 'src_port' | 'src_ip' | 'dest_ip' | 'src_mac' | 'icmp_type';
-
-interface Cond {
-  include: string[];
-  exclude: string[];
-  /** the exclude field is showing */
-  excluding: boolean;
-}
-
-interface SheetForm {
-  name: string;
-  src: string;
-  dest: string;
-  proto: string[];
-  family: Family;
-  conds: Partial<Record<CondKey, Cond>>;
-  target: string;
-  enabled: boolean;
-  limit: string;
-  limitBurst: string;
-  log: string;
-  scheduled: boolean;
-  schedule: ScheduleForm;
-  /** ticked: open every port, as opensEverything describes */
-  openAll: boolean;
-}
-
-const PORT_PROTOS = ['tcp', 'udp', 'sctp', 'udplite', 'dccp'];
-const ICMP_PROTOS = ['icmp', 'icmpv6', 'ipv6-icmp'];
-
-/** fw4 matches ports only with protocols that have them; no protocol is its default, TCP and UDP. */
-const portsApply = (proto: readonly string[]): boolean => proto.length === 0 || proto.every((p) => PORT_PROTOS.includes(p));
-const icmpApplies = (proto: readonly string[]): boolean => proto.some((p) => ICMP_PROTOS.includes(p));
-
-const conditions: readonly {
-  key: CondKey;
-  label: string;
-  placeholder: string;
-  check: (v: string) => boolean;
-}[] = [
-  { key: 'dest_port', label: 'Destination ports', placeholder: 'Port or range', check: (v) => portError(v) === undefined },
-  { key: 'src_port', label: 'Source ports', placeholder: 'Port or range', check: (v) => portError(v) === undefined },
-  { key: 'src_ip', label: 'Source addresses', placeholder: 'Address or network', check: isAddress },
-  { key: 'dest_ip', label: 'Destination addresses', placeholder: 'Address or network', check: isAddress },
-  { key: 'src_mac', label: 'Source devices', placeholder: 'MAC address', check: isMac },
-  { key: 'icmp_type', label: 'ICMP types', placeholder: 'e.g. echo-request', check: (v) => /^[a-z0-9-]+(\/\d+)?$/i.test(v) },
-];
 
 const icmpTypes = [
   'echo-request',
@@ -101,154 +45,6 @@ const icmpTypes = [
   'neighbour-advertisement',
 ];
 const protocols = ['tcp', 'udp', 'icmp', 'all', 'esp', 'ah', 'gre', 'igmp', 'sctp'];
-
-/** Values of one option: "!x" entries (fw4's "not") go to exclude. */
-function cond(s: Section | undefined, option: string): Cond | undefined {
-  const include: string[] = [];
-  const exclude: string[] = [];
-  let not = false;
-  for (const v of list(s, option)) {
-    if (v === '!') {
-      not = true;
-      continue;
-    }
-    if (not || v.startsWith('!')) exclude.push(v.replace(/^!/, ''));
-    else include.push(v);
-    not = false;
-  }
-  if (include.length + exclude.length === 0) return undefined;
-  return { include, exclude, excluding: exclude.length > 0 };
-}
-
-function formOf(rule: Rule | undefined, s: Section | undefined, preset: RulePreset | undefined): SheetForm {
-  const conds: Partial<Record<CondKey, Cond>> = {};
-  for (const c of conditions) {
-    const v = cond(s, c.key);
-    if (v !== undefined) conds[c.key] = v;
-  }
-  if (rule === undefined) {
-    const ports = preset?.ports.split(/\s+/).filter((p) => p !== '') ?? [];
-    if (ports.length > 0) conds.dest_port = { include: ports, exclude: [], excluding: false };
-    return {
-      name: preset?.name ?? '',
-      src: preset === undefined ? 'wan' : preset.src === '' ? ROUTER : preset.src,
-      dest: preset === undefined || preset.dest === '' ? ROUTER : preset.dest,
-      proto: preset === undefined || preset.proto === 'tcp udp' ? [] : preset.proto.split(' '),
-      family: 'any',
-      conds,
-      target: preset?.target ?? 'ACCEPT',
-      enabled: true,
-      limit: '',
-      limitBurst: '',
-      log: '',
-      scheduled: false,
-      schedule: bedtime,
-      openAll: false,
-    };
-  }
-  return {
-    name: rule.name ?? '',
-    src: rule.src ?? ROUTER,
-    dest: rule.dest ?? ROUTER,
-    proto: list(s, 'proto').map((p) => p.toLowerCase()),
-    family: rule.family,
-    conds,
-    target: rule.target,
-    enabled: rule.enabled,
-    limit: str(s, 'limit') ?? '',
-    limitBurst: str(s, 'limit_burst') ?? '',
-    log: str(s, 'log') ?? '',
-    scheduled: rule.schedule !== undefined,
-    schedule: scheduleForm(rule.schedule),
-    openAll: false,
-  };
-}
-
-/** A list option written as it was stored: one space-separated option stays one, a list stays a list. */
-function asStored(s: Section | undefined, option: string, values: string[]): string | string[] | undefined {
-  if (values.length === 0) return undefined;
-  return typeof s?.[option] === 'string' ? values.join(' ') : values;
-}
-
-function valuesOf(f: SheetForm, s: Section | undefined): Values {
-  const values: Values = {
-    name: f.name.trim(),
-    src: f.src === ROUTER ? undefined : f.src,
-    dest: f.dest === ROUTER ? undefined : f.dest,
-    proto: asStored(s, 'proto', f.proto),
-    family: f.family === 'any' ? undefined : f.family,
-    target: f.target,
-    enabled: f.enabled ? undefined : '0',
-    limit: f.limit.trim() === '' ? undefined : f.limit.trim(),
-    limit_burst: f.limit.trim() === '' || f.limitBurst.trim() === '' ? undefined : f.limitBurst.trim(),
-    log: f.log.trim() === '' ? undefined : f.log.trim(),
-    ...scheduleValues(f.scheduled ? f.schedule : undefined),
-  };
-  for (const c of conditions) {
-    const v = f.conds[c.key];
-    values[c.key] = asStored(s, c.key, v === undefined ? [] : [...v.include, ...v.exclude.map((x) => `!${x}`)]);
-  }
-  return values;
-}
-
-type Errors = Partial<Record<'name' | 'path' | 'proto' | 'open' | 'limit' | 'log' | 'schedule' | CondKey, string>>;
-
-/**
- * Who an accept with nothing narrowing it opens every port to: the internet,
- * any zone, or a guest network. A new rule starts as "from the internet to
- * the router, accept", so it takes ports, or a tick, before it opens every
- * one. Undefined when the rule names its ports or who it's from, or matches
- * only protocols without ports (icmp, esp…).
- */
-function opensEverything(f: SheetForm, cfg: FirewallConfig): { from: string; to: string } | undefined {
-  if (f.target !== 'ACCEPT' || f.src === ROUTER) return undefined;
-  const zone = (name: string): Zone | undefined => cfg.zones.find((z) => z.name === name);
-  const src = zone(f.src);
-  const outside = f.src === ANY || (src !== undefined && (isInternetZone(src) || isGuestNetwork(src.name)));
-  const dest = zone(f.dest);
-  if (!outside || (dest !== undefined && isInternetZone(dest))) return undefined;
-  if (f.proto.length > 0 && !f.proto.some((p) => p === 'all' || PORT_PROTOS.includes(p))) return undefined;
-  if ((['dest_port', 'src_ip', 'src_mac'] as const).some((k) => (f.conds[k]?.include.length ?? 0) > 0)) return undefined;
-  return {
-    from: f.src === ANY ? 'every network, the internet included' : zonePhrase(f.src, 'src', cfg),
-    to: f.dest === ROUTER ? 'the router, its login included' : `the devices on ${zonePhrase(f.dest, 'dest', cfg)}`,
-  };
-}
-
-function validate(f: SheetForm, cfg: FirewallConfig): Errors {
-  const e: Errors = {};
-  if (!isShortName(f.name)) e.name = 'A short name, e.g. Allow-WireGuard.';
-  if (f.src === ROUTER && f.dest === ROUTER) e.path = 'From the router to the router isn’t something a rule can match.';
-  if (f.proto.some((p) => !/^[a-z0-9-]+$/.test(p))) e.proto = 'Protocol names or numbers, e.g. tcp, udp, icmp, all.';
-  for (const c of conditions) {
-    const v = f.conds[c.key];
-    if (v === undefined) continue;
-    const all = [...v.include, ...v.exclude];
-    const bad = all.find((x) => !c.check(x));
-    if (bad !== undefined) e[c.key] = `“${bad}” doesn’t fit here.`;
-    else if ((c.key === 'dest_port' || c.key === 'src_port') && all.length > 0 && !portsApply(f.proto))
-      e[c.key] = 'Ports need TCP or UDP (or SCTP) as the protocol.';
-    else if (c.key === 'icmp_type' && all.length > 0 && !icmpApplies(f.proto)) e[c.key] = 'ICMP types need icmp as the protocol.';
-    else if (
-      f.family !== 'any' &&
-      (c.key === 'src_ip' || c.key === 'dest_ip') &&
-      all.some((a) => a.includes(':') !== (f.family === 'ipv6'))
-    ) {
-      e[c.key] = `Only ${f.family === 'ipv4' ? 'IPv4' : 'IPv6'} addresses: the rule is for that only.`;
-    }
-  }
-  if (!f.openAll && opensEverything(f, cfg) !== undefined) e.open = 'Add the ports it needs, or tick to open every port.';
-  if (f.limit.trim() !== '' && !/^\d+\/(s|sec|second|m|min|minute|h|hour|d|day)$/i.test(f.limit.trim()))
-    e.limit = 'A rate like 10/second or 100/minute.';
-  else if (f.limitBurst.trim() !== '' && !/^\d+$/.test(f.limitBurst.trim())) e.limit = 'The burst is a number of packets.';
-  const log = logPrefixError(f.log, f.name);
-  if (log !== undefined) e.log = log;
-  if (f.scheduled) {
-    const s = scheduleError(f.schedule);
-    if (s !== undefined) e.schedule = s;
-  }
-  return e;
-}
 
 /** Values as chips: Enter, a space or a comma adds what's typed, Backspace in an empty box takes the last off. */
 function TokenInput({
@@ -408,33 +204,39 @@ export function RuleSheet({
   preset,
   data,
   onClose,
-  onSave,
+  onSubmit,
   onDelete,
 }: {
   rule: Rule | undefined;
   preset: RulePreset | undefined;
   data: FirewallData;
   onClose: () => void;
-  onSave: (changes: Change[]) => void;
+  /** applies the changes; the failure's message when that didn't go through */
+  onSubmit: (changes: Change[]) => Promise<string | undefined>;
   /** asks first, then deletes the rule (an existing one only) */
   onDelete?: (() => void) | undefined;
 }): ReactElement {
   const id = useId();
   const section = rule === undefined ? undefined : data.sections.find((s) => s['.name'] === rule.section);
-  const [f, setF] = useState(() => formOf(rule, section, preset));
+  const schema = useMemo(() => ruleFormSchema(data.cfg), [data.cfg]);
+  const saved = useMemo(() => formOf(rule, section, preset), [rule, section, preset]);
+  const {
+    settings,
+    values: f,
+    failed,
+    submitting,
+  } = useSheetForm({ schema, saved, submit: (v) => onSubmit(editSection('rule', section, valuesOf(v, section))) });
+  const { form } = settings;
   const [tab, setTab] = useState<TabId>('match');
   const [adding, setAdding] = useState(false);
-  const set = <K extends keyof SheetForm>(key: K, value: SheetForm[K]): void => {
-    setF((x) => ({ ...x, [key]: value }));
-  };
   const setCond = (key: CondKey, value: Cond | undefined): void => {
-    setF((x) => {
-      const conds: Partial<Record<CondKey, Cond>> = Object.fromEntries(Object.entries(x.conds).filter(([k]) => k !== key));
-      if (value !== undefined) conds[key] = value;
-      return { ...x, conds };
-    });
+    const conds: Partial<Record<CondKey, Cond>> = Object.fromEntries(
+      Object.entries(form.getFieldValue('conds')).filter(([k]) => k !== key),
+    );
+    if (value !== undefined) conds[key] = value;
+    form.setFieldValue('conds', conds);
   };
-  const errors = validate(f, data.cfg);
+  const errors: Errors = formErrors(schema, f);
   const open = opensEverything(f, data.cfg);
   const wrong = new Set(Object.keys(errors).map((k) => tabOf[k as keyof Errors]));
   const values = valuesOf(f, section);
@@ -499,12 +301,12 @@ export function RuleSheet({
                         key={s.label}
                         type="button"
                         onClick={() => {
-                          setF((x) => ({
-                            ...x,
-                            name: s.name,
-                            proto: [s.proto],
-                            conds: { ...x.conds, dest_port: { include: [s.port], exclude: [], excluding: false } },
-                          }));
+                          form.setFieldValue('name', s.name);
+                          form.setFieldValue('proto', [s.proto]);
+                          form.setFieldValue('conds', {
+                            ...form.getFieldValue('conds'),
+                            dest_port: { include: [s.port], exclude: [], excluding: false },
+                          });
                         }}
                         className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
                       >
@@ -521,7 +323,7 @@ export function RuleSheet({
                     placeholder="Allow-WireGuard"
                     aria-invalid={f.name !== '' && errors.name !== undefined}
                     onChange={(e) => {
-                      set('name', e.target.value);
+                      form.setFieldValue('name', e.target.value);
                     }}
                   />
                   {f.name !== '' && errors.name !== undefined && <p className="text-xs text-destructive">{errors.name}</p>}
@@ -535,7 +337,7 @@ export function RuleSheet({
                       value={f.src}
                       options={srcOptions}
                       onChange={(v) => {
-                        set('src', v);
+                        form.setFieldValue('src', v);
                       }}
                     />
                     <span className="text-muted-foreground">to</span>
@@ -545,7 +347,7 @@ export function RuleSheet({
                       value={f.dest}
                       options={destOptions}
                       onChange={(v) => {
-                        set('dest', v);
+                        form.setFieldValue('dest', v);
                       }}
                     />
                   </div>
@@ -557,7 +359,7 @@ export function RuleSheet({
                     id={`${id}-proto`}
                     values={f.proto}
                     onChange={(v) => {
-                      set(
+                      form.setFieldValue(
                         'proto',
                         v.map((p) => p.toLowerCase()),
                       );
@@ -586,7 +388,7 @@ export function RuleSheet({
                         className="accent-primary"
                         checked={f.family === v}
                         onChange={() => {
-                          set('family', v);
+                          form.setFieldValue('family', v);
                         }}
                       />
                       {l}
@@ -712,7 +514,7 @@ export function RuleSheet({
                           type="checkbox"
                           checked={f.openAll}
                           onChange={(e) => {
-                            set('openAll', e.target.checked);
+                            form.setFieldValue('openAll', e.target.checked);
                           }}
                         />
                         Save it with every port open anyway
@@ -732,7 +534,7 @@ export function RuleSheet({
                       label="Action"
                       value={f.target as 'ACCEPT' | 'REJECT' | 'DROP'}
                       onChange={(v) => {
-                        set('target', v);
+                        form.setFieldValue('target', v);
                       }}
                       options={[
                         { value: 'ACCEPT', label: 'accept', icon: CheckIcon, tone: 'allow', hint: 'Let it through.' },
@@ -768,7 +570,7 @@ export function RuleSheet({
                       placeholder="No limit"
                       aria-invalid={errors.limit !== undefined}
                       onChange={(e) => {
-                        set('limit', e.target.value);
+                        form.setFieldValue('limit', e.target.value);
                       }}
                     />
                     <span className="text-xs text-muted-foreground">burst</span>
@@ -779,7 +581,7 @@ export function RuleSheet({
                       placeholder="5"
                       disabled={f.limit.trim() === ''}
                       onChange={(e) => {
-                        set('limitBurst', e.target.value);
+                        form.setFieldValue('limitBurst', e.target.value);
                       }}
                     />
                   </div>
@@ -796,7 +598,7 @@ export function RuleSheet({
                     placeholder="Not logged"
                     aria-invalid={errors.log !== undefined}
                     onChange={(e) => {
-                      set('log', e.target.value);
+                      form.setFieldValue('log', e.target.value);
                     }}
                   />
                   <p className={cn('text-xs', errors.log === undefined ? 'text-muted-foreground' : 'text-destructive')}>
@@ -807,7 +609,7 @@ export function RuleSheet({
                   id={`${id}-enabled`}
                   checked={f.enabled}
                   onChange={(v) => {
-                    set('enabled', v);
+                    form.setFieldValue('enabled', v);
                   }}
                   title={
                     <span className="flex items-center gap-2">
@@ -827,7 +629,7 @@ export function RuleSheet({
                     label="Schedule"
                     value={f.scheduled ? 'times' : 'always'}
                     onChange={(v) => {
-                      set('scheduled', v === 'times');
+                      form.setFieldValue('scheduled', v === 'times');
                     }}
                     options={[
                       { value: 'always', label: 'Always' },
@@ -840,7 +642,7 @@ export function RuleSheet({
                     id={`${id}-schedule`}
                     value={f.schedule}
                     onChange={(s) => {
-                      set('schedule', s);
+                      form.setFieldValue('schedule', s);
                     }}
                   />
                 )}
@@ -863,7 +665,8 @@ export function RuleSheet({
                 <Trash2Icon /> Delete
               </Button>
             )}
-            <p className="text-xs text-muted-foreground">
+            {failed !== undefined && <p className="text-xs font-medium text-destructive">{failed}</p>}
+            <p className={cn('text-xs text-muted-foreground', failed !== undefined && 'sr-only')}>
               {Object.keys(errors).length > 0
                 ? 'Fix what’s marked to save.'
                 : changes.length === 0
@@ -875,12 +678,7 @@ export function RuleSheet({
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button
-              disabled={Object.keys(errors).length > 0 || changes.length === 0}
-              onClick={() => {
-                onSave(changes);
-              }}
-            >
+            <Button disabled={Object.keys(errors).length > 0 || changes.length === 0 || submitting} onClick={settings.save}>
               Save rule
             </Button>
           </div>

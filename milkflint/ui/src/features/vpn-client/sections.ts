@@ -44,10 +44,34 @@ export function leakSection(zone: SourceZone): string {
 /** The home network's devices that don't use it ("everyone except"). */
 export const CLIENT_SKIP = `${CLIENT}_skip`;
 
+/**
+ * Sites that go direct: fw4's two sets of their addresses (no timeout), and
+ * dhcp's ipset section of the same name without the family, the one place
+ * the list of names lives, which has dnsmasq fill the sets as it answers
+ * (LuCI: DHCP and DNS → IP Sets). The VPN's DNS forwarder and AdGuard Home
+ * read the names from there too.
+ */
+export const DIRECT_SET4 = `${CLIENT}_direct4`;
+export const DIRECT_SET6 = `${CLIENT}_direct6`;
+export const DIRECT_DNS = `${CLIENT}_direct`;
+
+/** wg_out_direct_lan_4…: per zone and family, the MARK rule that takes the VPN's bits off traffic to those addresses. */
+export function directRuleSection(zone: SourceZone, family: 4 | 6): string {
+  return `${DIRECT_DNS}_${zone}_${String(family)}`;
+}
+
 export const CLIENT_FIREWALL: readonly string[] = [
   CLIENT,
   CLIENT_SKIP,
-  ...SOURCE_ZONES.flatMap((z) => [forwardSection(z), markSection(z), leakSection(z)]),
+  DIRECT_SET4,
+  DIRECT_SET6,
+  ...SOURCE_ZONES.flatMap((z) => [
+    forwardSection(z),
+    markSection(z),
+    leakSection(z),
+    directRuleSection(z, 4),
+    directRuleSection(z, 6),
+  ]),
 ];
 
 /** netifd's rule and rule6 sections: past the main table's own routes, into the tunnel's table, and the kill switch. */
@@ -63,3 +87,13 @@ export const CLIENT_META = 'vpn_client';
 export function isVpnShaper(device: string | undefined): boolean {
   return device === CLIENT || device === `ifb4${CLIENT}`;
 }
+
+/**
+ * Saved presets of the whole form: milkflint.vpnp_<n> (type vpn_profile), and
+ * the pointer to the active one, milkflint.vpn_profiles option active. Neither
+ * is part of what the client owns: Remove keeps the profiles.
+ */
+export const PROFILE_TYPE = 'vpn_profile';
+export const PROFILE_PREFIX = 'vpnp_';
+export const PROFILES_POINTER = 'vpn_profiles';
+export const PROFILES_POINTER_TYPE = 'vpn_profiles';

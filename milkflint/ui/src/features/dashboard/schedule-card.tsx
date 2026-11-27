@@ -1,23 +1,19 @@
 // Scheduled tasks on Home: the next one to run, by the router's own clock
 // (Home's poll brings it), and how many there are. Root's crontab is read
 // once; jobs that run every few minutes are never "next", only counted.
+import { dashboardQueries } from './queries';
+import { useRead } from '@/lib/query/use-read';
 import type { ReactElement } from 'react';
-import { useLoad } from '@/hooks/use-load';
-import { href } from '@/lib/router';
-import { readCrontab } from '../schedules/api';
-import { label, nextRun, sentence, type Task, tasksFrom, whenText } from '../schedules/model';
+import { pageLink } from '@/lib/router';
+import { label, nextRun, sentence, whenText } from '../schedules/model';
 import type { Dashboard } from './use-dashboard';
-import { sharedCall } from '@/lib/shared-call';
 import { cn } from '@/lib/utils';
 import { EMPTY_GOES } from './fit';
 import { OffNote, Widget, WidgetLink } from './widget';
 
-// one call for every Scheduled tasks widget on Home
-const loadTasks = sharedCall(async (): Promise<Task[]> => tasksFrom(await readCrontab()));
-
 export function ScheduleCard({ d }: { d: Dashboard }): ReactElement {
-  const { data: tasks, error } = useLoad(loadTasks);
-  const link = <WidgetLink href={href('schedules')}>Scheduled tasks</WidgetLink>;
+  const { data: tasks, error } = useRead(dashboardQueries.tasks());
+  const link = <WidgetLink to={pageLink('schedules')}>Scheduled tasks</WidgetLink>;
   if (tasks === undefined) {
     return (
       <Widget aside={error === undefined ? undefined : link}>
@@ -32,7 +28,7 @@ export function ScheduleCard({ d }: { d: Dashboard }): ReactElement {
   if (on.length === 0) {
     return (
       <Widget>
-        <OffNote action={<WidgetLink href={href('schedules')}>Add a task</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('schedules')}>Add a task</WidgetLink>}>
           Restart the router, turn Wi-Fi off and on, or run your own commands, at set times.
         </OffNote>
       </Widget>

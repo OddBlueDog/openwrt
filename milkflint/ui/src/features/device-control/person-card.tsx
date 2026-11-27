@@ -3,6 +3,8 @@
 // last seen), their week, their times in words, their data today, and the
 // two things a parent does most: Pause, and Extra time while they're off.
 // Pause and Extra time open their choices in place, as large buttons.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import {
   ChevronRightIcon,
   ClockPlusIcon,
@@ -18,7 +20,6 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { formatBytes } from '@/lib/format';
-import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import type { DcDevice } from './api';
 import {
@@ -213,9 +214,9 @@ export function PersonCard({
           <Note tone="warning" icon={<TriangleAlertIcon />}>
             {entry.own?.byHand.length === 1 ? 'One rule was' : `${String(entry.own?.byHand.length)} rules were`} changed on the
             Firewall page, so it’s left as it is there.{' '}
-            <a href={href('firewall')} className="link underline-offset-4">
+            <Link {...pageLink('firewall')} className="link underline-offset-4">
               Firewall
-            </a>
+            </Link>
           </Note>
         )}
         <p className="text-muted-foreground">

@@ -190,7 +190,7 @@ export function StatusCard({
         {!ap && <LookupBox conntrack={conntrack} onChanged={onChanged} />}
       </div>
       {/* the day of drops while it's on; off, only the line saying where they'll show */}
-      {on && !ap && <DropRibbon values={series} end={drops?.end} step={drops?.step ?? 300} muted={false} summary={summary} />}
+      {on && !ap && <DropRibbon values={series} end={drops?.end} step={drops?.step ?? 300} summary={summary} />}
       <div
         className={cn(
           'flex flex-wrap items-baseline justify-between gap-x-4 bg-muted/40 px-5 pb-3 text-xs text-muted-foreground sm:px-6',

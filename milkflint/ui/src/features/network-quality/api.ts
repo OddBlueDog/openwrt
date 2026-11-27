@@ -1,5 +1,7 @@
 import { z } from 'zod';
+import { bool, getConfig, str } from '@/lib/api/uci';
 import { call } from '@/lib/ubus';
+import { pingTargets, type QualityForm } from './model';
 import { possibleHistory } from './plausible';
 
 const sampleSchema = z.object({
@@ -94,4 +96,20 @@ export async function getHistory(span: number, step: number): Promise<History> {
 /** The probe daemon's state, with the samples newer than `since`. */
 export function getStatus(since: number): Promise<Status> {
   return call('milkflint.netquality', 'status', { since }, statusSchema);
+}
+
+/** The probe's settings as the form shows them. */
+export async function loadSettings(): Promise<QualityForm> {
+  const s = (await getConfig('milkflint')).find((x) => x['.name'] === 'netquality');
+  const target = str(s, 'ping_target') ?? '1.1.1.1';
+  const preset = pingTargets.some((p) => p.value === target);
+  return {
+    enabled: bool(s, 'enabled', true),
+    interval: str(s, 'interval') ?? '5',
+    pingTarget: preset ? target : 'custom',
+    customTarget: preset ? '' : target,
+    dnsDomain: str(s, 'dns_domain') ?? 'openwrt.org',
+    dnsServer: str(s, 'dns_server') ?? '',
+    routes: bool(s, 'routes', true),
+  };
 }

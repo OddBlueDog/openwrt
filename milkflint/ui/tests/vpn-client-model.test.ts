@@ -7,17 +7,20 @@ import {
   activeDnsOf,
   blankForm,
   type ClientData,
+  clientErrors,
   type ClientForm,
   describe,
+  directOf,
   drift,
   fromConf,
   homeDevices,
+  MAX_DIRECT,
   pickerLabel,
   removal,
   sources,
   summary,
   toChanges,
-  validate,
+  tunnelLine,
   wanted,
   whoSummary,
 } from '../src/features/vpn-client/model.ts';
@@ -26,6 +29,9 @@ import { ipToInt } from '../src/lib/api/network.ts';
 import type { Wanted } from '../src/lib/api/owned.ts';
 import type { WgConf } from '../src/lib/api/wireguard.ts';
 import { applied, nameOf, presentOf, section } from './uci-fixture.ts';
+
+// the form's checks, by the keys the page shows them under
+const validate = clientErrors;
 
 const KEY = `${'a'.repeat(42)}A=`;
 const OTHER = `${'b'.repeat(42)}E=`;
@@ -50,6 +56,7 @@ const form = (over: Partial<ClientForm> = {}): ClientForm => ({
   shaper: false,
   downMbit: '',
   upMbit: '',
+  direct: [],
   ...over,
 });
 
@@ -67,6 +74,9 @@ const data = (f: ClientForm = form(), over: Partial<ClientData> = {}): ClientDat
   wanRates: { down: 500, up: 100 },
   lan: { ip: ipToInt('192.168.1.1') ?? 0, prefix: 24 },
   taken: [{ ip: ipToInt('192.168.9.1') ?? 0, prefix: 24, name: 'Guests' }],
+  profiles: [],
+  active: undefined,
+  nftset: true,
   ...over,
 });
 
@@ -83,6 +93,7 @@ const onRouter = (f: ClientForm): ClientData['present'] => {
     firewall: p['firewall'] ?? [],
     sqm: p['sqm'] ?? [],
     milkflint: p['milkflint'] ?? [],
+    dhcp: p['dhcp'] ?? [],
   };
 };
 
@@ -245,6 +256,8 @@ test('the next save with the same settings changes nothing', () => {
     form({ enabled: false }),
     form({ addresses: ['10.64.12.7/32', 'fd00::7/128'], mtu: '1380', presharedKey: KEY }),
     form({ shaper: true, downMbit: '100', upMbit: '20' }),
+    form({ direct: ['bbc.co.uk', 'itv.com'], guests: ['guest'] }),
+    form({ enabled: false, direct: ['bbc.co.uk'] }),
   ]) {
     const d = data(f, { present: onRouter(f), exists: true });
     assert.deepEqual(toChanges(f, d), [], JSON.stringify(f));
@@ -468,7 +481,8 @@ test('their DNS: with Use VPN’s DNS on, through the tunnel to the VPN’s DNS;
   const off = (over: Partial<ClientForm> = {}): ClientForm => form({ useVpnDns: false, ...over });
   assert.equal(line(off(), 'tunnel')?.ok, true);
   assert.match(line(off(), 'tunnel')?.text ?? '', /through the tunnel.*nowhere else/);
-  assert.match(line(off({ killSwitch: false }), 'tunnel')?.text ?? '', /directly while the tunnel is down/);
+  assert.match(line(off({ killSwitch: false }), 'tunnel')?.text ?? '', /this router’s DNS while the tunnel is down/);
+  assert.doesNotMatch(line(off({ killSwitch: false }), 'tunnel')?.text ?? '', /directly while the tunnel is down/);
   assert.equal(line(off(), 'automatic')?.ok, false);
   assert.match(line(off(), 'automatic')?.text ?? '', /Turn on “Use VPN’s DNS”/);
   assert.equal(line(off(), undefined)?.ok, false);
@@ -528,4 +542,183 @@ test('two devices with one name: each says which it is', () => {
   assert.equal(pickerLabel(b, all), 'DESKTOP (aa:bb:cc:dd:ee:02)');
   assert.equal(pickerLabel(c, all), 'Tablet');
   assert.equal(pickerLabel(d, all), '192.168.1.50');
+});
+
+test('the tunnel line: when the server stopped answering and what the devices get', () => {
+  const clock = (epoch: number): string => `t${epoch}`;
+  const down = { up: false, since: 100, reason: 'no-answer' as const, dns_ok: null };
+  assert.equal(
+    tunnelLine(down, true, clock),
+    'The server stopped answering at t100. With the kill switch on, those devices have no internet until it’s back.',
+  );
+  assert.equal(
+    tunnelLine(down, false, clock),
+    'The server stopped answering at t100. Those devices are going out directly, with this router’s DNS, until it’s back.',
+  );
+  assert.equal(tunnelLine({ ...down, up: true, reason: null, dns_ok: false }, true, clock), 'The VPN’s DNS isn’t answering.');
+  assert.equal(tunnelLine({ ...down, up: true, reason: null, dns_ok: true }, true, clock), undefined);
+  assert.equal(tunnelLine({ ...down, up: true, reason: null, dns_ok: null }, false, clock), undefined);
+  assert.equal(tunnelLine(null, true, clock), undefined);
+});
+
+test('the same-LAN DNS limit: a server inside the home network is asked directly', () => {
+  const lines = (deviceDns: string[]): string[] => describe(form(), data(form(), { deviceDns })).map((l) => l.text);
+  const limit = (l: string): boolean => l.includes('look names up there directly, not through the VPN');
+  assert.ok(lines(['192.168.1.5']).some((l) => l.startsWith('Devices told to use 192.168.1.5 look names up there') && limit(l)));
+  assert.ok(lines(['192.168.1.5']).some((l) => l.endsWith('the kill switch can’t stop that on your own network.')));
+  assert.ok(!lines(['9.9.9.9']).some(limit));
+  assert.ok(!lines([]).some(limit));
+  assert.ok(!describe(form({ enabled: false }), data(form(), { deviceDns: ['192.168.1.5'] })).some((l) => limit(l.text)));
+});
+
+// ---- sites that go direct ----
+
+const DIRECT = ['wg_out_direct', 'wg_out_direct4', 'wg_out_direct6', 'wg_out_direct_lan_4', 'wg_out_direct_lan_6'];
+const isDirect = (name: string): boolean => name.startsWith('wg_out_direct');
+/** A wanted section as the router keeps it (uci drops what's unset). */
+const kept = (w: readonly Wanted[], config: string, name: string): ReturnType<typeof section> | undefined =>
+  presentOf(w)[config]?.find((s) => s['.name'] === name);
+
+test('sites that go direct: two fw4 sets, the dhcp list that fills them, and a rule per zone that clears the VPN bits', () => {
+  const f = form({ direct: ['bbc.co.uk'] });
+  const w = wanted(f, data(f));
+  assert.deepEqual(names(w).filter(isDirect).sort(), DIRECT);
+  for (const family of [4, 6] as const) {
+    const set = `wg_out_direct${String(family)}`;
+    assert.deepEqual(
+      kept(w, 'firewall', set),
+      section('ipset', set, { name: set, family: `ipv${String(family)}`, match: ['dest_ip'] }),
+    );
+    // no timeout: an entry that ran out mid-connection would send its later packets into the tunnel
+    assert.ok('timeout' in get(w, set).values && get(w, set).values['timeout'] === undefined, 'a timeout set in LuCI is unset');
+    assert.deepEqual(
+      kept(w, 'firewall', `wg_out_direct_lan_${String(family)}`),
+      section('rule', `wg_out_direct_lan_${String(family)}`, {
+        name: 'Direct-VPN-Home',
+        src: 'lan',
+        dest: '*',
+        proto: 'all',
+        family: `ipv${String(family)}`,
+        ipset: `${set} dest`,
+        target: 'MARK',
+        set_xmark: '0x0/0xf0000000',
+      }),
+    );
+  }
+  assert.deepEqual(
+    kept(w, 'dhcp', 'wg_out_direct'),
+    section('ipset', 'wg_out_direct', {
+      name: ['wg_out_direct4', 'wg_out_direct6'],
+      domain: ['bbc.co.uk'],
+      table: 'fw4',
+      table_family: 'inet',
+    }),
+  );
+});
+
+test('the direct rules come after the mark and the skip, so the mark they clear is already set', () => {
+  const f = form({ who: 'except', macs: [MAC], guests: ['guest'], direct: ['bbc.co.uk'] });
+  const order = names(wanted(f, data(f)));
+  for (const family of ['4', '6']) {
+    const lan = order.indexOf(`wg_out_direct_lan_${family}`);
+    assert.ok(lan > order.indexOf('wg_out_mark_lan') && lan > order.indexOf('wg_out_skip'), family);
+    assert.ok(order.indexOf(`wg_out_direct_guest_${family}`) > order.indexOf('wg_out_mark_guest'), family);
+  }
+  assert.equal(get(wanted(f, data(f)), 'wg_out_direct_guest_4').values['name'], 'Direct-VPN-My-visitors-');
+  // a list started later, on a tunnel that runs: its rules land after the marks already there
+  const present = onRouter(form({ who: 'except', macs: [MAC] }));
+  const firewall = applied({ firewall: present.firewall }, toChanges(f, data(f, { present })))['firewall'] ?? [];
+  const after = firewall.map((s) => s['.name']);
+  assert.ok(after.indexOf('wg_out_direct_lan_4') > after.indexOf('wg_out_skip'));
+});
+
+test('turned off: the direct rules are off; the sets and the list stay', () => {
+  const f = form({ enabled: false, direct: ['bbc.co.uk'] });
+  const w = wanted(f, data(f));
+  for (const name of ['wg_out_direct_lan_4', 'wg_out_direct_lan_6']) assert.equal(get(w, name).values['enabled'], '0', name);
+  for (const name of ['wg_out_direct', 'wg_out_direct4', 'wg_out_direct6'])
+    assert.equal(get(w, name).values['enabled'], undefined, name);
+  assert.deepEqual(get(w, 'wg_out_direct').values['domain'], ['bbc.co.uk']);
+});
+
+test('Remove deletes the sets, the list and every zone’s rules', () => {
+  const f = form({ guests: ['guest'], direct: ['bbc.co.uk'] });
+  const changes = removal(data(f, { present: onRouter(f), exists: true }));
+  const gone = changes.filter((c) => c.op === 'delete').map(nameOf);
+  for (const name of [...DIRECT, 'wg_out_direct_guest_4', 'wg_out_direct_guest_6']) assert.ok(gone.includes(name), name);
+  assert.ok(changes.some((c) => c.op === 'delete' && c.config === 'dhcp' && c.section === 'wg_out_direct'));
+});
+
+test('an empty list: none of them; a list emptied: they go', () => {
+  assert.ok(!names(wanted(form(), data())).some(isDirect));
+  const was = form({ direct: ['bbc.co.uk'] });
+  const gone = toChanges(form(), data(form(), { present: onRouter(was), exists: true }));
+  assert.deepEqual(
+    gone.map((c) => `${c.op} ${nameOf(c) ?? ''}`).sort(),
+    DIRECT.map((n) => `delete ${n}`),
+  );
+});
+
+test('a dnsmasq without nftset: nothing of the list is written, or checked', () => {
+  const f = form({ direct: ['bbc.co.uk'] });
+  assert.ok(!names(wanted(f, data(f, { nftset: false }))).some(isDirect));
+  assert.ok(!names(wanted(f, data(f, { nftset: undefined }))).some(isDirect));
+  const bad = form({ direct: ['bad_name!'] });
+  assert.equal(validate(bad, data(bad, { nftset: false }))['direct'], undefined);
+});
+
+test('the list’s checks: host names as the field cleans them, at most 64', () => {
+  const error = (direct: string[]): string | undefined => validate(form({ direct }), data())['direct'];
+  assert.equal(error(['bbc.co.uk', 'www.itv.com']), undefined);
+  for (const bad of [['https://bbc.co.uk/x'], ['BBC.co.uk'], ['.bbc.co.uk'], ['a/b'], ['bad_name!']])
+    assert.notEqual(error(bad), undefined, bad[0]);
+  const many = Array.from({ length: MAX_DIRECT + 1 }, (_, i) => `s${String(i)}.example`);
+  assert.equal(error(many.slice(0, MAX_DIRECT)), undefined);
+  assert.notEqual(error(many), undefined);
+});
+
+test('a site added to the list in LuCI is part of it: read back as the page reads it, and no drift', () => {
+  const f = form({ direct: ['bbc.co.uk'] });
+  const present = onRouter(f);
+  const list = present.dhcp?.find((s) => s['.name'] === 'wg_out_direct');
+  assert.ok(list !== undefined);
+  // LuCI's DHCP and DNS → IP Sets
+  list['domain'] = ['bbc.co.uk', 'itv.com'];
+  const read = { ...f, direct: directOf(present.dhcp ?? []) };
+  assert.deepEqual(read.direct, ['bbc.co.uk', 'itv.com']);
+  assert.deepEqual(drift(data(read, { present, exists: true })), []);
+  assert.deepEqual(directOf([]), []);
+});
+
+test('in words: what goes direct, and what a save changed about it', () => {
+  const f = form({ direct: ['bbc.co.uk', 'itv.com'] });
+  const line = describe(f, data(f)).find((l) => l.text.includes('bbc.co.uk'));
+  assert.equal(line?.text.includes('itv.com'), true);
+  assert.ok(!describe(form(), data()).some((l) => l.text.includes('go direct')));
+  assert.ok(!describe(f, data(f, { nftset: false })).some((l) => l.text.includes('bbc.co.uk')));
+  assert.match(summary(form(), f, data(f)).join(' '), /bbc\.co\.uk, itv\.com/);
+  assert.match(summary(f, form(), data()).join(' '), /No sites go direct/);
+  assert.doesNotMatch(summary(f, f, data(f)).join(' '), /direct/);
+});
+
+test('in words, with sites that go direct: the kill switch, the IPv6 block and an outage’s cuts make room for them', () => {
+  const lines = (g: ClientForm, nftset = true): string[] => describe(g, data(g, { nftset })).map((l) => l.text);
+  const kill = (t: string): boolean => t.startsWith('Kill switch:');
+  const none = (t: string): boolean => t.startsWith('No kill switch:');
+  const v6 = (t: string): boolean => t.startsWith('The VPN has no IPv6');
+  const on = form({ direct: ['bbc.co.uk'] });
+  assert.match(lines(on).find(kill) ?? '', /no internet but the sites that go direct.*Nothing else of theirs leaves/);
+  assert.match(lines(on).find(v6) ?? '', /blocked rather than going out directly, except to the sites that go direct/);
+  assert.match(
+    lines(form({ direct: ['bbc.co.uk'], killSwitch: false })).find(none) ?? '',
+    /cut when it drops and again when it’s back.*restarts twice/,
+  );
+  // without a list (or a dnsmasq that can't fill the sets), as before
+  for (const g of [form(), form({ killSwitch: false })]) for (const t of lines(g)) assert.doesNotMatch(t, /go direct/);
+  assert.match(lines(on, false).find(kill) ?? '', /^Kill switch: if the tunnel drops, those devices get no internet rather than/);
+  assert.match(lines(form()).find(v6) ?? '', /: their apps use IPv4\.$/);
+  assert.equal(
+    lines(form({ killSwitch: false })).find(none),
+    'No kill switch: if the tunnel drops, those devices go out directly until it’s back.',
+  );
 });

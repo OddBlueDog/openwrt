@@ -4,10 +4,11 @@
 // tab is in the URL (#/wifi-scan/radar), so links and the back button land
 // on it; the old #/radar-scan comes here too. Only the open tab is mounted,
 // so each polls the router only while it's shown.
-import { type ReactElement, useSyncExternalStore } from 'react';
+import { useNavigate } from '@tanstack/react-router';
+import type { ReactElement } from 'react';
 import { PageHeader } from '@/components/layout/page-header';
 import { TabPanel, Tabs } from '@/components/ui/tabs';
-import { href } from '@/lib/router';
+import { tabFrom, tabLink, useSubPath } from '@/lib/router';
 import { RadarScanPanel } from '../radar-scan/panel';
 import { NearbyNetworks } from './networks';
 
@@ -18,25 +19,9 @@ const tabs: readonly { id: Tab; label: string }[] = [
   { id: 'radar', label: 'Radar scan' },
 ];
 
-function currentTab(): Tab {
-  const name = window.location.hash.replace(/^#\/?/, '').split('/')[1] ?? '';
-  return tabs.find((t) => t.id === name)?.id ?? 'networks';
-}
-
-function subscribe(listener: () => void): () => void {
-  window.addEventListener('hashchange', listener);
-  return () => {
-    window.removeEventListener('hashchange', listener);
-  };
-}
-
-/** Where a tab lives: #/wifi-scan for the first, #/wifi-scan/radar for the radar scan. */
-function tabHref(tab: Tab): string {
-  return tab === 'networks' ? href('wifi-scan') : `${href('wifi-scan')}/${tab}`;
-}
-
 export function NearbyPage(): ReactElement {
-  const tab = useSyncExternalStore(subscribe, currentTab);
+  const tab = tabFrom(useSubPath(), tabs, 'networks');
+  const navigate = useNavigate();
   return (
     <>
       <PageHeader
@@ -50,7 +35,7 @@ export function NearbyPage(): ReactElement {
           items={tabs}
           value={tab}
           onChange={(t) => {
-            window.location.hash = tabHref(t);
+            void navigate(tabLink('wifi-scan', t, 'networks'));
           }}
         />
         <TabPanel prefix="nearby" id="networks" value={tab}>

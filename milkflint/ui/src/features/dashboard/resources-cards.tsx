@@ -9,7 +9,7 @@ import { formatBytes, formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { agoLabels, CORE_BUSY } from './model';
 import { CoreRings } from './core-rings';
-import { TimeChart } from './time-chart';
+import { TimeChart } from '@/components/charts/time-chart';
 import { type Dashboard, HISTORY, POLL_MS } from './use-dashboard';
 import { Widget } from './widget';
 import { useWidgetInfo } from './widget-info';

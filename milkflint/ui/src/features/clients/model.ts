@@ -3,6 +3,7 @@
 // them: how many are online and how, and what's wrong with an edit. And a
 // device's name, the same on every page that lists devices (All devices,
 // Data usage, Home).
+import { z } from 'zod';
 import { inSubnet } from '@/lib/api/network';
 import { type Change, type Section, str } from '@/lib/api/uci';
 import type { Device } from './api';
@@ -104,3 +105,24 @@ export function reserveError(
   const takenBy = data.devices.find((d) => d.mac !== mac && reservedIp(d.reservation) === ip);
   return takenBy === undefined ? undefined : `Already reserved for ${takenBy.name ?? takenBy.mac}.`;
 }
+
+/** The device sheet's form: its name, and whether to reserve an address and which. */
+export interface DeviceFormData {
+  devices: readonly Pick<Device, 'mac' | 'name' | 'reservation'>[];
+  routerIp: string;
+  prefix: number;
+}
+
+/** The sheet's checks for the device `mac` against the router's other devices and network. */
+export function deviceFormSchema(mac: string, data: DeviceFormData): z.ZodType<DeviceForm, DeviceForm> {
+  return deviceFields.superRefine((f, ctx) => {
+    const name = nameError(f.name);
+    if (name !== undefined) ctx.addIssue({ code: 'custom', path: ['name'], message: name });
+    const ip = f.reserve ? reserveError(f.ip, mac, data) : undefined;
+    if (ip !== undefined) ctx.addIssue({ code: 'custom', path: ['ip'], message: ip });
+  });
+}
+
+const deviceFields = z.object({ name: z.string(), reserve: z.boolean(), ip: z.string() });
+
+export type DeviceForm = z.infer<typeof deviceFields>;

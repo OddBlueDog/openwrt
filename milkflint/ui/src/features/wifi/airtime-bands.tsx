@@ -6,7 +6,8 @@
 // their rate. Each rate is typed once, where a class starts; the class below
 // it ends there. With auto, where slow links start being held back is worked
 // out from the good-link rate and the strength, so it's shown, not typed.
-import { Fragment, type ReactElement } from 'react';
+import { type ReactElement, useMemo } from 'react';
+import { type Column, DataTable } from '@/components/data-table';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -47,6 +48,9 @@ const ROWS: readonly Row[] = [
   { name: 'Weak link', cls: 'weak', goal: 'goal_weak' },
   { name: 'Not answering', cls: 'lost', goal: 'goal_lost' },
 ];
+
+/** A cell as tight as a narrow card needs, in line with the heading above the table; a heading wraps there. */
+const CELL = 'py-1.5 pr-2 pl-0 whitespace-normal @min-[24rem]:pr-3';
 
 /** How each strength turns a slower link into a smaller share, in words */
 const STRENGTH_WORDS: Record<AirtimeStrength, string> = {
@@ -112,32 +116,111 @@ export function AirtimeBandsTable({
     Number.isFinite(weakN)
       ? airtimeAutoPaceRate(fullN, weakN, strength)
       : undefined;
-  const input = (key: AirtimeBandKey, label: string, unit: string): ReactElement => (
-    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-      <Input
-        id={`${idPrefix}-${key}`}
-        aria-label={label}
-        title={`Default: ${defaults[key]}${unit === '%' ? '%' : ` ${unit}`}`}
-        inputMode="decimal"
-        className="h-8 w-12 px-1 text-center tabular @min-[24rem]:w-14 @min-[24rem]:px-1.5"
-        value={value[key]}
-        aria-invalid={errors[key] !== undefined}
-        aria-describedby={errors[key] === undefined ? undefined : `${idPrefix}-${key}-error`}
-        onChange={(e) => {
-          onChange({ ...value, [key]: e.target.value });
-        }}
-      />
-      {/* in a narrow card the unit is in the column's heading instead */}
-      <span className="hidden text-xs text-muted-foreground @min-[24rem]:inline">{unit}</span>
-    </span>
-  );
-  // the lowest class has no rate of its own: it is whatever is below the one above
-  const below = value.weak.trim() === '' ? '…' : value.weak.trim();
+  // the cells hold the inputs, so the columns go with what's typed
+  const columns = useMemo((): Column<Row>[] => {
+    const input = (key: AirtimeBandKey, label: string, unit: string): ReactElement => (
+      <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+        <Input
+          id={`${idPrefix}-${key}`}
+          aria-label={label}
+          title={`Default: ${defaults[key]}${unit === '%' ? '%' : ` ${unit}`}`}
+          inputMode="decimal"
+          className="h-8 w-12 px-1 text-center tabular @min-[24rem]:w-14 @min-[24rem]:px-1.5"
+          value={value[key]}
+          aria-invalid={errors[key] !== undefined}
+          aria-describedby={errors[key] === undefined ? undefined : `${idPrefix}-${key}-error`}
+          onChange={(e) => {
+            onChange({ ...value, [key]: e.target.value });
+          }}
+        />
+        {/* in a narrow card the unit is in the column's heading instead */}
+        <span className="hidden text-xs text-muted-foreground @min-[24rem]:inline">{unit}</span>
+      </span>
+    );
+    // the lowest class has no rate of its own: it is whatever is below the one above
+    const below = value.weak.trim() === '' ? '…' : value.weak.trim();
+    return [
+      {
+        label: 'Link',
+        className: CELL,
+        cell: (row) => (
+          <span className="flex items-center gap-2">
+            <span className={cn('size-2 shrink-0 rounded-full', airtimeFill[row.cls])} aria-hidden />
+            {row.name}
+          </span>
+        ),
+      },
+      {
+        label: 'Useful rate',
+        header: (
+          <>
+            Useful rate<span className="@min-[24rem]:hidden">, Mbit/s</span>
+          </>
+        ),
+        className: CELL,
+        cell: (row) =>
+          // with auto the slow row's start is worked out
+          strength !== undefined && row.from === 'pace' ? (
+            <span
+              className="text-xs whitespace-nowrap text-muted-foreground tabular"
+              title="Worked out from the good-link rate and the strength: below it, a device’s share beside one good link would be under four fifths of an even split"
+            >
+              {autoPace === undefined ? '…' : `from ${rate(autoPace)} Mbit/s`}
+            </span>
+          ) : row.from !== undefined ? (
+            <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+              <span className="hidden text-xs text-muted-foreground @min-[24rem]:inline">from</span>
+              {input(row.from, `${row.name} from, in Mbit/s`, 'Mbit/s')}
+            </span>
+          ) : (
+            <span className="text-xs text-muted-foreground">
+              {row.cls === 'weak' ? `under ${below} Mbit/s` : 'frames keep failing'}
+            </span>
+          ),
+      },
+      // with auto, the shares are worked out: no column for them
+      ...(strength === undefined
+        ? [
+            {
+              label: 'Airtime goal',
+              header: (
+                <>
+                  Airtime goal<span className="@min-[24rem]:hidden">, %</span>
+                </>
+              ),
+              className: 'py-1.5 pr-0 whitespace-normal',
+              cell: (row: Row) =>
+                row.goal !== undefined ? (
+                  input(row.goal, `${row.name}: airtime goal, in percent`, '%')
+                ) : (
+                  <span className="text-xs text-muted-foreground">{row.share}</span>
+                ),
+            },
+          ]
+        : []),
+    ];
+  }, [idPrefix, defaults, value, errors, onChange, strength, autoPace]);
+  // a row's errors under it, across the table: in the first column they would wrap to a word a line
+  const wrong = (row: Row): ReactElement | undefined => {
+    const goal = strength === undefined ? row.goal : undefined;
+    const from = strength !== undefined && row.from === 'pace' ? undefined : row.from;
+    const lines = [from, goal].flatMap((key) =>
+      key !== undefined && errors[key] !== undefined ? [{ key, text: errors[key] }] : [],
+    );
+    return lines.length === 0 ? undefined : (
+      <span className="flex flex-col text-xs text-destructive">
+        {lines.map((e) => (
+          <span key={e.key} id={`${idPrefix}-${e.key}-error`}>
+            {e.text}
+          </span>
+        ))}
+      </span>
+    );
+  };
 
   return (
-    // a container, so the table can tighten in a narrow card instead of pushing past it; a section of the
-    // band's column, under a hairline, not a box
-    <div className="@container flex flex-col gap-2 py-3.5">
+    // a section of the band's column, under a hairline, not a box (the table tightens in a narrow card by its own width)
+    <div className="flex flex-col gap-2 py-3.5">
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-0.5">
           <h4 className="text-sm font-semibold">{strength === undefined ? 'Link classes and airtime goals' : 'Link classes'}</h4>
@@ -193,89 +276,16 @@ export function AirtimeBandsTable({
           </SelectContent>
         </Select>
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full border-collapse text-sm">
-          <thead>
-            <tr className="text-left text-xs text-muted-foreground">
-              <th scope="col" className="py-1 pr-2 font-medium @min-[24rem]:pr-3">
-                Link
-              </th>
-              <th scope="col" className="py-1 pr-2 font-medium @min-[24rem]:pr-3">
-                Useful rate<span className="@min-[24rem]:hidden">, Mbit/s</span>
-              </th>
-              {/* with auto, the shares are worked out: no column for them */}
-              {strength === undefined && (
-                <th scope="col" className="py-1 font-medium">
-                  Airtime goal<span className="@min-[24rem]:hidden">, %</span>
-                </th>
-              )}
-            </tr>
-          </thead>
-          <tbody>
-            {ROWS.map((row) => {
-              // with auto the slow row's start is worked out, and no goal is shown
-              const workedOut = strength !== undefined && row.from === 'pace';
-              const goal = strength === undefined ? row.goal : undefined;
-              const from = workedOut ? undefined : row.from;
-              const wrong = [from, goal].flatMap((key) =>
-                key !== undefined && errors[key] !== undefined ? [{ key, text: errors[key] }] : [],
-              );
-              return (
-                <Fragment key={row.name}>
-                  <tr className="border-t align-middle">
-                    <th scope="row" className="py-1.5 pr-2 text-left font-normal @min-[24rem]:pr-3">
-                      <span className="flex items-center gap-2">
-                        <span className={cn('size-2 shrink-0 rounded-full', airtimeFill[row.cls])} aria-hidden />
-                        {row.name}
-                      </span>
-                    </th>
-                    <td className="py-1.5 pr-2 @min-[24rem]:pr-3">
-                      {workedOut ? (
-                        <span
-                          className="text-xs whitespace-nowrap text-muted-foreground tabular"
-                          title="Worked out from the good-link rate and the strength: below it, a device’s share beside one good link would be under four fifths of an even split"
-                        >
-                          {autoPace === undefined ? '…' : `from ${rate(autoPace)} Mbit/s`}
-                        </span>
-                      ) : from !== undefined ? (
-                        <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-                          <span className="hidden text-xs text-muted-foreground @min-[24rem]:inline">from</span>
-                          {input(from, `${row.name} from, in Mbit/s`, 'Mbit/s')}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">
-                          {row.cls === 'weak' ? `under ${below} Mbit/s` : 'frames keep failing'}
-                        </span>
-                      )}
-                    </td>
-                    {strength === undefined && (
-                      <td className="py-1.5">
-                        {goal !== undefined ? (
-                          input(goal, `${row.name}: airtime goal, in percent`, '%')
-                        ) : (
-                          <span className="text-xs text-muted-foreground">{row.share}</span>
-                        )}
-                      </td>
-                    )}
-                  </tr>
-                  {wrong.length > 0 && (
-                    // under its row, across the table: in the first column it would wrap to a word a line
-                    <tr>
-                      <td colSpan={strength === undefined ? 3 : 2} className="pb-1.5 pl-4 text-xs text-destructive">
-                        {wrong.map((e) => (
-                          <span key={e.key} id={`${idPrefix}-${e.key}-error`} className="block">
-                            {e.text}
-                          </span>
-                        ))}
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        label={strength === undefined ? 'Link classes and airtime goals' : 'Link classes'}
+        columns={columns}
+        rows={ROWS}
+        rowKey={(row) => row.name}
+        empty=""
+        framed={false}
+        cards={false}
+        detail={wrong}
+      />
     </div>
   );
 }

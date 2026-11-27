@@ -6,7 +6,14 @@ import { parseRouter } from '../src/features/test-bench/analysis.ts';
 import { defaultThresholds, runChecks } from '../src/features/test-bench/checks.ts';
 import { buildExport, EXPORT_FORMAT, exportName, hideAddresses, parseExport } from '../src/features/test-bench/export.ts';
 import type { RunRecord } from '../src/features/test-bench/member.ts';
-import { cakeSeconds, memberRate, stationSamples, wanPort, worstEachSecond } from '../src/features/test-bench/timelines.ts';
+import {
+  cakeSeconds,
+  memberRate,
+  onGrid,
+  stationSamples,
+  wanPort,
+  worstEachSecond,
+} from '../src/features/test-bench/timelines.ts';
 import { fixture, phases, T0 } from './test-bench-fixture.ts';
 
 // ---- Timelines ----
@@ -28,6 +35,51 @@ test('latency each second: the worst answered, a second with only lost probes, a
     [3500, 4],
   ]);
   assert.deepEqual(w.lost, [1200]);
+});
+
+test('the charts’ grid: points each second stay, gaps too; a sample on the second it covers; a sparser one held', () => {
+  // each second's, with a gap of three seconds: as it was
+  const w: [number, number | null][] = [
+    [500, 9],
+    [1500, null],
+    [4500, 4],
+  ];
+  assert.deepEqual(onGrid(w, 5000), [
+    [500, 9],
+    [1500, null],
+    [2500, null],
+    [3500, null],
+    [4500, 4],
+  ]);
+  // the router's samples, at whole seconds and a few ms off: each on the second before it
+  assert.deepEqual(
+    onGrid(
+      [
+        [1000, 1],
+        [2000, 2],
+        [2995, 3],
+      ],
+      3000,
+    ),
+    [
+      [500, 1],
+      [1500, 2],
+      [2500, 3],
+    ],
+  );
+  // every 2 s, read within 2.5 s; a scan every 10 s, within 6 s; beyond, a gap
+  assert.deepEqual(
+    onGrid(
+      [
+        [1000, 5],
+        [3000, 7],
+      ],
+      6000,
+      2500,
+    ).map((p) => p[1]),
+    [5, 5, 7, 7, 7, null],
+  );
+  assert.deepEqual(onGrid([[15_000, 9]], 26_000, 6000).filter((p) => p[1] === 9).length, 12);
 });
 
 test('a device’s speed each second: nothing arriving in its load phase is 0, outside it nothing', () => {

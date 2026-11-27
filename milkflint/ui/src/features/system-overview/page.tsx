@@ -4,7 +4,10 @@
 // core, memory in parts, storage, its addresses and every temperature
 // sensor. Read every 3 s while the page is open; the Processor card opens
 // the process list.
-import { type ReactElement, type ReactNode, useRef } from 'react';
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
+import { useQuery } from '@tanstack/react-query';
+import { type ReactElement, type ReactNode, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
@@ -12,21 +15,14 @@ import { ProcessesButton } from '@/components/processes/processes-sheet';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
-import { usePoll } from '@/hooks/use-poll';
-import { getInterfaces, ipv4, type NetworkInterface, wanInterfaces, wanIpv6 } from '@/lib/api/network';
-import { getStats, type Stats } from '@/lib/api/stats';
-import { type Board, firmwareName, getBoard, getInfo, memoryInUse, type SystemInfo } from '@/lib/api/system';
+import { ipv4, type NetworkInterface, wanInterfaces, wanIpv6 } from '@/lib/api/network';
+import type { Stats } from '@/lib/api/stats';
+import { firmwareName, memoryInUse } from '@/lib/api/system';
 import { formatBytes, formatDuration, formatNumber, formatPercent } from '@/lib/format';
-import { href } from '@/lib/router';
+import { useLive } from '@/lib/query/use-live';
 import { cn } from '@/lib/utils';
-
-interface Overview {
-  board: Board;
-  info: SystemInfo;
-  stats: Stats;
-  interfaces: NetworkInterface[];
-  cores: number[] | undefined;
-}
+import { coreLoads } from './model';
+import { systemQueries } from './queries';
 
 const TITLE = 'About this router';
 const DESCRIPTION =
@@ -101,34 +97,41 @@ function tempBadge(c: number): ReactElement | null {
 }
 
 export function SystemOverviewPage(): ReactElement {
-  const prevCpu = useRef<Stats['cpu']>(undefined);
-  const { data, error, refresh } = usePoll(async (): Promise<Overview> => {
-    const [board, info, stats, interfaces] = await Promise.all([getBoard(), getInfo(), getStats(), getInterfaces()]);
-    const before = new Map(prevCpu.current?.map((c) => [c.name, c]));
-    const cores =
-      prevCpu.current === undefined
-        ? undefined
-        : stats.cpu
-            .filter((c) => c.name !== 'cpu')
-            .map((c) => {
-              const p = before.get(c.name);
-              const total = c.total - (p?.total ?? c.total);
-              return total > 0 ? 1 - (c.idle - (p?.idle ?? c.idle)) / total : 0;
-            });
-    prevCpu.current = stats.cpu;
-    return { board, info, stats, interfaces, cores };
-  }, 3000);
+  const boardQuery = useQuery(systemQueries.board());
+  const live = useLive(systemQueries.overview());
+  // the samples the cores' loads are worked out between: each answer counted once, by when it came
+  const [samples, setSamples] = useState<{
+    at?: number | undefined;
+    now?: Stats['cpu'] | undefined;
+    before?: Stats['cpu'] | undefined;
+  }>({});
+  if (live.data !== undefined && live.at !== samples.at) {
+    setSamples({ at: live.at, now: live.data.stats.cpu, before: samples.now });
+  }
 
-  if (data === undefined) {
+  const error = boardQuery.error ?? live.error;
+  if (boardQuery.data === undefined || live.data === undefined) {
     return (
       <>
         <PageHeader title={TITLE} description={DESCRIPTION} />
-        {error === undefined ? <FormSkeleton /> : <LoadError error={error} retry={refresh} />}
+        {error === undefined || error === null ? (
+          <FormSkeleton />
+        ) : (
+          <LoadError
+            error={error}
+            retry={() => {
+              void boardQuery.refetch();
+              live.refresh();
+            }}
+          />
+        )}
       </>
     );
   }
 
-  const { board, info, stats, interfaces, cores } = data;
+  const { info, stats, interfaces } = live.data;
+  const board = boardQuery.data;
+  const cores = samples.at === live.at ? coreLoads(samples.before, stats.cpu) : undefined;
   const mem = info.memory;
   const used = memoryInUse(mem);
   const wan = interfaces.find((i) => i.interface === 'wan');
@@ -166,9 +169,9 @@ export function SystemOverviewPage(): ReactElement {
                 status={
                   <>
                     To install another firmware, see{' '}
-                    <a href={href('upgrade')} className="font-medium link">
+                    <Link {...pageLink('upgrade')} className="font-medium link">
                       Upgrade
-                    </a>
+                    </Link>
                     .
                   </>
                 }
@@ -296,13 +299,13 @@ export function SystemOverviewPage(): ReactElement {
                 status={
                   <>
                     Set on{' '}
-                    <a href={href('internet')} className="font-medium link">
+                    <Link {...pageLink('internet')} className="font-medium link">
                       Internet
-                    </a>{' '}
+                    </Link>{' '}
                     and{' '}
-                    <a href={href('lan')} className="font-medium link">
-                      LAN
-                    </a>
+                    <Link {...pageLink('lan')} className="font-medium link">
+                      LAN & DHCP
+                    </Link>
                     .
                   </>
                 }

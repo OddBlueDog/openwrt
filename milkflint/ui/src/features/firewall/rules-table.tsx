@@ -1,11 +1,13 @@
 // Traffic rules as a table, one group per chain they land in: from a zone to
 // the router, from a zone on through it, from the router out. fw4 checks a
 // chain's rules in order and the first that matches decides, so order
-// matters within a group: drag a rule's grip (or focus it and use the arrow
-// keys) to move it. On a phone each rule is a card with up and down buttons.
-// OpenWrt's standard rules fold into one row per run unless "Show OpenWrt's
-// rules" is on (remembered in this browser); a click on a row, or its edit
-// button, opens the rule's side sheet, which also deletes it.
+// matters within a group and nothing sorts: drag a rule's grip (or focus it
+// and use the arrow keys) to move it. On a phone each rule is a card with up
+// and down buttons. OpenWrt's standard rules fold into one row per run unless
+// "Show OpenWrt's rules" is on (remembered in this browser); a click on a
+// row, or its edit button, opens the rule's side sheet, which also deletes it.
+import { useNavigate } from '@tanstack/react-router';
+import { addressLink } from '@/lib/router';
 import {
   ArrowDownIcon,
   ArrowRightIcon,
@@ -18,9 +20,9 @@ import {
   ShieldIcon,
   SquarePenIcon,
 } from 'lucide-react';
-import { type DragEvent, type KeyboardEvent, type ReactElement, useId, useMemo, useRef, useState } from 'react';
+import { type ComponentProps, type ReactElement, type ReactNode, useCallback, useId, useMemo, useRef, useState } from 'react';
+import { type Column, DataTable } from '@/components/data-table';
 import { Button } from '@/components/ui/button';
-import { Card } from '@/components/ui/card';
 import { Switch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import type { Counters, FirewallData } from './api';
@@ -40,7 +42,6 @@ import { foldOpenWrt, moveTarget, namesText, plural, ruleOrigin, type RuleRow } 
 import { type DevctlRow, devctlRows } from '../device-control/model';
 import {
   GroupHeader,
-  HeadRow,
   HeaderButton,
   OffBadge,
   OnSwitch,
@@ -53,6 +54,7 @@ import {
 } from './table-parts';
 
 interface Chain {
+  /** the chain in words, by its zones' names: unique, and its section's name on a phone */
   key: string;
   from: string;
   to: string;
@@ -66,17 +68,21 @@ function zoneName(name: string, cfg: FirewallConfig): string {
   return name === '*' ? 'Any zone' : zoneTitle(name, cfg);
 }
 
+// (a zone's name has no spaces, so "any zone" is never one)
+const keyName = (name: string): string => (name === '*' ? 'any zone' : name);
+
 function chainOf(r: Rule, cfg: FirewallConfig): Omit<Chain, 'rules'> {
   if (r.src === undefined)
     return {
-      key: `out:${r.dest ?? ''}`,
+      key: r.dest === undefined ? 'the router out' : `the router to ${keyName(r.dest)}`,
       from: 'Router',
       to: r.dest === undefined ? 'Anywhere' : zoneName(r.dest, cfg),
       src: '',
       dest: r.dest ?? '',
     };
-  if (r.dest === undefined) return { key: `in:${r.src}`, from: zoneName(r.src, cfg), to: 'Router', src: r.src, dest: '' };
-  return { key: `fwd:${r.src}`, from: zoneName(r.src, cfg), to: 'Forwarded traffic', src: r.src, dest: r.dest };
+  if (r.dest === undefined)
+    return { key: `${keyName(r.src)} to the router`, from: zoneName(r.src, cfg), to: 'Router', src: r.src, dest: '' };
+  return { key: `${keyName(r.src)} forwarded`, from: zoneName(r.src, cfg), to: 'Forwarded traffic', src: r.src, dest: r.dest };
 }
 
 /** Rules grouped by chain, in the order each chain first appears. */
@@ -124,6 +130,17 @@ function ToCell({ r, data }: { r: Rule; data: FirewallData }): ReactElement {
     <Who icon={ShieldIcon} mono>
       {r.dest}
     </Who>
+  );
+}
+
+/** Where the rule's traffic comes from and goes, with the arrow read out as "to". */
+function Traffic({ r, data }: { r: Rule; data: FirewallData }): ReactElement {
+  return (
+    <>
+      <FromCell r={r} data={data} />
+      <ArrowRightIcon className="size-3.5 shrink-0 text-muted-foreground" aria-label="to" />
+      <ToCell r={r} data={data} />
+    </>
   );
 }
 
@@ -180,25 +197,13 @@ function NameCell({ r, wide, dc }: { r: Rule; wide: boolean; dc?: DevctlRow | un
   );
 }
 
-const columns = [
-  { label: '#', className: 'w-16' },
-  { label: 'Rule' },
-  { label: 'Traffic' },
-  { label: 'Match' },
-  { label: 'Action' },
-  { label: 'Hits', className: 'text-right' },
-  { label: 'On', className: 'w-14' },
-  { label: 'Edit', className: 'w-12', hidden: true },
-] as const;
-
 /** A chain's header: from → to, how many rules, and adding one to it. */
-function ChainHeader({ chain, actions, colSpan }: { chain: Chain; actions: Actions; colSpan?: number }): ReactElement {
+function ChainHeader({ chain, actions }: { chain: Chain; actions: Actions }): ReactElement {
   return (
     <GroupHeader
       title={<Path from={chain.from} to={chain.to} />}
       count={chain.rules.length}
       noun={['rule', 'rules']}
-      {...(colSpan === undefined ? {} : { colSpan })}
       action={
         <HeaderButton
           disabled={actions.applying}
@@ -239,11 +244,6 @@ function Folded({ rules, onShow }: { rules: readonly Rule[]; onShow: () => void 
   );
 }
 
-/** To another page (Device control, for its rules). */
-function goTo(to: string): void {
-  window.location.hash = to;
-}
-
 const SHOW_KEY = 'milkflint.firewall.show-openwrt-rules';
 
 /** "Show OpenWrt's rules", remembered in this browser (off when storage isn't there). */
@@ -255,15 +255,233 @@ function useShowOpenWrt(): [boolean, (v: boolean) => void] {
       return false;
     }
   });
-  const set = (v: boolean): void => {
+  const set = useCallback((v: boolean): void => {
     setShow(v);
     try {
       window.localStorage.setItem(SHOW_KEY, v ? '1' : '0');
     } catch {
       // private window or storage blocked: it holds for this visit only
     }
-  };
+  }, []);
   return [show, set];
+}
+
+/** A row of the table: a rule, or a folded run of OpenWrt's, with its chain's rows (a move steps over a folded run whole). */
+interface Entry {
+  row: RuleRow;
+  chain: Chain['key'];
+  rows: readonly RuleRow[];
+}
+
+const entryKey = (e: Entry): string => (e.row.kind === 'rule' ? e.row.rule.section : `fold-${e.row.rules[0]?.section ?? ''}`);
+
+/** What the rows' cells and cards work with. */
+interface Ctx {
+  data: FirewallData;
+  counters: Counters | undefined;
+  actions: Actions;
+  dc: ReadonlyMap<string, DevctlRow>;
+  /** each rule's place in the whole list */
+  number: ReadonlyMap<string, number>;
+  showAll: () => void;
+  /** to another page (Device control, for its rules) */
+  goTo: (address: string) => void;
+}
+
+/** Device control's rules open there, unless they were changed by hand. */
+function open(ctx: Ctx, r: Rule): void {
+  const row = ctx.dc.get(r.section);
+  if (row !== undefined && !row.byHand) ctx.goTo(row.href);
+  else ctx.actions.editRule(r);
+}
+
+function move(ctx: Ctx, rows: readonly RuleRow[], r: Rule, dir: 'up' | 'down'): void {
+  const to = moveTarget(rows, r.section, dir);
+  if (to !== undefined && !ctx.actions.applying) ctx.actions.apply([moveTo(ctx.data.cfg.order, r.section, to)]);
+}
+
+const movable = (rows: readonly RuleRow[], r: Rule): boolean =>
+  moveTarget(rows, r.section, 'up') !== undefined || moveTarget(rows, r.section, 'down') !== undefined;
+
+function Toggle({ r, actions }: { r: Rule; actions: Actions }): ReactElement {
+  return (
+    <OnSwitch
+      on={r.enabled}
+      name={r.name ?? r.label}
+      disabled={actions.applying}
+      onToggle={() => {
+        actions.apply([enabledChange(r.section, !r.enabled)]);
+      }}
+    />
+  );
+}
+
+function EditButton({ r, ctx }: { r: Rule; ctx: Ctx }): ReactElement {
+  const row = ctx.dc.get(r.section);
+  return (
+    <RowButton
+      label={row !== undefined && !row.byHand ? `Edit ${r.name ?? r.label} on Device control` : `Edit ${r.name ?? r.label}`}
+      icon={SquarePenIcon}
+      onClick={() => {
+        open(ctx, r);
+      }}
+    />
+  );
+}
+
+/** The grip a rule drags by (its row arms on a press there) or moves by, focused, with the arrow keys; and its number. */
+function Grip({ r, rows, ctx }: { r: Rule; rows: readonly RuleRow[]; ctx: Ctx }): ReactElement {
+  const { actions } = ctx;
+  return (
+    <span className="flex items-center gap-1.5 text-xs text-muted-foreground tabular">
+      <button
+        type="button"
+        className="rounded flex size-6 cursor-grab items-center justify-center hover:bg-accent active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-40"
+        aria-label={`Move ${r.name ?? r.label}: drag, or use the up and down arrow keys`}
+        title="Drag to move, or focus and use ↑ ↓"
+        disabled={actions.applying || !movable(rows, r)}
+        data-grip
+        onKeyDown={(e) => {
+          const dir = e.key === 'ArrowUp' ? 'up' : e.key === 'ArrowDown' ? 'down' : undefined;
+          if (dir === undefined || moveTarget(rows, r.section, dir) === undefined || actions.applying) return;
+          e.preventDefault();
+          move(ctx, rows, r, dir);
+        }}
+      >
+        <GripVerticalIcon className="size-3.5" />
+      </button>
+      {ctx.number.get(r.section)}
+    </span>
+  );
+}
+
+/** A cell drawn for a rule; a folded run's row leaves it empty. */
+const forRule =
+  (cell: (r: Rule) => ReactNode) =>
+  (e: Entry): ReactNode =>
+    e.row.kind === 'rule' ? cell(e.row.rule) : null;
+
+function ruleColumns(ctx: Ctx): Column<Entry>[] {
+  return [
+    {
+      label: '#',
+      className: 'w-16',
+      cell: (e) =>
+        e.row.kind === 'rule' ? (
+          <Grip r={e.row.rule} rows={e.rows} ctx={ctx} />
+        ) : (
+          // a run's numbers, under the rules' numbers (past the grip)
+          <span className="pl-7.5 text-xs whitespace-nowrap text-muted-foreground tabular">
+            {ctx.number.get(e.row.rules[0]?.section ?? '')}
+            {e.row.rules.length > 1 && `–${String(ctx.number.get(e.row.rules.at(-1)?.section ?? '') ?? '')}`}
+          </span>
+        ),
+    },
+    {
+      label: 'Rule',
+      className: 'max-w-80',
+      cell: (e) =>
+        e.row.kind === 'rule' ? (
+          <NameCell r={e.row.rule} wide dc={ctx.dc.get(e.row.rule.section)} />
+        ) : (
+          <Folded rules={e.row.rules} onShow={ctx.showAll} />
+        ),
+    },
+    {
+      label: 'Traffic',
+      cell: forRule((r) => (
+        <span className="flex items-center gap-1.5">
+          <Traffic r={r} data={ctx.data} />
+        </span>
+      )),
+    },
+    {
+      label: 'Match',
+      className: 'max-w-56 truncate text-xs',
+      cell: forRule((r) => <span title={matchText(r)}>{matchText(r)}</span>),
+    },
+    { label: 'Action', cell: forRule((r) => <VerdictBadge verdict={r.target} off={!r.enabled} />) },
+    {
+      label: 'Hits',
+      className: 'text-right text-xs tabular',
+      cell: forRule((r) => {
+        const hits = ctx.counters?.rules.get(r.label);
+        return (
+          <span title={hits === undefined ? undefined : `${String(hits)} packets since the firewall last started`}>
+            {hitsText(hits)}
+          </span>
+        );
+      }),
+    },
+    { label: 'On', className: 'w-14', cell: forRule((r) => <Toggle r={r} actions={ctx.actions} />) },
+    {
+      label: 'Edit',
+      className: 'w-12 py-1 text-right',
+      hidden: true,
+      cell: forRule((r) => <EditButton r={r} ctx={ctx} />),
+    },
+  ];
+}
+
+/** A rule's card on a phone or in a narrow window, or a folded run's. */
+function RuleCard({ e, ctx }: { e: Entry; ctx: Ctx }): ReactElement {
+  if (e.row.kind === 'openwrt') {
+    return (
+      <div className="px-4 py-3">
+        <Folded rules={e.row.rules} onShow={ctx.showAll} />
+      </div>
+    );
+  }
+  const r = e.row.rule;
+  const title = r.name ?? r.label;
+  const hits = ctx.counters?.rules.get(r.label);
+  const arrow = (dir: 'up' | 'down', Icon: typeof ArrowUpIcon): ReactElement => (
+    <Button
+      variant="ghost"
+      size="icon"
+      className="size-8"
+      aria-label={`Move ${title} ${dir}`}
+      disabled={moveTarget(e.rows, r.section, dir) === undefined || ctx.actions.applying}
+      onClick={() => {
+        move(ctx, e.rows, r, dir);
+      }}
+    >
+      <Icon />
+    </Button>
+  );
+  return (
+    <div className="flex flex-col gap-2 px-4 py-3">
+      <span className="flex items-start justify-between gap-3">
+        <span className="flex min-w-0 gap-2">
+          <span className="pt-px text-xs text-muted-foreground tabular">{ctx.number.get(r.section)}</span>
+          <NameCell r={r} wide={false} dc={ctx.dc.get(r.section)} />
+        </span>
+        <VerdictBadge verdict={r.target} off={!r.enabled} />
+      </span>
+      <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
+        <Traffic r={r} data={ctx.data} />
+      </span>
+      <span className="flex flex-wrap items-baseline justify-between gap-x-3 text-xs text-muted-foreground tabular">
+        <span className="min-w-0 break-words">{matchText(r)}</span>
+        {hits !== undefined && (
+          <span>
+            {hitsText(hits)} {hits === 1 ? 'hit' : 'hits'}
+          </span>
+        )}
+      </span>
+      <span className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Toggle r={r} actions={ctx.actions} />
+          <span aria-hidden="true">{r.enabled ? 'On' : 'Off'}</span>
+        </span>
+        <span className="flex items-center">
+          {arrow('up', ArrowUpIcon)}
+          {arrow('down', ArrowDownIcon)}
+          <EditButton r={r} ctx={ctx} />
+        </span>
+      </span>
+    </div>
+  );
 }
 
 export function RulesTable({
@@ -278,73 +496,92 @@ export function RulesTable({
   const id = useId();
   const [show, setShow] = useShowOpenWrt();
   const dc = useMemo(() => devctlRows(data.cfg, data.sections, data.milkflint, (mac) => data.names.byMac.get(mac)), [data]);
-  // Device control's rules open there, unless they were changed by hand
-  const open = (r: Rule): void => {
-    const row = dc.get(r.section);
-    if (row !== undefined && !row.byHand) goTo(row.href);
-    else actions.editRule(r);
-  };
-  const groups = chains(data.cfg.rules, data.cfg).map((chain) => ({ chain, rows: foldOpenWrt(chain.rules, show) }));
-  const number = new Map(data.cfg.rules.map((r, i) => [r.section, i + 1]));
-  const openwrt = data.cfg.rules.filter((r) => ruleOrigin(r) === 'openwrt').length;
-  // a row drags only from its grip: the grip arms it on pointer down
   const armed = useRef<string | undefined>(undefined);
-  const [dragging, setDragging] = useState<Chain['key'] | undefined>();
-  const [over, setOver] = useState<string>();
-  const move = (rows: readonly RuleRow[], r: Rule, dir: 'up' | 'down'): void => {
-    const to = moveTarget(rows, r.section, dir);
-    if (to !== undefined && !actions.applying) actions.apply([moveTo(data.cfg.order, r.section, to)]);
-  };
-  const onGripKey = (e: KeyboardEvent, rows: readonly RuleRow[], r: Rule): void => {
-    const dir = e.key === 'ArrowUp' ? 'up' : e.key === 'ArrowDown' ? 'down' : undefined;
-    if (dir === undefined || moveTarget(rows, r.section, dir) === undefined || actions.applying) return;
-    e.preventDefault();
-    move(rows, r, dir);
-  };
-  const dropProps = (
-    chain: Chain,
-    r: Rule,
-  ): { onDragOver: (e: DragEvent<HTMLTableRowElement>) => void; onDrop: (e: DragEvent<HTMLTableRowElement>) => void } => ({
-    onDragOver: (e) => {
-      if (dragging !== chain.key) return;
-      e.preventDefault();
-      setOver(r.section);
-    },
-    onDrop: (e) => {
-      e.preventDefault();
-      const from = e.dataTransfer.getData('text/plain');
-      setOver(undefined);
-      if (dragging === chain.key && from !== '' && from !== r.section) actions.apply([moveTo(data.cfg.order, from, r.section)]);
-    },
-  });
-  const toggle = (r: Rule): ReactElement => (
-    <OnSwitch
-      on={r.enabled}
-      name={r.name ?? r.label}
-      disabled={actions.applying}
-      onToggle={() => {
-        actions.apply([enabledChange(r.section, !r.enabled)]);
-      }}
-    />
+  const navigate = useNavigate();
+  const ctx = useMemo(
+    (): Ctx => ({
+      data,
+      counters,
+      actions,
+      dc,
+      number: new Map(data.cfg.rules.map((r, i) => [r.section, i + 1])),
+      showAll: () => {
+        setShow(true);
+      },
+      goTo: (address) => {
+        void navigate(addressLink(address));
+      },
+    }),
+    [data, counters, actions, dc, setShow, navigate],
   );
-  const edit = (r: Rule): ReactElement => {
-    const row = dc.get(r.section);
-    return (
-      <RowButton
-        label={row !== undefined && !row.byHand ? `Edit ${r.name ?? r.label} on Device control` : `Edit ${r.name ?? r.label}`}
-        icon={SquarePenIcon}
-        onClick={() => {
-          open(r);
-        }}
-      />
-    );
-  };
-  const showAll = (): void => {
-    setShow(true);
+  const columns = useMemo(() => ruleColumns(ctx), [ctx]);
+  const groups = useMemo(
+    () =>
+      chains(data.cfg.rules, data.cfg).map((chain) => {
+        const rows = foldOpenWrt(chain.rules, show);
+        return {
+          key: chain.key,
+          header: <ChainHeader chain={chain} actions={actions} />,
+          rows: rows.map((row): Entry => ({ row, chain: chain.key, rows })),
+        };
+      }),
+    [data, show, actions],
+  );
+  const openwrt = data.cfg.rules.filter((r) => ruleOrigin(r) === 'openwrt').length;
+  const [dragging, setDragging] = useState<Chain['key']>();
+  const [over, setOver] = useState<string>();
+  // a row drags (within its chain) and opens on a click; a folded run does neither
+  const rowProps = (e: Entry): ComponentProps<'tr'> => {
+    if (e.row.kind !== 'rule') return {};
+    const r = e.row.rule;
+    return {
+      draggable: !actions.applying && movable(e.rows, r),
+      // only a press on the grip arms the row to drag
+      onPointerDown: (ev) => {
+        armed.current = ev.target instanceof Element && ev.target.closest('[data-grip]') !== null ? r.section : undefined;
+      },
+      onPointerUp: () => {
+        armed.current = undefined;
+      },
+      onDragStart: (ev) => {
+        if (armed.current !== r.section) {
+          ev.preventDefault();
+          return;
+        }
+        ev.dataTransfer.effectAllowed = 'move';
+        ev.dataTransfer.setData('text/plain', r.section);
+        setDragging(e.chain);
+      },
+      onDragEnd: () => {
+        armed.current = undefined;
+        setDragging(undefined);
+        setOver(undefined);
+      },
+      onDragOver: (ev) => {
+        if (dragging !== e.chain) return;
+        ev.preventDefault();
+        setOver(r.section);
+      },
+      onDrop: (ev) => {
+        ev.preventDefault();
+        const from = ev.dataTransfer.getData('text/plain');
+        setOver(undefined);
+        if (dragging === e.chain && from !== '' && from !== r.section) actions.apply([moveTo(data.cfg.order, from, r.section)]);
+      },
+      onClick: rowClick(() => {
+        open(ctx, r);
+      }),
+      className: cn(
+        'cursor-pointer',
+        !r.enabled && 'text-muted-foreground',
+        over === r.section && 'bg-primary-subtle outline outline-1 -outline-offset-1 outline-primary',
+      ),
+    };
   };
 
   return (
-    <div className="flex flex-col gap-3">
+    // a container, so the hints below switch with the table's own cards
+    <div className="@container flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3">
         <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
           <p className="text-sm text-muted-foreground">
@@ -381,206 +618,21 @@ export function RulesTable({
           </Button>
         </div>
       </div>
-      <Card className="gap-0 overflow-hidden py-0">
-        {/* wide screens: a table */}
-        <div className="hidden overflow-x-auto lg:block">
-          <table className="w-full min-w-[56rem] border-collapse text-sm">
-            <thead>
-              <HeadRow columns={columns} />
-            </thead>
-            {groups.map(({ chain, rows }) => (
-              <tbody key={chain.key}>
-                <ChainHeader chain={chain} actions={actions} colSpan={columns.length} />
-                {rows.map((row) => {
-                  if (row.kind === 'openwrt') {
-                    return (
-                      <tr key={`fold-${row.rules[0]?.section ?? ''}`} className="border-b last:border-b-0">
-                        <td className="px-3 py-2 text-xs whitespace-nowrap text-muted-foreground tabular">
-                          <span className="pl-7.5">
-                            {number.get(row.rules[0]?.section ?? '')}
-                            {row.rules.length > 1 && `–${String(number.get(row.rules.at(-1)?.section ?? '') ?? '')}`}
-                          </span>
-                        </td>
-                        <td colSpan={columns.length - 1} className="py-2 pr-3 pl-3">
-                          <Folded rules={row.rules} onShow={showAll} />
-                        </td>
-                      </tr>
-                    );
-                  }
-                  const r = row.rule;
-                  const title = r.name ?? r.label;
-                  const hits = counters?.rules.get(r.label);
-                  const movable =
-                    moveTarget(rows, r.section, 'up') !== undefined || moveTarget(rows, r.section, 'down') !== undefined;
-                  return (
-                    <tr
-                      key={r.section}
-                      draggable={!actions.applying && movable}
-                      onDragStart={(e) => {
-                        if (armed.current !== r.section) {
-                          e.preventDefault();
-                          return;
-                        }
-                        e.dataTransfer.effectAllowed = 'move';
-                        e.dataTransfer.setData('text/plain', r.section);
-                        setDragging(chain.key);
-                      }}
-                      onDragEnd={() => {
-                        armed.current = undefined;
-                        setDragging(undefined);
-                        setOver(undefined);
-                      }}
-                      {...dropProps(chain, r)}
-                      onClick={rowClick(() => {
-                        open(r);
-                      })}
-                      className={cn(
-                        'cursor-pointer border-b last:border-b-0 hover:bg-muted/60',
-                        !r.enabled && 'text-muted-foreground',
-                        over === r.section && 'bg-primary-subtle outline outline-1 -outline-offset-1 outline-primary',
-                      )}
-                    >
-                      <td className="px-3 py-2">
-                        <span className="flex items-center gap-1.5 text-xs text-muted-foreground tabular">
-                          <button
-                            type="button"
-                            className="rounded flex size-6 cursor-grab items-center justify-center hover:bg-accent active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-40"
-                            aria-label={`Move ${title}: drag, or use the up and down arrow keys`}
-                            title="Drag to move, or focus and use ↑ ↓"
-                            disabled={actions.applying || !movable}
-                            onPointerDown={() => {
-                              armed.current = r.section;
-                            }}
-                            onPointerUp={() => {
-                              armed.current = undefined;
-                            }}
-                            onKeyDown={(e) => {
-                              onGripKey(e, rows, r);
-                            }}
-                          >
-                            <GripVerticalIcon className="size-3.5" />
-                          </button>
-                          {number.get(r.section)}
-                        </span>
-                      </td>
-                      <td className="max-w-80 px-3 py-2">
-                        <NameCell r={r} wide dc={dc.get(r.section)} />
-                      </td>
-                      <td className="px-3 py-2">
-                        <span className="flex items-center gap-1.5">
-                          <FromCell r={r} data={data} />
-                          <ArrowRightIcon className="size-3.5 shrink-0 text-muted-foreground" aria-label="to" />
-                          <ToCell r={r} data={data} />
-                        </span>
-                      </td>
-                      <td className="max-w-56 truncate px-3 py-2 text-xs" title={matchText(r)}>
-                        {matchText(r)}
-                      </td>
-                      <td className="px-3 py-2">
-                        <VerdictBadge verdict={r.target} off={!r.enabled} />
-                      </td>
-                      <td
-                        className="px-3 py-2 text-right text-xs tabular"
-                        title={hits === undefined ? undefined : `${String(hits)} packets since the firewall last started`}
-                      >
-                        {hitsText(hits)}
-                      </td>
-                      <td className="px-3 py-2">{toggle(r)}</td>
-                      <td className="px-2 py-1 text-right">{edit(r)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            ))}
-          </table>
-        </div>
-        {/* phones and narrow windows: a card per rule */}
-        <div className="lg:hidden">
-          {groups.map(({ chain, rows }) => (
-            <section key={chain.key} aria-label={`${chain.from} to ${chain.to}`}>
-              <ChainHeader chain={chain} actions={actions} />
-              <ul className="divide-y">
-                {rows.map((row) => {
-                  if (row.kind === 'openwrt') {
-                    return (
-                      <li key={`fold-${row.rules[0]?.section ?? ''}`} className="px-4 py-3">
-                        <Folded rules={row.rules} onShow={showAll} />
-                      </li>
-                    );
-                  }
-                  const r = row.rule;
-                  const title = r.name ?? r.label;
-                  const up = moveTarget(rows, r.section, 'up');
-                  const down = moveTarget(rows, r.section, 'down');
-                  const hits = counters?.rules.get(r.label);
-                  return (
-                    <li key={r.section} className="flex flex-col gap-2 px-4 py-3">
-                      <span className="flex items-start justify-between gap-3">
-                        <span className="flex min-w-0 gap-2">
-                          <span className="pt-px text-xs text-muted-foreground tabular">{number.get(r.section)}</span>
-                          <NameCell r={r} wide={false} dc={dc.get(r.section)} />
-                        </span>
-                        <VerdictBadge verdict={r.target} off={!r.enabled} />
-                      </span>
-                      <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-sm">
-                        <FromCell r={r} data={data} />
-                        <ArrowRightIcon className="size-3.5 shrink-0 text-muted-foreground" aria-label="to" />
-                        <ToCell r={r} data={data} />
-                      </span>
-                      <span className="flex flex-wrap items-baseline justify-between gap-x-3 text-xs text-muted-foreground tabular">
-                        <span className="min-w-0 break-words">{matchText(r)}</span>
-                        {hits !== undefined && (
-                          <span>
-                            {hitsText(hits)} {hits === 1 ? 'hit' : 'hits'}
-                          </span>
-                        )}
-                      </span>
-                      <span className="flex items-center justify-between gap-2">
-                        <span className="flex items-center gap-2 text-xs text-muted-foreground">
-                          {toggle(r)}
-                          <span aria-hidden="true">{r.enabled ? 'On' : 'Off'}</span>
-                        </span>
-                        <span className="flex items-center">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8"
-                            aria-label={`Move ${title} up`}
-                            disabled={up === undefined || actions.applying}
-                            onClick={() => {
-                              move(rows, r, 'up');
-                            }}
-                          >
-                            <ArrowUpIcon />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-8"
-                            aria-label={`Move ${title} down`}
-                            disabled={down === undefined || actions.applying}
-                            onClick={() => {
-                              move(rows, r, 'down');
-                            }}
-                          >
-                            <ArrowDownIcon />
-                          </Button>
-                          {edit(r)}
-                        </span>
-                      </span>
-                    </li>
-                  );
-                })}
-              </ul>
-            </section>
-          ))}
-        </div>
-      </Card>
-      <p className="hidden max-w-prose text-xs text-muted-foreground lg:block">
+      <DataTable
+        label="Traffic rules"
+        columns={columns}
+        groups={groups}
+        rowKey={entryKey}
+        empty="No traffic rules."
+        wide="lg"
+        card={(e) => <RuleCard e={e} ctx={ctx} />}
+        rowProps={rowProps}
+      />
+      <p className="hidden max-w-prose text-xs text-muted-foreground @min-[60rem]:block">
         Within a chain the first matching rule wins: drag the grip to reorder (or focus it and use ↑ ↓). Click a rule to edit or
         delete it. Hits count since the firewall last started.
       </p>
-      <p className="text-xs text-muted-foreground lg:hidden">
+      <p className="text-xs text-muted-foreground @min-[60rem]:hidden">
         Within a chain the first matching rule wins: move a rule with its arrows. Its edit button opens it, to change or delete
         it. Hits count since the firewall last started.
       </p>

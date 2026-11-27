@@ -86,7 +86,6 @@ export const OPTIONS = {
   ban_feedout: list('feed'),
   ban_feedinout: list('feed'),
   ban_feedreset: list('feed'),
-  ban_feedcomplete: list('feed'),
   ban_nftloglevel: {
     type: 'enum',
     default: 'warn',

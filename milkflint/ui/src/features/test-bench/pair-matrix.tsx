@@ -1,16 +1,17 @@
 import { TriangleAlertIcon } from 'lucide-react';
-import { type ReactElement, useMemo, useState } from 'react';
+import { type ReactElement, useCallback, useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import { type Column, DataTable } from '@/components/data-table';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatNumber, formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type { ReportRun } from './analysis';
 import type { RunMember, Schedule } from './api';
 import { type DirectionResult, type Loss, type PairResult, pairResults } from './pairs';
 import { candidateText, type LinkDiag, noPathCauses, pathNotes, pathText, type Side } from './rtc-diag';
-import { Dir } from './dir';
+import { Dir } from '@/components/dir';
 import type { RunData } from './run-data';
+import { distinctNames } from './summary';
 import { parseAgent } from './ua';
 
 const ms = (v: number | undefined): string => (v === undefined ? '—' : formatNumber(v, v < 10 ? 1 : 0));
@@ -31,14 +32,22 @@ function side(m: RunMember | undefined, id: string, diag: LinkDiag | undefined):
   };
 }
 
-function Cell({ d, pair, onWhy }: { d: DirectionResult; pair: PairResult; onWhy: () => void }): ReactElement {
+function Cell({ d, pair, onWhy }: { d: DirectionResult; pair: PairResult; onWhy: (pair: PairResult) => void }): ReactElement {
   if (!pair.probe.opened && !pair.bulk.opened) {
     return (
       <span className="flex flex-col items-start gap-1">
         <span className="inline-flex items-center gap-1.5 font-medium text-warning">
           <TriangleAlertIcon className="size-3.5" /> No direct path
         </span>
-        <Button type="button" variant="link" size="sm" className="h-auto p-0 text-xs" onClick={onWhy}>
+        <Button
+          type="button"
+          variant="link"
+          size="sm"
+          className="h-auto p-0 text-xs"
+          onClick={() => {
+            onWhy(pair);
+          }}
+        >
           What happened
         </Button>
       </span>
@@ -121,6 +130,38 @@ function DiagColumn({ s }: { s: Side }): ReactElement {
   );
 }
 
+/** What a pair measured from x to y, whichever way round it was planned. */
+function oneWay(pairs: readonly PairResult[], x: string, y: string): { pair: PairResult; d: DirectionResult } | undefined {
+  for (const p of pairs) {
+    if (p.a === x && p.b === y) return { pair: p, d: p.ab };
+    if (p.a === y && p.b === x) return { pair: p, d: p.ba };
+  }
+  return undefined;
+}
+
+function linkKind(m: RunMember | undefined): string {
+  const l = m?.link;
+  return l === undefined || l === null
+    ? ''
+    : l.kind === 'wired'
+      ? 'wired'
+      : `Wi-Fi${l.band === undefined || l.band === null ? '' : ` ${l.band} GHz`}`;
+}
+
+/** A row of the matrix: the device the figures are from. */
+interface FromRow {
+  id: string;
+}
+
+const heading = (title: string, note: string): ReactElement => (
+  <span className="flex flex-col">
+    <span>{title}</span>
+    <span className="text-xs font-normal text-muted-foreground">{note}</span>
+  </span>
+);
+// a matrix: no row stands out on hover, and nothing sorts
+const stillRow = (): { className: string } => ({ className: 'hover:bg-transparent' });
+
 /** Device to device: a matrix of what each planned pair measured, from (rows) to (columns), and why a pair found no path. */
 export function PairMatrix({
   data,
@@ -139,99 +180,68 @@ export function PairMatrix({
     [run.t0, end, schedule.phases, data.records],
   );
   const [why, setWhy] = useState<PairResult>();
+  const byId = useMemo(() => new Map(members.map((m) => [m.id, m])), [members]);
+  const ids = useMemo(() => [...new Set(pairs.flatMap((p) => [p.a, p.b]))], [pairs]);
+  const name = useCallback((id: string): string => byId.get(id)?.name ?? id, [byId]);
+  const columns = useMemo((): readonly Column<FromRow>[] => {
+    const labels = distinctNames(members);
+    return [
+      {
+        label: 'From (rows), to (columns)',
+        header: heading('From (rows)', 'to (columns)'),
+        cell: (r) => name(r.id),
+        className: 'w-32 font-medium',
+      },
+      ...ids.map((y): Column<FromRow> => ({
+        label: labels.get(y) ?? y,
+        header: heading(name(y), linkKind(byId.get(y))),
+        cell: (r) => {
+          // the diagonal, a device to itself, muted all over its cell
+          if (r.id === y) return <span aria-hidden="true" className="absolute inset-0 bg-muted/30" />;
+          const f = oneWay(pairs, r.id, y);
+          return f === undefined ? (
+            <span className="text-muted-foreground">—</span>
+          ) : (
+            <Cell d={f.d} pair={f.pair} onWhy={setWhy} />
+          );
+        },
+        className: 'relative align-top',
+      })),
+    ];
+  }, [pairs, members, byId, ids, name]);
   if (pairs.length === 0) return null;
-  const byId = new Map(members.map((m) => [m.id, m]));
-  const name = (id: string): string => byId.get(id)?.name ?? id;
-  const ids = [...new Set(pairs.flatMap((p) => [p.a, p.b]))];
-  const find = (x: string, y: string): { pair: PairResult; d: DirectionResult } | undefined => {
-    for (const p of pairs) {
-      if (p.a === x && p.b === y) return { pair: p, d: p.ab };
-      if (p.a === y && p.b === x) return { pair: p, d: p.ba };
-    }
-    return undefined;
-  };
-  const linkKind = (id: string): string => {
-    const l = byId.get(id)?.link;
-    return l === undefined || l === null
-      ? ''
-      : l.kind === 'wired'
-        ? 'wired'
-        : `Wi-Fi${l.band === undefined || l.band === null ? '' : ` ${l.band} GHz`}`;
-  };
+  // a card a device when narrow: each pair it sent to, "Mac → PC" over the figures
+  const fromCard = (r: FromRow): ReactElement => (
+    <div className="flex flex-col divide-y text-sm">
+      {ids.flatMap((y) => {
+        const f = r.id === y ? undefined : oneWay(pairs, r.id, y);
+        if (f === undefined) return [];
+        return [
+          <div key={y} className="flex flex-col gap-1.5 px-4 py-3">
+            <span className="inline-flex flex-wrap items-center gap-1 font-medium">
+              {name(r.id)} <Dir d="to" /> {name(y)}
+            </span>
+            <Cell d={f.d} pair={f.pair} onWhy={setWhy} />
+          </div>,
+        ];
+      })}
+    </div>
+  );
   const whyA = why === undefined ? undefined : side(byId.get(why.a), why.a, why.probe.a ?? why.bulk.a);
   const whyB = why === undefined ? undefined : side(byId.get(why.b), why.b, why.probe.b ?? why.bulk.b);
   return (
     <section className="flex flex-col gap-3">
       <h3 className="text-sm font-semibold">Device to device</h3>
-      <div className="hidden overflow-x-auto lg:block">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-32">
-                <span className="flex flex-col">
-                  <span>From (rows)</span>
-                  <span className="text-xs font-normal text-muted-foreground">to (columns)</span>
-                </span>
-              </TableHead>
-              {ids.map((id) => (
-                <TableHead key={id}>
-                  <span className="flex flex-col">
-                    <span>{name(id)}</span>
-                    <span className="text-xs font-normal text-muted-foreground">{linkKind(id)}</span>
-                  </span>
-                </TableHead>
-              ))}
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {ids.map((x) => (
-              <TableRow key={x} className="hover:bg-transparent">
-                <TableCell className="font-medium">{name(x)}</TableCell>
-                {ids.map((y) => {
-                  const f = x === y ? undefined : find(x, y);
-                  return (
-                    <TableCell key={y} className={cn('align-top', x === y && 'bg-muted/30')}>
-                      {f === undefined ? (
-                        <span className="text-muted-foreground">{x === y ? '' : '—'}</span>
-                      ) : (
-                        <Cell
-                          d={f.d}
-                          pair={f.pair}
-                          onWhy={() => {
-                            setWhy(f.pair);
-                          }}
-                        />
-                      )}
-                    </TableCell>
-                  );
-                })}
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </div>
-      <ul className="divide-y border-y lg:hidden">
-        {ids.flatMap((x) =>
-          ids.flatMap((y) => {
-            const f = x === y ? undefined : find(x, y);
-            if (f === undefined) return [];
-            return [
-              <li key={`${x}-${y}`} className="flex flex-col gap-1.5 px-3 py-3">
-                <span className="inline-flex flex-wrap items-center gap-1 text-sm font-medium">
-                  {name(x)} <Dir d="to" /> {name(y)}
-                </span>
-                <Cell
-                  d={f.d}
-                  pair={f.pair}
-                  onWhy={() => {
-                    setWhy(f.pair);
-                  }}
-                />
-              </li>,
-            ];
-          }),
-        )}
-      </ul>
+      <DataTable
+        label="Device to device"
+        columns={columns}
+        rows={ids.map((id) => ({ id }))}
+        rowKey={(r) => r.id}
+        empty="No pairs were planned."
+        framed={false}
+        rowProps={stillRow}
+        card={fromCard}
+      />
       <ul className="flex flex-col gap-1.5 text-xs text-muted-foreground">
         {pairs.map((p) => {
           const opened = p.probe.opened || p.bulk.opened;

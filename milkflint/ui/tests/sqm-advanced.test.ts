@@ -12,10 +12,14 @@ import {
   cakeEffect,
   directionOf,
   optsWith,
-  validateAdvanced,
+  advancedFormSchema,
+  type AdvancedErrors,
 } from '../src/features/sqm/advanced.ts';
+import { formErrors } from '../src/lib/form/errors.ts';
 import type { Change, Section } from '../src/lib/api/uci.ts';
 import { applied, section } from './uci-fixture.ts';
+
+const validateAdvanced = (f: AdvancedForm, data: AdvancedData): AdvancedErrors => formErrors(advancedFormSchema(data), f);
 
 const queue = (values: Record<string, string> = {}): Section =>
   section('queue', 'wan', {

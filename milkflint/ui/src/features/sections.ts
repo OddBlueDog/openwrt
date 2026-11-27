@@ -29,12 +29,28 @@ export const sections: readonly Section[] = [
   { page: 'banip', id: 'activity', title: 'Activity', keywords: 'blocked hits recent attacks' },
   // Firewall's tabs (firewall/page.tsx)
   { page: 'firewall', id: 'zones', title: 'Zones', keywords: 'zone lan wan guest forwarding masquerade' },
-  // cards a page scrolls to (tuning/page.tsx, admin-password/page.tsx)
+  // Router access's tabs (admin-password/page.tsx)
+  { page: 'admin-password', id: 'https', title: 'HTTPS', keywords: 'https certificate tls ssl redirect secure' },
+  { page: 'admin-password', id: 'ssh', title: 'SSH', keywords: 'ssh dropbear port password logins shell command line' },
+  {
+    page: 'admin-password',
+    id: 'ssh-keys',
+    title: 'SSH keys',
+    keywords: 'ssh keys authorized_keys public key ed25519 passwordless login',
+  },
+  {
+    page: 'admin-password',
+    id: 'package-keys',
+    title: 'Package keys',
+    keywords: 'apk repository public keys signing feed packages',
+  },
+  // Startup's tab (startup/page.tsx)
+  { page: 'startup', id: 'local', title: 'Local startup', keywords: 'rc.local boot commands script' },
+  // cards a page scrolls to (tuning/page.tsx)
   {
     page: 'tuning',
     id: 'diagnostics',
     title: 'Diagnostics',
     keywords: 'debug counters snapshot kfence memory error checker crash dropout',
   },
-  { page: 'admin-password', id: 'https', title: 'HTTPS', keywords: 'https certificate tls ssl redirect secure' },
 ];

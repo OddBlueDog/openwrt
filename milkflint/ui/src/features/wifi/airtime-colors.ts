@@ -12,3 +12,11 @@ export const airtimeFill: Record<AirtimeClass, string> = {
   weak: 'bg-destructive',
   lost: 'bg-foreground',
 };
+
+/** The same colours as values, for the last minute's chart */
+export const airtimeColor: Record<AirtimeClass, string> = {
+  full: 'var(--primary)',
+  slow: 'var(--warning)',
+  weak: 'var(--destructive)',
+  lost: 'var(--foreground)',
+};

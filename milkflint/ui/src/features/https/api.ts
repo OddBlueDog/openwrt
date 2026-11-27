@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { getConfig } from '@/lib/api/uci';
-import { call } from '@/lib/ubus';
+import { call, UnreachableError } from '@/lib/ubus';
 import { configOf, type HttpsConfig } from './model';
 
 const statusSchema = z.object({
@@ -47,4 +47,22 @@ export async function renewCertificate(): Promise<void> {
     z.object({ renewing: z.boolean().optional(), error: z.string().optional() }),
   );
   if (r.error !== undefined) throw new Error(`The router couldn’t: ${r.error}.`);
+}
+
+export interface Loaded {
+  config: HttpsConfig | undefined;
+  status: HttpsStatus;
+}
+
+/** The settings and what uhttpd runs with. uhttpd restarts a moment after a save or a new certificate: then this waits for it. */
+export async function loadHttps(): Promise<Loaded> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const [config, status] = await Promise.all([getHttpsConfig(), getHttpsStatus()]);
+      return { config, status };
+    } catch (err) {
+      if (!(err instanceof UnreachableError) || attempt >= 8) throw err;
+      await new Promise((r) => window.setTimeout(r, 1000));
+    }
+  }
 }

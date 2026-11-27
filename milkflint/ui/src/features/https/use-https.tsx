@@ -1,35 +1,24 @@
 // What the HTTPS part of Router access reads and does: uhttpd's settings
 // and what the running web server does, the form, the save and a new
 // certificate; and the answer it gives at the top of the page.
+import { useQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { ChevronRightIcon } from 'lucide-react';
-import { type ReactElement, type ReactNode, useCallback, useState } from 'react';
+import { type ReactElement, type ReactNode, useCallback, useMemo, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { type ApplyState, useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { href } from '@/lib/router';
-import { UnreachableError } from '@/lib/ubus';
+import { type SettingsForm, useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { pageLink } from '@/lib/router';
 import { errorMessage } from '@/lib/utils';
-import { getHttpsConfig, getHttpsStatus, type HttpsStatus, renewCertificate } from './api';
+import type { HttpsStatus, Loaded } from './api';
 import { type Certificate, formatFingerprint, fromBase64, parseCertificate } from './certificate';
-import { formOf, type HttpsConfig, type HttpsForm, moveTo, pageUrl, toChanges } from './model';
+import { formOf, type HttpsForm, httpsFormSchema, moveTo, pageUrl, toChanges } from './model';
+import { httpsQueries, useRenewCertificate } from './queries';
 
-export interface Loaded {
-  config: HttpsConfig | undefined;
-  status: HttpsStatus;
-}
+export type { Loaded } from './api';
 
-/** The settings and what uhttpd runs with. uhttpd restarts a moment after a save or a new certificate: then this waits for it. */
-async function load(): Promise<Loaded> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      const [config, status] = await Promise.all([getHttpsConfig(), getHttpsStatus()]);
-      return { config, status };
-    } catch (err) {
-      if (!(err instanceof UnreachableError) || attempt >= 8) throw err;
-      await new Promise((r) => window.setTimeout(r, 1000));
-    }
-  }
-}
+/** What the form holds before the settings are read (it isn't shown until they are). */
+const NOT_READ: HttpsForm = { https: false, redirect: false };
 
 export type Renew =
   { phase: 'idle' | 'confirm' | 'busy' } | { phase: 'done'; https: boolean } | { phase: 'failed'; message: string };
@@ -51,13 +40,16 @@ export interface Https {
   error: unknown;
   loading: boolean;
   reload: () => void;
-  /** The form as edited, or as saved. */
+  /** The form's values; undefined until the settings are read (or when uhttpd has none). */
   form: HttpsForm | undefined;
+  /** The form itself, for its fields. */
+  settings: SettingsForm<HttpsForm>;
   dirty: boolean;
-  set: <K extends keyof HttpsForm>(key: K, value: HttpsForm[K]) => void;
   revert: () => void;
   save: () => void;
   state: ApplyState;
+  /** Forget the last save's outcome (a field changed since). */
+  resetState: () => void;
   renew: Renew;
   setRenew: (r: Renew) => void;
   startRenew: () => void;
@@ -67,57 +59,58 @@ export interface Https {
 
 /** Everything the HTTPS part of the page reads and does, for its answer, its cards and the save bar. */
 export function useHttps(): Https {
-  const { data, error, loading, reload } = useLoad(load);
-  const [edit, setEdit] = useState<HttpsForm>();
+  const query = useQuery(httpsQueries.settings());
+  const { data, refetch } = query;
+  const reload = useCallback(() => {
+    void refetch();
+  }, [refetch]);
   // uhttpd restarts a second or so after a save: look again after that
   const onApplied = useCallback(() => {
-    setEdit(undefined);
     window.setTimeout(reload, 2500);
   }, [reload]);
   const { state, apply, applyAndMove, reset } = useApply(onApplied);
+  const renewal = useRenewCertificate();
   const [renew, setRenew] = useState<Renew>({ phase: 'idle' });
   const config = data?.config;
-  const saved = config === undefined ? undefined : formOf(config);
-  const form = edit ?? saved;
-  const dirty = edit !== undefined && JSON.stringify(edit) !== JSON.stringify(saved);
-  const set = <K extends keyof HttpsForm>(key: K, value: HttpsForm[K]): void => {
-    if (saved !== undefined) setEdit({ ...(edit ?? saved), [key]: value });
-    reset();
-  };
-  const save = (): void => {
-    if (form === undefined || config === undefined) return;
-    const changes = toChanges(form, config);
-    const next = moveTo(form, config, window.location);
-    void (next === undefined ? apply(changes) : applyAndMove(changes, next));
-  };
+  const saved = useMemo(() => (config === undefined ? NOT_READ : formOf(config)), [config]);
+  const settings = useSettingsForm({
+    schema: httpsFormSchema,
+    saved,
+    onSave: (values) => {
+      if (config === undefined) return undefined;
+      const changes = toChanges(values, config);
+      const next = moveTo(values, config, window.location);
+      return next === undefined ? apply(changes) : applyAndMove(changes, next);
+    },
+  });
+  const values = useFormValues(settings.form);
   const startRenew = (): void => {
     setRenew({ phase: 'busy' });
-    renewCertificate().then(
-      () => {
+    renewal.mutate(undefined, {
+      onSuccess: () => {
         const https = window.location.protocol === 'https:';
         setRenew({ phase: 'done', https });
         // over HTTP the page carries on: show the new one once uhttpd has made it
         if (!https) window.setTimeout(reload, 4000);
       },
-      (err: unknown) => {
+      onError: (err) => {
         setRenew({ phase: 'failed', message: errorMessage(err) });
       },
-    );
+    });
   };
   const cert = data?.status.cert;
   return {
     data,
-    error,
-    loading,
+    error: query.error ?? undefined,
+    loading: query.isPending,
     reload,
-    form,
-    dirty,
-    set,
-    revert: () => {
-      setEdit(undefined);
-    },
-    save,
+    form: config === undefined ? undefined : values,
+    settings,
+    dirty: settings.dirty,
+    revert: settings.discard,
+    save: settings.save,
     state,
+    resetState: reset,
     renew,
     setRenew,
     startRenew,
@@ -146,10 +139,10 @@ export function httpsAnswer(h: Https): { badge: ReactElement; text: ReactNode; n
       badge: <Badge variant="warning">No settings</Badge>,
       text: 'uhttpd, the router’s web server, has no settings: its main section is missing from /etc/config/uhttpd. Put it back by hand, or restore a backup.',
       next: (
-        <a href={href('backup-reset')} className={link}>
+        <Link {...pageLink('backup-reset')} className={link}>
           Backup &amp; reset
           <ChevronRightIcon className="size-4" />
-        </a>
+        </Link>
       ),
     };
   }
@@ -158,10 +151,10 @@ export function httpsAnswer(h: Https): { badge: ReactElement; text: ReactNode; n
       badge: <Badge variant="warning">Can’t serve HTTPS</Badge>,
       text: `${cantServeText(status)} MilkFlint’s releases include it.`,
       next: (
-        <a href={href('upgrade')} className={link}>
+        <Link {...pageLink('upgrade')} className={link}>
           Upgrade
           <ChevronRightIcon className="size-4" />
-        </a>
+        </Link>
       ),
     };
   }
@@ -172,10 +165,10 @@ export function httpsAnswer(h: Https): { badge: ReactElement; text: ReactNode; n
       badge: <Badge variant="warning">Not answering yet</Badge>,
       text: 'The web server makes its certificate as it starts, so a restart of the router (or of uhttpd) brings HTTPS up.',
       next: (
-        <a href={href('backup-reset')} className={link}>
+        <Link {...pageLink('backup-reset')} className={link}>
           Restart the router
           <ChevronRightIcon className="size-4" />
-        </a>
+        </Link>
       ),
     };
   }

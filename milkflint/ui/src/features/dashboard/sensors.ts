@@ -1,10 +1,11 @@
 // The temperature sensors as Home shows them (the Temperatures widget and
 // its tile): what each measures, in words, and the history the router
 // records (every 10 s, kept in RAM), so it's there when the page opens.
-import { type Poll, usePoll } from '@/hooks/use-poll';
+import { dashboardQueries } from './queries';
+import { useLive } from '@/lib/query/use-live';
+import type { Live } from '@/lib/query/use-live';
 import type { Stats } from '@/lib/api/stats';
-import { sharedCall } from '@/lib/shared-call';
-import { getSensorHistory, SAMPLE_SENSOR, type SensorHistory, type SensorSample } from './api';
+import { SAMPLE_SENSOR, type SensorHistory, type SensorSample } from './api';
 import type { Dashboard } from './use-dashboard';
 
 /** The recorder's interval, if it doesn't say. */
@@ -49,15 +50,10 @@ export function sampleSensors(sensors: readonly Sensor[]): boolean {
   return import.meta.env.DEV && sensors.length > 0 && sensors.every((t) => t.name.startsWith(SAMPLE_SENSOR));
 }
 
-// one call for the Temperatures widget and its tile (and any repeat)
-const readHistory = sharedCall(getSensorHistory);
-
 /** The recorded history, polled at the recorder's pace. */
-export function useSensorHistory(sensors: readonly Sensor[]): Poll<SensorHistory> {
+export function useSensorHistory(sensors: readonly Sensor[]): Live<SensorHistory> {
   const sample = sampleSensors(sensors);
-  return usePoll(
-    async (): Promise<SensorHistory> => (sample ? (await import('@/dev/sample-sensors')).sampleHistory(sensors) : readHistory()),
-    STEP_S * 1000,
-    sample ? 'sample' : '',
+  return useLive(
+    dashboardQueries.sensorHistory(sample, async () => (await import('@/dev/sample-sensors')).sampleHistory(sensors)),
   );
 }

@@ -6,11 +6,12 @@
 import 'virtual:milkflint-themes.css';
 import '@/styles.css';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
-import { cleanup, render } from 'vitest-browser-react';
+import { cleanup } from 'vitest-browser-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import type * as Api from '@/features/adguardhome/api';
 import { AdGuardHomePage } from '@/features/adguardhome/page';
 import type * as Uci from '@/lib/api/uci';
+import { renderWithProviders } from './render';
 
 interface PretendAdGuard {
   configured: boolean;
@@ -104,8 +105,8 @@ afterEach(async () => {
   await cleanup();
 });
 
-async function drawPage(): Promise<Awaited<ReturnType<typeof render>>> {
-  const screen = await render(
+async function drawPage(): Promise<Awaited<ReturnType<typeof renderWithProviders>>> {
+  const screen = await renderWithProviders(
     <TooltipProvider>
       <AdGuardHomePage />
     </TooltipProvider>,
@@ -114,7 +115,7 @@ async function drawPage(): Promise<Awaited<ReturnType<typeof render>>> {
   return screen;
 }
 
-async function fillCredentials(screen: Awaited<ReturnType<typeof render>>, user: string, pw: string): Promise<void> {
+async function fillCredentials(screen: Awaited<ReturnType<typeof renderWithProviders>>, user: string, pw: string): Promise<void> {
   await screen.getByLabelText('User name').fill(user);
   await screen.getByLabelText('Password', { exact: true }).fill(pw);
   await screen.getByLabelText('Password again').fill(pw);

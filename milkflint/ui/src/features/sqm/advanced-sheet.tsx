@@ -4,8 +4,13 @@
 // The expert choices the page used to show (multi-queue, the upload's ACK
 // filter and memory limit) are here too. It saves on its own, and only what
 // changed (./advanced.ts).
+import { Link } from '@tanstack/react-router';
+import { pageLink } from '@/lib/router';
 import { ArrowDownIcon, ArrowUpIcon, CableIcon, ListIcon, type LucideIcon } from 'lucide-react';
-import { type ReactElement, type ReactNode, useId, useState } from 'react';
+import { evaluate, useSelector } from '@tanstack/react-form';
+import { type ReactElement, type ReactNode, useId, useMemo, useState } from 'react';
+import { formErrors } from '@/lib/form/errors';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -29,7 +34,8 @@ import {
   downloadMq,
   RTT_PRESETS,
   scriptTins,
-  validateAdvanced,
+  advancedFieldNames,
+  advancedFormSchema,
 } from './advanced';
 import { cakeTargetMs, NO_SPLIT_GSO_KBIT, takesWhole } from './gso';
 import { linkPresets, lowMemlimit, presetOverhead } from './model';
@@ -942,9 +948,9 @@ function QueueTab({
       <Group title="Elsewhere">
         <p className="text-sm text-muted-foreground">
           CAKE’s ECN fallback and L4S marking are kernel settings, on{' '}
-          <a href="#/tuning" className="font-medium text-foreground underline underline-offset-2">
+          <Link {...pageLink('tuning')} className="font-medium text-foreground underline underline-offset-2">
             Performance Tuning
-          </a>
+          </Link>
           . The limits, targets and ECN options LuCI shows are for fq_codel’s scripts, not CAKE.
         </p>
       </Group>
@@ -959,7 +965,7 @@ export function AdvancedSheet({
   tab: firstTab = 'down',
   rssNote,
   onClose,
-  onSave,
+  onSubmit,
 }: {
   data: AdvancedData;
   /** the tab it opens on */
@@ -967,18 +973,39 @@ export function AdvancedSheet({
   /** why the download's queues don't spread over the CPUs now, when they don't */
   rssNote?: string | undefined;
   onClose: () => void;
-  onSave: (changes: Change[]) => void;
+  /** applies the changes; the failure's message when that didn't go through */
+  onSubmit: (changes: Change[]) => Promise<string | undefined>;
 }): ReactElement {
   const id = useId();
-  const [f, setF] = useState(data.form);
+  const schema = useMemo(() => advancedFormSchema(data), [data]);
+  const [failed, setFailed] = useState<string>();
+  const settings = useSettingsForm({
+    schema,
+    saved: data.form,
+    onSave: async (values) => {
+      setFailed(await onSubmit(advancedChanges(values, data)));
+    },
+  });
+  const { form } = settings;
+  const f = useFormValues(form);
+  const submitting = useSelector(form.store, (s) => s.isSubmitting);
   const [tab, setTab] = useState<TabId>(firstTab);
+  // the sheet's controls change the form through these, a field at a time
+  const setF = (update: (x: AdvancedForm) => AdvancedForm): void => {
+    const current = form.store.state.values;
+    const next = update(current);
+    for (const key of advancedFieldNames) {
+      if (!evaluate(current[key], next[key])) form.setFieldValue(key, next[key]);
+    }
+  };
   const set = <K extends keyof AdvancedForm>(key: K, value: AdvancedForm[K]): void => {
     setF((x) => ({ ...x, [key]: value }));
   };
   const setDir = <K extends keyof DirectionForm>(dir: Direction, key: K, value: DirectionForm[K]): void => {
     setF((x) => ({ ...x, [dir]: { ...x[dir], [key]: value } }));
   };
-  const errors = validateAdvanced(f, data);
+  // the checks as they stand, shown as they're typed, as before
+  const errors = formErrors(schema, f);
   const wrong = new Set(Object.keys(errors).map(tabOf));
   const changes = advancedChanges(f, data);
   const options = changes.reduce(
@@ -1048,7 +1075,8 @@ export function AdvancedSheet({
           </div>
         </div>
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-t px-6 py-3">
-          <p className="text-xs text-muted-foreground">
+          {failed !== undefined && <p className="text-xs font-medium text-destructive">{failed}</p>}
+          <p className="text-xs text-muted-foreground" hidden={failed !== undefined}>
             {invalid
               ? 'Fix what’s marked to save.'
               : options === 0
@@ -1059,12 +1087,7 @@ export function AdvancedSheet({
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button
-              disabled={invalid || changes.length === 0}
-              onClick={() => {
-                onSave(changes);
-              }}
-            >
+            <Button disabled={invalid || submitting || changes.length === 0} onClick={settings.save}>
               Save &amp; apply
             </Button>
           </div>

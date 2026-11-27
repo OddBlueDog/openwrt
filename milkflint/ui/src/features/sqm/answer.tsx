@@ -2,6 +2,7 @@
 // what speeds, and whether CAKE keeps the queues short (its own figures
 // for each direction, every 2 s). While it's off: what it does, and how to
 // set it up, with the pages that measure the line.
+import { Link } from '@tanstack/react-router';
 import { ArrowDownIcon, ArrowUpIcon, TriangleAlertIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { CardHeading } from '@/components/card-heading';
@@ -10,18 +11,18 @@ import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { formatBitrate, formatNumber, formatPercent } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink, type Route } from '@/lib/router';
 import { SHAPING_BUSY } from '../dashboard/model';
 import { delayMs } from './cake';
 import type { LiveDirection, SqmLive } from './live';
 import { shareOfLimit } from './surface';
 
 /** A link to another page inside a sentence. */
-function PageLink({ to, children }: { to: Parameters<typeof href>[0]; children: ReactNode }): ReactElement {
+function PageLink({ to, children }: { to: Route; children: ReactNode }): ReactElement {
   return (
-    <a href={href(to)} className="font-medium text-primary underline underline-offset-4 hover:decoration-2">
+    <Link {...pageLink(to)} className="font-medium text-primary underline underline-offset-4 hover:decoration-2">
       {children}
-    </a>
+    </Link>
   );
 }
 

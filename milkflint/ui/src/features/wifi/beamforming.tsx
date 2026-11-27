@@ -2,37 +2,15 @@
 // radio. OpenWrt turns on every kind the radio supports (wifi-scripts'
 // defaults); each band's More settings on Networks & radios have switches for
 // beamforming and MU-MIMO, which some Wi-Fi cards handle badly.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { CheckIcon, MinusIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Card, CardContent } from '@/components/ui/card';
-import { usePoll } from '@/hooks/use-poll';
-import { type Beamforming, getBeamforming, getWirelessStatus } from '@/lib/api/wireless';
-import { href } from '@/lib/router';
+import { useLive } from '@/lib/query/use-live';
+import { wifiQueries } from './queries';
 import { cn } from '@/lib/utils';
-
-interface Band {
-  radio: string;
-  band: string;
-  beamforming: Beamforming | undefined;
-}
-
-async function loadBands(): Promise<Band[]> {
-  const status = await getWirelessStatus();
-  return Promise.all(
-    // a radio that's turned off has nothing to report
-    Object.entries(status)
-      .filter(([, r]) => r.disabled !== true)
-      .map(async ([radio, r]): Promise<Band> => {
-        const phy = r.iwinfo?.phy;
-        return {
-          radio,
-          band: r.config?.band ?? '',
-          beamforming: phy === undefined ? undefined : await getBeamforming(phy).catch(() => undefined),
-        };
-      }),
-  );
-}
 
 function bandLabel(band: string): string {
   return band === '2g' ? '2.4 GHz' : band === '5g' ? '5 GHz' : band === '6g' ? '6 GHz' : band;
@@ -76,7 +54,7 @@ function Generation({
 }
 
 export function BeamformingCard({ className }: { className?: string }): ReactElement | null {
-  const bands = usePoll(loadBands, 30_000).data;
+  const bands = useLive(wifiQueries.beamforming()).data;
   if (bands === undefined || bands.length === 0) return null;
 
   return (
@@ -87,9 +65,9 @@ export function BeamformingCard({ className }: { className?: string }): ReactEle
         status={
           <>
             What each band runs with now: switch it under a band’s More settings on{' '}
-            <a href={href('wifi')} className="font-medium link">
+            <Link {...pageLink('wifi')} className="font-medium link">
               Networks &amp; radios
-            </a>
+            </Link>
             .
           </>
         }

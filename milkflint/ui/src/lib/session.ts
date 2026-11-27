@@ -42,8 +42,16 @@ function readStored(): SessionState {
 let state: SessionState = readStored();
 if (state.status === 'authenticated') setSessionId(state.id);
 const listeners = new Set<() => void>();
+const signedOutListeners = new Set<() => void>();
+
+/** Called when a signed-in session ends (signed out or expired), before the page hears of it. */
+export function onSignedOut(listener: () => void): () => void {
+  signedOutListeners.add(listener);
+  return () => signedOutListeners.delete(listener);
+}
 
 function update(next: SessionState): void {
+  const ended = state.status === 'authenticated' && next.status === 'anonymous';
   state = next;
   setSessionId(next.status === 'authenticated' ? next.id : NULL_SESSION);
   try {
@@ -58,6 +66,7 @@ function update(next: SessionState): void {
   } catch {
     // Storage unavailable: the session just won't survive a reload.
   }
+  if (ended) for (const listener of signedOutListeners) listener();
   for (const listener of listeners) listener();
 }
 
@@ -114,6 +123,11 @@ export async function logout(): Promise<void> {
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+/** Signed in now (for code outside React: the router's prefetch). */
+export function signedIn(): boolean {
+  return state.status === 'authenticated';
 }
 
 export function useSession(): SessionState {

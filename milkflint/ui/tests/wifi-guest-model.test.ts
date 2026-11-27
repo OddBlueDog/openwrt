@@ -9,23 +9,28 @@ import {
   apSections,
   bandCreds,
   blankNet,
+  type Errors,
   freeAddress,
   type GuestData,
+  guestErrors,
   joinCodes,
   moreSummary,
-  networkSummary,
-  newForm,
   type NetData,
   type NetForm,
+  networkSummary,
+  newForm,
   overlaps,
   removal,
   saveWarnings,
   toChanges,
-  validate,
 } from '../src/features/wifi-guest/model.ts';
 import { ipToInt } from '../src/lib/api/network.ts';
 import type { Change, Section } from '../src/lib/api/uci.ts';
 import { applied, nameOf, section } from './uci-fixture.ts';
+
+// one network's checks, as the page reads them: the form holds it and the others, the router has it as `net`
+const validate = (f: NetForm, net: NetData, d: GuestData, others: readonly NetForm[]): Errors =>
+  guestErrors({ nets: [f, ...others] }, f.id, { ...d, nets: [net, ...d.nets.filter((n) => n.id !== net.id)] });
 
 const range = (ip: string, prefix: number, name = 'Other'): { ip: number; prefix: number; name: string } => ({
   ip: ipToInt(ip) ?? 0,

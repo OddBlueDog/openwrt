@@ -173,6 +173,55 @@ export async function firewallError(): Promise<string | undefined> {
   return error ?? lines.filter((l) => l !== '').at(-1) ?? 'no details';
 }
 
+/** How long rpcd keeps a firewall change's rollback armed while nft checks it. */
+const FIREWALL_ROLLBACK_SECONDS = 60;
+
+/** A firewall change nft wouldn't load: it was rolled back. */
+export class FirewallRejectedError extends Error {
+  readonly fault: string;
+
+  constructor(fault: string) {
+    super(`The firewall couldn’t load this (${fault}), so it was undone.`);
+    this.name = 'FirewallRejectedError';
+    this.fault = fault;
+  }
+}
+
+/** What nft finds wrong with the firewall config; undefined when it loads, or when the check can't run. */
+async function firewallFault(): Promise<string | undefined> {
+  try {
+    return await firewallError();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The save every settings page makes: stage the changes and apply them at
+ * once, as LuCI's "Apply unchecked" does: no timer that undoes a change the
+ * browser can't confirm, so a new Wi-Fi name or password stays however long
+ * devices take to rejoin. A firewall change is the exception: it's applied
+ * with rollback armed, and undone at once (FirewallRejectedError) if nft
+ * won't load it, rather than kept for the next reload or boot to fail on;
+ * otherwise it's kept straight away.
+ */
+export async function applyChanges(changes: readonly Change[]): Promise<{ nothingChanged: boolean }> {
+  // a firewall that already fails its check isn't this change's doing: then it's applied like the rest
+  const checkFirewall = changes.some((c) => c.config === 'firewall') && (await firewallFault()) === undefined;
+  await stage(changes);
+  const applied = checkFirewall ? await applyWithRollback(FIREWALL_ROLLBACK_SECONDS) : await applyUnchecked();
+  if (!applied) return { nothingChanged: true };
+  if (checkFirewall) {
+    const fault = await firewallFault();
+    if (fault !== undefined) {
+      await rollback();
+      throw new FirewallRejectedError(fault);
+    }
+    await confirm();
+  }
+  return { nothingChanged: false };
+}
+
 /** Drop everything this session has staged. */
 export async function revertAll(configs: readonly string[]): Promise<void> {
   await Promise.all(configs.map((config) => exec('uci', 'revert', { config })));

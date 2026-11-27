@@ -4,7 +4,7 @@
 // the air. This router's channels, the quietest place at its width and
 // blocks no other network touches at a narrower width are marked.
 import type { ReactElement } from 'react';
-import { cn } from '@/lib/utils';
+import { type BarLabel, type BarPart, BarChart } from '@/components/charts/bar-chart';
 import { bandLabel, type BandId, type ChannelLoad } from './spectrum';
 
 export function ChannelCrowding({
@@ -36,60 +36,50 @@ export function ChannelCrowding({
           (c) => c !== undefined,
         ),
   );
+  // the channels left to right, and a space where the band skips some (5 GHz: 64 to 100, 144 to 149)
+  const places = loads.flatMap((l, i) => {
+    const prev = loads[i - 1];
+    return prev !== undefined && l.channel - prev.channel > (band === '2g' ? 1 : 4) ? [null, l] : [l];
+  });
+  const bars = places.map((l): BarPart[] | null =>
+    l === null
+      ? null
+      : [
+          {
+            value: Math.max(3, (l.load / peak) * 100),
+            color: own.has(l.channel)
+              ? 'var(--primary)'
+              : quietSet.has(l.channel)
+                ? 'var(--success)'
+                : emptySet.has(l.channel)
+                  ? 'color-mix(in oklab, var(--success) 40%, transparent)'
+                  : 'color-mix(in oklab, var(--muted-foreground) 30%, transparent)',
+          },
+        ],
+  );
+  const labels = places.flatMap((l, at): BarLabel[] => {
+    const prev = places[at - 1];
+    // on 5 and 6 GHz two numbered channels side by side would run together: the second goes
+    const crowded = band !== '2g' && prev !== undefined && prev !== null && numbered.has(prev.channel);
+    if (l === null || !numbered.has(l.channel) || crowded) return [];
+    const mine = own.has(l.channel);
+    const marked = quietSet.has(l.channel) || emptySet.has(l.channel);
+    return [{ at, text: String(l.channel), color: mine ? 'var(--primary)' : marked ? 'var(--success)' : undefined, bold: mine }];
+  });
   return (
-    <div className="flex min-w-0 flex-col gap-2">
-      <div className="flex h-28 items-end gap-[3px]">
-        {loads.map((l, i) => {
-          // a wider gap where the band skips channels (5 GHz: 64 to 100, 144 to 149)
-          const prev = loads[i - 1];
-          const gap = prev !== undefined && l.channel - prev.channel > (band === '2g' ? 1 : 4);
-          const mine = own.has(l.channel);
-          return (
-            <div
-              key={l.channel}
-              className={cn('flex h-full min-w-0 flex-1 flex-col justify-end', gap && 'ml-2')}
-              title={`Channel ${String(l.channel)}: ${l.networks === 0 ? 'no other networks' : `${String(l.networks)} network${l.networks === 1 ? '' : 's'}`}${mine ? ' (yours)' : ''}`}
-            >
-              <div
-                className={cn(
-                  'w-full rounded-t-sm transition-[height] duration-slow',
-                  mine
-                    ? 'bg-primary'
-                    : quietSet.has(l.channel)
-                      ? 'bg-success'
-                      : emptySet.has(l.channel)
-                        ? 'bg-success/40'
-                        : 'bg-muted-foreground/30',
-                )}
-                style={{ height: `${String(Math.max(3, (l.load / peak) * 100))}%` }}
-              />
-            </div>
-          );
-        })}
-      </div>
-      <div className="flex gap-[3px] border-t pt-1">
-        {loads.map((l, i) => {
-          const prev = loads[i - 1];
-          const gap = prev !== undefined && l.channel - prev.channel > (band === '2g' ? 1 : 4);
-          // on 5 and 6 GHz two numbered channels side by side would run together: the second goes
-          const crowded = band !== '2g' && prev !== undefined && !gap && numbered.has(prev.channel) && numbered.has(l.channel);
-          return (
-            <span
-              key={l.channel}
-              className={cn(
-                'min-w-0 flex-1 text-center text-xs leading-none text-muted-foreground tabular',
-                gap && 'ml-2',
-                own.has(l.channel) && 'font-semibold text-primary',
-                (quietSet.has(l.channel) || emptySet.has(l.channel)) && 'text-success',
-                (!numbered.has(l.channel) || crowded) && 'invisible',
-              )}
-            >
-              {l.channel}
-            </span>
-          );
-        })}
-      </div>
-      <span className="sr-only">{bandLabel(band)} channels by how crowded they are</span>
-    </div>
+    <BarChart
+      bars={bars}
+      max={100}
+      baseline
+      labels={labels}
+      label={`${bandLabel(band)} channels by how crowded they are`}
+      card={(at) => {
+        const l = places[at];
+        if (l === null || l === undefined) return { rows: [] };
+        const others = l.networks === 0 ? 'no other networks' : `${String(l.networks)} network${l.networks === 1 ? '' : 's'}`;
+        return { title: `Channel ${String(l.channel)}: ${others}${own.has(l.channel) ? ' (yours)' : ''}`, rows: [] };
+      }}
+      className="h-34"
+    />
   );
 }

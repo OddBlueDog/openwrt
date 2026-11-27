@@ -25,7 +25,25 @@ const ifaceSchema = z.object({
 });
 export type WgInterface = z.output<typeof ifaceSchema>;
 
-const statusSchema = z.object({ installed: z.boolean(), now: z.number(), interfaces: z.array(ifaceSchema) });
+const tunnelSchema = z.object({
+  up: z.boolean(),
+  /** epoch seconds */
+  since: z.number(),
+  reason: z.enum(['interface', 'no-answer', 'no-handshake']).nullable(),
+  dns_ok: z.boolean().nullable(),
+});
+/** The VPN watcher's verdict on the tunnel (/var/run/milkflint/vpn-tunnel.json). */
+export type Tunnel = z.output<typeof tunnelSchema>;
+
+const statusSchema = z.object({
+  installed: z.boolean(),
+  now: z.number(),
+  interfaces: z.array(ifaceSchema),
+  /** null: no watcher state (VPN off, or an older image) */
+  tunnel: tunnelSchema.nullable().default(null),
+  /** dnsmasq can fill nftables sets (dnsmasq-full), as the VPN's sites that go direct need; missing on an older image */
+  nftset: z.boolean().optional(),
+});
 export type WgStatus = z.output<typeof statusSchema>;
 
 /** Every WireGuard interface that's up and its peers; installed is false without WireGuard (or the plugin). */
@@ -35,7 +53,7 @@ export async function getWgStatus(): Promise<WgStatus> {
   } catch (err) {
     // an image without the VPN pages' plugin
     if (err instanceof UbusError && err.code === UbusStatus.notFound)
-      return { installed: false, now: Date.now() / 1000, interfaces: [] };
+      return { installed: false, now: Date.now() / 1000, interfaces: [], tunnel: null };
     throw err;
   }
 }

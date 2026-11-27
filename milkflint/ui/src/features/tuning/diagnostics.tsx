@@ -3,12 +3,13 @@
 // memory error checker, KFENCE). They live in milkflint.logs with the Logs
 // page's settings and are written the same way (../logs/api.ts); what they
 // record shows on the Logs page's Debug and Crashes tabs.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import type { ReactElement } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
 import { Card, CardContent } from '@/components/ui/card';
 import { Switch } from '@/components/ui/switch';
-import { href } from '@/lib/router';
 import type { LogSettings } from '../logs/api';
 import { explain } from '@/components/explain';
 
@@ -52,9 +53,9 @@ export function DiagnosticsCard({
           on > 0 && (
             <>
               What they record is on the{' '}
-              <a href={href('logs')} className="font-medium link">
+              <Link {...pageLink('logs')} className="font-medium link">
                 Logs
-              </a>{' '}
+              </Link>{' '}
               page.
             </>
           )

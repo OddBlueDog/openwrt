@@ -2,6 +2,7 @@
 // section main): listen_https, the addresses it serves HTTPS on (OpenWrt's
 // default: port 443 on every address), and redirect_https, which sends HTTP
 // requests on to HTTPS (LuCI's "Redirect to HTTPS").
+import { z } from 'zod';
 import { bool, type Change, list, type Section } from '@/lib/api/uci';
 
 /** OpenWrt's own listen_https: port 443 on every IPv4 and IPv6 address. */
@@ -15,11 +16,13 @@ export interface HttpsConfig {
   redirect: boolean;
 }
 
-export interface HttpsForm {
-  https: boolean;
+export const httpsFormSchema = z.object({
+  https: z.boolean(),
   /** Always use HTTPS: HTTP requests are sent on to it. */
-  redirect: boolean;
-}
+  redirect: z.boolean(),
+});
+
+export type HttpsForm = z.infer<typeof httpsFormSchema>;
 
 export function configOf(sections: readonly Section[]): HttpsConfig | undefined {
   const s = sections.find((x) => x['.name'] === 'main');

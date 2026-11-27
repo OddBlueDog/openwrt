@@ -6,14 +6,14 @@
 import { InfoIcon, TriangleAlertIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
 import { CardHeading } from '@/components/card-heading';
-import { Field } from '@/components/field';
+import { FormField, SelectField, SwitchField } from '@/components/form';
+import { MoreSettings } from '@/components/more-settings';
 import { Note } from '@/components/note';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
-import { MoreSettings } from '@/components/more-settings';
+import type { SettingsFormApi } from '@/lib/form/use-settings-form';
 import { ACK_FILTER_RATIO, suggestsAckFilter } from './ack-filter';
 import {
   isPppoeDevice,
@@ -43,258 +43,249 @@ function gapText(gap: LinkGap, device: string): string {
   }
 }
 
-type Set = <K extends keyof SqmForm>(key: K, value: SqmForm[K]) => void;
+type Form = SettingsFormApi<SqmForm>;
 
-function Speed({
-  id,
-  label,
-  value,
-  error,
-  set,
-}: {
-  id: 'downloadMbit' | 'uploadMbit';
-  label: string;
-  value: string;
-  error: string | undefined;
-  set: Set;
-}): ReactElement {
-  return (
-    <Field id={id} label={label} error={error}>
-      <div className="flex items-center gap-2">
-        <Input
-          id={id}
-          inputMode="decimal"
-          className="tabular"
-          value={value}
-          aria-invalid={error !== undefined}
-          aria-describedby={`${id}-unit${error === undefined ? '' : ` ${id}-error`}`}
-          onChange={(e) => {
-            set(id, e.target.value.trim());
-          }}
-        />
-        <span id={`${id}-unit`} className="shrink-0 text-sm text-muted-foreground">
-          Mbit/s
-        </span>
-      </div>
-    </Field>
-  );
-}
+const isPreset = (v: string): v is LinkPreset => v in linkPresets;
+const isLatency = (v: string): v is LatencyTarget => v in latencyTargets;
 
-function ConnectionType({ form, data, set }: { form: SqmForm; data: SqmData; set: Set }): ReactElement {
-  // OpenWrt's own queue comes without compensation: ask, rather than show that as chosen
-  const ask = linkUnasked(data) && form.link === 'none';
-  const near = form.link === 'custom' && data.form.link === 'custom' ? data.linkNear : undefined;
+function Speed({ form, id, label }: { form: Form; id: 'downloadMbit' | 'uploadMbit'; label: string }): ReactElement {
   return (
-    <Field
-      id="link"
-      label="Connection type"
-      hint="So shaping counts each packet’s overhead on your line. Not sure? Fibre / Ethernet."
-      status={
-        ((!ask && form.link === 'none') || near !== undefined) && (
-          <>
-            {!ask && form.link === 'none' && (
-              <span className="mt-1 block text-warning">With no compensation, the queue can build up in your modem instead.</span>
-            )}
-            {near !== undefined && (
-              <span className="mt-1 block text-warning">
-                {linkPresets[near.preset].label} with {near.gaps.map((g) => gapText(g, data.form.device)).join(', ')}: choose{' '}
-                {linkPresets[near.preset].label} again to set it as this page does.
+    <form.Field name={id}>
+      {(field) => (
+        <FormField field={field} id={id} label={label}>
+          {(control) => (
+            <div className="flex items-center gap-2">
+              <Input
+                {...control}
+                inputMode="decimal"
+                className="tabular"
+                value={field.state.value}
+                aria-describedby={[`${id}-unit`, control['aria-describedby']].filter((x) => x !== undefined).join(' ')}
+                onChange={(e) => {
+                  field.handleChange(e.target.value.trim());
+                }}
+                onBlur={field.handleBlur}
+              />
+              <span id={`${id}-unit`} className="shrink-0 text-sm text-muted-foreground">
+                Mbit/s
               </span>
-            )}
-          </>
-        )
-      }
-      why={
-        <>
-          Each kind of line adds bytes of its own to every packet (framing, ATM cells, a PPPoE header). Without them, CAKE counts
-          packets as smaller than the line carries them, small ones such as acknowledgements most of all, so the queue builds up
-          in your modem instead. Each choice sets sqm’s linklayer, overhead and tcMPU (and CAKE’s ptm for VDSL2); the Advanced
-          sheet’s Line tab has them one by one.
-        </>
-      }
-    >
-      <Select
-        value={ask ? '' : form.link}
-        onValueChange={(v) => {
-          set('link', v as LinkPreset | 'custom');
-        }}
-      >
-        <SelectTrigger id="link">
-          <SelectValue placeholder="Choose your connection type" />
-        </SelectTrigger>
-        <SelectContent>
-          {Object.entries(linkPresets).map(([key, p]) => (
-            <SelectItem key={key} value={key}>
-              {p.linklayer === 'none' ? `${p.label} (not recommended)` : `${p.label} · ${presetOverhead(p, form.device)} bytes`}
-            </SelectItem>
-          ))}
-          {form.link === 'custom' && (
-            <SelectItem value="custom">
-              {data.linkNear === undefined ? 'Custom: see Advanced' : `Custom: near ${linkPresets[data.linkNear.preset].label}`}
-            </SelectItem>
+            </div>
           )}
-        </SelectContent>
-      </Select>
-    </Field>
+        </FormField>
+      )}
+    </form.Field>
   );
 }
 
-function More({ form, data, set }: { form: SqmForm; data: SqmData; set: Set }): ReactElement {
-  const unusual = moreSummary(form, data);
-  const downloadsTinned = form.restoreDscp || data.squash.squash_ingress === '0';
+function ConnectionType({ form, values, data }: { form: Form; values: SqmForm; data: SqmData }): ReactElement {
+  // OpenWrt's own queue comes without compensation: ask, rather than show that as chosen
+  const ask = linkUnasked(data) && values.link === 'none';
+  const near = values.link === 'custom' && data.form.link === 'custom' ? data.linkNear : undefined;
+  return (
+    <form.Field name="link">
+      {(field) => (
+        <FormField
+          field={field}
+          id="link"
+          label="Connection type"
+          hint="So shaping counts each packet’s overhead on your line. Not sure? Fibre / Ethernet."
+          status={
+            ((!ask && values.link === 'none') || near !== undefined) && (
+              <>
+                {!ask && values.link === 'none' && (
+                  <span className="mt-1 block text-warning">
+                    With no compensation, the queue can build up in your modem instead.
+                  </span>
+                )}
+                {near !== undefined && (
+                  <span className="mt-1 block text-warning">
+                    {linkPresets[near.preset].label} with {near.gaps.map((g) => gapText(g, data.form.device)).join(', ')}: choose{' '}
+                    {linkPresets[near.preset].label} again to set it as this page does.
+                  </span>
+                )}
+              </>
+            )
+          }
+          why={
+            <>
+              Each kind of line adds bytes of its own to every packet (framing, ATM cells, a PPPoE header). Without them, CAKE
+              counts packets as smaller than the line carries them, small ones such as acknowledgements most of all, so the queue
+              builds up in your modem instead. Each choice sets sqm’s linklayer, overhead and tcMPU (and CAKE’s ptm for VDSL2);
+              the Advanced sheet’s Line tab has them one by one.
+            </>
+          }
+        >
+          {(control) => (
+            <Select
+              value={ask ? '' : field.state.value}
+              onValueChange={(v) => {
+                field.handleChange(isPreset(v) ? v : 'custom');
+              }}
+            >
+              <SelectTrigger {...control} onBlur={field.handleBlur}>
+                <SelectValue placeholder="Choose your connection type" />
+              </SelectTrigger>
+              <SelectContent>
+                {Object.entries(linkPresets).map(([key, p]) => (
+                  <SelectItem key={key} value={key}>
+                    {p.linklayer === 'none'
+                      ? `${p.label} (not recommended)`
+                      : `${p.label} · ${presetOverhead(p, values.device)} bytes`}
+                  </SelectItem>
+                ))}
+                {values.link === 'custom' && (
+                  <SelectItem value="custom">
+                    {data.linkNear === undefined
+                      ? 'Custom: see Advanced'
+                      : `Custom: near ${linkPresets[data.linkNear.preset].label}`}
+                  </SelectItem>
+                )}
+              </SelectContent>
+            </Select>
+          )}
+        </FormField>
+      )}
+    </form.Field>
+  );
+}
+
+function More({ form, values, data }: { form: Form; values: SqmForm; data: SqmData }): ReactElement {
+  const unusual = moreSummary(values, data);
+  const downloadsTinned = values.restoreDscp || data.squash.squash_ingress === '0';
   return (
     <MoreSettings summary={unusual.length > 0 ? unusual.join(' · ') : 'Mode, latency target, fairness, interface'}>
-      <Field
-        id="mode"
-        label="Mode"
-        hint={
-          form.prioritise
-            ? 'Calls and games go ahead of downloads and backups.'
-            : 'One fair queue for everything. Best for most homes.'
-        }
-        why={
-          form.prioritise
-            ? downloadsTinned
-              ? 'CAKE sorts traffic into tins by its DSCP marks, both ways (diffserv tins). sqm’s script: layer_cake.qos.'
-              : 'CAKE sorts uploads into tins by their DSCP marks (diffserv tins). Downloads arrive with your provider’s marks, which mean nothing here: they get tins with Keep devices’ priorities on downloads. sqm’s script: layer_cake.qos.'
-            : 'Every flow gets its fair share, with small ones such as calls and games going first anyway. sqm’s script: piece_of_cake.qos.'
-        }
-      >
-        <Select
-          value={form.prioritise ? 'layer' : 'simple'}
-          onValueChange={(v) => {
-            set('prioritise', v === 'layer');
-          }}
-        >
-          <SelectTrigger id="mode">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="simple">Simple (piece_of_cake)</SelectItem>
-            <SelectItem value="layer">Prioritise by traffic type (layer_cake)</SelectItem>
-          </SelectContent>
-        </Select>
-      </Field>
-      <Field
-        id="latency"
-        label="Latency target"
-        hint="Calls, games and other small flows go first at any setting."
-        why="Low asks big downloads and uploads to slow down sooner, so their queues stay shorter, for a little less speed. CAKE’s rtt, in both directions’ options (iqdisc_opts, eqdisc_opts)."
-      >
-        <Select
-          value={form.latency}
-          onValueChange={(v) => {
-            set('latency', v as LatencyTarget | 'custom');
-          }}
-        >
-          <SelectTrigger id="latency">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {Object.entries(latencyTargets).map(([key, t]) => (
-              <SelectItem key={key} value={key}>
-                {t.label}
-              </SelectItem>
-            ))}
-            {form.latency === 'custom' && <SelectItem value="custom">Custom: see Advanced</SelectItem>}
-          </SelectContent>
-        </Select>
-      </Field>
-      <Field
-        id="perDevice"
-        label="Fair share per device"
-        hint="One device’s downloads can’t crowd out the others."
-        why="CAKE’s per-host isolation behind NAT: nat, dual-dsthost and ingress in the download’s options (iqdisc_opts), nat and dual-srchost in the upload’s (eqdisc_opts)."
-      >
-        <Switch
-          id="perDevice"
-          checked={form.perDevice}
-          onCheckedChange={(v) => {
-            set('perDevice', v);
-          }}
-        />
-      </Field>
-      <Field
-        id="restoreDscp"
-        label="Keep devices’ priorities on downloads"
-        hint={form.enabled ? 'Downloads get back the priority mark their connection was sent with.' : undefined}
-        status={form.enabled ? undefined : 'Needs Smart Queue on.'}
-        why={
-          <>
-            Devices mark what they send as calls, video or background transfers (DSCP), but the marks don’t survive the way back
-            from the internet. This puts each connection’s mark back on its downloads, so Wi-Fi sends a call’s ahead of other
-            traffic and a backup’s behind it
-            {form.prioritise ? ', and Prioritise by traffic type applies to downloads as well' : ''}. Sets
-            milkflint.cake.dscp_restore, with sqm’s squash_dscp and squash_ingress.
-            {!form.restoreDscp && data.squash.squash_dscp === '0' && (
-              <span className="mt-1 block">
-                Downloads keep your provider’s marks now (set in LuCI). This needs CAKE to clear them, so they’re cleared, and
-                stay so if you turn it off again.
-              </span>
+      <form.Field name="prioritise">
+        {(field) => (
+          <FormField
+            field={field}
+            id="mode"
+            label="Mode"
+            hint={
+              values.prioritise
+                ? 'Calls and games go ahead of downloads and backups.'
+                : 'One fair queue for everything. Best for most homes.'
+            }
+            why={
+              values.prioritise
+                ? downloadsTinned
+                  ? 'CAKE sorts traffic into tins by its DSCP marks, both ways (diffserv tins). sqm’s script: layer_cake.qos.'
+                  : 'CAKE sorts uploads into tins by their DSCP marks (diffserv tins). Downloads arrive with your provider’s marks, which mean nothing here: they get tins with Keep devices’ priorities on downloads. sqm’s script: layer_cake.qos.'
+                : 'Every flow gets its fair share, with small ones such as calls and games going first anyway. sqm’s script: piece_of_cake.qos.'
+            }
+          >
+            {(control) => (
+              <Select
+                value={field.state.value ? 'layer' : 'simple'}
+                onValueChange={(v) => {
+                  field.handleChange(v === 'layer');
+                }}
+              >
+                <SelectTrigger {...control} onBlur={field.handleBlur}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="simple">Simple (piece_of_cake)</SelectItem>
+                  <SelectItem value="layer">Prioritise by traffic type (layer_cake)</SelectItem>
+                </SelectContent>
+              </Select>
             )}
-          </>
-        }
-      >
-        <Switch
-          id="restoreDscp"
-          checked={form.restoreDscp}
-          disabled={!form.enabled}
-          onCheckedChange={(v) => {
-            set('restoreDscp', v);
-          }}
-        />
-      </Field>
-      <Field
-        id="device"
-        label="Interface"
-        hint={
-          data.pppoe === undefined
-            ? 'Where to shape: your internet (WAN) port.'
-            : `Where to shape: with PPPoE, the session’s own device (${data.pppoe}).`
-        }
-        why={
-          data.pppoe === undefined
-            ? 'sqm’s interface. The download is shaped on an ifb device sqm-scripts makes for it.'
-            : `There CAKE reads the packets inside the PPPoE session; on the port it sees only PPPoE frames. sqm’s interface.`
-        }
-      >
-        <Select
-          value={form.device}
-          onValueChange={(v) => {
-            set('device', v);
-          }}
-        >
-          <SelectTrigger id="device">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {/* the WAN's device even while a PPPoE session's is down */}
-            {[...new Set([form.device, ...(data.wanDevice === undefined ? [] : [data.wanDevice]), ...data.devices])].map((d) => (
-              <SelectItem key={d} value={d}>
-                {d}
-                {d === data.wanDevice && ' (WAN)'}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </Field>
+          </FormField>
+        )}
+      </form.Field>
+      <form.Field name="latency">
+        {(field) => (
+          <SelectField
+            field={field}
+            id="latency"
+            label="Latency target"
+            hint="Calls, games and other small flows go first at any setting."
+            why="Low asks big downloads and uploads to slow down sooner, so their queues stay shorter, for a little less speed. CAKE’s rtt, in both directions’ options (iqdisc_opts, eqdisc_opts)."
+            options={[
+              ...Object.entries(latencyTargets).flatMap(([key, t]) => (isLatency(key) ? [{ value: key, label: t.label }] : [])),
+              ...(values.latency === 'custom' ? [{ value: 'custom' as const, label: 'Custom: see Advanced' }] : []),
+            ]}
+          />
+        )}
+      </form.Field>
+      <form.Field name="perDevice">
+        {(field) => (
+          <SwitchField
+            field={field}
+            id="perDevice"
+            label="Fair share per device"
+            hint="One device’s downloads can’t crowd out the others."
+            why="CAKE’s per-host isolation behind NAT: nat, dual-dsthost and ingress in the download’s options (iqdisc_opts), nat and dual-srchost in the upload’s (eqdisc_opts)."
+          />
+        )}
+      </form.Field>
+      <form.Field name="restoreDscp">
+        {(field) => (
+          <SwitchField
+            field={field}
+            id="restoreDscp"
+            label="Keep devices’ priorities on downloads"
+            hint={values.enabled ? 'Downloads get back the priority mark their connection was sent with.' : undefined}
+            status={values.enabled ? undefined : 'Needs Smart Queue on.'}
+            disabled={!values.enabled}
+            why={
+              <>
+                Devices mark what they send as calls, video or background transfers (DSCP), but the marks don’t survive the way
+                back from the internet. This puts each connection’s mark back on its downloads, so Wi-Fi sends a call’s ahead of
+                other traffic and a backup’s behind it
+                {values.prioritise ? ', and Prioritise by traffic type applies to downloads as well' : ''}. Sets
+                milkflint.cake.dscp_restore, with sqm’s squash_dscp and squash_ingress.
+                {!values.restoreDscp && data.squash.squash_dscp === '0' && (
+                  <span className="mt-1 block">
+                    Downloads keep your provider’s marks now (set in LuCI). This needs CAKE to clear them, so they’re cleared, and
+                    stay so if you turn it off again.
+                  </span>
+                )}
+              </>
+            }
+          />
+        )}
+      </form.Field>
+      <form.Field name="device">
+        {(field) => (
+          <SelectField
+            field={field}
+            id="device"
+            label="Interface"
+            hint={
+              data.pppoe === undefined
+                ? 'Where to shape: your internet (WAN) port.'
+                : `Where to shape: with PPPoE, the session’s own device (${data.pppoe}).`
+            }
+            why={
+              data.pppoe === undefined
+                ? 'sqm’s interface. The download is shaped on an ifb device sqm-scripts makes for it.'
+                : `There CAKE reads the packets inside the PPPoE session; on the port it sees only PPPoE frames. sqm’s interface.`
+            }
+            // the WAN's device even while a PPPoE session's is down
+            options={[
+              ...new Set([values.device, ...(data.wanDevice === undefined ? [] : [data.wanDevice]), ...data.devices]),
+            ].map((d) => ({ value: d, label: d === data.wanDevice ? `${d} (WAN)` : d }))}
+          />
+        )}
+      </form.Field>
     </MoreSettings>
   );
 }
 
 export function SettingsCard({
   form,
+  values,
   data,
   errors,
-  set,
 }: {
-  form: SqmForm;
+  form: Form;
+  values: SqmForm;
   data: SqmData;
+  /** the checks as they stand: the multi-queue one shows as a note */
   errors: SqmErrors;
-  set: Set;
 }): ReactElement {
-  const ackChanged = form.ackFilter !== data.form.ackFilter;
-  const suggestAck = form.enabled && form.ackFilter === 'off' && suggestsAckFilter(form.downloadMbit, form.uploadMbit);
+  const ackChanged = values.ackFilter !== data.form.ackFilter;
+  const suggestAck = values.enabled && values.ackFilter === 'off' && suggestsAckFilter(values.downloadMbit, values.uploadMbit);
   return (
     <Card>
       <CardHeading
@@ -303,8 +294,8 @@ export function SettingsCard({
       />
       <CardContent>
         <div className="divide-y">
-          <Speed id="downloadMbit" label="Download speed" value={form.downloadMbit} error={errors.downloadMbit} set={set} />
-          <Speed id="uploadMbit" label="Upload speed" value={form.uploadMbit} error={errors.uploadMbit} set={set} />
+          <Speed form={form} id="downloadMbit" label="Download speed" />
+          <Speed form={form} id="uploadMbit" label="Upload speed" />
           {errors.multiQueue !== undefined && (
             <Note tone="destructive" icon={<TriangleAlertIcon />} title="Multi-queue can’t run with this" className="py-3.5">
               <div className="flex flex-col items-start gap-2">
@@ -313,7 +304,7 @@ export function SettingsCard({
                   size="sm"
                   variant="outline"
                   onClick={() => {
-                    set('multiQueue', 'off');
+                    form.setFieldValue('multiQueue', 'off');
                   }}
                 >
                   Use one CAKE
@@ -340,7 +331,7 @@ export function SettingsCard({
                     size="sm"
                     variant="outline"
                     onClick={() => {
-                      set('ackFilter', 'on');
+                      form.setFieldValue('ackFilter', 'on');
                     }}
                   >
                     Turn the ACK filter on
@@ -349,9 +340,9 @@ export function SettingsCard({
               )}
             </Note>
           )}
-          <ConnectionType form={form} data={data} set={set} />
+          <ConnectionType form={form} values={values} data={data} />
         </div>
-        <More form={form} data={data} set={set} />
+        <More form={form} values={values} data={data} />
       </CardContent>
     </Card>
   );

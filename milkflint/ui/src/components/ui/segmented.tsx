@@ -10,6 +10,10 @@ export function Segmented<T extends string>({
   onChange,
   disabled = false,
   size = 'sm',
+  id,
+  'aria-invalid': invalid,
+  'aria-describedby': describedBy,
+  'data-form': dataForm,
 }: {
   label: string;
   value: T;
@@ -17,6 +21,11 @@ export function Segmented<T extends string>({
   onChange: (v: T) => void;
   disabled?: boolean;
   size?: 'sm' | 'xs';
+  /** wiring from a form field: its label's id and its error */
+  id?: string | undefined;
+  'aria-invalid'?: true | undefined;
+  'aria-describedby'?: string | undefined;
+  'data-form'?: string | undefined;
 }): ReactElement {
   const ref = useRef<HTMLDivElement>(null);
   const move = (e: KeyboardEvent<HTMLButtonElement>, i: number): void => {
@@ -31,8 +40,12 @@ export function Segmented<T extends string>({
   return (
     <div
       ref={ref}
+      id={id}
       role="radiogroup"
       aria-label={label}
+      aria-invalid={invalid}
+      aria-describedby={describedBy}
+      data-form={dataForm}
       // as wide as its options, never stretched by a flex column or grid it sits in (a Field's control column)
       className={cn('inline-flex w-fit max-w-full flex-wrap rounded-md border bg-muted/50 p-0.5', disabled && 'opacity-60')}
     >

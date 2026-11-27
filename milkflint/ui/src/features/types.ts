@@ -1,3 +1,4 @@
+import type { QueryClient } from '@tanstack/react-query';
 import type { LucideIcon } from 'lucide-react';
 import type { ComponentType, LazyExoticComponent } from 'react';
 import type { FeatureId } from './ids';
@@ -37,4 +38,10 @@ export interface Feature {
   /** Out of the menu (and its search) but still reachable at its route: a page folded into another. */
   inMenu?: false;
   page: LazyExoticComponent<ComponentType>;
+  /**
+   * Starts the page's first read (queryClient.prefetchQuery) while its code
+   * loads, or when a link to it is hovered. Never awaited: a slow router
+   * doesn't hold the page's own skeleton back.
+   */
+  prefetch?: (client: QueryClient) => void;
 }

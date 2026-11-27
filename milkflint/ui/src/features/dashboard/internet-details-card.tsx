@@ -2,11 +2,12 @@
 // Queue's limits while it shapes), the router's addresses on it, how long
 // it's been connected and how. In access point mode, the link to the main
 // router instead.
+import { Link } from '@tanstack/react-router';
 import type { ReactElement, ReactNode } from 'react';
 import { Progress } from '@/components/ui/progress';
 import { ipv4, wanIpv6 } from '@/lib/api/network';
 import { formatBitrate, formatDuration } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { wanBehindNat } from '../firewall/api';
 import type { Dashboard } from './use-dashboard';
@@ -69,7 +70,7 @@ export function InternetDetailsCard({ d, ap }: { d: Dashboard; ap: boolean }): R
         aside={
           <>
             <StateBadge tone={online ? 'success' : 'destructive'}>{online ? 'Connected' : 'Not connected'}</StateBadge>
-            <WidgetLink href={href('mode')}>Operating mode</WidgetLink>
+            <WidgetLink to={pageLink('mode')}>Operating mode</WidgetLink>
           </>
         }
       >
@@ -101,7 +102,7 @@ export function InternetDetailsCard({ d, ap }: { d: Dashboard; ap: boolean }): R
           <StateBadge tone={wan === undefined ? 'off' : online ? 'success' : 'destructive'}>
             {wan === undefined ? 'Not set up' : online ? 'Online' : 'Offline'}
           </StateBadge>
-          <WidgetLink href={href('internet')}>Internet</WidgetLink>
+          <WidgetLink to={pageLink('internet')}>Internet</WidgetLink>
         </>
       }
     >
@@ -140,9 +141,9 @@ export function InternetDetailsCard({ d, ap }: { d: Dashboard; ap: boolean }): R
           {gateway !== undefined && <Row label="Gateway">{gateway}</Row>}
           <Row label="Smart Queue">
             {d.cake.length === 0 ? (
-              <a href={href('sqm')} className="link">
+              <Link {...pageLink('sqm')} className="link">
                 Off: set it up
-              </a>
+              </Link>
             ) : (
               <>
                 {down?.bandwidth === undefined ? 'no limit' : formatBitrate(down.bandwidth)} down,{' '}

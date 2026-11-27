@@ -5,6 +5,7 @@ import { CheckIcon, CopyIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import type { Change, Section } from '@/lib/api/uci';
+import { previewLines } from './preview-lines';
 
 /** The UCI option a field sets, as LuCI's advanced users know it. */
 export function Opt({ children }: { children: ReactNode }): ReactElement {
@@ -22,29 +23,6 @@ export function FieldLabel({ htmlFor, label, opt }: { htmlFor?: string; label: s
       <Opt>{opt}</Opt>
     </span>
   );
-}
-
-const quote = (v: string): string => `'${v.replaceAll("'", "'\\''")}'`;
-
-/** The section as /etc/config/<config> will hold it once the changes are applied. */
-function previewLines(config: string, type: string, original: Section | undefined, changes: readonly Change[]): string[] {
-  const merged = new Map<string, string | string[]>();
-  for (const [k, v] of Object.entries(original ?? {}))
-    if (!k.startsWith('.') && v !== undefined && typeof v !== 'boolean' && typeof v !== 'number') merged.set(k, v);
-  // only this section's: a sheet's changes can touch others (a zone's forwardings)
-  const name = original?.['.name'];
-  for (const c of changes) {
-    if (c.config !== config) continue;
-    if (c.op === 'add' && name === undefined && c.type === type) for (const [k, v] of Object.entries(c.values)) merged.set(k, v);
-    else if (c.op === 'set' && c.section === name) for (const [k, v] of Object.entries(c.values)) merged.set(k, v);
-    else if (c.op === 'unset' && c.section === name) for (const k of c.options) merged.delete(k);
-  }
-  const lines = [`config ${type}${original === undefined ? '' : ` ${quote(original['.name'])}`}`];
-  for (const [k, v] of merged) {
-    if (Array.isArray(v)) for (const x of v) lines.push(`\tlist ${k} ${quote(x)}`);
-    else lines.push(`\toption ${k} ${quote(v)}`);
-  }
-  return lines;
 }
 
 function copyText(text: string): void {

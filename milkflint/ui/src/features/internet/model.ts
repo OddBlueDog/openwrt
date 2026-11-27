@@ -1,35 +1,38 @@
 // The Internet page's settings and the UCI changes that make them: the WAN
 // interface, the provider's VLAN as an 802.1q device, wan6 under PPPoE, and
 // Smart Queue's queue, which goes where PPPoE's packets can be read.
+import { z } from 'zod';
 import { ipToInt } from '@/lib/api/network';
 import { type Change, type Section, str } from '@/lib/api/uci';
 import { isPppoeDevice, pppoeDevice, queueMove } from '../sqm/model';
-import { type ClientIdMode, fromStored, toStored } from './client-id';
+import { fromStored, toStored } from './client-id';
 
-export interface InternetForm {
-  proto: string;
-  username: string;
-  password: string;
-  ipaddr: string;
-  netmask: string;
-  gateway: string;
+const internetFields = z.object({
+  proto: z.string(),
+  username: z.string(),
+  password: z.string(),
+  ipaddr: z.string(),
+  netmask: z.string(),
+  gateway: z.string(),
   /** Static IP only: the provider's DNS servers. Everything else: the DNS page. */
-  staticDns: string;
-  ipv6: boolean;
-  wan6Exists: boolean;
+  staticDns: z.string(),
+  ipv6: z.boolean(),
+  wan6Exists: z.boolean(),
   /** wan6's device: '@wan' follows wan's connection (PPPoE's link), anything else is a port. */
-  wan6Device: string;
+  wan6Device: z.string(),
   /** The WAN port, under any VLAN. */
-  port: string;
+  port: z.string(),
   /** The provider's VLAN ID, '' for none. */
-  vlan: string;
+  vlan: z.string(),
   /** The 802.1q device section the VLAN is, when it has one. */
-  vlanSection: string | undefined;
-  clientIdMode: ClientIdMode;
-  clientId: string;
-  /** Smart Queue's queue for the internet, as sqm has it (../sqm/model.ts); undefined: none, or no sqm */
-  sqmQueue: Section | undefined;
-}
+  vlanSection: z.union([z.string(), z.undefined()]),
+  clientIdMode: z.enum(['text', 'hex']),
+  clientId: z.string(),
+  /** Smart Queue's queue for the internet, as sqm has it (../sqm/model.ts); undefined: none, or no sqm. Not edited here. */
+  sqmQueue: z.union([z.custom<Section>(), z.undefined()]),
+});
+
+export type InternetForm = z.infer<typeof internetFields>;
 
 /**
  * wan's device as a port and a VLAN ID: an 802.1q device section by that
@@ -53,7 +56,8 @@ export function clientIdForm(raw: string): Pick<InternetForm, 'clientIdMode' | '
 
 const isIp = (v: string): boolean => ipToInt(v) !== undefined;
 
-export function validate(f: InternetForm): Partial<Record<keyof InternetForm, string>> {
+/** The form's checks: what each connection type needs, the VLAN ID and the client ID. */
+export const internetFormSchema = internetFields.superRefine((f, ctx) => {
   const e: Partial<Record<keyof InternetForm, string>> = {};
   if (f.proto === 'pppoe' && f.username === '') e.username = 'Your provider gives you this.';
   if (f.proto === 'static') {
@@ -71,8 +75,8 @@ export function validate(f: InternetForm): Partial<Record<keyof InternetForm, st
   if (f.proto === 'dhcp' && toStored(f.clientIdMode, f.clientId) === undefined) {
     e.clientId = f.clientIdMode === 'hex' ? 'Pairs of hex digits, e.g. 61:62:63 or 616263.' : 'Too long: 255 bytes at most.';
   }
-  return e;
-}
+  for (const [path, message] of Object.entries(e)) ctx.addIssue({ code: 'custom', path: [path], message });
+});
 
 export function toChanges(f: InternetForm, before: InternetForm): Change[] {
   const values: Record<string, string | string[]> = { proto: f.proto };

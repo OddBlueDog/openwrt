@@ -1,15 +1,20 @@
-// The Wi-Fi devices, busiest first: what each is downloading and uploading
-// now, its signal, its link speeds and how long it's been connected. A table
-// on a wide card, a list of cards on a narrow one, with the same figures.
-import { MonitorSmartphoneIcon } from 'lucide-react';
-import type { ReactElement } from 'react';
+// Busiest devices: all of them, those on the Wi-Fi or those on a cable,
+// busiest first: what each is downloading and uploading now, and for the
+// Wi-Fi ones their signal, link speeds and how long they've been connected.
+// A table on a wide card, a list of cards on a narrow one, with the same
+// figures. Which devices is a switch in its heading (busy.ts keeps it).
+import { EthernetPortIcon, MonitorSmartphoneIcon } from 'lucide-react';
+import { type ReactElement, useMemo } from 'react';
 import { SignalBars, SNR_HINT } from '@/components/charts/signal-bars';
+import { type Column, DataTable } from '@/components/data-table';
+import { Segmented } from '@/components/ui/segmented';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { formatBitrate, formatBytes, formatDuration, formatNumber } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { deviceLabel } from '../clients/model';
-import { busiestFirst } from './model';
+import { busyFilter, useBusyDevices } from './busy';
+import type { BusyDevice, BusyFilter } from './model';
 import type { Client, Dashboard } from './use-dashboard';
 import { useFit } from './fit';
 import { OffNote, Way, Widget, WidgetLink } from './widget';
@@ -88,19 +93,42 @@ function Details({ c }: { c: Client }): ReactElement {
   );
 }
 
+/** A wired device's tooltip: where its figures come from. */
+function WiredDetails({ d }: { d: BusyDevice }): ReactElement {
+  return (
+    <TooltipContent side="bottom" align="start" className="max-w-sm text-pretty">
+      <p className="font-medium">{deviceLabel(d.name)}</p>
+      <p className="mt-0.5 opacity-80">
+        On a cable. Its figures are what passes through the router, from its connections: traffic to another device on your
+        network doesn’t count.
+      </p>
+      {d.key !== d.ip && (
+        <p className="mt-2">
+          <span className="opacity-70">MAC </span>
+          <span className="font-mono">{d.key}</span>
+        </p>
+      )}
+    </TooltipContent>
+  );
+}
+
 /** The device's name, with what the row leaves out behind it (hover or focus). */
-function Name({ c }: { c: Client }): ReactElement {
+function Name({ d }: { d: BusyDevice }): ReactElement {
+  const c = d.wifi;
+  const details = c === undefined ? <WiredDetails d={d} /> : <Details c={c} />;
+  const Icon = c === undefined ? EthernetPortIcon : MonitorSmartphoneIcon;
+  const label = deviceLabel(d.name);
   return (
     <div className="flex min-w-0 items-center gap-3">
       <Tooltip>
         <TooltipTrigger
-          aria-label={`About ${label(c)}`}
+          aria-label={`About ${label}`}
           className="flex size-8 shrink-0 cursor-default items-center justify-center rounded-full bg-secondary"
         >
           {/* the kind of device isn't known: a neutral one, not a phone for everything */}
-          <MonitorSmartphoneIcon className="size-4 text-muted-foreground" />
+          <Icon className="size-4 text-muted-foreground" />
         </TooltipTrigger>
-        <Details c={c} />
+        {details}
       </Tooltip>
       <div className="min-w-0">
         <Tooltip>
@@ -108,16 +136,16 @@ function Name({ c }: { c: Client }): ReactElement {
             <span
               className={cn(
                 'block cursor-default truncate underline decoration-muted-foreground/50 decoration-dotted underline-offset-4',
-                c.name === undefined ? 'text-muted-foreground' : 'font-medium',
+                d.name === undefined ? 'text-muted-foreground' : 'font-medium',
               )}
             >
-              {label(c)}
+              {label}
             </span>
           </TooltipTrigger>
-          <Details c={c} />
+          {details}
         </Tooltip>
         <div className="truncate text-xs text-muted-foreground tabular">
-          {c.band ?? 'Wi-Fi'} · {c.ip ?? c.mac}
+          {c === undefined ? 'Cable' : (c.band ?? 'Wi-Fi')} · {d.ip ?? d.key}
         </div>
       </div>
     </div>
@@ -125,7 +153,7 @@ function Name({ c }: { c: Client }): ReactElement {
 }
 
 /** Its download now as a bar against the busiest device's, with the figures. */
-function Traffic({ c, most }: { c: Client; most: number }): ReactElement {
+function Traffic({ c, most }: { c: BusyDevice; most: number }): ReactElement {
   return (
     <div className="flex min-w-0 flex-col gap-1">
       <div className="h-1.5 overflow-hidden rounded-full bg-muted" aria-hidden="true">
@@ -187,9 +215,70 @@ function Link({ c, stacked = false }: { c: Client; stacked?: boolean }): ReactEl
 
 const connected = (c: Client): string => (c.connectedSeconds === undefined ? '—' : formatDuration(c.connectedSeconds));
 
-/** "1 device on Wi-Fi now", "9 devices on Wi-Fi now". */
-function onWifi(count: number): string {
-  return `${formatNumber(count)} ${count === 1 ? 'device' : 'devices'} on Wi-Fi now`;
+/** A Wi-Fi figure, or a dash for a device on a cable. */
+const onWifi = (d: BusyDevice, show: (c: Client) => ReactElement | string): ReactElement | string =>
+  d.wifi === undefined ? <span className="text-xs text-muted-foreground">—</span> : show(d.wifi);
+
+/**
+ * The table's columns, each bar against the busiest device's download
+ * (`most`); the device column takes what the figures leave (and truncates).
+ * On a cable there's no signal, link or connection time: LAN alone leaves them out.
+ */
+function columnsFor(most: number, filter: BusyFilter): Column<BusyDevice>[] {
+  const all: Column<BusyDevice>[] = [
+    { label: 'Device', cell: (d) => <Name d={d} />, className: 'w-full max-w-0' },
+    { label: 'Now', cell: (d) => <Traffic c={d} most={most} />, className: 'w-32 min-w-32' },
+  ];
+  if (filter === 'lan') return all;
+  return [
+    ...all,
+    { label: 'Signal', cell: (d) => onWifi(d, (c) => <Signal c={c} />) },
+    {
+      label: 'Link',
+      header: (
+        <>
+          Link <Way dir="down" /> / <Way dir="up" />
+        </>
+      ),
+      title: 'The link speeds the radios negotiated, to the device and from it',
+      cell: (d) => onWifi(d, (c) => <Link c={c} />),
+    },
+    {
+      label: 'Connected',
+      cell: (d) => onWifi(d, connected),
+      className: 'text-right text-xs whitespace-nowrap text-muted-foreground tabular',
+    },
+  ];
+}
+
+const devices = (n: number): string => `${formatNumber(n)} ${n === 1 ? 'device' : 'devices'}`;
+
+/** The foot of the card: how many are online, on the Wi-Fi (by band) and on a cable, for the filter. */
+function Totals({ d, filter }: { d: Dashboard; filter: BusyFilter }): ReactElement {
+  const wifi = d.clients.length;
+  const wired = d.wired;
+  const lead =
+    filter === 'wifi'
+      ? `${devices(wifi)} on Wi-Fi now`
+      : filter === 'lan'
+        ? wired === undefined
+          ? 'Wired devices'
+          : `${devices(wired)} on a cable now`
+        : wired === undefined
+          ? `${devices(wifi)} on Wi-Fi now`
+          : `${devices(wifi + wired)} online now`;
+  return (
+    <p className="flex flex-wrap gap-x-3 gap-y-1 border-t px-5 pt-4 text-sm text-muted-foreground">
+      <span className="font-medium text-foreground">{lead}</span>
+      {filter !== 'lan' &&
+        perBand(d.clients).map(([band, n]) => (
+          <span key={band}>
+            {band} · {formatNumber(n)}
+          </span>
+        ))}
+      {filter === 'all' && wired !== undefined && <span>Cable · {formatNumber(wired)}</span>}
+    </p>
+  );
 }
 
 /** Devices per band, in band order. */
@@ -199,109 +288,90 @@ function perBand(clients: Dashboard['clients']): [string, number][] {
   return [...bands].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
-export function ClientsCard({ d, rows }: { d: Dashboard; rows: 1 | 2 }): ReactElement {
-  const shown = busiestFirst(d.clients).slice(0, SHOWN[rows]);
+const FILTERS: readonly { value: BusyFilter; label: string }[] = [
+  { value: 'all', label: 'All' },
+  { value: 'wifi', label: 'Wi-Fi' },
+  { value: 'lan', label: 'LAN' },
+];
+
+const EMPTY: Readonly<Record<BusyFilter, string>> = {
+  all: 'No devices are online right now.',
+  wifi: 'No devices are connected to the Wi-Fi right now.',
+  lan: 'No wired device has traffic through the router right now.',
+};
+
+export function BusiestCard({ d, rows }: { d: Dashboard; rows: 1 | 2 }): ReactElement {
+  const busy = useBusyDevices(d);
+  const shown = busy.rows.slice(0, SHOWN[rows]);
   const most = Math.max(1, ...shown.map((c) => c.down ?? 0));
-  const count = d.clients.length;
+  const columns = useMemo(() => columnsFor(most, busy.filter), [most, busy.filter]);
   // the list is as long as the widget has room for, above the total
   const list = useFit<HTMLDivElement>();
   return (
     <Widget
-      status={count === 0 ? undefined : 'Busiest first'}
-      aside={<WidgetLink href={href('clients')}>All devices</WidgetLink>}
+      description="Wi-Fi figures come from the radios every 2 s; wired ones from their connections through the router, every 10 s or so."
+      aside={
+        <>
+          <Segmented
+            size="xs"
+            label="Which devices"
+            value={busy.filter}
+            options={FILTERS}
+            onChange={(f) => {
+              busyFilter.save(f);
+            }}
+          />
+          <WidgetLink to={pageLink('clients')}>All devices</WidgetLink>
+        </>
+      }
     >
-      {count === 0 ? (
-        <OffNote action={<WidgetLink href={href('wifi')}>Wi-Fi settings</WidgetLink>}>
-          No devices are connected to the Wi-Fi right now.
+      {shown.length === 0 ? (
+        <OffNote action={busy.filter === 'wifi' ? <WidgetLink to={pageLink('wifi')}>Wi-Fi settings</WidgetLink> : null}>
+          {busy.waiting ? 'Reading the wired devices’ connections…' : EMPTY[busy.filter]}
         </OffNote>
       ) : (
         <>
           <div {...list} className="flex min-h-0 flex-1 flex-col">
-            {/* a wide card: a table */}
-            <div className="hidden @min-[38rem]:block">
-              {/* the device column takes what the figures leave (and truncates); the figures never wrap */}
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-y bg-muted/50 text-left text-xs text-muted-foreground">
-                    <th scope="col" className="h-9 w-full py-0 pr-3 pl-5 font-medium">
-                      Device
-                    </th>
-                    <th scope="col" className="px-3 font-medium whitespace-nowrap">
-                      Now
-                    </th>
-                    <th scope="col" className="px-3 font-medium whitespace-nowrap">
-                      Signal
-                    </th>
-                    <th scope="col" className="px-3 font-medium whitespace-nowrap">
-                      <span title="The link speeds the radios negotiated, to the device and from it">
-                        Link <Way dir="down" /> / <Way dir="up" />
-                      </span>
-                    </th>
-                    <th scope="col" className="py-0 pr-5 pl-3 text-right font-medium whitespace-nowrap">
-                      Connected
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {shown.map((c) => (
-                    <tr key={c.mac} data-fit>
-                      <td className="max-w-0 py-2.5 pr-3 pl-5">
-                        <Name c={c} />
-                      </td>
-                      <td className="w-32 min-w-32 px-3 py-2.5">
-                        <Traffic c={c} most={most} />
-                      </td>
-                      <td className="px-3 py-2.5">
-                        <Signal c={c} />
-                      </td>
-                      <td className="px-3 py-2.5">
-                        <Link c={c} />
-                      </td>
-                      <td className="py-2.5 pr-5 pl-3 text-right text-xs whitespace-nowrap text-muted-foreground tabular">
-                        {connected(c)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            {/* a narrow card (a phone): one card per device, every figure kept */}
-            <ul className="flex flex-col divide-y border-t @min-[38rem]:hidden">
-              {shown.map((c) => (
-                <li key={c.mac} data-fit className="flex flex-col gap-3 px-5 py-3">
-                  <Name c={c} />
+            {/* a table on a wide card; on a narrow one (a phone), a card per device, every figure kept */}
+            <DataTable
+              label="Busiest devices"
+              columns={columns}
+              rows={shown}
+              rowKey={(c) => c.key}
+              // the widget says when there are none
+              empty={null}
+              fit
+              framed={false}
+              className="border-t"
+              card={(c) => (
+                <div className="flex flex-col gap-3 px-5 py-3">
+                  <Name d={c} />
                   <Traffic c={c} most={most} />
-                  <dl className="grid grid-cols-3 gap-x-3 gap-y-1">
-                    <div className="flex min-w-0 flex-col gap-0.5">
-                      <dt className="text-xs text-muted-foreground">Signal</dt>
-                      <dd>
-                        <Signal c={c} />
-                      </dd>
-                    </div>
-                    <div className="flex min-w-0 flex-col gap-0.5">
-                      <dt className="text-xs text-muted-foreground">Link</dt>
-                      <dd className="leading-tight">
-                        <Link c={c} stacked />
-                      </dd>
-                    </div>
-                    <div className="flex min-w-0 flex-col gap-0.5">
-                      <dt className="text-xs text-muted-foreground">Connected</dt>
-                      <dd className="text-xs tabular">{connected(c)}</dd>
-                    </div>
-                  </dl>
-                </li>
-              ))}
-            </ul>
+                  {c.wifi !== undefined && (
+                    <dl className="grid grid-cols-3 gap-x-3 gap-y-1">
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <dt className="text-xs text-muted-foreground">Signal</dt>
+                        <dd>
+                          <Signal c={c.wifi} />
+                        </dd>
+                      </div>
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <dt className="text-xs text-muted-foreground">Link</dt>
+                        <dd className="leading-tight">
+                          <Link c={c.wifi} stacked />
+                        </dd>
+                      </div>
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <dt className="text-xs text-muted-foreground">Connected</dt>
+                        <dd className="text-xs tabular">{connected(c.wifi)}</dd>
+                      </div>
+                    </dl>
+                  )}
+                </div>
+              )}
+            />
           </div>
-          {/* the bottom of the card: how many are on Wi-Fi and where, however tall its row is */}
-          <p className="flex flex-wrap gap-x-3 gap-y-1 border-t px-5 pt-4 text-sm text-muted-foreground">
-            <span className="font-medium text-foreground">{onWifi(count)}</span>
-            {perBand(d.clients).map(([band, n]) => (
-              <span key={band}>
-                {band} · {formatNumber(n)}
-              </span>
-            ))}
-          </p>
+          <Totals d={d} filter={busy.filter} />
         </>
       )}
     </Widget>

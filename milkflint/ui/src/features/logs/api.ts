@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { LogSettings } from './model';
 import { call } from '@/lib/ubus';
 import { bool, type Change, getConfig, str } from '@/lib/api/uci';
 
@@ -62,35 +63,7 @@ export function getLogStatus(): Promise<LogStatus> {
   return call('milkflint.logs', 'status', {}, statusSchema);
 }
 
-/** milkflint.logs, as the settings card edits it. */
-export interface LogSettings {
-  persist: boolean;
-  /** MB per log */
-  size: string;
-  wifi: boolean;
-  /** seconds between samples: the Wi-Fi log's devices, the debug counters */
-  interval: string;
-  /** Wi-Fi log: how busy each channel was, and with what (wifi_channel) */
-  channel: boolean;
-  /** Wi-Fi log: the MU/OFDMA and beamforming counters once a minute, and the driver's statistics for them (wifi_mu) */
-  mu: boolean;
-  /** Wi-Fi log: ask devices how they hear the router, 802.11k (wifi_rrm) */
-  rrm: boolean;
-  /** Wi-Fi log: the Network Quality rounds (wifi_net) */
-  net: boolean;
-  /** the radar log: hostapd's radar events, kept on the router's storage (radar) */
-  radar: boolean;
-  /** debug log: the load and packets at each hop every interval (debug_counters) */
-  counters: boolean;
-  /** debug log: everything at once when the internet or a device stops (debug_snapshot) */
-  snapshot: boolean;
-  /** the DNS log: slow and unanswered lookups, a summary every minute (dns) */
-  dns: boolean;
-  /** the kernel's memory error checker, KFENCE, whose reports the Crashes tab shows (kfence) */
-  kfence: boolean;
-  /** dnsmasq's section, whose logqueries goes with `dns`; not edited */
-  dnsmasq: string | undefined;
-}
+export type { LogSettings } from './model';
 
 export async function getLogSettings(): Promise<LogSettings> {
   const [milkflint, dhcp] = await Promise.all([getConfig('milkflint'), getConfig('dhcp')]);

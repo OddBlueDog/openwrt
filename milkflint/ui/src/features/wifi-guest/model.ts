@@ -5,11 +5,13 @@
 // the network's name, security and password or have its own. What the page
 // calls a network ("Guests", "Smart home") is MilkFlint's own setting
 // (milkflint.<id>.label): OpenWrt has nowhere for it.
+import { z } from 'zod';
 import { ipToInt } from '@/lib/api/network';
 import { bool, type Change, list, type Section, str } from '@/lib/api/uci';
+import { formErrors } from '@/lib/form/errors';
 import { addIntercept, interceptSection } from '../dns/intercept';
 import { keyError } from '../wifi/security';
-import { defaultGuestLabel, type GuestId, guestBridge } from './guest';
+import { defaultGuestLabel, GUEST_IDS, type GuestId, guestBridge } from './guest';
 
 /** Where a new guest network's addresses start. */
 export const ADDRESSES = ['192.168.9.1', '192.168.10.1', '192.168.20.1', '192.168.99.1', '10.99.0.1', '10.98.0.1'];
@@ -37,36 +39,45 @@ export interface Radio {
 }
 
 /** A band's network name, security and password. */
-export interface Creds {
-  ssid: string;
+const credsFields = z.object({
+  ssid: z.string(),
   /** OpenWrt's `encryption` up to its first '+'. */
-  encryption: string;
+  encryption: z.string(),
   /** A cipher set in LuCI (the rest of `encryption`), kept as it is. */
-  cipher: string;
-  key: string;
-}
+  cipher: z.string(),
+  key: z.string(),
+});
 
-export interface NetForm {
-  id: GuestId;
+export type Creds = z.infer<typeof credsFields>;
+
+const netFields = z.object({
+  id: z.enum(GUEST_IDS),
   /** What the page calls it, e.g. "Smart home". */
-  label: string;
-  enabled: boolean;
+  label: z.string(),
+  enabled: z.boolean(),
   /** radio -> the network runs on it */
-  bands: Record<string, boolean>;
+  bands: z.record(z.string(), z.boolean()),
   /** One name, security and password on every band (`shared`), or each band its own (`own`). */
-  same: boolean;
-  shared: Creds;
+  same: z.boolean(),
+  shared: credsFields,
   /** radio -> that band's own */
-  own: Record<string, Creds>;
+  own: z.record(z.string(), credsFields),
   /** Devices on it can't reach each other (ap_isolate, and bridge port isolation between bands). */
-  isolate: boolean;
+  isolate: z.boolean(),
   /** The router's address on it (a /24). */
-  ipaddr: string;
+  ipaddr: z.string(),
   /** The speed limit for all its devices together, Mbit/s; '' is none. */
-  downMbit: string;
-  upMbit: string;
+  downMbit: z.string(),
+  upMbit: z.string(),
   /** For a new network's DHCP pool. */
-  leasetime: string;
+  leasetime: z.string(),
+});
+
+export type NetForm = z.infer<typeof netFields>;
+
+/** The page's form: every guest network, as they'll be once saved (added ones too). */
+export interface GuestForm {
+  nets: NetForm[];
 }
 
 export interface Range {
@@ -273,7 +284,7 @@ function credsErrors(c: Creds, at: string, e: Errors): void {
  * What's wrong with a network's settings, by field id (`<id>-ssid`,
  * `<id>-radio0-key`…). `others` are the other networks, as they'll be.
  */
-export function validate(f: NetForm, net: NetData, d: GuestData, others: readonly NetForm[]): Errors {
+function netChecks(f: NetForm, net: NetData, d: GuestData, others: readonly NetForm[]): Errors {
   const e: Errors = {};
   const id = f.id;
   if (new TextEncoder().encode(f.label).length > 32) e[`${id}-label`] = 'Use up to 32 characters.';
@@ -299,6 +310,37 @@ export function validate(f: NetForm, net: NetData, d: GuestData, others: readonl
     else if (sibling !== undefined) e[`${id}-ip`] = `${labelOf(sibling)} uses that range: pick another.`;
   }
   if (!speedOk(f.downMbit) || !speedOk(f.upMbit)) e[`${id}-speed`] = 'Use 0.5 to 10,000 Mbit/s, or leave it empty for no limit.';
+  return e;
+}
+
+/** The form's checks against the router as loaded: each network's, as the networks will be (their ranges mustn't meet). */
+export function guestFormSchema(d: GuestData): z.ZodType<GuestForm, GuestForm> {
+  return z.object({ nets: z.array(netFields) }).superRefine(({ nets }, ctx) => {
+    nets.forEach((f, i) => {
+      const net = d.nets.find((n) => n.id === f.id) ?? blankNet(f, d);
+      const e = netChecks(
+        f,
+        net,
+        d,
+        nets.filter((o) => o.id !== f.id),
+      );
+      // each message under the network, by the field id the page shows it at
+      for (const [at, message] of Object.entries(e)) {
+        if (message !== undefined) ctx.addIssue({ code: 'custom', path: ['nets', i, at], message });
+      }
+    });
+  });
+}
+
+/** One network's errors by field id (`<id>-ssid`, `<id>-radio0-key`…), from the schema's verdict on the whole form. */
+export function guestErrors(form: GuestForm, id: GuestId, d: GuestData): Errors {
+  const i = form.nets.findIndex((f) => f.id === id);
+  if (i < 0) return {};
+  const prefix = `nets[${String(i)}].`;
+  const e: Errors = {};
+  for (const [path, message] of Object.entries(formErrors(guestFormSchema(d), form))) {
+    if (path.startsWith(prefix) && message !== undefined) e[path.slice(prefix.length)] = message;
+  }
   return e;
 }
 

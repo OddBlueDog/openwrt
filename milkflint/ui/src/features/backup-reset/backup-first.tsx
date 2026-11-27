@@ -1,25 +1,26 @@
 // "Download a backup first", for the confirmations of what erases settings:
 // an upgrade that doesn't keep them, and a factory reset.
 import { DownloadIcon, LoaderCircleIcon } from 'lucide-react';
-import { type ReactElement, useState } from 'react';
+import type { ReactElement } from 'react';
 import { Button } from '@/components/ui/button';
 import { cn, errorMessage } from '@/lib/utils';
-import { saveBackup } from './api';
+import { useSaveBackup } from './queries';
 
 export function BackupFirst(): ReactElement {
-  const [state, setState] = useState<'idle' | 'busy' | 'done' | { error: string }>('idle');
-  const run = async (): Promise<void> => {
-    setState('busy');
-    try {
-      await saveBackup();
-      setState('done');
-    } catch (err) {
-      setState({ error: errorMessage(err) });
-    }
+  const save = useSaveBackup();
+  const state: 'idle' | 'busy' | 'done' | { error: string } = save.isPending
+    ? 'busy'
+    : save.isSuccess
+      ? 'done'
+      : save.error !== null
+        ? { error: errorMessage(save.error) }
+        : 'idle';
+  const run = (): void => {
+    save.mutate();
   };
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-      <Button variant="outline" size="sm" onClick={() => void run()} disabled={state === 'busy'}>
+      <Button variant="outline" size="sm" onClick={run} disabled={state === 'busy'}>
         {state === 'busy' ? <LoaderCircleIcon className="animate-spin" /> : <DownloadIcon />}
         Download a backup first
       </Button>

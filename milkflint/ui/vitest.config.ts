@@ -16,6 +16,25 @@ export default defineConfig({
   resolve: {
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
+  // TanStack's entries bundled up front: found mid-run (a first test that
+  // imports one), Vite re-optimises and reloads, and the files running then fail
+  optimizeDeps: {
+    include: [
+      '@tanstack/react-query',
+      '@tanstack/react-form',
+      '@tanstack/react-router',
+      '@tanstack/react-table',
+      '@tanstack/charts',
+      '@tanstack/charts/crosshair',
+      '@tanstack/charts/cursor',
+      '@tanstack/charts/mark/decorative',
+      '@tanstack/charts/react',
+      '@tanstack/charts/scales/band',
+      '@tanstack/charts/scales/linear',
+      '@tanstack/charts/tooltip',
+      '@tanstack/charts/tooltip/portal',
+    ],
+  },
   test: {
     include: ['tests/browser/**/*.test.tsx'],
     browser: {

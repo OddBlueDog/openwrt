@@ -1,11 +1,22 @@
-import { type ReactElement, type ReactNode, useMemo } from 'react';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { type ReactElement, useMemo } from 'react';
+import { type Column, DataTable } from '@/components/data-table';
 import { formatNumber } from '@/lib/format';
-import { cn } from '@/lib/utils';
 import type { ReportRun } from './analysis';
 import type { RunMember, Schedule } from './api';
-import { deviceSites, deviceSummary, dnsmasqAdds, routerSites, siteMedian, type Timed, wildcardSites } from './dns-pages';
+import {
+  type DeviceSite,
+  deviceSites,
+  deviceSummary,
+  dnsmasqAdds,
+  type RouterDns,
+  type RouterSite,
+  routerSites,
+  siteMedian,
+  type Timed,
+  wildcardSites,
+} from './dns-pages';
 import type { RunData } from './run-data';
+import { distinctNames } from './summary';
 
 const ms = (v: number | undefined): string => (v === undefined ? '—' : formatNumber(v, v < 1 ? 2 : v < 10 ? 1 : 0));
 
@@ -27,16 +38,6 @@ function TimedCell({ t, extra }: { t: Timed; extra?: ReactElement | false | unde
 }
 
 const upstreamName = { dnsproxy: 'Encrypted DNS alone', server: 'Its server alone' } as const;
-
-/** A figure in a stacked block on a phone: its label left, the figure right. */
-function Pair({ label, children }: { label: ReactNode; children: ReactNode }): ReactElement {
-  return (
-    <div className="flex items-start justify-between gap-4">
-      <dt className="min-w-0 text-xs text-muted-foreground">{label}</dt>
-      <dd className="text-right text-sm tabular">{children}</dd>
-    </div>
-  );
-}
 
 /** A device's page load, first and again, and its lookup, for one site or the typical one. */
 function LoadCell({
@@ -67,7 +68,93 @@ function LoadCell({
   );
 }
 
-/** DNS and page loads over the run: the router's lookups per site, then each device's page loads and lookups. Tables on a wide screen, stacked figures on a narrower one. */
+const figure = 'text-right whitespace-nowrap tabular';
+
+const siteNotes = (s: RouterSite): ReactElement => (
+  <>
+    {s.wildcard && <span className="block text-xs font-normal text-muted-foreground">answers any name under it</span>}
+    {s.errors > 0 && (
+      <span className="block text-xs font-normal text-destructive">{String(s.errors)} lookups failed with an error</span>
+    )}
+  </>
+);
+const timedColumn = (label: string, t: (s: RouterSite) => Timed): Column<RouterSite> => ({
+  label,
+  cell: (s) => <TimedCell t={t(s)} />,
+  className: figure,
+});
+
+/** The router's lookups, a site a row in the order first looked up; the upstream alone when dnsmasq passes lookups on. */
+function routerColumns(upstream: RouterDns['upstream']): readonly Column<RouterSite>[] {
+  return [
+    {
+      label: 'Site',
+      cell: (s) => (
+        <>
+          {s.site}
+          {siteNotes(s)}
+        </>
+      ),
+      className: 'font-medium',
+    },
+    timedColumn('Made-up name', (s) => s.cold),
+    ...(upstream === null ? [] : [timedColumn(upstreamName[upstream], (s) => s.up)]),
+    timedColumn('Site, passed on', (s) => s.passedOn),
+    {
+      label: 'Site, cached',
+      cell: (s) => (
+        <TimedCell
+          t={s.fromCache}
+          extra={
+            s.rounds > 0 && (
+              <span className="text-xs text-muted-foreground">
+                cached already in {String(s.cachedFirst)} of {String(s.rounds)} rounds
+              </span>
+            )
+          }
+        />
+      ),
+      className: figure,
+    },
+  ];
+}
+
+/** A row of the matrix: a site, or (null) the typical site, every site together, which comes first. */
+interface LoadRow {
+  site: string | null;
+}
+
+/** A device's loads for the typical site, or for one. */
+function loadCell(sites: ReadonlyMap<string, DeviceSite>, site: string | null, wild: ReadonlySet<string>): ReactElement {
+  if (site === null) {
+    const sum = deviceSummary(sites, wild);
+    return (
+      <LoadCell
+        first={sum.first}
+        repeat={sum.repeat}
+        lookup={`lookup ${ms(sum.lookup)} ms`}
+        failed={sum.failed}
+        failedWord="loads failed"
+      />
+    );
+  }
+  const d = sites.get(site);
+  if (d === undefined) return <span className="text-muted-foreground">—</span>;
+  return (
+    <LoadCell
+      first={d.first}
+      repeat={siteMedian(d.repeats)}
+      lookup={wild.has(site) ? 'lookup not timed' : `lookup ${ms(siteMedian(d.lookups))} ms`}
+      failed={d.failed}
+      failedWord="failed"
+    />
+  );
+}
+
+const typicalRow = (r: LoadRow): { className?: string } =>
+  r.site === null ? { className: 'bg-muted/40 hover:bg-muted/40' } : {};
+
+/** DNS and page loads over the run: the router's lookups per site, then each device's page loads and lookups. Tables when there's room, a card a row when not. */
 export function DnsReport({
   data,
   run,
@@ -82,68 +169,32 @@ export function DnsReport({
   const hasPhases = schedule.phases.some((p) => p.kind === 'dns' || p.kind === 'household');
   const router = useMemo(() => routerSites(data.dns.lookups), [data.dns.lookups]);
   const devices = useMemo(() => {
-    const out = new Map<string, ReturnType<typeof deviceSites>>();
+    const out = new Map<string, Map<string, DeviceSite>>();
     for (const [id, recs] of data.records) {
       const sites = deviceSites(recs);
       if (sites.size > 0) out.set(id, sites);
     }
     return out;
   }, [data.records]);
-  if (!hasPhases || (router.length === 0 && devices.size === 0)) return null;
-  const wild = wildcardSites(router, devices.values());
-  const adds = dnsmasqAdds(router);
-  const names = new Map(members.map((m) => [m.id, m.name]));
-  const ids = [...devices.keys()];
-  const siteNames = [...new Set([...router.map((s) => s.site), ...[...devices.values()].flatMap((m) => [...m.keys()])])];
   const upstream = data.dns.upstream;
+  const siteColumns = useMemo(() => routerColumns(upstream), [upstream]);
+  // sites down, a column a device (in the order they sent records); nothing sorts in a matrix
+  const loadColumns = useMemo((): readonly Column<LoadRow>[] => {
+    const wild = wildcardSites(router, devices.values());
+    const names = distinctNames(members);
+    return [
+      { label: 'Site', cell: (r) => r.site ?? 'Typical site', className: 'font-medium' },
+      ...[...devices].map(([id, sites]): Column<LoadRow> => ({
+        label: names.get(id) ?? id,
+        cell: (r) => loadCell(sites, r.site, wild),
+        className: figure,
+      })),
+    ];
+  }, [router, devices, members]);
+  if (!hasPhases || (router.length === 0 && devices.size === 0)) return null;
+  const adds = dnsmasqAdds(router);
+  const siteNames = [...new Set([...router.map((s) => s.site), ...[...devices.values()].flatMap((m) => [...m.keys()])])];
   const ended = run.ended?.reason !== undefined && run.ended.reason !== 'completed';
-
-  const siteNotes = (s: (typeof router)[number]): ReactElement => (
-    <>
-      {s.wildcard && <span className="block text-xs font-normal text-muted-foreground">answers any name under it</span>}
-      {s.errors > 0 && (
-        <span className="block text-xs font-normal text-destructive">{String(s.errors)} lookups failed with an error</span>
-      )}
-    </>
-  );
-  const cachedCell = (s: (typeof router)[number]): ReactElement => (
-    <TimedCell
-      t={s.fromCache}
-      extra={
-        s.rounds > 0 && (
-          <span className="text-xs text-muted-foreground">
-            cached already in {String(s.cachedFirst)} of {String(s.rounds)} rounds
-          </span>
-        )
-      }
-    />
-  );
-  const typical = (id: string): ReactElement => {
-    const sum = deviceSummary(devices.get(id) ?? new Map(), wild);
-    return (
-      <LoadCell
-        first={sum.first}
-        repeat={sum.repeat}
-        lookup={`lookup ${ms(sum.lookup)} ms`}
-        failed={sum.failed}
-        failedWord="loads failed"
-      />
-    );
-  };
-  const siteCell = (id: string, site: string): ReactElement => {
-    const d = devices.get(id)?.get(site);
-    if (d === undefined) return <span className="text-muted-foreground">—</span>;
-    const lookup = wild.has(site) ? undefined : siteMedian(d.lookups);
-    return (
-      <LoadCell
-        first={d.first}
-        repeat={siteMedian(d.repeats)}
-        lookup={wild.has(site) ? 'lookup not timed' : `lookup ${ms(lookup)} ms`}
-        failed={d.failed}
-        failedWord="failed"
-      />
-    );
-  };
 
   return (
     <section className="flex flex-col gap-4">
@@ -159,121 +210,31 @@ export function DnsReport({
                 ? ' · dnsmasq adds nothing measurable to a lookup it passes on'
                 : ` · dnsmasq adds about ${ms(adds)} ms to a lookup it passes on`)}
           </span>
-          <div className="hidden lg:block">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Site</TableHead>
-                  <TableHead className="text-right">Made-up name</TableHead>
-                  {upstream !== null && <TableHead className="text-right">{upstreamName[upstream]}</TableHead>}
-                  <TableHead className="text-right">Site, passed on</TableHead>
-                  <TableHead className="text-right">Site, cached</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {router.map((s) => (
-                  <TableRow key={s.site}>
-                    <TableCell className="font-medium">
-                      {s.site}
-                      {siteNotes(s)}
-                    </TableCell>
-                    <TableCell className="text-right tabular">
-                      <TimedCell t={s.cold} />
-                    </TableCell>
-                    {upstream !== null && (
-                      <TableCell className="text-right tabular">
-                        <TimedCell t={s.up} />
-                      </TableCell>
-                    )}
-                    <TableCell className="text-right tabular">
-                      <TimedCell t={s.passedOn} />
-                    </TableCell>
-                    <TableCell className="text-right tabular">{cachedCell(s)}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-          <ul className="divide-y border-y lg:hidden">
-            {router.map((s) => (
-              <li key={s.site} className="flex flex-col gap-1.5 px-3 py-3">
-                <span className="text-sm font-medium break-words">
-                  {s.site}
-                  {siteNotes(s)}
-                </span>
-                <dl className="flex flex-col gap-1.5">
-                  <Pair label="Made-up name">
-                    <TimedCell t={s.cold} />
-                  </Pair>
-                  {upstream !== null && (
-                    <Pair label={upstreamName[upstream]}>
-                      <TimedCell t={s.up} />
-                    </Pair>
-                  )}
-                  <Pair label="Site, passed on">
-                    <TimedCell t={s.passedOn} />
-                  </Pair>
-                  <Pair label="Site, cached">{cachedCell(s)}</Pair>
-                </dl>
-              </li>
-            ))}
-          </ul>
+          <DataTable
+            label="The router’s own lookups"
+            columns={siteColumns}
+            rows={router}
+            rowKey={(s) => s.site}
+            empty="The router looked nothing up."
+            framed={false}
+          />
         </div>
       )}
 
-      {ids.length > 0 && (
+      {devices.size > 0 && (
         <div className="flex flex-col gap-1.5">
           <span className="text-xs text-muted-foreground">
             Each device: its page loads, first and then again, and its lookups of names nothing has cached
           </span>
-          <div className="hidden overflow-x-auto lg:block">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Site</TableHead>
-                  {ids.map((id) => (
-                    <TableHead key={id} className="text-right">
-                      {names.get(id) ?? id}
-                    </TableHead>
-                  ))}
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                <TableRow className="bg-muted/40 hover:bg-muted/40">
-                  <TableCell className="font-medium">Typical site</TableCell>
-                  {ids.map((id) => (
-                    <TableCell key={id} className="text-right tabular">
-                      {typical(id)}
-                    </TableCell>
-                  ))}
-                </TableRow>
-                {siteNames.map((site) => (
-                  <TableRow key={site}>
-                    <TableCell className="font-medium">{site}</TableCell>
-                    {ids.map((id) => (
-                      <TableCell key={id} className="text-right tabular">
-                        {siteCell(id, site)}
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-          <ul className="divide-y border-y lg:hidden">
-            {['', ...siteNames].map((site) => (
-              <li key={site} className={cn('flex flex-col gap-1.5 px-3 py-3', site === '' && 'bg-muted/40')}>
-                <span className="text-sm font-medium break-words">{site === '' ? 'Typical site' : site}</span>
-                <dl className="flex flex-col gap-1.5">
-                  {ids.map((id) => (
-                    <Pair key={id} label={names.get(id) ?? id}>
-                      {site === '' ? typical(id) : siteCell(id, site)}
-                    </Pair>
-                  ))}
-                </dl>
-              </li>
-            ))}
-          </ul>
+          <DataTable
+            label="Each device’s page loads"
+            columns={loadColumns}
+            rows={[{ site: null }, ...siteNames.map((site) => ({ site }))]}
+            rowKey={(r) => r.site ?? ''}
+            empty="No device loaded a page."
+            framed={false}
+            rowProps={typicalRow}
+          />
         </div>
       )}
 

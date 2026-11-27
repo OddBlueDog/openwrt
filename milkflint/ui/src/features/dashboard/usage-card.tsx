@@ -1,42 +1,13 @@
 import type { ReactElement } from 'react';
-import { usePoll } from '@/hooks/use-poll';
+import { dashboardQueries } from './queries';
+import { useLive } from '@/lib/query/use-live';
 import { formatBytes } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { deviceLabel } from '../clients/model';
-import { getPeriods, getUsage, loadNames, loadRouterIps, periodStart } from '../data-statistics/api';
-import { sharedCall } from '@/lib/shared-call';
+import { periodStart } from '../data-statistics/api';
 import { EMPTY_GOES } from './fit';
 import { OffNote, StateBadge, Widget, WidgetLink } from './widget';
-
-interface Usage {
-  /** the current accounting period's start (YYYY-MM-DD) */
-  start: string | undefined;
-  rx: number;
-  tx: number;
-  /** `name` undefined when it has none; `address` its IPv4 address, else its MAC */
-  top: { key: string; name: string | undefined; address: string; rx: number; tx: number }[];
-}
-
-/** The current period's totals and busiest devices; 'off' while Data usage is off, 'missing' without it. */
-async function loadUsage(): Promise<Usage | 'off' | 'missing'> {
-  const periods = await getPeriods();
-  if (!periods.installed) return 'missing';
-  if (periods.enabled === false) return 'off';
-  const [rows, names, routerIps] = await Promise.all([getUsage('', 'mac'), loadNames(), loadRouterIps()]);
-  const devices = rows.filter((r) => r.ip === undefined || !routerIps.has(r.ip));
-  return {
-    start: periods.periods[0],
-    rx: devices.reduce((n, r) => n + r.rx, 0),
-    tx: devices.reduce((n, r) => n + r.tx, 0),
-    top: devices
-      .slice(0, 4)
-      .map((r) => ({ key: r.key, name: names.get(r.key.toLowerCase()), address: r.ip ?? r.key, rx: r.rx, tx: r.tx })),
-  };
-}
-
-// one call for every Data usage widget on Home
-const readUsage = sharedCall(loadUsage);
 
 // download and upload keep the colours they have on every page
 function Total({ swatch, label, bytes, fit }: { swatch: string; label: string; bytes: number; fit?: 1 }): ReactElement {
@@ -53,13 +24,13 @@ function Total({ swatch, label, bytes, fit }: { swatch: string; label: string; b
 
 /** Data usage's current period: totals and the busiest devices. */
 export function UsageCard({ ap }: { ap: boolean }): ReactElement {
-  const { data, error } = usePoll(readUsage, 60_000);
-  const link = <WidgetLink href={href('data-statistics')}>Details</WidgetLink>;
+  const { data, error } = useLive(dashboardQueries.usage());
+  const link = <WidgetLink to={pageLink('data-statistics')}>Details</WidgetLink>;
 
   if (ap) {
     return (
       <Widget>
-        <OffNote action={<WidgetLink href={href('mode')}>Operating mode</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('mode')}>Operating mode</WidgetLink>}>
           In access point mode your main router counts the traffic.
         </OffNote>
       </Widget>
@@ -80,7 +51,9 @@ export function UsageCard({ ap }: { ap: boolean }): ReactElement {
     return (
       <Widget aside={<StateBadge tone="off">Off</StateBadge>}>
         <OffNote
-          action={<WidgetLink href={href('data-statistics')}>{data === 'off' ? 'Turn on Data usage' : 'Data usage'}</WidgetLink>}
+          action={
+            <WidgetLink to={pageLink('data-statistics')}>{data === 'off' ? 'Turn on Data usage' : 'Data usage'}</WidgetLink>
+          }
         >
           {data === 'off'
             ? 'It counts how much each device downloads and uploads.'

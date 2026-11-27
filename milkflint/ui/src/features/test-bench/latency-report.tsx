@@ -1,6 +1,6 @@
 import { CircleXIcon, InfoIcon, TriangleAlertIcon } from 'lucide-react';
 import type { ReactElement } from 'react';
-import { niceCeil } from '@/components/charts/path';
+import { niceCeil } from '@/components/charts/scale';
 import { formatNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type { RunMember } from './api';

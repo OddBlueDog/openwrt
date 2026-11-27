@@ -1,12 +1,16 @@
-import { type ReactElement, useMemo, useState } from 'react';
-import { HeatStrip } from '@/components/charts/heat-strip';
+import { createChartCursor } from '@tanstack/charts/cursor';
+import { type ComponentProps, type ReactElement, useMemo, useState } from 'react';
+import { niceCeil } from '@/components/charts/scale';
+import { seriesDash } from '@/components/charts/series';
+import { SeriesSwatch } from '@/components/charts/series-swatch';
 import { PLOT_LEFT } from '@/components/charts/time-axis';
-import { type TimeBand, TimelineChart, type TimelineSeries } from '@/components/charts/timeline-chart';
+import { type ChartBand, type ChartLine, type ChartMarks, TimeChart } from '@/components/charts/time-chart';
 import { Button } from '@/components/ui/button';
 import { formatNumber, formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { memberRtts, routerRtts } from './analysis';
-import { Arrowed } from './dir';
+import { Arrowed } from '@/components/dir';
+import { CoresChart } from './cores-chart';
 import { phaseName } from './phase-names';
 import { clockText, phaseStyle } from './phases';
 import { memberPeerRtts } from './pairs';
@@ -14,9 +18,11 @@ import { reportRun, type RunData } from './run-data';
 import {
   cakeSeconds,
   cpuRows,
+  GRID_MS,
   ifRate,
   memberColor,
   memberRate,
+  onGrid,
   peerRate,
   routerSeries,
   softnetRate,
@@ -88,7 +94,45 @@ function Chart({
   );
 }
 
-const hasData = (s: TimelineSeries): boolean => s.points.some((p) => p[1] !== null && p[1] > 0) || (s.marks?.length ?? 0) > 0;
+/** A chart's keys under it, lined up with its plot; a dashed line's paler, as it means something else. */
+function Keys({ lines }: { lines: readonly ChartLine[] }): ReactElement {
+  // a chart that dashes some lines to say something (peak against average) keeps its own dashes
+  const ownDashes = lines.some((l) => l.dashed === true);
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground" style={{ paddingLeft: PLOT_LEFT }}>
+      {lines.map((l) => (
+        <span key={l.label} className="inline-flex items-center gap-1.5">
+          <SeriesSwatch
+            color={l.color}
+            dash={l.dashed === true ? '4 3' : seriesDash(l.color, lines.length, ownDashes)}
+            className={cn(l.dashed === true && 'opacity-60')}
+          />
+          {l.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** One of the report's charts, its keys under it; the scale's top a round number over the peak, never under `minMax` (so quiet periods don't look busy) unless `max` fixes it (a share: 1). */
+function Timeline({
+  max,
+  minMax,
+  className = 'h-36',
+  ...chart
+}: Omit<ComponentProps<typeof TimeChart>, 'max'> & { max?: number | undefined; minMax: number }): ReactElement {
+  const peak = chart.lines.reduce((m, l) => l.points.reduce((n, p) => (p[1] === null ? n : Math.max(n, p[1])), m), 0);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <TimeChart {...chart} max={max ?? niceCeil(Math.max(peak * 1.1, minMax))} className={className} />
+      <Keys lines={chart.lines} />
+    </div>
+  );
+}
+
+const hasData = (l: ChartLine): boolean => l.points.some((p) => p[1] !== null && p[1] > 0);
+/** A latency line, and when its probes got no answer. */
+type Series = ChartLine & { marks: readonly number[] };
 function pts<T extends { t: number }>(xs: readonly T[], pick: (x: T) => number | null | undefined): TPoint[] {
   return xs.map((x) => [x.t, pick(x) ?? null]);
 }
@@ -98,20 +142,27 @@ type WifiView = 'rate' | 'retries' | 'aql';
 
 /** The run second by second: latency, speeds, then what the router did, all on one time axis with the phases behind. */
 export function Timelines({ data }: { data: RunData }): ReactElement | null {
-  const [hover, setHover] = useState<number>();
   const [latency, setLatency] = useState<LatencyView>('internet');
   const [wifiView, setWifiView] = useState<WifiView>('rate');
-  // what's drawn depends on the run only; a hover redraws the guide line and card
+  // one for all the charts: hovering one shows the same moment in each
+  const [cursor] = useState(() => createChartCursor<number, number>());
+  // what's drawn depends on the run only
   const built = useMemo(() => {
     const t0 = data.meta.t0;
     const run = reportRun(data);
     const to = Math.max(1000, (run.ended?.at ?? run.end) - t0);
     const phases = data.meta.schedule.phases.filter((p) => p.start < to);
-    const bands: TimeBand[] = phases.map((p, i) => ({ from: p.start, to: Math.min(p.start + p.dur, to), shade: i % 2 === 1 }));
+    // every other phase shaded
+    const bands: ChartBand[] = phases.flatMap((p, i) =>
+      i % 2 === 1 ? [{ from: p.start, to: Math.min(p.start + p.dur, to) }] : [],
+    );
     const members = data.meta.members;
     const color = (id: string): string => memberColor(members.findIndex((m) => m.id === id));
-    const lat = (view: LatencyView): TimelineSeries[] => {
-      const out: TimelineSeries[] = members.map((m) => {
+    // each chart's points on the grid of seconds; `within` reaches a sample's value to the seconds between samples
+    const grid = (lines: readonly ChartLine[], within?: number): ChartLine[] =>
+      lines.map((l) => ({ ...l, points: onGrid(l.points, to, within) }));
+    const lat = (view: LatencyView): { lines: ChartLine[]; marks: ChartMarks[] } => {
+      const out: Series[] = members.map((m) => {
         const recs = data.records.get(m.id) ?? [];
         const all = { from: t0, to: t0 + to };
         const s =
@@ -135,14 +186,18 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
         }
       }
       // a device that never answers the router's pings (a firewall) has only unanswered ones: left out
-      return out.filter((s) => s.points.some((p) => p[1] !== null));
+      const shown = out.filter((s) => s.points.some((p) => p[1] !== null));
+      return {
+        lines: grid(shown),
+        marks: shown.map((s) => ({ label: s.label, color: s.color, times: s.marks })),
+      };
     };
     const latencyViews = (['router', 'internet', 'ping', 'peers'] as const)
-      .map((k) => ({ k, series: lat(k) }))
-      .filter((v) => v.series.length > 0);
+      .map((k) => ({ k, ...lat(k) }))
+      .filter((v) => v.lines.length > 0);
 
     const wan = wanPort(data.router);
-    const speed: TimelineSeries[] = [];
+    const speed: ChartLine[] = [];
     if (wan !== undefined) {
       speed.push({ label: 'Internet line, download', color: 'var(--chart-2)', points: ifRate(data.router, t0, wan, 0) });
       speed.push({ label: 'Internet line, upload', color: 'var(--chart-1)', points: ifRate(data.router, t0, wan, 1) });
@@ -168,46 +223,54 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
     const down = cakeSeconds(data.router, t0, 'down');
     const up = cakeSeconds(data.router, t0, 'up');
     const cake = down.length + up.length > 0;
-    const delay: TimelineSeries[] = [
+    const delay = grid([
       { label: 'Download, average', color: 'var(--chart-2)', points: pts(down, (s) => s.avgMs) },
       { label: 'Upload, average', color: 'var(--chart-1)', points: pts(up, (s) => s.avgMs) },
       { label: 'Download, peak', color: 'var(--chart-2)', points: pts(down, (s) => s.peakMs), dashed: true },
       { label: 'Upload, peak', color: 'var(--chart-1)', points: pts(up, (s) => s.peakMs), dashed: true },
-    ];
-    const signals: TimelineSeries[] = [
+    ]);
+    const signals = grid([
       { label: 'Download drops', color: 'var(--chart-2)', points: pts(down, (s) => s.drops) },
       { label: 'Download ECN marks', color: 'var(--chart-2)', points: pts(down, (s) => s.marks), dashed: true },
       { label: 'Upload drops', color: 'var(--chart-1)', points: pts(up, (s) => s.drops) },
       { label: 'Upload ECN marks', color: 'var(--chart-1)', points: pts(up, (s) => s.marks), dashed: true },
-    ];
-    const backlog: TimelineSeries[] = [
+    ]);
+    const backlog = grid([
       { label: 'Download queued', color: 'var(--chart-2)', points: pts(down, (s) => s.backlog) },
       { label: 'Upload queued', color: 'var(--chart-1)', points: pts(up, (s) => s.backlog) },
-    ];
+    ]);
 
     const cpu = cpuRows(data.router, t0);
-    const conns: TimelineSeries[] = [
-      { label: 'Tracked', color: 'var(--chart-3)', points: routerSeries(data.router, t0, (l) => l.ct) },
-      { label: 'Offloaded', color: 'var(--chart-2)', points: routerSeries(data.router, t0, (l) => l.ct_scan?.off) },
-    ];
-    const softnet: TimelineSeries[] = [
+    // the connection scans are 10 s apart
+    const conns = grid(
+      [
+        { label: 'Tracked', color: 'var(--chart-3)', points: routerSeries(data.router, t0, (l) => l.ct) },
+        { label: 'Offloaded', color: 'var(--chart-2)', points: routerSeries(data.router, t0, (l) => l.ct_scan?.off) },
+      ],
+      6000,
+    );
+    const softnet = grid([
       { label: 'Dropped', color: 'var(--destructive)', points: softnetRate(data.router, t0, 1) },
       { label: 'Squeezed', color: 'var(--chart-4)', points: softnetRate(data.router, t0, 2) },
-    ];
+    ]);
 
     const stations = members.map((m) => ({ m, s: stationSamples(data.router, t0, m.id) })).filter((x) => x.s.length > 0);
-    const wifi = (view: WifiView): TimelineSeries[] =>
-      stations.map(({ m, s }) => ({
-        label: m.name,
-        color: color(m.id),
-        points: s.map((x): TPoint => [x.t, view === 'rate' ? x.txMbit : view === 'retries' ? x.retries : x.aqlMs]),
-      }));
+    // the stations every 2 s
+    const wifi = (view: WifiView): ChartLine[] =>
+      grid(
+        stations.map(({ m, s }) => ({
+          label: m.name,
+          color: color(m.id),
+          points: s.map((x): TPoint => [x.t, view === 'rate' ? x.txMbit : view === 'retries' ? x.retries : x.aqlMs]),
+        })),
+        2500,
+      );
     return {
       to,
       phases,
       bands,
       latencyViews,
-      speed: speed.filter(hasData),
+      speed: grid(speed.filter(hasData)),
       cake,
       delay,
       signals,
@@ -216,11 +279,11 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
       conns,
       softnet,
       stations: stations.length,
-      wifi,
+      wifi: { rate: wifi('rate'), retries: wifi('retries'), aql: wifi('aql') },
     };
   }, [data]);
   const { to, phases } = built;
-  const common = { from: 0, to, bands: built.bands, timeText: clockText, hover, onHover: setHover };
+  const common = { from: 0, to, step: GRID_MS, bands: built.bands, timeText: clockText, cursor, left: PLOT_LEFT };
 
   if (data.router.length === 0 && built.latencyViews.length === 0) return null;
   const view = built.latencyViews.find((v) => v.k === latency) ?? built.latencyViews[0];
@@ -271,9 +334,10 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
             )
           }
         >
-          <TimelineChart
+          <Timeline
             {...common}
-            series={view.series}
+            lines={view.lines}
+            marks={view.marks}
             format={msText}
             minMax={10}
             label={`Latency ${latencyNames[view.k].toLowerCase()}`}
@@ -283,7 +347,7 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
 
       {built.speed.length > 0 && (
         <Chart title="Speed" hint="The internet line as the router’s WAN port counted it; each device’s own loads dashed">
-          <TimelineChart {...common} series={built.speed} format={mbit} minMax={1} label="Speed" />
+          <Timeline {...common} lines={built.speed} format={mbit} minMax={1} label="Speed" />
         </Chart>
       )}
 
@@ -293,19 +357,12 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
             title="Smart Queue delay"
             hint="Each queue’s, weighted by what it sent that second; none where too few packets went to tell"
           >
-            <TimelineChart
-              {...common}
-              series={built.delay}
-              format={msText}
-              minMax={5}
-              className="h-28"
-              label="Smart Queue delay"
-            />
+            <Timeline {...common} lines={built.delay} format={msText} minMax={5} className="h-28" label="Smart Queue delay" />
           </Chart>
           <Chart title="Smart Queue drops and marks" hint="Each second, every tin">
-            <TimelineChart
+            <Timeline
               {...common}
-              series={built.signals}
+              lines={built.signals}
               format={perSecond}
               minMax={1}
               className="h-28"
@@ -313,14 +370,7 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
             />
           </Chart>
           <Chart title="Smart Queue backlog">
-            <TimelineChart
-              {...common}
-              series={built.backlog}
-              format={kb}
-              minMax={1024}
-              className="h-28"
-              label="Smart Queue backlog"
-            />
+            <Timeline {...common} lines={built.backlog} format={kb} minMax={1024} className="h-28" label="Smart Queue backlog" />
           </Chart>
         </>
       )}
@@ -330,31 +380,17 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
           title="Router CPU, per core"
           hint="Busy share each second, the deeper the busier; the hover adds its softirq share"
         >
-          <HeatStrip
-            {...common}
-            rows={built.cpu.busy.map((values, i) => ({
-              label: `CPU ${String(i)}`,
-              values,
-              detail: (at) => {
-                const si = built.cpu.softirq[i]?.[at];
-                return si === null || si === undefined ? undefined : `softirq ${formatPercent(si)}`;
-              },
-            }))}
-            spans={built.cpu.spans}
-            format={formatPercent}
-            label="Router CPU per core"
-          />
+          <CoresChart cpu={built.cpu} from={0} to={to} timeText={clockText} cursor={cursor} label="Router CPU per core" />
         </Chart>
       )}
 
       {built.conns.some(hasData) && (
         <Chart title="Connections" hint="Offloaded: from the connection scans, every few seconds">
-          <TimelineChart
+          <Timeline
             {...common}
-            series={built.conns}
+            lines={built.conns}
             format={(v) => formatNumber(v)}
             minMax={10}
-            tolerance={6000}
             className="h-28"
             label="Connections"
           />
@@ -368,7 +404,7 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
           </p>
         ) : (
           <Chart title="softnet" hint="Packets dropped from a CPU’s backlog, and the times NAPI ran out of budget, every CPU">
-            <TimelineChart {...common} series={built.softnet} format={perSecond} minMax={1} className="h-28" label="softnet" />
+            <Timeline {...common} lines={built.softnet} format={perSecond} minMax={1} className="h-28" label="softnet" />
           </Chart>
         ))}
 
@@ -389,13 +425,12 @@ export function Timelines({ data }: { data: RunData }): ReactElement | null {
             />
           }
         >
-          <TimelineChart
+          <Timeline
             {...common}
-            series={built.wifi(wifiView)}
+            lines={built.wifi[wifiView]}
             format={wifiView === 'rate' ? mbit : wifiView === 'retries' ? formatPercent : msText}
             max={wifiView === 'retries' ? 1 : undefined}
             minMax={wifiView === 'aql' ? 1 : 10}
-            tolerance={2500}
             label={`Wi-Fi ${wifiView}`}
           />
         </Chart>

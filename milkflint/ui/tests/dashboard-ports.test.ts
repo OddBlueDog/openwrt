@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { NetworkDevice, NetworkInterface } from '@/lib/api/network';
-import { fastest, linkSpeed, portLabel, portList, portNetworks, portsOf, speedText } from '@/features/dashboard/ports';
+import { fastest, linkSpeed, portLabel, portList, portNetworks, portsOf, speedNote, speedText } from '@/features/dashboard/ports';
 
 const iface = (name: string, device: string, over: Partial<NetworkInterface> = {}): NetworkInterface => ({
   interface: name,
@@ -106,4 +106,45 @@ test('each port’s state: a link and its speed, and traffic as the household se
       ['LAN 3', true, 100, true, undefined, undefined, undefined],
     ],
   );
+});
+
+test('what the hover says: the MAC, totals and faults as the household sees them, and the other end’s fastest', () => {
+  const more: Record<string, NetworkDevice> = {
+    ...devices,
+    eth1: {
+      ...devices['eth1'],
+      macaddr: '94:83:c4:00:00:01',
+      statistics: { rx_bytes: 9_000, tx_bytes: 1_000, rx_errors: 2, tx_errors: 1, rx_dropped: 0, tx_dropped: 4 },
+    },
+    lan1: {
+      ...devices['lan1'],
+      speed: '100F',
+      'link-partner-advertising': ['10baseT-F', '100baseT-F'],
+      statistics: { rx_bytes: 50, tx_bytes: 700 },
+    },
+  };
+  const [wan, lan1] = portsOf(
+    [
+      { role: 'wan', device: 'eth1' },
+      { role: 'lan', device: 'lan1' },
+    ],
+    more,
+    interfaces,
+    () => undefined,
+  );
+  assert.deepEqual(
+    [wan?.mac, wan?.totalDown, wan?.totalUp, wan?.errors, wan?.dropped],
+    ['94:83:c4:00:00:01', 9_000, 1_000, 3, 4],
+  );
+  // a LAN port sends what the devices download
+  assert.deepEqual([lan1?.totalDown, lan1?.totalUp, lan1?.errors, lan1?.partnerMbit], [700, 50, 0, 100]);
+});
+
+test('why a link is slower than the port: the other end, or the cable', () => {
+  const port = { link: true, mbit: 100, maxMbit: 1000, partnerMbit: 100 };
+  assert.match(speedNote(port) ?? '', /other end goes up to 100 Mbit\/s/);
+  assert.match(speedNote({ ...port, partnerMbit: 1000 }) ?? '', /cable/);
+  assert.match(speedNote({ ...port, partnerMbit: undefined }) ?? '', /cable|other end/);
+  assert.equal(speedNote({ ...port, mbit: 1000 }), undefined);
+  assert.equal(speedNote({ ...port, link: false }), undefined);
 });

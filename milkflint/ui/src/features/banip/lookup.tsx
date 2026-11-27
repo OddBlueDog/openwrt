@@ -19,6 +19,7 @@ import {
   type SetHit,
   unblock,
 } from './api';
+import { useBanipWrite } from './queries';
 import { infoOf } from './feeds';
 import { lineOwner } from './model';
 
@@ -76,10 +77,12 @@ function AddressResult({
   const allowed = r.sets.some((s) => s.feed === 'allowlist') || r.allowlist.length > 0;
   const inBlocklist = r.blocklist.length > 0 || r.sets.some((s) => s.feed === 'blocklist');
   const mineAllowed = r.allowlist.filter((l) => lineOwner(l.comment) === 'you');
+  // the lookup's writes (unblock, allow, block, end connections): banIP's reads are asked again once each went through
+  const write = useBanipWrite<string | undefined>();
   const run = (what: string, fn: () => Promise<string | undefined>): void => {
     setBusy(what);
     setNote(undefined);
-    fn().then(
+    write.mutateAsync(fn).then(
       (msg) => {
         setBusy(undefined);
         setNote(msg);

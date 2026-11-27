@@ -3,35 +3,20 @@
 // lengths in place. It reads the people and their rules once and the
 // router's pause and clock every 15 s, while it's on Home; two of them share
 // the calls.
+import { dashboardQueries } from './queries';
+import { usePauseDevice } from './queries';
+import { useLive } from '@/lib/query/use-live';
+import { useRead } from '@/lib/query/use-read';
 import { PauseIcon, PlayIcon, XIcon } from 'lucide-react';
-import { type ReactElement, useCallback, useState } from 'react';
+import { type ReactElement, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { getHostHints, hintName } from '@/lib/api/network';
-import { getConfig, type Section } from '@/lib/api/uci';
-import { href } from '@/lib/router';
-import { sharedCall } from '@/lib/shared-call';
+import { pageLink } from '@/lib/router';
 import { cn, errorMessage } from '@/lib/utils';
-import { clockOf, getStatus, overridesOf, pause, resume } from '../device-control/api';
-import { atText, deviceRules, morningAfter, type PauseChoice, pauseUntil, parsePeople, stateText } from '../device-control/model';
-import { entries, entryState } from '../device-control/view';
-import { parseFirewall } from '../firewall/model';
+import { clockOf, overridesOf } from '../device-control/api';
+import { atText, morningAfter, type PauseChoice, pauseUntil, stateText } from '../device-control/model';
+import { entryState } from '../device-control/view';
 import { EMPTY_GOES } from './fit';
 import { Dot, OffNote, Widget, WidgetLink } from './widget';
-
-const loadPeople = sharedCall(async () => {
-  const [firewall, milkflint, hints] = await Promise.all([
-    getConfig('firewall'),
-    getConfig('milkflint').catch((): Section[] => []),
-    getHostHints().catch(() => ({})),
-  ]);
-  const names = new Map(Object.entries(hints).map(([mac, h]) => [mac.toLowerCase(), hintName(h)]));
-  const cfg = parseFirewall(firewall, milkflint);
-  const name = (mac: string): string | undefined => names.get(mac);
-  return { list: entries(cfg, firewall, parsePeople(milkflint), name), rules: deviceRules(cfg) };
-});
-const loadStatus = sharedCall(getStatus);
 
 const CHOICES: readonly { value: PauseChoice; label: string }[] = [
   { value: '30m', label: '30 min' },
@@ -41,29 +26,20 @@ const CHOICES: readonly { value: PauseChoice; label: string }[] = [
 ];
 
 export function DeviceControlCard(): ReactElement {
-  const people = useLoad(loadPeople);
-  const status = usePoll(loadStatus, 15_000);
+  const people = useRead(dashboardQueries.deviceControl());
+  const status = useLive(dashboardQueries.deviceControlStatus());
   const [choosing, setChoosing] = useState<string>();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-  const refresh = status.refresh;
-  const run = useCallback(
-    async (job: () => Promise<void>) => {
-      setBusy(true);
-      setError(undefined);
-      try {
-        await job();
+  const act = usePauseDevice();
+  const busy = act.isPending;
+  const error = act.error === null ? undefined : errorMessage(act.error);
+  const run = (vars: { macs: readonly string[]; until: number | null | 'resume' }): void => {
+    act.mutate(vars, {
+      onSuccess: () => {
         setChoosing(undefined);
-      } catch (err) {
-        setError(errorMessage(err));
-      } finally {
-        setBusy(false);
-        refresh();
-      }
-    },
-    [refresh],
-  );
-  const link = <WidgetLink href={href('device-control')}>Device control</WidgetLink>;
+      },
+    });
+  };
+  const link = <WidgetLink to={pageLink('device-control')}>Device control</WidgetLink>;
 
   if (people.data === undefined || status.data === undefined) {
     return (
@@ -78,7 +54,7 @@ export function DeviceControlCard(): ReactElement {
   if (list.length === 0) {
     return (
       <Widget>
-        <OffNote action={<WidgetLink href={href('device-control')}>Set times for devices</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('device-control')}>Set times for devices</WidgetLink>}>
           A bedtime, school hours and a pause, for a group of devices or a single one.
         </OffNote>
       </Widget>
@@ -117,7 +93,7 @@ export function DeviceControlCard(): ReactElement {
                   className="h-10"
                   disabled={busy}
                   onClick={() => {
-                    void run(() => pause(picked.e.macs, until));
+                    run({ macs: picked.e.macs, until });
                   }}
                 >
                   {c.value === 'morning' ? `Until ${atText(morningAfter(picked.e.own?.windows ?? [], clock), clock)}` : c.label}
@@ -147,7 +123,7 @@ export function DeviceControlCard(): ReactElement {
                     disabled={busy}
                     aria-label={`Resume ${e.title}`}
                     onClick={() => {
-                      void run(() => resume(e.macs));
+                      run({ macs: e.macs, until: 'resume' });
                     }}
                   >
                     <PlayIcon /> Resume

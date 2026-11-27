@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import { sharedCall } from '@/lib/shared-call';
 import { call } from '@/lib/ubus';
 import type { Options } from './options';
 
@@ -26,6 +25,8 @@ export type State = (typeof STATES)[number];
 const statusSchema = z.object({
   installed: z.boolean(),
   version: z.string().nullish(),
+  /** openwrt/packages at the commit the installed build is from (the package's URL; none before 1.9.2-r1001) */
+  source: z.string().nullish(),
   /** the license texts this image carries, as links (none on images before they were added) */
   licenses: z.object({ banip: z.string().nullish(), gawk: z.string().nullish() }).nullish(),
   enabled: z.boolean().optional(),
@@ -69,9 +70,6 @@ export type BanipStatus = z.output<typeof statusSchema>;
 export function getStatus(): Promise<BanipStatus> {
   return call('milkflint.banip', 'status', {}, statusSchema);
 }
-
-/** For Home, where the warning and each banIP widget ask at once: one call answers them all. */
-export const getStatusShared = sharedCall(getStatus);
 
 const optionValue = z.union([z.string(), z.array(z.string())]).nullable();
 

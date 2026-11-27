@@ -1,5 +1,8 @@
 import { z } from 'zod';
+import { getConfig, type Section } from '@/lib/api/uci';
 import { call } from '@/lib/ubus';
+import { type TuningData, tuningData } from './model';
+import type { WedConfig } from './wed';
 
 const groPortSchema = z.object({
   /** the internet port's hardware device (eth1) */
@@ -85,4 +88,25 @@ export type TuningStatus = z.output<typeof statusSchema>;
 /** What the settings are doing right now (milkflint.tuning in this feature's rpcd plugin). */
 export function getTuningStatus(): Promise<TuningStatus> {
   return call('milkflint.tuning', 'status', {}, statusSchema);
+}
+
+/** The page's settings as saved: milkflint's, the network's packet steering, Smart Queue's queue, the firewall's offloading. */
+export async function loadTuning(): Promise<TuningData> {
+  const [milkflint, network, sqm, firewall] = await Promise.all([
+    getConfig('milkflint').catch((): Section[] => []),
+    getConfig('network'),
+    getConfig('sqm').catch((): Section[] => []),
+    getConfig('firewall').catch((): Section[] => []),
+  ]);
+  return tuningData({ milkflint, network, sqm, firewall });
+}
+
+/** What hardware offloading with WED (./wed.ts) reads: milkflint's, Smart Queue's and the firewall's sections. */
+export async function loadWed(): Promise<WedConfig> {
+  const [milkflint, sqm, firewall] = await Promise.all([
+    getConfig('milkflint').catch((): Section[] => []),
+    getConfig('sqm').catch((): Section[] => []),
+    getConfig('firewall').catch((): Section[] => []),
+  ]);
+  return { milkflint, sqm, firewall };
 }

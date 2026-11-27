@@ -1,8 +1,8 @@
 import { z } from 'zod';
-import { getHostHints, getInterfaces, getLeases } from '@/lib/api/network';
-import { getConfig, list, str } from '@/lib/api/uci';
+import { getInterfaces } from '@/lib/api/network';
+import { bool, getConfig, type Section, str } from '@/lib/api/uci';
 import { call } from '@/lib/ubus';
-import { deviceName } from '../clients/model';
+import type { DataUsageForm } from './model';
 
 const periodsSchema = z.object({
   installed: z.boolean(),
@@ -50,28 +50,6 @@ export async function getUsage(period: string, group: 'mac' | 'layer7'): Promise
   return [...rows.values()].sort((a, b) => b.rx + b.tx - (a.rx + a.tx));
 }
 
-/** Device names by MAC (lower case), as All devices finds them (clients/model.ts, deviceName). */
-export async function loadNames(): Promise<Map<string, string>> {
-  const [leases, hints, dhcp] = await Promise.all([
-    getLeases().catch(() => []),
-    getHostHints().catch(() => ({})),
-    getConfig('dhcp').catch(() => []),
-  ]);
-  const given = new Map(
-    dhcp
-      .filter((s) => s['.type'] === 'host')
-      .flatMap((h) => list(h, 'mac').map((mac) => [mac.toLowerCase(), str(h, 'name')] as const)),
-  );
-  const leased = new Map(leases.map((l) => [l.macaddr.toLowerCase(), l.hostname] as const));
-  const hinted = new Map(Object.entries(hints).map(([mac, h]) => [mac.toLowerCase(), h.name] as const));
-  const names = new Map<string, string>();
-  for (const mac of new Set([...given.keys(), ...leased.keys(), ...hinted.keys()])) {
-    const name = deviceName(given.get(mac), leased.get(mac), hinted.get(mac));
-    if (name !== undefined) names.set(mac, name);
-  }
-  return names;
-}
-
 /** The router's own IPv4 addresses: its traffic isn't a device's. */
 export async function loadRouterIps(): Promise<Set<string>> {
   const ifaces = await getInterfaces().catch(() => []);
@@ -82,4 +60,29 @@ export async function loadRouterIps(): Promise<Set<string>> {
 export function periodStart(start: string): string {
   const d = new Date(`${start}T00:00:00Z`);
   return d.toLocaleDateString('en-GB', { timeZone: 'UTC', day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+/** Counting's settings as saved, with what the form can't change. */
+export interface DataUsageSettings extends DataUsageForm {
+  /** milkflint.datastats, the on/off: missing on routers from before it */
+  toggle: boolean;
+  /** nlbwmon's own section, with the accounting period */
+  section: string | undefined;
+}
+
+export async function loadSettings(): Promise<DataUsageSettings> {
+  const [nlbwmon, milkflint] = await Promise.all([
+    getConfig('nlbwmon').catch((): Section[] => []),
+    getConfig('milkflint').catch((): Section[] => []),
+  ]);
+  const s = nlbwmon.find((x) => x['.type'] === 'nlbwmon');
+  const ds = milkflint.find((x) => x['.name'] === 'datastats');
+  const interval = str(s, 'database_interval') ?? '1';
+  return {
+    toggle: ds !== undefined,
+    enabled: bool(ds, 'enabled', true),
+    history: bool(ds, 'history', false),
+    section: s?.['.name'],
+    day: /^\d+$/.test(interval) ? interval : 'custom',
+  };
 }

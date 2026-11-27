@@ -7,6 +7,7 @@
 // through UCI with fw4's check; pause and extra time are set on the router
 // at once, with no reload. #/device-control/<mac> opens on that device.
 import { ClockAlertIcon, InfoIcon, MonitorSmartphoneIcon, PlusIcon } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
 import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { PageHeader } from '@/components/layout/page-header';
@@ -16,26 +17,13 @@ import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { type ApplyState, useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
+import { useLive } from '@/lib/query/use-live';
 import type { Change } from '@/lib/api/uci';
 import { formatBytes } from '@/lib/format';
-import { href, useSubPath } from '@/lib/router';
+import { pageLink, useSubPath } from '@/lib/router';
 import { errorMessage } from '@/lib/utils';
 import { ConfirmDialog } from '../firewall/parts';
-import {
-  clockOf,
-  type DcData,
-  type DcDevice,
-  type DcStatus,
-  getStatus,
-  giveExtra,
-  loadDeviceControl,
-  overridesOf,
-  pause,
-  resume,
-  whoAmI,
-} from './api';
+import { clockOf, type DcData, type DcDevice, type DcStatus, overridesOf } from './api';
 import {
   atText,
   type Clock,
@@ -51,6 +39,7 @@ import {
   stateText,
 } from './model';
 import { type Choices, PersonCard } from './person-card';
+import { deviceControlQueries, useGiveExtra, usePause, useResume } from './queries';
 import { PersonSheet, type SheetData } from './person-sheet';
 import { blockedByOlder, type Entry, entries, entryState, weekSpans } from './view';
 
@@ -92,24 +81,19 @@ function clockTrouble(s: DcStatus, fetched: number): string | undefined {
 
 export function DeviceControlPage(): ReactElement {
   const sub = useSubPath();
-  const { data, error, loading, reload } = useLoad(loadDeviceControl);
-  const [fetched, setFetched] = useState(() => Date.now());
-  const status = usePoll(
-    useCallback(async () => {
-      const s = await getStatus();
-      setFetched(Date.now());
-      return s;
-    }, []),
-    15_000,
-  );
-  const who = useLoad(whoAmI);
+  const { data, error, refetch } = useQuery(deviceControlQueries.settings());
+  const status = useLive(deviceControlQueries.status());
+  // when the status last answered: the router's clock moves on from there
+  const [mounted] = useState(() => Date.now());
+  const fetched = status.at ?? mounted;
+  const who = useQuery(deviceControlQueries.me());
   const me = who.data?.mac;
   const refreshStatus = status.refresh;
-  const onApplied = useCallback(() => {
-    reload();
-    refreshStatus();
-  }, [reload, refreshStatus]);
-  const { state: saveState, apply } = useApply(onApplied);
+  // a save refreshes every read itself (useApply)
+  const { state: saveState, apply } = useApply();
+  const pauseNow = usePause();
+  const extraNow = useGiveExtra();
+  const resumeNow = useResume();
   const [actState, setActState] = useState<ApplyState>({ phase: 'idle' });
   const [lastShown, setLastShown] = useState<'save' | 'act'>('save');
   const [sheet, setSheet] = useState<Sheet>();
@@ -154,21 +138,26 @@ export function DeviceControlPage(): ReactElement {
       setActState({ phase: 'failed', message: errorMessage(err) });
     } finally {
       setBusy(false);
-      refreshStatus();
     }
   };
 
   // after a save fw4 loads the rules and sets for a few seconds: no "not ready" warning meanwhile
   const [settling, setSettling] = useState(false);
-  const save = (changes: Change[]): void => {
-    setSheet(undefined);
+  const save = (changes: Change[]): Promise<ApplyState> => {
     setLastShown('save');
     setSettling(true);
     window.setTimeout(() => {
       setSettling(false);
       refreshStatus();
     }, 20_000);
-    void apply(changes);
+    return apply(changes);
+  };
+  // the sheet's save: it closes once that went through, and keeps the failure on screen when it didn't
+  const submit = async (changes: Change[]): Promise<string | undefined> => {
+    const end = await save(changes);
+    if (end.phase === 'failed') return end.message;
+    setSheet(undefined);
+    return undefined;
   };
 
   const sheetData = (d: DcData, s: DcStatus | undefined): SheetData => ({
@@ -192,73 +181,76 @@ export function DeviceControlPage(): ReactElement {
       />
       <div className="flex flex-col gap-4">
         <ApplyStatus state={shownState} />
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading && data === undefined ? (
+        {error !== null && data === undefined ? (
+          <LoadError
+            error={error}
+            retry={() => {
+              void refetch();
+            }}
+          />
+        ) : data === undefined ? (
           <FormSkeleton />
         ) : (
-          data !== undefined && (
-            <Body
-              data={data}
-              list={list}
-              rules={rules}
-              status={status.data}
-              settling={settling}
-              fetched={fetched}
-              clock={clock}
-              overrides={overrides}
-              deviceMap={deviceMap}
-              me={me}
-              busy={busy}
-              open={open}
-              setOpen={setOpen}
-              onAdd={(kind, devices) => {
-                setSheet({ entry: undefined, kind, ...(devices === undefined ? {} : { devices }) });
-              }}
-              onEdit={(e) => {
-                setSheet({ entry: e, kind: e.person?.name === undefined ? 'device' : 'person' });
-              }}
-              onAddDevice={(e, mac) => {
-                if (e.person === undefined) return;
-                const own = e.own;
-                const form: PersonForm = {
-                  name: e.person.name,
-                  devices: [...e.person.devices, mac],
-                  windows: own?.windows ?? [],
-                  always: own?.always === true,
-                  safeSearch: e.person.safeSearch,
-                  guest: e.person.guest,
-                };
-                save(
-                  personChanges(e.person.id, form, {
-                    cfg: data.fw.cfg,
-                    firewall: data.fw.sections,
-                    milkflint: data.milkflint,
-                    deviceName,
-                  }),
-                );
-              }}
-              onPause={(e, choice) => {
-                if (clock === undefined) return;
-                const until = pauseUntil(choice, e.own?.windows ?? [], clock);
-                void act(
-                  until === null
-                    ? `${e.title} is paused until you resume.`
-                    : `${e.title} is paused until ${atText(until, clock)}.`,
-                  () => pause(e.macs, until),
-                );
-              }}
-              onExtra={(e, choice, mac) => {
-                if (clock === undefined) return;
-                const until = extraUntil(choice, mac, rules, clock);
-                if (until === undefined) return;
-                void act(`${e.title} has extra time until ${atText(until, clock)}.`, () => giveExtra(e.macs, until));
-              }}
-              onResume={(e) => {
-                void act(`The times for ${e.title} apply again.`, () => resume(e.macs));
-              }}
-            />
-          )
+          <Body
+            data={data}
+            list={list}
+            rules={rules}
+            status={status.data}
+            settling={settling}
+            fetched={fetched}
+            clock={clock}
+            overrides={overrides}
+            deviceMap={deviceMap}
+            me={me}
+            busy={busy}
+            open={open}
+            setOpen={setOpen}
+            onAdd={(kind, devices) => {
+              setSheet({ entry: undefined, kind, ...(devices === undefined ? {} : { devices }) });
+            }}
+            onEdit={(e) => {
+              setSheet({ entry: e, kind: e.person?.name === undefined ? 'device' : 'person' });
+            }}
+            onAddDevice={(e, mac) => {
+              if (e.person === undefined) return;
+              const own = e.own;
+              const form: PersonForm = {
+                name: e.person.name,
+                devices: [...e.person.devices, mac],
+                windows: own?.windows ?? [],
+                always: own?.always === true,
+                safeSearch: e.person.safeSearch,
+                guest: e.person.guest,
+              };
+              void save(
+                personChanges(e.person.id, form, {
+                  cfg: data.fw.cfg,
+                  firewall: data.fw.sections,
+                  milkflint: data.milkflint,
+                  deviceName,
+                }),
+              );
+            }}
+            onPause={(e, choice) => {
+              if (clock === undefined) return;
+              const until = pauseUntil(choice, e.own?.windows ?? [], clock);
+              void act(
+                until === null ? `${e.title} is paused until you resume.` : `${e.title} is paused until ${atText(until, clock)}.`,
+                () => pauseNow.mutateAsync({ macs: e.macs, until }),
+              );
+            }}
+            onExtra={(e, choice, mac) => {
+              if (clock === undefined) return;
+              const until = extraUntil(choice, mac, rules, clock);
+              if (until === undefined) return;
+              void act(`${e.title} has extra time until ${atText(until, clock)}.`, () =>
+                extraNow.mutateAsync({ macs: e.macs, until }),
+              );
+            }}
+            onResume={(e) => {
+              void act(`The times for ${e.title} apply again.`, () => resumeNow.mutateAsync(e.macs));
+            }}
+          />
         )}
       </div>
       {data !== undefined && sheet !== undefined && (
@@ -272,7 +264,7 @@ export function DeviceControlPage(): ReactElement {
           onClose={() => {
             setSheet(undefined);
           }}
-          onSave={save}
+          onSubmit={submit}
           onDelete={
             sheet.entry?.person === undefined
               ? undefined
@@ -294,7 +286,7 @@ export function DeviceControlPage(): ReactElement {
             const p = deleting.person;
             setDeleting(undefined);
             if (p === undefined) return;
-            save(
+            void save(
               personChanges(p.id, undefined, {
                 cfg: data.fw.cfg,
                 firewall: data.fw.sections,
@@ -303,8 +295,7 @@ export function DeviceControlPage(): ReactElement {
               }),
             );
             // a pause or extra time of theirs ends with them
-            if (p.devices.some((m) => overrides.paused.has(m) || overrides.extra.has(m)))
-              void resume(p.devices).catch(() => undefined);
+            if (p.devices.some((m) => overrides.paused.has(m) || overrides.extra.has(m))) resumeNow.mutate(p.devices);
           }}
         >
           <span>
@@ -607,7 +598,7 @@ function ClockAlert({ text }: { text: string }): ReactElement {
       <AlertTitle>Check the router’s clock</AlertTitle>
       <AlertDescription>
         <span>{text}</span>
-        <GoLink href={href('time')}>Time</GoLink>
+        <GoLink to={pageLink('time')}>Time</GoLink>
       </AlertDescription>
     </Alert>
   );

@@ -2,21 +2,22 @@
 // channel is, where it's quietest) with the scan and its cost, then the radar
 // of what the router hears, each band's channels by how crowded they are, and
 // every network heard, which opens in a side sheet.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { InfoIcon, TriangleAlertIcon } from 'lucide-react';
-import { type ReactElement, type ReactNode, useMemo, useRef, useState } from 'react';
+import { type ReactElement, type ReactNode, useMemo, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Card, CardContent } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
-import { usePoll } from '@/hooks/use-poll';
-import { getRegulatory } from '@/lib/api/wireless';
-import { href } from '@/lib/router';
+import { useLive } from '@/lib/query/use-live';
 import { cn, errorMessage } from '@/lib/utils';
-import { getScan, loadRadios, type ScanState, startScan } from './api';
+import type { ScanState } from './api';
 import { ScanAnswer } from './answer';
 import { ChannelCrowding } from './crowding';
 import { NetworkSheet } from './detail';
 import { NetworkList } from './list';
+import { useStartWifiScan, wifiScanQueries } from './queries';
 import { ago, allowedChannels, blockLabel, ownChannelsOf, quietestLabel, type Radio, scannedBands, STALE_AFTER_S } from './model';
 import { type Blip, type OwnChannel, Radar } from './radar';
 import { bandLabel, bandOrder, channelLoads, emptyNarrower, layoutSectors, overlapMhz, quietest, spanOf } from './spectrum';
@@ -31,22 +32,18 @@ function Legend({ swatch, children }: { swatch: string; children: ReactNode }): 
 }
 
 export function NearbyNetworks(): ReactElement {
-  const radiosPoll = usePoll(loadRadios, 30_000);
+  const radiosPoll = useLive(wifiScanQueries.radios());
   const radios = useMemo(() => radiosPoll.data ?? [], [radiosPoll.data]);
   // a scan asked for here, until the router has it: the start time of the scan it replaces, and its radios
   const [asked, setAsked] = useState<{ replaces: number | undefined; phys: string[] }>();
   const [fast, setFast] = useState(false);
-  const starting = useRef(false);
-  const scan = usePoll(getScan, fast ? 1000 : 60_000);
-  const [startError, setStartError] = useState<string>();
+  const scan = useLive(wifiScanQueries.scan(fast ? 1000 : 60_000));
+  const start = useStartWifiScan();
+  const startError = start.error === null ? undefined : errorMessage(start.error);
   const [hover, setHover] = useState<string>();
   const [selected, setSelected] = useState<string>();
   const country = radios.find((r) => r.country !== undefined)?.country;
-  const rules = usePoll(
-    () => (country === undefined ? Promise.resolve(undefined) : getRegulatory(country)),
-    3_600_000,
-    country ?? '',
-  ).data?.rules;
+  const rules = useLive(wifiScanQueries.regulatory(country)).data?.rules;
 
   const state = scan.data;
   const running = state?.state === 'running';
@@ -88,23 +85,17 @@ export function NearbyNetworks(): ReactElement {
   const stale = !scanning && finishedAgo !== undefined && finishedAgo >= STALE_AFTER_S;
   const longest = Math.max(0, ...(shown?.radios ?? []).map((r) => r.duration_ms ?? 0));
 
-  const onScan = async (chosen: readonly Radio[]): Promise<void> => {
+  const onScan = (chosen: readonly Radio[]): void => {
     // two clicks before the page redraws (a fast double click) ask for one scan
-    if (scanning || starting.current) return;
-    starting.current = true;
-    setStartError(undefined);
+    if (scanning || start.isPending) return;
     setSelected(undefined);
     const phys = chosen.flatMap((r) => (r.phy === undefined ? [] : [r.phy]));
     setAsked({ replaces: state?.started, phys });
-    try {
-      await startScan(phys);
-      scan.refresh();
-    } catch (err) {
-      setAsked(undefined);
-      setStartError(errorMessage(err));
-    } finally {
-      starting.current = false;
-    }
+    start.mutate(phys, {
+      onError: () => {
+        setAsked(undefined);
+      },
+    });
   };
 
   const elapsed = running ? Math.max(0, state.now - (state.started ?? state.now)) : undefined;
@@ -157,9 +148,9 @@ export function NearbyNetworks(): ReactElement {
           <AlertDescription>
             <p>
               A band scans from its own network, so turn one on in{' '}
-              <a href={href('wifi')} className="font-medium text-primary underline underline-offset-4">
+              <Link {...pageLink('wifi')} className="font-medium text-primary underline underline-offset-4">
                 Networks &amp; radios
-              </a>{' '}
+              </Link>{' '}
               first.
             </p>
           </AlertDescription>
@@ -178,7 +169,7 @@ export function NearbyNetworks(): ReactElement {
             scannable={scannable}
             status={status}
             stale={stale ? finishedAgo : undefined}
-            onScan={(chosen) => void onScan(chosen)}
+            onScan={onScan}
           />
         </div>
 

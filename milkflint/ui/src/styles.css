@@ -85,6 +85,8 @@
   --color-ramp-5: var(--ramp-5);
   --color-brand-stone: var(--brand-stone);
   --color-brand-milk: var(--brand-milk);
+  /* The wordmark's dot over the i: the same orange in every theme. */
+  --color-brand-spark: oklch(70% 0.19 47);
 
   --font-sans: var(--font-sans);
   --font-mono: var(--font-mono);
@@ -283,4 +285,17 @@
     opacity: 0;
     transform: scale(1);
   }
+}
+
+/* TanStack Charts' tooltip (components/charts/time-chart.tsx) as the app's
+   popover: on its own class, so a portalled one (a sparkline's) has it too */
+.mf-chart-tooltip {
+  --ts-chart-tooltip-background: var(--popover);
+  --ts-chart-tooltip-color: var(--popover-foreground);
+  --ts-chart-tooltip-border: 1px solid var(--border);
+  --ts-chart-tooltip-border-radius: var(--mf-radius-md);
+  --ts-chart-tooltip-shadow: var(--mf-shadow-md);
+  --ts-chart-tooltip-padding: 0.5rem 0.625rem;
+  --ts-chart-tooltip-font: var(--mf-text-xs) / var(--mf-text-xs-leading) var(--font-sans);
+  font-variant-numeric: tabular-nums;
 }

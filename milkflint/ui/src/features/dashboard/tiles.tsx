@@ -3,21 +3,23 @@
 // fills the rest of the tile (without one, the detail sits at the foot), and
 // the whole tile a link to its page. The busiest devices' is a short list
 // instead, as many as fit.
+import { Link } from '@tanstack/react-router';
 import { ChevronRightIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { Sparkline } from '@/components/charts/sparkline';
 import { ipv4, wanIpv6 } from '@/lib/api/network';
-import type { Poll } from '@/hooks/use-poll';
+import type { Live as Polled } from '@/lib/query/use-live';
 import { Progress } from '@/components/ui/progress';
 import { formatBitrate, formatBitrateOf, formatDurationShort, formatNumber, formatPercent } from '@/lib/format';
-import { href, type Route } from '@/lib/router';
+import { pageLink, type PageLink, type Route } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import type { Live } from '../network-quality/live';
 import { deviceLabel } from '../clients/model';
 import { delayMs } from '../sqm/cake';
 import { CoreRings } from './core-rings';
 import { useFit } from './fit';
-import { busiestFirst, ms, pingScale, responsiveness, SHAPING_BUSY, shapingShare, temperatureLevel, type Tone } from './model';
+import { ms, pingScale, responsiveness, SHAPING_BUSY, shapingShare, temperatureLevel, type Tone } from './model';
+import { useBusyDevices } from './busy';
 import { sensorLabel, slotted, STEP_S, useSensorHistory } from './sensors';
 import { type CakeDirection, type Dashboard, HISTORY } from './use-dashboard';
 import { Dot, Way } from './widget';
@@ -36,9 +38,10 @@ interface Spark {
   format: (value: number) => string;
 }
 
-function Tile({
+export function Tile({
   title: named,
   route,
+  to,
   tone,
   value,
   lines,
@@ -51,6 +54,8 @@ function Tile({
   /** the widget's own, unless it says otherwise (the main router's in access point mode) */
   title?: string;
   route: Route;
+  /** where the tile goes when that is a page's tab, not its first */
+  to?: PageLink | undefined;
   tone: Tone | 'off' | undefined;
   value: ReactNode;
   lines: readonly ReactNode[];
@@ -72,9 +77,9 @@ function Tile({
   const box = useFit<HTMLAnchorElement>();
   const last = spark !== undefined ? 'spark' : footer !== undefined ? 'footer' : graphic !== undefined ? 'graphic' : 'words';
   return (
-    <a
+    <Link
       {...box}
-      href={href(route)}
+      {...(to ?? pageLink(route))}
       // the graph takes whatever height the cell has beyond the words, so there's no blank band at the foot
       className={TILE}
     >
@@ -133,14 +138,14 @@ function Tile({
             max={spark.max}
             slots={slots}
             color={spark.color}
-            className="h-auto min-h-6 flex-1 [&>svg]:absolute [&>svg]:inset-0 [&>svg]:rounded-b-[calc(var(--mf-radius-xl)-1px)]"
+            className="h-auto min-h-6 flex-1 overflow-hidden rounded-b-[calc(var(--mf-radius-xl)-1px)]"
             label={spark.label}
             format={spark.format}
             timeOf={(slot) => times[slot - (slots - times.length)]}
           />
         </div>
       )}
-    </a>
+    </Link>
   );
 }
 
@@ -294,7 +299,7 @@ export function DevicesTile({ d }: { d: Dashboard }): ReactElement {
 const PING_SPAN_S = 600;
 
 /** Responsiveness as a tile: the last 5 minutes' typical ping, its state, the latest, and the hour's peak and loss. */
-export function ResponsivenessTile({ live }: { live: Poll<Live> }): ReactElement {
+export function ResponsivenessTile({ live }: { live: Polled<Live> }): ReactElement {
   const g = responsivenessGlance(live);
   const data = live.data;
   if (data?.status.enabled !== true) {
@@ -471,9 +476,9 @@ export function BusiestTile({ d }: { d: Dashboard }): ReactElement {
   const icons = useDecorativeIcons();
   const { icon: Icon } = useWidgetInfo();
   const list = useFit<HTMLUListElement>();
-  const shown = busiestFirst(d.clients).slice(0, BUSIEST);
+  const shown = useBusyDevices(d).rows.slice(0, BUSIEST);
   return (
-    <a href={href('clients')} className={TILE}>
+    <Link {...pageLink('clients')} className={TILE}>
       <h2 className="flex items-center justify-between gap-2 px-5 pt-4 text-sm font-medium text-muted-foreground">
         <span className="flex min-w-0 items-center gap-2">
           {icons && <Icon className="size-4 shrink-0" aria-hidden="true" />}
@@ -486,11 +491,11 @@ export function BusiestTile({ d }: { d: Dashboard }): ReactElement {
         />
       </h2>
       {shown.length === 0 ? (
-        <p className="flex flex-1 items-center px-5 pb-4 text-sm text-muted-foreground">No devices on the Wi-Fi now</p>
+        <p className="flex flex-1 items-center px-5 pb-4 text-sm text-muted-foreground">No busy devices now</p>
       ) : (
         <ul {...list} aria-label="Busiest first" className="flex min-h-0 flex-1 flex-col gap-1.5 px-5 pt-3 pb-4 text-sm">
           {shown.map((c) => (
-            <li key={c.mac} data-fit className="flex items-baseline justify-between gap-3">
+            <li key={c.key} data-fit className="flex items-baseline justify-between gap-3">
               <span className={cn('min-w-0 truncate', c.name === undefined && 'text-muted-foreground')}>
                 {deviceLabel(c.name)}
               </span>
@@ -501,6 +506,6 @@ export function BusiestTile({ d }: { d: Dashboard }): ReactElement {
           ))}
         </ul>
       )}
-    </a>
+    </Link>
   );
 }

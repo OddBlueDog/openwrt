@@ -5,15 +5,15 @@
 // chart with the busy stretches Home saw shaded.
 import type { ReactElement, ReactNode } from 'react';
 import { Skeleton } from '@/components/ui/skeleton';
-import type { Poll } from '@/hooks/use-poll';
+import type { Live as Polled } from '@/lib/query/use-live';
 import { formatNumber, formatPercent } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import { timeTicks } from '../network-quality/chart-data';
 import { type Live, WINDOW_SECONDS } from '../network-quality/live';
 import { rating, summarize } from '../network-quality/score';
 import { useLoadPairs } from './load-store';
 import { loadSummary, ms, pingScale, responsiveness } from './model';
-import { TimeChart } from './time-chart';
+import { TimeChart } from '@/components/charts/time-chart';
 import { Figure, OffNote, StateBadge, Widget, WidgetLink } from './widget';
 
 const HOUR = 3600;
@@ -37,9 +37,9 @@ function Reading({ label, children, note }: { label: string; children: ReactNode
 
 const quietly = (text: string): ReactElement => <span className="text-sm font-normal text-muted-foreground">{text}</span>;
 
-export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement {
+export function ResponsivenessCard({ live }: { live: Polled<Live> }): ReactElement {
   const pairs = useLoadPairs();
-  const link = <WidgetLink href={href('network-quality')}>Network quality</WidgetLink>;
+  const link = <WidgetLink to={pageLink('network-quality')}>Network quality</WidgetLink>;
 
   if (live.data === undefined) {
     return (
@@ -60,7 +60,7 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
   if (!status.enabled) {
     return (
       <Widget aside={<StateBadge tone="off">Not measured</StateBadge>}>
-        <OffNote action={<WidgetLink href={href('network-quality')}>Turn on Network Quality</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('network-quality')}>Turn on Network Quality</WidgetLink>}>
           Network Quality pings the internet every few seconds to show how quickly it answers.
         </OffNote>
       </Widget>
@@ -165,7 +165,7 @@ export function ResponsivenessCard({ live }: { live: Poll<Live> }): ReactElement
               ...ticks.filter((t) => t.t - from > 900 && status.now - t.t > 900),
               { t: status.now, label: 'Now' },
             ]}
-            marks={lost.length === 0 ? undefined : { label: 'Lost', color: 'var(--destructive)', times: lost }}
+            marks={[{ label: 'Lost', color: 'var(--destructive)', times: lost }]}
             bands={load.stretches.map((b, i) => ({
               ...b,
               // the newest stretch is labelled; older ones would crowd it

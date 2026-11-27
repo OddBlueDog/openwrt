@@ -15,7 +15,8 @@ import {
   TriangleAlertIcon,
   UploadIcon,
 } from 'lucide-react';
-import { type ChangeEvent, type ReactElement, useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { type ChangeEvent, type ReactElement, useMemo, useRef, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
@@ -29,7 +30,8 @@ import { Switch } from '@/components/ui/switch';
 import type { ApplyState } from '@/hooks/use-apply';
 import { formatNumber } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
-import { type BanipConfig, getList, listEntry, type ListName, saveList, saveOptions } from './api';
+import { type BanipConfig, listEntry, type ListName, saveList, saveOptions } from './api';
+import { banipQueries, useBanipWrite } from './queries';
 import { ENTRY_PROBLEMS, formatEntry, insideConflicts, lineOwner, parseEntry, summarize } from './model';
 import { effective, ITEMS, type Options, optionChanges } from './options';
 
@@ -60,30 +62,25 @@ const TEXT: Record<ListName, { title: string; description: string; empty: string
   },
 };
 
-function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSaved: () => void }): ReactElement {
+function ListEditor({ list, c }: { list: ListName; c: BanipConfig }): ReactElement {
   const t = TEXT[list];
-  const [saved, setSaved] = useState<string>();
+  const read = useQuery(banipQueries.list(list));
+  const saved = read.data?.text;
+  const tooBig = read.data?.tooBig === true;
+  const loadError = read.data === undefined && read.error !== null ? errorMessage(read.error) : undefined;
   const [text, setText] = useState('');
-  const [tooBig, setTooBig] = useState(false);
-  const [loadError, setLoadError] = useState<string>();
+  // the text as last read: a new read replaces the text only while it hasn't been edited
+  const [base, setBase] = useState<string>();
+  if (saved !== undefined && saved !== base) {
+    if (base === undefined || text === base) setText(saved);
+    setBase(saved);
+  }
+  const write = useBanipWrite<Awaited<ReturnType<typeof saveList>>>();
   const [state, setState] = useState<ApplyState>({ phase: 'idle' });
   const [quick, setQuick] = useState('');
   const [importing, setImporting] = useState<string>();
   const gutter = useRef<HTMLDivElement>(null);
   const file = useRef<HTMLInputElement>(null);
-  const load = (): void => {
-    getList(list).then(
-      (r) => {
-        setSaved(r.text);
-        setText(r.text);
-        setTooBig(r.tooBig);
-      },
-      (err: unknown) => {
-        setLoadError(errorMessage(err));
-      },
-    );
-  };
-  useEffect(load, [list]);
   const lines = useMemo(() => text.replace(/\n$/, '').split('\n'), [text]);
   const entries = useMemo(() => lines.map(parseEntry), [lines]);
   const summary = summarize(entries);
@@ -98,25 +95,29 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
       .map((l) => l.trimEnd())
       .join('\n')
       .replace(/\n+$/, '');
-    saveList(list, body === '' ? '' : `${body}\n`).then(
-      (r) => {
-        setState({
-          phase: 'done',
-          nothingChanged: false,
-          note:
-            r.pending === true
-              ? `Saved. With big lists loaded, the change takes a few seconds to reach them (${String(r.added ?? 0)} to add, ${String(r.removed ?? 0)} to take out).`
-              : r.applied === true
-                ? `In effect now: ${String(r.added ?? 0)} added, ${String(r.removed ?? 0)} taken out of the loaded lists.`
-                : 'Saved: banIP reads it when it next starts.',
-        });
-        load();
-        onSaved();
-      },
-      (err: unknown) => {
-        setState({ phase: 'failed', message: errorMessage(err) });
-      },
-    );
+    const next = body === '' ? '' : `${body}\n`;
+    write
+      .mutateAsync(() => saveList(list, next))
+      .then(
+        (r) => {
+          setState({
+            phase: 'done',
+            nothingChanged: false,
+            note:
+              r.pending === true
+                ? `Saved. With big lists loaded, the change takes a few seconds to reach them (${String(r.added ?? 0)} to add, ${String(r.removed ?? 0)} to take out).`
+                : r.applied === true
+                  ? `In effect now: ${String(r.added ?? 0)} added, ${String(r.removed ?? 0)} taken out of the loaded lists.`
+                  : 'Saved: banIP reads it when it next starts.',
+          });
+          // what was saved is the list now (banIP's reads were asked again)
+          setText(next);
+          setBase(next);
+        },
+        (err: unknown) => {
+          setState({ phase: 'failed', message: errorMessage(err) });
+        },
+      );
   };
   if (loadError !== undefined) return <p className="text-sm text-destructive">{loadError}</p>;
   if (saved === undefined) return <FormSkeleton />;
@@ -174,16 +175,17 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
             if (!quickOk) return;
             if (tooBig) {
               setState({ phase: 'applying' });
-              listEntry(list, 'add', quick.trim()).then(
-                () => {
-                  setState({ phase: 'done', nothingChanged: false, note: 'Added, and in effect now.' });
-                  setQuick('');
-                  load();
-                },
-                (err: unknown) => {
-                  setState({ phase: 'failed', message: errorMessage(err) });
-                },
-              );
+              write
+                .mutateAsync(() => listEntry(list, 'add', quick.trim()))
+                .then(
+                  () => {
+                    setState({ phase: 'done', nothingChanged: false, note: 'Added, and in effect now.' });
+                    setQuick('');
+                  },
+                  (err: unknown) => {
+                    setState({ phase: 'failed', message: errorMessage(err) });
+                  },
+                );
               return;
             }
             setText((x) => `${x.replace(/\n*$/, '')}${x.trim() === '' ? '' : '\n'}${formatEntry(quick.trim().toLowerCase())}\n`);
@@ -357,7 +359,7 @@ function ListEditor({ list, c, onSaved }: { list: ListName; c: BanipConfig; onSa
 
 const URL_RE = new RegExp(ITEMS.url);
 
-function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): ReactElement {
+function AllowOptions({ c }: { c: BanipConfig }): ReactElement {
   const saved: Options = {
     ban_autoallowlist: c.options?.['ban_autoallowlist'] ?? null,
     ban_autoallowuplink: c.options?.['ban_autoallowuplink'] ?? null,
@@ -366,6 +368,7 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
     ban_monitorallowed: c.options?.['ban_monitorallowed'] ?? null,
   };
   const [o, setO] = useState<Options>(saved);
+  const write = useBanipWrite();
   const [url, setUrl] = useState('');
   const [state, setState] = useState<ApplyState>({ phase: 'idle' });
   const [confirmOnly, setConfirmOnly] = useState(false);
@@ -374,19 +377,20 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
   const only = effective(o, 'ban_allowlistonly') === '1';
   const save = (): void => {
     setState({ phase: 'applying' });
-    saveOptions(changes).then(
-      () => {
-        setState({
-          phase: 'done',
-          nothingChanged: false,
-          note: c.enabled === true ? 'banIP is loading its lists again with these.' : undefined,
-        });
-        onSaved();
-      },
-      (err: unknown) => {
-        setState({ phase: 'failed', message: errorMessage(err) });
-      },
-    );
+    write
+      .mutateAsync(() => saveOptions(changes))
+      .then(
+        () => {
+          setState({
+            phase: 'done',
+            nothingChanged: false,
+            note: c.enabled === true ? 'banIP is loading its lists again with these.' : undefined,
+          });
+        },
+        (err: unknown) => {
+          setState({ phase: 'failed', message: errorMessage(err) });
+        },
+      );
   };
   return (
     <Card>
@@ -554,13 +558,13 @@ function AllowOptions({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): 
   );
 }
 
-export function ListsTab({ c, onSaved }: { c: BanipConfig; onSaved: () => void }): ReactElement {
+export function ListsTab({ c }: { c: BanipConfig }): ReactElement {
   return (
     <div className="grid items-start gap-4 xl:grid-cols-2">
-      <ListEditor list="allowlist" c={c} onSaved={onSaved} />
-      <ListEditor list="blocklist" c={c} onSaved={onSaved} />
+      <ListEditor list="allowlist" c={c} />
+      <ListEditor list="blocklist" c={c} />
       <div className="xl:col-span-2">
-        <AllowOptions c={c} onSaved={onSaved} />
+        <AllowOptions c={c} />
       </div>
     </div>
   );

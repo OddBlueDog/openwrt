@@ -14,18 +14,18 @@ import {
   SearchIcon,
   ShieldCheckIcon,
 } from 'lucide-react';
-import { type ReactElement, useEffect, useMemo, useState } from 'react';
+import { type ReactElement, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
+import { type Column, DataTable } from '@/components/data-table';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { getHostHints, type HostHint, hintName } from '@/lib/api/network';
+import { useQuery } from '@tanstack/react-query';
+import { useLive } from '@/lib/query/use-live';
+import { hintName } from '@/lib/api/network';
 import { formatNumber } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
 import {
@@ -34,10 +34,9 @@ import {
   type BanipStatus,
   type Drop,
   type DropFilter,
-  getDrops,
-  getProcessingLog,
   getReport,
   type Report,
+  type ReportSet,
   type Search,
   saveOptions,
   search,
@@ -46,8 +45,9 @@ import {
 } from './api';
 import { infoOf } from './feeds';
 import { LookupResult } from './lookup';
-import { describeDrop, parseLogLine, serviceOf } from './model';
+import { describeDrop, type DropWords, parseLogLine, serviceOf } from './model';
 import { Segmented } from '@/components/ui/segmented';
+import { banipQueries, useBanipWrite } from './queries';
 
 const PAGE = 50;
 
@@ -66,22 +66,24 @@ function portLabel(k: string): string {
 
 const setName = (s: string): string => (s === '' ? '–' : s.replace(/\.(v4|v6)(MAC)?$/, ''));
 
-function Recording({ c, s, onSaved }: { c: BanipConfig; s: BanipStatus | undefined; onSaved: () => void }): ReactElement {
+function Recording({ c, s }: { c: BanipConfig; s: BanipStatus | undefined }): ReactElement {
   const [busy, setBusy] = useState<string>();
   const [failed, setFailed] = useState<string>();
+  const write = useBanipWrite();
   const set = (name: 'ban_loginbound' | 'ban_logoutbound', on: boolean): void => {
     setBusy(name);
     setFailed(undefined);
-    saveOptions({ [name]: on ? '1' : '0' }).then(
-      () => {
-        setBusy(undefined);
-        onSaved();
-      },
-      (err: unknown) => {
-        setBusy(undefined);
-        setFailed(errorMessage(err));
-      },
-    );
+    write
+      .mutateAsync(() => saveOptions({ [name]: on ? '1' : '0' }))
+      .then(
+        () => {
+          setBusy(undefined);
+        },
+        (err: unknown) => {
+          setBusy(undefined);
+          setFailed(errorMessage(err));
+        },
+      );
   };
   const out = s?.logging?.outbound ?? c.options?.['ban_logoutbound'] === '1';
   const inb = s?.logging?.inbound ?? c.options?.['ban_loginbound'] === '1';
@@ -215,6 +217,40 @@ function LookupDialog({
   );
 }
 
+interface DropRow {
+  d: Drop;
+  w: DropWords;
+  key: string;
+}
+
+/** The blocked connections' columns: who the device is, and the row's actions, from the log's own state. */
+function dropColumns(
+  deviceCell: (d: Drop, w: DropWords) => ReactElement | string,
+  rowActions: (d: Drop, w: DropWords, end: boolean) => ReactElement,
+): Column<DropRow>[] {
+  return [
+    { label: 'Time', cell: ({ d }) => timeText(d.t), className: 'w-28 text-xs whitespace-nowrap text-muted-foreground tabular' },
+    {
+      label: 'What',
+      cell: ({ w }) => (
+        <>
+          <span className="block">{w.direction}</span>
+          <span className="text-xs text-muted-foreground">{w.service}</span>
+        </>
+      ),
+    },
+    { label: 'Address', cell: ({ w }) => <span className="font-mono text-xs">{w.outside}</span> },
+    { label: 'Device', cell: ({ d, w }) => deviceCell(d, w), className: 'text-xs' },
+    { label: 'List', cell: ({ d }) => setName(d.set), className: 'text-xs' },
+    {
+      label: 'Actions',
+      hidden: true,
+      cell: ({ d, w }) => rowActions(d, w, true),
+      className: 'w-28 py-1.5 text-right xl:w-44',
+    },
+  ];
+}
+
 function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): ReactElement {
   const [dir, setDir] = useState<'all' | 'out' | 'in' | 'pre'>('all');
   const [q, setQ] = useState('');
@@ -229,9 +265,9 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
         ? { address: q.trim() }
         : {}),
   };
-  const key = JSON.stringify([filter, page]);
-  const { data, loading, refresh } = usePoll(() => getDrops(page * PAGE, PAGE, filter), 15000, key);
-  const hints = useLoad(() => getHostHints().catch((): Record<string, HostHint> => ({}))).data;
+  const { data, loading, refresh } = useLive(banipQueries.drops(page * PAGE, PAGE, filter));
+  const hints = useQuery(banipQueries.hostHints()).data;
+  const write = useBanipWrite();
   const names = useMemo(() => {
     const m = new Map<string, string>();
     for (const [mac, h] of Object.entries(hints ?? {})) {
@@ -242,62 +278,74 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
     }
     return m;
   }, [hints]);
-  const device = (ip: string | null, mac: string): string | undefined =>
-    (mac !== '' ? names.get(mac.toLowerCase()) : undefined) ?? (ip === null ? undefined : names.get(ip));
+  const device = useCallback(
+    (ip: string | null, mac: string): string | undefined =>
+      (mac !== '' ? names.get(mac.toLowerCase()) : undefined) ?? (ip === null ? undefined : names.get(ip)),
+    [names],
+  );
   const pages = Math.max(1, Math.ceil((data?.total ?? 0) / PAGE));
   const conntrack = c.tools?.conntrack === true;
-  const deviceCell = (d: Drop, w: ReturnType<typeof describeDrop>): ReactElement | string => {
-    const who = d.dir === 'out' ? device(d.src, d.mac) : w.inside === null ? undefined : device(w.inside, '');
-    return (
-      who ??
-      (w.inside === null ? (
-        <span className="text-muted-foreground">the router</span>
-      ) : (
-        <span className="font-mono">{w.inside}</span>
-      ))
-    );
-  };
-  const rowActions = (d: Drop, w: ReturnType<typeof describeDrop>, end: boolean): ReactElement => (
-    <div className={cn('flex gap-1', end && 'justify-end')}>
-      <Button
-        size="sm"
-        variant="ghost"
-        onClick={() => {
-          setLook(w.outside);
-        }}
-      >
-        Look up
-      </Button>
-      {d.dir !== 'pre' && (
+  const deviceCell = useCallback(
+    (d: Drop, w: DropWords): ReactElement | string => {
+      const who = d.dir === 'out' ? device(d.src, d.mac) : w.inside === null ? undefined : device(w.inside, '');
+      return (
+        who ??
+        (w.inside === null ? (
+          <span className="text-muted-foreground">the router</span>
+        ) : (
+          <span className="font-mono">{w.inside}</span>
+        ))
+      );
+    },
+    [device],
+  );
+  const rowActions = useCallback(
+    (d: Drop, w: DropWords, end: boolean): ReactElement => (
+      <div className={cn('flex gap-1', end && 'justify-end')}>
         <Button
           size="sm"
           variant="ghost"
-          title="Always allow"
-          aria-label={`Always allow ${w.outside}`}
-          disabled={allowed[w.outside] !== undefined}
           onClick={() => {
-            setAllowed((a) => ({ ...a, [w.outside]: 'busy' }));
-            allowAddress(w.outside).then(
-              () => {
-                setAllowed((a) => ({ ...a, [w.outside]: 'done' }));
-                onChanged();
-              },
-              () => {
-                setAllowed((a) => Object.fromEntries(Object.entries(a).filter(([k]) => k !== w.outside)));
-              },
-            );
+            setLook(w.outside);
           }}
         >
-          {allowed[w.outside] === 'busy' ? (
-            <LoaderCircleIcon className="animate-spin" />
-          ) : (
-            <ShieldCheckIcon className={cn(allowed[w.outside] === 'done' && 'text-success')} />
-          )}
-          <span className={cn(end && 'hidden xl:inline')}>{allowed[w.outside] === 'done' ? 'Allowed' : 'Always allow'}</span>
+          Look up
         </Button>
-      )}
-    </div>
+        {d.dir !== 'pre' && (
+          <Button
+            size="sm"
+            variant="ghost"
+            title="Always allow"
+            aria-label={`Always allow ${w.outside}`}
+            disabled={allowed[w.outside] !== undefined}
+            onClick={() => {
+              setAllowed((a) => ({ ...a, [w.outside]: 'busy' }));
+              write
+                .mutateAsync(() => allowAddress(w.outside))
+                .then(
+                  () => {
+                    setAllowed((a) => ({ ...a, [w.outside]: 'done' }));
+                  },
+                  () => {
+                    setAllowed((a) => Object.fromEntries(Object.entries(a).filter(([k]) => k !== w.outside)));
+                  },
+                );
+            }}
+          >
+            {allowed[w.outside] === 'busy' ? (
+              <LoaderCircleIcon className="animate-spin" />
+            ) : (
+              <ShieldCheckIcon className={cn(allowed[w.outside] === 'done' && 'text-success')} />
+            )}
+            <span className={cn(end && 'hidden xl:inline')}>{allowed[w.outside] === 'done' ? 'Allowed' : 'Always allow'}</span>
+          </Button>
+        )}
+      </div>
+    ),
+    [allowed, write],
   );
+  const columns = useMemo(() => dropColumns(deviceCell, rowActions), [deviceCell, rowActions]);
+  const rows = useMemo(() => data?.rows.map((d, i) => ({ d, w: describeDrop(d), key: `${String(d.t)}-${String(i)}` })), [data]);
   return (
     <Card>
       <CardHeading
@@ -349,55 +397,22 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
             <Top title="Lists" rows={data.top.sets} label={setName} />
           </div>
         )}
-        <div className="hidden lg:block">
-          <Table className="min-w-[44rem]">
-            <TableHeader>
-              <TableRow>
-                <TableHead className="w-28">Time</TableHead>
-                <TableHead>What</TableHead>
-                <TableHead>Address</TableHead>
-                <TableHead>Device</TableHead>
-                <TableHead>List</TableHead>
-                <TableHead className="w-28 text-right xl:w-44">
-                  <span className="sr-only">Actions</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {(data?.rows ?? []).map((d: Drop, i) => {
-                const w = describeDrop(d);
-                return (
-                  <TableRow key={`${String(d.t)}-${String(i)}`}>
-                    <TableCell className="text-xs text-muted-foreground tabular">{timeText(d.t)}</TableCell>
-                    <TableCell className="text-sm">
-                      <span className="block">{w.direction}</span>
-                      <span className="text-xs text-muted-foreground">{w.service}</span>
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">{w.outside}</TableCell>
-                    <TableCell className="text-xs">{deviceCell(d, w)}</TableCell>
-                    <TableCell className="text-xs">{setName(d.set)}</TableCell>
-                    <TableCell className="text-right">{rowActions(d, w, true)}</TableCell>
-                  </TableRow>
-                );
-              })}
-              {data?.rows.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
-                    {Object.keys(filter).length > 0
-                      ? 'Nothing matches.'
-                      : 'Nothing blocked and recorded yet. Turn on what’s recorded above to see each one here.'}
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </div>
-        {/* on a phone, each blocked connection is a card */}
-        <ul className="flex flex-col divide-y border-y lg:hidden">
-          {(data?.rows ?? []).map((d: Drop, i) => {
-            const w = describeDrop(d);
-            return (
-              <li key={`${String(d.t)}-${String(i)}`} className="flex flex-col gap-2 py-3">
+        {/* newest first, a page at a time from the router: sorting one page would mislead */}
+        {rows !== undefined && (
+          <DataTable
+            label="Blocked connections"
+            columns={columns}
+            rows={rows}
+            rowKey={(r) => r.key}
+            empty={
+              Object.keys(filter).length > 0
+                ? 'Nothing matches.'
+                : 'Nothing blocked and recorded yet. Turn on what’s recorded above to see each one here.'
+            }
+            framed={false}
+            wide="md"
+            card={({ d, w }) => (
+              <div className="flex flex-col gap-2 py-3">
                 <span className="flex items-baseline justify-between gap-3">
                   <span className="text-sm font-medium">{w.direction}</span>
                   <span className="shrink-0 text-xs text-muted-foreground tabular">{timeText(d.t)}</span>
@@ -413,17 +428,10 @@ function DropLog({ c, onChanged }: { c: BanipConfig; onChanged: () => void }): R
                   <dd>{setName(d.set)}</dd>
                 </dl>
                 <div className="-ml-3">{rowActions(d, w, false)}</div>
-              </li>
-            );
-          })}
-          {data?.rows.length === 0 && (
-            <li className="py-6 text-center text-sm text-muted-foreground">
-              {Object.keys(filter).length > 0
-                ? 'Nothing matches.'
-                : 'Nothing blocked and recorded yet. Turn on what’s recorded above to see each one here.'}
-            </li>
-          )}
-        </ul>
+              </div>
+            )}
+          />
+        )}
         {pages > 1 && (
           <div className="flex items-center justify-end gap-2 text-sm text-muted-foreground">
             <span className="tabular">
@@ -630,6 +638,46 @@ const FLOOD: Record<string, string> = {
   bcp38: 'Spoofed sources (BCP38)',
 };
 
+type SetRow = [name: string, x: ReportSet];
+
+/** A count where the list counts that way; a list that doesn't is "–" here and last when sorted. */
+const hits = (counts: boolean, n: number | null | undefined): number | undefined => (counts ? (n ?? 0) : undefined);
+const count = (n: number | undefined): ReactNode =>
+  n === undefined ? <span className="text-muted-foreground">–</span> : formatNumber(n);
+
+/** Each list's columns: its name, entries and hits each way sort (the biggest first), and its Contents button. */
+function reportColumns(contents: (name: string) => ReactElement): Column<SetRow>[] {
+  return [
+    { label: 'List', cell: ([name]) => <span className="font-mono text-xs">{name}</span>, sort: ([name]) => name },
+    {
+      label: 'Entries',
+      cell: ([, x]) => count(x.elements ?? undefined),
+      sort: ([, x]) => x.elements ?? undefined,
+      sortDescFirst: true,
+      sortLabel: 'Most entries first',
+      className: 'text-right text-xs tabular',
+    },
+    {
+      label: 'Coming in',
+      cell: ([, x]) => count(hits(x.inbound, x.in_packets)),
+      sort: ([, x]) => hits(x.inbound, x.in_packets),
+      sortDescFirst: true,
+      sortLabel: 'Most hits coming in first',
+      className: 'text-right text-xs tabular',
+    },
+    {
+      label: 'Going out',
+      cell: ([, x]) => count(hits(x.outbound, x.out_packets)),
+      sort: ([, x]) => hits(x.outbound, x.out_packets),
+      sortDescFirst: true,
+      sortLabel: 'Most hits going out first',
+      className: 'text-right text-xs tabular',
+    },
+    { label: 'Ports', cell: ([, x]) => x.ports ?? '', className: 'text-xs' },
+    { label: 'Contents', hidden: true, cell: ([name]) => contents(name), className: 'w-24 py-1.5' },
+  ];
+}
+
 function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void }): ReactElement {
   const [report, setReport] = useState<Report>();
   const [failed, setFailed] = useState<string>();
@@ -658,6 +706,22 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
   const sets = Object.entries(report?.sets ?? {}).sort(([a], [b]) => (own(a) - own(b)) * 1000 + a.localeCompare(b));
   const hitsOf = (x: { in_packets?: number | null | undefined; out_packets?: number | null | undefined }): number =>
     (x.in_packets ?? 0) + (x.out_packets ?? 0);
+  const contents = useCallback(
+    (name: string): ReactElement => (
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-7 shrink-0"
+        onClick={() => {
+          setOpen(name);
+        }}
+      >
+        Contents
+      </Button>
+    ),
+    [],
+  );
+  const columns = useMemo(() => reportColumns(contents), [contents]);
   return (
     <Card>
       <CardHeading
@@ -685,61 +749,16 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
       />
       <CardContent className="flex flex-col gap-4">
         {failed !== undefined && <p className="text-sm text-destructive">{failed}</p>}
-        <div className="hidden lg:block">
-          <Table className="min-w-[36rem]">
-            <TableHeader>
-              <TableRow>
-                <TableHead>List</TableHead>
-                <TableHead className="text-right">Entries</TableHead>
-                <TableHead className="text-right">Coming in</TableHead>
-                <TableHead className="text-right">Going out</TableHead>
-                <TableHead>Ports</TableHead>
-                <TableHead className="w-24">
-                  <span className="sr-only">Contents</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {sets.map(([name, x]) => (
-                <TableRow key={name}>
-                  <TableCell className="py-1 font-mono text-xs">{name}</TableCell>
-                  <TableCell className="text-right text-xs tabular">
-                    {x.elements === null || x.elements === undefined ? '–' : formatNumber(x.elements)}
-                  </TableCell>
-                  <TableCell className="text-right text-xs tabular">
-                    {x.inbound ? formatNumber(x.in_packets ?? 0) : <span className="text-muted-foreground">–</span>}
-                  </TableCell>
-                  <TableCell className="text-right text-xs tabular">
-                    {x.outbound ? formatNumber(x.out_packets ?? 0) : <span className="text-muted-foreground">–</span>}
-                  </TableCell>
-                  <TableCell className="text-xs">{x.ports ?? ''}</TableCell>
-                  <TableCell className="py-1">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7"
-                      onClick={() => {
-                        setOpen(name);
-                      }}
-                    >
-                      Contents
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {sets.length === 0 && (
-                <TableRow>
-                  <TableCell colSpan={6} className="py-6 text-center text-sm text-muted-foreground">
-                    No report yet: it’s made after each update.
-                  </TableCell>
-                </TableRow>
-              )}
-            </TableBody>
-          </Table>
-        </div>
-        <ul className="flex flex-col divide-y border-y lg:hidden">
-          {sets.map(([name, x]) => (
-            <li key={name} className="flex items-center justify-between gap-3 py-2.5">
+        <DataTable
+          label="Each list"
+          columns={columns}
+          rows={sets}
+          rowKey={([name]) => name}
+          empty="No report yet: it’s made after each update."
+          defaultOrder="Lists first, your own last"
+          framed={false}
+          card={([name, x]) => (
+            <div className="flex items-center justify-between gap-3 py-2.5">
               <span className="flex min-w-0 flex-col gap-0.5">
                 <span className="font-mono text-xs break-all">{name}</span>
                 <span className="text-xs text-muted-foreground tabular">
@@ -749,22 +768,10 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
                   {x.ports !== null && x.ports !== undefined && x.ports !== '' ? ` · ports ${x.ports}` : ''}
                 </span>
               </span>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="shrink-0"
-                onClick={() => {
-                  setOpen(name);
-                }}
-              >
-                Contents
-              </Button>
-            </li>
-          ))}
-          {sets.length === 0 && (
-            <li className="py-6 text-center text-sm text-muted-foreground">No report yet: it’s made after each update.</li>
+              {contents(name)}
+            </div>
           )}
-        </ul>
+        />
         {sets.length > 0 && (
           <p className="text-xs text-muted-foreground">
             Most hits:{' '}
@@ -816,12 +823,9 @@ function ReportCard({ c, onLook }: { c: BanipConfig; onLook: (v: string) => void
 
 function ProcessingLog(): ReactElement {
   const [open, setOpen] = useState(false);
-  const { data, refresh } = usePoll(
-    () => (open ? getProcessingLog(300) : Promise.resolve({ lines: [] as string[] })),
-    10000,
-    open ? 'open' : 'closed',
-  );
-  const lines = (data?.lines ?? []).map((l) => ({ raw: l, p: parseLogLine(l) })).reverse();
+  // read only while it's open
+  const { data, refresh } = useLive({ ...banipQueries.processingLog(), enabled: open });
+  const lines = (open ? (data?.lines ?? []) : []).map((l) => ({ raw: l, p: parseLogLine(l) })).reverse();
   return (
     <Card>
       <CardHeading
@@ -878,7 +882,7 @@ export function ActivityTab({
   const [look, setLook] = useState<string>();
   return (
     <div className="flex flex-col gap-4">
-      <Recording c={c} s={s} onSaved={onSaved} />
+      <Recording c={c} s={s} />
       <DropLog c={c} onChanged={onSaved} />
       <ReportCard c={c} onLook={setLook} />
       <ProcessingLog />

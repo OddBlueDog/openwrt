@@ -1,33 +1,34 @@
 // The AdGuard Home page's model: what its state means in words, the sign-in
-// form's checks, the updates' choices and the networks it can tell apart.
+// form's checks and the networks it can tell apart.
 // AdGuard Home does the filtering, set in its own web interface; MilkFlint
 // turns it on and off and keeps the DNS chain around it (the router's
 // adguardhome feature).
+import { z } from 'zod';
 import { intToIp, ipToInt } from '@/lib/api/network';
-import type { AdGuardStatus, Network, Setting, State, UpdateInfo } from './api';
+import type { AdGuardStatus, Network, Setting, State } from './api';
 
 /** MilkFlint's own account in AdGuard Home (for its figures); not for people. */
 export const API_USER = 'milkflint';
 const USER = /^[A-Za-z0-9._@-]{1,64}$/;
 
-export interface Credentials {
-  user: string;
-  password: string;
-  again: string;
-}
+const credentialFields = z.object({ user: z.string(), password: z.string(), again: z.string() });
 
-export function validateCredentials(c: Credentials): Partial<Record<keyof Credentials, string>> {
-  const e: Partial<Record<keyof Credentials, string>> = {};
-  if (!USER.test(c.user)) e.user = 'Letters, digits and . _ @ -, up to 64.';
-  else if (c.user === API_USER) e.user = 'That one is MilkFlint’s own: choose another.';
+export type Credentials = z.infer<typeof credentialFields>;
+
+/** AdGuard Home's own sign-in: a user name, and a password typed twice. */
+export const credentialsSchema: z.ZodType<Credentials, Credentials> = credentialFields.superRefine((c, ctx) => {
+  const issue = (path: keyof Credentials, message: string): void => {
+    ctx.addIssue({ code: 'custom', path: [path], message });
+  };
+  if (!USER.test(c.user)) issue('user', 'Letters, digits and . _ @ -, up to 64.');
+  else if (c.user === API_USER) issue('user', 'That one is MilkFlint’s own: choose another.');
   // bcrypt uses 72 bytes of a password; golang's refuses longer ones
   const bytes = new TextEncoder().encode(c.password).length;
-  if (c.password.length < 8) e.password = 'At least 8 characters.';
-  else if (bytes > 72) e.password = 'At most 72 bytes (fewer characters with accents or emoji).';
-  else if (/[\r\n]/.test(c.password)) e.password = 'On one line.';
-  if (c.again !== c.password) e.again = 'The two don’t match.';
-  return e;
-}
+  if (c.password.length < 8) issue('password', 'At least 8 characters.');
+  else if (bytes > 72) issue('password', 'At most 72 bytes (fewer characters with accents or emoji).');
+  else if (/[\r\n]/.test(c.password)) issue('password', 'On one line.');
+  if (c.again !== c.password) issue('again', 'The two don’t match.');
+});
 
 export type Tone = 'success' | 'warning' | 'muted' | 'info';
 
@@ -85,14 +86,6 @@ export function needsAttention(s: AdGuardStatus | undefined): { fallback: boolea
   };
 }
 
-/** "v0.107.80" from the package's 0.107.80-r1 (its release number is MilkFlint's). */
-export function versionLabel(v: string | null | undefined): string {
-  if (v === null || v === undefined || v === '') return 'unknown';
-  const m = /^([0-9][0-9a-z.]*)-r([0-9]+)$/.exec(v);
-  if (m === null) return v;
-  return m[2] === '1' ? `v${m[1] ?? ''}` : `v${m[1] ?? ''} (build ${m[2] ?? ''})`;
-}
-
 /** The share of lookups it blocked, e.g. "12.4%"; undefined before any. */
 export function blockedShare(stats: AdGuardStatus['stats']): string | undefined {
   return stats === null || stats === undefined ? undefined : shareOf(stats.blocked, stats.queries);
@@ -103,42 +96,6 @@ export function shareOf(blocked: number, queries: number): string | undefined {
   if (queries <= 0) return undefined;
   const p = (blocked / queries) * 100;
   return `${p < 10 ? p.toFixed(1) : p.toFixed(0)}%`;
-}
-
-/** apk's order of two versions (0.107.80-r1 after 0.107.79-r3), numbers as numbers. */
-export function compareVersions(a: string, b: string): number {
-  const pa = a.replace(/-r/, '.').split('.');
-  const pb = b.replace(/-r/, '.').split('.');
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = Number(pa[i] ?? 0);
-    const y = Number(pb[i] ?? 0);
-    if (x !== y) return x < y ? -1 : 1;
-  }
-  return 0;
-}
-
-export interface UpdateChoice {
-  installed: string | undefined;
-  latest: string | undefined;
-  /** The feed has a newer one than the installed one. */
-  newer: boolean;
-  /** Earlier versions to go back to, newest first. */
-  earlier: string[];
-  /** Installed as an earlier version on purpose (pinned until the next update). */
-  pinned: boolean;
-}
-
-export function updateChoice(installed: string | null | undefined, u: UpdateInfo | null | undefined): UpdateChoice {
-  const have = installed ?? undefined;
-  const versions = [...(u?.versions ?? [])].sort((a, b) => compareVersions(b, a));
-  const latest = u?.latest ?? versions[0] ?? undefined;
-  return {
-    installed: have,
-    latest,
-    newer: have !== undefined && latest !== undefined && compareVersions(latest, have) > 0,
-    earlier: have === undefined ? [] : versions.filter((v) => compareVersions(v, have) < 0),
-    pinned: (u?.pinned ?? undefined) !== undefined && u?.pinned === have,
-  };
 }
 
 export interface NetworkRow {

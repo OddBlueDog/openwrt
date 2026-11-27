@@ -6,12 +6,21 @@ import { RouterOnly } from '@/components/router-only';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { featureById } from '@/features';
 import { LoginPage } from '@/pages/login';
-import { useRawRoute, useRoute, useSubPath } from '@/lib/router';
+import { useRawRoute, useRoute } from '@/lib/router';
 import { useRouterMode } from '@/lib/router-mode';
 import { useSession } from '@/lib/session';
 
 // a test bench's page for the devices that join it: no admin sign-in
 const JoinPage = lazy(() => import('@/features/test-bench/join-page').then((m) => ({ default: m.JoinPage })));
+
+/** #/test-bench/join/<code>: outside the sign-in gate and the shell. */
+export function Join(): ReactElement {
+  return (
+    <Suspense fallback={null}>
+      <JoinPage />
+    </Suspense>
+  );
+}
 
 // development only (#/specimen): every theme token and component; left out of production builds
 const Specimen = import.meta.env.DEV ? lazy(() => import('@/dev/specimen').then((m) => ({ default: m.SpecimenPage }))) : null;
@@ -19,7 +28,6 @@ const Specimen = import.meta.env.DEV ? lazy(() => import('@/dev/specimen').then(
 export function App(): ReactElement {
   const session = useSession();
   const route = useRoute();
-  const sub = useSubPath();
   const routerMode = useRouterMode();
   const raw = useRawRoute();
 
@@ -33,13 +41,6 @@ export function App(): ReactElement {
     );
   }
 
-  if (route === 'test-bench' && /^join(\/|$)/.test(sub)) {
-    return (
-      <Suspense fallback={null}>
-        <JoinPage />
-      </Suspense>
-    );
-  }
   if (session.status === 'anonymous') return <LoginPage reason={session.reason} />;
 
   const feature = featureById(route);

@@ -1,6 +1,6 @@
 // The AdGuard Home page's model: its state in words, when the Dashboard warns,
-// the sign-in form's checks (as AdGuard Home and bcrypt take a password), the
-// updates' choices (going back, kept back) and the networks' subnets.
+// the sign-in form's checks (as AdGuard Home and bcrypt take a password) and
+// the networks' subnets. (Its Updates card's versions: package-versions.test.ts.)
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { AdGuardStatus, Setting } from '../src/features/adguardhome/api.ts';
@@ -13,15 +13,16 @@ import {
   windowText,
   API_USER,
   blockedShare,
-  compareVersions,
   describeState,
   needsAttention,
   networkOf,
   networkRows,
-  updateChoice,
-  validateCredentials,
-  versionLabel,
+  credentialsSchema,
+  type Credentials,
 } from '../src/features/adguardhome/model.ts';
+import { formErrors } from '../src/lib/form/errors.ts';
+
+const validateCredentials = (c: Credentials): Partial<Record<keyof Credentials, string>> => formErrors(credentialsSchema, c);
 
 const status = (over: Partial<AdGuardStatus> = {}): AdGuardStatus => ({
   installed: true,
@@ -90,40 +91,6 @@ test('sign-in: a user name AdGuard Home takes, not MilkFlint’s own; a password
   assert.notEqual(validateCredentials({ ...good, password: '€'.repeat(25), again: '€'.repeat(25) }).password, undefined);
   assert.notEqual(validateCredentials({ ...good, password: 'two\nlines', again: 'two\nlines' }).password, undefined);
   assert.notEqual(validateCredentials({ ...good, again: 'correct horsf' }).again, undefined);
-});
-
-test('versions: as AdGuard Home names them, in apk’s order', () => {
-  assert.equal(versionLabel('1.0.0-r1'), 'v1.0.0');
-  assert.equal(versionLabel('0.107.80-r1'), 'v0.107.80');
-  assert.equal(versionLabel('0.107.80-r3'), 'v0.107.80 (build 3)');
-  assert.equal(versionLabel(null), 'unknown');
-  assert.ok(compareVersions('1.0.0-r1', '0.107.80-r1') > 0);
-  assert.ok(compareVersions('0.107.80-r1', '0.107.79-r3') > 0);
-  assert.ok(compareVersions('0.107.79-r3', '0.107.79-r1') > 0);
-  assert.ok(compareVersions('0.107.100-r1', '0.107.99-r1') > 0);
-  assert.equal(compareVersions('1.0.0-r1', '1.0.0-r1'), 0);
-});
-
-test('updates: a newer one to install, earlier ones to go back to, and one kept back', () => {
-  const feed = { versions: ['0.107.79-r1', '0.107.81-r1', '0.107.80-r1'], latest: '0.107.81-r1' };
-  const c = updateChoice('0.107.80-r1', feed);
-  assert.equal(c.newer, true);
-  assert.equal(c.latest, '0.107.81-r1');
-  assert.deepEqual(c.earlier, ['0.107.79-r1']);
-  assert.equal(c.pinned, false);
-  // gone back to 79: the newest is newer, and it's kept back until then
-  const back = updateChoice('0.107.79-r1', { ...feed, pinned: '0.107.79-r1' });
-  assert.equal(back.newer, true);
-  assert.equal(back.pinned, true);
-  assert.deepEqual(back.earlier, []);
-  // never checked
-  assert.deepEqual(updateChoice('0.107.80-r1', null), {
-    installed: '0.107.80-r1',
-    latest: undefined,
-    newer: false,
-    earlier: [],
-    pinned: false,
-  });
 });
 
 test('a blocked share: one decimal under 10%', () => {

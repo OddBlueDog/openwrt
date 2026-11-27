@@ -2,7 +2,7 @@
 // new tab), restart the router, or erase everything. A factory reset asks
 // for "reset" typed out, and says what the router is afterwards: no
 // password and Wi-Fi off, so only a cable reaches it.
-import { DownloadIcon, ExternalLinkIcon, LoaderCircleIcon, PowerIcon, RotateCcwIcon, TriangleAlertIcon } from 'lucide-react';
+import { ArrowRightIcon, DownloadIcon, LoaderCircleIcon, PowerIcon, RotateCcwIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useId, useState } from 'react';
 import { PageHeader } from '@/components/layout/page-header';
 import { Note } from '@/components/note';
@@ -12,10 +12,9 @@ import { Card } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { reboot } from '@/lib/api/system';
 import { errorMessage } from '@/lib/utils';
-import { factoryReset, saveBackup, waitForRouterAndReload } from './api';
 import { BackupFirst } from './backup-first';
+import { useRestart, useSaveBackup } from './queries';
 
 type Busy = 'restarting' | 'resetting' | undefined;
 
@@ -41,31 +40,24 @@ function Action({ title, children, action }: { title: string; children: ReactNod
 
 export function BackupResetPage(): ReactElement {
   const [dialog, setDialog] = useState<'restart' | 'reset'>();
-  const [busy, setBusy] = useState<Busy>();
-  const [error, setError] = useState<string>();
-  const [saving, setSaving] = useState(false);
   const [confirmText, setConfirmText] = useState('');
+  const backupMutation = useSaveBackup();
+  const restartMutation = useRestart();
+  const saving = backupMutation.isPending;
+  const error = backupMutation.error === null ? undefined : errorMessage(backupMutation.error);
+  const busy: Busy = !restartMutation.isPending
+    ? undefined
+    : restartMutation.variables === 'restart'
+      ? 'restarting'
+      : 'resetting';
 
-  const backup = async (): Promise<void> => {
-    setError(undefined);
-    setSaving(true);
-    try {
-      await saveBackup();
-    } catch (err) {
-      setError(errorMessage(err));
-    }
-    setSaving(false);
+  const backup = (): void => {
+    backupMutation.mutate();
   };
 
-  const run = async (what: 'restart' | 'reset'): Promise<void> => {
+  const run = (what: 'restart' | 'reset'): void => {
     setDialog(undefined);
-    setBusy(what === 'restart' ? 'restarting' : 'resetting');
-    try {
-      await (what === 'restart' ? reboot() : factoryReset());
-    } catch {
-      // the router may drop the connection while answering
-    }
-    await waitForRouterAndReload();
+    restartMutation.mutate(what);
   };
 
   return (
@@ -98,23 +90,19 @@ export function BackupResetPage(): ReactElement {
             title="Backup"
             action={
               <>
-                <Button variant="outline" onClick={() => void backup()} disabled={busy !== undefined || saving}>
+                <Button variant="outline" onClick={backup} disabled={busy !== undefined || saving}>
                   {saving ? <LoaderCircleIcon className="animate-spin" /> : <DownloadIcon />} Download backup
                 </Button>
                 <Button variant="ghost" asChild>
-                  <a href="/cgi-bin/luci/admin/system/flash" target="_blank" rel="noreferrer">
-                    Restore in LuCI <ExternalLinkIcon />
-                    <span className="sr-only">(opens in a new tab)</span>
+                  <a href="/cgi-bin/luci/admin/system/flash">
+                    Restore in LuCI <ArrowRightIcon />
                   </a>
                 </Button>
               </>
             }
           >
             <p>All your settings in one file, passwords included. Keep a copy before big changes.</p>
-            <p className="mt-1">
-              Restoring one is done in LuCI, OpenWrt’s own interface, which opens in a new tab on its Backup / Flash Firmware
-              page.
-            </p>
+            <p className="mt-1">Restoring one is done in LuCI, OpenWrt’s own interface, on its Backup / Flash Firmware page.</p>
           </Action>
           <Action
             title="Restart"
@@ -195,7 +183,9 @@ export function BackupResetPage(): ReactElement {
                 <Button
                   variant="destructive"
                   disabled={confirmText.trim().toLowerCase() !== 'reset'}
-                  onClick={() => void run('reset')}
+                  onClick={() => {
+                    run('reset');
+                  }}
                 >
                   Erase and restart
                 </Button>
@@ -216,7 +206,13 @@ export function BackupResetPage(): ReactElement {
                 >
                   Cancel
                 </Button>
-                <Button onClick={() => void run('restart')}>Restart</Button>
+                <Button
+                  onClick={() => {
+                    run('restart');
+                  }}
+                >
+                  Restart
+                </Button>
               </DialogFooter>
             </>
           )}

@@ -7,6 +7,7 @@
 // here: a zone's policies fall back to the global ones, which fall back to
 // drop; rules and port forwards are TCP and UDP unless they say otherwise.
 import { devctlPart } from '../device-control/names';
+import { isPortOrRange } from '@/lib/schemas';
 import { bool, type Change, list, type Section, str } from '@/lib/api/uci';
 import { INTERCEPT_SECTIONS } from '../dns/intercept';
 import type { FeatureId } from '../ids';
@@ -681,18 +682,11 @@ export function isAddress(v: string): boolean {
   return /^\d{1,3}$/.test(prefix) && Number(prefix) <= (v4 ? 32 : 128);
 }
 
-export function isMac(v: string): boolean {
-  return /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(v);
-}
+export { isMac } from '@/lib/schemas';
 
 /** A port or range (8000-8010, as fw4 also takes 8000:8010); undefined when fine. */
 export function portError(value: string): string | undefined {
-  const m = /^(\d{1,5})(?:[-:](\d{1,5}))?$/.exec(value);
-  const message = 'A port (1–65535) or a range like 8000-8010.';
-  if (m === null) return message;
-  const a = Number(m[1]);
-  const b = m[2] === undefined ? a : Number(m[2]);
-  return a < 1 || b > 65535 || b < a ? message : undefined;
+  return isPortOrRange(value) ? undefined : 'A port (1–65535) or a range like 8000-8010.';
 }
 
 /** Two port ranges ("25565", "8000-8010") overlap. */

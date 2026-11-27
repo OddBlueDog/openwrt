@@ -32,6 +32,7 @@ export const featureIds = [
   'upgrade',
   'time',
   'schedules',
+  'startup',
   'logs',
   'backup-reset',
   'themes',

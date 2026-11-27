@@ -4,6 +4,9 @@
 // a MilkFlint router gets a MilkFlint image (./keep.ts), and off otherwise
 // with the reason; erasing them is the destructive choice, and the
 // confirmation offers a backup first.
+import { pageLink } from '@/lib/router';
+import { useQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import { CheckCircle2Icon, CloudUploadIcon, FileIcon, LoaderCircleIcon, TriangleAlertIcon, XCircleIcon } from 'lucide-react';
 import { type ChangeEvent, type ReactElement, type ReactNode, useCallback, useEffect, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
@@ -15,15 +18,15 @@ import { Card, CardContent, CardFooter } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
 import { Switch } from '@/components/ui/switch';
-import { usePoll } from '@/hooks/use-poll';
-import { type Board, firmwareName, getBoard, getInfo } from '@/lib/api/system';
+import { type Board, firmwareName } from '@/lib/api/system';
+import { useLive } from '@/lib/query/use-live';
 import { formatBytes, formatDuration } from '@/lib/format';
-import { href } from '@/lib/router';
 import { cn, errorMessage } from '@/lib/utils';
-import { type RestartPhase, waitForRouterAndReload } from '../backup-reset/api';
+import type { RestartPhase } from '../backup-reset/api';
 import { BackupFirst } from '../backup-reset/backup-first';
-import { type Check, checkImage, discardImage, startUpgrade, uploadImage, type Validation, validateImage } from './api';
+import type { Check, Validation } from './api';
 import { erasedText, type KeepChoice, keepChoice } from './keep';
+import { upgradeQueries, useCheckImage, useDiscardImage, useStartUpgrade } from './queries';
 
 type Stage =
   | { kind: 'idle' }
@@ -116,9 +119,9 @@ function RunningNow({
           ) : (
             <Note tone="warning" icon={<TriangleAlertIcon />} title="The router didn’t restart">
               So the new firmware wasn’t installed. Upload the image again to retry; the{' '}
-              <a href={href('logs')} className="font-medium link">
+              <Link {...pageLink('logs')} className="font-medium link">
                 system log
-              </a>{' '}
+              </Link>{' '}
               may say what stopped it.
             </Note>
           )}
@@ -144,7 +147,21 @@ function Detail({ label, children }: { label: string; children: ReactNode }): Re
 }
 
 export function UpgradePage(): ReactElement {
-  const board = usePoll(getBoard, 60_000).data;
+  const board = useLive(upgradeQueries.board()).data;
+  const checkMutation = useCheckImage();
+  const discardMutation = useDiscardImage();
+  const upgradeMutation = useStartUpgrade();
+  // the time Install was pressed, kept across the reload; NaN when there's none to report
+  const [started] = useState(() => {
+    try {
+      return Number(sessionStorage.getItem(STARTED_KEY) ?? NaN);
+    } catch {
+      // storage blocked: nothing to report
+      return NaN;
+    }
+  });
+  const afterQuery = useQuery({ ...upgradeQueries.info(), enabled: !Number.isNaN(started) });
+  const after = afterQuery.data;
   const [stage, setStage] = useState<Stage>({ kind: 'idle' });
   // set from the image when it's checked (./keep.ts)
   const [keep, setKeep] = useState(false);
@@ -156,25 +173,20 @@ export function UpgradePage(): ReactElement {
 
   // After an upgrade's reload (and signing in again): did the router restart?
   // If it was up for longer than since Install, it didn't.
+  const [reported, setReported] = useState<number>();
+  if (after !== undefined && reported !== started) {
+    setReported(started);
+    // up for less than since Install, when the router answered: it restarted
+    setOutcome({ restarted: after.uptime < (afterQuery.dataUpdatedAt - started) / 1000, uptime: after.uptime });
+  }
   useEffect(() => {
-    let started = NaN;
+    if (reported === undefined) return;
     try {
-      started = Number(sessionStorage.getItem(STARTED_KEY) ?? NaN);
+      sessionStorage.removeItem(STARTED_KEY);
     } catch {
-      // storage blocked: nothing to report
+      // shown once more next time, no harm
     }
-    if (Number.isNaN(started)) return;
-    void getInfo()
-      .then((info) => {
-        setOutcome({ restarted: info.uptime < (Date.now() - started) / 1000, uptime: info.uptime });
-        try {
-          sessionStorage.removeItem(STARTED_KEY);
-        } catch {
-          // shown once more next time, no harm
-        }
-      })
-      .catch(() => undefined);
-  }, []);
+  }, [reported]);
 
   const upload = useCallback(
     async (file: File): Promise<void> => {
@@ -185,11 +197,15 @@ export function UpgradePage(): ReactElement {
       setForce(false);
       try {
         setStage({ kind: 'uploading', name: file.name, progress: 0 });
-        await uploadImage(file, (progress) => {
-          setStage({ kind: 'uploading', name: file.name, progress });
+        const { validation, check } = await checkMutation.mutateAsync({
+          file,
+          onProgress: (progress) => {
+            setStage({ kind: 'uploading', name: file.name, progress });
+          },
+          onChecking: () => {
+            setStage({ kind: 'checking', name: file.name });
+          },
         });
-        setStage({ kind: 'checking', name: file.name });
-        const [validation, check] = await Promise.all([validateImage(), checkImage()]);
         const choice = keepChoice({ running, image: file.name, allowBackup: validation.allow_backup });
         setKeep(choice.keep);
         setStage({ kind: 'ready', name: file.name, validation, check, choice });
@@ -197,7 +213,7 @@ export function UpgradePage(): ReactElement {
         setStage({ kind: 'error', message: errorMessage(err) });
       }
     },
-    [running],
+    [running, checkMutation],
   );
 
   // A firmware file dropped anywhere on the page is uploaded while the drop
@@ -244,7 +260,7 @@ export function UpgradePage(): ReactElement {
   };
 
   const discard = async (): Promise<void> => {
-    await discardImage().catch(() => undefined);
+    await discardMutation.mutateAsync();
     setStage({ kind: 'idle' });
   };
 
@@ -258,13 +274,12 @@ export function UpgradePage(): ReactElement {
       // no report after the reload, the upgrade still runs
     }
     setStage({ kind: 'upgrading', since, phase: 'starting' });
-    try {
-      await startUpgrade(keep, force);
-    } catch {
-      // the router may already be going down
-    }
-    await waitForRouterAndReload((phase) => {
-      setStage({ kind: 'upgrading', since, phase });
+    await upgradeMutation.mutateAsync({
+      keep,
+      force,
+      onPhase: (phase) => {
+        setStage({ kind: 'upgrading', since, phase });
+      },
     });
   };
 
@@ -445,9 +460,9 @@ export function UpgradePage(): ReactElement {
             {erasing ? (
               <Note tone="destructive" icon={<TriangleAlertIcon />} title="All settings are erased">
                 {erasedText(ready?.choice.kind ?? 'unknown')} A backup brings them back, on{' '}
-                <a href={href('backup-reset')} className="font-medium link">
+                <Link {...pageLink('backup-reset')} className="font-medium link">
                   Backup &amp; reset
-                </a>
+                </Link>
                 .
               </Note>
             ) : (

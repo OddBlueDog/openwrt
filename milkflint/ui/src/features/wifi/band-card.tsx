@@ -1,6 +1,8 @@
 // A band's card on Networks & radios, the whole band in one place: whether
 // it's on air and how it's doing now, its network (name, password, security,
 // the QR code to join it), then its radio (radio-card.tsx).
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ArrowDownIcon, ArrowUpIcon, EyeIcon, EyeOffIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { SNR_HINT } from '@/components/charts/signal-bars';
@@ -15,11 +17,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { formatBitrate, formatBytes, formatPercent } from '@/lib/format';
 import { wifiQrText } from '@/lib/qr';
-import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { explain } from '@/components/explain';
 import { channelLabel, LIVE_HISTORY, LIVE_POLL_MS, type LiveBand, modeLabel } from './live';
-import { bandLabel, cipherFits, type RadioForm, type RadioOptions, SECURITY_PLAIN, validateNetwork } from './model';
+import { bandLabel, cipherFits, networkErrors, type RadioForm, type RadioOptions, SECURITY_PLAIN } from './model';
 import { securityOptions } from './security';
 import type { RegRule } from '@/lib/api/wireless';
 import { RadioFields } from './radio-card';
@@ -68,9 +69,9 @@ function StatusLine({
       return (
         <>
           The network couldn’t start.{' '}
-          <a href={href('logs')} className="font-medium text-foreground underline underline-offset-2">
+          <Link {...pageLink('logs')} className="font-medium text-foreground underline underline-offset-2">
             The system log
-          </a>{' '}
+          </Link>{' '}
           says why (filter: hostapd).
         </>
       );
@@ -312,7 +313,7 @@ export function BandCard({
   /** The country's rules, for each channel's power limit */
   rules: readonly RegRule[] | undefined;
 }): ReactElement {
-  const errors = validateNetwork(form);
+  const errors = networkErrors(form);
   const id = (field: string): string => `${form.radio}-${field}`;
   const band = bandLabel(form.band);
   const iface = form.iface;
@@ -354,7 +355,7 @@ export function BandCard({
             {iface === undefined ? (
               <p className="py-4 text-sm text-muted-foreground">
                 This band has no network of its own.{' '}
-                <a href={LUCI_WIRELESS} target="_blank" rel="noreferrer" className="font-medium link">
+                <a href={LUCI_WIRELESS} className="font-medium link">
                   Set one up in LuCI
                 </a>
                 .

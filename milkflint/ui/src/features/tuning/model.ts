@@ -1,7 +1,8 @@
 // Performance tuning's model: the form, what it reads from the router's
 // configuration, what a save writes, and the labels the page and its
 // summary share.
-import { bool, type Change, getConfig, type Section, sectionChanges, str } from '@/lib/api/uci';
+import { z } from 'zod';
+import { bool, type Change, type Section, sectionChanges, str } from '@/lib/api/uci';
 import type { NetworkLive } from '@/hooks/use-network-live';
 import { formatNumber } from '@/lib/format';
 import { cpuText } from '@/lib/network-text';
@@ -17,8 +18,8 @@ import {
   aqlTotalError,
   aqlTotalOf,
   aqlTotalValue,
-  type Knobs,
   knobDefaults,
+  knobFields,
   knobOptions,
   knobSectionsChanged,
   readKnobs,
@@ -71,27 +72,32 @@ export type SteeringInUse = Exclude<Steering, 'auto'>;
 export type Gro = 'auto' | 'fraglist' | 'plain' | 'off';
 export type UdpFwd = 'auto' | 'on' | 'off';
 
-export interface TuningForm extends Knobs {
-  aql: Aql;
+const tuningFields = knobFields.extend({
+  aql: z.custom<Aql>(),
   /** the custom AQL limits, µs */
-  aqlLow: string;
-  aqlHigh: string;
+  aqlLow: z.string(),
+  aqlHigh: z.string(),
   /** the radio's total that holds devices to their low limit, and the custom one in µs */
-  aqlTotal: AqlTotal;
-  aqlTotalCustom: string;
-  steering: Steering;
+  aqlTotal: z.custom<AqlTotal>(),
+  aqlTotalCustom: z.string(),
+  steering: z.custom<Steering>(),
   /** switch Smart Queue's multi-queue CAKE with the steering */
-  followQueue: boolean;
-  gro: Gro;
-  udpFwd: UdpFwd;
+  followQueue: z.boolean(),
+  gro: z.custom<Gro>(),
+  udpFwd: z.custom<UdpFwd>(),
   /** the largest plain GRO packet in bytes, "" for the kernel's 64 KB */
-  groMax: string;
-  whole: Whole;
+  groMax: z.string(),
+  whole: z.custom<Whole>(),
   /** software flow offloading */
-  offload: boolean;
+  offload: z.boolean(),
   /** hardware offloading with Wireless Ethernet Dispatch */
-  wed: boolean;
-}
+  wed: z.boolean(),
+});
+
+export type TuningForm = z.infer<typeof tuningFields>;
+
+/** Every field of the form, by name. */
+export const tuningFieldNames = tuningFields.keyof().options;
 
 export interface TuningData {
   form: TuningForm;
@@ -205,13 +211,18 @@ function multiQueueSpreads(s: SteeringInUse): boolean {
   return s === 'rss' || s === 'rps';
 }
 
-export async function loadTuning(): Promise<TuningData> {
-  const [milkflint, network, sqm, firewall] = await Promise.all([
-    getConfig('milkflint').catch((): Section[] => []),
-    getConfig('network'),
-    getConfig('sqm').catch((): Section[] => []),
-    getConfig('firewall').catch((): Section[] => []),
-  ]);
+/** The page's settings, from milkflint, network, sqm and the firewall as uci has them. */
+export function tuningData({
+  milkflint,
+  network,
+  sqm,
+  firewall,
+}: {
+  milkflint: Section[];
+  network: Section[];
+  sqm: Section[];
+  firewall: Section[];
+}): TuningData {
   const fwDefaults = firewall.find((s) => s['.type'] === 'defaults');
   const section = (name: string): Section | undefined => milkflint.find((s) => s['.name'] === name);
   const aqlBe = str(section('wifi'), 'aql_be');
@@ -334,17 +345,19 @@ export function aqlHighOf(f: TuningForm): number {
   return f.aql === 'off' ? 12_000 : f.aql === 'custom' ? Number(f.aqlHigh) : Number(defaults.aqlHigh);
 }
 
-export function validate(f: TuningForm): Errors {
+/** The form and its checks: the AQL limits and the total. */
+export const tuningFormSchema: z.ZodType<TuningForm, TuningForm> = tuningFields.superRefine((f, ctx) => {
   const e: Errors = {};
   const totalError = aqlTotalError(f.aqlTotal, f.aqlTotalCustom, aqlHighOf(f));
   if (totalError !== undefined) e.aqlTotal = totalError;
-  if (f.aql !== 'custom') return e;
-  const ok = (v: string): boolean => /^\d{1,6}$/.test(v) && Number(v) >= 500 && Number(v) <= 50_000;
-  if (!ok(f.aqlLow)) e.aqlLow = 'Whole microseconds, 500 to 50,000.';
-  if (!ok(f.aqlHigh)) e.aqlHigh = 'Whole microseconds, 500 to 50,000.';
-  else if (e.aqlLow === undefined && Number(f.aqlHigh) < Number(f.aqlLow)) e.aqlHigh = 'At least the low limit.';
-  return e;
-}
+  if (f.aql === 'custom') {
+    const ok = (v: string): boolean => /^\d{1,6}$/.test(v) && Number(v) >= 500 && Number(v) <= 50_000;
+    if (!ok(f.aqlLow)) e.aqlLow = 'Whole microseconds, 500 to 50,000.';
+    if (!ok(f.aqlHigh)) e.aqlHigh = 'Whole microseconds, 500 to 50,000.';
+    else if (e.aqlLow === undefined && Number(f.aqlHigh) < Number(f.aqlLow)) e.aqlHigh = 'At least the low limit.';
+  }
+  for (const [path, message] of Object.entries(e)) ctx.addIssue({ code: 'custom', path: [path], message });
+});
 
 // Only what changed is written, so Restore defaults leaves alone what's
 // already the default (a LuCI Packet Steering "Enabled" stays as it is).

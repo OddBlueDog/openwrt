@@ -1,23 +1,21 @@
 // banIP and AdGuard Home on Home: what each is doing, and what it blocked.
 // Each reads its own status, only while it's on Home, every 30 s (the same
 // call as the notes above the grid).
+import { dashboardQueries } from './queries';
+import { useLive } from '@/lib/query/use-live';
 import type { ReactElement } from 'react';
 import { Sparkline } from '@/components/charts/sparkline';
-import { usePoll } from '@/hooks/use-poll';
 import { formatNumber } from '@/lib/format';
-import { href } from '@/lib/router';
-import { getAdGuardStatus } from '../adguardhome/api';
+import { pageLink } from '@/lib/router';
+import type { AdGuardStatus } from '../adguardhome/api';
+import { InsightsBody } from '../adguardhome/insights';
+import { useInsights } from '../adguardhome/queries';
 import { blockedShare, describeState as adguardState } from '../adguardhome/model';
-import { getStatusShared } from '../banip/api';
 import { describeState as banipState } from '../banip/model';
 import type { Tone } from './model';
-import { sharedCall } from '@/lib/shared-call';
 import { OffNote, StateBadge, Widget, WidgetLink } from './widget';
 
-const STATUS_MS = 30_000;
-
 // one call for every AdGuard Home widget on Home (banIP's is shared with Home's warning: banip/api.ts)
-const readAdGuard = sharedCall(getAdGuardStatus);
 
 /** The features' quiet tone is a state that's off here. */
 const tone = (t: Tone | 'muted'): Tone | 'off' => (t === 'muted' ? 'off' : t);
@@ -40,8 +38,8 @@ function Headline({ label, value, note }: { label: string; value: string; note?:
 
 export function BanipCard(): ReactElement {
   // a firmware without it answers "not found"
-  const { data, error } = usePoll(getStatusShared, STATUS_MS);
-  const link = <WidgetLink href={href('banip')}>banIP</WidgetLink>;
+  const { data, error } = useLive(dashboardQueries.banip());
+  const link = <WidgetLink to={pageLink('banip')}>banIP</WidgetLink>;
   if (data === undefined) {
     return (
       <Widget aside={error === undefined ? undefined : link}>
@@ -53,7 +51,7 @@ export function BanipCard(): ReactElement {
   if (!data.installed || data.enabled !== true || data.state === 'off' || data.state === 'ap') {
     return (
       <Widget aside={<StateBadge tone={tone(words.tone)}>{words.label}</StateBadge>}>
-        <OffNote action={data.state === 'ap' ? null : <WidgetLink href={href('banip')}>Turn on banIP</WidgetLink>}>
+        <OffNote action={data.state === 'ap' ? null : <WidgetLink to={pageLink('banip')}>Turn on banIP</WidgetLink>}>
           {data.state === 'ap'
             ? 'In access point mode the main router faces the internet.'
             : 'Blocks addresses on lists of known attackers, coming in and going out.'}
@@ -88,46 +86,62 @@ export function BanipCard(): ReactElement {
           label="Blocked"
           format={(n) => `${formatNumber(Math.round(n))} blocked`}
           timeOf={end === undefined ? undefined : (slot) => end - (series.length - 1 - slot) * drops.step}
-          className="-mb-5 h-auto min-h-10 flex-1 [&>svg]:absolute [&>svg]:inset-0 [&>svg]:rounded-b-[calc(var(--mf-radius-xl)-1px)]"
+          className="-mb-5 h-auto min-h-10 flex-1 overflow-hidden rounded-b-[calc(var(--mf-radius-xl)-1px)]"
         />
       )}
     </Widget>
   );
 }
 
-export function AdGuardCard(): ReactElement {
-  const { data, error } = usePoll(readAdGuard, STATUS_MS);
-  const link = <WidgetLink href={href('adguardhome')}>AdGuard Home</WidgetLink>;
+/** AdGuard Home's state for its widgets, and the widget itself while it's being read, failed or is off. */
+function useAdGuard(): { data: AdGuardStatus; aside: ReactElement } | { off: ReactElement } {
+  const { data, error } = useLive(dashboardQueries.adguard());
+  const link = <WidgetLink to={pageLink('adguardhome')}>AdGuard Home</WidgetLink>;
   if (data === undefined) {
-    return (
-      <Widget aside={error === undefined ? undefined : link}>
-        <OffNote action={null}>{error === undefined ? 'Reading AdGuard Home’s state…' : 'AdGuard Home didn’t answer.'}</OffNote>
-      </Widget>
-    );
+    return {
+      off: (
+        <Widget aside={error === undefined ? undefined : link}>
+          <OffNote action={null}>{error === undefined ? 'Reading AdGuard Home’s state…' : 'AdGuard Home didn’t answer.'}</OffNote>
+        </Widget>
+      ),
+    };
   }
   const words = adguardState(data);
+  const badge = <StateBadge tone={tone(words.tone)}>{words.label}</StateBadge>;
   if (!data.installed || data.enabled !== true || data.mode === 'ap') {
-    return (
-      <Widget aside={<StateBadge tone={tone(words.tone)}>{words.label}</StateBadge>}>
-        <OffNote action={data.mode === 'ap' ? null : <WidgetLink href={href('adguardhome')}>Turn on AdGuard Home</WidgetLink>}>
-          {data.mode === 'ap'
-            ? 'In access point mode the main router answers your devices’ lookups.'
-            : 'Blocks ads and trackers for every device, by their lookups.'}
-        </OffNote>
-      </Widget>
-    );
+    return {
+      off: (
+        <Widget aside={badge}>
+          <OffNote
+            action={data.mode === 'ap' ? null : <WidgetLink to={pageLink('adguardhome')}>Turn on AdGuard Home</WidgetLink>}
+          >
+            {data.mode === 'ap'
+              ? 'In access point mode the main router answers your devices’ lookups.'
+              : 'Blocks ads and trackers for every device, by their lookups.'}
+          </OffNote>
+        </Widget>
+      ),
+    };
   }
+  return {
+    data,
+    aside: (
+      <>
+        {badge}
+        {link}
+      </>
+    ),
+  };
+}
+
+export function AdGuardCard(): ReactElement {
+  const state = useAdGuard();
+  if ('off' in state) return state.off;
+  const { data, aside } = state;
   const stats = data.stats;
   const share = blockedShare(stats);
   return (
-    <Widget
-      aside={
-        <>
-          <StateBadge tone={tone(words.tone)}>{words.label}</StateBadge>
-          {link}
-        </>
-      }
-    >
+    <Widget aside={aside}>
       <Headline
         label="Lookups blocked"
         value={share ?? '—'}
@@ -143,6 +157,24 @@ export function AdGuardCard(): ReactElement {
           {`Average answer ${formatNumber(stats.avg_ms, stats.avg_ms < 10 ? 1 : 0)}\u00a0ms`}
         </p>
       )}
+    </Widget>
+  );
+}
+
+/** What AdGuard Home is seeing, as on its page: read only while it's on. */
+export function AdGuardInsightsCard(): ReactElement {
+  const state = useAdGuard();
+  if ('off' in state) return state.off;
+  return <InsightsWidget aside={state.aside} />;
+}
+
+function InsightsWidget({ aside }: { aside: ReactElement }): ReactElement {
+  const insights = useInsights();
+  return (
+    <Widget aside={aside} status={insights.span === undefined ? undefined : `Last ${insights.span}`}>
+      <div className="flex flex-col gap-4 px-5">
+        <InsightsBody insights={insights} widget />
+      </div>
     </Widget>
   );
 }

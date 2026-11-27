@@ -4,10 +4,10 @@
 import type { ReactElement } from 'react';
 import { CardHeading, InfoRow } from '@/components/card-heading';
 import { CpuLanes, RssTable } from '@/components/cpu-lanes';
+import { type Column, DataTable } from '@/components/data-table';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import type { NetworkLive } from '@/hooks/use-network-live';
+import type { NetworkLive, ThreadNow } from '@/hooks/use-network-live';
 import { formatNumber, formatPercent } from '@/lib/format';
 import { cpuText, pathSentence } from '@/lib/network-text';
 import type { TuningStatus } from './api';
@@ -49,6 +49,26 @@ function waitingText(share: number): string {
   return `${formatNumber(ms, ms < 10 ? 1 : 0)} ms/s`;
 }
 
+const figure = 'text-right whitespace-nowrap tabular';
+
+/** The threads as listed (Ethernet's, then Wi-Fi's rings and its sending thread); nothing sorts, as live rows would jump. */
+const threadColumns: readonly Column<ThreadNow>[] = [
+  {
+    label: 'Thread',
+    cell: (t) => (
+      <span className="flex min-w-0 flex-col">
+        <span>{t.role}</span>
+        <span className="text-xs break-all text-muted-foreground tabular">
+          <span className="font-mono">{t.name}</span> · {cpuText(t.cpus)}
+        </span>
+      </span>
+    ),
+  },
+  { label: 'Busy', cell: (t) => (t.load === undefined ? '…' : formatPercent(t.load)), className: figure },
+  { label: 'Waiting', cell: (t) => (t.waiting === undefined ? '…' : waitingText(t.waiting)), className: figure },
+  { label: 'Per wake', cell: (t) => (t.waitPerRunUs === undefined ? '…' : usText(t.waitPerRunUs)), className: figure },
+];
+
 /**
  * How long each network thread waits for a CPU while other work holds it
  * (the kernel's scheduler statistics, /proc/<pid>/schedstat), live. Read
@@ -72,35 +92,15 @@ export function WaitsCard({ status, live }: { status: TuningStatus | undefined; 
           <p className="text-sm text-muted-foreground">No network driver threads on this router.</p>
         ) : (
           <>
-            <Table>
-              <TableHeader>
-                <TableRow className="hover:bg-transparent">
-                  <TableHead>Thread</TableHead>
-                  <TableHead className="text-right">Busy</TableHead>
-                  <TableHead className="text-right">Waiting</TableHead>
-                  <TableHead className="text-right">Per wake</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {threads.map((t) => (
-                  <TableRow key={t.name}>
-                    <TableCell className="whitespace-normal">
-                      <span className="flex min-w-0 flex-col">
-                        <span>{t.role}</span>
-                        <span className="text-xs break-all text-muted-foreground tabular">
-                          <span className="font-mono">{t.name}</span> · {cpuText(t.cpus)}
-                        </span>
-                      </span>
-                    </TableCell>
-                    <TableCell className="text-right tabular">{t.load === undefined ? '…' : formatPercent(t.load)}</TableCell>
-                    <TableCell className="text-right tabular">{t.waiting === undefined ? '…' : waitingText(t.waiting)}</TableCell>
-                    <TableCell className="text-right tabular">
-                      {t.waitPerRunUs === undefined ? '…' : usText(t.waitPerRunUs)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+            <DataTable
+              label="Network threads"
+              columns={threadColumns}
+              rows={threads}
+              rowKey={(t) => t.name}
+              empty="No network driver threads on this router."
+              framed={false}
+              cards={false}
+            />
             <p className="text-xs text-muted-foreground">
               Busy is its share of one CPU; waiting, the time it was ready to run but another thread or softirq work held its CPU;
               per wake, how long that took on average each time it got the CPU.

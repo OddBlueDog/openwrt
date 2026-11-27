@@ -1,6 +1,7 @@
 import { ClockIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { timeQueries } from './queries';
 
 export const feature = {
   id: 'time',
@@ -13,4 +14,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.TimePage,
   ),
+  prefetch: (client) => {
+    client.query(timeQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

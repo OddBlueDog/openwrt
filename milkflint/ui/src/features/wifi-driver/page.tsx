@@ -4,16 +4,17 @@
 // each DSCP mark gets on Wi-Fi, and the beamforming the bands run with. The
 // everyday settings (names, passwords, channels) are on Networks & radios;
 // this page writes only its own options, so a save here never rewrites those.
-import { type ReactElement, useCallback, useMemo, useState } from 'react';
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
+import { useSuspenseQuery } from '@tanstack/react-query';
+import { type ReactElement, useMemo } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
 import { PageHeader } from '@/components/layout/page-header';
-import { FormSkeleton, LoadError } from '@/components/page-states';
+import { PageBoundary } from '@/components/page-boundary';
 import { useApply } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
 import { sectionChanges } from '@/lib/api/uci';
-import { href } from '@/lib/router';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
 import { BeamformingCard } from '../wifi/beamforming';
-import { loadWifi } from '../wifi/load';
 import {
   bandOrder,
   driverChanged,
@@ -24,53 +25,13 @@ import {
   radarCheckSeconds,
   radarNote,
   type RadioForm,
-  validateDriver,
 } from '../wifi/model';
 import { SaveArea } from '@/components/save-area';
+import { driverFormSchema } from './model';
+import { driverQueries } from './queries';
 import { AirtimeSection, GroupSection, MuruSection, SharingSection, TwtSection } from './sections';
 
-const loadDriver = (): ReturnType<typeof loadWifi> => loadWifi('driver');
-
 export function WifiDriverPage(): ReactElement {
-  const { data, error, loading, reload } = useLoad(loadDriver);
-  const [edits, setEdits] = useState<Record<string, RadioForm>>({});
-  const onApplied = useCallback(() => {
-    setEdits({});
-    reload();
-  }, [reload]);
-  const { state, apply } = useApply(onApplied);
-
-  const saved = useMemo(() => [...(data?.forms ?? [])].sort((a, b) => bandOrder(a.band) - bandOrder(b.band)), [data]);
-  const forms = useMemo(() => saved.map((f) => edits[f.radio] ?? f), [saved, edits]);
-  const dirty = forms.some((f, i) => driverChanged(f, saved[i]));
-  const invalid = forms.some((f) => Object.keys(validateDriver(f)).length > 0);
-  const warnings = data === undefined ? [] : impactLines(driverImpacts(forms, saved, data.options));
-
-  const save = (): void => {
-    if (data === undefined) return;
-    const changes = forms.flatMap((f, i) => {
-      const before = saved[i];
-      return before === undefined || !driverChanged(f, before) ? [] : driverChanges(f, before);
-    });
-    changes.push(...sectionChanges('milkflint', data.milkflint, 'wifi', driverSection(forms)));
-    // a radio its save restarts on radar channels stays off for its radar check
-    const radarS = Math.max(
-      0,
-      ...forms.map((f, i) => {
-        const before = saved[i];
-        return before !== undefined && driverChanges(f, before).length > 0 ? radarCheckSeconds(f, data.options[f.radio]) : 0;
-      }),
-    );
-    const note = radarNote(radarS);
-    void apply(changes, note === undefined ? undefined : { note });
-  };
-
-  const set =
-    (f: RadioForm) =>
-    <K extends keyof RadioForm>(key: K, value: RadioForm[K]): void => {
-      setEdits((e) => ({ ...e, [f.radio]: { ...(e[f.radio] ?? f), [key]: value } }));
-    };
-
   return (
     <>
       <PageHeader
@@ -79,40 +40,75 @@ export function WifiDriverPage(): ReactElement {
         status={
           <>
             Network names, passwords and channels are on{' '}
-            <a href={href('wifi')} className="font-medium link">
+            <Link {...pageLink('wifi')} className="font-medium link">
               Networks &amp; radios
-            </a>
+            </Link>
             .
           </>
         }
       />
+      <PageBoundary>
+        <WifiDriver />
+      </PageBoundary>
+    </>
+  );
+}
+
+function WifiDriver(): ReactElement {
+  const { data } = useSuspenseQuery(driverQueries.settings());
+  const saved = useMemo(() => [...data.forms].sort((a, b) => bandOrder(a.band) - bandOrder(b.band)), [data]);
+  const savedForm = useMemo(() => ({ radios: saved }), [saved]);
+  const { state, apply } = useApply();
+  const settings = useSettingsForm({
+    schema: driverFormSchema,
+    saved: savedForm,
+    onSave: ({ radios: forms }) => {
+      const changes = forms.flatMap((f, i) => {
+        const before = saved[i];
+        return before === undefined || !driverChanged(f, before) ? [] : driverChanges(f, before);
+      });
+      changes.push(...sectionChanges('milkflint', data.milkflint, 'wifi', driverSection(forms)));
+      // a radio its save restarts on radar channels stays off for its radar check
+      const radarS = Math.max(
+        0,
+        ...forms.map((f, i) => {
+          const before = saved[i];
+          return before !== undefined && driverChanges(f, before).length > 0 ? radarCheckSeconds(f, data.options[f.radio]) : 0;
+        }),
+      );
+      const note = radarNote(radarS);
+      return apply(changes, note === undefined ? undefined : { note });
+    },
+  });
+  const { form } = settings;
+  const forms = useFormValues(form).radios;
+  const warnings = impactLines(driverImpacts(forms, saved, data.options));
+
+  const set =
+    (f: RadioForm) =>
+    <K extends keyof RadioForm>(key: K, value: RadioForm[K]): void => {
+      form.setFieldValue('radios', (radios) => radios.map((r) => (r.radio === f.radio ? { ...r, [key]: value } : r)));
+    };
+
+  return (
+    <>
       <div className="flex flex-col gap-4">
         <ApplyStatus state={state} />
-        {error !== undefined && data === undefined ? (
-          <LoadError error={error} retry={reload} />
-        ) : loading && data === undefined ? (
-          <FormSkeleton />
-        ) : (
-          <>
-            <AirtimeSection forms={forms} saved={saved} set={set} />
-            <TwtSection forms={forms} options={data?.options ?? {}} set={set} />
-            <SharingSection forms={forms} options={data?.options ?? {}} set={set} />
-            <MuruSection forms={forms} options={data?.options ?? {}} set={set} />
-            <GroupSection forms={forms} set={set} />
-            <BeamformingCard />
-          </>
-        )}
+        <AirtimeSection forms={forms} saved={saved} set={set} />
+        <TwtSection forms={forms} options={data.options} set={set} />
+        <SharingSection forms={forms} options={data.options} set={set} />
+        <MuruSection forms={forms} options={data.options} set={set} />
+        <GroupSection forms={forms} set={set} />
+        <BeamformingCard />
       </div>
       <SaveArea
-        visible={dirty}
+        visible={settings.dirty}
         busy={state.phase === 'applying'}
-        invalid={invalid}
+        invalid={settings.invalid}
         warnings={warnings}
         confirm={undefined}
-        onSave={save}
-        onRevert={() => {
-          setEdits({});
-        }}
+        onSave={settings.save}
+        onRevert={settings.discard}
       />
     </>
   );

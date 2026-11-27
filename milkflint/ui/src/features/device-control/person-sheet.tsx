@@ -5,8 +5,13 @@
 // milkflint section and their firewall rules in one apply; the Firewall
 // page shows the same rules. A device only an older rule covers is taken
 // over here: its rule goes, and its times become Device control's.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { InfoIcon, PlusIcon, SearchIcon, ShieldBanIcon, Trash2Icon, TriangleAlertIcon, XIcon } from 'lucide-react';
+import { evaluate, useSelector } from '@tanstack/react-form';
 import { type ReactElement, useId, useMemo, useState } from 'react';
+import { formErrors } from '@/lib/form/errors';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
 import { EditorSheet } from '@/components/editor-sheet';
 import { Note } from '@/components/note';
 import { Button } from '@/components/ui/button';
@@ -14,7 +19,6 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Segmented } from '@/components/ui/segmented';
 import type { Change, Section } from '@/lib/api/uci';
-import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import type { FirewallConfig } from '../firewall/model';
 import { DialogField, ScheduleFields, SwitchRow } from '../firewall/parts';
@@ -35,6 +39,7 @@ import {
   windowOfRule,
   windowText,
 } from './model';
+import { initialForm, type SheetForm, sheetFieldNames, sheetFormSchema, type When } from './sheet-form';
 import { WeekTimeline } from './timeline';
 import { type Entry, formSpans } from './view';
 
@@ -61,66 +66,6 @@ export interface SheetData {
   adguard: 'on' | 'off' | 'none';
   /** DNS intercept on the home network */
   intercept: boolean;
-}
-
-type When = 'times' | 'always' | 'never';
-
-interface Form {
-  name: string;
-  devices: string[];
-  when: When;
-  windows: Window[];
-  safeSearch: boolean;
-  guest: boolean;
-  /** older rules taken over: deleted on save */
-  takeOver: string[];
-  manual: string;
-}
-
-function initialForm(entry: Entry | undefined, kind: 'person' | 'device', blocking: boolean): Form {
-  if (entry?.person !== undefined) {
-    const p = entry.person;
-    const own = entry.own;
-    return {
-      name: p.name ?? '',
-      devices: [...p.devices],
-      when: own?.always === true ? 'always' : (own?.windows.length ?? 0) > 0 || kind === 'person' ? 'times' : 'never',
-      windows: own?.windows.map((w) => ({ ...w, days: [...w.days] })) ?? [],
-      safeSearch: p.safeSearch,
-      guest: p.guest,
-      takeOver: [],
-      manual: '',
-    };
-  }
-  if (entry !== undefined) {
-    // a device only an older rule covers: its times, as Device control writes them
-    const windows = entry.older.flatMap((r) => {
-      const w = windowOfRule(r);
-      return w === undefined ? [] : [w];
-    });
-    const always = entry.older.some((r) => r.start === undefined && r.stop === undefined && r.days === undefined);
-    return {
-      name: entry.macs.length > 1 ? (entry.older[0]?.name ?? '') : '',
-      devices: [...entry.macs],
-      when: always ? 'always' : 'times',
-      windows,
-      safeSearch: false,
-      guest: false,
-      takeOver: entry.older.map((r) => r.section),
-      manual: '',
-    };
-  }
-  return {
-    name: '',
-    devices: [],
-    // blocking (the Firewall page's Block a device) starts on always; anything else on set times, as a group does
-    when: kind === 'device' && blocking ? 'always' : 'times',
-    windows: [],
-    safeSearch: false,
-    guest: false,
-    takeOver: [],
-    manual: '',
-  };
 }
 
 function ago(s: number | undefined): string | undefined {
@@ -239,6 +184,7 @@ export function PersonSheet({
   blocking = false,
   onClose,
   onSave,
+  onSubmit,
   onDelete,
 }: {
   data: SheetData;
@@ -254,7 +200,10 @@ export function PersonSheet({
   me: string | undefined;
   deviceName: (mac: string) => string | undefined;
   onClose: () => void;
-  onSave: (changes: Change[]) => void;
+  /** hands the changes over; the caller closes the sheet (the Firewall page's Block a device) */
+  onSave?: ((changes: Change[]) => void) | undefined;
+  /** applies the changes; the failure's message when that didn't go through (the sheet stays open with it) */
+  onSubmit?: ((changes: Change[]) => Promise<string | undefined>) | undefined;
   onDelete?: (() => void) | undefined;
 }): ReactElement {
   const id = useId();
@@ -265,10 +214,33 @@ export function PersonSheet({
       : entry.person !== undefined
         ? entry.person.name === undefined
         : entry.macs.length === 1;
-  const [f, setF] = useState<Form>(() => {
-    const start = initialForm(entry, single ? 'device' : 'person', blocking);
-    return entry === undefined && initialDevices !== undefined ? { ...start, devices: [...initialDevices] } : start;
+  // what it opened with: the form's saved settings
+  const [start] = useState<SheetForm>(() => {
+    const first = initialForm(entry, single ? 'device' : 'person', blocking);
+    return entry === undefined && initialDevices !== undefined ? { ...first, devices: [...initialDevices] } : first;
   });
+  const schema = useMemo(() => sheetFormSchema(single), [single]);
+  const [failed, setFailed] = useState<string>();
+  const settings = useSettingsForm({
+    schema,
+    saved: start,
+    onSave: async (values) => {
+      const changes = changesOf(values);
+      if (onSubmit !== undefined) setFailed(await onSubmit(changes));
+      else onSave?.(changes);
+    },
+  });
+  const { form } = settings;
+  const f = useFormValues(form);
+  const submitting = useSelector(form.store, (x) => x.isSubmitting);
+  // the sheet's own controls change the form through this, a field at a time
+  const setF = (update: (x: SheetForm) => SheetForm): void => {
+    const current = form.store.state.values;
+    const next = update(current);
+    for (const key of sheetFieldNames) {
+      if (!evaluate(current[key], next[key])) form.setFieldValue(key, next[key]);
+    }
+  };
   const isNew = entry === undefined;
   const taking = entry !== undefined && entry.person === undefined;
 
@@ -306,39 +278,35 @@ export function PersonSheet({
           ? `It’s in ${takenBy.get(manual) ?? ''} already.`
           : undefined;
 
-  const windowErrors = f.when === 'times' ? f.windows.map(windowError) : [];
-  const nameError =
-    !single && f.name.trim() === ''
-      ? 'A name for the group, like Sam or Games consoles.'
-      : f.name.length > 32
-        ? 'At most 32 characters.'
-        : undefined;
-  const devicesError = f.devices.length === 0 ? 'Pick at least one device.' : undefined;
-  const timesError =
-    f.when === 'times' && f.windows.length === 0 ? 'Add a time, or choose Always or Only when paused.' : undefined;
+  // the checks as they stand: the first one to fix holds the save back
+  const errors = formErrors(schema, f);
+  const nameError = errors['name'];
+  const devicesError = errors['devices'];
+  const timesError = errors['windows'];
+  const windowErrors = f.windows.map((_, i) => errors[`windows[${String(i)}]`]);
   const blocked = nameError ?? devicesError ?? timesError ?? windowErrors.find((e) => e !== undefined);
 
-  const personForm: PersonForm = {
-    name: single ? undefined : f.name.trim(),
-    devices: f.devices,
-    windows: f.when === 'times' ? f.windows : [],
-    always: f.when === 'always',
-    safeSearch: f.safeSearch,
-    guest: f.guest && f.when === 'times',
-  };
+  const personFormOf = (x: SheetForm): PersonForm => ({
+    name: single ? undefined : x.name.trim(),
+    devices: x.devices,
+    windows: x.when === 'times' ? x.windows : [],
+    always: x.when === 'always',
+    safeSearch: x.safeSearch,
+    guest: x.guest && x.when === 'times',
+  });
+  const personForm = personFormOf(f);
   const preview = formSpans(personForm.windows, personForm.always);
 
-  const save = (): void => {
+  function changesOf(x: SheetForm): Change[] {
     const taken = new Set([...data.firewall, ...data.milkflint].map((s) => s['.name']));
     const pid = entry?.person?.id ?? newPersonId(taken);
     const ctx = { cfg: data.cfg, firewall: data.firewall, milkflint: data.milkflint, deviceName };
-    const changes: Change[] = [
+    return [
       // older rules taken over go first, so the new rules never sit beside them
-      ...f.takeOver.map((section): Change => ({ op: 'delete', config: 'firewall', section })),
-      ...personChanges(pid, personForm, ctx),
+      ...x.takeOver.map((section): Change => ({ op: 'delete', config: 'firewall', section })),
+      ...personChanges(pid, personFormOf(x), ctx),
     ];
-    onSave(changes);
-  };
+  }
 
   const olderOfPerson: DeviceRule[] = entry?.person === undefined ? [] : entry.older;
   const privateOnes = f.devices.filter((m) => listed.find((d) => d.mac === m)?.privateMac === true);
@@ -361,7 +329,9 @@ export function PersonSheet({
       }
       onClose={onClose}
       status={
-        onDelete !== undefined ? (
+        failed !== undefined ? (
+          <span className="text-xs font-medium text-destructive">{failed}</span>
+        ) : onDelete !== undefined ? (
           <Button variant="ghost" className="text-destructive" onClick={onDelete}>
             <Trash2Icon /> Delete
           </Button>
@@ -374,7 +344,7 @@ export function PersonSheet({
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button disabled={blocked !== undefined} onClick={save}>
+          <Button disabled={blocked !== undefined || submitting} onClick={settings.save}>
             {isNew && single && blocking ? <ShieldBanIcon /> : null}
             {isNew ? (single && blocking ? 'Block' : 'Add') : 'Save'}
           </Button>
@@ -482,7 +452,7 @@ export function PersonSheet({
                     title={p.hint}
                     className="h-9"
                     onClick={() => {
-                      setF((x) => ({ ...x, windows: [...x.windows, { ...p.window, days: [...p.window.days] }] }));
+                      form.pushFieldValue('windows', { ...p.window, days: [...p.window.days] });
                     }}
                   >
                     <PlusIcon /> {p.window.label}
@@ -493,10 +463,7 @@ export function PersonSheet({
                   size="sm"
                   className="h-9"
                   onClick={() => {
-                    setF((x) => ({
-                      ...x,
-                      windows: [...x.windows, { start: '18:00', stop: '19:00', days: [...DAYS], label: 'Internet off' }],
-                    }));
+                    form.pushFieldValue('windows', { start: '18:00', stop: '19:00', days: [...DAYS], label: 'Internet off' });
                   }}
                 >
                   <PlusIcon /> Other time
@@ -520,7 +487,7 @@ export function PersonSheet({
                         size="icon"
                         aria-label={`Remove ${w.label}`}
                         onClick={() => {
-                          setF((x) => ({ ...x, windows: x.windows.filter((_, j) => j !== i) }));
+                          void form.removeFieldValue('windows', i);
                         }}
                       >
                         <XIcon />
@@ -532,12 +499,12 @@ export function PersonSheet({
                       value={w}
                       error={windowError(w)}
                       onChange={(s) => {
-                        setF((x) => ({
-                          ...x,
-                          windows: x.windows.map((y, j) =>
-                            j === i ? { ...y, start: s.start, stop: s.stop, days: s.days as Window['days'] } : y,
-                          ),
-                        }));
+                        void form.replaceFieldValue('windows', i, {
+                          ...w,
+                          start: s.start,
+                          stop: s.stop,
+                          days: s.days as Window['days'],
+                        });
                       }}
                     />
                   </li>
@@ -614,16 +581,16 @@ export function PersonSheet({
           {f.safeSearch && data.adguard !== 'on' && (
             <p className="text-xs text-muted-foreground">
               Without AdGuard Home, a family DNS server does it for every device instead:{' '}
-              <a href={href('dns')} className="link underline-offset-4">
+              <Link {...pageLink('dns')} className="link underline-offset-4">
                 DNS
-              </a>
+              </Link>
               {data.adguard === 'off' && (
                 <>
                   {' '}
                   or{' '}
-                  <a href={href('adguardhome')} className="link underline-offset-4">
+                  <Link {...pageLink('adguardhome')} className="link underline-offset-4">
                     turn on AdGuard Home
-                  </a>
+                  </Link>
                 </>
               )}
               .
@@ -632,9 +599,9 @@ export function PersonSheet({
           {f.safeSearch && !data.intercept && (
             <p className="text-xs text-muted-foreground">
               DNS intercept is off, so a device set to its own DNS server skips it. Turn it on on the{' '}
-              <a href={href('dns')} className="link underline-offset-4">
+              <Link {...pageLink('dns')} className="link underline-offset-4">
                 DNS page
-              </a>
+              </Link>
               .
             </p>
           )}

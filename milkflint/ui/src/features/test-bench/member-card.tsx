@@ -12,14 +12,14 @@ import {
 } from 'lucide-react';
 import { type ReactElement, type SyntheticEvent, useState } from 'react';
 import { SignalBars } from '@/components/charts/signal-bars';
+import { type Column, DataTable } from '@/components/data-table';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { formatNumber } from '@/lib/format';
 import { errorMessage } from '@/lib/utils';
 import type { Link, Member } from './api';
-import { Arrowed, Dir } from './dir';
+import { Arrowed, Dir } from '@/components/dir';
 import { presence } from './summary';
 import { agentText, parseAgent } from './ua';
 
@@ -162,29 +162,46 @@ export interface MemberEntry {
 }
 
 /** A member's row state: renaming, and an action under way or failed. */
-function useRow(): {
+interface RowState {
   editing: boolean;
-  setEditing: (v: boolean) => void;
   busy: boolean;
   error: string | undefined;
+}
+const IDLE: RowState = { editing: false, busy: false, error: undefined };
+
+/** A member's row: its entry and its state, with what changes that. */
+interface MemberRow extends RowState {
+  e: MemberEntry;
+  setEditing: (v: boolean) => void;
   act: (f: (() => Promise<void>) | undefined) => Promise<void>;
-} {
-  const [editing, setEditing] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-  const act = async (f: (() => Promise<void>) | undefined): Promise<void> => {
-    if (f === undefined) return;
-    setBusy(true);
-    setError(undefined);
-    try {
-      await f();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-  return { editing, setEditing, busy, error, act };
+}
+
+/** The rows, each with its state, kept by member here (its cells and its card share it). */
+function useRows(entries: readonly MemberEntry[]): MemberRow[] {
+  const [states, setStates] = useState<ReadonlyMap<string, RowState>>(new Map());
+  return entries.map((e) => {
+    const id = e.m.id;
+    const set = (s: Partial<RowState>): void => {
+      setStates((all) => new Map(all).set(id, { ...(all.get(id) ?? IDLE), ...s }));
+    };
+    return {
+      e,
+      ...(states.get(id) ?? IDLE),
+      setEditing: (editing) => {
+        set({ editing });
+      },
+      act: async (f) => {
+        if (f === undefined) return;
+        set({ busy: true, error: undefined });
+        try {
+          await f();
+          set({ busy: false });
+        } catch (err) {
+          set({ busy: false, error: errorMessage(err) });
+        }
+      },
+    };
+  });
 }
 
 /** You and Coordinator, as marks beside a device. */
@@ -267,73 +284,84 @@ const clockText = (m: Member): string =>
     ? 'not synced yet'
     : `±${formatNumber(m.clock_us / 1000, m.clock_us < 10_000 ? 1 : 0)} ms`;
 
-/** A device as a table row, on a wide screen. */
-function MemberTableRow({ e }: { e: MemberEntry }): ReactElement {
-  const { m, actions } = e;
-  const row = useRow();
-  return (
-    <TableRow className={e.me ? 'bg-primary-subtle/40 hover:bg-primary-subtle/40' : undefined}>
-      <TableCell className="min-w-48 whitespace-normal">
-        <NameBlock e={e} editing={row.editing} setEditing={row.setEditing} marks ip />
-        {row.error !== undefined && <p className="mt-1 text-xs text-destructive">{row.error}</p>}
-      </TableCell>
-      <TableCell className="max-w-72 text-xs whitespace-normal">
-        <LinkLine link={m.link} />
-      </TableCell>
-      <TableCell className="text-xs text-muted-foreground tabular">{clockText(m)}</TableCell>
-      <TableCell className="whitespace-normal">
-        <div className="flex flex-col items-start gap-1">
-          <Presence m={m} />
-          {e.phaseLabel !== undefined && (
-            <span className="text-xs font-medium">
-              <Arrowed text={e.phaseLabel} />
-            </span>
-          )}
-        </div>
-      </TableCell>
-      <TableCell className="text-right">
-        <div className="flex justify-end gap-1">
-          {actions.makeCoordinator !== undefined && (
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              className="size-8 text-muted-foreground hover:text-foreground"
-              aria-label={`Make ${m.name} the coordinator`}
-              title={`Make ${m.name} the coordinator`}
-              disabled={row.busy}
-              onClick={() => void row.act(actions.makeCoordinator)}
-            >
-              <CrownIcon />
-            </Button>
-          )}
-          {actions.remove !== undefined && (
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              className="size-8 text-muted-foreground hover:text-foreground"
-              aria-label={`Remove ${m.name} from the bench`}
-              title={`Remove ${m.name} from the bench`}
-              disabled={row.busy}
-              onClick={() => void row.act(actions.remove)}
-            >
-              <UserMinusIcon />
-            </Button>
-          )}
-        </div>
-      </TableCell>
-    </TableRow>
-  );
-}
+const iconButton = 'size-8 text-muted-foreground hover:text-foreground';
 
-/** A device as stacked lines, on a phone. */
-function MemberListItem({ e }: { e: MemberEntry }): ReactElement {
+/** The bench's devices in the order they joined: name, browser, how it's connected, its clock and state. */
+const memberColumns: readonly Column<MemberRow>[] = [
+  {
+    label: 'Device',
+    cell: (r) => (
+      <>
+        <NameBlock e={r.e} editing={r.editing} setEditing={r.setEditing} marks ip />
+        {r.error !== undefined && <p className="mt-1 text-xs text-destructive">{r.error}</p>}
+      </>
+    ),
+    className: 'min-w-48',
+  },
+  { label: 'Connected', cell: (r) => <LinkLine link={r.e.m.link} />, className: 'max-w-72 text-xs' },
+  { label: 'Clock', cell: (r) => clockText(r.e.m), className: 'text-xs whitespace-nowrap text-muted-foreground tabular' },
+  {
+    label: 'State',
+    cell: (r) => (
+      <div className="flex flex-col items-start gap-1">
+        <Presence m={r.e.m} />
+        {r.e.phaseLabel !== undefined && (
+          <span className="text-xs font-medium">
+            <Arrowed text={r.e.phaseLabel} />
+          </span>
+        )}
+      </div>
+    ),
+  },
+  {
+    label: 'Actions',
+    hidden: true,
+    cell: ({ e: { m, actions }, busy, act }) => (
+      <div className="flex justify-end gap-1">
+        {actions.makeCoordinator !== undefined && (
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className={iconButton}
+            aria-label={`Make ${m.name} the coordinator`}
+            title={`Make ${m.name} the coordinator`}
+            disabled={busy}
+            onClick={() => void act(actions.makeCoordinator)}
+          >
+            <CrownIcon />
+          </Button>
+        )}
+        {actions.remove !== undefined && (
+          <Button
+            type="button"
+            size="icon"
+            variant="ghost"
+            className={iconButton}
+            aria-label={`Remove ${m.name} from the bench`}
+            title={`Remove ${m.name} from the bench`}
+            disabled={busy}
+            onClick={() => void act(actions.remove)}
+          >
+            <UserMinusIcon />
+          </Button>
+        )}
+      </div>
+    ),
+    className: 'text-right',
+  },
+];
+
+/** You stand out among the rows. */
+const meRow = (r: MemberRow): { className?: string } =>
+  r.e.me ? { className: 'bg-primary-subtle/40 hover:bg-primary-subtle/40' } : {};
+
+/** A device as stacked lines, when there’s no room for the table. */
+function memberCard({ e, editing, setEditing, busy, error, act }: MemberRow): ReactElement {
   const { m, actions } = e;
-  const row = useRow();
   return (
-    <li className="flex flex-col gap-2 px-5 py-3">
-      <NameBlock e={e} editing={row.editing} setEditing={row.setEditing} marks={false} ip={false} />
+    <div className="flex flex-col gap-2 px-5 py-3">
+      <NameBlock e={e} editing={editing} setEditing={setEditing} marks={false} ip={false} />
       <div className="flex flex-wrap items-center gap-1.5 pl-6.5">
         <Presence m={m} />
         <Marks e={e} />
@@ -353,57 +381,36 @@ function MemberListItem({ e }: { e: MemberEntry }): ReactElement {
       {(actions.makeCoordinator !== undefined || actions.remove !== undefined) && (
         <div className="flex flex-wrap gap-2 pl-6.5">
           {actions.makeCoordinator !== undefined && (
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={row.busy}
-              onClick={() => void row.act(actions.makeCoordinator)}
-            >
+            <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void act(actions.makeCoordinator)}>
               <CrownIcon /> Make coordinator
             </Button>
           )}
           {actions.remove !== undefined && (
-            <Button type="button" size="sm" variant="ghost" disabled={row.busy} onClick={() => void row.act(actions.remove)}>
+            <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => void act(actions.remove)}>
               <UserMinusIcon /> Remove
             </Button>
           )}
         </div>
       )}
-      {row.error !== undefined && <p className="pl-6.5 text-xs text-destructive">{row.error}</p>}
-    </li>
+      {error !== undefined && <p className="pl-6.5 text-xs text-destructive">{error}</p>}
+    </div>
   );
 }
 
-/** The bench's devices: name, browser, how it's connected, its address, clock and state. A table on a wide screen, stacked rows on a phone. */
+/** The bench's devices: name, browser, how it's connected, its address, clock and state. A table when there's room, stacked rows when not. */
 export function MemberList({ entries }: { entries: readonly MemberEntry[] }): ReactElement {
+  const rows = useRows(entries);
   return (
-    <>
-      <div className="hidden lg:block">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Device</TableHead>
-              <TableHead>Connected</TableHead>
-              <TableHead>Clock</TableHead>
-              <TableHead>State</TableHead>
-              <TableHead className="text-right">
-                <span className="sr-only">Actions</span>
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {entries.map((e) => (
-              <MemberTableRow key={e.m.id} e={e} />
-            ))}
-          </TableBody>
-        </Table>
-      </div>
-      <ul className="divide-y border-t lg:hidden">
-        {entries.map((e) => (
-          <MemberListItem key={e.m.id} e={e} />
-        ))}
-      </ul>
-    </>
+    <DataTable
+      label="Devices"
+      columns={memberColumns}
+      rows={rows}
+      rowKey={(r) => r.e.m.id}
+      empty="No devices yet."
+      framed={false}
+      rowProps={meRow}
+      card={memberCard}
+      className="border-t"
+    />
   );
 }

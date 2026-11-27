@@ -15,15 +15,18 @@ import {
   reachOf,
   removal,
   type ServerData,
+  serverErrors,
   type ServerForm,
   subnetOf,
   toChanges,
-  validate,
   wanted,
 } from '../src/features/remote-access/model.ts';
 import { ipToInt } from '../src/lib/api/network.ts';
 import type { Wanted } from '../src/lib/api/owned.ts';
 import { applied, presentOf, section } from './uci-fixture.ts';
+
+// the form's checks, by the keys the page shows them under
+const validate = serverErrors;
 
 const KEY = `${'a'.repeat(42)}A=`;
 const OTHER = `${'b'.repeat(42)}E=`;

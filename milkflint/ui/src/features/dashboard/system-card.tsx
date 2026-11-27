@@ -1,7 +1,7 @@
 import type { ReactElement, ReactNode } from 'react';
 import { Progress } from '@/components/ui/progress';
 import { formatBytes, formatDuration, formatNumber } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import type { Dashboard } from './use-dashboard';
 import { Widget, WidgetLink } from './widget';
 import { useWidgetInfo } from './widget-info';
@@ -57,7 +57,7 @@ export function SystemCard({ d }: { d: Dashboard }): ReactElement {
   });
 
   return (
-    <Widget aside={<WidgetLink href={href('system-overview')}>Details</WidgetLink>}>
+    <Widget aside={<WidgetLink to={pageLink('system-overview')}>Details</WidgetLink>}>
       {/* as many rows as the widget has room for, two to a line when it's wide */}
       <div className="flex flex-1 flex-col gap-4 px-5">
         <dl className="grid grid-cols-1 content-start gap-x-6 @sm:grid-cols-2 [&>*]:border-t [&>*:first-child]:border-t-0 @sm:[&>*:nth-child(2)]:border-t-0">

@@ -41,3 +41,9 @@ test('totals add up what is shown', () => {
   assert.deepEqual(totals(shownRows(rows, 'devices', router, undefined)), { rx: 150, tx: 15 });
   assert.deepEqual(totals([]), { rx: 0, tx: 0 });
 });
+
+test('the router’s own MACs, to hide from the history the way shownRows hides its rows', async () => {
+  const { routerMacs } = await import('../src/features/data-statistics/model.ts');
+  assert.deepEqual([...routerMacs(rows, router)], ['aa:bb:cc:dd:ee:03']);
+  assert.deepEqual([...routerMacs(rows, undefined)], []);
+});

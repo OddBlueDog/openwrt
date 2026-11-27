@@ -1,7 +1,8 @@
 import { InfoIcon, LoaderCircleIcon, PlayIcon } from 'lucide-react';
-import { type ReactElement, useMemo, useState } from 'react';
+import { type ReactElement, useEffect, useMemo, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { Note } from '@/components/note';
+import { NumberInput } from '@/components/number-input';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -12,23 +13,27 @@ import { Switch } from '@/components/ui/switch';
 import { formatNumber } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
 import type { Member, Options, Phase, Poll, ScheduleRequest } from './api';
-import { Arrowed } from './dir';
+import { Arrowed } from '@/components/dir';
 import { clockText, phaseRoles, phaseStyle } from './phases';
 import {
   buildPlan,
   type CustomPlan,
   dataEstimate,
   defaultBudget,
-  defaultCustom,
+  MAX_BUDGET_MB,
   MAX_PHASE_S,
+  MAX_RUN_NAME,
+  MIN_BUDGET_MB,
   MIN_PHASE_S,
   planMembers,
   type PresetId,
   presets,
+  runName,
   scheduleLength,
   usesInternet,
 } from './plans';
 import { MAX_CUSTOM_SITES, parseSites, SITES } from './pages';
+import { planChoices } from './plan-memory';
 import { latencyTargets } from './probes';
 
 /** The phases one after another, as wide as they last. */
@@ -113,18 +118,14 @@ function Seconds({
         {label}
       </Label>
       <div className="flex items-center gap-1.5">
-        <Input
+        <NumberInput
           id={id}
-          type="number"
-          inputMode="numeric"
           min={min}
           max={MAX_PHASE_S}
+          integer
           value={value}
           className="h-7 w-16 text-right tabular"
-          onChange={(e) => {
-            const v = Number(e.target.value);
-            if (Number.isFinite(v)) onChange(Math.min(MAX_PHASE_S, Math.max(min, Math.round(v))));
-          }}
+          onChange={onChange}
         />
         <span className="text-xs text-muted-foreground">s</span>
       </div>
@@ -227,7 +228,7 @@ function mb(v: number): string {
 function SitesField({ sites, onSites }: { sites: readonly string[]; onSites: (s: string[]) => void }): ReactElement {
   const [text, setText] = useState(sites.join(', '));
   const parsed = parseSites(text);
-  const over = parsed.sites.length > MAX_CUSTOM_SITES;
+  const over = parsed.over;
   return (
     <div className="flex flex-col gap-1.5 border-b py-2.5 sm:col-span-2">
       <Label htmlFor="tb-sites" className="font-normal">
@@ -242,7 +243,7 @@ function SitesField({ sites, onSites }: { sites: readonly string[]; onSites: (s:
         spellCheck={false}
         onChange={(e) => {
           setText(e.target.value);
-          onSites(parseSites(e.target.value).sites.slice(0, MAX_CUSTOM_SITES));
+          onSites(parseSites(e.target.value).sites);
         }}
       />
       <span className={cn('text-xs', parsed.bad.length > 0 || over ? 'text-warning' : 'text-muted-foreground')}>
@@ -273,7 +274,7 @@ function Settings({
   /** the plan has DNS and page loads */
   pages: boolean;
   onDry: (v: boolean) => void;
-  onOptions: (o: Options) => void;
+  onOptions: (patch: Partial<Options>) => void;
 }): ReactElement {
   return (
     <div className={gridClass}>
@@ -293,7 +294,7 @@ function Settings({
         <Select
           value={options.latency}
           onValueChange={(v) => {
-            onOptions({ ...options, latency: v === 'eu' || v === 'us' ? v : 'uk' });
+            onOptions({ latency: v === 'eu' || v === 'us' ? v : 'uk' });
           }}
         >
           <SelectTrigger id="tb-latency" className="h-7 w-36">
@@ -313,17 +314,18 @@ function Settings({
           Data, each device
         </Label>
         <div className="flex items-center gap-1.5">
-          <Input
+          <NumberInput
             id="tb-budget"
-            type="number"
-            inputMode="numeric"
-            min={10}
-            max={100000}
+            min={MIN_BUDGET_MB}
+            max={MAX_BUDGET_MB}
+            integer
             value={options.budget_mb}
             className="h-7 w-24 text-right tabular"
-            onChange={(e) => {
-              const v = Math.round(Number(e.target.value));
-              if (Number.isFinite(v)) onOptions({ ...options, budget_mb: Math.min(100000, Math.max(10, v)) });
+            onChange={(v) => {
+              onOptions({ budget_mb: v });
+            }}
+            onEmpty={() => {
+              onOptions({ budget_mb: 0 });
             }}
           />
           <span className="text-xs text-muted-foreground">MB</span>
@@ -333,7 +335,7 @@ function Settings({
         <SitesField
           sites={options.custom_sites}
           onSites={(custom_sites) => {
-            onOptions({ ...options, custom_sites });
+            onOptions({ custom_sites });
           }}
         />
       )}
@@ -345,7 +347,7 @@ function Settings({
           <Select
             value={options.endpoint}
             onValueChange={(v) => {
-              onOptions({ ...options, endpoint: v === 'cloudflare' ? 'cloudflare' : 'dev' });
+              onOptions({ endpoint: v === 'cloudflare' ? 'cloudflare' : 'dev' });
             }}
           >
             <SelectTrigger id="tb-endpoint" className="h-7 w-48">
@@ -386,19 +388,27 @@ export function PlanCard({
   busy: boolean;
   onStart: (s: ScheduleRequest) => Promise<void>;
 }): ReactElement {
-  const [preset, setPreset] = useState<PresetId>('quick');
-  const [custom, setCustom] = useState<CustomPlan>(defaultCustom);
+  const [saved] = useState(() => planChoices.get());
+  const [preset, setPreset] = useState<PresetId>(saved.preset);
+  const [custom, setCustom] = useState<CustomPlan>(saved.custom);
   const [confirming, setConfirming] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string>();
   const [dry, setDry] = useState(false);
+  // undefined follows the plan's title; not saved with the other choices
+  const [name, setName] = useState<string>();
   // in development, loads stay on the dev server unless asked otherwise; a budget of 0 follows the plan
   const [options, setOptions] = useState<Options>({
     endpoint: import.meta.env.DEV ? 'dev' : 'cloudflare',
-    latency: 'uk',
-    budget_mb: 0,
-    custom_sites: [],
+    latency: saved.latency,
+    budget_mb: saved.budget_mb,
+    custom_sites: saved.custom_sites,
   });
+  const { latency, budget_mb, custom_sites } = options;
+  // the next visit starts where this one left off (not Rehearsal)
+  useEffect(() => {
+    planChoices.save({ preset, custom, latency, budget_mb, custom_sites });
+  }, [preset, custom, latency, budget_mb, custom_sites]);
   const pm = useMemo(() => planMembers(members), [members]);
   const estimate = dataEstimate(buildPlan(preset, pm, dry, custom).schedule, shaper);
   const budget = options.budget_mb > 0 ? options.budget_mb : defaultBudget(estimate);
@@ -407,6 +417,8 @@ export function PlanCard({
     [preset, pm, dry, custom, options, budget],
   );
   const names = useMemo(() => new Map(members.map((m) => [m.id, m.name])), [members]);
+  const planTitle = built.schedule.name ?? '';
+  const runTitle = runName(name, planTitle);
   const length = scheduleLength(built.schedule);
   const wan = usesInternet(built.schedule);
   const pages = built.schedule.phases.some((p) => p.kind === 'dns' || p.kind === 'household');
@@ -414,7 +426,8 @@ export function PlanCard({
     setStarting(true);
     setError(undefined);
     try {
-      await onStart(built.schedule);
+      await onStart({ ...built.schedule, name: runTitle });
+      setName(undefined);
       setConfirming(false);
     } catch (err) {
       setError(errorMessage(err));
@@ -426,6 +439,23 @@ export function PlanCard({
     <Card>
       <CardHeading title="Plan" description={presets.find((p) => p.id === preset)?.description} />
       <CardContent className="flex flex-col gap-4">
+        <div className={cn(rowClass, 'border-b-0 py-0')}>
+          <Label htmlFor="tb-name" className="font-normal">
+            Name
+          </Label>
+          <Input
+            id="tb-name"
+            className="max-w-72"
+            maxLength={MAX_RUN_NAME}
+            value={name ?? planTitle}
+            onChange={(e) => {
+              setName(e.target.value);
+            }}
+            onBlur={() => {
+              if (name?.trim() === '') setName(undefined);
+            }}
+          />
+        </div>
         <PresetPicker value={preset} onChange={setPreset} />
         {preset === 'custom' && <CustomOptions c={custom} onChange={setCustom} />}
         <Settings
@@ -435,7 +465,9 @@ export function PlanCard({
           wan={wan}
           pages={pages}
           onDry={setDry}
-          onOptions={setOptions}
+          onOptions={(patch) => {
+            setOptions((o) => ({ ...o, ...patch }));
+          }}
         />
         <div className="flex flex-col gap-2">
           <PhaseStrip phases={built.schedule.phases} />
@@ -488,8 +520,8 @@ export function PlanCard({
           <DialogHeader>
             <DialogTitle>Start {dry ? 'a rehearsal' : 'the run'}?</DialogTitle>
             <DialogDescription>
-              {built.schedule.name} on {String(members.length)} {members.length === 1 ? 'device' : 'devices'}, {clockText(length)}{' '}
-              long, starting a few seconds after you press Start. Any device can stop it, and it stops by itself at the end.
+              {runTitle} on {String(members.length)} {members.length === 1 ? 'device' : 'devices'}, {clockText(length)} long,
+              starting a few seconds after you press Start. Any device can stop it, and it stops by itself at the end.
               {!dry &&
                 wan &&
                 (estimate === undefined

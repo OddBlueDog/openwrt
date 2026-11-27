@@ -1,6 +1,7 @@
 import { GaugeIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { sqmQueries } from './queries';
 
 export const feature = {
   id: 'sqm',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.SqmPage,
   ),
+  prefetch: (client) => {
+    client.query(sqmQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

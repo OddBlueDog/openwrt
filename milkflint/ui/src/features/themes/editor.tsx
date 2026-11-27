@@ -2,6 +2,8 @@
 // go with it) or every colour one at a time, for light and dark, with the
 // draft drawn beside it and checked against WCAG 2.2 AA as you go. Saved on
 // the router as a custom theme (src/theme/custom.ts); a new one is put in use.
+import { Link, useNavigate } from '@tanstack/react-router';
+import { pageLink } from '@/lib/router';
 import { ArrowLeftIcon, CheckCircle2Icon, RotateCcwIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, useEffect, useMemo, useState } from 'react';
 import { Field } from '@/components/field';
@@ -13,7 +15,8 @@ import { Input } from '@/components/ui/input';
 import { Segmented } from '@/components/ui/segmented';
 import { TabPanel, Tabs } from '@/components/ui/tabs';
 import type { ApplyState } from '@/hooks/use-apply';
-import { previewTheme, saveCustomTheme, useTheme } from '@/lib/theme';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { previewTheme, useTheme } from '@/lib/theme';
 import { cn } from '@/lib/utils';
 import { type ContrastFailure, contrastFailures } from '@/theme/checks';
 import { toHex } from '@/theme/color';
@@ -34,7 +37,9 @@ import {
   TOKEN_LABELS,
 } from '@/theme/custom';
 import { themes as builtIn } from '@/theme/themes';
+import { themeFormSchema } from './model';
 import { ThemeSample } from './preview';
+import { useSaveTheme } from './queries';
 
 /** The draft's id while it's drawn beside the editor (never saved under it). */
 const DRAFT_ID = 'custom-draft';
@@ -193,13 +198,28 @@ export function ThemeEditor({
   takenIds: readonly string[];
   onStatus: (state: ApplyState) => void;
 }): ReactElement {
+  const navigate = useNavigate();
   const editing = source.id !== undefined;
   const { dark } = useTheme();
-  const [name, setName] = useState(source.name);
-  const [changes, setChanges] = useState(source.colors);
+  // the draft: what it's called and the colours changed from its base
+  const [saved] = useState(() => ({ name: source.name, colors: source.colors }));
+  const saveTheme = useSaveTheme();
+  const settings = useSettingsForm({
+    schema: themeFormSchema,
+    saved,
+    onSave: (values) => save(values.name.trim(), values.colors),
+  });
+  const { form } = settings;
+  const { name, colors: changes } = useFormValues(form);
+  const setName = (value: string): void => {
+    form.setFieldValue('name', value);
+  };
+  const setChanges = (next: (c: Record<SchemeName, ColorChanges>) => Record<SchemeName, ColorChanges>): void => {
+    form.setFieldValue('colors', next);
+  };
   const [scheme, setScheme] = useState<SchemeName>(dark ? 'dark' : 'light');
   const [tab, setTab] = useState<'main' | 'all'>('main');
-  const [busy, setBusy] = useState(false);
+  const busy = saveTheme.isPending;
   const base = source.base;
 
   const draft = useMemo(
@@ -228,7 +248,7 @@ export function ThemeEditor({
   const total = failures.light.length + failures.dark.length;
   const trimmed = name.trim();
   const nameError = trimmed === '' ? 'Give it a name.' : undefined;
-  const dirty = !editing || trimmed !== source.name || JSON.stringify(changes) !== JSON.stringify(source.colors);
+  const dirty = !editing || settings.dirty;
 
   const setScheme1 = (next: ColorChanges): void => {
     setChanges((c) => ({ ...c, [scheme]: next }));
@@ -248,27 +268,24 @@ export function ThemeEditor({
     }, 0);
   };
 
-  const save = async (): Promise<void> => {
-    setBusy(true);
+  async function save(named: string, colors: Record<SchemeName, ColorChanges>): Promise<void> {
     onStatus({ phase: 'applying' });
     try {
       if (source.id !== undefined) {
-        await saveCustomTheme({ id: source.id, name: trimmed, base: base.id, colors: changes });
-        onStatus({ phase: 'done', nothingChanged: false, note: `${trimmed} is saved.` });
+        await saveTheme.mutateAsync({ theme: { id: source.id, name: named, base: base.id, colors }, use: false });
+        onStatus({ phase: 'done', nothingChanged: false, note: `${named} is saved.` });
       } else {
-        await saveCustomTheme(
-          { id: newCustomId(trimmed, takenIds), name: trimmed, base: base.id, colors: changes },
-          { use: true },
-        );
-        onStatus({ phase: 'done', nothingChanged: false, note: `${trimmed} is saved and in use.` });
+        await saveTheme.mutateAsync({
+          theme: { id: newCustomId(named, takenIds), name: named, base: base.id, colors },
+          use: true,
+        });
+        onStatus({ phase: 'done', nothingChanged: false, note: `${named} is saved and in use.` });
       }
-      window.location.hash = '#/themes';
+      void navigate(pageLink('themes'));
     } catch (e) {
       onStatus({ phase: 'failed', message: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setBusy(false);
     }
-  };
+  }
 
   const mainRows = (list: readonly MainColor[]): ReactElement => (
     <ul className="flex flex-col divide-y">
@@ -298,10 +315,10 @@ export function ThemeEditor({
         description="Change its colours for light and dark; the preview shows them as you go."
         actions={
           <Button variant="outline" asChild>
-            <a href="#/themes">
+            <Link {...pageLink('themes')}>
               <ArrowLeftIcon />
               All themes
-            </a>
+            </Link>
           </Button>
         }
       />
@@ -415,14 +432,10 @@ export function ThemeEditor({
         }
         warningTitle="Some text or lines are hard to see"
         confirm={undefined}
-        onSave={() => {
-          void save();
-        }}
+        onSave={settings.save}
         onRevert={() => {
-          if (editing) {
-            setName(source.name);
-            setChanges(source.colors);
-          } else window.location.hash = '#/themes';
+          if (editing) settings.discard();
+          else void navigate(pageLink('themes'));
         }}
       />
     </>

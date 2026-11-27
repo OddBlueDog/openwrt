@@ -3,12 +3,15 @@
 // chart's scale, the busiest devices, and the path from the internet to the
 // devices. Pure functions, so the tests can check them.
 import type { FeatureId } from '@/features/ids';
-import { niceCeil } from '@/components/charts/path';
+import { niceCeil } from '@/components/charts/scale';
+import type { AddressName } from '@/lib/api/names';
+import type { Connections } from '../lan/connections-api';
 import { inSubnet, isReachable, type Neighbor } from '@/lib/api/network';
 import { formatBitrate, formatNumber, formatPercent } from '@/lib/format';
 import type { Sample as ProbeSample } from '../network-quality/api';
 import { possibleSamples, possibleTime } from '../network-quality/plausible';
 import { type ProbeSummary, summarize } from '../network-quality/score';
+import type { Client } from './use-dashboard';
 
 /**
  * Wired devices online: neighbours on the LAN that answered recently and
@@ -44,6 +47,95 @@ export function busiestFirst<T extends { down: number | undefined; up: number | 
   const active = devices.filter((d) => traffic(d) >= IDLE_BPS).sort((a, b) => traffic(b) - traffic(a));
   const idle = devices.filter((d) => traffic(d) < IDLE_BPS).sort((a, b) => (b.signal ?? -200) - (a.signal ?? -200));
   return [...active, ...idle];
+}
+
+/** Which devices Busiest devices lists: all of them, those on the Wi-Fi, or those on a cable. */
+export type BusyFilter = 'all' | 'wifi' | 'lan';
+
+/** What a device has received and sent through its connections now, bytes: one device across its addresses. */
+export interface WiredSum {
+  /** Its MAC, else the address when no MAC is known. */
+  key: string;
+  mac: string | undefined;
+  name: string | undefined;
+  /** Its IPv4 address if it has one, else the first it uses. */
+  ip: string | undefined;
+  received: number;
+  sent: number;
+}
+
+/**
+ * The connections' sums per device (milkflint.connections' summary: each
+ * address's in and out), folded by MAC; the router's own left out.
+ */
+export function wiredSums(devices: Connections['devices'], names: ReadonlyMap<string, AddressName>): WiredSum[] {
+  const byKey = new Map<string, WiredSum>();
+  for (const d of devices) {
+    if (d.addr === 'router') continue;
+    const who = names.get(d.addr);
+    const key = who?.mac ?? d.addr;
+    const sum = byKey.get(key) ?? { key, mac: who?.mac, name: who?.name, ip: undefined, received: 0, sent: 0 };
+    sum.received += d.in;
+    sum.sent += d.out;
+    if (sum.ip === undefined || (sum.ip.includes(':') && !d.addr.includes(':'))) sum.ip = d.addr;
+    byKey.set(key, sum);
+  }
+  return [...byKey.values()];
+}
+
+/** A device in Busiest devices: on the Wi-Fi (with its station's figures) or on a cable. */
+export interface BusyDevice {
+  key: string;
+  name: string | undefined;
+  ip: string | undefined;
+  wifi: Client | undefined;
+  /** bit/s */
+  down: number | undefined;
+  up: number | undefined;
+  signal: number | undefined;
+}
+
+/** The devices for a filter, busiest first: the Wi-Fi's from their stations, the rest from their connections. */
+export function busyDevices(
+  clients: readonly Client[],
+  wired: readonly {
+    key: string;
+    mac: string | undefined;
+    name: string | undefined;
+    ip: string | undefined;
+    down: number | undefined;
+    up: number | undefined;
+  }[],
+  filter: BusyFilter,
+): BusyDevice[] {
+  const onWifi = new Set(clients.map((c) => c.mac));
+  const wifi =
+    filter === 'lan'
+      ? []
+      : clients.map((c): BusyDevice => ({
+          key: c.mac,
+          name: c.name,
+          ip: c.ip,
+          wifi: c,
+          down: c.down,
+          up: c.up,
+          signal: c.signal,
+        }));
+  const cabled =
+    filter === 'wifi'
+      ? []
+      : wired
+          .filter((w) => w.mac === undefined || !onWifi.has(w.mac))
+          .map((w): BusyDevice => ({
+            key: w.key,
+            name: w.name,
+            ip: w.ip,
+            wifi: undefined,
+            down: w.down,
+            up: w.up,
+            signal: undefined,
+          }));
+  return busiestFirst([...wifi, ...cabled]);
 }
 
 export type Tone = 'success' | 'warning' | 'destructive' | 'info';

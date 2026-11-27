@@ -6,9 +6,9 @@
 // same rules as Device control's, in words, with the way back to them.
 import 'virtual:milkflint-themes.css';
 import '@/styles.css';
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, test, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
-import { cleanup, render } from 'vitest-browser-react';
+import { cleanup } from 'vitest-browser-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { DeviceControlPage } from '@/features/device-control/page';
 import { loadFirewall } from '@/features/firewall/api';
@@ -16,6 +16,8 @@ import type { Actions } from '@/features/firewall/forms';
 import { RulesTable } from '@/features/firewall/rules-table';
 import type * as Ubus from '@/lib/ubus';
 import { pickableThemes, setThemeId } from '@/lib/theme';
+import { DEFAULT_THEME_ID } from '@/theme/themes';
+import { renderWithProviders } from './render';
 
 vi.mock('@/lib/ubus', async (importOriginal) => {
   const real = await importOriginal<typeof Ubus>();
@@ -35,9 +37,9 @@ afterEach(async () => {
   await page.viewport(1400, 1000);
 });
 
-async function drawPage(): Promise<Awaited<ReturnType<typeof render>>> {
+async function drawPage(): Promise<Awaited<ReturnType<typeof renderWithProviders>>> {
   window.location.hash = '#/device-control';
-  const screen = await render(
+  const screen = await renderWithProviders(
     <TooltipProvider>
       <DeviceControlPage />
     </TooltipProvider>,
@@ -111,6 +113,10 @@ test('Add a single device opens a sheet for one device: no group name, its times
   await expect.element(sheet.getByRole('button', { name: 'Block', exact: true })).not.toBeInTheDocument();
 });
 
+// (the theme each test chooses is kept in localStorage, which the test files run after this one in the same
+// browser read as theirs: the default goes back after the last, as its explanations show inline)
+afterAll(() => setThemeId(DEFAULT_THEME_ID));
+
 describe.each(pickableThemes().map((t) => ({ name: t.name, id: t.id })))('$name', ({ id }) => {
   test('on a phone: no sideways scrolling, and the main buttons are big enough to tap', async () => {
     await setThemeId(id);
@@ -138,7 +144,7 @@ const actions: Actions = {
 
 test('the Firewall page shows Device control’s rules as its own: badged, for Sam, in words, edited there', async () => {
   const data = await loadFirewall();
-  const screen = await render(
+  const screen = await renderWithProviders(
     <TooltipProvider>
       <RulesTable data={data} counters={undefined} actions={actions} />
     </TooltipProvider>,

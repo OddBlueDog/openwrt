@@ -3,6 +3,7 @@
 // download; then what gets logged. The switches that change how the router
 // runs (debug counters and snapshot, the memory error checker) are on
 // Performance tuning, under Diagnostics.
+import { Link, useNavigate } from '@tanstack/react-router';
 import {
   BugOffIcon,
   DownloadIcon,
@@ -15,7 +16,7 @@ import {
   ShieldOffIcon,
   WifiOffIcon,
 } from 'lucide-react';
-import { type ReactElement, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { type ReactElement, type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { Note } from '@/components/note';
 import { PageHeader } from '@/components/layout/page-header';
 import { LoadError } from '@/components/page-states';
@@ -24,11 +25,13 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { TabPanel, Tabs } from '@/components/ui/tabs';
-import { usePoll } from '@/hooks/use-poll';
+import { useLive } from '@/lib/query/use-live';
+import { PageBoundary } from '@/components/page-boundary';
 import { formatBytes } from '@/lib/format';
-import { href, tabFrom, tabHref, useSubPath } from '@/lib/router';
+import { pageLink, type PageLink, tabFrom, tabLink, useSubPath } from '@/lib/router';
 import { cn } from '@/lib/utils';
-import { getLogStatus, type LogKind, type LogStatus, readLog } from './api';
+import type { LogKind, LogStatus } from './api';
+import { logsQueries } from './queries';
 import { LogSettingsCard } from './settings';
 
 const kinds: { id: LogKind; label: string; title: string }[] = [
@@ -53,7 +56,7 @@ const placeholders: Record<LogKind, string> = {
   crash: 'Filter, e.g. Oops, KFENCE or mt7915',
 };
 
-const DIAGNOSTICS = `${href('tuning')}/diagnostics`;
+const DIAGNOSTICS = pageLink('tuning', 'diagnostics');
 
 function severity(line: string): 'error' | 'warning' | undefined {
   if (/\.(err|crit|alert|emerg)\b|\berror\b|\bfailed\b|BUG:|Oops|Kernel panic/i.test(line)) return 'error';
@@ -94,11 +97,11 @@ function source(kind: LogKind, status: LogStatus | undefined): string {
   return 'since the last restart';
 }
 
-function Link({ to, children }: { to: string; children: ReactNode }): ReactElement {
+function PageLinkText({ to, children }: { to: PageLink; children: ReactNode }): ReactElement {
   return (
-    <a href={to} className="font-medium link">
+    <Link {...to} className="font-medium link">
       {children}
-    </a>
+    </Link>
   );
 }
 
@@ -121,8 +124,9 @@ function OffNote({ kind, status, empty }: { kind: LogKind; status: LogStatus | u
   if (kind === 'debug' && status !== undefined && !debugOn(status)) {
     return (
       <Note tone="info" icon={<BugOffIcon />} title="The debug log is off">
-        Turn on its counters or its snapshot on <Link to={DIAGNOSTICS}>Performance tuning, under Diagnostics</Link>, while chasing
-        a dropout. Older lines from when it was on are still shown.
+        Turn on its counters or its snapshot on{' '}
+        <PageLinkText to={DIAGNOSTICS}>Performance tuning, under Diagnostics</PageLinkText>, while chasing a dropout. Older lines
+        from when it was on are still shown.
       </Note>
     );
   }
@@ -145,8 +149,8 @@ function OffNote({ kind, status, empty }: { kind: LogKind; status: LogStatus | u
         )}
         {status?.kfence_active === false && (
           <Note tone="info" icon={<ShieldOffIcon />} title="The memory error checker is off">
-            Turn it on on <Link to={DIAGNOSTICS}>Performance tuning, under Diagnostics</Link>, while chasing a crash: the kernel
-            then reports memory it misuses here, with the code that did it. Crashes are kept either way.
+            Turn it on on <PageLinkText to={DIAGNOSTICS}>Performance tuning, under Diagnostics</PageLinkText>, while chasing a
+            crash: the kernel then reports memory it misuses here, with the code that did it. Crashes are kept either way.
           </Note>
         )}
       </div>
@@ -158,16 +162,17 @@ function OffNote({ kind, status, empty }: { kind: LogKind; status: LogStatus | u
 export function LogsPage(): ReactElement {
   // the log shown is in the address (#/logs/radar), so a link or the menu's search opens its tab
   const kind = tabFrom(useSubPath(), kinds, 'system');
+  const navigate = useNavigate();
   const setKind = (k: LogKind): void => {
-    window.location.hash = tabHref('logs', k, 'system');
+    void navigate(tabLink('logs', k, 'system'));
   };
   const [lines, setLines] = useState('500');
   const [query, setQuery] = useState('');
   const [follow, setFollow] = useState(true);
   const box = useRef<HTMLPreElement>(null);
 
-  const { data, error, refresh } = usePoll(() => readLog(kind, Number(lines)), follow ? 5000 : 3_600_000, `${kind}:${lines}`);
-  const { data: status, refresh: refreshStatus } = usePoll(getLogStatus, 15_000);
+  const { data, error, refresh } = useLive(logsQueries.log(kind, Number(lines), follow));
+  const { data: status } = useLive(logsQueries.status());
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
     return (data?.lines ?? []).filter((l) => q === '' || l.toLowerCase().includes(q));
@@ -188,10 +193,6 @@ export function LogsPage(): ReactElement {
 
   const where = source(kind, status);
   const reports = (status?.crash_reports ?? 0) + (status?.memory_reports ?? 0);
-  const onApplied = useCallback(() => {
-    refreshStatus();
-    refresh();
-  }, [refreshStatus, refresh]);
   const title = kinds.find((k) => k.id === kind)?.title ?? 'Log';
 
   return (
@@ -308,7 +309,9 @@ export function LogsPage(): ReactElement {
             </CardContent>
           </TabPanel>
         </Card>
-        <LogSettingsCard onApplied={onApplied} />
+        <PageBoundary fallback={null}>
+          <LogSettingsCard />
+        </PageBoundary>
       </div>
     </>
   );

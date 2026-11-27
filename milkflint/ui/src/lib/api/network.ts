@@ -36,6 +36,8 @@ const deviceSchema = z.object({
   speed: z.string().optional(),
   /** the speeds the port can do, e.g. "2500baseT-F" */
   'link-supported': z.array(z.string()).optional(),
+  /** the speeds the device at the other end of the cable offered */
+  'link-partner-advertising': z.array(z.string()).optional(),
   macaddr: z.string().optional(),
   'bridge-members': z.array(z.string()).optional(),
   statistics: z
@@ -44,6 +46,10 @@ const deviceSchema = z.object({
       tx_bytes: z.number(),
       rx_packets: z.number().optional(),
       tx_packets: z.number().optional(),
+      rx_errors: z.number().optional(),
+      tx_errors: z.number().optional(),
+      rx_dropped: z.number().optional(),
+      tx_dropped: z.number().optional(),
     })
     .loose()
     .optional(),
@@ -62,19 +68,75 @@ export function getBuiltinPorts(): Promise<BuiltinPort[]> {
   return call('luci', 'getBuiltinEthernetPorts', {}, z.object({ result: z.array(portSchema) })).then((r) => r.result);
 }
 
+// luci-rpc's lease times: seconds left (0 or less: expired), or false for a lease that never ends.
+const expiresSchema = z.union([z.number(), z.literal(false)]).optional();
 const leaseSchema = z.object({
   hostname: z.string().optional(),
   macaddr: z.string(),
   ipaddr: z.string().optional(),
-  expires: z.number().optional(),
+  expires: expiresSchema,
 });
-export type Lease = z.output<typeof leaseSchema>;
+const lease6Schema = z.object({
+  hostname: z.string().optional(),
+  macaddr: z.string().optional(),
+  duid: z.string().optional(),
+  ip6addr: z.string().optional(),
+  ip6addrs: z.array(z.string()).optional(),
+  expires: expiresSchema,
+});
+const leasesSchema = z
+  .object({ dhcp_leases: z.array(leaseSchema.loose()).optional(), dhcp6_leases: z.array(lease6Schema.loose()).optional() })
+  .loose();
+
+export interface Lease {
+  hostname?: string;
+  macaddr: string;
+  ipaddr?: string;
+  expires?: number | false;
+}
+/** A DHCPv6 lease; its addresses come without the "/128" luci-rpc adds. */
+export interface Lease6 {
+  hostname?: string;
+  macaddr?: string;
+  duid?: string;
+  ip6addrs: string[];
+  expires?: number | false;
+}
+
+function without128(a: string): string {
+  return a.endsWith('/128') ? a.slice(0, -4) : a;
+}
+
+/** luci-rpc's getDHCPLeases answer as the UI uses it: IPv4 and DHCPv6 leases. */
+export function leasesFrom(raw: unknown): { v4: Lease[]; v6: Lease6[] } {
+  const r = leasesSchema.parse(raw);
+  const v4 = (r.dhcp_leases ?? []).map((l): Lease => {
+    const out: Lease = { macaddr: l.macaddr };
+    if (l.hostname !== undefined) out.hostname = l.hostname;
+    if (l.ipaddr !== undefined) out.ipaddr = l.ipaddr;
+    if (l.expires !== undefined) out.expires = l.expires;
+    return out;
+  });
+  const v6 = (r.dhcp6_leases ?? []).map((l): Lease6 => {
+    const raws = l.ip6addrs ?? (l.ip6addr === undefined ? [] : [l.ip6addr]);
+    const out: Lease6 = { ip6addrs: raws.map(without128) };
+    if (l.hostname !== undefined) out.hostname = l.hostname;
+    if (l.macaddr !== undefined) out.macaddr = l.macaddr;
+    if (l.duid !== undefined) out.duid = l.duid;
+    if (l.expires !== undefined) out.expires = l.expires;
+    return out;
+  });
+  return { v4, v6 };
+}
+
+/** DHCP leases (dnsmasq and odhcpd), with the hostnames devices sent. */
+export function getDhcpLeases(): Promise<{ v4: Lease[]; v6: Lease6[] }> {
+  return call('luci-rpc', 'getDHCPLeases', {}, z.unknown()).then(leasesFrom);
+}
 
 /** DHCPv4 leases (dnsmasq), with the hostnames devices sent. */
 export function getLeases(): Promise<Lease[]> {
-  return call('luci-rpc', 'getDHCPLeases', {}, z.object({ dhcp_leases: z.array(leaseSchema).optional() }).loose()).then(
-    (r) => r.dhcp_leases ?? [],
-  );
+  return getDhcpLeases().then((l) => l.v4);
 }
 
 /** Interface name -> its IPv4 address with prefix, e.g. "192.168.1.1/24". */
@@ -106,9 +168,10 @@ const hintSchema = z.object({
   ip6addrs: z.array(z.string()).optional(),
 });
 export type HostHint = z.output<typeof hintSchema>;
+export type HostHints = Record<string, HostHint>;
 
 /** MAC -> names and addresses the router knows (neighbours, leases, /etc/ethers). */
-export function getHostHints(): Promise<Record<string, HostHint>> {
+export function getHostHints(): Promise<HostHints> {
   return call('luci-rpc', 'getHostHints', {}, z.record(z.string(), hintSchema));
 }
 

@@ -24,6 +24,7 @@ import { feature as portForwards } from './port-forwards/feature';
 import { feature as remoteAccess } from './remote-access/feature';
 import { feature as schedules } from './schedules/feature';
 import { feature as sqm } from './sqm/feature';
+import { feature as startup } from './startup/feature';
 import { feature as systemOverview } from './system-overview/feature';
 import { feature as testBench } from './test-bench/feature';
 import { feature as themes } from './themes/feature';
@@ -71,6 +72,7 @@ const byId: { readonly [K in FeatureId]: Feature & { id: K } } = {
   upgrade,
   time,
   schedules,
+  startup,
   logs,
   'backup-reset': backupReset,
   themes,

@@ -7,16 +7,18 @@
 // has to go (fit.ts) or be cut short with an ellipsis.
 import 'virtual:milkflint-themes.css';
 import '@/styles.css';
-import { describe, expect, test, vi } from 'vitest';
-import { cleanup, render } from 'vitest-browser-react';
+import { afterAll, describe, expect, test, vi } from 'vitest';
+import { cleanup } from 'vitest-browser-react';
 import type * as Ubus from '@/lib/ubus';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { type Editing, HomeGrid } from '@/features/dashboard/home-grid';
 import { sizeLabel } from '@/features/dashboard/layout';
 import { definition, type HomeData, WIDGET_IDS } from '@/features/dashboard/widgets';
 import { pickableThemes, setThemeId } from '@/lib/theme';
+import { DEFAULT_THEME_ID } from '@/theme/themes';
 import { dashboard, live, type Scenario, SCENARIOS } from './fixtures';
 import { answer } from './router';
+import { renderWithProviders } from './render';
 
 // the scenario the pretend router answers for; set before each drawing
 const router = vi.hoisted(() => ({ scenario: 'busy' }));
@@ -136,7 +138,7 @@ async function drawn(scenario: Scenario, width: string, editing?: Editing): Prom
   const data: HomeData = { d: dashboard(scenario), live: live(scenario), ap: scenario === 'ap' };
   // being edited, every widget shows (one with nothing to show says so)
   const shown = editing === undefined ? LAYOUT.filter((w) => definition(w.id).hidden?.(data) !== true) : LAYOUT;
-  const screen = await render(
+  const screen = await renderWithProviders(
     // as the app has it around every page (app.tsx)
     <TooltipProvider>
       <div style={{ width }}>
@@ -156,6 +158,10 @@ async function drawn(scenario: Scenario, width: string, editing?: Editing): Prom
   expect(cells.length).toBe(shown.length);
   return cells;
 }
+
+// (the theme each test chooses is kept in localStorage, which the test files run after this one in the same
+// browser read as theirs: the default goes back after the last, as its explanations show inline)
+afterAll(() => setThemeId(DEFAULT_THEME_ID));
 
 describe.each(pickableThemes().map((t) => ({ name: t.name, id: t.id })))('$name', ({ id }) => {
   test.each(SCENARIOS.flatMap((scenario) => WIDTHS.map((w) => ({ scenario, ...w }))))(

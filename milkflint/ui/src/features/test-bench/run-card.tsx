@@ -8,12 +8,12 @@ import { Card, CardContent } from '@/components/ui/card';
 import { formatBitrate, formatNumber, formatPercent } from '@/lib/format';
 import { cn, errorMessage } from '@/lib/utils';
 import type { Member, RouterLive } from './api';
-import { Arrowed, Dir } from './dir';
+import { Arrowed, Dir } from '@/components/dir';
 import type { BenchMember, MemberState } from './member';
 import { clockText, phaseRoles, phaseStyle } from './phases';
 import { PhaseStrip } from './plan-card';
 import { phaseAt } from './plans';
-import { useRunData } from './run-data';
+import { useRunData } from './queries';
 import { RunReport } from './run-report';
 import { runStatus } from './summary';
 
@@ -140,7 +140,7 @@ export function RunCard({ member, state }: { member: BenchMember; state: MemberS
   const over = run?.state === 'done' || run?.state === 'collecting';
   // read a few seconds after the end, once the members have sent what they held
   const { data, error: dataError } = useRunData(
-    member.session === undefined ? undefined : { session: member.session },
+    member.session === undefined || state.me === undefined ? undefined : { session: member.session, member: state.me },
     run?.id ?? '',
     over,
     3000,

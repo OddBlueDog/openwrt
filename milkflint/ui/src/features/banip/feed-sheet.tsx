@@ -3,7 +3,9 @@
 // its port limit), checked as banIP checks them, and tried out before it's
 // saved: the router fetches the address and counts what the rule finds.
 import { FlaskConicalIcon, LoaderCircleIcon, Trash2Icon } from 'lucide-react';
-import { type ReactElement, useId, useState } from 'react';
+import { type ReactElement, useId, useMemo, useState } from 'react';
+import { formErrors } from '@/lib/form/errors';
+import { useSheetForm } from '@/lib/form/use-sheet-form';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -11,7 +13,8 @@ import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/
 import { formatBytes, formatNumber } from '@/lib/format';
 import { errorMessage } from '@/lib/utils';
 import { type Feed, type FeedTest, removeFeed, saveFeed, testFeed } from './api';
-import { checkFeedForm, definitionOf, type FeedForm } from './feed-form';
+import { definitionOf, type FeedForm, feedFormSchema } from './feed-form';
+import { useBanipWrite } from './queries';
 
 const RULES = [
   { value: 'feed 1', label: 'One address or network a line' },
@@ -33,28 +36,51 @@ export function FeedSheet({
   onSaved: () => void;
 }): ReactElement {
   const id = useId();
-  const [f, setF] = useState<FeedForm>({
-    name: feed?.name ?? '',
-    descr: feed?.descr ?? '',
-    url_4: feed?.url_4 ?? '',
-    url_6: feed?.url_6 ?? '',
-    rule: feed?.rule ?? 'feed 1',
-    chain: feed?.chain === 'out' || feed?.chain === 'inout' ? feed.chain : 'in',
-    flag: feed?.flag ?? '',
+  const saved = useMemo(
+    (): FeedForm => ({
+      name: feed?.name ?? '',
+      descr: feed?.descr ?? '',
+      url_4: feed?.url_4 ?? '',
+      url_6: feed?.url_6 ?? '',
+      rule: feed?.rule ?? 'feed 1',
+      chain: feed?.chain === 'out' || feed?.chain === 'inout' ? feed.chain : 'in',
+      flag: feed?.flag ?? '',
+    }),
+    [feed],
+  );
+  const schema = useMemo(() => feedFormSchema(names, feed !== undefined), [names, feed]);
+  // banIP's reads are asked again once a list is saved or removed
+  const write = useBanipWrite();
+  const {
+    settings,
+    values: f,
+    failed: saveFailed,
+    submitting,
+  } = useSheetForm({
+    schema,
+    saved,
+    submit: (v) =>
+      write
+        .mutateAsync(() => saveFeed(v.name, definitionOf(v)))
+        .then(
+          () => {
+            onSaved();
+            return undefined;
+          },
+          (err: unknown) => errorMessage(err),
+        ),
   });
+  const { form } = settings;
   const [tried, setTried] = useState(false);
   const [busy, setBusy] = useState<string>();
   const [failed, setFailed] = useState<string>();
   const [test, setTest] = useState<FeedTest>();
-  const errors = checkFeedForm(f, names, feed !== undefined);
+  const errors: Partial<Record<keyof FeedForm, string>> = formErrors(schema, f);
   const show = (k: keyof FeedForm): string | undefined => (tried ? errors[k] : undefined);
-  const set = <K extends keyof FeedForm>(k: K, v: FeedForm[K]): void => {
-    setF((x) => ({ ...x, [k]: v }));
-  };
   const run = (what: string, fn: () => Promise<unknown>, after?: () => void): void => {
     setBusy(what);
     setFailed(undefined);
-    fn().then(
+    (what === 'test' ? fn() : write.mutateAsync(fn)).then(
       () => {
         setBusy(undefined);
         after?.();
@@ -101,7 +127,7 @@ export function FeedSheet({
               disabled={feed !== undefined}
               className="font-mono"
               onChange={(e) => {
-                set('name', e.target.value.toLowerCase());
+                form.setFieldValue('name', e.target.value.toLowerCase());
               }}
             />,
           )}
@@ -113,7 +139,7 @@ export function FeedSheet({
               id={`${id}-descr`}
               value={f.descr}
               onChange={(e) => {
-                set('descr', e.target.value);
+                form.setFieldValue('descr', e.target.value);
               }}
             />,
           )}
@@ -128,7 +154,7 @@ export function FeedSheet({
               className="font-mono text-xs"
               placeholder="https://example.org/blocklist.txt"
               onChange={(e) => {
-                set('url_4', e.target.value.trim());
+                form.setFieldValue('url_4', e.target.value.trim());
               }}
             />,
           )}
@@ -142,7 +168,7 @@ export function FeedSheet({
               spellCheck={false}
               className="font-mono text-xs"
               onChange={(e) => {
-                set('url_6', e.target.value.trim());
+                form.setFieldValue('url_6', e.target.value.trim());
               }}
             />,
           )}
@@ -153,7 +179,7 @@ export function FeedSheet({
             <Select
               value={RULES.some((r) => r.value === f.rule) ? f.rule : '__own'}
               onValueChange={(v) => {
-                if (v !== '__own') set('rule', v);
+                if (v !== '__own') form.setFieldValue('rule', v);
               }}
             >
               <SelectTrigger id={`${id}-rule`}>
@@ -173,7 +199,7 @@ export function FeedSheet({
               value={f.rule}
               className="font-mono text-xs"
               onChange={(e) => {
-                set('rule', e.target.value);
+                form.setFieldValue('rule', e.target.value);
               }}
             />
             {show('rule') !== undefined && <p className="text-xs text-destructive">{show('rule')}</p>}
@@ -189,7 +215,7 @@ export function FeedSheet({
             <Select
               value={f.chain}
               onValueChange={(v) => {
-                set('chain', v as FeedForm['chain']);
+                form.setFieldValue('chain', v as FeedForm['chain']);
               }}
             >
               <SelectTrigger id={`${id}-chain`}>
@@ -211,7 +237,7 @@ export function FeedSheet({
               value={f.flag}
               className="font-mono text-xs"
               onChange={(e) => {
-                set('flag', e.target.value.replace(/\s+/g, ' ').trimStart());
+                form.setFieldValue('flag', e.target.value.replace(/\s+/g, ' ').trimStart());
               }}
             />,
           )}
@@ -261,7 +287,7 @@ export function FeedSheet({
               </p>
             )}
           </div>
-          {failed !== undefined && <p className="text-sm text-destructive">{failed}</p>}
+          {(failed ?? saveFailed) !== undefined && <p className="text-sm text-destructive">{failed ?? saveFailed}</p>}
         </div>
         <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
           {feed !== undefined ? (
@@ -283,13 +309,14 @@ export function FeedSheet({
               Cancel
             </Button>
             <Button
-              disabled={busy !== undefined}
+              disabled={busy !== undefined || submitting}
               onClick={() => {
                 setTried(true);
-                if (Object.keys(errors).length === 0) run('save', () => saveFeed(f.name, definitionOf(f)), onSaved);
+                setFailed(undefined);
+                if (Object.keys(errors).length === 0) settings.save();
               }}
             >
-              {busy === 'save' && <LoaderCircleIcon className="animate-spin" />}
+              {submitting && <LoaderCircleIcon className="animate-spin" />}
               Save
             </Button>
           </div>

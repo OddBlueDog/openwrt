@@ -1,6 +1,7 @@
 import { RouteIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { vpnClientQueries } from './queries';
 
 export const feature = {
   id: 'vpn-client',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.VpnClientPage,
   ),
+  prefetch: (client) => {
+    client.query(vpnClientQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

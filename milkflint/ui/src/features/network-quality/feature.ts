@@ -1,6 +1,7 @@
 import { RadarIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { qualityQueries } from './queries';
 
 export const feature = {
   id: 'network-quality',
@@ -13,4 +14,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.NetworkQualityPage,
   ),
+  prefetch: (client) => {
+    client.query(qualityQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

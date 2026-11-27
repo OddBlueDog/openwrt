@@ -1,6 +1,7 @@
 // What the Firewall page's dialogs share that isn't a component: schedules,
 // device labels, lists typed into a field, and the actions the tabs call.
 import type { MouseEvent } from 'react';
+import { z } from 'zod';
 import type { Change } from '@/lib/api/uci';
 import type { Device } from './api';
 import { normalizeDay, type NatRule, type Redirect, type Rule, type Schedule, type Values, WEEKDAYS } from './model';
@@ -17,12 +18,14 @@ export function splitList(value: string): string[] {
     .filter((x) => x !== '');
 }
 
-export interface ScheduleForm {
-  start: string;
-  stop: string;
+export const scheduleFormSchema = z.object({
+  start: z.string(),
+  stop: z.string(),
   /** Mon … Sun */
-  days: string[];
-}
+  days: z.array(z.string()),
+});
+
+export type ScheduleForm = z.infer<typeof scheduleFormSchema>;
 
 export const bedtime: ScheduleForm = { start: '22:00', stop: '07:00', days: [...WEEKDAYS] };
 

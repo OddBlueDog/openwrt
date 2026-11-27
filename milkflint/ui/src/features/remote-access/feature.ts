@@ -1,6 +1,7 @@
 import { SmartphoneIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { remoteAccessQueries } from './queries';
 
 export const feature = {
   id: 'remote-access',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.RemoteAccessPage,
   ),
+  prefetch: (client) => {
+    client.query(remoteAccessQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

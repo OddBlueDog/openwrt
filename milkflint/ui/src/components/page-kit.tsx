@@ -3,6 +3,8 @@
 // choose one of (one selected style for every such choice), and a link with
 // its arrow. The "More settings" fold and the UCI lines in "Why?" come from
 // the Wi-Fi pages (../wifi/more-settings, ../wifi/explain).
+import type { PageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ChevronRightIcon, type LucideIcon } from 'lucide-react';
 import { type KeyboardEvent, type ReactElement, type ReactNode, useId, useRef } from 'react';
 import { Card } from '@/components/ui/card';
@@ -67,15 +69,12 @@ export function Figure({ children, className }: { children: ReactNode; className
 }
 
 /** A link to another page or place, with its arrow. */
-export function GoLink({ href, children, className }: { href: string; children: ReactNode; className?: string }): ReactElement {
+export function GoLink({ to, children, className }: { to: PageLink; children: ReactNode; className?: string }): ReactElement {
   return (
-    <a
-      href={href}
-      className={cn('inline-flex w-fit items-center gap-0.5 text-sm font-medium link underline-offset-4', className)}
-    >
+    <Link {...to} className={cn('inline-flex w-fit items-center gap-0.5 text-sm font-medium link underline-offset-4', className)}>
       {children}
       <ChevronRightIcon className="size-4 shrink-0" aria-hidden="true" />
-    </a>
+    </Link>
   );
 }
 

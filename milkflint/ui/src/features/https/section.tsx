@@ -3,10 +3,12 @@
 // keeps the settings (/etc/config/uhttpd, section main); the router side
 // (milkflint.https) says what the running web server does and makes a new
 // certificate. #/https lands here.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { InfoIcon, LoaderCircleIcon, LockIcon, RefreshCwIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactElement, useEffect, useState } from 'react';
 import { CardHeading, InfoRow } from '@/components/card-heading';
-import { Field } from '@/components/field';
+import { FormField } from '@/components/form';
 import { Note } from '@/components/note';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -15,7 +17,6 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Switch } from '@/components/ui/switch';
 import { canServe, cantServeText, type Https } from './use-https';
-import { href } from '@/lib/router';
 
 const date = (d: Date): string => d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
 
@@ -24,48 +25,62 @@ export function HttpsCard({ h, id }: { h: Https; id: string }): ReactElement | n
   const { data, form } = h;
   const config = data?.config;
   const status = data?.status;
+  const fields = h.settings.form;
   if (form === undefined || config === undefined || status === undefined) return null;
   const serve = canServe(status);
+  // a change makes the last save's outcome old news
+  const listeners = { onChange: h.resetState };
   return (
     <Card id={id} className="scroll-mt-6">
       <CardHeading
         title="HTTPS"
         description="An encrypted connection to these pages and LuCI, with the router’s own certificate. On by default, as on OpenWrt."
         action={
-          <Switch
-            checked={form.https}
-            // the firmware can't serve it: it can be turned off, not on
-            disabled={!serve && !form.https}
-            onCheckedChange={(v) => {
-              h.set('https', v);
-            }}
-            aria-label="HTTPS on"
-          />
+          <fields.Field name="https" listeners={listeners}>
+            {(field) => (
+              <Switch
+                checked={field.state.value}
+                // the firmware can't serve it: it can be turned off, not on
+                disabled={!serve && !field.state.value}
+                onCheckedChange={(v) => {
+                  field.handleChange(v);
+                }}
+                aria-label="HTTPS on"
+              />
+            )}
+          </fields.Field>
         }
       />
       <CardContent className="flex flex-col gap-3">
         <div className="divide-y border-t">
-          <Field
-            id="https-redirect"
-            label="Always use HTTPS"
-            hint="Opening the router’s HTTP address sends you on to HTTPS."
-            why={
-              <>
-                Off, HTTP keeps working beside HTTPS. On, every request to the HTTP address is answered with a redirect to HTTPS,
-                so nothing you type here crosses the network unencrypted. It’s LuCI’s Redirect to HTTPS: uhttpd’s{' '}
-                <span className="font-mono">redirect_https</span> option.
-              </>
-            }
-          >
-            <Switch
-              id="https-redirect"
-              checked={form.https && form.redirect}
-              disabled={!form.https || !serve}
-              onCheckedChange={(v) => {
-                h.set('redirect', v);
-              }}
-            />
-          </Field>
+          <fields.Field name="redirect" listeners={listeners}>
+            {(field) => (
+              <FormField
+                field={field}
+                id="https-redirect"
+                label="Always use HTTPS"
+                hint="Opening the router’s HTTP address sends you on to HTTPS."
+                why={
+                  <>
+                    Off, HTTP keeps working beside HTTPS. On, every request to the HTTP address is answered with a redirect to
+                    HTTPS, so nothing you type here crosses the network unencrypted. It’s LuCI’s Redirect to HTTPS: uhttpd’s{' '}
+                    <span className="font-mono">redirect_https</span> option.
+                  </>
+                }
+              >
+                {(control) => (
+                  <Switch
+                    {...control}
+                    checked={form.https && field.state.value}
+                    disabled={!form.https || !serve}
+                    onCheckedChange={(v) => {
+                      field.handleChange(v);
+                    }}
+                  />
+                )}
+              </FormField>
+            )}
+          </fields.Field>
         </div>
         {!serve && (
           <Note
@@ -75,9 +90,9 @@ export function HttpsCard({ h, id }: { h: Https; id: string }): ReactElement | n
             className="border-t pt-3"
           >
             {cantServeText(status)}{' '}
-            <a href={href('upgrade')} className="font-medium link underline-offset-4">
+            <Link {...pageLink('upgrade')} className="font-medium link underline-offset-4">
               Upgrade
-            </a>{' '}
+            </Link>{' '}
             to a MilkFlint release, which includes it.
           </Note>
         )}

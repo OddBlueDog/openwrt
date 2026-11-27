@@ -1,8 +1,10 @@
 // The LAN page's settings: the router's own address and network size, and
 // the DHCP server's pool (first address, how many, lease time), with the UCI
 // changes that make them. Plain functions, so ui/tests can run them.
+import { z } from 'zod';
 import { intToIp, ipToInt } from '@/lib/api/network';
 import type { Change } from '@/lib/api/uci';
+import { ipv4, isPrivateIpv4 } from '@/lib/schemas';
 
 export const prefixes = ['24', '23', '22', '16'] as const;
 
@@ -13,16 +15,45 @@ export const leaseTimes = [
   { value: '7d', label: '1 week' },
 ] as const;
 
-export interface LanForm {
-  ipaddr: string;
-  prefix: string;
-  dhcp: boolean;
-  start: string;
-  limit: string;
-  leasetime: string;
-  /** network.lan.ipaddr holds address/prefix (no netmask option) */
-  cidrStyle: boolean;
-}
+/**
+ * The form: the router's address and network size, and the DHCP pool. The
+ * address must be a private one that's neither the network's nor its
+ * broadcast address, and the pool has to fit in the network.
+ */
+export const lanFormSchema = z
+  .object({
+    ipaddr: ipv4('Enter an IPv4 address, e.g. 192.168.1.1.'),
+    prefix: z.string(),
+    dhcp: z.boolean(),
+    start: z.string(),
+    limit: z.string(),
+    leasetime: z.string(),
+    /** network.lan.ipaddr holds address/prefix (no netmask option) */
+    cidrStyle: z.boolean(),
+  })
+  .superRefine((f, ctx) => {
+    const size = 2 ** (32 - Number(f.prefix));
+    const ip = ipToInt(f.ipaddr);
+    if (ip !== undefined) {
+      const host = ip % size;
+      if (!isPrivateIpv4(ip))
+        ctx.addIssue({ code: 'custom', path: ['ipaddr'], message: 'Use a private address (10.x, 172.16–31.x or 192.168.x).' });
+      else if (host === 0 || host === size - 1)
+        ctx.addIssue({
+          code: 'custom',
+          path: ['ipaddr'],
+          message: 'That’s the network or broadcast address, not usable by the router.',
+        });
+    }
+    const start = Number(f.start);
+    const limit = Number(f.limit);
+    if (!Number.isInteger(start) || start < 1 || start >= size - 1)
+      ctx.addIssue({ code: 'custom', path: ['start'], message: `Use 1 to ${String(size - 2)}.` });
+    if (!Number.isInteger(limit) || limit < 1 || start + limit > size - 1)
+      ctx.addIssue({ code: 'custom', path: ['limit'], message: 'The range would run past the end of the network.' });
+  });
+
+export type LanForm = z.infer<typeof lanFormSchema>;
 
 export function netmaskOf(prefix: number): string {
   return intToIp(prefix === 0 ? 0 : (2 ** 32 - 2 ** (32 - prefix)) >>> 0);
@@ -47,27 +78,6 @@ export function range(f: LanForm): { first: string; last: string } | undefined {
 /** A lease time as words: the list's label, or what OpenWrt has ("2h") when it's another. */
 export function leaseLabel(value: string): string {
   return leaseTimes.find((t) => t.value === value)?.label ?? value;
-}
-
-export function validate(f: LanForm): Partial<Record<keyof LanForm, string>> {
-  const e: Partial<Record<keyof LanForm, string>> = {};
-  const ip = ipToInt(f.ipaddr);
-  const size = 2 ** (32 - Number(f.prefix));
-  if (ip === undefined) e.ipaddr = 'Enter an IPv4 address, e.g. 192.168.1.1.';
-  else {
-    const host = ip % size;
-    const first = Math.floor(ip / 16777216);
-    const second = Math.floor(ip / 65536) % 256;
-    const isPrivate = first === 10 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168);
-    if (!isPrivate) e.ipaddr = 'Use a private address (10.x, 172.16–31.x or 192.168.x).';
-    else if (host === 0 || host === size - 1) e.ipaddr = 'That’s the network or broadcast address, not usable by the router.';
-  }
-  const start = Number(f.start);
-  const limit = Number(f.limit);
-  if (!Number.isInteger(start) || start < 1 || start >= size - 1) e.start = `Use 1 to ${String(size - 2)}.`;
-  if (!Number.isInteger(limit) || limit < 1 || start + limit > size - 1)
-    e.limit = 'The range would run past the end of the network.';
-  return e;
 }
 
 export function toChanges(f: LanForm, before: LanForm): Change[] {

@@ -1,6 +1,7 @@
 import { CalendarClockIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { schedulesQueries } from './queries';
 
 export const feature = {
   id: 'schedules',
@@ -13,4 +14,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.SchedulesPage,
   ),
+  prefetch: (client) => {
+    client.query(schedulesQueries.crontab()).catch(() => undefined);
+  },
 } satisfies Feature;

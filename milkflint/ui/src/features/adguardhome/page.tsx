@@ -5,20 +5,22 @@
 // answer (on or off, what it's doing now: lookups and the share blocked),
 // then what's wrong if anything, its sign-in and updates, and how it fits
 // with the rest of the router.
+import { useQuery } from '@tanstack/react-query';
+import { Link } from '@tanstack/react-router';
 import {
   ChevronRightIcon,
   ExternalLinkIcon,
   InfoIcon,
   LoaderCircleIcon,
   PackageIcon,
-  RotateCcwIcon,
   TriangleAlertIcon,
   WrenchIcon,
 } from 'lucide-react';
-import { type ReactElement, type ReactNode, useState } from 'react';
+import { type ReactElement, type ReactNode, useMemo, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
-import { CardHeading, InfoRow } from '@/components/card-heading';
+import { CardHeading } from '@/components/card-heading';
 import { Field } from '@/components/field';
+import { PackageUpdatesCard } from '@/components/package-updates';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
@@ -27,27 +29,22 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import type { ApplyState } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { getConfig, type Section, str } from '@/lib/api/uci';
+import { formErrors } from '@/lib/form/errors';
+import { useFormValues, useSettingsForm } from '@/lib/form/use-settings-form';
+import { useLive } from '@/lib/query/use-live';
 import { formatBytes, formatNumber } from '@/lib/format';
-import { href } from '@/lib/router';
+import { href, pageLink } from '@/lib/router';
 import { useSession } from '@/lib/session';
+import { FEED_SITE, versionLabel } from '@/lib/package-versions';
 import { errorMessage } from '@/lib/utils';
-import { homeDhcp, readDeviceDns } from '../dns/device-dns';
-import { SERVER } from '../remote-access/sections';
 import { InsightsCard } from './insights';
-import { guestLabels, isGuestNetwork } from '../wifi-guest/guest';
 import {
   type AdGuardStatus,
-  checkUpdates,
   enableAdGuard,
   enableRouterLogin,
-  getAdGuardStatus,
-  installVersion,
+  type Around,
   openAdGuard,
   repairAdGuard,
   setCredentials,
@@ -58,36 +55,12 @@ import {
   adGuardOpenTarget,
   blockedShare,
   type Credentials,
+  credentialsSchema,
   describeState,
   networkRows,
   type Tone,
-  updateChoice,
-  validateCredentials,
-  versionLabel,
 } from './model';
-
-interface Around {
-  /** Devices on the home network are told to use another DNS server (the DNS page). */
-  ownServer: boolean;
-  /** Remote access's devices may open the router's pages (its zone accepts input). */
-  remoteAdmin: boolean | undefined;
-  guestLabel: (zone: string) => string | undefined;
-}
-
-async function loadAround(): Promise<Around> {
-  const [dhcp, firewall, milkflint] = await Promise.all([
-    getConfig('dhcp'),
-    getConfig('firewall'),
-    getConfig('milkflint').catch((): Section[] => []),
-  ]);
-  const zone = firewall.find((s) => s['.type'] === 'zone' && str(s, 'name') === SERVER);
-  const labels = guestLabels(milkflint);
-  return {
-    ownServer: readDeviceDns(homeDhcp(dhcp)).own,
-    remoteAdmin: zone === undefined ? undefined : str(zone, 'input') === 'ACCEPT',
-    guestLabel: (z) => (isGuestNetwork(z) ? labels[z] : undefined),
-  };
-}
+import { adguardQueries, useAdGuardWrite } from './queries';
 
 type Busy = { what: string } | undefined;
 
@@ -132,9 +105,9 @@ function RouterPasswordNote(): ReactElement | null {
       <AlertTitle>{old ? 'Your router still uses the default password' : 'Your router has no admin password yet'}</AlertTitle>
       <AlertDescription>
         Anyone who can sign in here can open AdGuard Home too. {old ? 'Change it' : 'Set one'} on{' '}
-        <a href={href('admin-password')} className={link}>
+        <Link {...pageLink('admin-password')} className={link}>
           Router access
-        </a>
+        </Link>
         .
       </AlertDescription>
     </Alert>
@@ -152,13 +125,12 @@ function CredentialsForm({
   busy: boolean;
   onSubmit: (c: Credentials) => void;
 }): ReactElement {
-  const [c, setC] = useState<Credentials>({ user: initialUser, password: '', again: '' });
+  const saved = useMemo((): Credentials => ({ user: initialUser, password: '', again: '' }), [initialUser]);
+  const { form } = useSettingsForm({ schema: credentialsSchema, saved, onSave: onSubmit });
+  const c = useFormValues(form);
   const [tried, setTried] = useState(false);
-  const errors = validateCredentials(c);
+  const errors: Partial<Record<keyof Credentials, string>> = formErrors(credentialsSchema, c);
   const show = (k: keyof Credentials): string | undefined => (tried || (k === 'again' && c.again !== '') ? errors[k] : undefined);
-  const set = (k: keyof Credentials, v: string): void => {
-    setC({ ...c, [k]: v });
-  };
   return (
     <form
       className="divide-y"
@@ -175,7 +147,7 @@ function CredentialsForm({
           spellCheck={false}
           value={c.user}
           onChange={(e) => {
-            set('user', e.target.value.trim());
+            form.setFieldValue('user', e.target.value.trim());
           }}
         />
       </Field>
@@ -186,7 +158,7 @@ function CredentialsForm({
           autoComplete="new-password"
           value={c.password}
           onChange={(e) => {
-            set('password', e.target.value);
+            form.setFieldValue('password', e.target.value);
           }}
         />
       </Field>
@@ -197,7 +169,7 @@ function CredentialsForm({
           autoComplete="new-password"
           value={c.again}
           onChange={(e) => {
-            set('again', e.target.value);
+            form.setFieldValue('again', e.target.value);
           }}
         />
       </Field>
@@ -208,136 +180,6 @@ function CredentialsForm({
         </Button>
       </div>
     </form>
-  );
-}
-
-function UpdatesCard({
-  s,
-  busy,
-  run,
-}: {
-  s: AdGuardStatus;
-  busy: Busy;
-  run: (what: string, fn: () => Promise<unknown>) => void;
-}): ReactElement {
-  const u = s.update ?? undefined;
-  const choice = updateChoice(s.version, u);
-  const [back, setBack] = useState<string>();
-  const working = u?.busy === true;
-  const checked = u?.checked === null || u?.checked === undefined ? undefined : new Date(u.checked * 1000);
-  return (
-    <Card>
-      <CardHeading
-        title="Updates"
-        description="From MilkFlint’s package feed, packaging AdGuard Home’s official releases. Its own updater is off."
-        action={
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={working || busy !== undefined}
-            onClick={() => {
-              run('check', checkUpdates);
-            }}
-          >
-            {working && u.action === 'check' && <LoaderCircleIcon className="animate-spin" />}
-            Check
-          </Button>
-        }
-      />
-      <CardContent className="flex flex-col gap-3">
-        <div className="divide-y">
-          <InfoRow label="Installed">
-            {versionLabel(choice.installed)}
-            {choice.pinned && ' (kept back)'}
-          </InfoRow>
-          <InfoRow label="Newest in the feed">
-            {choice.latest === undefined
-              ? u?.error === 'feed'
-                ? 'couldn’t reach the feed'
-                : 'not checked yet'
-              : versionLabel(choice.latest)}
-          </InfoRow>
-          {checked !== undefined && <InfoRow label="Checked">{checked.toLocaleString()}</InfoRow>}
-        </div>
-        {working && u.action === 'install' && (
-          <p className="flex items-center gap-2 text-sm text-muted-foreground">
-            <LoaderCircleIcon className="size-4 animate-spin" /> Installing; the router answers DNS itself meanwhile.
-          </p>
-        )}
-        {!working && u?.action === 'install' && u.ok === false && u.error === 'settings' && (
-          <p className="text-sm text-destructive">
-            That version can’t read AdGuard Home’s settings, which a newer version changed, so {versionLabel(u.installed)} is back
-            on.
-          </p>
-        )}
-        {!working && u?.action === 'install' && u.ok === false && u.error !== 'settings' && (
-          <p className="text-sm text-destructive">
-            The last install didn’t work
-            {u.log !== null && u.log !== undefined && u.log !== '' ? `: ${u.log.split('\n').slice(-2).join(' ')}` : '.'}
-          </p>
-        )}
-        {!working && u?.action === 'install' && u.ok === true && (
-          <p className="text-sm text-success">Installed {versionLabel(u.installed)}.</p>
-        )}
-        <div className="flex flex-wrap items-center gap-2">
-          {choice.newer && (
-            <Button
-              size="sm"
-              disabled={working || busy !== undefined}
-              onClick={() => {
-                run('install', () => installVersion(''));
-              }}
-            >
-              Update to {versionLabel(choice.latest)}
-            </Button>
-          )}
-          {choice.pinned && !choice.newer && choice.latest !== undefined && choice.latest !== choice.installed && (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={working || busy !== undefined}
-              onClick={() => {
-                run('install', () => installVersion(''));
-              }}
-            >
-              Back to the newest
-            </Button>
-          )}
-        </div>
-        {choice.earlier.length > 0 && (
-          <Field
-            id="agh-back"
-            label="Go back"
-            hint="If an update misbehaves: an earlier version from the feed, kept until you update again."
-            className="pb-0"
-          >
-            <div className="flex gap-2">
-              <Select value={back ?? ''} onValueChange={setBack}>
-                <SelectTrigger id="agh-back" className="min-w-0 flex-1">
-                  <SelectValue placeholder="An earlier version" />
-                </SelectTrigger>
-                <SelectContent>
-                  {choice.earlier.map((v) => (
-                    <SelectItem key={v} value={v}>
-                      {versionLabel(v)}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                variant="outline"
-                disabled={back === undefined || working || busy !== undefined}
-                onClick={() => {
-                  if (back !== undefined) run('install', () => installVersion(back));
-                }}
-              >
-                <RotateCcwIcon /> Install
-              </Button>
-            </div>
-          </Field>
-        )}
-      </CardContent>
-    </Card>
   );
 }
 
@@ -689,19 +531,20 @@ function Answer({
 }
 
 export function AdGuardHomePage(): ReactElement {
-  const { data: s, error, loading, refresh } = usePoll(getAdGuardStatus, 5000);
-  const around = useLoad(loadAround).data;
+  const { data: s, error, loading, refresh } = useLive(adguardQueries.status());
+  const around = useQuery(adguardQueries.around()).data;
   const [busy, setBusy] = useState<Busy>();
   const [toast, setToast] = useState<ApplyState>({ phase: 'idle' });
+  // every write, AdGuard Home's own sign-in included: the status is asked again once it went through
+  const write = useAdGuardWrite();
 
   const run = (what: string, fn: () => Promise<unknown>, done?: string): void => {
     setBusy({ what });
     setToast({ phase: 'idle' });
-    fn().then(
+    write.mutateAsync(fn).then(
       () => {
         setBusy(undefined);
         if (done !== undefined) setToast({ phase: 'done', nothingChanged: false, note: done });
-        refresh();
       },
       (err: unknown) => {
         setBusy(undefined);
@@ -739,14 +582,14 @@ export function AdGuardHomePage(): ReactElement {
             </p>
             <div className="mt-2 flex flex-wrap gap-2">
               <Button size="sm" asChild>
-                <a href={href('upgrade')}>
+                <Link {...pageLink('upgrade')}>
                   Upgrade <ChevronRightIcon />
-                </a>
+                </Link>
               </Button>
               <Button size="sm" variant="outline" asChild>
-                <a href={href('dns')}>
+                <Link {...pageLink('dns')}>
                   DNS page <ChevronRightIcon />
-                </a>
+                </Link>
               </Button>
             </div>
           </AlertDescription>
@@ -790,9 +633,9 @@ export function AdGuardHomePage(): ReactElement {
                 Another router gives your devices their addresses and answers their DNS lookups, so AdGuard Home here would filter
                 nothing: it stays off. Run it on that router, or on another server your devices use.
               </p>
-              <a href={href('mode')} className={`mt-1 inline-flex items-center gap-0.5 ${link}`}>
+              <Link {...pageLink('mode')} className={`mt-1 inline-flex items-center gap-0.5 ${link}`}>
                 Operating mode <ChevronRightIcon className="size-4" />
-              </a>
+              </Link>
             </AlertDescription>
           </Alert>
         )}
@@ -807,9 +650,9 @@ export function AdGuardHomePage(): ReactElement {
             Your devices still get answers, from the router itself, with the DNS page’s servers. MilkFlint sends their lookups
             back to AdGuard Home once it answers
             {s.reason === 'stopped' ? ', and starts it again every few minutes' : ''}. Its messages are on the{' '}
-            <a href={href('logs')} className={link}>
+            <Link {...pageLink('logs')} className={link}>
               Logs page
-            </a>
+            </Link>
             .
           </Problem>
         )}
@@ -824,9 +667,9 @@ export function AdGuardHomePage(): ReactElement {
             Nothing gets through unfiltered: their lookups keep going to AdGuard Home
             {s.reason === 'stopped' ? ', which is started again every 30 seconds' : ''}, and work again once it answers. To keep
             DNS working meanwhile, turn on “Answer them unfiltered” below. Its messages are on the{' '}
-            <a href={href('logs')} className={link}>
+            <Link {...pageLink('logs')} className={link}>
               Logs page
-            </a>
+            </Link>
             .
           </Problem>
         )}
@@ -857,9 +700,9 @@ export function AdGuardHomePage(): ReactElement {
           <Problem title="Your devices use another DNS server">
             The DNS page tells your home network’s devices to ask another server on your network directly, so AdGuard Home on the
             router doesn’t filter their lookups (only the guest networks’ and Remote access’s).{' '}
-            <a href={href('dns')} className={link}>
+            <Link {...pageLink('dns')} className={link}>
               DNS page
-            </a>
+            </Link>
           </Problem>
         )}
 
@@ -871,7 +714,14 @@ export function AdGuardHomePage(): ReactElement {
         {s.configured === true && (
           <div className="grid items-start gap-4 xl:grid-cols-2">
             <SignInCard s={s} busy={busy} run={run} />
-            <UpdatesCard s={s} busy={busy} run={run} />
+            <PackageUpdatesCard
+              name="adguardhome"
+              title="Updates"
+              notes="From MilkFlint’s package feed, packaging AdGuard Home’s official releases, offered once MilkFlint has tested them with this release. Its own updater is off."
+              installing="the router answers DNS itself meanwhile"
+              backNote="Your settings stay, in the format that version reads."
+              onInstalled={refresh}
+            />
           </div>
         )}
 
@@ -882,9 +732,9 @@ export function AdGuardHomePage(): ReactElement {
               <li>
                 Your devices keep asking the router (its own address, port 53): it hands their lookups to AdGuard Home with their
                 own address, and AdGuard Home sends what it doesn’t block to the router’s DNS, which uses the{' '}
-                <a href={href('dns')} className={link}>
+                <Link {...pageLink('dns')} className={link}>
                   DNS page
-                </a>
+                </Link>
                 ’s servers, cache and rebinding protection. Change those there, not in AdGuard Home.
               </li>
               <li>
@@ -894,9 +744,9 @@ export function AdGuardHomePage(): ReactElement {
               <li>
                 AdGuard Home knows devices by address. To give one its own rules, give it an address that doesn’t change (a
                 reservation on the{' '}
-                <a href={href('clients')} className={link}>
+                <Link {...pageLink('clients')} className={link}>
                   Clients page
-                </a>
+                </Link>
                 ), or a whole network its rules by its subnet:
               </li>
             </ul>
@@ -923,8 +773,9 @@ export function AdGuardHomePage(): ReactElement {
             <h3 className="font-medium text-foreground">License</h3>
             <p className="max-w-4xl">
               AdGuard Home is free software, under the GNU General Public License version 3. MilkFlint packages AdGuard’s official
-              release, unchanged, with its own service settings; MilkFlint isn’t made or endorsed by AdGuard, whose trademark the
-              name is.
+              release binary, unchanged, with its own service settings, and offers its updates from MilkFlint’s own package feed.
+              The release number after the version is MilkFlint’s build number, upstream’s plus 1000, so a same-named build from
+              OpenWrt can’t replace it. MilkFlint isn’t made or endorsed by AdGuard, whose trademark the name is.
             </p>
             <div className="flex flex-wrap gap-x-4 gap-y-1">
               <a href={s.licenses?.license} target="_blank" rel="noreferrer" className={link}>
@@ -943,6 +794,16 @@ export function AdGuardHomePage(): ReactElement {
                   className={link}
                 >
                   Source code (v{version})
+                </a>
+              )}
+              {s.version !== null && s.version !== undefined && s.version !== '' && (
+                <a
+                  href={`${FEED_SITE}/sources/adguardhome/${s.version}/SOURCE.txt`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className={link}
+                >
+                  MilkFlint’s package ({s.version})
                 </a>
               )}
             </div>

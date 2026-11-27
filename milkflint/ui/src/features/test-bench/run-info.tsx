@@ -1,9 +1,9 @@
 import type { ReactElement, ReactNode } from 'react';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { type Column, DataTable } from '@/components/data-table';
 import { formatNumber } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import { percentile } from './analysis';
-import type { RunSettings } from './api';
+import type { RunMember, RunSettings } from './api';
 import { LinkLine } from './member-card';
 import { clockText } from './phases';
 import { type RunData, reportRun } from './run-data';
@@ -13,10 +13,54 @@ import { agentText, parseAgent } from './ua';
 const signedMs = (v: number | undefined): string =>
   v === undefined ? '—' : `${v >= 0 ? '+' : '−'}${formatNumber(Math.abs(v), Math.abs(v) < 10 ? 1 : 0)} ms`;
 
-/** Each device: how it was connected, the phases it started, how close to time, and how far its clock could be off. A table on a wide screen, stacked on a narrower one. */
+interface TimingRow {
+  m: RunMember;
+  notes: string[];
+  phases: ReactNode;
+  typical: string;
+  worst: string;
+  clock: string;
+}
+
+const who = (r: TimingRow): ReactElement => (
+  <>
+    <div className="font-medium">{r.m.name}</div>
+    <div className="text-xs text-muted-foreground">{agentText(parseAgent(r.m.ua))}</div>
+    {r.notes.length > 0 && <div className="text-xs text-warning">{r.notes.join(' · ')}</div>}
+  </>
+);
+
+const figure = 'text-right whitespace-nowrap tabular';
+// in the run's order: few devices, nothing to sort
+const timingColumns: readonly Column<TimingRow>[] = [
+  { label: 'Device', cell: who },
+  { label: 'Connected', cell: (r) => <LinkLine link={r.m.link} />, className: 'text-xs' },
+  { label: 'Phases', cell: (r) => r.phases, className: figure },
+  { label: 'Start, typical', cell: (r) => r.typical, className: figure },
+  { label: 'Start, worst', cell: (r) => r.worst, className: figure },
+  { label: 'Clock', cell: (r) => r.clock, className: figure },
+];
+
+/** A device's card when narrow: who, how connected, then its figures two by two. */
+const timingCard = (r: TimingRow): ReactElement => (
+  <div className="flex flex-col gap-2 px-4 py-3 text-sm">
+    <div>{who(r)}</div>
+    <div className="text-xs">
+      <LinkLine link={r.m.link} />
+    </div>
+    <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+      <Item label="Phases started">{r.phases}</Item>
+      <Item label="Clock">{r.clock}</Item>
+      <Item label="Start, typical">{r.typical}</Item>
+      <Item label="Start, worst">{r.worst}</Item>
+    </dl>
+  </div>
+);
+
+/** Each device: how it was connected, the phases it started, how close to time, and how far its clock could be off. A table when there's room, a card each when not. */
 export function TimingTable({ data }: { data: RunData }): ReactElement {
   const reached = phasesReached(reportRun(data), data.meta.schedule.phases);
-  const rows = data.meta.members.map((m) => {
+  const rows = data.meta.members.map((m): TimingRow => {
     const recs = data.records.get(m.id) ?? [];
     const t = recs.length === 0 ? undefined : memberTiming(recs, reached);
     const notes = [
@@ -37,60 +81,16 @@ export function TimingTable({ data }: { data: RunData }): ReactElement {
       clock: t?.uncertainty === undefined ? '—' : `±${formatNumber(t.uncertainty, 1)} ms`,
     };
   });
-  const who = (r: (typeof rows)[number]): ReactElement => (
-    <>
-      <div className="font-medium">{r.m.name}</div>
-      <div className="text-xs text-muted-foreground">{agentText(parseAgent(r.m.ua))}</div>
-      {r.notes.length > 0 && <div className="text-xs text-warning">{r.notes.join(' · ')}</div>}
-    </>
-  );
   return (
-    <>
-      <div className="hidden lg:block">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Device</TableHead>
-              <TableHead>Connected</TableHead>
-              <TableHead className="text-right">Phases</TableHead>
-              <TableHead className="text-right">Start, typical</TableHead>
-              <TableHead className="text-right">Start, worst</TableHead>
-              <TableHead className="text-right">Clock</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((r) => (
-              <TableRow key={r.m.id}>
-                <TableCell className="whitespace-normal">{who(r)}</TableCell>
-                <TableCell className="text-xs whitespace-normal">
-                  <LinkLine link={r.m.link} />
-                </TableCell>
-                <TableCell className="text-right tabular">{r.phases}</TableCell>
-                <TableCell className="text-right tabular">{r.typical}</TableCell>
-                <TableCell className="text-right tabular">{r.worst}</TableCell>
-                <TableCell className="text-right tabular">{r.clock}</TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </div>
-      <ul className="divide-y border-y lg:hidden">
-        {rows.map((r) => (
-          <li key={r.m.id} className="flex flex-col gap-2 px-3 py-3 text-sm">
-            <div>{who(r)}</div>
-            <div className="text-xs">
-              <LinkLine link={r.m.link} />
-            </div>
-            <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5">
-              <Item label="Phases started">{r.phases}</Item>
-              <Item label="Clock">{r.clock}</Item>
-              <Item label="Start, typical">{r.typical}</Item>
-              <Item label="Start, worst">{r.worst}</Item>
-            </dl>
-          </li>
-        ))}
-      </ul>
-    </>
+    <DataTable
+      label="Each device’s timing"
+      columns={timingColumns}
+      rows={rows}
+      rowKey={(r) => r.m.id}
+      empty="No devices took part."
+      framed={false}
+      card={timingCard}
+    />
   );
 }
 
@@ -146,7 +146,7 @@ export function RunInfo({ data }: { data: RunData }): ReactElement {
     <section className="flex flex-col gap-4">
       <h3 className="text-sm font-semibold">About the run</h3>
       <dl className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
-        <Item label="Plan">
+        <Item label="Run">
           {m.schedule.name ?? 'Run'} · {String(m.schedule.phases.length)} phases, {clockText(m.schedule.length)}
           {m.schedule.dry ? ' · rehearsal' : ''}
         </Item>

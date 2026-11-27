@@ -1,8 +1,6 @@
 // A finished run's raw parts, read from the router page by page: what it
 // was (the plan, its members as they were, the settings), each member's
 // records, the router's pings, its samples and its DNS lookups.
-import { useEffect, useState } from 'react';
-import { errorMessage } from '@/lib/utils';
 import {
   BenchError,
   getRunMeta,
@@ -30,8 +28,12 @@ export interface RunData {
 
 export const reportRun = (d: RunData): ReportRun => ({ t0: d.meta.t0, end: d.meta.end, ended: d.end });
 
-/** Who reads a run: the admin (any stored run), or a member with its own session (its bench's runs). */
-export type RunReader = { admin: true } | { session: string };
+/**
+ * Who reads a run: the admin (any stored run), or a member with its own
+ * session (its bench's runs). A member's reads are kept by its id, never by
+ * its session.
+ */
+export type RunReader = { admin: true } | { session: string; member: string };
 
 const readerKey = (r: RunReader | undefined): string | undefined =>
   r === undefined ? undefined : 'admin' in r ? 'admin' : r.session;
@@ -74,39 +76,4 @@ async function load(key: string, run: string): Promise<RunData> {
     router: parseRouter(await all('router')),
     dns: parseDns(await all('dns')),
   };
-}
-
-/**
- * Reads a run once it's over (`ready`). A run that has just ended waits
- * `delayMs` first, while its members send what they still hold.
- */
-export function useRunData(
-  reader: RunReader | undefined,
-  run: string,
-  ready: boolean,
-  delayMs = 0,
-): { data: RunData | undefined; error: string | undefined } {
-  const key = readerKey(reader);
-  // kept with its run's id: a new run's page mustn't show the last one's figures
-  const [loaded, setLoaded] = useState<{ run: string; data: RunData }>();
-  const [failed, setFailed] = useState<{ run: string; error: string }>();
-  useEffect(() => {
-    if (!ready || key === undefined || run === '') return;
-    let cancelled = false;
-    const t = setTimeout(() => {
-      load(key, run).then(
-        (data) => {
-          if (!cancelled) setLoaded({ run, data });
-        },
-        (err: unknown) => {
-          if (!cancelled) setFailed({ run, error: errorMessage(err) });
-        },
-      );
-    }, delayMs);
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [ready, key, run, delayMs]);
-  return { data: loaded?.run === run ? loaded.data : undefined, error: failed?.run === run ? failed.error : undefined };
 }

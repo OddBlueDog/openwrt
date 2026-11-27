@@ -12,6 +12,7 @@
 // download while squash_ingress is on (its default), and both add wash to
 // the download while squash_dscp is on (its default). The opts come last.
 // The fq_codel-only options (limits, targets, ECN) don't apply to CAKE.
+import { z } from 'zod';
 import { bool, type Change, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { takesWhole, type Whole, wholeOf, wholeValue, words } from './gso';
 import { type MultiQueue, multiQueueOf, multiQueueValue, usesMultiQueue } from './multi-queue';
@@ -52,58 +53,65 @@ export const RTT_PRESETS = [
   'interplanetary',
 ] as const;
 
-export interface DirectionForm {
+const directionFields = z.object({
   /** '': the script's (see scriptTins) */
-  diffserv: string;
+  diffserv: z.string(),
   /** '': CAKE's own, triple-isolate */
-  isolation: string;
+  isolation: z.string(),
   /** '': sqm's, nat */
-  nat: '' | 'nat' | 'nonat';
+  nat: z.custom<'' | 'nat' | 'nonat'>(),
   /** '': the default (the download's follows squash_dscp, the upload's doesn't wash) */
-  wash: '' | 'wash' | 'nowash';
+  wash: z.custom<'' | 'wash' | 'nowash'>(),
   /** '': CAKE's egress mode; the download's queue wants ingress */
-  ingress: '' | 'ingress' | 'egress';
-  ackFilter: '' | 'ack-filter' | 'ack-filter-aggressive' | 'no-ack-filter';
+  ingress: z.custom<'' | 'ingress' | 'egress'>(),
+  ackFilter: z.custom<'' | 'ack-filter' | 'ack-filter-aggressive' | 'no-ack-filter'>(),
   /** '': CAKE's (split) */
-  gso: '' | 'split-gso' | 'no-split-gso';
+  gso: z.custom<'' | 'split-gso' | 'no-split-gso'>(),
   /** '': CAKE's 100 ms; a preset's name, or a time ("50ms") */
-  rtt: string;
+  rtt: z.string(),
   /** '': CAKE's own */
-  memlimit: string;
-  autorate: boolean;
-  fwmark: string;
-  ptm: boolean;
+  memlimit: z.string(),
+  autorate: z.boolean(),
+  fwmark: z.string(),
+  ptm: z.boolean(),
   /** the keywords no setting covers, as typed */
-  extra: string;
-}
+  extra: z.string(),
+});
 
-export interface AdvancedForm {
-  down: DirectionForm;
-  up: DirectionForm;
+export type DirectionForm = z.infer<typeof directionFields>;
+
+const advancedFields = z.object({
+  down: directionFields,
+  up: directionFields,
   /** whether the download's CAKE takes GRO packets whole (./gso.ts); manages its gso group */
-  whole: Whole;
+  whole: z.custom<Whole>(),
   /** multi-queue CAKE for the download (./multi-queue.ts): sqm's use_mq and milkflint.cake.multi_queue */
-  multiQueue: MultiQueue;
-  script: string;
+  multiQueue: z.custom<MultiQueue>(),
+  script: z.string(),
   /** squash_dscp: the download's CAKE clears DSCP marks (sqm's default) */
-  squashDscp: boolean;
+  squashDscp: z.boolean(),
   /** squash_ingress: the download's CAKE ignores DSCP for its tins (sqm's default) */
-  squashIngress: boolean;
-  linklayer: string;
-  overhead: string;
+  squashIngress: z.boolean(),
+  linklayer: z.string(),
+  overhead: z.string(),
   /** tcMPU; '' unset */
-  mpu: string;
+  mpu: z.string(),
   /** linklayer_adaptation_mechanism; '' unset (default: CAKE's own for CAKE) */
-  llam: string;
+  llam: z.string(),
   /** tcMTU, tcTSIZE: tc_stab's; '' unset */
-  mtu: string;
-  tsize: string;
+  mtu: z.string(),
+  tsize: z.string(),
   /** use_mq_egress: '' like the download (use_mq) */
-  mqEgress: '' | '1' | '0';
-  debug: boolean;
+  mqEgress: z.custom<'' | '1' | '0'>(),
+  debug: z.boolean(),
   /** verbosity; '' sqm's (5) */
-  verbosity: string;
-}
+  verbosity: z.string(),
+});
+
+export type AdvancedForm = z.infer<typeof advancedFields>;
+
+/** Every field of the sheet's form, by name. */
+export const advancedFieldNames = advancedFields.keyof().options;
 
 export interface AdvancedData {
   form: AdvancedForm;
@@ -271,31 +279,36 @@ const MARK = /^(?:0x[0-9a-f]{1,8}|\d{1,10})$/i;
 const int = (v: string, min: number, max: number): boolean => /^-?\d+$/.test(v) && Number(v) >= min && Number(v) <= max;
 
 /** errors by field: "down.rtt", "overhead", ... */
-export function validateAdvanced(f: AdvancedForm, data: AdvancedData): AdvancedErrors {
-  const e: AdvancedErrors = {};
-  // the kernel refuses it with multi-queue CAKE, and the download then goes unshaped
-  if (f.down.autorate && downloadMq(f, data))
-    e['down.autorate'] = 'Not with multi-queue CAKE, which can’t: turn Multi-queue off first.';
-  for (const dir of ['down', 'up'] as const) {
-    const d = f[dir];
-    if (d.rtt !== '' && !(RTT_PRESETS as readonly string[]).includes(d.rtt) && !TIME.test(d.rtt))
-      e[`${dir}.rtt`] = 'A time such as 50ms, 1s or 500us.';
-    if (d.memlimit !== '' && !SIZE.test(d.memlimit)) e[`${dir}.memlimit`] = 'Bytes, or with a unit: 4mb, 512kb.';
-    if (d.fwmark !== '' && !MARK.test(d.fwmark)) e[`${dir}.fwmark`] = 'A mask such as 0xff.';
-    const extra = words(d.extra);
-    const taken = extra.find((w) => groupOf(w) !== undefined || SQM_OWN.has(w));
-    const last = extra.at(-1);
-    if (taken !== undefined)
-      e[`${dir}.extra`] = SQM_OWN.has(taken) ? `sqm sets ${taken} itself.` : `${taken} has its own setting above.`;
-    else if (last !== undefined && TAKES_VALUE.has(last)) e[`${dir}.extra`] = `${last} needs a value after it.`;
-    else if (extra.some((w) => !/^[\w.:-]+$/.test(w)))
-      e[`${dir}.extra`] = 'CAKE keywords only: letters, digits, dots, colons and dashes.';
-  }
-  if (!int(f.overhead, -64, 256)) e['overhead'] = 'Bytes, -64 to 256.';
-  if (f.mpu !== '' && !int(f.mpu, 0, 256)) e['mpu'] = 'Bytes, 0 to 256.';
-  if (f.mtu !== '' && !int(f.mtu, 0, 65535)) e['mtu'] = 'Bytes, up to 65535.';
-  if (f.tsize !== '' && !int(f.tsize, 1, 65535)) e['tsize'] = 'Entries, 1 to 65535.';
-  return e;
+/** The sheet's form and its checks, which need the queue as saved (`data`). Fields are named as the form has them: down.rtt, overhead. */
+export function advancedFormSchema(data: AdvancedData): z.ZodType<AdvancedForm, AdvancedForm> {
+  return advancedFields.superRefine((f, ctx) => {
+    const e: AdvancedErrors = {};
+    // the kernel refuses it with multi-queue CAKE, and the download then goes unshaped
+    if (f.down.autorate && downloadMq(f, data))
+      e['down.autorate'] = 'Not with multi-queue CAKE, which can’t: turn Multi-queue off first.';
+    for (const dir of ['down', 'up'] as const) {
+      const d = f[dir];
+      if (d.rtt !== '' && !(RTT_PRESETS as readonly string[]).includes(d.rtt) && !TIME.test(d.rtt))
+        e[`${dir}.rtt`] = 'A time such as 50ms, 1s or 500us.';
+      if (d.memlimit !== '' && !SIZE.test(d.memlimit)) e[`${dir}.memlimit`] = 'Bytes, or with a unit: 4mb, 512kb.';
+      if (d.fwmark !== '' && !MARK.test(d.fwmark)) e[`${dir}.fwmark`] = 'A mask such as 0xff.';
+      const extra = words(d.extra);
+      const taken = extra.find((w) => groupOf(w) !== undefined || SQM_OWN.has(w));
+      const last = extra.at(-1);
+      if (taken !== undefined)
+        e[`${dir}.extra`] = SQM_OWN.has(taken) ? `sqm sets ${taken} itself.` : `${taken} has its own setting above.`;
+      else if (last !== undefined && TAKES_VALUE.has(last)) e[`${dir}.extra`] = `${last} needs a value after it.`;
+      else if (extra.some((w) => !/^[\w.:-]+$/.test(w)))
+        e[`${dir}.extra`] = 'CAKE keywords only: letters, digits, dots, colons and dashes.';
+    }
+    if (!int(f.overhead, -64, 256)) e['overhead'] = 'Bytes, -64 to 256.';
+    if (f.mpu !== '' && !int(f.mpu, 0, 256)) e['mpu'] = 'Bytes, 0 to 256.';
+    if (f.mtu !== '' && !int(f.mtu, 0, 65535)) e['mtu'] = 'Bytes, up to 65535.';
+    if (f.tsize !== '' && !int(f.tsize, 1, 65535)) e['tsize'] = 'Entries, 1 to 65535.';
+    for (const [name, message] of Object.entries(e)) {
+      if (message !== undefined) ctx.addIssue({ code: 'custom', path: name.split('.'), message });
+    }
+  });
 }
 
 /** A direction's settings as saved: the GRO choice sets the download's gso group, when CAKE doesn't already do what it gives. */

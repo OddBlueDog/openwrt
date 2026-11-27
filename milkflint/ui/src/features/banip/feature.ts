@@ -1,6 +1,7 @@
 import { ShieldXIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { banipQueries } from './queries';
 
 export const feature = {
   id: 'banip',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.BanipPage,
   ),
+  prefetch: (client) => {
+    client.query(banipQueries.config()).catch(() => undefined);
+  },
 } satisfies Feature;

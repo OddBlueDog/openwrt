@@ -1,7 +1,8 @@
 // A setting's bands side by side (stacked in a narrow card), each under its
 // own heading, so the two bands' choices read across.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import type { ReactElement, ReactNode } from 'react';
-import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { bandLabel, type RadioForm } from '../wifi/model';
 
@@ -47,9 +48,9 @@ export function NeedsWifi6(): ReactElement {
   return (
     <NotHere>
       Needs Wi-Fi 6: this band runs an older Wi-Fi mode.{' '}
-      <a href={href('wifi')} className="font-medium link">
+      <Link {...pageLink('wifi')} className="font-medium link">
         Change it on Networks &amp; radios
-      </a>
+      </Link>
       .
     </NotHere>
   );
@@ -60,7 +61,7 @@ export function NoNetwork(): ReactElement {
   return (
     <NotHere>
       This band has no network of its own.{' '}
-      <a href="/cgi-bin/luci/admin/network/wireless" target="_blank" rel="noreferrer" className="font-medium link">
+      <a href="/cgi-bin/luci/admin/network/wireless" className="font-medium link">
         Set one up in LuCI
       </a>
       .

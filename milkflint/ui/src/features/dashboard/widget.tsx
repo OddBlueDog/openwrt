@@ -2,6 +2,8 @@
 // the title, from the same Lucide set as the menu), the link to the widget's
 // page, the state dot, and the one-line note a widget shows while its feature
 // is off.
+import type { PageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ArrowDownIcon, ArrowUpIcon, ChevronRightIcon, type LucideIcon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useId } from 'react';
 import { AskButton, AskPanel } from '@/components/on-request';
@@ -98,14 +100,14 @@ export function Widget({
 }
 
 /** To the widget's page, or to where its feature is turned on. */
-export function WidgetLink({ href, children }: { href: string; children: ReactNode }): ReactElement {
+export function WidgetLink({ to, children }: { to: PageLink; children: ReactNode }): ReactElement {
   return (
     // one narrow column: in the heading, the arrow alone (its words stay for screen readers), so the heading keeps
     // to its lines; in the widget's body (the way to a feature that's off) the words are what it's for, and stay
-    <a href={href} className="inline-flex min-h-6 min-w-6 items-center justify-center gap-0.5 text-sm font-medium link">
+    <Link {...to} className="inline-flex min-h-6 min-w-6 items-center justify-center gap-0.5 text-sm font-medium link">
       <span className="narrow:in-data-[slot=widget-aside]:sr-only">{children}</span>
       <ChevronRightIcon className="size-4" aria-hidden="true" />
-    </a>
+    </Link>
   );
 }
 

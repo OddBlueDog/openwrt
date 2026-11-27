@@ -1,9 +1,10 @@
-import { ChevronDownIcon, ExternalLinkIcon, LogOutIcon } from 'lucide-react';
+import { Link } from '@tanstack/react-router';
+import { ArrowRightIcon, ChevronDownIcon, LogOutIcon } from 'lucide-react';
 import { type ComponentProps, type ReactElement, useEffect, useId, useState } from 'react';
 import { menuBands, menuFor, type MenuGroup } from '@/features';
 import type { Feature, GroupId } from '@/features/types';
 import { type Board, firmwareName } from '@/lib/api/system';
-import { href, type Route } from '@/lib/router';
+import { pageLink, type Route } from '@/lib/router';
 import { useRouterMode } from '@/lib/router-mode';
 import { logout } from '@/lib/session';
 import { cn } from '@/lib/utils';
@@ -29,16 +30,23 @@ export function Logo({ className, ...props }: ComponentProps<'svg'>): ReactEleme
   );
 }
 
-/** MilkFlint's stylized wordmark: tight bold tracking with a primary circle spark over the i in Flint. */
+/**
+ * MilkFlint's stylized wordmark: tight bold tracking with an orange spark over
+ * the i in Flint, the same orange in every theme. The dotless i and the spark
+ * share one grid cell on the baseline, and the spark is lifted by the font's
+ * x-height (ex) plus a tittle's gap, so it sits just above the stem whatever
+ * font the theme uses. The cell keeps the i's whole advance (normal tracking,
+ * the tightening moved to its margin), as the stem sits in the middle of it.
+ */
 export function Wordmark({ className }: { className?: string }): ReactElement {
   return (
     <span className={cn('inline-flex items-baseline leading-none font-bold tracking-[-0.042em]', className)}>
       <span className="sr-only">MilkFlint</span>
       <span aria-hidden="true" className="inline-flex items-baseline">
         MilkFl
-        <span className="relative inline-block">
-          {'\u0131'}
-          <span className="absolute top-[0.07em] left-1/2 size-[0.165em] -translate-x-1/2 rounded-full bg-primary" />
+        <span className="me-[-0.042em] inline-grid items-baseline justify-items-center tracking-normal">
+          <span className="[grid-area:1/1]">{'\u0131'}</span>
+          <span className="size-[0.19em] -translate-y-[calc(1ex+0.05em)] rounded-full bg-brand-spark [grid-area:1/1]" />
         </span>
         nt
       </span>
@@ -55,13 +63,13 @@ export function Brand({ board }: { board: Board | undefined }): ReactElement {
   const product = board?.release?.distribution ?? 'MilkFlint';
   const named = board !== undefined && board.hostname.toLowerCase() !== product.toLowerCase() ? board.hostname : undefined;
   return (
-    <a href={href('dashboard')} className="flex min-w-0 items-center gap-3 rounded-lg">
+    <Link {...pageLink('dashboard')} className="flex min-w-0 items-center gap-3 rounded-lg">
       <Logo className="size-8 shrink-0" />
       <span className="flex min-w-0 flex-col gap-0.5">
         <Wordmark className="text-sm" />
         <span className="block truncate text-xs text-sidebar-muted-foreground">{named ?? board?.model ?? 'Router'}</span>
       </span>
-    </a>
+    </Link>
   );
 }
 
@@ -82,8 +90,8 @@ export function NavLink({
   const Icon = feature.icon;
   const icons = useDecorativeIcons();
   return (
-    <a
-      href={href(feature.id)}
+    <Link
+      {...pageLink(feature.id)}
       onClick={onNavigate}
       aria-current={active ? 'page' : undefined}
       className={cn(
@@ -97,16 +105,16 @@ export function NavLink({
         <Icon className={cn('size-4 text-sidebar-muted-foreground', active && 'text-sidebar-primary-foreground')} />
       )}
       <span className="truncate">{feature.title}</span>
-    </a>
+    </Link>
   );
 }
 
+/** LuCI in this tab, in place of MilkFlint (as LuCI's link back does): no second tab of the router left open. */
 export function LuciLink({ className }: { className?: string }): ReactElement {
   return (
-    <a href="/cgi-bin/luci/" target="_blank" rel="noreferrer" className={cn(itemClass, className)}>
+    <a href="/cgi-bin/luci/" className={cn(itemClass, className)}>
       <span className="flex-1">Open LuCI</span>
-      <ExternalLinkIcon className="size-3.5 text-sidebar-muted-foreground" />
-      <span className="sr-only">(opens in a new tab)</span>
+      <ArrowRightIcon className="size-3.5 text-sidebar-muted-foreground" />
     </a>
   );
 }

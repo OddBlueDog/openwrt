@@ -1,6 +1,7 @@
 import { ChartColumnIcon } from 'lucide-react';
 import { lazyPage } from '../lazy-page';
 import type { Feature } from '../types';
+import { dataUsageQueries } from './queries';
 
 export const feature = {
   id: 'data-statistics',
@@ -14,4 +15,7 @@ export const feature = {
     () => import('./page'),
     (m) => m.DataStatisticsPage,
   ),
+  prefetch: (client) => {
+    client.query(dataUsageQueries.settings()).catch(() => undefined);
+  },
 } satisfies Feature;

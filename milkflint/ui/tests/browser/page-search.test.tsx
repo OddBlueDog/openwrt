@@ -6,11 +6,12 @@ import 'virtual:milkflint-themes.css';
 import '@/styles.css';
 import { afterEach, expect, test, vi } from 'vitest';
 import { userEvent } from 'vitest/browser';
-import { cleanup, render } from 'vitest-browser-react';
+import { cleanup } from 'vitest-browser-react';
 import { PageSearch } from '@/components/layout/page-search';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { LogsPage } from '@/features/logs/page';
 import type * as Ubus from '@/lib/ubus';
+import { renderWithProviders } from './render';
 
 // no router here: every call fails as a method the router hasn't got; the search needs none,
 // and the Logs page draws its tabs before any log has loaded
@@ -28,9 +29,9 @@ afterEach(async () => {
   window.location.hash = '';
 });
 
-async function drawSearch(): Promise<Awaited<ReturnType<typeof render>>> {
+async function drawSearch(): Promise<Awaited<ReturnType<typeof renderWithProviders>>> {
   window.location.hash = '#/dashboard';
-  return render(
+  return renderWithProviders(
     <TooltipProvider>
       <PageSearch />
     </TooltipProvider>,
@@ -87,7 +88,7 @@ test('wifi and wi-fi find the Wi-Fi pages', async () => {
 
 test('the Logs page opens on the log in its address, and a tab picked goes in the address', async () => {
   window.location.hash = '#/logs/radar';
-  const screen = await render(
+  const screen = await renderWithProviders(
     <TooltipProvider>
       <LogsPage />
     </TooltipProvider>,

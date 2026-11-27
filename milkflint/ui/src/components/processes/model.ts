@@ -1,6 +1,6 @@
 // The process list's sums, kept apart from React so they can be tested: two
 // readings make each process's share of the processor (as top works it
-// out), plus the names, sorting and filtering the list uses.
+// out), plus the names, filtering and order the list uses.
 import type { Process, ProcessList } from '@/lib/api/processes';
 
 /** Clock ticks a second in /proc (USER_HZ): fixed at 100 on Linux. */
@@ -79,48 +79,31 @@ export function snapshot(prev: ProcessList | undefined, next: ProcessList): Snap
 }
 
 export type ProcessView = 'all' | 'programs' | 'kernel';
-export type SortKey = 'cpu' | 'memory' | 'name' | 'user' | 'pid';
-export interface Sort {
-  key: SortKey;
-  desc: boolean;
-}
-
-/** Figures start busiest first, words A to Z. */
-export const firstDirection = (key: SortKey): boolean => key === 'cpu' || key === 'memory';
 
 /** The first comparison that tells two rows apart. */
 const first = (...order: number[]): number => order.find((n) => n !== 0) ?? 0;
 const words = (a: string, b: string): number => a.localeCompare(b, 'en-GB', { sensitivity: 'base' });
-const byName = (a: ProcessRow, b: ProcessRow): number => first(words(a.name, b.name), a.p.pid - b.p.pid);
 
-/** The rows in view: by kind and by a few typed letters of a name, command, user or pid; then sorted. */
-export function shownRows(rows: readonly ProcessRow[], view: ProcessView, query: string, sort: Sort): ProcessRow[] {
+/**
+ * The rows in view: by kind and by a few typed letters of a name, command,
+ * user or pid; the biggest in memory first, then by name and pid. The
+ * table's sort keeps that order among rows it can't tell apart: idle
+ * processes under CPU go by memory, and kernel threads (which hold none)
+ * under Memory by name.
+ */
+export function shownRows(rows: readonly ProcessRow[], view: ProcessView, query: string): ProcessRow[] {
   const q = query.trim().toLowerCase();
-  const shown = rows.filter(
-    (r) =>
-      (view === 'all' || (view === 'kernel') === r.p.kernel) &&
-      (q === '' ||
-        r.name.toLowerCase().includes(q) ||
-        r.p.cmd.toLowerCase().includes(q) ||
-        r.p.user.toLowerCase().includes(q) ||
-        String(r.p.pid) === q),
-  );
-  const dir = sort.desc ? -1 : 1;
-  return shown.sort((a, b) => {
-    switch (sort.key) {
-      case 'cpu':
-        // not yet measured counts as nothing; ties go to the bigger in memory, then by name
-        return first(dir * ((a.cpu ?? -1) - (b.cpu ?? -1)), b.p.rss - a.p.rss, byName(a, b));
-      case 'memory':
-        return first(dir * (a.p.rss - b.p.rss), byName(a, b));
-      case 'user':
-        return first(dir * words(a.p.user, b.p.user), byName(a, b));
-      case 'pid':
-        return dir * (a.p.pid - b.p.pid);
-      case 'name':
-        return dir * byName(a, b);
-    }
-  });
+  return rows
+    .filter(
+      (r) =>
+        (view === 'all' || (view === 'kernel') === r.p.kernel) &&
+        (q === '' ||
+          r.name.toLowerCase().includes(q) ||
+          r.p.cmd.toLowerCase().includes(q) ||
+          r.p.user.toLowerCase().includes(q) ||
+          String(r.p.pid) === q),
+    )
+    .sort((a, b) => first(b.p.rss - a.p.rss, words(a.name, b.name), a.p.pid - b.p.pid));
 }
 
 /** A share of the processor or memory: tenths below 10 %, so small ones still show. */

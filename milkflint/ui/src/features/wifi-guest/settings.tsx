@@ -2,6 +2,8 @@
 // bands first; what the page calls it, one name per band, isolation, the
 // speed limit, its address and lease time under More settings. Each "Why?"
 // names the UCI options the control writes.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import { ArrowDownIcon, ArrowUpIcon, CheckIcon, EyeIcon, EyeOffIcon, RefreshCwIcon, Trash2Icon } from 'lucide-react';
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { Field } from '@/components/field';
@@ -11,7 +13,6 @@ import { Input } from '@/components/ui/input';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { intToIp, ipToInt } from '@/lib/api/network';
-import { href } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { explain } from '@/components/explain';
 import { SECURITY_PLAIN } from '../wifi/model';
@@ -326,9 +327,9 @@ export function NetworkSettings({
       {offBands.length > 0 && (
         <p className="text-xs text-warning">
           {offBands.map((r) => bandLabel(r.band)).join(' and ')} {offBands.length === 1 ? 'is' : 'are'} off in{' '}
-          <a href={href('wifi')} className="font-medium underline underline-offset-2">
+          <Link {...pageLink('wifi')} className="font-medium underline underline-offset-2">
             Networks &amp; radios
-          </a>
+          </Link>
           : this network starts there once {offBands.length === 1 ? 'it’s' : 'they’re'} on.
         </p>
       )}

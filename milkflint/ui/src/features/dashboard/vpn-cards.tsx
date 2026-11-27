@@ -2,30 +2,34 @@
 // access (wg_in, a peer per device). Both read WireGuard's live state, only
 // while they're on Home, every 10 s; Remote access reads its devices' names
 // once.
+import { dashboardQueries } from './queries';
+import { useLive } from '@/lib/query/use-live';
+import { useRead } from '@/lib/query/use-read';
 import type { ReactElement } from 'react';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { getConfig, str } from '@/lib/api/uci';
-import { getWgStatus, isConnected, splitEndpoint, type WgInterface } from '@/lib/api/wireguard';
+import { isConnected, splitEndpoint, type Tunnel, type WgInterface } from '@/lib/api/wireguard';
 import { formatBytes, formatDurationShort, formatNumber } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
+import { tunnelLine } from '../vpn-client/model';
 import { SERVER } from '../remote-access/sections';
 import { CLIENT } from '../vpn-client/sections';
-import { sharedCall } from '@/lib/shared-call';
 import { cn } from '@/lib/utils';
 import { EMPTY_GOES } from './fit';
 import { Dot, OffNote, StateBadge, Way, Widget, WidgetLink } from './widget';
 
-const WG_MS = 10_000;
-
 // one call for the VPN and Remote access widgets (and any repeat of either): they read the same status
-const readTunnels = sharedCall(getWgStatus);
 
-function useTunnel(name: string): { iface: WgInterface | undefined; now: number; ready: boolean; failed: boolean } {
-  const { data, error } = usePoll(readTunnels, WG_MS);
+function useTunnel(name: string): {
+  iface: WgInterface | undefined;
+  now: number;
+  ready: boolean;
+  failed: boolean;
+  tunnel: Tunnel | null;
+} {
+  const { data, error } = useLive(dashboardQueries.tunnels());
   return {
     iface: data?.interfaces.find((i) => i.name === name),
     now: data?.now ?? 0,
+    tunnel: data?.tunnel ?? null,
     ready: data !== undefined,
     failed: data === undefined && error !== undefined,
   };
@@ -43,8 +47,10 @@ function Row({ label, children }: { label: string; children: ReactElement | stri
 }
 
 export function VpnCard(): ReactElement {
-  const { iface, now, ready, failed } = useTunnel(CLIENT);
-  const link = <WidgetLink href={href('vpn-client')}>VPN</WidgetLink>;
+  const { iface, now, ready, failed, tunnel } = useTunnel(CLIENT);
+  // the kill switch is network.wg_out_kill, there and not disabled
+  const kill = useRead(dashboardQueries.vpnKillSwitch()).data === true;
+  const link = <WidgetLink to={pageLink('vpn-client')}>VPN</WidgetLink>;
   if (!ready) {
     return (
       <Widget aside={failed ? link : undefined}>
@@ -56,13 +62,15 @@ export function VpnCard(): ReactElement {
   if (iface === undefined || peer === undefined) {
     return (
       <Widget aside={<StateBadge tone="off">Off</StateBadge>}>
-        <OffNote action={<WidgetLink href={href('vpn-client')}>Send through a VPN</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('vpn-client')}>Send through a VPN</WidgetLink>}>
           Sends your devices’ traffic through a VPN provider’s server.
         </OffNote>
       </Widget>
     );
   }
   const up = isConnected(peer, now);
+  // a short form of the page's line: when it stopped answering, or that its DNS isn't
+  const note = tunnelLine(tunnel, kill, (e) => new Date(e * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
   return (
     <Widget
       aside={
@@ -75,6 +83,11 @@ export function VpnCard(): ReactElement {
       <dl className="flex flex-1 flex-col gap-1.5 px-5 text-sm">
         <Row label="Server">{peer.endpoint === null ? 'Not known yet' : splitEndpoint(peer.endpoint).host}</Row>
         <Row label="Last answer">{ago(now, peer.latest_handshake)}</Row>
+        {note !== undefined && (
+          <p data-fit className="text-muted-foreground">
+            {note}
+          </p>
+        )}
         {/* what went through it since it came up, at the widget's foot */}
         <div data-fit className="mt-auto flex flex-wrap items-baseline justify-between gap-x-3 border-t pt-2">
           <dt className="text-muted-foreground">Through it</dt>
@@ -92,27 +105,10 @@ export function VpnCard(): ReactElement {
   );
 }
 
-/** Each device's name on Remote access, by its public key (the page keeps them as the peers' descriptions). */
-async function peerNames(): Promise<Map<string, string>> {
-  const sections = await getConfig('network');
-  return new Map(
-    sections
-      .filter((s) => s['.type'] === `wireguard_${SERVER}`)
-      .flatMap((s) => {
-        const key = str(s, 'public_key');
-        const name = str(s, 'description');
-        return key === undefined || name === undefined ? [] : [[key, name] as const];
-      }),
-  );
-}
-
-// one call for every Remote access widget on Home
-const readPeerNames = sharedCall(peerNames);
-
 export function RemoteAccessCard(): ReactElement {
   const { iface, now, ready, failed } = useTunnel(SERVER);
-  const { data: names } = useLoad(readPeerNames);
-  const link = <WidgetLink href={href('remote-access')}>Remote access</WidgetLink>;
+  const { data: names } = useRead(dashboardQueries.peerNames());
+  const link = <WidgetLink to={pageLink('remote-access')}>Remote access</WidgetLink>;
   if (!ready) {
     return (
       <Widget aside={failed ? link : undefined}>
@@ -125,7 +121,7 @@ export function RemoteAccessCard(): ReactElement {
   if (iface === undefined) {
     return (
       <Widget aside={<StateBadge tone="off">Off</StateBadge>}>
-        <OffNote action={<WidgetLink href={href('remote-access')}>Set up Remote access</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('remote-access')}>Set up Remote access</WidgetLink>}>
           Reach your home network from your phone or laptop, wherever you are.
         </OffNote>
       </Widget>

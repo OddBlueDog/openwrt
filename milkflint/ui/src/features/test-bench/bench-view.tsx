@@ -6,7 +6,8 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { handoff, kick, rename, startRun } from './api';
-import { Arrowed } from './dir';
+import { useBenchWrite } from './queries';
+import { Arrowed } from '@/components/dir';
 import { InviteCard } from './invite-card';
 import type { BenchMember, MemberState } from './member';
 import { type MemberActions, type MemberEntry, MemberList } from './member-card';
@@ -141,6 +142,8 @@ export function BenchView({
   const p = state.poll;
   const me = state.me;
   const sid = member.session;
+  // a member's writes, with its own session: the bench's reads are asked again once each went through
+  const write = useBenchWrite();
   const coordinatorId = p?.bench.coordinator ?? undefined;
   const isCoordinator = me !== undefined && coordinatorId === me;
   const members = p?.members ?? [];
@@ -156,12 +159,16 @@ export function BenchView({
     const a: MemberActions = {};
     if (id === me || isCoordinator) {
       a.rename = async (name) => {
-        await rename(sid, name, id === me ? undefined : id);
+        await write.mutateAsync(() => rename(sid, name, id === me ? undefined : id));
       };
     }
     if (isCoordinator && id !== me) {
-      a.makeCoordinator = () => handoff(sid, id);
-      a.remove = () => kick(sid, id);
+      a.makeCoordinator = async () => {
+        await write.mutateAsync(() => handoff(sid, id));
+      };
+      a.remove = async () => {
+        await write.mutateAsync(() => kick(sid, id));
+      };
     }
     return a;
   };
@@ -223,7 +230,7 @@ export function BenchView({
           shaper={p?.bench.shaper}
           busy={runOn}
           onStart={async (s) => {
-            await startRun(sid, s);
+            await write.mutateAsync(() => startRun(sid, s));
           }}
         />
       )}

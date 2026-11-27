@@ -9,9 +9,10 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { usePoll } from '@/hooks/use-poll';
+import { useLive } from '@/lib/query/use-live';
 import { errorMessage } from '@/lib/utils';
-import { type Bench, closeBench, coordinate, getStatus, newCode, openBench } from './api';
+import { type Bench, closeBench, coordinate, newCode, openBench } from './api';
+import { benchQueries, useBenchWrite } from './queries';
 import { BenchView } from './bench-view';
 import { HistoryCard } from './history-card';
 import { benchMember, useMember } from './member';
@@ -173,7 +174,9 @@ function useJoinOwnBench(bench: Bench | null | undefined, refresh: () => void): 
 }
 
 export function TestBenchPage(): ReactElement {
-  const { data, error, loading, refresh } = usePoll(getStatus, 5000);
+  const { data, error, loading, refresh } = useLive(benchQueries.status());
+  // the bench's reads are asked again once each of these went through
+  const write = useBenchWrite();
   const member = benchMember();
   const state = useMember(member);
   const bench = data?.bench;
@@ -187,8 +190,7 @@ export function TestBenchPage(): ReactElement {
         bench !== undefined && bench !== null ? (
           <CloseButton
             onClose={async () => {
-              await closeBench();
-              refresh();
+              await write.mutateAsync(closeBench);
             }}
           />
         ) : undefined
@@ -212,8 +214,7 @@ export function TestBenchPage(): ReactElement {
         <div className="flex flex-col gap-4">
           <OpenCard
             onOpen={async (name) => {
-              await openBench(name, false);
-              refresh();
+              await write.mutateAsync(() => openBench(name, false));
             }}
           />
           <HistoryCard reader={{ admin: true }} />
@@ -237,12 +238,11 @@ export function TestBenchPage(): ReactElement {
               code: bench.code,
               codeDisabled: bench.code_disabled,
               onNewCode: async () => {
-                await newCode();
-                refresh();
+                await write.mutateAsync(newCode);
               },
               onTakeOver: async () => {
-                if (state.me !== undefined) await coordinate(state.me);
-                refresh();
+                const me = state.me;
+                if (me !== undefined) await write.mutateAsync(() => coordinate(me));
               },
             }}
           />

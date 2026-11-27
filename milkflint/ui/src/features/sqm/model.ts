@@ -1,6 +1,7 @@
 // The Smart Queue page's settings, read from sqm's queue for the internet
 // port, and the UCI changes a save makes. Only what changed is written: a
 // setting left as it was keeps what the router has, set in LuCI or not.
+import { z } from 'zod';
 import { bool, type Change, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { isVpnShaper } from '../vpn-client/sections';
 import { isGuestShaper } from '../wifi-guest/guest';
@@ -114,24 +115,26 @@ const FAIR_EGRESS = ['nat', 'dual-srchost'];
 // Whether CAKE takes GRO packets whole (no-split-gso) goes with the speed,
 // unless Performance Tuning sets it (milkflint.gro.whole): ./gso.ts.
 
-export interface SqmForm {
-  section: string | undefined;
-  enabled: boolean;
-  device: string;
-  downloadMbit: string;
-  uploadMbit: string;
-  prioritise: boolean;
-  link: LinkPreset | 'custom';
-  latency: LatencyTarget | 'custom';
-  uploadMemory: UploadMemory | 'custom';
-  ackFilter: AckFilter;
-  perDevice: boolean;
+const sqmFields = z.object({
+  section: z.union([z.string(), z.undefined()]),
+  enabled: z.boolean(),
+  device: z.string(),
+  downloadMbit: z.string(),
+  uploadMbit: z.string(),
+  prioritise: z.boolean(),
+  link: z.custom<LinkPreset | 'custom'>(),
+  latency: z.custom<LatencyTarget | 'custom'>(),
+  uploadMemory: z.custom<UploadMemory | 'custom'>(),
+  ackFilter: z.custom<AckFilter>(),
+  perDevice: z.boolean(),
   /** multi-queue CAKE for the download: with the speed, or always, or never (./multi-queue.ts) */
-  multiQueue: MultiQueue;
+  multiQueue: z.custom<MultiQueue>(),
   /** Downloads get back the DSCP their connection sends with (milkflint.cake.dscp_restore) */
-  restoreDscp: boolean;
-  offloadOff: boolean;
-}
+  restoreDscp: z.boolean(),
+  offloadOff: z.boolean(),
+});
+
+export type SqmForm = z.infer<typeof sqmFields>;
 
 export interface SqmData {
   form: SqmForm;
@@ -305,29 +308,32 @@ const kbit = (mbit: string): number => Math.round(Number(mbit) * 1000);
 
 export type SqmErrors = Partial<Record<'downloadMbit' | 'uploadMbit' | 'multiQueue', string>>;
 
-export function validate(f: SqmForm, data: SqmData): SqmErrors {
-  const e: SqmErrors = {};
-  for (const key of ['downloadMbit', 'uploadMbit'] as const) {
-    // with Smart Queue off, a speed is checked when it's written: a new
-    // queue's, or one that changed. sqm takes 0 or a word for "don't shape",
-    // and the automatic choices go with the speed.
-    if (!f.enabled && f.section !== undefined && kbit(f[key]) === kbit(data.form[key])) continue;
-    const v = Number(f[key]);
-    if (!Number.isFinite(v) || v <= 0) e[key] = 'Enter your line speed in Mbit/s, e.g. 450.';
-    else if (kbit(f[key]) < 1) e[key] = 'Too slow to shape: at least 0.001 Mbit/s.';
-    else if (v > 10_000) e[key] = 'That’s more than 10 Gbit/s.';
-  }
-  // the kernel refuses a multi-queue CAKE that estimates the line's speed,
-  // and the download then goes unshaped
-  if (
-    f.enabled &&
-    usesMultiQueue(kbit(f.downloadMbit), f.multiQueue, data.pppoe !== undefined) &&
-    words(data.iqdiscOpts).includes('autorate-ingress')
-  ) {
-    e.multiQueue =
-      'Multi-queue CAKE can’t estimate the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
-  }
-  return e;
+/** The page's form and its checks, which need the queue as saved (`data`). */
+export function sqmFormSchema(data: SqmData): z.ZodType<SqmForm, SqmForm> {
+  return sqmFields.superRefine((f, ctx) => {
+    const e: SqmErrors = {};
+    for (const key of ['downloadMbit', 'uploadMbit'] as const) {
+      // with Smart Queue off, a speed is checked when it's written: a new
+      // queue's, or one that changed. sqm takes 0 or a word for "don't shape",
+      // and the automatic choices go with the speed.
+      if (!f.enabled && f.section !== undefined && kbit(f[key]) === kbit(data.form[key])) continue;
+      const v = Number(f[key]);
+      if (!Number.isFinite(v) || v <= 0) e[key] = 'Enter your line speed in Mbit/s, e.g. 450.';
+      else if (kbit(f[key]) < 1) e[key] = 'Too slow to shape: at least 0.001 Mbit/s.';
+      else if (v > 10_000) e[key] = 'That’s more than 10 Gbit/s.';
+    }
+    // the kernel refuses a multi-queue CAKE that estimates the line's speed,
+    // and the download then goes unshaped
+    if (
+      f.enabled &&
+      usesMultiQueue(kbit(f.downloadMbit), f.multiQueue, data.pppoe !== undefined) &&
+      words(data.iqdiscOpts).includes('autorate-ingress')
+    ) {
+      e.multiQueue =
+        'Multi-queue CAKE can’t estimate the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
+    }
+    for (const [path, message] of Object.entries(e)) ctx.addIssue({ code: 'custom', path: [path], message });
+  });
 }
 
 /** CAKE keywords a save replaces in one direction's opts, and what it puts in their place */

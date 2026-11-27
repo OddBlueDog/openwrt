@@ -1,12 +1,13 @@
 // Beside a guest network's settings: the devices on it now, and what they may
 // reach (as the firewall has it, which the Firewall page can change).
+import { Link } from '@tanstack/react-router';
 import { CheckIcon, XIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { CardHeading } from '@/components/card-heading';
 import { SignalReading } from '@/components/charts/signal-bars';
 import { Card, CardContent } from '@/components/ui/card';
 import { formatDuration } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import type { Guest } from './api';
 import { type Access, labelOf, type NetForm } from './model';
 
@@ -83,7 +84,7 @@ export function WhatItGets({
     form.downMbit === '' ? undefined : `${form.downMbit} Mbit/s down`,
     form.upMbit === '' ? undefined : `${form.upMbit} Mbit/s up`,
   ].filter((x) => x !== undefined);
-  const zones = `${href('firewall')}/zones`;
+  const zones = pageLink('firewall', 'zones');
   return (
     <Card>
       <CardHeading title="What its devices get" />
@@ -110,18 +111,18 @@ export function WhatItGets({
         {access.fromLan && (
           <p className="text-xs text-muted-foreground">
             Your devices may reach these, as set on the{' '}
-            <a href={zones} className="font-medium link underline-offset-4">
+            <Link {...zones} className="font-medium link underline-offset-4">
               Firewall page
-            </a>
+            </Link>
             .
           </p>
         )}
         <p className="border-t pt-3 text-xs text-muted-foreground">
           Set up as OpenWrt’s own guide does it, so it shows in LuCI too: Network → Interfaces ({form.id}), Wireless, Firewall,
           and DHCP and DNS. On the{' '}
-          <a href={zones} className="font-medium link underline-offset-4">
+          <Link {...zones} className="font-medium link underline-offset-4">
             Firewall page
-          </a>{' '}
+          </Link>{' '}
           it’s zone <span className="font-mono">{form.id}</span>.
         </p>
       </CardContent>

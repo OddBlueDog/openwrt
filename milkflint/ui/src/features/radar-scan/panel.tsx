@@ -6,6 +6,8 @@
 // scan. The scan runs on the router (radar-scan, with a watchdog that brings
 // 5 GHz back), so a browser on 5 GHz losing the router meanwhile doesn't
 // matter: the page catches up.
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
 import {
   ChevronRightIcon,
   CircleStopIcon,
@@ -14,8 +16,9 @@ import {
   TriangleAlertIcon,
   WifiOffIcon,
 } from 'lucide-react';
-import { type ReactElement, type ReactNode, useMemo, useRef, useState } from 'react';
+import { type ReactElement, type ReactNode, useMemo, useState } from 'react';
 import { CardHeading } from '@/components/card-heading';
+import { type Column, DataTable } from '@/components/data-table';
 import { Field } from '@/components/field';
 import { Note } from '@/components/note';
 import { LoadError } from '@/components/page-states';
@@ -29,12 +32,11 @@ import { Progress } from '@/components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
-import { usePoll } from '@/hooks/use-poll';
-import { getRadar, getWirelessStatus, type Radar } from '@/lib/api/wireless';
-import { href } from '@/lib/router';
+import { useLive } from '@/lib/query/use-live';
 import { cn, errorMessage } from '@/lib/utils';
 import { describeChannels } from '../wifi/channels';
-import { type ChipReport, getChipReports, getScanStatus, type ScanBlock, startScan, stopScan } from './api';
+import type { ChipReport, ScanBlock } from './api';
+import { radarQueries, useStartRadarScan, useStopRadarScan } from './queries';
 import {
   blockLabel,
   blocksOf,
@@ -48,21 +50,6 @@ import {
   radarSummary,
   scanPlan,
 } from './model';
-
-interface Radio {
-  radio: string;
-  phy: string;
-  radar: Radar | undefined;
-}
-
-async function loadRadio(): Promise<Radio | null> {
-  const status = await getWirelessStatus();
-  const entry = Object.entries(status).find(([, r]) => r.config?.band === '5g' && r.iwinfo?.phy !== undefined);
-  if (entry === undefined) return null;
-  const [radio, r] = entry;
-  const phy = r.iwinfo?.phy ?? '';
-  return { radio, phy, radar: await getRadar(phy).catch(() => undefined) };
-}
 
 function time(unixS: number): string {
   return new Date(unixS * 1000).toLocaleString(undefined, {
@@ -84,6 +71,16 @@ function StateBadge({ state }: { state: ChannelState }): ReactElement {
       return <Badge variant="secondary">Not checked yet</Badge>;
   }
 }
+
+type Pulse = ChipReport['pulses'][number] & { key: string };
+const pulseCell = 'py-1 text-xs tabular';
+/** The chip's pulses in its own order, in its own units. */
+const pulseColumns: readonly Column<Pulse>[] = [
+  { label: 'List', cell: (p) => p.kind, className: pulseCell },
+  { label: 'Start', cell: (p) => String(p.start), className: pulseCell },
+  { label: 'Width', cell: (p) => String(p.width), className: pulseCell },
+  { label: 'Power', cell: (p) => String(p.power), className: pulseCell },
+];
 
 /** One of the chip's radar reports: the pattern it matched and the pulses it measured, in its own units. */
 function ReportDetails({ report }: { report: ChipReport }): ReactElement {
@@ -148,28 +145,16 @@ function ReportDetails({ report }: { report: ChipReport }): ReactElement {
         </Button>
       )}
       {open && (
-        <div className="overflow-x-auto">
-          <table className="w-full max-w-md text-xs tabular">
-            <thead className="text-muted-foreground">
-              <tr className="text-left">
-                <th className="py-1 font-normal">List</th>
-                <th className="py-1 font-normal">Start</th>
-                <th className="py-1 font-normal">Width</th>
-                <th className="py-1 font-normal">Power</th>
-              </tr>
-            </thead>
-            <tbody>
-              {report.pulses.map((p, i) => (
-                <tr key={`${p.kind}-${String(p.start)}-${String(i)}`}>
-                  <td>{p.kind}</td>
-                  <td>{String(p.start)}</td>
-                  <td>{String(p.width)}</td>
-                  <td>{String(p.power)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <DataTable
+          label="Pulses"
+          columns={pulseColumns}
+          rows={report.pulses.map((p, i) => ({ ...p, key: String(i) }))}
+          rowKey={(p) => p.key}
+          empty="No pulses."
+          framed={false}
+          cards={false}
+          className="max-w-md"
+        />
       )}
     </div>
   );
@@ -233,31 +218,28 @@ function BlockRow({ block, seconds }: { block: ScanBlock; seconds: number }): Re
 
 function LinkOn({ children }: { children: ReactNode }): ReactElement {
   return (
-    <a href={href('wifi')} className="inline-flex items-center gap-0.5 font-medium link underline-offset-4">
+    <Link {...pageLink('wifi')} className="inline-flex items-center gap-0.5 font-medium link underline-offset-4">
       {children}
       <ChevronRightIcon className="size-4" aria-hidden />
-    </a>
+    </Link>
   );
 }
 
 export function RadarScanPanel(): ReactElement {
-  const radioPoll = usePoll(loadRadio, 30_000);
+  const radioPoll = useLive(radarQueries.radio());
   const radio = radioPoll.data;
   const [fast, setFast] = useState(false);
-  const status = usePoll(getScanStatus, fast ? 1000 : 15_000);
-  const reports = usePoll(
-    () => (radio === null || radio === undefined ? Promise.resolve(null) : getChipReports(radio.phy)),
-    15_000,
-    radio?.phy ?? '',
-  );
+  const status = useLive(radarQueries.status(fast ? 1000 : 15_000));
+  const reports = useLive(radarQueries.reports(radio?.phy));
+  const startMutation = useStartRadarScan();
+  const stopMutation = useStopRadarScan();
   const options = useMemo(() => blocksOf(radio?.radar), [radio]);
   const [picked, setPicked] = useState<ReadonlySet<string>>(new Set());
   const [duration, setDuration] = useState('60');
   const [custom, setCustom] = useState('90');
   const [confirming, setConfirming] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [startError, setStartError] = useState<string>();
-  const starting = useRef(false);
+  const busy = startMutation.isPending;
+  const startError = startMutation.error === null ? undefined : errorMessage(startMutation.error);
 
   const s = status.data;
   const active = s?.state === 'starting' || s?.state === 'running';
@@ -270,26 +252,15 @@ export function RadarScanPanel(): ReactElement {
   const plan = scanPlan(chosen.length, seconds);
   const canStart = radio !== null && radio !== undefined && plan.ok && !active;
 
-  const start = async (): Promise<void> => {
-    if (starting.current || radio === null || radio === undefined) return;
-    starting.current = true;
-    setBusy(true);
-    setStartError(undefined);
+  const start = (): void => {
+    if (startMutation.isPending || radio === null || radio === undefined) return;
     setConfirming(false);
-    try {
-      await startScan(
-        radio.radio,
-        radio.phy,
-        chosen.map((o) => ({ freq: o.freq, width: o.width, center: o.center })),
-        seconds,
-      );
-      status.refresh();
-    } catch (err) {
-      setStartError(errorMessage(err));
-    } finally {
-      starting.current = false;
-      setBusy(false);
-    }
+    startMutation.mutate({
+      radio: radio.radio,
+      phy: radio.phy,
+      blocks: chosen.map((o) => ({ freq: o.freq, width: o.width, center: o.center })),
+      seconds,
+    });
   };
 
   const unreachable = status.error !== undefined && s !== undefined && s.state !== 'done';
@@ -314,9 +285,7 @@ export function RadarScanPanel(): ReactElement {
                   variant="outline"
                   size="sm"
                   onClick={() => {
-                    void stopScan().then(() => {
-                      status.refresh();
-                    });
+                    stopMutation.mutate();
                   }}
                 >
                   <CircleStopIcon />
@@ -326,6 +295,13 @@ export function RadarScanPanel(): ReactElement {
             }
           : {})}
       />
+      {stopMutation.error !== null && (
+        <div className="px-5 pt-3">
+          <Note tone="destructive" icon={<TriangleAlertIcon />} title="The scan didn’t stop">
+            {errorMessage(stopMutation.error)}
+          </Note>
+        </div>
+      )}
       {s.error !== undefined && s.error !== null && (
         <div className="px-5 pt-3">
           <Note tone="warning" icon={<TriangleAlertIcon />}>
@@ -529,7 +505,7 @@ export function RadarScanPanel(): ReactElement {
             >
               Cancel
             </Button>
-            <Button onClick={() => void start()}>Start scan</Button>
+            <Button onClick={start}>Start scan</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

@@ -6,33 +6,31 @@
 // the defaults open in a side sheet that shows the section as it will be
 // saved. Only what changed is written, so a policy a zone takes from the
 // defaults stays unset.
-import { CheckIcon, ExternalLinkIcon, PlusIcon, SettingsIcon, ShieldIcon, SquarePenIcon, Trash2Icon } from 'lucide-react';
-import { type ReactElement, useId, useState } from 'react';
+import { pageLink } from '@/lib/router';
+import { Link } from '@tanstack/react-router';
+import { CheckIcon, ExternalLinkIcon, PlusIcon, ShieldIcon, SquarePenIcon, Trash2Icon } from 'lucide-react';
+import { type ReactElement, useId, useMemo, useState } from 'react';
+import { type Column, DataTable } from '@/components/data-table';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
-import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from '@/components/ui/sheet';
 import type { Change, Section } from '@/lib/api/uci';
-import { href } from '@/lib/router';
+import { formErrors } from '@/lib/form/errors';
+import { useSheetForm } from '@/lib/form/use-sheet-form';
 import { cn } from '@/lib/utils';
 import { useWed } from '../tuning/use-wed';
 import { WedNotice } from '../tuning/wed-notice';
 import type { Counters, FirewallData } from './api';
 import { type Actions, rowClick } from './forms';
+import { defaultsChanges, defaultsFormOf, defaultsFormSchema, zoneChanges, zoneForm, zoneFormSchema } from './zone-form';
 import {
-  editSection,
-  enabledChange,
-  isInternetZone,
+  type FirewallConfig,
   managedBy,
   type Policy,
   SYN_RATE_FW4,
   SYN_RATE_MILKFLINT,
-  synRateError,
   synRateLabel,
-  synRateText,
-  synRateValues,
-  type Values,
   type Zone,
   zoneTitle,
   zoneUsers,
@@ -40,7 +38,7 @@ import {
 import { NatTable } from './nat';
 import { Segmented, SwitchRow } from './parts';
 import { FieldLabel, Opt, UciPreview } from './sheet-parts';
-import { GroupHeader, HeadRow, HeaderButton, RowButton, VerdictBadge } from './table-parts';
+import { GroupHeader, RowButton, VerdictBadge } from './table-parts';
 
 const policies = [
   { value: 'ACCEPT', label: 'accept' },
@@ -76,103 +74,6 @@ function PolicyField({
       <p className="text-xs text-muted-foreground">{policyHints[value]}</p>
     </div>
   );
-}
-
-const pairKey = (src: string, dest: string): string => `${src}>${dest}`;
-
-/** Forwardings that are on, as "src>dest". */
-function forwardingsOn(data: FirewallData): Set<string> {
-  return new Set(data.cfg.forwardings.filter((f) => f.enabled).map((f) => pairKey(f.src, f.dest)));
-}
-
-/**
- * Turn forwardings on and off, as LuCI does: one that's no longer wanted is
- * deleted, one that's wanted is turned back on if it's there but off, or
- * added.
- */
-function forwardingChanges(
-  data: FirewallData,
-  want: ReadonlySet<string>,
-  scope: (src: string, dest: string) => boolean,
-): Change[] {
-  const on = forwardingsOn(data);
-  const changes: Change[] = [];
-  for (const f of data.cfg.forwardings) {
-    if (scope(f.src, f.dest) && f.enabled && !want.has(pairKey(f.src, f.dest)))
-      changes.push({ op: 'delete', config: 'firewall', section: f.section });
-  }
-  for (const p of want) {
-    if (on.has(p)) continue;
-    const [src = '', dest = ''] = p.split('>');
-    const off = data.cfg.forwardings.find((f) => f.src === src && f.dest === dest);
-    changes.push(
-      off === undefined
-        ? { op: 'add', config: 'firewall', type: 'forwarding', values: { src, dest } }
-        : enabledChange(off.section, true),
-    );
-  }
-  return changes;
-}
-
-interface ZoneForm {
-  name: string;
-  networks: string[];
-  input: Policy;
-  output: Policy;
-  forward: Policy;
-  masq: boolean;
-  mtuFix: boolean;
-  /** zones it may start connections to */
-  to: string[];
-  /** zones that may start connections to it */
-  from: string[];
-}
-
-function zoneForm(zone: Zone | undefined, data: FirewallData): ZoneForm {
-  const wan = data.cfg.zones.find(isInternetZone)?.name;
-  if (zone === undefined) {
-    return {
-      name: '',
-      networks: [],
-      input: 'REJECT',
-      output: 'ACCEPT',
-      forward: 'REJECT',
-      masq: false,
-      mtuFix: false,
-      to: wan === undefined ? [] : [wan],
-      from: [],
-    };
-  }
-  const on = data.cfg.forwardings.filter((f) => f.enabled);
-  return {
-    name: zone.name,
-    networks: zone.networks,
-    input: zone.input,
-    output: zone.output,
-    forward: zone.forward,
-    masq: zone.masq,
-    mtuFix: zone.mtuFix,
-    to: on.filter((f) => f.src === zone.name).map((f) => f.dest),
-    from: on.filter((f) => f.dest === zone.name).map((f) => f.src),
-  };
-}
-
-function zoneChanges(f: ZoneForm, zone: Zone | undefined, data: FirewallData): Change[] {
-  const was = zoneForm(zone, data);
-  const values: Values = {};
-  const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
-  if (zone === undefined) values['name'] = f.name;
-  if (zone === undefined || !same(f.networks, was.networks)) values['network'] = f.networks;
-  if (zone === undefined || f.input !== was.input) values['input'] = f.input;
-  if (zone === undefined || f.output !== was.output) values['output'] = f.output;
-  if (zone === undefined || f.forward !== was.forward) values['forward'] = f.forward;
-  if (f.masq !== was.masq) values['masq'] = f.masq ? '1' : undefined;
-  if (f.mtuFix !== was.mtuFix) values['mtu_fix'] = f.mtuFix ? '1' : undefined;
-  const section = zone === undefined ? undefined : data.sections.find((s) => s['.name'] === zone.section);
-  const changes = Object.keys(values).length === 0 ? [] : editSection('zone', section, values);
-  const want = new Set([...f.to.map((d) => pairKey(f.name, d)), ...f.from.map((s) => pairKey(s, f.name))]);
-  changes.push(...forwardingChanges(data, want, (src, dest) => src === f.name || dest === f.name));
-  return changes;
 }
 
 /** Zone chips to pick from: other zones, each on or off. */
@@ -220,26 +121,25 @@ function ZoneSheet({
   zone,
   data,
   onClose,
-  onSave,
+  onSubmit,
 }: {
   zone: Zone | undefined;
   data: FirewallData;
   onClose: () => void;
-  onSave: (c: Change[]) => void;
+  /** applies the changes; the failure's message when that didn't go through */
+  onSubmit: (c: Change[]) => Promise<string | undefined>;
 }): ReactElement {
   const id = useId();
-  const [f, setF] = useState(() => zoneForm(zone, data));
-  const set = <K extends keyof ZoneForm>(key: K, value: ZoneForm[K]): void => {
-    setF((x) => ({ ...x, [key]: value }));
-  };
-  const nameError =
-    zone !== undefined
-      ? undefined
-      : !/^[A-Za-z][A-Za-z0-9_]{0,10}$/.test(f.name)
-        ? 'Up to 11 letters, digits and _, starting with a letter.'
-        : data.cfg.zones.some((z) => z.name === f.name)
-          ? 'There’s a zone with that name already.'
-          : undefined;
+  const schema = useMemo(() => zoneFormSchema(zone, data.cfg), [zone, data.cfg]);
+  const saved = useMemo(() => zoneForm(zone, data), [zone, data]);
+  const {
+    settings,
+    values: f,
+    failed,
+    submitting,
+  } = useSheetForm({ schema, saved, submit: (v) => onSubmit(zoneChanges(v, zone, data)) });
+  const { form } = settings;
+  const nameError = formErrors(schema, f)['name'];
   const changes = nameError === undefined ? zoneChanges(f, zone, data) : [];
   const section = zone === undefined ? undefined : data.sections.find((s) => s['.name'] === zone.section);
   const others = data.cfg.zones.filter((z) => z.name !== zone?.name).map((z) => z.name);
@@ -293,7 +193,7 @@ function ZoneSheet({
                 disabled={zone !== undefined}
                 aria-invalid={f.name !== '' && nameError !== undefined}
                 onChange={(e) => {
-                  set('name', e.target.value.trim());
+                  form.setFieldValue('name', e.target.value.trim());
                 }}
               />
               <p
@@ -320,7 +220,7 @@ function ZoneSheet({
                       aria-pressed={on}
                       title={other === undefined ? undefined : `Also in zone ${other}`}
                       onClick={() => {
-                        set('networks', on ? f.networks.filter((x) => x !== n) : [...f.networks, n]);
+                        form.setFieldValue('networks', on ? f.networks.filter((x) => x !== n) : [...f.networks, n]);
                       }}
                       className={cn(
                         'flex items-center gap-1.5 rounded-md border px-2 py-1 font-mono text-xs transition-colors',
@@ -352,7 +252,7 @@ function ZoneSheet({
               hint="Connections from this zone to the router itself: its web page, DNS, DHCP."
               value={f.input}
               onChange={(p) => {
-                set('input', p);
+                form.setFieldValue('input', p);
               }}
             />
             {internet && f.input === 'ACCEPT' && (
@@ -373,7 +273,7 @@ function ZoneSheet({
               hint="Connections from the router into this zone. Usually accept."
               value={f.output}
               onChange={(p) => {
-                set('output', p);
+                form.setFieldValue('output', p);
               }}
             />
             <PolicyField
@@ -382,14 +282,14 @@ function ZoneSheet({
               hint="Between the zone’s own networks; only matters when it covers more than one. Other zones: forwarding, below."
               value={f.forward}
               onChange={(p) => {
-                set('forward', p);
+                form.setFieldValue('forward', p);
               }}
             />
             <SwitchRow
               id={`${id}-masq`}
               checked={f.masq}
               onChange={(v) => {
-                set('masq', v);
+                form.setFieldValue('masq', v);
               }}
               title={
                 <span className="flex items-center gap-2">
@@ -402,7 +302,7 @@ function ZoneSheet({
               id={`${id}-mtu`}
               checked={f.mtuFix}
               onChange={(v) => {
-                set('mtuFix', v);
+                form.setFieldValue('mtuFix', v);
               }}
               title={
                 <span className="flex items-center gap-2">
@@ -428,7 +328,7 @@ function ZoneSheet({
                   zones={others}
                   value={f.to}
                   onChange={(v) => {
-                    set('to', v);
+                    form.setFieldValue('to', v);
                   }}
                 />
               </div>
@@ -440,7 +340,7 @@ function ZoneSheet({
                   zones={others}
                   value={f.from}
                   onChange={(v) => {
-                    set('from', v);
+                    form.setFieldValue('from', v);
                   }}
                 />
               </div>
@@ -454,7 +354,8 @@ function ZoneSheet({
           </div>
         </div>
         <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
-          <p className="text-xs text-muted-foreground">
+          {failed !== undefined && <p className="text-xs font-medium text-destructive">{failed}</p>}
+          <p className={cn('text-xs text-muted-foreground', failed !== undefined && 'sr-only')}>
             {nameError !== undefined
               ? 'Give it a name to save.'
               : changes.length === 0
@@ -465,12 +366,7 @@ function ZoneSheet({
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button
-              disabled={nameError !== undefined || changes.length === 0}
-              onClick={() => {
-                onSave(changes);
-              }}
-            >
+            <Button disabled={nameError !== undefined || changes.length === 0 || submitting} onClick={settings.save}>
               Save zone
             </Button>
           </div>
@@ -480,60 +376,42 @@ function ZoneSheet({
   );
 }
 
-interface DefaultsForm {
-  input: Policy;
-  output: Policy;
-  forward: Policy;
-  synFlood: boolean;
-  /** new connections a second per address, as typed; '' is fw4's own */
-  synRate: string;
-  dropInvalid: boolean;
-  offload: boolean;
-  offloadHw: boolean;
-}
-
 function DefaultsSheet({
   data,
   onClose,
-  onSave,
+  onSubmit,
 }: {
   data: FirewallData;
   onClose: () => void;
-  onSave: (c: Change[]) => void;
+  /** applies the changes; the failure's message when that didn't go through */
+  onSubmit: (c: Change[]) => Promise<string | undefined>;
 }): ReactElement {
   const id = useId();
   const d = data.cfg.defaults;
-  const was: DefaultsForm = {
-    input: d.input,
-    output: d.output,
-    forward: d.forward,
-    synFlood: d.synFlood,
-    synRate: synRateText(d.synRate),
-    dropInvalid: d.dropInvalid,
-    offload: d.offload,
-    offloadHw: d.offloadHw,
-  };
-  const [f, setF] = useState(was);
-  const rateError = f.synRate === was.synRate ? undefined : synRateError(f.synRate);
-  const set = <K extends keyof DefaultsForm>(key: K, value: DefaultsForm[K]): void => {
-    setF((x) => ({ ...x, [key]: value }));
-  };
-  const bit = (on: boolean): string => (on ? '1' : '0');
-  const values: Values = {};
-  if (f.input !== was.input) values['input'] = f.input;
-  if (f.output !== was.output) values['output'] = f.output;
-  if (f.forward !== was.forward) values['forward'] = f.forward;
-  if (f.synFlood !== was.synFlood) values[d.synFloodOption] = bit(f.synFlood);
-  if (f.synRate !== was.synRate && rateError === undefined) Object.assign(values, synRateValues(f.synRate));
-  if (f.dropInvalid !== was.dropInvalid) values['drop_invalid'] = bit(f.dropInvalid);
-  if (f.offload !== was.offload) values['flow_offloading'] = bit(f.offload);
-  if (f.offloadHw !== was.offloadHw) values['flow_offloading_hw'] = bit(f.offloadHw);
+  const was = useMemo(() => defaultsFormOf(d), [d]);
+  const schema = useMemo(() => defaultsFormSchema(was), [was]);
   const section: Section | undefined = data.sections.find((s) => s['.name'] === d.section);
   // hardware offloading with WED needs both kinds of flow offloading: either one off here turns WED off,
   // which puts back what it had turned off; the firewall's own options stay as this sheet sets them
   const wed = useWed();
+  const {
+    settings,
+    values: f,
+    failed,
+    submitting,
+  } = useSheetForm({
+    schema,
+    saved: was,
+    submit: (v) =>
+      onSubmit([
+        ...(wed.on && (!v.offload || !v.offloadHw) ? wed.offChanges({ keepFirewall: true }) : []),
+        ...defaultsChanges(v, was, d, section),
+      ]),
+  });
+  const { form } = settings;
+  const rateError = formErrors(schema, f)['synRate'];
   const wedOff = wed.on && (!f.offload || !f.offloadHw);
-  const changes = Object.keys(values).length === 0 ? [] : editSection('defaults', section, values);
+  const changes = defaultsChanges(f, was, d, section);
   const toggle = (
     key: 'synFlood' | 'dropInvalid' | 'offload' | 'offloadHw',
     label: string,
@@ -546,7 +424,7 @@ function DefaultsSheet({
       checked={f[key]}
       disabled={disabled}
       onChange={(v) => {
-        set(key, v);
+        form.setFieldValue(key, v);
       }}
       title={
         <span className="flex items-center gap-2">
@@ -579,7 +457,7 @@ function DefaultsSheet({
               hint="Between zones when no forwarding allows it, the internet to your devices’ IPv6 addresses included. MilkFlint’s default, drop, keeps them silent."
               value={f.forward}
               onChange={(p) => {
-                set('forward', p);
+                form.setFieldValue('forward', p);
               }}
             />
             {f.forward === 'ACCEPT' && (
@@ -593,7 +471,7 @@ function DefaultsSheet({
               hint="To the router from networks in no zone."
               value={f.input}
               onChange={(p) => {
-                set('input', p);
+                form.setFieldValue('input', p);
               }}
             />
             <PolicyField
@@ -602,7 +480,7 @@ function DefaultsSheet({
               hint="From the router to networks in no zone."
               value={f.output}
               onChange={(p) => {
-                set('output', p);
+                form.setFieldValue('output', p);
               }}
             />
             {toggle(
@@ -622,7 +500,7 @@ function DefaultsSheet({
                 disabled={!f.synFlood}
                 aria-invalid={rateError !== undefined}
                 onChange={(e) => {
-                  set('synRate', e.target.value.trim());
+                  form.setFieldValue('synRate', e.target.value.trim());
                 }}
               />
               <p className={cn('text-xs', rateError === undefined ? 'text-muted-foreground' : 'text-destructive')}>
@@ -660,9 +538,9 @@ function DefaultsSheet({
               <Alert variant="warning">
                 <AlertDescription>
                   Smart Queue can’t shape what bypasses the CPU: latency under load comes back (
-                  <a href={href('sqm')} className="underline">
+                  <Link {...pageLink('sqm')} className="underline">
                     Smart Queue
-                  </a>
+                  </Link>
                   ).
                 </AlertDescription>
               </Alert>
@@ -673,19 +551,18 @@ function DefaultsSheet({
           </div>
         </div>
         <div className="flex items-center justify-between gap-3 border-t px-6 py-3">
-          <p className="text-xs text-muted-foreground">
-            {changes.length === 0 ? 'No changes yet.' : 'Applies to the whole firewall.'}
-          </p>
+          {failed !== undefined ? (
+            <p className="text-xs font-medium text-destructive">{failed}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {changes.length === 0 ? 'No changes yet.' : 'Applies to the whole firewall.'}
+            </p>
+          )}
           <div className="flex gap-2">
             <Button variant="ghost" onClick={onClose}>
               Cancel
             </Button>
-            <Button
-              disabled={changes.length === 0 || rateError !== undefined}
-              onClick={() => {
-                onSave([...(wedOff ? wed.offChanges({ keepFirewall: true }) : []), ...changes]);
-              }}
-            >
+            <Button disabled={changes.length === 0 || rateError !== undefined || submitting} onClick={settings.save}>
               Save defaults
             </Button>
           </div>
@@ -694,18 +571,6 @@ function DefaultsSheet({
     </Sheet>
   );
 }
-
-const columns = [
-  { label: 'Zone' },
-  { label: 'Networks' },
-  { label: 'Input' },
-  { label: 'Output' },
-  { label: 'Forward' },
-  { label: 'Masq' },
-  { label: 'MSS' },
-  { label: 'Forwards to' },
-  { label: 'Actions', className: 'w-24', hidden: true },
-] as const;
 
 function Flag({ on }: { on: boolean }): ReactElement {
   return on ? <CheckIcon className="size-4 text-success" aria-label="on" /> : <span className="text-muted-foreground">—</span>;
@@ -726,14 +591,199 @@ function Chips({ items }: { items: readonly string[] }): ReactElement {
 
 type Open = { kind: 'zone'; zone: Zone | undefined } | { kind: 'defaults' };
 
+/** A row of the zones table: a zone, or the defaults for what no zone covers. */
+type ZoneRow = { kind: 'zone'; zone: Zone } | { kind: 'defaults' };
+
+// (a section's name has no spaces, so no zone's key is this)
+const DEFAULTS_KEY = 'the defaults';
+const DEFAULTS: ZoneRow = { kind: 'defaults' };
+
+function ZoneName({ z, cfg }: { z: Zone; cfg: FirewallConfig }): ReactElement {
+  const managed = managedBy[z.section];
+  const title = zoneTitle(z.name, cfg) === z.name ? '' : zoneTitle(z.name, cfg);
+  return (
+    <span className="flex flex-col">
+      <span className="flex items-center gap-1.5">
+        <ShieldIcon className="size-3.5 text-muted-foreground" />
+        <span className="font-mono text-xs font-medium">{z.name}</span>
+      </span>
+      <span className="text-xs text-muted-foreground">
+        {managed === undefined ? title : `${zoneTitle(z.name, cfg)} · ${managed.title} page`}
+      </span>
+    </span>
+  );
+}
+
+function DefaultsName(): ReactElement {
+  return (
+    <span className="flex flex-col">
+      <span className="font-mono text-xs font-medium">defaults</span>
+      <span className="text-xs text-muted-foreground">what no zone covers</span>
+    </span>
+  );
+}
+
+/** What the zones table's cells and cards work with. */
+interface ZoneCtx {
+  data: FirewallData;
+  actions: Actions;
+  setOpen: (open: Open) => void;
+}
+
+/** The zones each zone may forward to (its forwardings that are on). */
+function forwardsTo(z: Zone, cfg: FirewallConfig): string[] {
+  return cfg.forwardings.filter((f) => f.enabled && f.src === z.name).map((f) => f.dest);
+}
+
+function removeZone({ data: { cfg }, actions }: ZoneCtx, z: Zone): void {
+  const users = zoneUsers(cfg, z.name);
+  actions.confirm({
+    title: `Delete zone ${z.name}?`,
+    body: `Its networks are left in no zone, so only the defaults apply to them, and its forwardings go too.${
+      users.length === 0 ? '' : ` These still name it, and the firewall skips them until you change them: ${users.join(', ')}.`
+    }`,
+    action: 'Delete zone',
+    changes: [
+      { op: 'delete', config: 'firewall', section: z.section },
+      ...cfg.forwardings
+        .filter((f) => f.src === z.name || f.dest === z.name)
+        .map((f): Change => ({ op: 'delete', config: 'firewall', section: f.section })),
+    ],
+  });
+}
+
+/** A row's edit and delete buttons; the defaults only edit. */
+function RowActions({ row, ctx }: { row: ZoneRow; ctx: ZoneCtx }): ReactElement {
+  if (row.kind === 'defaults') {
+    return (
+      <span className="flex justify-end">
+        <RowButton
+          label="Edit the defaults"
+          icon={SquarePenIcon}
+          onClick={() => {
+            ctx.setOpen({ kind: 'defaults' });
+          }}
+        />
+      </span>
+    );
+  }
+  const z = row.zone;
+  return (
+    <span className="flex items-center justify-end">
+      <RowButton
+        label={`Edit zone ${z.name}`}
+        icon={SquarePenIcon}
+        onClick={() => {
+          ctx.setOpen({ kind: 'zone', zone: z });
+        }}
+      />
+      <RowButton
+        label={`Delete zone ${z.name}`}
+        icon={Trash2Icon}
+        disabled={ctx.actions.applying}
+        onClick={() => {
+          removeZone(ctx, z);
+        }}
+      />
+    </span>
+  );
+}
+
+/** The defaults' notes: SYN flood protection, invalid packets, offloading. */
+function defaultsNotes(cfg: FirewallConfig): string[] {
+  return [
+    cfg.defaults.synFlood ? `SYN flood protection ${synRateLabel(cfg.defaults.synRate)}` : 'no SYN flood protection',
+    cfg.defaults.dropInvalid && 'drops invalid',
+    cfg.defaults.offloadHw ? 'hardware offloading' : cfg.defaults.offload && 'software offloading',
+  ].filter((x): x is string => typeof x === 'string');
+}
+
+function zoneColumns(ctx: ZoneCtx): Column<ZoneRow>[] {
+  const { cfg } = ctx.data;
+  // a zone's policies, or the defaults'
+  const policy = (row: ZoneRow): Pick<Zone, 'input' | 'output' | 'forward'> => (row.kind === 'zone' ? row.zone : cfg.defaults);
+  // the defaults have no masquerading, MSS clamping or forwardings: their notes go under their row instead
+  const ofZone = (cell: (z: Zone) => ReactElement) => (row: ZoneRow) => (row.kind === 'zone' ? cell(row.zone) : null);
+  return [
+    { label: 'Zone', cell: (row) => (row.kind === 'zone' ? <ZoneName z={row.zone} cfg={cfg} /> : <DefaultsName />) },
+    { label: 'Networks', cell: (row) => <Chips items={row.kind === 'zone' ? row.zone.networks : []} /> },
+    { label: 'Input', cell: (row) => <VerdictBadge verdict={policy(row).input} /> },
+    { label: 'Output', cell: (row) => <VerdictBadge verdict={policy(row).output} /> },
+    { label: 'Forward', cell: (row) => <VerdictBadge verdict={policy(row).forward} /> },
+    { label: 'Masq', cell: ofZone((z) => <Flag on={z.masq} />) },
+    { label: 'MSS', cell: ofZone((z) => <Flag on={z.mtuFix} />) },
+    { label: 'Forwards to', cell: ofZone((z) => <Chips items={forwardsTo(z, cfg)} />) },
+    { label: 'Actions', className: 'w-24 py-1', hidden: true, cell: (row) => <RowActions row={row} ctx={ctx} /> },
+  ];
+}
+
+/** A zone's card on a phone or in a narrow window, or the defaults'. */
+function ZoneCard({ row, ctx }: { row: ZoneRow; ctx: ZoneCtx }): ReactElement {
+  const { cfg } = ctx.data;
+  const z = row.kind === 'zone' ? row.zone : undefined;
+  const notes = defaultsNotes(cfg);
+  const policy = (dt: string, verdict: string): ReactElement => (
+    <>
+      <dt className="text-muted-foreground">{dt}</dt>
+      <dd>
+        <VerdictBadge verdict={verdict} />
+      </dd>
+    </>
+  );
+  return (
+    <div className="flex flex-col gap-2 px-4 py-3">
+      <span className="flex items-start justify-between gap-2">
+        {z === undefined ? <DefaultsName /> : <ZoneName z={z} cfg={cfg} />}
+        <RowActions row={row} ctx={ctx} />
+      </span>
+      <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-1.5 text-xs">
+        {z === undefined ? (
+          <>
+            {policy('To the router (input)', cfg.defaults.input)}
+            {policy('From the router (output)', cfg.defaults.output)}
+            {policy('Between zones (forward)', cfg.defaults.forward)}
+            {notes.length > 0 && (
+              <>
+                <dt className="text-muted-foreground">Also</dt>
+                <dd>{notes.join(' · ')}</dd>
+              </>
+            )}
+          </>
+        ) : (
+          <>
+            <dt className="text-muted-foreground">Networks</dt>
+            <dd>
+              <Chips items={z.networks} />
+            </dd>
+            {policy('To the router (input)', z.input)}
+            {policy('From the router (output)', z.output)}
+            {policy('Within the zone (forward)', z.forward)}
+            <dt className="text-muted-foreground">Masquerading</dt>
+            <dd>{z.masq ? 'On' : 'Off'}</dd>
+            <dt className="text-muted-foreground">MSS clamping</dt>
+            <dd>{z.mtuFix ? 'On' : 'Off'}</dd>
+            <dt className="text-muted-foreground">Forwards to</dt>
+            <dd>
+              <Chips items={forwardsTo(z, cfg)} />
+            </dd>
+          </>
+        )}
+      </dl>
+    </div>
+  );
+}
+
 export function ZonesTab({
   data,
   counters,
   actions,
+  onSubmit,
 }: {
   data: FirewallData;
   counters: Counters | undefined;
   actions: Actions;
+  /** applies a sheet's changes; the failure's message when that didn't go through */
+  onSubmit: (changes: Change[]) => Promise<string | undefined>;
 }): ReactElement {
   const [open, setOpen] = useState<Open>();
   const { cfg } = data;
@@ -741,74 +791,25 @@ export function ZonesTab({
   const close = (): void => {
     setOpen(undefined);
   };
-  const save = (changes: Change[]): void => {
-    setOpen(undefined);
-    actions.apply(changes);
+  // a sheet closes once its save went through, and stays open with the failure when it didn't
+  const submit = async (changes: Change[]): Promise<string | undefined> => {
+    const failed = await onSubmit(changes);
+    if (failed === undefined) setOpen(undefined);
+    return failed;
   };
-  const remove = (z: Zone): void => {
-    const users = zoneUsers(cfg, z.name);
-    actions.confirm({
-      title: `Delete zone ${z.name}?`,
-      body: `Its networks are left in no zone, so only the defaults apply to them, and its forwardings go too.${
-        users.length === 0 ? '' : ` These still name it, and the firewall skips them until you change them: ${users.join(', ')}.`
-      }`,
-      action: 'Delete zone',
-      changes: [
-        { op: 'delete', config: 'firewall', section: z.section },
-        ...cfg.forwardings
-          .filter((f) => f.src === z.name || f.dest === z.name)
-          .map((f): Change => ({ op: 'delete', config: 'firewall', section: f.section })),
-      ],
-    });
-  };
-  const editDefaults = (
-    <HeaderButton
-      onClick={() => {
-        setOpen({ kind: 'defaults' });
-      }}
-    >
-      <SettingsIcon /> Edit
-    </HeaderButton>
-  );
-  const defaultsNotes = [
-    cfg.defaults.synFlood ? `SYN flood protection ${synRateLabel(cfg.defaults.synRate)}` : 'no SYN flood protection',
-    cfg.defaults.dropInvalid && 'drops invalid',
-    cfg.defaults.offloadHw ? 'hardware offloading' : cfg.defaults.offload && 'software offloading',
-  ].filter((x): x is string => typeof x === 'string');
-  const zoneActions = (z: Zone): ReactElement => (
-    <span className="flex items-center justify-end">
-      <RowButton
-        label={`Edit zone ${z.name}`}
-        icon={SquarePenIcon}
-        onClick={() => {
-          setOpen({ kind: 'zone', zone: z });
-        }}
-      />
-      <RowButton
-        label={`Delete zone ${z.name}`}
-        icon={Trash2Icon}
-        disabled={actions.applying}
-        onClick={() => {
-          remove(z);
-        }}
-      />
-    </span>
-  );
-  const zoneName = (z: Zone): ReactElement => {
-    const managed = managedBy[z.section];
-    const title = zoneTitle(z.name, cfg) === z.name ? '' : zoneTitle(z.name, cfg);
-    return (
-      <span className="flex flex-col">
-        <span className="flex items-center gap-1.5">
-          <ShieldIcon className="size-3.5 text-muted-foreground" />
-          <span className="font-mono text-xs font-medium">{z.name}</span>
-        </span>
-        <span className="text-xs text-muted-foreground">
-          {managed === undefined ? title : `${zoneTitle(z.name, cfg)} · ${managed.title} page`}
-        </span>
-      </span>
-    );
-  };
+  const ctx = useMemo((): ZoneCtx => ({ data, actions, setOpen }), [data, actions]);
+  const columns = useMemo(() => zoneColumns(ctx), [ctx]);
+  const notes = defaultsNotes(cfg);
+  const groups = [
+    {
+      key: 'zones',
+      header: (
+        <GroupHeader title={<span className="font-medium">Zones</span>} count={cfg.zones.length} noun={['zone', 'zones']} />
+      ),
+      rows: cfg.zones.map((zone): ZoneRow => ({ kind: 'zone', zone })),
+    },
+    { key: 'defaults', header: <GroupHeader title={<span className="font-medium">Defaults</span>} />, rows: [DEFAULTS] },
+  ];
 
   return (
     <div className="flex flex-col gap-4">
@@ -827,157 +828,31 @@ export function ZonesTab({
         </Button>
       </div>
       <div className="flex flex-col gap-2">
-        <Card className="gap-0 overflow-hidden py-0">
-          <div className="hidden overflow-x-auto lg:block">
-            <table className="w-full min-w-[52rem] border-collapse text-sm">
-              <thead>
-                <HeadRow columns={columns} />
-              </thead>
-              <tbody>
-                <GroupHeader
-                  title={<span className="font-medium">Zones</span>}
-                  count={cfg.zones.length}
-                  noun={['zone', 'zones']}
-                  colSpan={columns.length}
-                />
-                {cfg.zones.map((z) => (
-                  <tr
-                    key={z.section}
-                    onClick={rowClick(() => {
-                      setOpen({ kind: 'zone', zone: z });
-                    })}
-                    className="cursor-pointer border-b last:border-b-0 hover:bg-muted/60"
-                  >
-                    <td className="px-3 py-2">{zoneName(z)}</td>
-                    <td className="px-3 py-2">
-                      <Chips items={z.networks} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <VerdictBadge verdict={z.input} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <VerdictBadge verdict={z.output} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <VerdictBadge verdict={z.forward} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <Flag on={z.masq} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <Flag on={z.mtuFix} />
-                    </td>
-                    <td className="px-3 py-2">
-                      <Chips items={on.filter((f) => f.src === z.name).map((f) => f.dest)} />
-                    </td>
-                    <td className="px-2 py-1">{zoneActions(z)}</td>
-                  </tr>
-                ))}
-              </tbody>
-              <tbody>
-                <GroupHeader title={<span className="font-medium">Defaults</span>} colSpan={columns.length} />
-                <tr>
-                  <td className="px-3 py-2">
-                    <span className="flex flex-col">
-                      <span className="font-mono text-xs font-medium">defaults</span>
-                      <span className="text-xs text-muted-foreground">what no zone covers</span>
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground">—</td>
-                  <td className="px-3 py-2">
-                    <VerdictBadge verdict={cfg.defaults.input} />
-                  </td>
-                  <td className="px-3 py-2">
-                    <VerdictBadge verdict={cfg.defaults.output} />
-                  </td>
-                  <td className="px-3 py-2">
-                    <VerdictBadge verdict={cfg.defaults.forward} />
-                  </td>
-                  <td colSpan={3} className="px-3 py-2 text-xs text-muted-foreground">
-                    {defaultsNotes.length === 0 ? '—' : defaultsNotes.join(' · ')}
-                  </td>
-                  <td className="px-2 py-1">
-                    <span className="flex justify-end">
-                      <RowButton
-                        label="Edit the defaults"
-                        icon={SquarePenIcon}
-                        onClick={() => {
-                          setOpen({ kind: 'defaults' });
-                        }}
-                      />
-                    </span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <div className="lg:hidden">
-            <GroupHeader title={<span className="font-medium">Zones</span>} count={cfg.zones.length} noun={['zone', 'zones']} />
-            <ul className="divide-y">
-              {cfg.zones.map((z) => (
-                <li key={z.section} className="flex flex-col gap-2 px-4 py-3">
-                  <span className="flex items-start justify-between gap-2">
-                    {zoneName(z)}
-                    {zoneActions(z)}
-                  </span>
-                  <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-1.5 text-xs">
-                    <dt className="text-muted-foreground">Networks</dt>
-                    <dd>
-                      <Chips items={z.networks} />
-                    </dd>
-                    <dt className="text-muted-foreground">To the router (input)</dt>
-                    <dd>
-                      <VerdictBadge verdict={z.input} />
-                    </dd>
-                    <dt className="text-muted-foreground">From the router (output)</dt>
-                    <dd>
-                      <VerdictBadge verdict={z.output} />
-                    </dd>
-                    <dt className="text-muted-foreground">Within the zone (forward)</dt>
-                    <dd>
-                      <VerdictBadge verdict={z.forward} />
-                    </dd>
-                    <dt className="text-muted-foreground">Masquerading</dt>
-                    <dd>{z.masq ? 'On' : 'Off'}</dd>
-                    <dt className="text-muted-foreground">MSS clamping</dt>
-                    <dd>{z.mtuFix ? 'On' : 'Off'}</dd>
-                    <dt className="text-muted-foreground">Forwards to</dt>
-                    <dd>
-                      <Chips items={on.filter((f) => f.src === z.name).map((f) => f.dest)} />
-                    </dd>
-                  </dl>
-                </li>
-              ))}
-            </ul>
-            <GroupHeader title={<span className="font-medium">Defaults</span>} action={editDefaults} />
-            <div className="flex flex-col gap-2 px-4 py-3">
-              <span className="flex flex-col">
-                <span className="font-mono text-xs font-medium">defaults</span>
-                <span className="text-xs text-muted-foreground">what no zone covers</span>
-              </span>
-              <dl className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-4 gap-y-1.5 text-xs">
-                <dt className="text-muted-foreground">To the router (input)</dt>
-                <dd>
-                  <VerdictBadge verdict={cfg.defaults.input} />
-                </dd>
-                <dt className="text-muted-foreground">From the router (output)</dt>
-                <dd>
-                  <VerdictBadge verdict={cfg.defaults.output} />
-                </dd>
-                <dt className="text-muted-foreground">Between zones (forward)</dt>
-                <dd>
-                  <VerdictBadge verdict={cfg.defaults.forward} />
-                </dd>
-                {defaultsNotes.length > 0 && (
-                  <>
-                    <dt className="text-muted-foreground">Also</dt>
-                    <dd>{defaultsNotes.join(' · ')}</dd>
-                  </>
-                )}
-              </dl>
-            </div>
-          </div>
-        </Card>
+        <DataTable
+          label="Zones"
+          columns={columns}
+          groups={groups}
+          rowKey={(row) => (row.kind === 'zone' ? row.zone.section : DEFAULTS_KEY)}
+          empty="No zones."
+          wide="lg"
+          card={(row) => <ZoneCard row={row} ctx={ctx} />}
+          rowProps={(row) =>
+            row.kind === 'zone'
+              ? {
+                  onClick: rowClick(() => {
+                    setOpen({ kind: 'zone', zone: row.zone });
+                  }),
+                  className: 'cursor-pointer',
+                }
+              : {}
+          }
+          // the defaults' notes, across the columns a zone's flags and forwardings are in
+          detail={(row) =>
+            row.kind === 'defaults' && (
+              <span className="text-xs text-muted-foreground">{notes.length === 0 ? '—' : notes.join(' · ')}</span>
+            )
+          }
+        />
         <p className="text-xs text-muted-foreground lg:text-right">
           Input: connections to the router · Output: from the router · Forward: between a zone’s own networks · Forwards to: zones
           it may start connections to, one way; replies always come back.
@@ -994,8 +869,8 @@ export function ZonesTab({
           </a>
         </p>
       )}
-      {open?.kind === 'zone' && <ZoneSheet zone={open.zone} data={data} onClose={close} onSave={save} />}
-      {open?.kind === 'defaults' && <DefaultsSheet data={data} onClose={close} onSave={save} />}
+      {open?.kind === 'zone' && <ZoneSheet zone={open.zone} data={data} onClose={close} onSubmit={submit} />}
+      {open?.kind === 'defaults' && <DefaultsSheet data={data} onClose={close} onSubmit={submit} />}
     </div>
   );
 }

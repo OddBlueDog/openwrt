@@ -5,22 +5,25 @@
 // Activity (what's been blocked); everything else in the Advanced sheet.
 // banIP does the work (its own nftables table); the router side is
 // source/feed/milkflint-ui/files/features/banip.
+import { useQuery } from '@tanstack/react-query';
+import { Link, useNavigate } from '@tanstack/react-router';
 import { ArrowUpCircleIcon, ChevronRightIcon, InfoIcon, PackageXIcon, SlidersHorizontalIcon } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
 import { ApplyStatus } from '@/components/apply-status';
+import { PackageUpdatesCard } from '@/components/package-updates';
 import { PageHeader } from '@/components/layout/page-header';
 import { FormSkeleton, LoadError } from '@/components/page-states';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { TabPanel, Tabs } from '@/components/ui/tabs';
 import type { ApplyState } from '@/hooks/use-apply';
-import { useLoad } from '@/hooks/use-load';
-import { usePoll } from '@/hooks/use-poll';
-import { href, tabFrom, tabHref, useSubPath } from '@/lib/router';
+import { useLive } from '@/lib/query/use-live';
+import { pageLink, tabFrom, tabLink, useSubPath } from '@/lib/router';
 import { errorMessage } from '@/lib/utils';
 import { ActivityTab } from './activity';
 import { AdvancedSheet } from './advanced-sheet';
-import { enableBanip, getConfig, getStatus, runAction, saveOptions } from './api';
+import { enableBanip, runAction, saveOptions } from './api';
+import { banipQueries, useBanipRefresh, useBanipWrite } from './queries';
 import { ListsTab } from './lists';
 import { ProtectionTab } from './protection';
 import { PRESETS, type PresetId } from './feeds';
@@ -37,12 +40,15 @@ const TABS: { id: TabId; label: string }[] = [
 ];
 
 export function BanipPage(): ReactElement {
-  const status = usePoll(getStatus, 3000);
-  const config = useLoad(getConfig);
+  const status = useLive(banipQueries.status());
+  const config = useQuery(banipQueries.config());
+  const write = useBanipWrite();
+  const reload = useBanipRefresh();
   // the tab is in the address (#/banip/activity), so a link or the menu's search opens it
   const tab = tabFrom(useSubPath(), TABS, 'protection');
+  const navigate = useNavigate();
   const setTab = (t: TabId): void => {
-    window.location.hash = tabHref('banip', t, 'protection');
+    void navigate(tabLink('banip', t, 'protection'));
   };
   const [advanced, setAdvanced] = useState(false);
   const [busy, setBusy] = useState<string>();
@@ -52,18 +58,14 @@ export function BanipPage(): ReactElement {
   const s = status.data;
   const c = config.data;
 
-  const reload = (): void => {
-    config.reload();
-    status.refresh();
-  };
+  // a write refreshes every banIP read once it went through (useBanipWrite)
   const run = (what: string, fn: () => Promise<unknown>, note?: string): void => {
     setBusy(what);
     setState({ phase: 'applying' });
-    fn().then(
+    write.mutateAsync(fn).then(
       () => {
         setBusy(undefined);
         setState({ phase: 'done', nothingChanged: false, note });
-        reload();
       },
       (err: unknown) => {
         setBusy(undefined);
@@ -93,16 +95,16 @@ export function BanipPage(): ReactElement {
     />
   );
   if (s === undefined || c === undefined) {
-    const err = status.error ?? config.error;
+    const err = status.error ?? config.error ?? undefined;
     return (
       <>
         {header}
-        {err !== undefined && !status.loading && !config.loading ? (
+        {err !== undefined && !status.loading && !config.isLoading ? (
           <LoadError
             error={err}
             retry={() => {
               status.refresh();
-              config.reload();
+              void config.refetch();
             }}
           />
         ) : (
@@ -124,9 +126,9 @@ export function BanipPage(): ReactElement {
               newest release to get it.
             </p>
             <Button size="sm" variant="outline" className="mt-2" asChild>
-              <a href={href('upgrade')}>
+              <Link {...pageLink('upgrade')}>
                 <ArrowUpCircleIcon /> Upgrade
-              </a>
+              </Link>
             </Button>
           </AlertDescription>
         </Alert>
@@ -181,10 +183,13 @@ export function BanipPage(): ReactElement {
                 Another router faces the internet and filters what reaches your network, so banIP stays off here. Run it on that
                 router.
               </p>
-              <a href={href('mode')} className="mt-1 inline-flex w-fit items-center gap-0.5 font-medium link underline-offset-4">
+              <Link
+                {...pageLink('mode')}
+                className="mt-1 inline-flex w-fit items-center gap-0.5 font-medium link underline-offset-4"
+              >
                 Operating mode
                 <ChevronRightIcon className="size-4" />
-              </a>
+              </Link>
             </AlertDescription>
           </Alert>
         )}
@@ -216,13 +221,20 @@ export function BanipPage(): ReactElement {
               <ProtectionTab key={version} c={c} s={s} onSaved={reload} onPick={setPick} />
             </TabPanel>
             <TabPanel prefix="banip" id="lists" value={tab}>
-              <ListsTab key={version} c={c} onSaved={reload} />
+              <ListsTab key={version} c={c} />
             </TabPanel>
             <TabPanel prefix="banip" id="activity" value={tab}>
               {tab === 'activity' && <ActivityTab c={c} s={s} onSaved={reload} />}
             </TabPanel>
           </>
         )}
+        <PackageUpdatesCard
+          name="banip"
+          title="Updates"
+          notes="New banIP versions reach this card after MilkFlint has tested them with this page."
+          backNote="Your settings stay as they are."
+          onInstalled={reload}
+        />
         <LicenseCard s={s} />
       </div>
       {advanced && (

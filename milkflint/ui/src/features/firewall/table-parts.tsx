@@ -1,6 +1,7 @@
 // What the Firewall and Port forwards pages' tables share (rules, port
-// forwards, zones, NAT): the grouped table frame, its group headers, the
-// small cells, and the on/off switch each row has.
+// forwards, zones, NAT): their group headers (DataTable draws the row or
+// card section around one), the small cells, and the on/off switch each row
+// has.
 import { ArrowRightIcon, type LucideIcon, RouterIcon } from 'lucide-react';
 import type { ReactElement, ReactNode } from 'react';
 import { Badge } from '@/components/ui/badge';
@@ -102,22 +103,20 @@ export function Path({ from, to }: { from: ReactNode; to: ReactNode }): ReactEle
   );
 }
 
-/** A group's header: its title and size on the left, an action on the right; a table row when it has columns to span. */
+/** A group's header: its title and size on the left, an action on the right. */
 export function GroupHeader({
   title,
   count,
   noun,
   action,
-  colSpan,
 }: {
   title: ReactNode;
   /** how many it holds, with its noun singular and plural; left out for a group of one kind */
   count?: number;
   noun?: readonly [string, string];
   action?: ReactNode;
-  colSpan?: number;
 }): ReactElement {
-  const content = (
+  return (
     <div className="flex min-h-7 items-center justify-between gap-2">
       <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-sm">
         {title}
@@ -129,15 +128,6 @@ export function GroupHeader({
       </span>
       {action}
     </div>
-  );
-  return colSpan === undefined ? (
-    <div className="border-y bg-muted/60 px-4 py-1.5">{content}</div>
-  ) : (
-    <tr>
-      <th scope="colgroup" colSpan={colSpan} className="border-y bg-muted/60 px-3 py-1.5 text-left font-normal">
-        {content}
-      </th>
-    </tr>
   );
 }
 
@@ -161,23 +151,6 @@ export function HeaderButton({
     >
       {children}
     </Button>
-  );
-}
-
-/** The table's column headings. */
-export function HeadRow({
-  columns,
-}: {
-  columns: readonly { label: string; className?: string; hidden?: boolean }[];
-}): ReactElement {
-  return (
-    <tr className="text-left text-xs text-muted-foreground">
-      {columns.map((c) => (
-        <th key={c.label} scope="col" className={cn('h-9 px-3 font-medium whitespace-nowrap', c.className)}>
-          {c.hidden === true ? <span className="sr-only">{c.label}</span> : c.label}
-        </th>
-      ))}
-    </tr>
   );
 }
 

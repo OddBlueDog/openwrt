@@ -16,7 +16,6 @@ import {
   lossBins,
   lossSliceAt,
   niceRange,
-  runs,
   slotValues,
   timeTicks,
   unrecorded,
@@ -56,7 +55,6 @@ test('an hour of once-a-minute route pings fills the whole hour, not half of it'
   assert.ok((l.points[0]?.t ?? 0) - (now - 3600) < 60, 'starts at the left edge');
   assert.ok(now - (l.points[59]?.t ?? 0) < 60, 'ends at the right edge');
   assert.deepEqual(unrecorded([l], now - 3600, now), []);
-  assert.equal(runs(l.points).length, 1, 'one unbroken line');
 });
 
 test('a lost sample is a point without a value; a sample not asked is no point', () => {
@@ -69,7 +67,6 @@ test('a lost sample is a point without a value; a sample not asked is no point',
       [120, 76, 0],
     ],
   );
-  assert.equal(runs(l.points).length, 2);
 });
 
 test('a history bucket keeps its typical, worst and loss; empty ones are skipped', () => {
@@ -93,7 +90,6 @@ test('a history bucket keeps its typical, worst and loss; empty ones are skipped
 
 test('a line breaks where nothing was recorded, and the time shows as unrecorded', () => {
   const l = line([at(0, 1), at(60, 1), at(120, 1), at(900, 1), at(960, 1)]);
-  assert.equal(runs(l.points).length, 2);
   assert.deepEqual(unrecorded([l], 0, 960), [{ from: 120, to: 900 }]);
   assert.deepEqual(unrecorded([l], -600, 1500), [
     { from: -600, to: 0 },

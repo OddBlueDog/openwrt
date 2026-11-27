@@ -39,6 +39,16 @@ export function SearchSelect({
     if (open) list.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest' });
   }, [open, active, q]);
 
+  const openList = (): void => {
+    setQuery('');
+    setActive(
+      Math.max(
+        options.findIndex((o) => o.value === value),
+        0,
+      ),
+    );
+  };
+
   const choose = (o: SearchOption | undefined): void => {
     if (o !== undefined) onChange(o.value);
     setQuery(null);
@@ -74,14 +84,13 @@ export function SearchSelect({
         placeholder={open ? 'Type to search' : placeholder}
         value={query ?? selected?.label ?? ''}
         onFocus={(e) => {
-          setQuery('');
-          setActive(
-            Math.max(
-              options.findIndex((o) => o.value === value),
-              0,
-            ),
-          );
+          openList();
           e.target.select();
+        }}
+        // a click on the box (or its arrows) while it already has the focus: a choice
+        // made with the mouse closed the list but left the focus here
+        onClick={() => {
+          if (!open) openList();
         }}
         onChange={(e) => {
           setQuery(e.target.value);

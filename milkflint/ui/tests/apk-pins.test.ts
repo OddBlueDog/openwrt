@@ -66,9 +66,10 @@ const lines = (s: string): string[] =>
     .sort();
 
 const world = [
-  'adguardhome@milkflint',
+  'adguardhome',
   'banip',
   'base-files=1720~981c978eff',
+  'custompkg@custom',
   'gawk',
   'hostapd-common',
   'kmod-mt7915e',
@@ -84,6 +85,7 @@ test('what MilkFlint changes is pinned at the version installed, by origin or by
   assert.equal(r.status, 0);
   const got = lines(r.world);
   for (const pin of [
+    'adguardhome=0.107.80-r1',
     'wpad-basic-mbedtls=2025.08.26~ca266cc2-r6',
     'hostapd-common=2025.08.26~ca266cc2-r6',
     'gawk=5.3.2-r2',
@@ -96,16 +98,10 @@ test('what MilkFlint changes is pinned at the version installed, by origin or by
 
 test('the rest stays as it was: OpenWrt’s own packages, kernel modules, pins and tags already there', () => {
   const got = lines(run(world).world);
-  for (const same of [
-    'ucode',
-    'kmod-mt7915e',
-    'base-files=1720~981c978eff',
-    'kernel=6.12.115~b5431106-r1',
-    'adguardhome@milkflint',
-  ]) {
+  for (const same of ['ucode', 'kmod-mt7915e', 'base-files=1720~981c978eff', 'kernel=6.12.115~b5431106-r1', 'custompkg@custom']) {
     assert.ok(got.includes(same), same);
   }
-  assert.ok(!got.some((l) => l.startsWith('adguardhome=') || l.startsWith('ucode=')));
+  assert.ok(!got.some((l) => l.startsWith('ucode=') || l.startsWith('adguardhome@')));
 });
 
 test('one installed as another’s dependency, not in the world, is added pinned', () => {
@@ -144,10 +140,10 @@ test('without a package database it leaves the world alone, and succeeds', () =>
   assert.equal(r.world, world);
 });
 
-test('its lists: hostapd’s folder, the overrides by name and banIP; not AdGuard Home, nor kernel modules', () => {
+test('its lists: hostapd’s folder, the overrides (including AdGuard Home) by name and banIP; not kernel modules', () => {
   const block = /# BEGIN generated\n([\s\S]*?)# END generated/.exec(script)?.[1] ?? '';
-  for (const want of [HOSTAPD, 'feeds/base/network/config/firewall4', 'gawk', 'sqm-scripts', 'banip']) {
+  for (const want of [HOSTAPD, 'feeds/base/network/config/firewall4', 'adguardhome', 'gawk', 'sqm-scripts', 'banip']) {
     assert.ok(block.split(/\s+/).includes(want), want);
   }
-  assert.ok(!/adguardhome|feeds\/base\/kernel\//.test(block));
+  assert.ok(!block.includes('feeds/base/kernel/'));
 });

@@ -21,6 +21,10 @@ export function useFirewallActions(onApplied: () => void): {
   setDialog: (d: OpenDialog | undefined) => void;
   /** close the dialog and apply what it saved */
   save: (changes: Change[]) => void;
+  /** apply what a sheet saved, closing it once that went through; the failure's message when it didn't */
+  submit: (changes: Change[]) => Promise<string | undefined>;
+  /** apply what a sheet of the page's own (the zones tab's) saved; the failure's message when it didn't go through */
+  applyNow: (changes: Change[]) => Promise<string | undefined>;
 } {
   const done = useRef<(() => void) | undefined>(undefined);
   const applied = useCallback(() => {
@@ -67,5 +71,23 @@ export function useFirewallActions(onApplied: () => void): {
     [apply],
   );
 
-  return { state, actions, dialog, setDialog, save };
+  const applyNow = useCallback(
+    async (changes: Change[]): Promise<string | undefined> => {
+      done.current = undefined;
+      const end = await apply(changes);
+      return end.phase === 'failed' ? end.message : undefined;
+    },
+    [apply],
+  );
+
+  const submit = useCallback(
+    async (changes: Change[]): Promise<string | undefined> => {
+      const failed = await applyNow(changes);
+      if (failed === undefined) setDialog(undefined);
+      return failed;
+    },
+    [applyNow],
+  );
+
+  return { state, actions, dialog, setDialog, save, submit, applyNow };
 }

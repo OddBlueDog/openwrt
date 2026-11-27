@@ -13,13 +13,15 @@ import {
   SignalZeroIcon,
 } from 'lucide-react';
 import { type ReactElement, useState } from 'react';
+import { BarChart } from '@/components/charts/bar-chart';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { usePoll } from '@/hooks/use-poll';
-import { type AirtimeDevice, type AirtimeRadio, describeRate, getAirtime } from '@/lib/api/wireless';
+import { useLive } from '@/lib/query/use-live';
+import { type AirtimeDevice, type AirtimeRadio, describeRate } from '@/lib/api/wireless';
+import { wifiQueries } from './queries';
 import { formatBitrate, formatDuration, formatPercent } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { airtimeFill } from './airtime-colors';
+import { airtimeColor, airtimeFill } from './airtime-colors';
 import {
   AIRTIME_CLASS_LABELS,
   AIRTIME_CLASSES,
@@ -54,13 +56,12 @@ import {
   airtimeWeightPart,
 } from './airtime';
 
-const POLL_MS = 2_000;
 /** The strip's columns: a minute, a second each */
 const SECONDS = 60;
 /** Devices always listed; past these, only the ones the policy gives less than a full share */
 const LISTED = 6;
 
-// A colour a class, the same in the bar, the list and the strip (airtime-colors.ts)
+// A colour a class, the same in the bar, the list and the last minute (airtime-colors.ts)
 const fill = airtimeFill;
 
 /** A name on a segment: the lighter of the theme's two text colours on the amber, the page's background on the rest */
@@ -73,6 +74,7 @@ const onFill: Record<AirtimeClass, string> = {
 
 /** What other networks and noise took: the same grey in the bar, its legend and the last minute */
 const otherFill = 'bg-muted-foreground/35';
+const otherColor = 'color-mix(in oklab, var(--muted-foreground) 35%, transparent)';
 
 /** The unfilled part of a class's meter: its colour, faint */
 const track: Record<AirtimeClass, string> = {
@@ -419,30 +421,6 @@ function DeviceRow({
   );
 }
 
-/** The strip's scale at one of its sides: all of the air at the top, down to a quarter */
-function StripMarks({ side }: { side: 'left' | 'right' }): ReactElement {
-  return (
-    <div
-      aria-hidden
-      className={cn(
-        'relative w-8 shrink-0 text-xs leading-none text-muted-foreground tabular',
-        side === 'left' ? 'text-right' : 'text-left',
-      )}
-    >
-      {AIRTIME_STRIP_MARKS.map((mark) => (
-        // the top one hangs from the strip's edge, the others are centred on their line
-        <span
-          key={mark}
-          className={cn('absolute inset-x-0', mark < 1 && '-translate-y-1/2')}
-          style={{ top: `${String((1 - mark) * 100)}%` }}
-        >
-          {formatPercent(mark)}
-        </span>
-      ))}
-    </div>
-  );
-}
-
 /**
  * The last minute, a column a second: how much of the air the band's devices
  * took, split by class, with what other networks and noise took on top. Full
@@ -452,20 +430,9 @@ function StripMarks({ side }: { side: 'left' | 'right' }): ReactElement {
  * placed by its own time, so one the router didn't measure is a gap.
  */
 function LastMinute({ band, history, now }: { band: string; history: AirtimeRadio['history']; now: number }): ReactElement {
-  const [pointed, setPointed] = useState<number>();
   const columns = airtimeColumns(history, SECONDS);
   const newest = columns.at(-1)?.t ?? 0;
   const peak = Math.max(0, ...columns.map((c) => (c.second === undefined ? 0 : airtimeSecondTotal(c.second))));
-  const column = pointed === undefined ? undefined : columns[pointed];
-  const second = column?.second;
-  // a gap within the history: the router didn't measure that second
-  const gap =
-    column !== undefined && second === undefined && history.length > 0 && column.t > Math.round(history[0]?.t ?? Infinity);
-  const parts = second === undefined ? [] : airtimeSecondParts(second);
-  // How far along the strip the pointed column is, in percent. The breakdown
-  // sits above it and is shifted left by as much of its own width, so it
-  // stays within the strip at either end.
-  const along = pointed === undefined ? 0 : ((pointed + 0.5) / SECONDS) * 100;
   // nothing took the air: say so rather than draw an empty frame
   const idle = peak < 0.005 && !columns.some((c) => (c.second?.other ?? 0) >= 0.005);
   if (idle)
@@ -475,97 +442,46 @@ function LastMinute({ band, history, now }: { band: string; history: AirtimeRadi
         <p className="text-sm text-muted-foreground">No traffic on this band in the last minute.</p>
       </div>
     );
+  const bars = columns.map(({ second: s }) =>
+    s === undefined
+      ? []
+      : [
+          ...AIRTIME_CLASSES.map((cls) => ({ value: s[cls], color: airtimeColor[cls] })),
+          // on top of the band's own devices, as in the bar of the air right now
+          { value: s.other ?? 0, color: otherColor },
+        ],
+  );
   return (
     <div className="flex flex-col gap-1.5">
       <h5 className={heading}>The last minute</h5>
-      <div className="flex gap-1.5">
-        <StripMarks side="left" />
-        <div className="relative min-w-0 flex-1">
-          <div
-            role="img"
-            aria-label={`The air on ${band} in each of the last ${String(SECONDS)} seconds, on a scale of all of it: this band’s devices by class, then other networks and noise. The most this band’s devices took in one second: ${percent(peak)}.`}
-            className="relative flex h-28 gap-px overflow-hidden rounded-md bg-muted/60"
-            onPointerLeave={() => {
-              setPointed(undefined);
-            }}
-          >
-            {AIRTIME_STRIP_MARKS.filter((mark) => mark < 1).map((mark) => (
-              <div
-                key={mark}
-                aria-hidden
-                className="pointer-events-none absolute inset-x-0 border-t border-foreground/10"
-                style={{ bottom: `${String(mark * 100)}%` }}
-              />
-            ))}
-            {columns.map(({ second: s }, i) => (
-              <div
-                key={i}
-                className={cn(
-                  'relative flex h-full min-w-0 flex-1 flex-col-reverse',
-                  pointed === i && (s !== undefined || gap) && 'bg-foreground/10',
-                )}
-                onPointerEnter={() => {
-                  setPointed(i);
-                }}
-              >
-                {s !== undefined &&
-                  AIRTIME_CLASSES.map((cls) =>
-                    s[cls] > 0 ? (
-                      <div
-                        key={cls}
-                        className={cn('shrink-0', fill[cls])}
-                        style={{ height: `${String(Math.min(1, s[cls]) * 100)}%` }}
-                      />
-                    ) : null,
-                  )}
-                {/* on top of the band's own devices, as in the bar of the air right now */}
-                {s !== undefined && s.other !== null && s.other > 0 && (
-                  <div className={cn('shrink-0', otherFill)} style={{ height: `${String(Math.min(1, s.other) * 100)}%` }} />
-                )}
-              </div>
-            ))}
-          </div>
-          {column !== undefined && (second !== undefined || gap) && (
-            <div
-              className="pointer-events-none absolute bottom-full z-10 mb-1.5 rounded-md border bg-popover px-2.5 py-1.5 text-xs whitespace-nowrap text-popover-foreground shadow-md"
-              style={{ left: `${String(along)}%`, transform: `translateX(-${String(along)}%)` }}
-            >
-              <p className="font-medium">{airtimeAgo(airtimeColumnAgo(column.t, now, newest))}</p>
-              {gap && <p className="text-muted-foreground">Not measured</p>}
-              <ul className="mt-1 flex flex-col gap-0.5 empty:hidden">
-                {parts.map((part) => (
-                  <li key={part.key} className="flex items-center gap-1.5">
-                    <span
-                      className={cn(
-                        'size-2 shrink-0 rounded-[2px]',
-                        part.key === 'other' ? otherFill : part.key === 'free' ? 'border bg-muted' : fill[part.key],
-                      )}
-                      aria-hidden
-                    />
-                    {part.label}
-                    <span
-                      className="ml-auto pl-4 tabular"
-                      title={
-                        part.share === null
-                          ? 'The channel wasn’t measured that second: it’s only measured while this page is open.'
-                          : undefined
-                      }
-                    >
-                      {part.share === null ? '–' : percent(part.share)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-        <StripMarks side="right" />
-      </div>
-      {/* in line with the strip: past each side's marks and the gap to them */}
-      <div className="flex justify-between px-[2.375rem] text-xs text-muted-foreground">
-        <span>A minute ago</span>
-        <span>Now</span>
-      </div>
+      <BarChart
+        bars={bars}
+        max={1}
+        gap={0.12}
+        scale={{ ticks: AIRTIME_STRIP_MARKS, format: formatPercent }}
+        labels={[
+          { at: 0, text: 'A minute ago', align: 'start' },
+          { at: SECONDS - 1, text: 'Now', align: 'end' },
+        ]}
+        label={`The air on ${band} in each of the last ${String(SECONDS)} seconds, on a scale of all of it: this band’s devices by class, then other networks and noise. The most this band’s devices took in one second: ${percent(peak)}.`}
+        card={(at) => {
+          const column = columns[at];
+          const second = column?.second;
+          return {
+            title: airtimeAgo(airtimeColumnAgo(column?.t ?? newest, now, newest)),
+            // the second in full, in the order of the bar above; what isn't known (the channel unread) a dash
+            rows:
+              second === undefined
+                ? [{ label: 'Not measured', value: '' }]
+                : airtimeSecondParts(second).map((part) => ({
+                    label: part.label,
+                    value: part.share === null ? '–' : percent(part.share),
+                    color: part.key === 'other' ? otherColor : part.key === 'free' ? 'var(--muted)' : airtimeColor[part.key],
+                  })),
+          };
+        }}
+        className="h-34"
+      />
     </div>
   );
 }
@@ -679,7 +595,7 @@ function RadioPanel({ radio, now }: { radio: AirtimeRadio; now: number }): React
  * the Airtime fairness card on the Wi-Fi driver page, under its settings.
  */
 export function AirtimeLive(): ReactElement {
-  const { data } = usePoll(getAirtime, POLL_MS);
+  const { data } = useLive(wifiQueries.airtime());
   // hardware offloading with WED: what it forwards passes the policy by
   const wed = useWed();
   const order = (band: string): number => ['2g', '5g', '6g'].indexOf(band);

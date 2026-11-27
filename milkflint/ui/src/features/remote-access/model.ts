@@ -5,7 +5,10 @@
 // the router, and, as set, the internet through home, the home network, the
 // router's settings and each other. Off keeps every part (LuCI shows them
 // turned off) and closes the port; Remove deletes them.
+import { z } from 'zod';
 import { intToIp, ipToInt } from '@/lib/api/network';
+import { formErrors } from '@/lib/form/errors';
+import { isPrivateIpv4 } from '@/lib/schemas';
 import { type Owned, reconcile, type Wanted } from '@/lib/api/owned';
 import type { Section } from '@/lib/api/uci';
 import { formatConf, isKey, joinEndpoint } from '@/lib/api/wireguard';
@@ -19,44 +22,51 @@ export const PREFIX = 24;
 /** How often a device's app says hello while it's quiet, so mobile networks keep its way in open. */
 export const KEEPALIVE = 25;
 
-export interface PeerForm {
+const peerFields = z.object({
   /** its section in /etc/config/network (named when this page made it, cfg… when LuCI did) */
-  section: string;
-  name: string;
+  section: z.string(),
+  name: z.string(),
   /** its address in the tunnel */
-  ip: string;
+  ip: z.string(),
   /** more of its allowed IPs, set in LuCI (a network behind it, say): kept as they are */
-  otherIps: string[];
-  enabled: boolean;
-  publicKey: string;
+  otherIps: z.array(z.string()),
+  enabled: z.boolean(),
+  publicKey: z.string(),
   /** kept on the router for its QR code, as LuCI does; '' for one set up elsewhere with only its public key */
-  privateKey: string;
-  presharedKey: string;
-}
+  privateKey: z.string(),
+  presharedKey: z.string(),
+});
 
-export interface ServerForm {
-  enabled: boolean;
+export type PeerForm = z.infer<typeof peerFields>;
+
+const serverFields = z.object({
+  enabled: z.boolean(),
   /** the router's address in the tunnel */
-  address: string;
+  address: z.string(),
   /** its network's size: 24 here, kept as it is for one set up in LuCI */
-  prefix: number;
+  prefix: z.number(),
   /** more addresses set in LuCI (an IPv6 one, say): kept as they are */
-  extraAddresses: string[];
-  port: string;
+  extraAddresses: z.array(z.string()),
+  port: z.string(),
   /** what devices connect to: a hostname or address, '' for the internet port's own address */
-  endpoint: string;
+  endpoint: z.string(),
   /** a forwarding to the internet */
-  internet: boolean;
+  internet: z.boolean(),
   /** a forwarding to the home network */
-  lan: boolean;
+  lan: z.boolean(),
   /** the zone's input policy: the router's settings pages, SSH and the rest */
-  admin: boolean;
+  admin: z.boolean(),
   /** the zone's forward policy: devices reach each other */
-  between: boolean;
+  between: z.boolean(),
   /** '' until it's first turned on: the router makes one then */
-  privateKey: string;
-  peers: PeerForm[];
-}
+  privateKey: z.string(),
+  peers: z.array(peerFields),
+});
+
+export type ServerForm = z.infer<typeof serverFields>;
+
+/** The form's top-level fields, for setting several at once. */
+export const serverFormKeys = serverFields.keyof().options;
 
 export interface Range {
   ip: number;
@@ -99,11 +109,7 @@ export type Errors = Partial<Record<string, string>>;
 
 // ---- addresses ----
 
-function isPrivate(ip: number): boolean {
-  const a = Math.floor(ip / 2 ** 24);
-  const b = Math.floor(ip / 2 ** 16) % 256;
-  return a === 10 || (a === 172 && b >= 16 && b < 32) || (a === 192 && b === 168);
-}
+const isPrivate = isPrivateIpv4;
 
 function networkOf(ip: number, prefix: number): number {
   const size = 2 ** (32 - prefix);
@@ -207,7 +213,46 @@ export function peerLabel(p: PeerForm): string {
   return name !== '' ? name : `Device ${p.ip}`;
 }
 
-export function validate(f: ServerForm, d: ServerData): Errors {
+/** The form's checks against the router as loaded (ports in use, port forwards, other networks). */
+export function serverFormSchema(d: ServerData): z.ZodType<ServerForm, ServerForm> {
+  return serverFields.superRefine((f, ctx) => {
+    const e = checks(f, d);
+    for (const [path, message] of Object.entries(e)) {
+      if (message !== undefined) ctx.addIssue({ code: 'custom', path: issuePath(f, path), message });
+    }
+  });
+}
+
+/** Where a check's message goes in the form: a field, or a device's field (peers[i].name, .ip, .publicKey). */
+function issuePath(f: ServerForm, key: string): (string | number)[] {
+  const m = /^peer-(.+)-(name|ip|key)$/.exec(key);
+  if (m === null) return [key];
+  const i = f.peers.findIndex((p) => p.section === m[1]);
+  return ['peers', i, m[2] === 'key' ? 'publicKey' : (m[2] ?? '')];
+}
+
+/** The schema's verdict by the keys the page shows them under: port, address, endpoint, peer-<section>-name|ip|key. */
+export function serverErrors(f: ServerForm, d: ServerData): Errors {
+  const found = formErrors(serverFormSchema(d), f);
+  const e: Errors = {};
+  for (const key of ['port', 'address', 'endpoint']) {
+    const message = found[key];
+    if (message !== undefined) e[key] = message;
+  }
+  f.peers.forEach((p, i) => {
+    for (const [field, part] of [
+      ['name', 'name'],
+      ['ip', 'ip'],
+      ['publicKey', 'key'],
+    ] as const) {
+      const message = found[`peers[${String(i)}].${field}`];
+      if (message !== undefined) e[`peer-${p.section}-${part}`] = message;
+    }
+  });
+  return e;
+}
+
+function checks(f: ServerForm, d: ServerData): Errors {
   const e: Errors = {};
   const port = Number(f.port);
   if (!/^\d+$/.test(f.port) || port < 1 || port > 65535) e['port'] = 'A port from 1 to 65535.';

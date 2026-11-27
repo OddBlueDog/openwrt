@@ -80,7 +80,7 @@ export async function loadClients(): Promise<ClientsData> {
     const d = get(l.macaddr);
     d.name = l.hostname ?? d.name;
     d.ip = l.ipaddr ?? d.ip;
-    d.leaseExpires = l.expires;
+    d.leaseExpires = l.expires === false ? undefined : l.expires;
   }
   for (const ap of aps) {
     for (const s of ap.stations) {

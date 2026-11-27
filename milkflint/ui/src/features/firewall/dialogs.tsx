@@ -18,12 +18,15 @@ export function FirewallDialogs({
   data,
   onClose,
   onSave,
+  onSubmit,
   confirm,
 }: {
   dialog: OpenDialog | undefined;
   data: FirewallData;
   onClose: () => void;
   onSave: (changes: Change[]) => void;
+  /** a sheet that stays open until its save went through (the port forward's) */
+  onSubmit: (changes: Change[]) => Promise<string | undefined>;
   /** ask before a delete (it replaces the open sheet) */
   confirm: Actions['confirm'];
 }): ReactElement | null {
@@ -37,7 +40,7 @@ export function FirewallDialogs({
           forward={r}
           data={data}
           onClose={onClose}
-          onSave={onSave}
+          onSubmit={onSubmit}
           onDelete={
             r === undefined
               ? undefined
@@ -61,7 +64,7 @@ export function FirewallDialogs({
           preset={dialog.preset}
           data={data}
           onClose={onClose}
-          onSave={onSave}
+          onSubmit={onSubmit}
           onDelete={
             r === undefined
               ? undefined
@@ -90,7 +93,7 @@ export function FirewallDialogs({
           nat={r}
           data={data}
           onClose={onClose}
-          onSave={onSave}
+          onSubmit={onSubmit}
           onDelete={
             r === undefined
               ? undefined

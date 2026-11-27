@@ -2,20 +2,16 @@
 // as LuCI's Scheduled Tasks does (the feature's ACL allows that one file and
 // cron's enable and reload): the router's cron runs it, on its own clock.
 import { z } from 'zod';
-import { call, exec, UbusError, UbusStatus } from '@/lib/ubus';
+import { readText, writeText } from '@/lib/api/files';
+import { call } from '@/lib/ubus';
 
 export const CRONTAB = '/etc/crontabs/root';
 
 const execResult = z.object({ code: z.number(), stdout: z.string().optional(), stderr: z.string().optional() }).loose();
 
 /** The crontab's text; empty when there's none yet. */
-export async function readCrontab(): Promise<string> {
-  try {
-    return (await call('file', 'read', { path: CRONTAB }, z.object({ data: z.string() }))).data;
-  } catch (err) {
-    if (err instanceof UbusError && err.code === UbusStatus.notFound) return '';
-    throw err;
-  }
+export function readCrontab(): Promise<string> {
+  return readText(CRONTAB);
 }
 
 async function cron(action: 'enable' | 'reload'): Promise<void> {
@@ -32,9 +28,7 @@ async function cron(action: 'enable' | 'reload'): Promise<void> {
  * only when the file changed).
  */
 export async function saveCrontab(text: string, before: string): Promise<void> {
-  if ((await readCrontab()) !== before)
-    throw new Error('The crontab changed on the router since this page read it. Reload the page, then make the change again.');
-  await exec('file', 'write', { path: CRONTAB, data: text, mode: 0o600 });
+  await writeText(CRONTAB, text, before, 0o600);
   await cron('enable');
   await cron('reload');
 }

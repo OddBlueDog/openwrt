@@ -1,7 +1,7 @@
 import type { ReactElement } from 'react';
 import { Progress } from '@/components/ui/progress';
 import { formatBitrate, formatNumber, formatPercent } from '@/lib/format';
-import { href } from '@/lib/router';
+import { pageLink } from '@/lib/router';
 import { cn } from '@/lib/utils';
 import { delayMs } from '../sqm/cake';
 import { SHAPING_BUSY, shapingShare } from './model';
@@ -56,7 +56,7 @@ export function SqmCard({ d, ap }: { d: Dashboard; ap: boolean }): ReactElement 
   if (ap) {
     return (
       <Widget>
-        <OffNote action={<WidgetLink href={href('mode')}>Operating mode</WidgetLink>}>
+        <OffNote action={<WidgetLink to={pageLink('mode')}>Operating mode</WidgetLink>}>
           In access point mode your main router shapes the internet connection.
         </OffNote>
       </Widget>
@@ -68,7 +68,7 @@ export function SqmCard({ d, ap }: { d: Dashboard; ap: boolean }): ReactElement 
         aside={
           <>
             <StateBadge tone="off">Off</StateBadge>
-            <WidgetLink href={href('sqm')}>Set up</WidgetLink>
+            <WidgetLink to={pageLink('sqm')}>Set up</WidgetLink>
           </>
         }
       >
@@ -93,7 +93,7 @@ export function SqmCard({ d, ap }: { d: Dashboard; ap: boolean }): ReactElement 
       aside={
         <>
           <StateBadge tone="success">On</StateBadge>
-          <WidgetLink href={href('sqm')}>Details</WidgetLink>
+          <WidgetLink to={pageLink('sqm')}>Details</WidgetLink>
         </>
       }
     >

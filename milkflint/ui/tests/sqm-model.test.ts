@@ -3,7 +3,18 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { advancedData, cakeArgs } from '../src/features/sqm/advanced.ts';
-import { internetQueue, type SqmData, type SqmForm, sqmData, toChanges, validate } from '../src/features/sqm/model.ts';
+import {
+  internetQueue,
+  type SqmData,
+  type SqmErrors,
+  type SqmForm,
+  sqmData,
+  sqmFormSchema,
+  toChanges,
+} from '../src/features/sqm/model.ts';
+import { formErrors } from '../src/lib/form/errors.ts';
+
+const validate = (f: SqmForm, data: SqmData): SqmErrors => formErrors(sqmFormSchema(data), f);
 import type { Change, Section } from '../src/lib/api/uci.ts';
 import { applied, section } from './uci-fixture.ts';
 

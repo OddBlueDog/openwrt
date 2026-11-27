@@ -11,12 +11,13 @@ import { Note } from '@/components/note';
 import { Segmented } from '@/components/ui/segmented';
 import type { ApplyState } from '@/hooks/use-apply';
 import { useSubPath } from '@/lib/router';
-import { deleteCustomTheme, type SchemeChoice, setTheme, setThemeId, useTheme, useThemes } from '@/lib/theme';
+import { type SchemeChoice, setTheme, useTheme, useThemes } from '@/lib/theme';
 import type { Theme } from '@/theme/contract';
 import { baseOf } from '@/theme/custom';
 import { themes as builtIn } from '@/theme/themes';
 import { type EditorSource, ThemeEditor } from './editor';
 import { ThemeGrid } from './gallery';
+import { useDeleteTheme, useUseTheme } from './queries';
 
 /** What #/themes/new/<id> or #/themes/edit/<id> opens, if that theme exists. */
 function sourceFor(path: string, view: ReturnType<typeof useThemes>): EditorSource | undefined {
@@ -58,6 +59,8 @@ export function ThemesPage(): ReactElement {
   const path = useSubPath();
   const view = useThemes();
   const [state, setState] = useState<ApplyState>({ phase: 'idle' });
+  const pickTheme = useUseTheme();
+  const deleteTheme = useDeleteTheme();
   const busy = state.phase === 'applying';
   const source = path === '' ? undefined : sourceFor(path, view);
 
@@ -71,7 +74,7 @@ export function ThemesPage(): ReactElement {
     }
   };
   const pick = (theme: Theme): void => {
-    void run(() => setThemeId(theme.id), `${theme.name} is in use.`);
+    void run(() => pickTheme.mutateAsync(theme.id), `${theme.name} is in use.`);
   };
 
   if (source !== undefined) {
@@ -140,7 +143,7 @@ export function ThemesPage(): ReactElement {
                 customise: `#/themes/new/${t.id}`,
                 edit: `#/themes/edit/${t.id}`,
                 onDelete: () => {
-                  void run(() => deleteCustomTheme(t.id), `${t.name} is gone from the router.`);
+                  void run(() => deleteTheme.mutateAsync(t.id), `${t.name} is gone from the router.`);
                 },
               })}
             />
