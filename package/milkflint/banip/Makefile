@@ -2,17 +2,25 @@
 # Copyright (c) 2018-2026 Dirk Brenken (dev@brenken.org)
 # This is free software, licensed under the GNU General Public License v3.
 #
-# MilkFlint: the packages feed's banIP 1.9.1-5, from its openwrt-25.12
-# branch (commit 3a4c00487dda), unchanged. The 25.12.6 release pins
-# 1.9.1-2, whose urlhaus list is at an address abuse.ch has taken down; -3
-# moves it to abuse.ch's export, which needs a free personal Auth-Key
-# (ban_authkey, set on the banIP page), and skips it until one is set.
+# MilkFlint: the packages feed's banIP 1.9.2-1, from its openwrt-25.12
+# branch (commit ccb56eff0a2e), unchanged, built as 1.9.2-r1001. The 25.12.6
+# release pins 1.9.1-2, whose urlhaus list is at an address abuse.ch has
+# taken down; 1.9.1-3 moved it to abuse.ch's export, which needs a free
+# personal Auth-Key (ban_authkey, set on the banIP page), and skips it until
+# one is set.
+#
+# Why r1001: PKG_RELEASE is upstream's + 1000, MilkFlint's own build number.
+# Routers update banIP from MilkFlint's own package feed, and apk's world pins
+# it as banip=<version> without the feed's tag; OpenWrt's builds never have
+# an r1000 or higher, so that pin can only match MilkFlint's build, and
+# OpenWrt's same-named banip can't replace it. URL is upstream's files at
+# that commit, which the banIP page links as the installed version's source.
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=banip
-PKG_VERSION:=1.9.1
-PKG_RELEASE:=5
+PKG_VERSION:=1.9.2
+PKG_RELEASE:=1001
 PKG_LICENSE:=GPL-3.0-or-later
 PKG_MAINTAINER:=Dirk Brenken <dev@brenken.org>
 
@@ -24,6 +32,7 @@ define Package/banip
 	TITLE:=banIP blocks IPs via named nftables Sets
 	DEPENDS:=+jshn +jsonfilter +firewall4 +gawk +ca-bundle +rpcd +rpcd-mod-rpcsys
 	PKGARCH:=all
+	URL:=https://github.com/openwrt/packages/tree/ccb56eff0a2e/net/banip
 endef
 
 define Package/banip/description
