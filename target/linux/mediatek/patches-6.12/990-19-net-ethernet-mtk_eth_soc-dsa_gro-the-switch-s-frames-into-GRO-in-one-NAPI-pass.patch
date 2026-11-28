@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 11:13:00 +0000
+Subject: [PATCH] net: ethernet: mtk_eth_soc: dsa_gro switch, the switch's
+ frames into GRO on their port from the driver's NAPI
+
+Every frame the switch's ports receive (eth0's, the DSA conduit's) takes
+two NAPI passes: mtk_poll_rx()'s napi_gro_receive() on eth0, which can't
+merge it (ETH_P_XDSA), and the receive path on eth0 up to
+dsa_switch_rcv(), then the port's gro_cells, whose NAPI runs in an
+unthreaded NET_RX softirq on the CPU this driver's threaded NAPI let BH
+go on, with GRO on the port at last. Under a wired download that softirq
+is most of CPU0's busy time.
+
+dsa_gro (module parameter, off by default, as before; writable at
+runtime) hands such a frame to dsa_switch_rcv_napi() right after the PPE
+check and the RX queue record, and its result, on its port, to this
+NAPI's napi_gro_receive(): one pass, GRO on the port with the port's
+features. Only while nothing on eth0 itself would see the tagged frame
+(mtk_dsa_rcv_here(): taps such as tcpdump -i eth0, a protocol handler
+bound to it, an rx_handler, generic XDP, tc or netfilter ingress);
+otherwise the usual path. The RX queue recorded is the ring's, as the
+frame had through gro_cells. RPS is then the port's (lanN's rx-0),
+not eth0's: the steering script moves it when this is on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 42 +++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index 9385967..85bf423 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2489,6 +2489,41 @@ static void mtk_pdma_stag(struct mtk_eth *eth)
+ 		MTK_CDMP_IG_CTRL);
+ }
+ 
++/* What the switch's ports receive (eth0's tagged frames on the GL-MT6000,
++ * the DSA conduit's) into GRO on their port (lan1-5) from this driver's
++ * NAPI, through DSA's own receive (dsa_switch_rcv_napi()): left out are the
++ * receive path on the conduit, and the port's gro_cells, a second NAPI that
++ * runs in an unthreaded NET_RX softirq. Only while nothing on the conduit
++ * itself would see the frames tagged (mtk_dsa_rcv_here()); tcpdump -i eth0,
++ * say, puts them back on the usual path. Their RPS is then the port's
++ * (lanN's rx-0), not the conduit's. Writable at runtime; off by default.
++ */
++static bool dsa_gro;
++module_param(dsa_gro, bool, 0644);
++MODULE_PARM_DESC(dsa_gro, "Frames the DSA switch's ports receive into GRO on their port from this driver's NAPI, rather than through the conduit's receive path and the port's gro_cells");
++
++static bool mtk_dsa_rcv_here(struct net_device *dev, const struct sk_buff *skb)
++{
++	if (!READ_ONCE(dsa_gro) || skb->protocol != htons(ETH_P_XDSA))
++		return false;
++	/* taps on the conduit (tcpdump -i eth0), a protocol handler bound to
++	 * it, an rx_handler, generic XDP, tc or netfilter ingress on it
++	 */
++	if (!list_empty(&dev->ptype_all) || !list_empty(&dev->ptype_specific) ||
++	    rcu_access_pointer(dev->rx_handler) ||
++	    rcu_access_pointer(dev->xdp_prog))
++		return false;
++#ifdef CONFIG_NET_XGRESS
++	if (rcu_access_pointer(dev->tcx_ingress))
++		return false;
++#endif
++#ifdef CONFIG_NETFILTER_INGRESS
++	if (rcu_access_pointer(dev->nf_hooks_ingress))
++		return false;
++#endif
++	return true;
++}
++
+ static int mtk_poll_rx(struct napi_struct *napi, int budget,
+ 		       struct mtk_eth *eth)
+ {
+@@ -2675,6 +2710,13 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
+ 			mtk_ppe_check_skb(eth->ppe[ppe_idx], skb, hash);
+ 
+ 		skb_record_rx_queue(skb, ring->ring_no);
++#if IS_REACHABLE(CONFIG_NET_DSA)
++		if (mtk_dsa_rcv_here(netdev, skb)) {
++			skb = dsa_switch_rcv_napi(skb);
++			if (!skb)
++				goto skip_rx;
++		}
++#endif
+ 		napi_gro_receive(napi, skb);
+ 
+ skip_rx:
