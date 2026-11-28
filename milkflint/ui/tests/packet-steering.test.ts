@@ -106,7 +106,7 @@ function run(setup: Setup = {}): Result {
     const driver = join(root, 'drivers/mtk_soc_eth');
     mkdirSync(driver, { recursive: true });
     for (const [dev, queues, isEth] of [
-      ['eth0', 1, true],
+      ['eth0', 2, true],
       ['eth1', 4, true],
       ['lan1', 1, false],
       ['phy1-ap0', 1, false],
@@ -198,6 +198,7 @@ esac`,
     const rps: Record<string, string> = {};
     for (const [dev, q] of [
       ['eth0', 0],
+      ['eth0', 1],
       ['eth1', 0],
       ['eth1', 3],
       ['lan1', 0],
@@ -231,7 +232,7 @@ esac`,
   }
 }
 
-const NO_RPS = { 'eth0/0': '0', 'eth1/0': '0', 'eth1/3': '0', 'lan1/0': '0', 'phy1-ap0/0': '0' };
+const NO_RPS = { 'eth0/0': '0', 'eth0/1': '0', 'eth1/0': '0', 'eth1/3': '0', 'lan1/0': '0', 'phy1-ap0/0': '0' };
 
 test('with four rings: flows on rings 1-3, each ring on its own CPU, no RPS', () => {
   const r = run();
@@ -271,7 +272,7 @@ function assertRpsLayout(r: Result): void {
   for (const pid of [TX, RING0, RING1, RING2, RING3]) assert.equal(r.mask[pid], '1', 'the Ethernet NAPI on CPU0');
   for (const pid of WIFI) assert.equal(r.mask[pid], 'e', pid);
   // received packets spread over CPUs 1-3, on the Ethernet's ports only
-  assert.deepEqual(r.rps, { 'eth0/0': 'e', 'eth1/0': 'e', 'eth1/3': 'e', 'lan1/0': '0', 'phy1-ap0/0': '0' });
+  assert.deepEqual(r.rps, { 'eth0/0': 'e', 'eth0/1': 'e', 'eth1/0': 'e', 'eth1/3': 'e', 'lan1/0': '0', 'phy1-ap0/0': '0' });
   assert.deepEqual(r.rtprio, [`${RING1} other`, `${RING2} other`, `${RING3} other`]);
 }
 
@@ -321,6 +322,32 @@ test('off: every thread on every CPU, no RPS, one ring', () => {
 const PPPOE = { 'network.wan.proto': 'pppoe', 'network.wan.device': 'eth1' };
 // RSS chosen on the page, whatever the line
 const RSS = { 'milkflint.steering.rss': '1' };
+
+// the switch's packets aren't hashed by RSS: all of them land on eth0's ring 0
+const LAN_RPS = { 'milkflint.steering.lan_rps': '1' };
+
+test('LAN ports’ RPS with RSS: the switch port’s ring 0 is handed on to CPUs 1-3, nothing else', () => {
+  const r = run({ uci: LAN_RPS });
+  assert.deepEqual(r.rss, ['-X eth1 weight 0 1 1 1']);
+  assert.deepEqual(r.affinity, { '119': '1', '120': '2', '121': '4', '122': '8' });
+  assert.deepEqual(r.rps, { ...NO_RPS, 'eth0/0': 'e' });
+  assert.deepEqual(r.rtprio, [`${RING1} fifo 1`, `${RING2} fifo 1`, `${RING3} fifo 1`]);
+});
+
+test('LAN ports’ RPS: only "1" turns it on, as the page writes it', () => {
+  for (const v of ['0', 'yes', 'on', '']) assert.deepEqual(run({ uci: { 'milkflint.steering.lan_rps': v } }).rps, NO_RPS, v);
+});
+
+test('LAN ports’ RPS without RSS: the RPS layout as before, and off is off', () => {
+  assertRpsLayout(run({ uci: { ...LAN_RPS, 'milkflint.steering.rss': '0' } }));
+  assertRpsLayout(run({ uci: LAN_RPS, rings: false }));
+  assert.deepEqual(run({ uci: LAN_RPS, arg: '0' }).rps, NO_RPS);
+});
+
+test('LAN ports’ RPS with RSS chosen on a PPPoE WAN: the switch port’s ring 0 and the PPPoE port’s', () => {
+  const r = run({ uci: { ...PPPOE, ...RSS, ...LAN_RPS } });
+  assert.deepEqual(r.rps, { ...NO_RPS, 'eth0/0': 'e', 'eth1/0': 'e' });
+});
 
 test('a PPPoE WAN, automatic: the RPS layout, as RSS would spread nothing', () => {
   assertRpsLayout(run({ uci: PPPOE }));

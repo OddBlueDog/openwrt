@@ -59,18 +59,43 @@ const statusSchema = z.object({
     .object({
       /** the Ethernet's longest receive interrupt delay, µs; 0 no limit */
       rx_delay: z.number().nullable(),
+      /** experimental: each receive ring picks its own interrupt delay (mtk_eth's rx_dim_per_ring); null without it */
+      rx_dim_per_ring: z.boolean().nullable().default(null),
+      /** experimental: send-complete interrupts follow sending's moderation (mtk_eth's qdma_tx_dim); null without it */
+      qdma_tx_dim: z.boolean().nullable().default(null),
+      /** the CPUs the switch port's first receive queue hands its packets on to (RPS); null without a switch port */
+      lan_rps: z.array(z.number()).nullable().default(null),
       /** sch_cake's ecn_fail_count: 0 always marks */
       cake_ecn: z.number().nullable(),
       /** sch_cake's l4s_ramp: where L4S traffic starts to be marked, in percent of its target; 0 not at all */
       cake_l4s: z.number().nullable().default(null),
       /** whether sch_cake is loaded: Smart Queue has run since boot */
       cake_loaded: z.boolean().default(false),
+      /** experimental: sch_cake drops one packet of a group it takes whole (drop_one_segment) */
+      cake_drop_one_segment: z.boolean().nullable().default(null),
+      /** experimental: how far ahead of the shaper a new flow's packet may go on a download, µs; 0 off (sparse_ahead_us) */
+      cake_sparse_ahead: z.number().nullable().default(null),
+      /** experimental: packets sch_cake dropped one of a group since it loaded (one_segment_drops); null without the counter */
+      cake_one_segment_drops: z.number().nullable().default(null),
       /** the Wi-Fi driver's sends of a data frame */
       wifi_retries: z.number().nullable(),
       /** whether the Wi-Fi driver aggregates the voice queue; null without the setting, or on an older router */
       wifi_vo_aggr: z.boolean().nullable().default(null),
     })
-    .default({ rx_delay: null, cake_ecn: null, cake_l4s: null, cake_loaded: false, wifi_retries: null, wifi_vo_aggr: null }),
+    .default({
+      rx_delay: null,
+      rx_dim_per_ring: null,
+      qdma_tx_dim: null,
+      lan_rps: null,
+      cake_ecn: null,
+      cake_l4s: null,
+      cake_loaded: false,
+      cake_drop_one_segment: null,
+      cake_sparse_ahead: null,
+      cake_one_segment_drops: null,
+      wifi_retries: null,
+      wifi_vo_aggr: null,
+    }),
   /** hardware offloading with WED (./wed.ts); an older router doesn't say */
   wed: z
     .object({

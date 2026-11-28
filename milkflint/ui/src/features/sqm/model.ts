@@ -250,9 +250,12 @@ export function sqmData({ sqm, firewall, milkflint, wanDevice, wanProto, devices
     link: queue === undefined ? 'ethernet' : link.link,
     latency: latencyOf(str(queue, 'iqdisc_opts'), str(queue, 'eqdisc_opts')),
     uploadMemory: uploadMemoryOf(str(queue, 'eqdisc_opts'), Number(str(queue, 'upload') ?? '0')),
-    ackFilter: ackFilterOf(words(str(queue, 'eqdisc_opts'))),
+    // a new queue: fair shares per device and the upload's ACK filter, as
+    // first boot gives a queue that isn't in use yet (uci-defaults.sh, sqm_fair)
+    ackFilter: queue === undefined ? 'on' : ackFilterOf(words(str(queue, 'eqdisc_opts'))),
     perDevice:
-      words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost'),
+      queue === undefined ||
+      (words(str(queue, 'iqdisc_opts')).includes('dual-dsthost') && words(str(queue, 'eqdisc_opts')).includes('dual-srchost')),
     multiQueue: multiQueueOf(
       str(cake, 'multi_queue'),
       queue === undefined ? undefined : bool(queue, 'use_mq'),
@@ -330,7 +333,7 @@ export function sqmFormSchema(data: SqmData): z.ZodType<SqmForm, SqmForm> {
       words(data.iqdiscOpts).includes('autorate-ingress')
     ) {
       e.multiQueue =
-        'Multi-queue CAKE can’t estimate the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
+        'Multi-queue CAKE can’t adapt to the line’s speed (autorate-ingress, in Advanced): turn one of them off, or downloads go unshaped.';
     }
     for (const [path, message] of Object.entries(e)) ctx.addIssue({ code: 'custom', path: [path], message });
   });

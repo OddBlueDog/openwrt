@@ -222,6 +222,11 @@ export function RestoreDialog({
               to={rxDelayLabel(defaults.rxDelay)}
               from={data.form.rxDelay === defaults.rxDelay ? undefined : rxDelayLabel(data.form.rxDelay)}
             />
+            {data.form.lanRps && <RestoreItem label="Spread what the LAN ports receive" to="Off" from="On" />}
+            {data.form.rxDimPerRing && <RestoreItem label="Each receive ring picks its own interrupt delay" to="Off" from="On" />}
+            {data.form.qdmaTxDim && (
+              <RestoreItem label="Send-complete interrupts follow sending’s own moderation" to="Off" from="On" />
+            )}
             <RestoreItem
               label="Smart Queue drops from downloads that ignore ECN marks"
               to={ecnDropLabel(defaults.ecnDrop)}
@@ -254,7 +259,7 @@ export function RestoreDialog({
                   from={data.form.groMax === '' ? undefined : sizeLabel(data.form.groMax)}
                 />
                 <RestoreItem
-                  label="Smart Queue takes GRO packets whole"
+                  label="Smart Queue keeps grouped packets whole"
                   to="Automatic: from 500 Mbit/s"
                   from={data.form.whole === defaults.whole ? undefined : data.form.whole === 'on' ? 'Always' : 'Never'}
                 />

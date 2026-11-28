@@ -46,7 +46,8 @@ import { type WedConfig, wedOffChanges, wedOn, wedOnChanges } from './wed';
 //   Automatic is plain GRO up to 16 KB when the download CAKE takes GRO
 //   packets whole, fraglist GRO otherwise;
 // - the latency settings in ./knobs.ts: milkflint.steering.wifi_all,
-//   .rings_rt and .rx_delay, milkflint.cake.ecn_drop and .l4s, milkflint.wifi.retries;
+//   .rings_rt and .rx_delay, the experimental .lan_rps, .rx_dim_per_ring and
+//   .qdma_tx_dim, milkflint.cake.ecn_drop and .l4s, milkflint.wifi.retries;
 // - firewall's defaults flow_offloading: software flow offloading, as the
 //   Firewall page sets it ("1" in the image). Turning it off turns hardware
 //   offloading (flow_offloading_hw) off too, as that needs it;
@@ -330,6 +331,9 @@ export function meaning(f: TuningForm, data: TuningData | undefined): string {
     f.wed,
     f.wifiAll,
     f.ringsRt,
+    f.lanRps,
+    f.rxDimPerRing,
+    f.qdmaTxDim,
     f.rxDelay,
     f.ecnDrop,
     f.l4s,
@@ -477,7 +481,7 @@ export function holdMs(bytes: number, kbit: number): string {
 }
 
 export function groReason(port: GroPort): string {
-  return port.whole ? 'Smart Queue takes GRO packets whole' : 'Smart Queue splits GRO packets';
+  return port.whole ? 'Smart Queue keeps grouped packets whole' : 'Smart Queue splits grouped packets up';
 }
 
 export function groNow(port: GroPort): string {
@@ -505,10 +509,13 @@ export function changedSettings(f: TuningForm, data: Pick<TuningData, 'firewall'
     ['essentials', 'Hardware offloading (WED)', f.wed !== defaults.wed],
     ['expert', 'Wi-Fi threads on every CPU', f.wifiAll !== defaults.wifiAll],
     ['expert', 'Internet receive threads first', f.ringsRt !== defaults.ringsRt],
+    ['expert', 'Spread what the LAN ports receive', f.lanRps !== defaults.lanRps],
     ['expert', 'Receive interrupt delay', f.rxDelay !== defaults.rxDelay],
+    ['expert', 'Each receive ring picks its own interrupt delay', f.rxDimPerRing !== defaults.rxDimPerRing],
+    ['expert', 'Send-complete interrupts follow sending’s own moderation', f.qdmaTxDim !== defaults.qdmaTxDim],
     ['expert', 'GRO', f.gro !== defaults.gro],
     ['expert', 'UDP GRO forwarding', f.udpFwd !== defaults.udpFwd],
-    ['expert', 'Smart Queue takes GRO packets whole', f.whole !== defaults.whole],
+    ['expert', 'Smart Queue keeps grouped packets whole', f.whole !== defaults.whole],
     ['expert', 'Largest GRO packet', f.groMax !== defaults.groMax],
     ['expert', 'ECN drops', f.ecnDrop !== defaults.ecnDrop],
     ['expert', 'L4S marking', f.l4s !== defaults.l4s],

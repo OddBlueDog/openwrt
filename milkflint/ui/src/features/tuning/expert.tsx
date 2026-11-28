@@ -4,6 +4,7 @@
 // driver's queue. Every control names the option it writes under "Why?".
 import type { ReactElement } from 'react';
 import { CardHeading } from '@/components/card-heading';
+import { ExperimentalBadge } from '@/components/experimental';
 import { Field } from '@/components/field';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -21,13 +22,15 @@ import {
   ecnDropChoices,
   ecnDropLabel,
   ecnNow,
+  lanRpsNow,
   l4sChoices,
   l4sLabel,
   l4sNow,
   retriesLabel,
   retryChoices,
-  rxDelayChoices,
   rxDelayLabel,
+  rxDelayOptions,
+  switchNow,
   voAggrChoices,
   voAggrLabel,
 } from './knobs';
@@ -56,19 +59,48 @@ function WedLine({ children }: { children: string }): ReactElement {
   return <p className="py-3 text-sm text-muted-foreground">{children}</p>;
 }
 
+const NOT_YET = 'This image doesn’t have it yet.';
+
+/** An experimental on/off setting: its switch with the label beside it, held off where the image lacks it (one already on can still go off) */
+function ExperimentalSwitch({
+  id,
+  checked,
+  missing,
+  onChange,
+}: {
+  id: string;
+  checked: boolean;
+  missing: boolean;
+  onChange: (on: boolean) => void;
+}): ReactElement {
+  return (
+    <span className="flex items-center gap-3">
+      <Switch id={id} checked={checked} disabled={missing && !checked} onCheckedChange={onChange} />
+      <ExperimentalBadge />
+    </span>
+  );
+}
+
 export function CpuCard({
   form,
+  saved,
   status,
   rss,
   set,
 }: {
   form: TuningForm;
+  /** the settings as saved: an interrupt delay the page no longer offers stays a choice until it's saved away */
+  saved: TuningForm;
   status: TuningStatus | undefined;
   rss: boolean;
   set: SetForm;
 }): ReactElement {
-  const now = status?.knobs.rx_delay;
-  const choices = [...rxDelayChoices, ...(rxDelayChoices.includes(form.rxDelay) ? [] : [form.rxDelay])];
+  const knobs = status?.knobs;
+  const now = knobs?.rx_delay;
+  const choices = rxDelayOptions(saved.rxDelay, form.rxDelay);
+  // where the image lacks a parameter: only known once the router said
+  const perRingMissing = knobs?.rx_dim_per_ring === null;
+  const qdmaMissing = knobs?.qdma_tx_dim === null;
   return (
     <Card>
       <CardHeading
@@ -110,17 +142,35 @@ export function CpuCard({
                 }}
               />
             </Field>
+            <Field
+              id="lanRps"
+              label="Spread what the LAN ports receive"
+              {...explain(
+                'With RSS, everything the LAN ports receive arrives on one receive ring, on CPU 0: the hardware spreads only the internet port. On, CPU 0 hands each of those connections on to CPUs 1–3 in software (packet steering, RPS), as without RSS, so a wired device’s upload, or what it sends to Wi-Fi, isn’t all handled on CPU 0. Costs CPU 0 a little for the handing on; downloads from the internet aren’t affected.',
+                [mf('steering', 'lan_rps')],
+              )}
+            >
+              <ExperimentalSwitch
+                id="lanRps"
+                checked={form.lanRps}
+                missing={false}
+                onChange={(v) => {
+                  set('lanRps', v);
+                }}
+              />
+            </Field>
+            {knobs !== undefined && <NowRow label="LAN ports in use now">{lanRpsNow(knobs.lan_rps)}</NowRow>}
           </>
         ) : (
           <p className="py-3.5 text-sm text-muted-foreground">
-            The Wi-Fi and receive thread settings are for RSS packet steering, which isn’t in use.
+            The Wi-Fi thread, receive thread and LAN port settings are for RSS packet steering, which isn’t in use.
           </p>
         )}
         <Field
           id="rxDelay"
           label="Longest receive interrupt delay"
           {...explain(
-            'Shorter: received packets reach their CPU sooner, so pings and games wait less while something downloads, for more interrupts and a little more CPU under load. One setting for every port.',
+            'Shorter: received packets reach their CPU sooner, so pings and games wait less while something downloads, for more interrupts and a little more CPU under load. The hardware counts the delay in steps of 20 µs, so each choice is a multiple of 20, and under steady load the driver’s own choice usually sits at this limit. One setting for every port.',
             [mf('steering', 'rx_delay')],
           )}
         >
@@ -149,6 +199,48 @@ export function CpuCard({
         {status !== undefined && (
           <NowRow label="In use now">{now === null || now === undefined ? 'Not in this image' : rxDelayLabel(now)}</NowRow>
         )}
+        <Field
+          id="rxDimPerRing"
+          label="Each receive ring picks its own interrupt delay"
+          status={perRingMissing ? NOT_YET : undefined}
+          {...explain(
+            'The Ethernet’s adaptive moderation picks each receive ring’s interrupt delay from that ring’s own traffic, rather than one delay for all of them, so a quiet ring needn’t wait as a busy one does. It matters more with a longer delay limit above: the delay moves in 20 µs steps, so at the default 80 µs the rings can differ by up to three steps. The driver takes it at its next moderation step, within moments under traffic (mtk_eth’s rx_dim_per_ring).',
+            [mf('steering', 'rx_dim_per_ring')],
+          )}
+        >
+          <ExperimentalSwitch
+            id="rxDimPerRing"
+            checked={form.rxDimPerRing}
+            missing={perRingMissing}
+            onChange={(v) => {
+              set('rxDimPerRing', v);
+            }}
+          />
+        </Field>
+        {knobs !== undefined && !perRingMissing && (
+          <NowRow label="Per-ring delays in use now">{switchNow(knobs.rx_dim_per_ring)}</NowRow>
+        )}
+        <Field
+          id="qdmaTxDim"
+          label="Send-complete interrupts follow sending’s own moderation"
+          status={qdmaMissing ? NOT_YET : undefined}
+          {...explain(
+            'The interrupts that say sent packets are done wait as long as sending’s own adaptive moderation picks, as upstream Linux has it, rather than as long as receiving’s, as MediaTek’s code has it. Which of the two the hardware expects isn’t documented, so this tries the other way. The driver takes it at its next moderation step (mtk_eth’s qdma_tx_dim).',
+            [mf('steering', 'qdma_tx_dim')],
+          )}
+        >
+          <ExperimentalSwitch
+            id="qdmaTxDim"
+            checked={form.qdmaTxDim}
+            missing={qdmaMissing}
+            onChange={(v) => {
+              set('qdmaTxDim', v);
+            }}
+          />
+        </Field>
+        {knobs !== undefined && !qdmaMissing && (
+          <NowRow label="Send-complete moderation in use now">{switchNow(knobs.qdma_tx_dim)}</NowRow>
+        )}
       </CardContent>
     </Card>
   );
@@ -169,7 +261,7 @@ export function GroCard({
   const q = data.sqm;
   const plain = form.gro === 'plain' || (form.gro === 'auto' && port?.auto === 'plain');
   const groHint: Record<Gro, string> = {
-    auto: `Plain GRO, up to 16 KB a group, when Smart Queue takes GRO packets whole; fraglist GRO otherwise.${
+    auto: `Plain GRO, up to 16 KB a group, when Smart Queue keeps grouped packets whole; fraglist GRO otherwise.${
       port === undefined ? '' : ` Now ${port.auto === 'plain' ? 'plain' : 'fraglist'}: ${groReason(port)}.`
     }`,
     fraglist:
@@ -229,7 +321,7 @@ export function GroCard({
         </Field>
         <Field
           id="whole"
-          label="Smart Queue takes GRO packets whole"
+          label="Smart Queue keeps grouped packets whole"
           status={q === undefined || q.download <= 0 ? 'Smart Queue isn’t shaping downloads.' : undefined}
           {...explain(
             q === undefined || q.download <= 0
@@ -253,7 +345,7 @@ export function GroCard({
             <SelectContent>
               <SelectItem value="auto">Automatic: from 500 Mbit/s (default)</SelectItem>
               <SelectItem value="on">Always</SelectItem>
-              <SelectItem value="off">Never: split each one</SelectItem>
+              <SelectItem value="off">Never: split each one up</SelectItem>
             </SelectContent>
           </Select>
         </Field>
@@ -286,7 +378,7 @@ export function GroCard({
         {port !== undefined && (
           <>
             <NowRow label={`In use now on ${port.dev}`}>{groNow(port)}</NowRow>
-            <NowRow label="Smart Queue">{port.whole ? 'takes GRO packets whole' : 'splits GRO packets'}</NowRow>
+            <NowRow label="Smart Queue">{port.whole ? 'keeps grouped packets whole' : 'splits grouped packets up'}</NowRow>
             <NowRow label="Flow offloading">{port.offload ? 'on' : 'off'}</NowRow>
           </>
         )}

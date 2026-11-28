@@ -25,19 +25,26 @@ export function FieldLabel({ htmlFor, label, opt }: { htmlFor?: string; label: s
   );
 }
 
-function copyText(text: string): void {
+function copyText(text: string, host: HTMLElement): boolean {
   // the router's page is plain http, where the clipboard API isn't there
   if (window.isSecureContext && 'clipboard' in navigator) {
     void navigator.clipboard.writeText(text);
-    return;
+    return true;
   }
+  const active = document.activeElement;
   const t = document.createElement('textarea');
   t.value = text;
-  document.body.append(t);
-  t.select();
+  t.readOnly = true;
+  t.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+  // inside the sheet's focus scope: Radix Dialog pulls focus back if appended to document.body
+  host.append(t);
+  t.focus({ preventScroll: true });
+  t.setSelectionRange(0, text.length);
   // eslint-disable-next-line @typescript-eslint/no-deprecated -- the one way to copy on a plain-http page
-  document.execCommand('copy');
+  const ok = document.execCommand('copy');
   t.remove();
+  if (active instanceof HTMLElement) active.focus({ preventScroll: true });
+  return ok;
 }
 
 /** The section a sheet edits, as it will be in the file once saved, with a copy button. */
@@ -63,8 +70,8 @@ export function UciPreview({
           size="icon"
           className="size-7"
           aria-label="Copy"
-          onClick={() => {
-            copyText(lines.join('\n'));
+          onClick={(e) => {
+            if (!copyText(lines.join('\n'), e.currentTarget.parentElement ?? document.body)) return;
             setCopied(true);
             window.setTimeout(() => {
               setCopied(false);

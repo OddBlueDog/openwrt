@@ -12,8 +12,13 @@
 // download while squash_ingress is on (its default), and both add wash to
 // the download while squash_dscp is on (its default). The opts come last.
 // The fq_codel-only options (limits, targets, ECN) don't apply to CAKE.
+//
+// The sheet's experimental download settings are sch_cake module parameters,
+// saved in milkflint.cake (./cake-extras.ts): they change no sqm option, and
+// CAKE takes them without a restart.
 import { z } from 'zod';
 import { bool, type Change, type Section, sectionChanges, str } from '@/lib/api/uci';
+import { cakeExtrasOf, cakeExtrasOptions } from './cake-extras';
 import { takesWhole, type Whole, wholeOf, wholeValue, words } from './gso';
 import { type MultiQueue, multiQueueOf, multiQueueValue, usesMultiQueue } from './multi-queue';
 
@@ -87,6 +92,10 @@ const advancedFields = z.object({
   whole: z.custom<Whole>(),
   /** multi-queue CAKE for the download (./multi-queue.ts): sqm's use_mq and milkflint.cake.multi_queue */
   multiQueue: z.custom<MultiQueue>(),
+  /** experimental: CAKE drops one packet of a group it takes whole (milkflint.cake.drop_one_segment, ./cake-extras.ts) */
+  dropOneSegment: z.boolean(),
+  /** experimental: how far ahead of the shaper a new flow's packet may go, µs; '' off (milkflint.cake.sparse_ahead) */
+  sparseAhead: z.string(),
   script: z.string(),
   /** squash_dscp: the download's CAKE clears DSCP marks (sqm's default) */
   squashDscp: z.boolean(),
@@ -241,6 +250,7 @@ export function advancedData(queue: Section, milkflint: Section[], pppoe: boolea
         downloadKbit,
       ),
       multiQueue: multiQueueOf(str(cake, 'multi_queue'), bool(queue, 'use_mq'), downloadKbit, pppoe),
+      ...cakeExtrasOf(str(cake, 'drop_one_segment'), str(cake, 'sparse_ahead')),
       script: str(queue, 'script') ?? '',
       squashDscp: str(queue, 'squash_dscp') !== '0',
       squashIngress: str(queue, 'squash_ingress') !== '0',
@@ -372,8 +382,14 @@ export function advancedChanges(f: AdvancedForm, data: AdvancedData): Change[] {
   if (Object.keys(values).length > 0) changes.push({ op: 'set', config: 'sqm', section: data.section, values });
   if (unset.length > 0) changes.push({ op: 'unset', config: 'sqm', section: data.section, options: unset });
   if (f.whole !== was.whole) changes.push(...sectionChanges('milkflint', data.milkflint, 'gro', { whole: wholeValue(f.whole) }));
-  if (f.multiQueue !== was.multiQueue)
-    changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', { multi_queue: multiQueueValue(f.multiQueue) }));
+  // milkflint.cake: the multi-queue choice and the experimental settings, each only when it changed
+  const extras = cakeExtrasOptions(f);
+  const cake: Record<string, string | undefined> = {
+    ...(f.multiQueue === was.multiQueue ? {} : { multi_queue: multiQueueValue(f.multiQueue) }),
+    ...(f.dropOneSegment === was.dropOneSegment ? {} : { drop_one_segment: extras.drop_one_segment }),
+    ...(f.sparseAhead === was.sparseAhead ? {} : { sparse_ahead: extras.sparse_ahead }),
+  };
+  if (Object.keys(cake).length > 0) changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', cake));
   return changes;
 }
 

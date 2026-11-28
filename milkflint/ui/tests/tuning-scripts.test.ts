@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { aqlAutoTotal, aqlTotalOf, L4S_DEFAULT, readKnobs } from '../src/features/tuning/knobs.ts';
+import { cakeExtrasOf } from '../src/features/sqm/cake-extras.ts';
+import { aqlAutoTotal, aqlTotalOf, L4S_DEFAULT, RX_DELAY_DEFAULT, readKnobs } from '../src/features/tuning/knobs.ts';
 import { functionsSh, uciExport } from './openwrt-shell.ts';
 
 const scripts = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/tuning/bin/', import.meta.url));
@@ -20,10 +21,12 @@ after(() => {
 const cakeParams = join(root, 'sch_cake');
 const ctParams = join(root, 'nf_conntrack');
 const wifiParams = join(root, 'mt76_connac_lib');
+const ethParams = join(root, 'mtk_eth');
 const radio = join(root, 'ieee80211', 'phy0');
 mkdirSync(cakeParams);
 mkdirSync(ctParams);
 mkdirSync(wifiParams);
+mkdirSync(ethParams);
 mkdirSync(radio, { recursive: true });
 mkdirSync(join(root, 'bin'));
 // uci -q get <option>: from the environment, failing if unset, as uci does;
@@ -65,6 +68,7 @@ function stage(name: string, dir = scripts): string {
     .replaceAll('/sys/module/sch_cake/parameters', cakeParams)
     .replaceAll('/sys/module/nf_conntrack/parameters', ctParams)
     .replaceAll('/sys/module/mt76_connac_lib/parameters', wifiParams)
+    .replaceAll('/sys/module/mtk_eth/parameters', ethParams)
     .replaceAll('/sys/kernel/debug/ieee80211', join(root, 'ieee80211'));
   const path = join(root, name);
   writeFileSync(path, text);
@@ -173,6 +177,125 @@ test('cake-ecn: an image whose sch_cake has no L4S ramp is left alone', () => {
   assert.equal(Number(readFileSync(join(cakeParams, 'ecn_fail_count'), 'utf8')), 16);
 });
 
+function rxDelay(settings: Record<string, string>): number {
+  writeFileSync(join(ethParams, 'rx_dim_max_us'), '');
+  run('rx-delay', settings);
+  return Number(readFileSync(join(ethParams, 'rx_dim_max_us'), 'utf8'));
+}
+
+test('rx-delay: unset is the default, 80 µs, as the page shows it; a choice is written as set', () => {
+  assert.equal(rxDelay({}), 80);
+  assert.equal(rxDelay({}), RX_DELAY_DEFAULT);
+  assert.equal(readKnobs(() => undefined).rxDelay, '');
+  // 40, the driver's own default and MilkFlint's earlier one, now a choice
+  for (const [v, want] of [
+    ['40', 40],
+    ['160', 160],
+    ['0', 0],
+    ['060', 60],
+  ] as const) {
+    assert.equal(rxDelay({ 'milkflint.steering.rx_delay': v }), want, v);
+  }
+  // what the script would ignore is the default, and the page reads it so too
+  for (const v of ['abc', '-5', '1001', '2.5']) {
+    assert.equal(rxDelay({ 'milkflint.steering.rx_delay': v }), 80, v);
+    assert.equal(readKnobs((s, o) => (s === 'steering' && o === 'rx_delay' ? v : undefined)).rxDelay, '', `page, ${v}`);
+  }
+});
+
+function ethDim(settings: Record<string, string>): { perRing: string; qdma: string } {
+  writeFileSync(join(ethParams, 'rx_dim_per_ring'), '');
+  writeFileSync(join(ethParams, 'qdma_tx_dim'), '');
+  run('eth-dim', settings);
+  return {
+    perRing: readFileSync(join(ethParams, 'rx_dim_per_ring'), 'utf8').trim(),
+    qdma: readFileSync(join(ethParams, 'qdma_tx_dim'), 'utf8').trim(),
+  };
+}
+
+test('eth-dim: each switch on only with "1", as the page reads it; off otherwise, so clearing it takes', () => {
+  assert.deepEqual(ethDim({}), { perRing: 'N', qdma: 'N' });
+  assert.deepEqual(ethDim({ 'milkflint.steering.rx_dim_per_ring': '1' }), { perRing: 'Y', qdma: 'N' });
+  assert.deepEqual(ethDim({ 'milkflint.steering.qdma_tx_dim': '1' }), { perRing: 'N', qdma: 'Y' });
+  for (const v of ['0', 'Y', 'yes', 'on', '1; reboot', '']) {
+    assert.deepEqual(ethDim({ 'milkflint.steering.rx_dim_per_ring': v, 'milkflint.steering.qdma_tx_dim': v }), {
+      perRing: 'N',
+      qdma: 'N',
+    });
+    const k = readKnobs((section) => (section === 'steering' ? v : undefined));
+    assert.equal(k.rxDimPerRing || k.qdmaTxDim, false, v);
+  }
+});
+
+test('eth-dim: an image without a parameter: the other is still set, and nothing is made', () => {
+  rmSync(join(ethParams, 'rx_dim_per_ring'), { force: true });
+  writeFileSync(join(ethParams, 'qdma_tx_dim'), '');
+  run('eth-dim', { 'milkflint.steering.rx_dim_per_ring': '1', 'milkflint.steering.qdma_tx_dim': '1' });
+  assert.equal(existsSync(join(ethParams, 'rx_dim_per_ring')), false);
+  assert.equal(readFileSync(join(ethParams, 'qdma_tx_dim'), 'utf8').trim(), 'Y');
+  rmSync(join(ethParams, 'qdma_tx_dim'), { force: true });
+  run('eth-dim', { 'milkflint.steering.qdma_tx_dim': '1' });
+  assert.equal(existsSync(join(ethParams, 'qdma_tx_dim')), false);
+});
+
+function shaper(settings: Record<string, string>): { drop: string; ahead: number } {
+  writeFileSync(join(cakeParams, 'drop_one_segment'), '');
+  writeFileSync(join(cakeParams, 'sparse_ahead_us'), '');
+  run('cake-shaper', settings);
+  return {
+    drop: readFileSync(join(cakeParams, 'drop_one_segment'), 'utf8').trim(),
+    ahead: Number(readFileSync(join(cakeParams, 'sparse_ahead_us'), 'utf8')),
+  };
+}
+
+test('cake-shaper: nothing set is off for both, so clearing a setting takes', () => {
+  assert.deepEqual(shaper({}), { drop: 'N', ahead: 0 });
+  assert.deepEqual(shaper({ 'milkflint.cake.drop_one_segment': '1', 'milkflint.cake.sparse_ahead': '250' }), {
+    drop: 'Y',
+    ahead: 250,
+  });
+});
+
+test('cake-shaper: one packet of a group only with "1", as the page reads it', () => {
+  for (const v of ['0', 'Y', 'on', '1 ', '']) {
+    assert.equal(shaper({ 'milkflint.cake.drop_one_segment': v }).drop, 'N', v);
+    assert.equal(cakeExtrasOf(v, undefined).dropOneSegment, false, `page, ${v}`);
+  }
+  assert.equal(cakeExtrasOf('1', undefined).dropOneSegment, true);
+});
+
+test('cake-shaper: how far ahead, 1 to 1000 µs, as the page reads it; anything else off', () => {
+  for (const [v, want] of [
+    ['100', 100],
+    ['250', 250],
+    ['500', 500],
+    ['0500', 500],
+    ['1', 1],
+    ['1000', 1000],
+    ['0', 0],
+    ['00', 0],
+    ['1001', 0],
+    ['01000', 0],
+    ['99999', 0],
+    ['-1', 0],
+    ['2.5', 0],
+    ['250us', 0],
+    ['1; reboot', 0],
+  ] as const) {
+    assert.equal(shaper({ 'milkflint.cake.sparse_ahead': v }).ahead, want, v);
+    const page = cakeExtrasOf(undefined, v).sparseAhead;
+    assert.equal(page === '' ? 0 : Number(page), want, `page, ${v}`);
+  }
+});
+
+test('cake-shaper: a sch_cake without a parameter: the other is still set, and nothing is made', () => {
+  rmSync(join(cakeParams, 'drop_one_segment'), { force: true });
+  writeFileSync(join(cakeParams, 'sparse_ahead_us'), '');
+  run('cake-shaper', { 'milkflint.cake.drop_one_segment': '1', 'milkflint.cake.sparse_ahead': '100' });
+  assert.equal(existsSync(join(cakeParams, 'drop_one_segment')), false);
+  assert.equal(readFileSync(join(cakeParams, 'sparse_ahead_us'), 'utf8').trim(), '100');
+});
+
 function dscp(settings: Record<string, string>): { learn: string; restore: string } {
   writeFileSync(join(ctParams, 'dscp_learn'), '');
   writeFileSync(join(cakeParams, 'dscp_restore'), '');
@@ -276,6 +399,7 @@ test('cake-ecn and cake-dscp: sch_cake not loaded, they say nothing of it was se
     writeFileSync(join(ctParams, 'dscp_learn'), '');
     assert.equal(status('cake-ecn', { 'milkflint.cake.ecn_drop': '16', 'milkflint.cake.l4s': '60' }), 1);
     assert.equal(status('cake-dscp', { 'milkflint.cake.dscp_restore': '1' }), 1);
+    assert.equal(status('cake-shaper', { 'milkflint.cake.sparse_ahead': '250' }), 1);
     assert.equal(readFileSync(join(ctParams, 'dscp_learn'), 'utf8').trim(), '1');
   });
   // loaded: done
@@ -284,13 +408,14 @@ test('cake-ecn and cake-dscp: sch_cake not loaded, they say nothing of it was se
   writeFileSync(join(cakeParams, 'dscp_restore'), '');
   assert.equal(status('cake-ecn', { 'milkflint.cake.ecn_drop': '16' }), 0);
   assert.equal(status('cake-dscp', {}), 0);
+  assert.equal(status('cake-shaper', {}), 0);
 });
 
 const tuningInit = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/tuning/init', import.meta.url));
 
 /**
  * milkflint-tuning's apply(), as a start (force) or a reload runs it: the
- * real cake-ecn and cake-dscp against the pretend /sys, every other command
+ * real cake-ecn, cake-dscp, cake-shaper and eth-dim against the pretend /sys, every other command
  * it runs a stand-in that does nothing
  */
 function tuningApply(settings: Record<string, string>, force = false): void {
@@ -298,7 +423,7 @@ function tuningApply(settings: Record<string, string>, force = false): void {
   const initd = join(root, 'init.d');
   mkdirSync(libexec, { recursive: true });
   mkdirSync(initd, { recursive: true });
-  for (const name of ['cake-ecn', 'cake-dscp']) {
+  for (const name of ['cake-ecn', 'cake-dscp', 'cake-shaper', 'eth-dim']) {
     writeFileSync(join(libexec, name), readFileSync(stage(name), 'utf8'));
     chmodSync(join(libexec, name), 0o755);
   }
@@ -330,21 +455,30 @@ function tuningApply(settings: Record<string, string>, force = false): void {
   });
 }
 
-/** sch_cake's three parameters, as the module has them */
+/** sch_cake's five parameters, as the module has them */
 function cakeNow(): string[] {
-  return ['ecn_fail_count', 'l4s_ramp', 'dscp_restore'].map((p) => readFileSync(join(cakeParams, p), 'utf8').trim());
+  return ['ecn_fail_count', 'l4s_ramp', 'dscp_restore', 'drop_one_segment', 'sparse_ahead_us'].map((p) =>
+    readFileSync(join(cakeParams, p), 'utf8').trim(),
+  );
 }
 
 // sch_cake loads at boot (/etc/modules.d/sched-cake), before milkflint-tuning;
 // were it loaded later, a run before then must not count as done
 test('milkflint-tuning: CAKE’s settings from a run without sch_cake aren’t kept as done; the next reload puts them in', () => {
-  const settings = { 'milkflint.cake.ecn_drop': '16', 'milkflint.cake.l4s': '60', 'milkflint.cake.dscp_restore': '1' };
+  const settings = {
+    'milkflint.cake.ecn_drop': '16',
+    'milkflint.cake.l4s': '60',
+    'milkflint.cake.dscp_restore': '1',
+    'milkflint.cake.drop_one_segment': '1',
+    'milkflint.cake.sparse_ahead': '250',
+  };
   rmSync(join(root, 'tuning-run'), { recursive: true, force: true });
   withoutCake(() => {
     tuningApply(settings, true);
   });
   assert.equal(existsSync(join(root, 'tuning-run', 'cake_ecn')), false);
   assert.equal(existsSync(join(root, 'tuning-run', 'cake_dscp')), false);
+  assert.equal(existsSync(join(root, 'tuning-run', 'cake_shaper')), false);
   // another setting it ran is kept as done, as before
   assert.equal(existsSync(join(root, 'tuning-run', 'rx_delay')), true);
 
@@ -352,10 +486,13 @@ test('milkflint-tuning: CAKE’s settings from a run without sch_cake aren’t k
   writeFileSync(join(cakeParams, 'ecn_fail_count'), '8');
   writeFileSync(join(cakeParams, 'l4s_ramp'), '100');
   writeFileSync(join(cakeParams, 'dscp_restore'), '0');
+  writeFileSync(join(cakeParams, 'drop_one_segment'), 'N');
+  writeFileSync(join(cakeParams, 'sparse_ahead_us'), '0');
   tuningApply(settings);
-  assert.deepEqual(cakeNow(), ['16', '60', '1']);
+  assert.deepEqual(cakeNow(), ['16', '60', '1', 'Y', '250']);
   assert.equal(readFileSync(join(root, 'tuning-run', 'cake_ecn'), 'utf8').trim(), '16 60');
   assert.equal(readFileSync(join(root, 'tuning-run', 'cake_dscp'), 'utf8').trim(), '1');
+  assert.equal(readFileSync(join(root, 'tuning-run', 'cake_shaper'), 'utf8').trim(), '1 250');
 
   // done: a reload with nothing changed leaves sch_cake alone
   writeFileSync(join(cakeParams, 'ecn_fail_count'), 'untouched');
@@ -364,6 +501,25 @@ test('milkflint-tuning: CAKE’s settings from a run without sch_cake aren’t k
   // a changed setting goes in at the next reload
   tuningApply({ ...settings, 'milkflint.cake.ecn_drop': '32' });
   assert.equal(cakeNow()[0], '32');
+  // and one cleared is off again, the others left alone
+  writeFileSync(join(cakeParams, 'ecn_fail_count'), 'untouched');
+  tuningApply({ ...settings, 'milkflint.cake.ecn_drop': '32', 'milkflint.cake.sparse_ahead': '' });
+  assert.deepEqual(cakeNow().slice(3), ['Y', '0']);
+  assert.equal(cakeNow()[0], 'untouched');
+});
+
+test('milkflint-tuning: the Ethernet’s moderation switches go in when they change, and only then', () => {
+  rmSync(join(root, 'tuning-run'), { recursive: true, force: true });
+  writeFileSync(join(ethParams, 'rx_dim_per_ring'), 'N');
+  writeFileSync(join(ethParams, 'qdma_tx_dim'), 'N');
+  const eth = (): string[] => ['rx_dim_per_ring', 'qdma_tx_dim'].map((p) => readFileSync(join(ethParams, p), 'utf8').trim());
+  tuningApply({ 'milkflint.steering.qdma_tx_dim': '1' }, true);
+  assert.deepEqual(eth(), ['N', 'Y']);
+  writeFileSync(join(ethParams, 'qdma_tx_dim'), 'untouched');
+  tuningApply({ 'milkflint.steering.qdma_tx_dim': '1' });
+  assert.deepEqual(eth(), ['N', 'untouched']);
+  tuningApply({ 'milkflint.steering.rx_dim_per_ring': '1' });
+  assert.deepEqual(eth(), ['Y', 'N']);
 });
 
 const wifiBin = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/wifi/bin/', import.meta.url));

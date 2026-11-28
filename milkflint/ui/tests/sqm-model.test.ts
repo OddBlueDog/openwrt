@@ -241,7 +241,10 @@ test('a queue with no interface gets the one the page shows', () => {
 
 test('a new queue gets everything, and loads back as saved', () => {
   const data = load([]);
-  const form = { ...data.form, enabled: true, downloadMbit: '800', uploadMbit: '60', link: 'ethernet' as const, perDevice: true };
+  // home defaults: a fair share per device, the upload's ACK filter
+  assert.equal(data.form.perDevice, true);
+  assert.equal(data.form.ackFilter, 'on');
+  const form = { ...data.form, enabled: true, downloadMbit: '800', uploadMbit: '60', link: 'ethernet' as const };
   const changes = toChanges(form, data);
   const sqm = applied({ sqm: [] }, changes)['sqm'] ?? [];
   assert.deepEqual(sqm[0], {
@@ -261,7 +264,7 @@ test('a new queue gets everything, and loads back as saved', () => {
     tcMPU: '84',
     linklayer_advanced: '1',
     iqdisc_opts: 'nat dual-dsthost ingress no-split-gso',
-    eqdisc_opts: 'nat dual-srchost',
+    eqdisc_opts: 'nat dual-srchost ack-filter',
     qdisc_advanced: '1',
     qdisc_really_really_advanced: '1',
   });

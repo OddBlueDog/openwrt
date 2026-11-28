@@ -2,8 +2,9 @@
 // sqm-scripts and CAKE take for the internet port's queue, as LuCI has
 // them, by direction, with what CAKE will get and the file as it will be.
 // The expert choices the page used to show (multi-queue, the upload's ACK
-// filter and memory limit) are here too. It saves on its own, and only what
-// changed (./advanced.ts).
+// filter and memory limit) are here too, and the download's experimental
+// sch_cake settings (./cake-extras.ts), with what sch_cake has now. It saves
+// on its own, and only what changed (./advanced.ts).
 import { Link } from '@tanstack/react-router';
 import { pageLink } from '@/lib/router';
 import { ArrowDownIcon, ArrowUpIcon, CableIcon, ListIcon, type LucideIcon } from 'lucide-react';
@@ -20,7 +21,9 @@ import { Switch } from '@/components/ui/switch';
 import { TabPanel, Tabs } from '@/components/ui/tabs';
 import type { Change } from '@/lib/api/uci';
 import { formatBitrate } from '@/lib/format';
+import { useLive } from '@/lib/query/use-live';
 import { cn } from '@/lib/utils';
+import { tuningQueries } from '../tuning/queries';
 import { Opt, UciPreview } from '../firewall/sheet-parts';
 import {
   type AdvancedData,
@@ -37,6 +40,17 @@ import {
   advancedFieldNames,
   advancedFormSchema,
 } from './advanced';
+import {
+  type CakeExtrasLive,
+  cakeParamMissing,
+  dropOneSegmentIdle,
+  dropOneSegmentNow,
+  fraglistNow,
+  oneSegmentDropsNow,
+  sparseAheadChoices,
+  sparseAheadLabel,
+  sparseAheadNow,
+} from './cake-extras';
 import { cakeTargetMs, NO_SPLIT_GSO_KBIT, takesWhole } from './gso';
 import { linkPresets, lowMemlimit, presetOverhead } from './model';
 import { multiQueueThresholdKbit, usesMultiQueue } from './multi-queue';
@@ -246,10 +260,10 @@ function CakePreview({ f, data, dir }: { f: AdvancedForm; data: AdvancedData; di
     tinsShort[e.diffserv] ?? e.diffserv,
     isolationShort[e.isolation] ?? e.isolation,
     e.nat === 'nat' ? 'NAT-aware' : 'No NAT lookup',
-    e.wash === 'wash' ? 'Clears DSCP' : 'Keeps DSCP',
-    ...(dir === 'down' ? [e.ingress === 'ingress' ? 'Ingress mode' : 'Egress mode'] : []),
+    e.wash === 'wash' ? (dir === 'down' && data.dscpRestore ? 'Devices’ own DSCP' : 'Clears DSCP') : 'Keeps DSCP',
+    ...(dir === 'down' ? [e.ingress === 'ingress' ? 'Counts dropped packets' : 'Dropped packets not counted'] : []),
     ...(e.ackFilter === 'no-ack-filter' ? [] : [e.ackFilter === 'ack-filter' ? 'ACK filter' : 'Aggressive ACK filter']),
-    e.gso === 'no-split-gso' ? 'GRO packets whole' : 'GRO packets split',
+    e.gso === 'no-split-gso' ? 'Grouped packets kept whole' : 'Grouped packets split up',
     `Target ${target === null ? '?' : target < 1 ? `${String(Math.round(target * 1000))} µs` : `${String(Math.round(target * 10) / 10)} ms`}`,
   ];
   return (
@@ -285,6 +299,8 @@ function DirectionTab({
   data,
   errors,
   rssNote,
+  cakeLive,
+  fraglist,
   setDir,
   set,
 }: {
@@ -295,6 +311,10 @@ function DirectionTab({
   errors: AdvancedErrors;
   /** why the download's queues don't spread over the CPUs now, when they don't */
   rssNote: string | undefined;
+  /** what sch_cake has now, for the experimental settings; undefined until the router said */
+  cakeLive: CakeExtrasLive | undefined;
+  /** whether the internet port groups with fraglist GRO now; undefined while it isn't known */
+  fraglist: boolean | undefined;
   setDir: <K extends keyof DirectionForm>(dir: Direction, key: K, value: DirectionForm[K]) => void;
   set: <K extends keyof AdvancedForm>(key: K, value: AdvancedForm[K]) => void;
 }): ReactElement {
@@ -423,7 +443,7 @@ function DirectionTab({
               disabled={data.dscpRestore}
               hint={
                 data.dscpRestore
-                  ? 'Set by Keep devices’ priorities on downloads, on the page.'
+                  ? 'Kept on for Keep devices’ priorities on downloads, which puts each connection’s own mark back where CAKE clears your provider’s. Turn that off on the page to change this.'
                   : 'After sorting downloads into tins, CAKE clears the marks they came with: your provider’s mean nothing on your network.'
               }
               onChange={(v) => {
@@ -439,7 +459,7 @@ function DirectionTab({
               disabled={data.dscpRestore}
               hint={
                 data.dscpRestore
-                  ? 'Set by Keep devices’ priorities on downloads, on the page.'
+                  ? 'Follows Prioritise by traffic type while Keep devices’ priorities on downloads is on: on, downloads go into tins by their connection’s own mark. Change either on the page.'
                   : 'With layer_cake, downloads get tins by the marks they arrive with; off, they share one tin (sqm-scripts’ default).'
               }
               onChange={(v) => {
@@ -451,19 +471,28 @@ function DirectionTab({
         <Row
           id={fid('wash')}
           label={down ? 'Clear marks, by keyword' : 'Clear DSCP marks'}
-          opt={down ? 'wash' : 'wash · nowash'}
+          opt="wash · nowash"
           changed={ch('wash')}
           hint={
-            down
-              ? 'Overrides Clear DSCP marks above; usually left as it is.'
-              : 'Clears the marks of what goes out to your provider, after CAKE has sorted it into tins.'
+            !down
+              ? 'Clears the marks of what goes out to your provider, after CAKE has sorted it into tins.'
+              : !data.dscpRestore
+                ? 'Overrides Clear DSCP marks above; usually left as it is.'
+                : d.wash === 'nowash'
+                  ? 'Keep devices’ priorities on downloads can’t work with this: it puts each connection’s own mark back where CAKE clears the provider’s. Choose Same as Clear DSCP marks.'
+                  : 'Kept as Clear DSCP marks for Keep devices’ priorities on downloads, which puts each connection’s own mark back where CAKE clears your provider’s. Turn that off on the page to change this.'
           }
         >
           <Pick
             id={fid('wash')}
             value={d.wash}
+            // the restore happens where CAKE washes: nowash would turn it off
+            disabled={down && data.dscpRestore && d.wash !== 'nowash'}
             options={[
-              { value: '', label: down ? 'From Clear DSCP marks' : 'Keep them (CAKE’s default)' },
+              {
+                value: '',
+                label: down ? `Same as Clear DSCP marks (${f.squashDscp ? 'on' : 'off'})` : 'Keep them (CAKE’s default)',
+              },
               { value: 'wash', label: 'Clear them (wash)' },
               { value: 'nowash', label: 'Keep them (nowash)' },
             ]}
@@ -481,8 +510,8 @@ function DirectionTab({
           changed={ch('ackFilter')}
           hint={
             down
-              ? 'Drops acknowledgements a newer one has replaced. Meant for the upload, where a download’s acknowledgements go.'
-              : 'Drops acknowledgements a newer one has replaced, so they take less of the upload. Aggressive drops more, and can confuse some connections.'
+              ? 'You probably don’t want this on here: look on the Upload tab for it, where downloads send their acknowledgements.'
+              : 'Downloads send small acknowledgements (ACKs) back up the line. When they queue behind a busy upload, this drops the ones a newer ACK has replaced, leaving more of the upload for everything else. Aggressive drops more and can confuse some connections.'
           }
         >
           <Pick
@@ -492,7 +521,8 @@ function DirectionTab({
               { value: '', label: 'Off (CAKE’s default)' },
               { value: 'ack-filter', label: 'On (ack-filter)' },
               { value: 'ack-filter-aggressive', label: 'Aggressive (ack-filter-aggressive)' },
-              { value: 'no-ack-filter', label: 'Off (no-ack-filter)' },
+              // the same as the default: offered only when it's what's set
+              ...(d.ackFilter === 'no-ack-filter' ? [{ value: 'no-ack-filter' as const, label: 'Off (no-ack-filter)' }] : []),
             ]}
             onChange={(v) => {
               setDir(dir, 'ackFilter', v);
@@ -502,10 +532,10 @@ function DirectionTab({
         {down ? (
           <Row
             id={fid('whole')}
-            label="GRO packets"
-            opt="no-split-gso"
+            label="Grouped packets"
+            opt="split-gso · no-split-gso"
             changed={f.whole !== data.form.whole}
-            hint={`The router groups a download’s packets (GRO) before Smart Queue. Whole saves CPU at high speeds; split lets a ping overtake sooner. Automatic takes them whole from ${String(NO_SPLIT_GSO_KBIT / 1000)} Mbit/s. Also on Performance Tuning.`}
+            hint={`Before Smart Queue, the router merges a download’s packets into bigger ones (GRO) to save work. Kept whole, they cost far less CPU at high speeds, which keeps delays down too; split up, each packet is scheduled on its own. Automatic keeps them whole from ${String(NO_SPLIT_GSO_KBIT / 1000)} Mbit/s. Also on Performance Tuning.`}
           >
             <Pick
               id={fid('whole')}
@@ -513,10 +543,10 @@ function DirectionTab({
               options={[
                 {
                   value: 'auto',
-                  label: `Automatic: ${takesWhole(data.downloadKbit, 'auto') ? 'whole' : 'split'} at ${formatBitrate(data.downloadKbit * 1000)}`,
+                  label: `Automatic: ${takesWhole(data.downloadKbit, 'auto') ? 'kept whole' : 'split up'} at ${formatBitrate(data.downloadKbit * 1000)}`,
                 },
-                { value: 'on', label: 'Always whole (no-split-gso)' },
-                { value: 'off', label: 'Never: split each one (split-gso)' },
+                { value: 'on', label: 'Always keep whole (no-split-gso)' },
+                { value: 'off', label: 'Always split up (split-gso)' },
               ]}
               onChange={(v) => {
                 set('whole', v);
@@ -526,18 +556,19 @@ function DirectionTab({
         ) : (
           <Row
             id={fid('gso')}
-            label="GSO packets"
-            opt="split-gso"
+            label="Grouped packets"
+            opt="split-gso · no-split-gso"
             changed={ch('gso')}
-            hint="Big packets the router sends itself or forwards whole: CAKE splits them by default, so a ping can overtake."
+            hint="Big packets the router sends, or forwards as they arrived. Split up, a ping or a call’s packet can slip in between them; kept whole, they take less CPU."
           >
             <Pick
               id={fid('gso')}
               value={d.gso}
               options={[
-                { value: '', label: 'Split (CAKE’s default)' },
-                { value: 'split-gso', label: 'Split (split-gso)' },
-                { value: 'no-split-gso', label: 'Whole (no-split-gso)' },
+                { value: '', label: 'Split up (CAKE’s default)' },
+                { value: 'no-split-gso', label: 'Keep whole (no-split-gso)' },
+                // the same as the default: offered only when it's what's set
+                ...(d.gso === 'split-gso' ? [{ value: 'split-gso' as const, label: 'Split up (split-gso)' }] : []),
               ]}
               onChange={(v) => {
                 setDir(dir, 'gso', v);
@@ -549,25 +580,25 @@ function DirectionTab({
           <>
             <SwitchField
               id={fid('ingress')}
-              label="Ingress mode"
+              label="Count dropped packets (ingress mode)"
               opt="ingress"
               checked={d.ingress === 'ingress'}
               changed={ch('ingress')}
-              hint="Counts packets CAKE drops toward the speed too, since they’ve already crossed the line: right for a download queue."
+              hint="Packets CAKE drops here have already used your line, so this counts them toward the speed as well, keeping downloads under it when CAKE drops a lot. Fair share per device turns it on."
               onChange={(v) => {
                 setDir(dir, 'ingress', v ? 'ingress' : '');
               }}
             />
             <SwitchField
               id={fid('autorate')}
-              label="Estimate the line’s speed"
+              label="Adapt to the line’s speed"
               opt="autorate-ingress"
               checked={d.autorate}
               changed={ch('autorate')}
               error={errors['down.autorate']}
               // multi-queue CAKE can't: one set in LuCI can still be turned off
               disabled={mq && !d.autorate}
-              hint={`CAKE measures how fast downloads arrive and shapes to that instead of the speed you set: for lines whose speed changes, such as 4G or 5G.${mq ? ' Not with multi-queue CAKE, which the download uses (Multi-queue, above).' : ''}`}
+              hint={`CAKE measures how fast downloads arrive and shapes to that instead of the speed you set. For lines whose speed changes, such as 4G or 5G; leave it off on a fixed line.${mq ? ' Not with multi-queue CAKE, which the download uses (Multi-queue, above).' : ''}`}
               onChange={(v) => {
                 setDir(dir, 'autorate', v);
               }}
@@ -689,7 +720,107 @@ function DirectionTab({
           />
         </Row>
       </Group>
+      {down && <ExperimentalGroup id={id} f={f} data={data} live={cakeLive} fraglist={fraglist} set={set} />}
     </>
+  );
+}
+
+const NOT_YET = 'This image doesn’t have it yet.';
+
+/** A line under an experimental setting: why it can't be switched, or what sch_cake has now when that isn't what's saved. */
+function Note({ children }: { children: ReactNode }): ReactElement {
+  return <span className="mt-1 block font-medium text-foreground">{children}</span>;
+}
+
+/** The download's experimental sch_cake settings, which CAKE takes at once, without a restart. */
+function ExperimentalGroup({
+  id,
+  f,
+  data,
+  live,
+  fraglist,
+  set,
+}: {
+  id: string;
+  f: AdvancedForm;
+  data: AdvancedData;
+  live: CakeExtrasLive | undefined;
+  fraglist: boolean | undefined;
+  set: <K extends keyof AdvancedForm>(key: K, value: AdvancedForm[K]) => void;
+}): ReactElement {
+  const was = data.form;
+  const dropMissing = cakeParamMissing(live?.dropOneSegment, live);
+  const aheadMissing = cakeParamMissing(live?.sparseAhead, live);
+  const whole = takesWhole(data.downloadKbit, f.whole);
+  const dropNow = dropOneSegmentNow(was.dropOneSegment, live);
+  const dropIdle = dropOneSegmentIdle(whole, fraglist);
+  const dropped = oneSegmentDropsNow(live?.dropOneSegment === true || was.dropOneSegment, live);
+  const aheadNow = sparseAheadNow(was.sparseAhead, live);
+  return (
+    <Group title="Experimental">
+      <p className="-mt-2 text-xs text-muted-foreground">
+        Off by default, for trying out. CAKE takes them at once, without a restart.
+        {live !== undefined && !live.loaded && ' Smart Queue hasn’t run since the router started: CAKE takes them when it does.'}
+      </p>
+      <SwitchField
+        id={`${id}-down-dropOne`}
+        label="Drop one packet of a group, not the whole group"
+        opt="drop_one_segment"
+        checked={f.dropOneSegment}
+        changed={f.dropOneSegment !== was.dropOneSegment}
+        // one already on can still be turned off
+        disabled={dropMissing && !f.dropOneSegment}
+        hint={
+          <>
+            When CAKE drops from a download whose grouped packets it keeps whole, it drops one packet of the group rather than the
+            whole group, so the download loses less at once. It needs both: CAKE keeping grouped packets whole (Grouped packets,
+            above), and the internet port grouping with fraglist (Receive grouping on Performance Tuning), as a plain GRO packet
+            has no separate packets to drop one of. Automatic picks plain GRO whenever CAKE keeps them whole. sch_cake’s
+            drop_one_segment.
+            {dropMissing && <Note>{NOT_YET}</Note>}
+            {dropIdle.map((line) => (
+              <Note key={line}>{line}</Note>
+            ))}
+            {dropNow !== undefined && <Note>{dropNow}</Note>}
+            {dropped !== undefined && <Note>{dropped}</Note>}
+          </>
+        }
+        onChange={(v) => {
+          set('dropOneSegment', v);
+        }}
+      />
+      <Row
+        id={`${id}-down-sparseAhead`}
+        label="Let a new flow’s first packets go ahead of the shaper"
+        opt="sparse_ahead"
+        changed={f.sparseAhead !== was.sparseAhead}
+        hint={
+          <>
+            A download’s packets have already crossed your line, so holding them back for the shaper delays only them. With this,
+            while the shaper holds packets back, a packet of a connection CAKE counts as new or light (a ping, a DNS answer, a
+            game’s update) goes at once if the shaper would let the next one go within this long. It’s charged to the shaper, so
+            the speed holds and the others wait that much longer; busy downloads and uploads wait as before. sch_cake’s
+            sparse_ahead_us.
+            {aheadMissing && <Note>{NOT_YET}</Note>}
+            {aheadNow !== undefined && <Note>{aheadNow}</Note>}
+          </>
+        }
+      >
+        <Pick
+          id={`${id}-down-sparseAhead`}
+          value={f.sparseAhead}
+          disabled={aheadMissing && f.sparseAhead === ''}
+          // one set by hand stays a choice, by its figure, until it's changed
+          options={[...new Set([...sparseAheadChoices, was.sparseAhead, f.sparseAhead])].map((v) => ({
+            value: v,
+            label: sparseAheadLabel(v),
+          }))}
+          onChange={(v) => {
+            set('sparseAhead', v);
+          }}
+        />
+      </Row>
+    </Group>
   );
 }
 
@@ -977,6 +1108,19 @@ export function AdvancedSheet({
   onSubmit: (changes: Change[]) => Promise<string | undefined>;
 }): ReactElement {
   const id = useId();
+  // what sch_cake has now, for the experimental settings: read only while the sheet is open
+  const status = useLive(tuningQueries.status());
+  const knobs = status.data?.knobs;
+  const cakeLive: CakeExtrasLive | undefined =
+    knobs === undefined
+      ? undefined
+      : {
+          dropOneSegment: knobs.cake_drop_one_segment,
+          sparseAhead: knobs.cake_sparse_ahead,
+          oneSegmentDrops: knobs.cake_one_segment_drops,
+          loaded: knobs.cake_loaded,
+        };
+  const fraglist = fraglistNow(status.data?.gro);
   const schema = useMemo(() => advancedFormSchema(data), [data]);
   const [failed, setFailed] = useState<string>();
   const settings = useSettingsForm({
@@ -1017,7 +1161,11 @@ export function AdvancedSheet({
   const milkflint = [
     ...(f.whole === data.form.whole ? [] : ['milkflint.gro.whole (the GRO choice, shared with Performance Tuning)']),
     ...(f.multiQueue === data.form.multiQueue ? [] : ['milkflint.cake.multi_queue (Multi-queue)']),
+    ...(f.dropOneSegment === data.form.dropOneSegment ? [] : ['milkflint.cake.drop_one_segment']),
+    ...(f.sparseAhead === data.form.sparseAhead ? [] : ['milkflint.cake.sparse_ahead']),
   ];
+  // only sqm's own options restart Smart Queue; the experimental settings go to sch_cake as they are
+  const restarts = changes.some((c) => c.config === 'sqm');
   const prefix = `${id}-sqm`;
 
   return (
@@ -1056,7 +1204,18 @@ export function AdvancedSheet({
         <div className="flex-1 overflow-y-auto">
           {(['down', 'up'] as const).map((dir) => (
             <TabPanel key={dir} prefix={prefix} id={dir} value={tab} className="flex flex-col gap-5 px-6 py-5">
-              <DirectionTab id={id} dir={dir} f={f} data={data} errors={errors} rssNote={rssNote} setDir={setDir} set={set} />
+              <DirectionTab
+                id={id}
+                dir={dir}
+                f={f}
+                data={data}
+                errors={errors}
+                rssNote={rssNote}
+                cakeLive={cakeLive}
+                fraglist={fraglist}
+                setDir={setDir}
+                set={set}
+              />
             </TabPanel>
           ))}
           <TabPanel prefix={prefix} id="line" value={tab} className="flex flex-col gap-5 px-6 py-5">
@@ -1081,7 +1240,7 @@ export function AdvancedSheet({
               ? 'Fix what’s marked to save.'
               : options === 0
                 ? 'No changes yet.'
-                : `${String(options)} option${options === 1 ? '' : 's'} to change. Smart Queue restarts for a moment.`}
+                : `${String(options)} option${options === 1 ? '' : 's'} to change.${restarts ? ' Smart Queue restarts for a moment.' : ''}`}
           </p>
           <div className="ml-auto flex gap-2">
             <Button variant="ghost" onClick={onClose}>

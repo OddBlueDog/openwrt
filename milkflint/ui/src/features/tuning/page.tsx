@@ -284,7 +284,7 @@ function TuningSettings({ data }: { data: TuningData }): ReactElement {
           >
             <div id={expertPanel} hidden={!expertShown} className="grid items-start gap-4 xl:grid-cols-2">
               <div className="flex min-w-0 flex-col gap-4">
-                <CpuCard form={values} status={status.data} rss={rss} set={set} />
+                <CpuCard form={values} saved={data.form} status={status.data} rss={rss} set={set} />
                 <GroCard form={values} data={data} port={status.data?.gro[0]} set={set} />
               </div>
               <div className="flex min-w-0 flex-col gap-4">

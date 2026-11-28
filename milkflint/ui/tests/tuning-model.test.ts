@@ -35,3 +35,13 @@ test('a written AQL limit or total counts, even at the default figures', () => {
     ['Wi-Fi queue limit', 'Wi-Fi radio’s total'],
   );
 });
+
+test('the experimental CPU settings are named in the expert tier, in the page’s order', () => {
+  const f = { ...defaults, lanRps: true, rxDimPerRing: true, qdmaTxDim: true, rxDelay: '20' };
+  assert.deepEqual(changedSettings(f, firewall), [
+    { tier: 'expert', label: 'Spread what the LAN ports receive' },
+    { tier: 'expert', label: 'Receive interrupt delay' },
+    { tier: 'expert', label: 'Each receive ring picks its own interrupt delay' },
+    { tier: 'expert', label: 'Send-complete interrupts follow sending’s own moderation' },
+  ]);
+});

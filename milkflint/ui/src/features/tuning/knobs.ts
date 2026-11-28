@@ -5,8 +5,14 @@
 //   CPUs 1-3 (unset: every CPU);
 // - steering.rings_rt "0": the RSS rings' receive threads at normal priority
 //   (unset: real-time);
+// - steering.lan_rps "1": with RSS, what the LAN ports receive (all on the
+//   switch port's ring 0) is handed on to CPUs 1-3 (unset: it isn't);
 // - steering.rx_delay: the longest the Ethernet's receive interrupt waits,
-//   in µs; "0" no limit (the driver's adaptive choice, up to 260 µs); unset 40;
+//   in µs; "0" no limit (the driver's adaptive choice, up to 260 µs); unset 80;
+// - steering.rx_dim_per_ring "1": each receive ring's interrupt delay from
+//   its own traffic (mtk_eth's rx_dim_per_ring; unset: off);
+// - steering.qdma_tx_dim "1": the send-complete interrupts held back by
+//   sending's own moderation (mtk_eth's qdma_tx_dim; unset: off);
 // - cake.ecn_drop: after how many ignored marks Smart Queue drops from an
 //   ECN download that ignores them, 8 to 65535 (sch_cake's ecn_fail_count);
 //   "0" never, it always marks; unset 8;
@@ -27,6 +33,12 @@ import { z } from 'zod';
 export const knobFields = z.object({
   wifiAll: z.boolean(),
   ringsRt: z.boolean(),
+  /** experimental: with RSS, the LAN ports' packets handed on to CPUs 1-3 */
+  lanRps: z.boolean(),
+  /** experimental: each receive ring picks its own interrupt delay */
+  rxDimPerRing: z.boolean(),
+  /** experimental: send-complete interrupts follow sending's own moderation */
+  qdmaTxDim: z.boolean(),
   /** µs as text; '' for the default, 40 */
   rxDelay: z.string(),
   /** ignored marks as text; '' for the default, 8; '0' never drops */
@@ -41,15 +53,38 @@ export const knobFields = z.object({
 
 export type Knobs = z.infer<typeof knobFields>;
 
-export const knobDefaults: Knobs = { wifiAll: true, ringsRt: true, rxDelay: '', ecnDrop: '', l4s: '', retries: '', voAggr: '' };
+export const knobDefaults: Knobs = {
+  wifiAll: true,
+  ringsRt: true,
+  lanRps: false,
+  rxDimPerRing: false,
+  qdmaTxDim: false,
+  rxDelay: '',
+  ecnDrop: '',
+  l4s: '',
+  retries: '',
+  voAggr: '',
+};
 
-export const RX_DELAY_DEFAULT = 40;
+export const RX_DELAY_DEFAULT = 80;
 export const RETRIES_DEFAULT = 15;
 export const ECN_DROP_DEFAULT = 8;
 export const L4S_DEFAULT = 100;
 
-/** The interrupt delays the page offers: '' is the default, '0' no limit */
-export const rxDelayChoices = ['', '20', '80', '160', '0'];
+/**
+ * The interrupt delays the page offers: '' is the default, '0' no limit. The
+ * hardware counts the delay in 20 µs steps and the driver rounds up, so only
+ * multiples of 20 mean what they say; 80, 140 and 260 are where the driver's
+ * own adaptive levels land.
+ */
+export const rxDelayChoices = ['', '40', '60', '100', '140', '160', '0'];
+
+/** The choices, with any other value set (saved, or in the form) kept at the end, so it shows until it's changed */
+export function rxDelayOptions(...kept: string[]): string[] {
+  const out = [...rxDelayChoices];
+  for (const v of kept) if (!out.includes(v)) out.push(v);
+  return out;
+}
 /** The retry limits the page offers: '' is the default */
 export const retryChoices = ['', '10', '7', '4'];
 /** When the page offers to drop from downloads that ignore ECN marks: '' is the default, '0' never */
@@ -96,6 +131,10 @@ export function readKnobs(get: Get): Knobs {
   return {
     wifiAll: get('steering', 'wifi_all') !== '0',
     ringsRt: get('steering', 'rings_rt') !== '0',
+    // only "1", as packet-steering.sh and eth-dim take them
+    lanRps: get('steering', 'lan_rps') === '1',
+    rxDimPerRing: get('steering', 'rx_dim_per_ring') === '1',
+    qdmaTxDim: get('steering', 'qdma_tx_dim') === '1',
     rxDelay: numberOrDefault(get('steering', 'rx_delay'), 0, 1000, RX_DELAY_DEFAULT),
     ecnDrop: ecnDropOf(get('cake', 'ecn_drop')),
     l4s: l4sOf(get('cake', 'l4s')),
@@ -106,7 +145,14 @@ export function readKnobs(get: Get): Knobs {
 
 /** The milkflint options for the settings, by section; undefined is unset, the default. */
 export interface KnobOptions {
-  steering: { wifi_all: string | undefined; rings_rt: string | undefined; rx_delay: string | undefined };
+  steering: {
+    wifi_all: string | undefined;
+    rings_rt: string | undefined;
+    lan_rps: string | undefined;
+    rx_delay: string | undefined;
+    rx_dim_per_ring: string | undefined;
+    qdma_tx_dim: string | undefined;
+  };
   cake: { ecn_drop: string | undefined; l4s: string | undefined };
   wifi: { retries: string | undefined; vo_aggr: string | undefined };
 }
@@ -116,7 +162,10 @@ export function knobOptions(k: Knobs): KnobOptions {
     steering: {
       wifi_all: k.wifiAll ? undefined : '0',
       rings_rt: k.ringsRt ? undefined : '0',
+      lan_rps: k.lanRps ? '1' : undefined,
       rx_delay: k.rxDelay === '' ? undefined : k.rxDelay,
+      rx_dim_per_ring: k.rxDimPerRing ? '1' : undefined,
+      qdma_tx_dim: k.qdmaTxDim ? '1' : undefined,
     },
     cake: { ecn_drop: k.ecnDrop === '' ? undefined : k.ecnDrop, l4s: k.l4s === '' ? undefined : k.l4s },
     wifi: { retries: k.retries === '' ? undefined : k.retries, vo_aggr: k.voAggr === '' ? undefined : k.voAggr },
@@ -134,18 +183,18 @@ export function knobSectionsChanged(a: Knobs, b: Knobs): Set<'steering' | 'cake'
   return changed;
 }
 
-/** "40 µs", "No limit (up to 260 µs)" */
+/** "80 µs", "No limit (up to 260 µs)" */
 export function rxDelayLabel(value: string | number): string {
   const us = value === '' ? RX_DELAY_DEFAULT : Number(value);
   return us === 0 ? 'No limit (up to 260 µs)' : `${String(us)} µs`;
 }
 
-/** "15 sends" */
 /** A choice of voice queue aggregation */
 export function voAggrLabel(value: string): string {
   return value === '0' ? 'Off, as stock OpenWrt' : 'On (default)';
 }
 
+/** "15 sends" */
 export function retriesLabel(value: string | number): string {
   const n = value === '' ? RETRIES_DEFAULT : Number(value);
   return `${String(n)} send${n === 1 ? '' : 's'}`;
@@ -186,6 +235,26 @@ export function l4sLabel(value: string | number, targetMs: number | null): strin
 export function l4sNow(ramp: number | null, loaded: boolean, targetMs: number | null): string {
   if (ramp === null) return loaded ? 'Not in this image' : 'Smart Queue hasn’t run since the router started';
   return ramp === 0 ? 'Only CAKE’s classic marks (as CAKE upstream)' : l4sLabel(ramp, targetMs);
+}
+
+/** What an experimental on/off driver setting does now: null where the image lacks it */
+export function switchNow(on: boolean | null): string {
+  return on === null ? 'Not in this image' : on ? 'On' : 'Off';
+}
+
+/** Where what the LAN ports receive goes now, from the CPUs the switch port hands it on to (null: no switch port) */
+export function lanRpsNow(cpus: readonly number[] | null): string {
+  if (cpus === null) return 'No switch port in this image';
+  if (cpus.length === 0) return 'Stays on the CPU it arrives on';
+  const ranges: string[] = [];
+  let i = 0;
+  while (i < cpus.length) {
+    let j = i;
+    while (j + 1 < cpus.length && (cpus[j + 1] ?? 0) === (cpus[j] ?? 0) + 1) j++;
+    ranges.push(i === j ? String(cpus[i]) : `${String(cpus[i])}–${String(cpus[j])}`);
+    i = j + 1;
+  }
+  return `Handed on to ${cpus.length === 1 ? 'CPU' : 'CPUs'} ${ranges.join(', ')}`;
 }
 
 /** mac80211's own total for a radio's AQL, µs */
