@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 17:47:06 +0000
+Subject: [PATCH] wifi: mt76: tests: a full station add sends the peer's
+ current SM power save mode
+
+---
+ mt7915/tests/mcu-test.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index 76622e30..75f0eb12 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -2667,8 +2667,11 @@ static void mt7915_test_add_sta_full(struct kunit *test)
+ 
+ 	ht = mt7915_test_tlv(test, msg, STA_REC_HT, struct sta_rec_ht);
+ 	KUNIT_ASSERT_NOT_NULL(test, ht);
++	/* the peer's current SM power save mode: off (SMPS disabled) */
+ 	KUNIT_EXPECT_EQ(test, le16_to_cpu(ht->ht_cap),
+-			c.sta->deflink.ht_cap.cap);
++			(c.sta->deflink.ht_cap.cap & ~IEEE80211_HT_CAP_SM_PS) |
++			(WLAN_HT_CAP_SM_PS_DISABLED <<
++			 IEEE80211_HT_CAP_SM_PS_SHIFT));
+ 	vht = mt7915_test_tlv(test, msg, STA_REC_VHT, struct sta_rec_vht);
+ 	KUNIT_ASSERT_NOT_NULL(test, vht);
+ 	KUNIT_EXPECT_EQ(test, le32_to_cpu(vht->vht_cap),

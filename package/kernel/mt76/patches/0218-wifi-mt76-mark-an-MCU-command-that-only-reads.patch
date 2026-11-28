@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Tue, 24 Nov 2026 09:42:53 +0100
+Subject: [PATCH] wifi: mt76: mark an MCU command that only reads
+
+The core cannot tell a command that only reads firmware state from one
+that changes it. The query bit of the command id does not show it.
+Several reads are sent without that bit, and a command that returns
+data can still change state.
+
+Add a cmd flag for a command that changes no firmware state. The core
+can then handle a lost answer of such a command on its own. The core
+strips the flag before any mcu_ops call. A driver compare of the
+command id thus needs no mask.
+
+Link: https://patch.msgid.link/20261124084309.1981968-4-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 6362ceba512d4275398764a962a39f6a18624629)
+---
+ mcu.c  | 5 ++++-
+ mt76.h | 5 +++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/mcu.c b/mcu.c
+index 5cfbbc2a..4d99a535 100644
+--- a/mcu.c
++++ b/mcu.c
+@@ -59,7 +59,8 @@ int mt76_mcu_send_and_get_msg(struct mt76_dev *dev, int cmd, const void *data,
+ 	struct sk_buff *skb;
+ 
+ 	if (dev->mcu_ops->mcu_send_msg)
+-		return dev->mcu_ops->mcu_send_msg(dev, cmd, data, len, wait_resp);
++		return dev->mcu_ops->mcu_send_msg(dev, cmd & ~MT76_MCU_CMD_READ,
++						  data, len, wait_resp);
+ 
+ 	skb = mt76_mcu_msg_alloc(dev, data, len);
+ 	if (!skb)
+@@ -78,6 +79,8 @@ int mt76_mcu_skb_send_and_get_msg(struct mt76_dev *dev, struct sk_buff *skb,
+ 	unsigned long expires;
+ 	int ret, seq;
+ 
++	cmd &= ~MT76_MCU_CMD_READ;
++
+ 	if (ret_skb)
+ 		*ret_skb = NULL;
+ 
+diff --git a/mt76.h b/mt76.h
+index df7ad2e7..02e80b68 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -288,6 +288,11 @@ struct mt76_queue {
+ 	struct page_pool *page_pool;
+ };
+ 
++/* cmd flag of a command that changes no firmware state; the core strips it
++ * before it calls an mcu_ops function
++ */
++#define MT76_MCU_CMD_READ	BIT(30)
++
+ struct mt76_mcu_ops {
+ 	unsigned int max_retry;
+ 	u32 headroom;

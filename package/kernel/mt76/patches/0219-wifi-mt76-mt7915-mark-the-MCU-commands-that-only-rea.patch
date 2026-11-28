@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Tue, 24 Nov 2026 09:42:58 +0100
+Subject: [PATCH] wifi: mt76: mt7915: mark the MCU commands that only read
+
+The core retries a lost answer only for a command with the read flag.
+Without the flag, the core takes the loss as an unknown firmware state.
+
+Set the flag on the reads of the efuse, the MIB counters and the
+temperature. Set it on the reads of the TX power table, the RX rate,
+an RF register and the MU statistics. Set it on the WA queries and the
+SER query as well.
+
+Link: https://patch.msgid.link/20261124084309.1981968-9-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 837d80abcb035acea314ab0e587b47682e7a7c2e)
+---
+ mt7915/mcu.c | 40 ++++++++++++++++++++++++++++------------
+ 1 file changed, 28 insertions(+), 12 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 2521c1fe..5653000c 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -325,6 +325,9 @@ int mt7915_mcu_wa_cmd(struct mt7915_dev *dev, int cmd, u32 a1, u32 a2, u32 a3)
+ 		},
+ 	};
+ 
++	if (cmd == MCU_WA_PARAM_CMD(QUERY))
++		cmd |= MT76_MCU_CMD_READ;
++
+ 	return mt76_mcu_send_msg(&dev->mt76, cmd, &req, sizeof(req), false);
+ }
+ 
+@@ -2736,7 +2739,8 @@ int mt7915_mcu_muru_debug_get(struct mt7915_phy *phy)
+ 		.band_idx = phy->mt76->band_idx,
+ 	};
+ 
+-	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD(MURU_CTRL),
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD(MURU_CTRL) |
++					MT76_MCU_CMD_READ,
+ 					&req, sizeof(req), true, &skb);
+ 	if (ret)
+ 		return ret;
+@@ -3475,7 +3479,8 @@ int mt7915_mcu_get_eeprom(struct mt7915_dev *dev, u32 offset, u8 *read_buf)
+ 	int ret;
+ 
+ 	ret = mt76_mcu_send_and_get_msg(&dev->mt76,
+-					MCU_EXT_QUERY(EFUSE_ACCESS),
++					MCU_EXT_QUERY(EFUSE_ACCESS) |
++					MT76_MCU_CMD_READ,
+ 					&req, sizeof(req), true, &skb);
+ 	if (ret)
+ 		return ret;
+@@ -3516,7 +3521,8 @@ int mt7915_mcu_get_eeprom_free_block(struct mt7915_dev *dev, u8 *block_num)
+ 	int ret;
+ 
+ 	ret = mt76_mcu_send_and_get_msg(&dev->mt76,
+-					MCU_EXT_QUERY(EFUSE_FREE_BLOCK),
++					MCU_EXT_QUERY(EFUSE_FREE_BLOCK) |
++					MT76_MCU_CMD_READ,
+ 					&req, sizeof(req), true, &skb);
+ 	if (ret)
+ 		return ret;
+@@ -3791,7 +3797,8 @@ int mt7915_mcu_get_chan_mib_info(struct mt7915_phy *phy, bool chan_switch)
+ 		req[i].offs = cpu_to_le32(offs[i]);
+ 	}
+ 
+-	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD(GET_MIB_INFO),
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD(GET_MIB_INFO) |
++					MT76_MCU_CMD_READ,
+ 					req, len * sizeof(req[0]), true, &skb);
+ 	if (ret)
+ 		return ret;
+@@ -3848,8 +3855,8 @@ int mt7915_mcu_get_temperature(struct mt7915_phy *phy)
+ 		.band_idx = phy->mt76->band_idx,
+ 	};
+ 
+-	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(THERMAL_CTRL), &req,
+-				 sizeof(req), true);
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(THERMAL_CTRL) |
++				 MT76_MCU_CMD_READ, &req, sizeof(req), true);
+ }
+ 
+ int mt7915_mcu_set_thermal_throttling(struct mt7915_phy *phy, u8 state)
+@@ -4143,7 +4150,8 @@ int mt7915_mcu_get_txpower_sku(struct mt7915_phy *phy, s8 *txpower, int len,
+ 	int ret, i;
+ 
+ 	ret = mt76_mcu_send_and_get_msg(&dev->mt76,
+-					MCU_EXT_CMD(TX_POWER_FEATURE_CTRL),
++					MCU_EXT_CMD(TX_POWER_FEATURE_CTRL) |
++					MT76_MCU_CMD_READ,
+ 					&req, sizeof(req), true, &skb);
+ 	if (ret)
+ 		return ret;
+@@ -4235,9 +4243,13 @@ int mt7915_mcu_set_ser(struct mt7915_dev *dev, u8 action, u8 set, u8 band)
+ 		.set = set,
+ 		.band = band,
+ 	};
++	int cmd = MCU_EXT_CMD(SET_SER_TRIGGER);
+ 
+-	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(SET_SER_TRIGGER),
+-				 &req, sizeof(req), false);
++	/* action 0 writes the SER statistics to the firmware log */
++	if (!action)
++		cmd |= MT76_MCU_CMD_READ;
++
++	return mt76_mcu_send_msg(&dev->mt76, cmd, &req, sizeof(req), false);
+ }
+ 
+ /* an AC's quantum level for a station's airtime weight; vow_fw_quanta
+@@ -4657,7 +4669,8 @@ int mt7915_mcu_get_rx_rate(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 	int ret;
+ 	bool cck = false;
+ 
+-	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD(PHY_STAT_INFO),
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD(PHY_STAT_INFO) |
++					MT76_MCU_CMD_READ,
+ 					&req, sizeof(req), true, &skb);
+ 	if (ret)
+ 		return ret;
+@@ -4924,7 +4937,8 @@ int mt7915_mcu_wed_wa_tx_stats(struct mt7915_dev *dev, u16 wlan_idx)
+ 		len = sizeof(req);
+ 	}
+ 
+-	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_WA_PARAM_CMD(QUERY),
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_WA_PARAM_CMD(QUERY) |
++					MT76_MCU_CMD_READ,
+ 					&req, len, true, &skb);
+ 	if (ret)
+ 		return ret;
+@@ -4981,7 +4995,9 @@ int mt7915_mcu_rf_regval(struct mt7915_dev *dev, u32 regidx, u32 *val, bool set)
+ 		return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(RF_REG_ACCESS),
+ 					 &req, sizeof(req), false);
+ 
+-	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_QUERY(RF_REG_ACCESS),
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76,
++					MCU_EXT_QUERY(RF_REG_ACCESS) |
++					MT76_MCU_CMD_READ,
+ 					&req, sizeof(req), true, &skb);
+ 	if (ret)
+ 		return ret;

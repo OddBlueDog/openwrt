@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Tue, 24 Nov 2026 09:42:54 +0100
+Subject: [PATCH] wifi: mt76: retry only an MCU command that reads
+
+mt76_mcu_skb_send_and_get_msg() sends a command again after its answer
+did not come in time. The firmware keeps no state per sequence number,
+so a command whose answer alone was lost runs twice. Not every command
+is safe to run twice. A second removal of a station record can clear
+the entry of another station.
+
+Retry only a command that is marked as a read. Any other command whose
+answer does not come goes to the timeout handling of the driver at
+once. As before, a driver gets the retry only with an
+mcu_skb_prepare_msg op. A command that changes state and loses its
+answer during the probe now fails the probe.
+
+Fixes: 3688c18b65ae ("wifi: mt76: mt7915: retry mcu messages")
+Link: https://patch.msgid.link/20261124084309.1981968-5-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+[adapted to the fork's MCU send path, which records each command: the
+ read flag is taken before it is stripped; the core's KUnit tests mark
+ their retried commands as reads and check that a state command is sent
+ once]
+(cherry picked from commit d33e3f3ef096e924ca44ee39f29a4cbb72789ba9)
+---
+ mcu.c            |  4 +++-
+ tests/mcu-test.c | 41 +++++++++++++++++++++++++++++++++--------
+ 2 files changed, 36 insertions(+), 9 deletions(-)
+
+diff --git a/mcu.c b/mcu.c
+index 4d99a535..0eadf04a 100644
+--- a/mcu.c
++++ b/mcu.c
+@@ -74,6 +74,7 @@ int mt76_mcu_skb_send_and_get_msg(struct mt76_dev *dev, struct sk_buff *skb,
+ 				  int cmd, bool wait_resp,
+ 				  struct sk_buff **ret_skb)
+ {
++	bool read = cmd & MT76_MCU_CMD_READ;
+ 	unsigned int retry = 0;
+ 	struct sk_buff *orig_skb = NULL;
+ 	unsigned long expires;
+@@ -121,7 +122,8 @@ retry:
+ 	do {
+ 		skb = mt76_mcu_get_response(dev, expires);
+ 		mt76_record_mcu_resp(dev, cmd, seq, skb);
+-		if (!skb && !test_bit(MT76_MCU_RESET, &dev->phy.state) &&
++		if (!skb && read &&
++		    !test_bit(MT76_MCU_RESET, &dev->phy.state) &&
+ 		    orig_skb && retry++ < dev->mcu_ops->max_retry) {
+ 			dev_err(dev->dev, "Retry message %08x (seq %d)\n",
+ 				cmd, seq);
+diff --git a/tests/mcu-test.c b/tests/mcu-test.c
+index e0592ee0..3fe28fce 100644
+--- a/tests/mcu-test.c
++++ b/tests/mcu-test.c
+@@ -471,8 +471,9 @@ static void mt76_mcu_test_parse_error(struct kunit *test)
+ 	KUNIT_EXPECT_EQ(test, skb_queue_len(&dev->mcu.res_q), 0);
+ }
+ 
+-/* A lost reply is retried with the same prepared message (not prepared
+- * again), up to max_retry times, and the message is freed in the end.
++/* A lost reply to a read is retried with the same prepared message (not
++ * prepared again), up to max_retry times, and the message is freed in the
++ * end. The read flag doesn't reach the driver.
+  */
+ static void mt76_mcu_test_retry_then_timeout(struct kunit *test)
+ {
+@@ -488,9 +489,8 @@ static void mt76_mcu_test_retry_then_timeout(struct kunit *test)
+ 	skb = mt76_mcu_test_skb(test, dev, 3);
+ 	skb_get(skb);
+ 
+-	KUNIT_EXPECT_EQ(test, mt76_mcu_skb_send_and_get_msg(dev, skb, 5, true,
+-							    NULL),
+-			-ETIMEDOUT);
++	KUNIT_EXPECT_EQ(test, mt76_mcu_skb_send_and_get_msg(dev, skb,
++			5 | MT76_MCU_CMD_READ, true, NULL), -ETIMEDOUT);
+ 	KUNIT_EXPECT_EQ(test, st->n_prepare, 1);
+ 	KUNIT_EXPECT_EQ(test, st->n_send, 1 + 2);
+ 	KUNIT_EXPECT_EQ(test, st->n_parse, 1);
+@@ -500,12 +500,34 @@ static void mt76_mcu_test_retry_then_timeout(struct kunit *test)
+ 		KUNIT_EXPECT_EQ(test, msg->len, 4);
+ 		KUNIT_EXPECT_EQ(test, msg->data[0], MT76_MCU_TEST_HDR);
+ 		KUNIT_EXPECT_EQ(test, msg->data[3], 0x11);
++		KUNIT_EXPECT_EQ(test, msg->cmd, 5);
+ 	}
+ 	/* only our reference is left */
+ 	KUNIT_EXPECT_EQ(test, refcount_read(&skb->users), 1);
+ 	kfree_skb(skb);
+ }
+ 
++/* A command that changes firmware state isn't sent again after its reply
++ * was lost: the firmware may have run it, and a second run of some (a
++ * station record's removal) can hit another station's entry.
++ */
++static void mt76_mcu_test_no_retry_state(struct kunit *test)
++{
++	struct mt76_dev *dev = mt76_mcu_test_dev(test,
++						 &mt76_mcu_test_retry_ops);
++	struct mt76_mcu_test_state *st = &mt76_mcu_test_state;
++
++	dev->mcu.timeout = 1;
++	st->silent_sends = 100;
++
++	KUNIT_EXPECT_EQ(test, mt76_mcu_skb_send_and_get_msg(dev,
++			mt76_mcu_test_skb(test, dev, 3), 5, true, NULL),
++			-ETIMEDOUT);
++	KUNIT_EXPECT_EQ(test, st->n_prepare, 1);
++	KUNIT_EXPECT_EQ(test, st->n_send, 1);
++	KUNIT_EXPECT_EQ(test, st->n_parse, 1);
++}
++
+ /* A retry that gets an answer succeeds. */
+ static void mt76_mcu_test_retry_then_reply(struct kunit *test)
+ {
+@@ -518,7 +540,8 @@ static void mt76_mcu_test_retry_then_reply(struct kunit *test)
+ 	st->silent_sends = 1;
+ 
+ 	KUNIT_ASSERT_EQ(test, mt76_mcu_skb_send_and_get_msg(dev,
+-			mt76_mcu_test_skb(test, dev, 3), 5, true, &reply), 0);
++			mt76_mcu_test_skb(test, dev, 3), 5 | MT76_MCU_CMD_READ,
++			true, &reply), 0);
+ 	KUNIT_ASSERT_NOT_NULL(test, reply);
+ 	KUNIT_EXPECT_EQ(test, reply->data[0], 0xa4);	/* header + 3 */
+ 	kfree_skb(reply);
+@@ -540,9 +563,10 @@ static void mt76_mcu_test_no_retry_in_reset(struct kunit *test)
+ 	st->silent_sends = 100;
+ 	set_bit(MT76_MCU_RESET, &dev->phy.state);
+ 
++	/* not even a read */
+ 	KUNIT_EXPECT_EQ(test, mt76_mcu_skb_send_and_get_msg(dev,
+-			mt76_mcu_test_skb(test, dev, 3), 5, true, NULL),
+-			-ETIMEDOUT);
++			mt76_mcu_test_skb(test, dev, 3), 5 | MT76_MCU_CMD_READ,
++			true, NULL), -ETIMEDOUT);
+ 	KUNIT_EXPECT_EQ(test, st->n_send, 1);
+ 	KUNIT_EXPECT_LT(test, jiffies - start, HZ / 2);
+ 	clear_bit(MT76_MCU_RESET, &dev->phy.state);
+@@ -722,6 +746,7 @@ static struct kunit_case mt76_mcu_test_cases[] = {
+ 	KUNIT_CASE(mt76_mcu_test_parse_error),
+ 	KUNIT_CASE(mt76_mcu_test_retry_then_timeout),
+ 	KUNIT_CASE(mt76_mcu_test_retry_then_reply),
++	KUNIT_CASE(mt76_mcu_test_no_retry_state),
+ 	KUNIT_CASE(mt76_mcu_test_no_retry_in_reset),
+ 	KUNIT_CASE(mt76_mcu_test_prepare_error),
+ 	KUNIT_CASE(mt76_mcu_test_send_error),

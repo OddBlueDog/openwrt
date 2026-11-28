@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 17:44:43 +0000
+Subject: [PATCH] wifi: mt76: tests: HT/VHT LDPC and SM power save bits, BF
+ columns at 160 MHz
+
+mt7915_test_sta_ht_vht() passes the interface now, and checks that the
+LDPC bit leaves each word where the interface has no LDPC for that mode,
+and that the SM power save bits are the peer's current mode. The HE and
+VHT beamformer tests get a 160 MHz peer with more streams than rows: no
+more columns than rows.
+---
+ mt7915/tests/mcu-test.c | 91 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 81 insertions(+), 10 deletions(-)
+
+diff --git a/mt7915/tests/mcu-test.c b/mt7915/tests/mcu-test.c
+index eb814157..76622e30 100644
+--- a/mt7915/tests/mcu-test.c
++++ b/mt7915/tests/mcu-test.c
+@@ -3282,36 +3282,82 @@ static void mt7915_test_mcu_set_muru_dl_ul(struct kunit *test)
+ }
+ 
+ /* HT and VHT TLVs carry the station's capabilities, and are left out
+- * without them.
++ * without them. LDPC goes where the interface has none for that mode, and
++ * the SM power save bits are the peer's current mode, not the ones it
++ * associated with: the firmware takes the peer's stream limit from them.
+  */
+ static void mt7915_test_sta_ht_vht(struct kunit *test)
+ {
++	static const struct {
++		enum ieee80211_smps_mode smps;
++		u16 sm_ps;
++	} modes[] = {
++		{ IEEE80211_SMPS_AUTOMATIC, WLAN_HT_CAP_SM_PS_DISABLED },
++		{ IEEE80211_SMPS_OFF, WLAN_HT_CAP_SM_PS_DISABLED },
++		{ IEEE80211_SMPS_STATIC, WLAN_HT_CAP_SM_PS_STATIC },
++		{ IEEE80211_SMPS_DYNAMIC, WLAN_HT_CAP_SM_PS_DYNAMIC },
++	};
+ 	struct mt7915_test_ctx c;
+ 	struct sta_rec_vht *vht;
+ 	struct sta_rec_ht *ht;
+ 	struct sk_buff *skb;
++	u16 ht_cap;
++	int i;
+ 
+ 	mt7915_test_init(test, &c, NL80211_BAND_5GHZ, NL80211_IFTYPE_AP);
+ 	skb = mt7915_test_sta_req(test, &c, &c.msta->wcid);
+-	mt7915_mcu_sta_ht_tlv(skb, c.sta);
+-	mt7915_mcu_sta_vht_tlv(skb, c.sta);
++	mt7915_mcu_sta_ht_tlv(skb, c.vif, c.sta);
++	mt7915_mcu_sta_vht_tlv(skb, c.vif, c.sta);
+ 	KUNIT_EXPECT_EQ(test, mt7915_test_ntlv(test, skb->data, skb->len), 0);
+ 
+ 	mt7915_test_ht(c.sta);
+ 	mt7915_test_vht(c.sta);
++	c.mvif->cap.ht_ldpc = true;
++	c.mvif->cap.vht_ldpc = true;
++	ht_cap = c.sta->deflink.ht_cap.cap & ~IEEE80211_HT_CAP_SM_PS;
++	for (i = 0; i < ARRAY_SIZE(modes); i++) {
++		c.sta->deflink.smps_mode = modes[i].smps;
++		skb = mt7915_test_sta_req(test, &c, &c.msta->wcid);
++		mt7915_mcu_sta_ht_tlv(skb, c.vif, c.sta);
++		mt7915_mcu_sta_vht_tlv(skb, c.vif, c.sta);
++		ht = mt7915_test_skb_tlv(test, skb, STA_REC_HT,
++					 struct sta_rec_ht);
++		KUNIT_ASSERT_NOT_NULL(test, ht);
++		KUNIT_EXPECT_EQ(test, le16_to_cpu(ht->ht_cap),
++				ht_cap | (modes[i].sm_ps <<
++					  IEEE80211_HT_CAP_SM_PS_SHIFT));
++		vht = mt7915_test_skb_tlv(test, skb, STA_REC_VHT,
++					  struct sta_rec_vht);
++		KUNIT_ASSERT_NOT_NULL(test, vht);
++		KUNIT_EXPECT_EQ(test, le32_to_cpu(vht->vht_cap),
++				c.sta->deflink.vht_cap.cap);
++		KUNIT_EXPECT_EQ(test, le16_to_cpu(vht->vht_rx_mcs_map), 0xfffa);
++		KUNIT_EXPECT_EQ(test, le16_to_cpu(vht->vht_tx_mcs_map), 0xfff5);
++	}
++	/* the peer's own bits are left as they were */
++	KUNIT_EXPECT_EQ(test, c.sta->deflink.ht_cap.cap & IEEE80211_HT_CAP_SM_PS,
++			0);
++
++	/* no LDPC on the interface: none in either word */
++	c.mvif->cap.ht_ldpc = false;
++	c.mvif->cap.vht_ldpc = false;
++	c.sta->deflink.smps_mode = IEEE80211_SMPS_OFF;
+ 	skb = mt7915_test_sta_req(test, &c, &c.msta->wcid);
+-	mt7915_mcu_sta_ht_tlv(skb, c.sta);
+-	mt7915_mcu_sta_vht_tlv(skb, c.sta);
++	mt7915_mcu_sta_ht_tlv(skb, c.vif, c.sta);
++	mt7915_mcu_sta_vht_tlv(skb, c.vif, c.sta);
+ 	ht = mt7915_test_skb_tlv(test, skb, STA_REC_HT, struct sta_rec_ht);
+ 	KUNIT_ASSERT_NOT_NULL(test, ht);
+-	KUNIT_EXPECT_EQ(test, le16_to_cpu(ht->ht_cap),
+-			c.sta->deflink.ht_cap.cap);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(ht->ht_cap) &
++			IEEE80211_HT_CAP_LDPC_CODING, 0);
++	KUNIT_EXPECT_EQ(test, le16_to_cpu(ht->ht_cap) &
++			~IEEE80211_HT_CAP_LDPC_CODING,
++			(ht_cap & ~IEEE80211_HT_CAP_LDPC_CODING) |
++			(WLAN_HT_CAP_SM_PS_DISABLED <<
++			 IEEE80211_HT_CAP_SM_PS_SHIFT));
+ 	vht = mt7915_test_skb_tlv(test, skb, STA_REC_VHT, struct sta_rec_vht);
+ 	KUNIT_ASSERT_NOT_NULL(test, vht);
+ 	KUNIT_EXPECT_EQ(test, le32_to_cpu(vht->vht_cap),
+-			c.sta->deflink.vht_cap.cap);
+-	KUNIT_EXPECT_EQ(test, le16_to_cpu(vht->vht_rx_mcs_map), 0xfffa);
+-	KUNIT_EXPECT_EQ(test, le16_to_cpu(vht->vht_tx_mcs_map), 0xfff5);
++			c.sta->deflink.vht_cap.cap & ~IEEE80211_VHT_CAP_RXLDPC);
+ }
+ 
+ /* Hardware A-MSDU for AP and station peers that take A-MSDUs: 8 subframes
+@@ -3774,6 +3820,20 @@ static void mt7915_test_bfer_he(struct kunit *test)
+ 	KUNIT_ASSERT_NOT_NULL(test, bf);
+ 	KUNIT_EXPECT_EQ(test, bf->ncol_gt_bw80, 2);
+ 
++	/* fewer STS above 80 MHz than streams: no more columns than rows,
++	 * which the firmware would refuse (no profile at all)
++	 */
++	pe->phy_cap_info[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
++		u8_encode_bits(5, IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_MASK) |
++		u8_encode_bits(1, IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_MASK);
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->nrow_gt_bw80, 1);
++	KUNIT_EXPECT_EQ(test, bf->ncol_gt_bw80, 1);
++	pe->phy_cap_info[4] = IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE |
++		u8_encode_bits(5, IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_UNDER_80MHZ_MASK) |
++		u8_encode_bits(2, IEEE80211_HE_PHY_CAP4_BEAMFORMEE_MAX_STS_ABOVE_80MHZ_MASK);
++
+ 	pe->phy_cap_info[0] =
+ 		IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G;
+ 	bf = mt7915_test_bf_tlv(test, &c);
+@@ -3816,6 +3876,17 @@ static void mt7915_test_bfer_vht(struct kunit *test)
+ 	bf = mt7915_test_bf_tlv(test, &c);
+ 	KUNIT_ASSERT_NOT_NULL(test, bf);
+ 	KUNIT_EXPECT_EQ(test, bf->nrow, 1);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 1);
++
++	/* three streams at 160 MHz: no more columns than that one row */
++	c.sta->deflink.rx_nss = 3;
++	c.sta->deflink.vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(0xffea);
++	bf = mt7915_test_bf_tlv(test, &c);
++	KUNIT_ASSERT_NOT_NULL(test, bf);
++	KUNIT_EXPECT_EQ(test, bf->nrow, 1);
++	KUNIT_EXPECT_EQ(test, bf->ncol, 1);
++	c.sta->deflink.vht_cap.vht_mcs.rx_mcs_map = cpu_to_le16(0xfffa);
++	c.sta->deflink.rx_nss = 2;
+ 
+ 	/* rows limited by the station's STS, then by our antennas */
+ 	c.sta->deflink.bandwidth = IEEE80211_STA_RX_BW_80;

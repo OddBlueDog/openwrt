@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Wed, 25 Nov 2026 18:36:11 +0100
+Subject: [PATCH] wifi: mt76: mt7915: mask the LDPC bits of STA_REC_HT and
+ STA_REC_VHT
+
+mt7915_mcu_sta_ht_tlv() and mt7915_mcu_sta_vht_tlv() send the HT and
+VHT capability words of the peer unchanged. The firmware picks LDPC for
+a TX rate from these words. Only STA_REC_RA masks them with the LDPC
+capability of the interface. Since commit 33eb14f10290 ("wifi: mt76:
+mt7915: use mac80211 .sta_state op"), the update at authorisation sends
+these TLVs again without STA_REC_RA. An AP configured without LDPC thus
+sends LDPC frames to an LDPC peer.
+
+Clear the LDPC bit of each word where the interface has no LDPC for that
+mode. The rate control and HE TLVs already do so.
+
+Fixes: 33eb14f10290 ("wifi: mt76: mt7915: use mac80211 .sta_state op")
+Link: https://patch.msgid.link/20261125173616.3776951-13-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 67cceaade0caac883ee60463710802ca325dd42c)
+---
+ mt7915/mcu.c | 24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 09527467..f057e468 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -1376,33 +1376,45 @@ mt7915_mcu_sta_muru_tlv(struct mt7915_dev *dev, struct sk_buff *skb,
+ }
+ 
+ static void
+-mt7915_mcu_sta_ht_tlv(struct sk_buff *skb, struct ieee80211_sta *sta)
++mt7915_mcu_sta_ht_tlv(struct sk_buff *skb, struct ieee80211_vif *vif,
++		      struct ieee80211_sta *sta)
+ {
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	u16 cap = sta->deflink.ht_cap.cap;
+ 	struct sta_rec_ht *ht;
+ 	struct tlv *tlv;
+ 
+ 	if (!sta->deflink.ht_cap.ht_supported)
+ 		return;
+ 
++	if (!mvif->cap.ht_ldpc)
++		cap &= ~IEEE80211_HT_CAP_LDPC_CODING;
++
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_HT, sizeof(*ht));
+ 
+ 	ht = (struct sta_rec_ht *)tlv;
+-	ht->ht_cap = cpu_to_le16(sta->deflink.ht_cap.cap);
++	ht->ht_cap = cpu_to_le16(cap);
+ }
+ 
+ static void
+-mt7915_mcu_sta_vht_tlv(struct sk_buff *skb, struct ieee80211_sta *sta)
++mt7915_mcu_sta_vht_tlv(struct sk_buff *skb, struct ieee80211_vif *vif,
++		       struct ieee80211_sta *sta)
+ {
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	u32 cap = sta->deflink.vht_cap.cap;
+ 	struct sta_rec_vht *vht;
+ 	struct tlv *tlv;
+ 
+ 	if (!sta->deflink.vht_cap.vht_supported)
+ 		return;
+ 
++	if (!mvif->cap.vht_ldpc)
++		cap &= ~IEEE80211_VHT_CAP_RXLDPC;
++
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_VHT, sizeof(*vht));
+ 
+ 	vht = (struct sta_rec_vht *)tlv;
+-	vht->vht_cap = cpu_to_le32(sta->deflink.vht_cap.cap);
++	vht->vht_cap = cpu_to_le32(cap);
+ 	vht->vht_rx_mcs_map = sta->deflink.vht_cap.vht_mcs.rx_mcs_map;
+ 	vht->vht_tx_mcs_map = sta->deflink.vht_cap.vht_mcs.tx_mcs_map;
+ }
+@@ -2164,9 +2176,9 @@ int __mt7915_mcu_add_sta(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 		/* starec bfer */
+ 		mt7915_mcu_sta_bfer_tlv(dev, skb, vif, sta);
+ 		/* starec ht */
+-		mt7915_mcu_sta_ht_tlv(skb, sta);
++		mt7915_mcu_sta_ht_tlv(skb, vif, sta);
+ 		/* starec vht */
+-		mt7915_mcu_sta_vht_tlv(skb, sta);
++		mt7915_mcu_sta_vht_tlv(skb, vif, sta);
+ 		/* starec uapsd */
+ 		mt76_connac_mcu_sta_uapsd(skb, vif, sta);
+ 	}

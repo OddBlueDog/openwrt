@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Wed, 25 Nov 2026 18:36:00 +0100
+Subject: [PATCH] wifi: mt76: mt7915: hold the rate update of a station in
+ power save
+
+At each STA_REC_RA the firmware clears every stop reason of the TX
+queue of the wlan index. It also clears the power save reason, and it
+stops the queue again only at the next enter. mt7915_mac_sta_rc_work()
+sends STA_REC_RA for a sleeping station too, so its frames go out while
+it sleeps and are lost. Reachable via a channel width change, an
+Operating Mode Notification and mt7915_set_bitrate_mask().
+
+Keep the update of a station in power save in the work. Send it when
+the PS state clears: at the leave, a TWT add or an L1 recovery. An
+SMPS change of a sleeping station waits too.
+
+While the update waits, PS-Poll and U-APSD deliveries use the old rate
+state. Whether the hardware limits the width to the channel is not
+read. A fixed rate from user space reaches a sleeping station at its
+wake. An enter that the host did not see before the send can still
+restart the queue once.
+
+Fixes: e57b7901469f ("mt76: add mac80211 driver for MT7915 PCIe-based chipsets")
+Link: https://patch.msgid.link/20261125173616.3776951-2-nbd@nbd.name
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+[adapted to the fork's power save record: the work keeps the update of a
+ station the firmware reports dozing without a TWT agreement
+ (msta->ps.dozing), as the fork sets MT_WCID_FLAG_PS only while it holds
+ a station's frames; mt7915_mac_sta_rc_release() queues it again from
+ the PS sync event's wake, mt7915_mcu_sta_ps_update() and
+ mt7915_mcu_sta_ps_wake(), and not for a station the firmware doesn't
+ have again yet after a full reset; with a KUnit test]
+(cherry picked from commit 5b32ba1479a4e1c4838db58a21b4ab007040caf7)
+---
+ mt7915/mac.c            | 36 ++++++++++++++++++++
+ mt7915/mcu.c            |  8 +++++
+ mt7915/mt7915.h         | 19 +++++++++--
+ mt7915/tests/mac-test.c | 74 +++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 135 insertions(+), 2 deletions(-)
+
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 28f5a47f..798eecd1 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2340,6 +2340,13 @@ void mt7915_mac_sta_rc_work(struct work_struct *work)
+ 	while (!list_empty(&list)) {
+ 		msta = list_first_entry(&list, struct mt7915_sta, rc_list);
+ 		list_del_init(&msta->rc_list);
++
++		/* kept, with its changes, until it wakes:
++		 * mt7915_mac_sta_rc_release()
++		 */
++		if (mt7915_sta_rc_held(msta))
++			continue;
++
+ 		changed = msta->changed;
+ 		msta->changed = 0;
+ 		spin_unlock_bh(&dev->mt76.sta_poll_lock);
+@@ -2364,6 +2371,35 @@ void mt7915_mac_sta_rc_work(struct work_struct *work)
+ 	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
++/* A rate update that mt7915_mac_sta_rc_work() kept for a dozing station goes
++ * now, as it is awake again (or has a TWT agreement). Called after the PS
++ * record has changed, not under its lock: the work reads the record under
++ * sta_poll_lock, so it either sees the change or leaves the station off the
++ * list for this to put back.
++ */
++void mt7915_mac_sta_rc_release(struct mt7915_dev *dev, struct mt7915_sta *msta)
++{
++	bool queue;
++
++	if (mt7915_sta_rc_held(msta))
++		return;
++
++	/* Not for a station the firmware doesn't have: after a full reset,
++	 * until mac80211 adds it again (mt7915_mac_sta_add() starts its list
++	 * entry afresh, which must not be on the list then), as
++	 * mt7915_sta_rc_update().
++	 */
++	spin_lock_bh(&dev->mt76.sta_poll_lock);
++	queue = msta->wcid.sta && msta->changed &&
++		list_empty(&msta->rc_list);
++	if (queue)
++		list_add_tail(&msta->rc_list, &dev->sta_rc_list);
++	spin_unlock_bh(&dev->mt76.sta_poll_lock);
++
++	if (queue)
++		ieee80211_queue_work(msta->vif->phy->mt76->hw, &dev->rc_work);
++}
++
+ void mt7915_mac_work(struct work_struct *work)
+ {
+ 	struct mt7915_phy *phy;
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index e2b47a52..2521c1fe 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -684,6 +684,9 @@ static void mt7915_mcu_sta_ps_set(struct mt7915_dev *dev,
+ 	mt76_sta_ps_transition(&dev->mt76, &msta->wcid,
+ 			       mt7915_mcu_sta_ps_hold(msta, dozing));
+ 	spin_unlock_bh(&msta->ps.lock);
++
++	if (!dozing)
++		mt7915_mac_sta_rc_release(dev, msta);
+ }
+ 
+ void mt7915_mcu_sta_ps_record(struct mt7915_sta *msta, bool dozing)
+@@ -701,6 +704,8 @@ void mt7915_mcu_sta_ps_wake(struct mt7915_dev *dev, struct mt7915_sta *msta)
+ 	if (test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags))
+ 		mt76_sta_ps_transition(&dev->mt76, &msta->wcid, false);
+ 	spin_unlock_bh(&msta->ps.lock);
++
++	mt7915_mac_sta_rc_release(dev, msta);
+ }
+ 
+ static void
+@@ -743,6 +748,9 @@ void mt7915_mcu_sta_ps_update(struct mt7915_dev *dev, struct mt7915_sta *msta)
+ 	if (hold != test_bit(MT_WCID_FLAG_PS, &msta->wcid.flags))
+ 		mt76_sta_ps_transition(&dev->mt76, &msta->wcid, hold);
+ 	spin_unlock_bh(&msta->ps.lock);
++
++	/* an agreement that began lets a kept rate update go */
++	mt7915_mac_sta_rc_release(dev, msta);
+ }
+ 
+ static void
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index d4e7a2e6..efcfee8d 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -206,8 +206,9 @@ struct mt7915_sta {
+ 		struct mt7915_twt_flow flow[MT7915_MAX_STA_TWT_AGRT];
+ 	} twt;
+ 
+-	/* power save as the firmware reports it, for debugfs (tx doesn't
+-	 * look at it): set by the PS sync events, read by the "ps" file
++	/* power save as the firmware reports it: set by the PS sync events,
++	 * read by the "ps" file and the rate control work (tx doesn't look
++	 * at it)
+ 	 */
+ 	struct {
+ 		spinlock_t lock;
+@@ -219,6 +220,19 @@ struct mt7915_sta {
+ 	} ps;
+ };
+ 
++/*
++ * At each STA_REC_RA the firmware clears every reason it has stopped a
++ * station's TX queue for, power save among them, and stops it again only at
++ * the station's next doze: an update sent while the station dozes lets the
++ * frames the firmware holds for it go out unheard. The rate control work
++ * keeps it until the station wakes. A station with a TWT agreement isn't
++ * kept: the firmware reports it dozing outside its wake periods.
++ */
++static inline bool mt7915_sta_rc_held(struct mt7915_sta *msta)
++{
++	return READ_ONCE(msta->ps.dozing) && !READ_ONCE(msta->twt.flowid_mask);
++}
++
+ struct mt7915_vif_cap {
+ 	bool ht_ldpc:1;
+ 	bool vht_ldpc:1;
+@@ -823,6 +837,7 @@ void mt7915_mac_work(struct work_struct *work);
+ void mt7915_mac_reset_work(struct work_struct *work);
+ void mt7915_mac_dump_work(struct work_struct *work);
+ void mt7915_mac_sta_rc_work(struct work_struct *work);
++void mt7915_mac_sta_rc_release(struct mt7915_dev *dev, struct mt7915_sta *msta);
+ void mt7915_mac_update_stats(struct mt7915_phy *phy);
+ void mt7915_mac_twt_teardown_flow(struct mt7915_dev *dev,
+ 				  struct mt7915_sta *msta,
+diff --git a/mt7915/tests/mac-test.c b/mt7915/tests/mac-test.c
+index 2a6d05bb..f2e56914 100644
+--- a/mt7915/tests/mac-test.c
++++ b/mt7915/tests/mac-test.c
+@@ -6654,6 +6654,79 @@ static void mt7915_test_ps_release_clears_dozing(struct kunit *test)
+ 	cancel_delayed_work_sync(&dev->mphy.mac_work);
+ }
+ 
++/* A dozing station's rate update waits for its wake: the firmware's
++ * STA_REC_RA would let the frames it holds for the station go out unheard.
++ * The wake sends it once; so does an agreement beginning; a station still
++ * dozing, with nothing changed, or not in the firmware, gets nothing.
++ */
++static void mt7915_test_sta_rc_work_dozing(struct kunit *test)
++{
++	struct mt7915_test_env *env = mt7915_test_hw_env(test);
++	struct mt7915_dev *dev = env->dev;
++	struct mt76_test_fake *fake = mt76_test_fake;
++	struct mt7915_vif *mvif = mt7915_test_vif(test, dev, 1);
++	struct mt7915_sta *msta = mt7915_test_sta(test, dev, 9, mvif);
++	struct cfg80211_bitrate_mask *mask = &mvif->bitrate_mask;
++	int cmd = MCU_EXT_CMD(STA_REC_UPDATE);
++	int sent;
++
++	cancel_delayed_work_sync(&dev->mphy.mac_work);
++	mask->control[NL80211_BAND_5GHZ].legacy = GENMASK(7, 0);
++	mask->control[NL80211_BAND_5GHZ].he_gi = GENMASK(7, 0);
++	mask->control[NL80211_BAND_5GHZ].he_ltf = GENMASK(7, 0);
++	mt7915_test_to_sta(msta)->deflink.supp_rates[NL80211_BAND_5GHZ] = 0xff;
++	sent = mt76_test_count_msgs(fake, cmd);
++
++	mt7915_mcu_sta_ps_record(msta, true);
++	msta->changed = IEEE80211_RC_BW_CHANGED;
++	list_add_tail(&msta->rc_list, &dev->sta_rc_list);
++	mt7915_mac_sta_rc_work(&dev->rc_work);
++
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, cmd), sent);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->sta_rc_list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&msta->rc_list));
++	KUNIT_EXPECT_EQ(test, msta->changed, IEEE80211_RC_BW_CHANGED);
++
++	/* still dozing: stays kept */
++	mt7915_mac_sta_rc_release(dev, msta);
++	KUNIT_EXPECT_TRUE(test, list_empty(&msta->rc_list));
++
++	/* awake (here by an L1 SER's release): sent, once */
++	mt7915_mcu_sta_ps_wake(dev, msta);
++	flush_work(&dev->rc_work);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, cmd), sent + 1);
++	KUNIT_EXPECT_EQ(test, msta->changed, 0);
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->sta_rc_list));
++	mt7915_mac_sta_rc_release(dev, msta);
++	flush_work(&dev->rc_work);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, cmd), sent + 1);
++
++	/* dozing again, then an agreement begins: sent */
++	mt7915_mcu_sta_ps_record(msta, true);
++	msta->changed = IEEE80211_RC_NSS_CHANGED;
++	list_add_tail(&msta->rc_list, &dev->sta_rc_list);
++	mt7915_mac_sta_rc_work(&dev->rc_work);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, cmd), sent + 1);
++	msta->twt.flowid_mask = BIT(0);
++	mt7915_mcu_sta_ps_update(dev, msta);
++	flush_work(&dev->rc_work);
++	KUNIT_EXPECT_EQ(test, mt76_test_count_msgs(fake, cmd), sent + 2);
++	KUNIT_EXPECT_EQ(test, msta->changed, 0);
++	msta->twt.flowid_mask = 0;
++
++	/* a station the firmware doesn't have (after a full reset, before
++	 * mac80211 adds it again) isn't put on the list, awake or not
++	 */
++	msta->wcid.sta = 0;
++	mt7915_mcu_sta_ps_record(msta, false);
++	msta->changed = IEEE80211_RC_BW_CHANGED;
++	mt7915_mac_sta_rc_release(dev, msta);
++	KUNIT_EXPECT_TRUE(test, list_empty(&msta->rc_list));
++	KUNIT_EXPECT_TRUE(test, list_empty(&dev->sta_rc_list));
++	msta->changed = 0;
++	msta->wcid.sta = 1;
++}
++
+ /* Full reset restarts the firmware and wipes VIF slots, so the per-phy
+  * spatial reuse shadow state (spr_vifs, spr_dpd_off, spr_forced_off) must
+  * be cleared on both bands while keeping the configured spr_mode.
+@@ -7111,6 +7184,7 @@ static struct kunit_case mt7915_mac_hw_test_cases[] = {
+ 	KUNIT_CASE(mt7915_test_full_reset),
+ 	KUNIT_CASE(mt7915_test_full_reset_wa),
+ 	KUNIT_CASE(mt7915_test_ps_release_clears_dozing),
++	KUNIT_CASE(mt7915_test_sta_rc_work_dozing),
+ 	KUNIT_CASE(mt7915_test_full_reset_clears_spr),
+ 	{}
+ };
