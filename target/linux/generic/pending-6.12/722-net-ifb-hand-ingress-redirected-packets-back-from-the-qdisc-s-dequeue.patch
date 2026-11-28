@@ -1,0 +1,554 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 11:10:00 +0000
+Subject: [PATCH] net: ifb: hand ingress-redirected packets back from the
+ qdisc's dequeue, under a switch
+
+ifb hands everything its qdisc sends back to the receive path from a
+tasklet: ifb_xmit() queues the packet on its queue's rq and schedules the
+tasklet, which takes the tx lock to move rq over, hands each packet back
+to its device (the netfilter ingress hook, the flowtable, forwarding) and
+takes the lock again to finish. Under Smart Queue's download shaping
+that is a TASKLET_SOFTIRQ round, two tx lock round trips and a cold
+packet for every GRO batch CAKE lets through.
+
+direct_xmit (module parameter, off by default, as before; writable at
+runtime) hands a packet tc's ingress redirected back from ifb_xmit()
+itself, where the qdisc's dequeue sends it, with the queue's tx lock
+held as sch_direct_xmit() holds it, when:
+- no tasklet run is pending: nothing is queued ahead of the packet and
+  the tasklet isn't using the queue (it clears tasklet_pending under that
+  lock, with both its lists empty), so packets stay in the order the
+  qdisc sent them;
+- the queue's qdisc can't send a packet straight past its queue
+  (TCQ_F_CAN_BYPASS: fq_codel, pfifo...; CAKE never does), whose bypass
+  may hold the qdisc's busylock across the send: a packet sent on from
+  here that came back to the same qdisc would wait on it for ever;
+- this CPU isn't already inside a direct hand-back: what one ifb hands
+  back that reaches another ifb takes that one's tasklet, so the stack
+  grows by one receive path at most.
+Anything else, and egress redirects, take the tasklet as before. The
+hand-back itself is the tasklet's, moved into ifb_deliver(), so both
+ways do the same.
+
+ifb gets its own lock classes (netdev_lockdep_set_classes(), as a
+bridge's or a VLAN's), else lockdep reads the next device's tx lock (and
+its qdisc's busylock) taken inside ifb's as one lock taken twice.
+
+KUnit: eight cases, direct on and off, under a bypassing qdisc, a packet
+behind one queued for the tasklet (both handed back in order), nested,
+an egress redirect, a device that is gone, not redirected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ifb.c      | 115 ++++++++++++----
+ drivers/net/ifb_test.c | 304 ++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 391 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/ifb.c b/drivers/net/ifb.c
+index 75c9400..0fe916f 100644
+--- a/drivers/net/ifb.c
++++ b/drivers/net/ifb.c
+@@ -38,6 +38,25 @@
+ 
+ #define TX_Q_LIMIT    32
+ 
++/* What ifb's qdisc sends goes back to the receive path from a tasklet, one
++ * softirq later, as upstream. With direct_xmit, a packet tc's ingress
++ * redirected (Smart Queue's download shaping) is handed back from
++ * ifb_xmit() itself, where the qdisc's dequeue sends it, when nothing is
++ * queued for the tasklet ahead of it: one tasklet round per batch fewer,
++ * the packet still warm when the flowtable or forwarding takes it. Not
++ * under a qdisc that may send a packet straight past its queue
++ * (TCQ_F_CAN_BYPASS: fq_codel, pfifo...; CAKE never does): that bypass can
++ * hold the qdisc's busylock across the send, and a packet sent on from here
++ * that came back to the same qdisc would wait on it for ever. One level deep
++ * per CPU: what an ifb hands back that reaches another ifb takes that one's
++ * tasklet. Writable at runtime; off by default.
++ */
++static bool direct_xmit;
++module_param(direct_xmit, bool, 0644);
++MODULE_PARM_DESC(direct_xmit, "Hand ingress-redirected packets back from the qdisc's dequeue rather than from a tasklet, under a qdisc without bypass (CAKE)");
++
++static DEFINE_PER_CPU(bool, ifb_in_direct);
++
+ struct ifb_q_stats {
+ 	u64 packets;
+ 	u64 bytes;
+@@ -107,6 +126,43 @@ static int ifb_nf_ingress(struct sk_buff *skb)
+ 	return ret;
+ }
+ 
++/* Hands one packet back to the device it came in on (from_ingress) or
++ * sends it out of the one it was leaving by. False: that device is gone, the
++ * packet freed.
++ */
++static bool ifb_deliver(struct ifb_q_private *txp, struct sk_buff *skb)
++{
++	/* Skip tc and netfilter to prevent redirection loop. */
++	skb->redirected = 0;
++#ifdef CONFIG_NET_CLS_ACT
++	skb->tc_skip_classify = 1;
++#endif
++	nf_skip_egress(skb, true);
++
++	ifb_update_q_stats(&txp->tx_stats, skb->len);
++
++	rcu_read_lock();
++	skb->dev = dev_get_by_index_rcu(dev_net(txp->dev), skb->skb_iif);
++	if (!skb->dev) {
++		rcu_read_unlock();
++		dev_kfree_skb(skb);
++		txp->dev->stats.tx_dropped++;
++		return false;
++	}
++	rcu_read_unlock();
++	skb->skb_iif = txp->dev->ifindex;
++
++	if (!skb->from_ingress) {
++		dev_queue_xmit(skb);
++	} else {
++		skb_pull_rcsum(skb, skb->mac_len);
++		if (ifb_nf_ingress(skb) < 0)
++			return true;
++		netif_receive_skb(skb);
++	}
++	return true;
++}
++
+ static void ifb_ri_tasklet(struct tasklet_struct *t)
+ {
+ 	struct ifb_q_private *txp = from_tasklet(txp, t, ifb_tasklet);
+@@ -123,36 +179,11 @@ static void ifb_ri_tasklet(struct tasklet_struct *t)
+ 	}
+ 
+ 	while ((skb = __skb_dequeue(&txp->tq)) != NULL) {
+-		/* Skip tc and netfilter to prevent redirection loop. */
+-		skb->redirected = 0;
+-#ifdef CONFIG_NET_CLS_ACT
+-		skb->tc_skip_classify = 1;
+-#endif
+-		nf_skip_egress(skb, true);
+-
+-		ifb_update_q_stats(&txp->tx_stats, skb->len);
+-
+-		rcu_read_lock();
+-		skb->dev = dev_get_by_index_rcu(dev_net(txp->dev), skb->skb_iif);
+-		if (!skb->dev) {
+-			rcu_read_unlock();
+-			dev_kfree_skb(skb);
+-			txp->dev->stats.tx_dropped++;
++		if (!ifb_deliver(txp, skb)) {
+ 			if (skb_queue_len(&txp->tq) != 0)
+ 				goto resched;
+ 			break;
+ 		}
+-		rcu_read_unlock();
+-		skb->skb_iif = txp->dev->ifindex;
+-
+-		if (!skb->from_ingress) {
+-			dev_queue_xmit(skb);
+-		} else {
+-			skb_pull_rcsum(skb, skb->mac_len);
+-			if (ifb_nf_ingress(skb) < 0)
+-				continue;
+-			netif_receive_skb(skb);
+-		}
+ 	}
+ 
+ 	if (__netif_tx_trylock(txq)) {
+@@ -214,6 +245,12 @@ static int ifb_dev_init(struct net_device *dev)
+ 	if (!txp)
+ 		return -ENOMEM;
+ 	dp->tx_private = txp;
++	/* ifb's own lock classes, as a bridge's or a VLAN's: what direct_xmit
++	 * hands back is sent on with ifb's tx lock held, and lockdep would
++	 * otherwise take the next device's tx lock (and its qdisc's busylock)
++	 * for the same lock taken twice
++	 */
++	netdev_lockdep_set_classes(dev);
+ 	for (i = 0; i < dev->num_tx_queues; i++,txp++) {
+ 		txp->txqnum = i;
+ 		txp->dev = dev;
+@@ -364,6 +401,25 @@ static void ifb_setup(struct net_device *dev)
+ 	dev->max_mtu = 0;
+ }
+ 
++/* direct_xmit's conditions, with the queue's tx lock held (as
++ * sch_direct_xmit() holds it around ifb_xmit()): no tasklet run pending, so
++ * nothing queued ahead of this packet and the tasklet not using the queue
++ * (it clears tasklet_pending under the same lock, with both its lists
++ * empty)
++ */
++static bool ifb_direct_ok(struct ifb_q_private *txp, const struct sk_buff *skb)
++{
++	struct netdev_queue *txq;
++	const struct Qdisc *q;
++
++	if (!READ_ONCE(direct_xmit) || !skb->from_ingress ||
++	    txp->tasklet_pending || __this_cpu_read(ifb_in_direct))
++		return false;
++	txq = netdev_get_tx_queue(txp->dev, txp->txqnum);
++	q = rcu_dereference_bh(txq->qdisc);
++	return q && !(q->flags & TCQ_F_CAN_BYPASS);
++}
++
+ static netdev_tx_t ifb_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct ifb_dev_private *dp = netdev_priv(dev);
+@@ -377,6 +433,13 @@ static netdev_tx_t ifb_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		return NETDEV_TX_OK;
+ 	}
+ 
++	if (ifb_direct_ok(txp, skb)) {
++		__this_cpu_write(ifb_in_direct, true);
++		ifb_deliver(txp, skb);
++		__this_cpu_write(ifb_in_direct, false);
++		return NETDEV_TX_OK;
++	}
++
+ 	if (skb_queue_len(&txp->rq) >= dev->tx_queue_len)
+ 		netif_tx_stop_queue(netdev_get_tx_queue(dev, txp->txqnum));
+ 
+diff --git a/drivers/net/ifb_test.c b/drivers/net/ifb_test.c
+index 0a532e5..81c39e8 100644
+--- a/drivers/net/ifb_test.c
++++ b/drivers/net/ifb_test.c
+@@ -1,7 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ /* KUnit tests for the netfilter ingress hook ifb runs on what it hands back
+- * to the receive path, and for the fraglist GRO batches it passes whole. Built into ifb.ko (#included at the end of ifb.c)
+- * when CONFIG_IFB_KUNIT_TEST is set; the suite runs when it loads.
++ * to the receive path, for the fraglist GRO batches it passes whole, and for
++ * direct_xmit's hand-back from the qdisc's dequeue. Built into ifb.ko
++ * (#included at the end of ifb.c) when CONFIG_IFB_KUNIT_TEST is set; the
++ * suite runs when it loads.
+  */
+ #include <kunit/test.h>
+ #include <linux/ip.h>
+@@ -19,6 +21,7 @@ struct ifb_test_hook {
+ 	struct nf_hook_ops ops;
+ 	unsigned int verdict;
+ 	int seen;
++	u32 order[4];
+ 	const struct net_device *in;
+ 	int network_offset;
+ };
+@@ -31,6 +34,8 @@ static unsigned int ifb_test_hookfn(void *priv, struct sk_buff *skb,
+ 	if (skb->mark != IFB_TEST_MARK)
+ 		return NF_ACCEPT;
+ 
++	if (h->seen < ARRAY_SIZE(h->order))
++		h->order[h->seen] = skb->priority;
+ 	h->seen++;
+ 	h->in = state->in;
+ 	h->network_offset = skb_network_offset(skb);
+@@ -305,6 +310,293 @@ static void ifb_test_fraglist_split_v6(struct kunit *test)
+ 	ifb_test_fraglist_split(test, true);
+ }
+ 
++/* direct_xmit as the test sets it, put back afterwards */
++static bool ifb_test_saved_direct;
++
++static void ifb_test_restore_direct(void *unused)
++{
++	WRITE_ONCE(direct_xmit, ifb_test_saved_direct);
++}
++
++static void ifb_test_set_direct(struct kunit *test, bool on)
++{
++	ifb_test_saved_direct = READ_ONCE(direct_xmit);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, ifb_test_restore_direct, NULL));
++	WRITE_ONCE(direct_xmit, on);
++}
++
++static void ifb_test_dev_free(void *p)
++{
++	struct net_device *dev = p;
++
++	/* kills the tasklet once a scheduled run is over, then purges */
++	ifb_dev_free(dev);
++	free_netdev(dev);
++}
++
++/* An ifb device as ifb_dev_init() sets it up (not registered, one tx
++ * queue), that queue under a qdisc with @qflags (0: as CAKE)
++ */
++static struct net_device *ifb_test_dev(struct kunit *test, u32 qflags)
++{
++	struct net_device *dev;
++	struct Qdisc *q;
++	int err;
++
++	dev = alloc_netdev(sizeof(struct ifb_dev_private), "ifbtest%d",
++			   NET_NAME_UNKNOWN, ifb_setup);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	err = ifb_dev_init(dev);
++	if (err)
++		free_netdev(dev);
++	KUNIT_ASSERT_EQ(test, err, 0);
++	KUNIT_ASSERT_EQ(test, 0, kunit_add_action_or_reset(test, ifb_test_dev_free, dev));
++	q = kunit_kzalloc(test, sizeof(*q), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, q);
++	q->flags = qflags;
++	rcu_assign_pointer(netdev_get_tx_queue(dev, 0)->qdisc, q);
++	return dev;
++}
++
++static struct ifb_q_private *ifb_test_txp(struct net_device *dev)
++{
++	return ((struct ifb_dev_private *)netdev_priv(dev))->tx_private;
++}
++
++/* A packet as tc's mirred hands it to ifb: back at its MAC header,
++ * redirected, with the index of the device it came in on (from_ingress) or
++ * was leaving by
++ */
++static struct sk_buff *ifb_test_redirected(struct kunit *test, bool from_ingress,
++					   int iif, u32 id)
++{
++	struct sk_buff *skb = alloc_skb(128, GFP_KERNEL);
++	struct iphdr *iph;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	skb_reserve(skb, 32);
++	skb_reset_mac_header(skb);
++	skb_put_zero(skb, ETH_HLEN);
++	skb->mac_len = ETH_HLEN;
++	skb_set_network_header(skb, ETH_HLEN);
++	iph = skb_put_zero(skb, sizeof(*iph));
++	iph->version = 4;
++	iph->ihl = 5;
++	iph->ttl = 64;
++	iph->protocol = IPPROTO_UDP;
++	iph->tot_len = htons(sizeof(*iph));
++	skb->protocol = htons(ETH_P_IP);
++	skb->mark = IFB_TEST_MARK;
++	skb->priority = id;
++	skb->skb_iif = iif;
++	skb_set_redirected(skb, from_ingress);
++	return skb;
++}
++
++/* What the queue looked like when ifb_xmit() returned, before the tx lock
++ * and BH were let go (and with them, a tasklet just scheduled)
++ */
++struct ifb_test_after {
++	int seen;
++	u32 rq;
++	int pending;
++};
++
++/* ifb_xmit() as the qdisc's dequeue calls it: BH off, the queue's tx lock
++ * held (sch_direct_xmit()); @nested: from inside another ifb's direct_xmit
++ */
++static void ifb_test_xmit(struct kunit *test, struct net_device *dev, struct sk_buff *skb,
++			  const struct ifb_test_hook *h, bool nested,
++			  struct ifb_test_after *after)
++{
++	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
++	struct ifb_q_private *txp = ifb_test_txp(dev);
++
++	local_bh_disable();
++	__netif_tx_lock(txq, smp_processor_id());
++	if (nested)
++		__this_cpu_write(ifb_in_direct, true);
++	KUNIT_EXPECT_EQ(test, ifb_xmit(skb, dev), NETDEV_TX_OK);
++	if (nested)
++		__this_cpu_write(ifb_in_direct, false);
++	after->seen = h ? h->seen : 0;
++	after->rq = skb_queue_len(&txp->rq);
++	after->pending = txp->tasklet_pending;
++	__netif_tx_unlock(txq);
++	local_bh_enable();
++}
++
++/* The tasklet's runs so far are over (tasklet_kill() waits for a scheduled
++ * one); ifb_dev_free() kills it again at the end
++ */
++static void ifb_test_tasklet_done(struct net_device *dev)
++{
++	tasklet_kill(&ifb_test_txp(dev)->ifb_tasklet);
++}
++
++/* direct_xmit on, under CAKE (no bypass): the packet goes back to its
++ * device from ifb_xmit() itself, through the netfilter ingress hook, with
++ * nothing queued and no tasklet run
++ */
++static void ifb_test_direct(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_STOLEN);
++	struct net_device *dev = ifb_test_dev(test, 0);
++	struct ifb_test_after after;
++
++	ifb_test_set_direct(test, true);
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 1),
++		      h, false, &after);
++	KUNIT_EXPECT_EQ(test, after.seen, 1);
++	KUNIT_EXPECT_EQ(test, after.rq, 0);
++	KUNIT_EXPECT_EQ(test, after.pending, 0);
++	KUNIT_EXPECT_PTR_EQ(test, h->in, init_net.loopback_dev);
++	KUNIT_EXPECT_EQ(test, h->network_offset, 0);
++	KUNIT_EXPECT_EQ(test, ifb_test_txp(dev)->rx_stats.packets, 1);
++	KUNIT_EXPECT_EQ(test, ifb_test_txp(dev)->tx_stats.packets, 1);
++}
++
++/* direct_xmit off: queued for the tasklet, which hands it back, as upstream */
++static void ifb_test_direct_off(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_STOLEN);
++	struct net_device *dev = ifb_test_dev(test, 0);
++	struct ifb_test_after after;
++
++	ifb_test_set_direct(test, false);
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 1),
++		      h, false, &after);
++	KUNIT_EXPECT_EQ(test, after.seen, 0);
++	KUNIT_EXPECT_EQ(test, after.rq, 1);
++	KUNIT_EXPECT_EQ(test, after.pending, 1);
++	ifb_test_tasklet_done(dev);
++	KUNIT_EXPECT_EQ(test, h->seen, 1);
++	KUNIT_EXPECT_EQ(test, ifb_test_txp(dev)->tasklet_pending, 0);
++	KUNIT_EXPECT_EQ(test, ifb_test_txp(dev)->tx_stats.packets, 1);
++}
++
++/* Under a qdisc that may send past its queue (fq_codel, pfifo), whose
++ * busylock can be held around the send: the tasklet
++ */
++static void ifb_test_direct_bypass(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_STOLEN);
++	struct net_device *dev = ifb_test_dev(test, TCQ_F_CAN_BYPASS);
++	struct ifb_test_after after;
++
++	ifb_test_set_direct(test, true);
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 1),
++		      h, false, &after);
++	KUNIT_EXPECT_EQ(test, after.seen, 0);
++	KUNIT_EXPECT_EQ(test, after.rq, 1);
++	ifb_test_tasklet_done(dev);
++	KUNIT_EXPECT_EQ(test, h->seen, 1);
++}
++
++/* A packet arriving while the tasklet has one still to hand back queues
++ * behind it: both go back in the order the qdisc sent them
++ */
++static void ifb_test_direct_behind(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_STOLEN);
++	struct net_device *dev = ifb_test_dev(test, 0);
++	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
++	struct ifb_q_private *txp = ifb_test_txp(dev);
++	struct ifb_test_after after;
++	struct sk_buff *first;
++
++	ifb_test_set_direct(test, true);
++	/* the first as ifb_xmit() queues it, its tasklet run not yet begun */
++	first = ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 1);
++	local_bh_disable();
++	__netif_tx_lock(txq, smp_processor_id());
++	__skb_queue_tail(&txp->rq, first);
++	txp->tasklet_pending = 1;
++	__netif_tx_unlock(txq);
++	local_bh_enable();
++
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 2),
++		      h, false, &after);
++	KUNIT_EXPECT_EQ(test, after.seen, 0);
++	KUNIT_EXPECT_EQ(test, after.rq, 2);
++
++	tasklet_schedule(&txp->ifb_tasklet);
++	ifb_test_tasklet_done(dev);
++	KUNIT_ASSERT_EQ(test, h->seen, 2);
++	KUNIT_EXPECT_EQ(test, h->order[0], 1);
++	KUNIT_EXPECT_EQ(test, h->order[1], 2);
++	KUNIT_EXPECT_EQ(test, txp->tasklet_pending, 0);
++
++	/* and with the queue empty again, the next goes back at once */
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 3),
++		      h, false, &after);
++	KUNIT_EXPECT_EQ(test, after.seen, 3);
++	KUNIT_EXPECT_EQ(test, after.rq, 0);
++}
++
++/* From inside another ifb's direct hand-back (one level deep only): the
++ * tasklet
++ */
++static void ifb_test_direct_nested(struct kunit *test)
++{
++	struct ifb_test_hook *h = ifb_test_hook(test, NF_STOLEN);
++	struct net_device *dev = ifb_test_dev(test, 0);
++	struct ifb_test_after after;
++
++	ifb_test_set_direct(test, true);
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 1),
++		      h, true, &after);
++	KUNIT_EXPECT_EQ(test, after.seen, 0);
++	KUNIT_EXPECT_EQ(test, after.rq, 1);
++	ifb_test_tasklet_done(dev);
++	KUNIT_EXPECT_EQ(test, h->seen, 1);
++	KUNIT_EXPECT_FALSE(test, __this_cpu_read(ifb_in_direct));
++}
++
++/* Redirected from a device's egress: the tasklet sends it on, as upstream
++ * (here to a device that is gone, so it's dropped and counted)
++ */
++static void ifb_test_direct_egress(struct kunit *test)
++{
++	struct net_device *dev = ifb_test_dev(test, 0);
++	struct ifb_test_after after;
++
++	ifb_test_set_direct(test, true);
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, false, INT_MAX, 1), NULL, false, &after);
++	KUNIT_EXPECT_EQ(test, after.rq, 1);
++	ifb_test_tasklet_done(dev);
++	KUNIT_EXPECT_EQ(test, dev->stats.tx_dropped, 1);
++}
++
++/* The device it came in on is gone: freed and counted, there and then */
++static void ifb_test_direct_gone(struct kunit *test)
++{
++	struct net_device *dev = ifb_test_dev(test, 0);
++	struct ifb_test_after after;
++
++	ifb_test_set_direct(test, true);
++	ifb_test_xmit(test, dev, ifb_test_redirected(test, true, INT_MAX, 1), NULL, false, &after);
++	KUNIT_EXPECT_EQ(test, after.rq, 0);
++	KUNIT_EXPECT_EQ(test, after.pending, 0);
++	KUNIT_EXPECT_EQ(test, dev->stats.tx_dropped, 1);
++}
++
++/* Not redirected (sent to ifb some other way): dropped, as upstream */
++static void ifb_test_direct_not_redirected(struct kunit *test)
++{
++	struct net_device *dev = ifb_test_dev(test, 0);
++	struct ifb_test_after after;
++	struct sk_buff *skb;
++
++	ifb_test_set_direct(test, true);
++	skb = ifb_test_redirected(test, true, init_net.loopback_dev->ifindex, 1);
++	skb->redirected = 0;
++	ifb_test_xmit(test, dev, skb, NULL, false, &after);
++	KUNIT_EXPECT_EQ(test, after.rq, 0);
++	KUNIT_EXPECT_EQ(test, dev->stats.rx_dropped, 1);
++	KUNIT_EXPECT_EQ(test, ifb_test_txp(dev)->tx_stats.packets, 0);
++}
++
+ static struct kunit_case ifb_test_cases[] = {
+ 	KUNIT_CASE(ifb_test_no_hook),
+ 	KUNIT_CASE(ifb_test_accept),
+@@ -313,6 +605,14 @@ static struct kunit_case ifb_test_cases[] = {
+ 	KUNIT_CASE(ifb_test_fraglist_features),
+ 	KUNIT_CASE(ifb_test_fraglist_split_v4),
+ 	KUNIT_CASE(ifb_test_fraglist_split_v6),
++	KUNIT_CASE(ifb_test_direct),
++	KUNIT_CASE(ifb_test_direct_off),
++	KUNIT_CASE(ifb_test_direct_bypass),
++	KUNIT_CASE(ifb_test_direct_behind),
++	KUNIT_CASE(ifb_test_direct_nested),
++	KUNIT_CASE(ifb_test_direct_egress),
++	KUNIT_CASE(ifb_test_direct_gone),
++	KUNIT_CASE(ifb_test_direct_not_redirected),
+ 	{}
+ };
+ 
