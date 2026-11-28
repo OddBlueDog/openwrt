@@ -16,7 +16,10 @@
 #   RSS rings' CPUs, and milkflint.steering.rings_rt "0" runs the rings'
 #   receive threads at normal priority (packet-steering.sh too), and
 #   milkflint.steering.lan_rps "1" hands what the LAN ports receive on to
-#   CPUs 1-3 with RSS (packet-steering.sh again);
+#   CPUs 1-3 with RSS (packet-steering.sh again), and the experimental
+#   milkflint.steering.pdma_stag and .dsa_gro, "1" on, are the Ethernet
+#   driver's (packet-steering.sh sets them, as the LAN ports' RPS follows
+#   dsa_gro);
 # - milkflint.steering.rx_delay: the longest the Ethernet's receive
 #   interrupt waits, in µs (/usr/libexec/milkflint/rx-delay);
 # - milkflint.steering.rx_dim_per_ring and .qdma_tx_dim: how the Ethernet's
@@ -34,6 +37,10 @@
 # - milkflint.cake.drop_one_segment and .sparse_ahead: the Smart Queue
 #   page's experimental download settings (/usr/libexec/milkflint/cake-shaper;
 #   the same iface hotplug, and put_done, as cake-ecn);
+# - milkflint.cake.ifb_direct: the Smart Queue page's experimental hand-back
+#   of a shaped download straight from CAKE's dequeue, "1" on
+#   (/usr/libexec/milkflint/ifb-direct; the same iface hotplug, and put_done:
+#   ifb's parameter, kept as done only once ifb took it);
 # - milkflint.cake.dscp_restore: downloads get back the DSCP their connection
 #   sends with (/usr/libexec/milkflint/cake-dscp; the same iface hotplug too);
 # - milkflint.wifi.vo_aggr: whether the Wi-Fi driver aggregates the voice queue,
@@ -105,12 +112,13 @@ apply() {
 	# first, every time: it may change sqm and firewall, which the rest reads
 	/usr/libexec/milkflint/wed guard
 	put aql "$(uci -q get milkflint.wifi.aql_be) $(uci -q get milkflint.wifi.aql_threshold)" /usr/libexec/milkflint/wifi-aql
-	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss) $(uci -q get milkflint.steering.wifi_all) $(uci -q get milkflint.steering.rings_rt) $(uci -q get milkflint.steering.lan_rps)" reload_if_enabled packet_steering
+	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss) $(uci -q get milkflint.steering.wifi_all) $(uci -q get milkflint.steering.rings_rt) $(uci -q get milkflint.steering.lan_rps) $(uci -q get milkflint.steering.pdma_stag) $(uci -q get milkflint.steering.dsa_gro)" reload_if_enabled packet_steering
 	put rx_delay "$(uci -q get milkflint.steering.rx_delay)" /usr/libexec/milkflint/rx-delay
 	put eth_dim "$(uci -q get milkflint.steering.rx_dim_per_ring) $(uci -q get milkflint.steering.qdma_tx_dim)" /usr/libexec/milkflint/eth-dim
 	put_done cake_ecn "$(uci -q get milkflint.cake.ecn_drop) $(uci -q get milkflint.cake.l4s)" /usr/libexec/milkflint/cake-ecn
 	put_done cake_shaper "$(uci -q get milkflint.cake.drop_one_segment) $(uci -q get milkflint.cake.sparse_ahead)" /usr/libexec/milkflint/cake-shaper
 	put_done cake_dscp "$(uci -q get milkflint.cake.dscp_restore)" /usr/libexec/milkflint/cake-dscp
+	put_done ifb_direct "$(uci -q get milkflint.cake.ifb_direct)" /usr/libexec/milkflint/ifb-direct
 	put vo_aggr "$(uci -q get milkflint.wifi.vo_aggr)" /usr/libexec/milkflint/wifi-vo-aggr
 	put spr "$(uci -q get milkflint.wifi.spr_2g) $(uci -q get milkflint.wifi.spr_5g) $(uci -q get milkflint.wifi.spr_6g)" /usr/libexec/milkflint/wifi-spr
 	put twt "$(uci -q show milkflint.wifi | grep '\.twt_')" /usr/libexec/milkflint/wifi-twt

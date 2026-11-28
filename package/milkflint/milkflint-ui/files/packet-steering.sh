@@ -39,6 +39,19 @@
 # port's ring 0 with RSS too, so a wired upload, or a wired device sending
 # to Wi-Fi, is spread as before RSS instead of all handled on CPU0. Unset,
 # nothing is handed on with RSS.
+# Two more experimental switches of the page are the Ethernet driver's, set
+# here (each "1" on, unset or anything else off) because the RPS below
+# depends on the second, in every layout:
+# - milkflint.steering.pdma_stag turns the CDMP special tag on, so RSS may
+#   hash the switch's tagged packets too (mtk_eth's pdma_stag, 990-18): 990-06
+#   turned it off together with another fix, and the tag alone was never
+#   tried;
+# - milkflint.steering.dsa_gro: what the LAN ports receive goes to GRO on its
+#   port from the Ethernet's own NAPI, one pass instead of two (mtk_eth's
+#   dsa_gro, 990-19). Its RPS is then the LAN port's (lanN's rx-0), not the
+#   switch port's: the LAN ports get the mask the switch port's rx-0 would,
+#   and that one none (what still comes that way, with tcpdump on eth0 say,
+#   is handed on at the LAN port after it).
 # milkflint.steering.rss=0 keeps every flow on ring 0 with the RPS layout
 # above. Without the rings (an older image), that layout is all there is.
 #
@@ -67,6 +80,29 @@ WORK_CPUS=$(printf %x $((((1 << ncpu) - 1) & ~1)))
 # the one that isn't the switch's (eth1 on the GL-MT6000, wan on the EX5601)
 RSS_DEV=$(/usr/libexec/milkflint/ports rss 2> /dev/null)
 [ -n "$RSS_DEV" ] || RSS_DEV=eth1
+
+# the Ethernet driver's switches; an image without a parameter has nothing
+# to set for it
+MTK_PARAMS=/sys/module/mtk_eth/parameters
+eth_flag() {
+	[ -w "$MTK_PARAMS/$1" ] || return 0
+	if [ "$(uci -q get "milkflint.steering.$1")" = 1 ]; then echo Y; else echo N; fi > "$MTK_PARAMS/$1"
+}
+eth_flag pdma_stag
+eth_flag dsa_gro
+dsa_gro=
+[ "$(cat "$MTK_PARAMS/dsa_gro" 2> /dev/null)" = Y ] && dsa_gro=1
+
+# the DSA switch port that device $1 is a port of (its one lower device has
+# DSA's tagging attribute, as eth0 is lan1-5's); fails for anything else
+dsa_conduit() {
+	local lower
+	lower=$(ls -d /sys/class/net/$1/lower_* 2> /dev/null)
+	[ -n "$lower" ] && [ "$(echo "$lower" | wc -l)" -eq 1 ] || return 1
+	lower=${lower##*/lower_}
+	[ -e "/sys/class/net/$lower/dsa/tagging" ] || return 1
+	echo "$lower"
+}
 
 # the frame engine's interrupt for GIC SPI number $1 (pdma0-3: 221-224)
 eth_irq() {
@@ -243,25 +279,42 @@ done
 # LAN ports receive lands. Not RSS_DEV's: what Smart Queue's ifb hands back
 # to it from its tx queue N comes in as rx queue N-1, so ring 1's downloads
 # would be steered again after CAKE.
+# With dsa_gro, a LAN port's rx-0 takes what its switch port's would, and
+# the switch port's what's left: none.
 lan_rps=
 [ -n "$rss" ] && [ "$(uci -q get milkflint.steering.lan_rps)" = 1 ] && lan_rps=1
-for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
-	dev=${q#/sys/class/net/}
-	dev=${dev%%/*}
-	case "$(basename "$(readlink "/sys/class/net/$dev/device/driver")")" in
+# <device> <rx-N>: that queue's mask
+rps_mask() {
+	local m p
+	case "$(basename "$(readlink "/sys/class/net/$1/device/driver")")" in
 	mtk_soc_eth) m=$WORK_CPUS ;;
 	*) m=0 ;;
 	esac
 	if [ -n "$lan_rps" ]; then
-		case "$dev/${q#*/queues/}" in "$RSS_DEV"/* | */rx-[1-9]*/*) m=0 ;; esac
+		case "$1/$2" in "$RSS_DEV"/* | */rx-[1-9]*) m=0 ;; esac
 	elif [ -n "$rss" ]; then
 		m=0
 	fi
 	[ -n "$off" ] && m=0
 	if [ -z "$off" ]; then
 		for p in $pppoe_ports; do
-			[ "$q" = "/sys/class/net/$p/queues/rx-0/rps_cpus" ] && m=$WORK_CPUS
+			[ "$1/$2" = "$p/rx-0" ] && m=$WORK_CPUS
 		done
+	fi
+	echo "$m"
+}
+for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
+	dev=${q#/sys/class/net/}
+	dev=${dev%%/*}
+	rxq=${q#*/queues/}
+	rxq=${rxq%/rps_cpus}
+	m=$(rps_mask "$dev" "$rxq")
+	if [ -n "$dsa_gro" ] && [ "$rxq" = rx-0 ]; then
+		if [ -e "/sys/class/net/$dev/dsa/tagging" ]; then
+			m=0
+		elif conduit=$(dsa_conduit "$dev"); then
+			m=$(rps_mask "$conduit" rx-0)
+		fi
 	fi
 	echo "$m" > "$q"
 done

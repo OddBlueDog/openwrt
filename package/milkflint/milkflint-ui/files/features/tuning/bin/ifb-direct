@@ -1,0 +1,23 @@
+#!/bin/sh
+# An experimental setting of Smart Queue's download (the Smart Queue page's
+# Advanced sheet), for ifb: whether what CAKE lets through on a download's
+# ifb goes straight back to the router from CAKE's dequeue, rather than from
+# a tasklet one softirq later, from milkflint.cake.ifb_direct: "1" on, unset
+# (or anything else) off, as upstream (ifb's direct_xmit, 722). Only under
+# CAKE, and only while nothing is queued ahead; ifb takes it at once.
+# milkflint-tuning runs this at boot and when the setting changes, and the
+# iface hotplug 12-milkflint-cake-ecn after sqm.
+#
+#   ifb-direct
+#
+# Exits 1 when ifb isn't loaded, so nothing was set: milkflint-tuning then
+# doesn't count it as done. An ifb without the parameter has nothing to set.
+
+P=/sys/module/ifb/parameters
+
+[ -d /sys/module/ifb ] || exit 1
+
+if [ -w "$P/direct_xmit" ]; then
+	if [ "$(uci -q get milkflint.cake.ifb_direct)" = 1 ]; then echo Y; else echo N; fi > "$P/direct_xmit"
+fi
+exit 0

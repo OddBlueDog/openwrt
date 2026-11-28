@@ -112,6 +112,14 @@ function wired(dev) {
 		length(filter(lsdir(p) ?? [], (f) => match(f, /^lower_/))) == 0;
 }
 
+// a port of the DSA switch (lan1-5: its one lower device, the switch port,
+// has DSA's attributes), where packet-steering.sh sets RPS with mtk_eth's
+// dsa_gro on
+function dsa_port(dev) {
+	const lower = filter(lsdir(`/sys/class/net/${dev}`) ?? [], (f) => match(f, /^lower_/));
+	return length(lower) == 1 && access(`/sys/class/net/${substr(lower[0], 6)}/dsa`) == true;
+}
+
 // Where the network work runs: the CPUs the Ethernet receive (mtk_eth NAPI)
 // threads and the Wi-Fi driver's threads may use, and the CPUs what the
 // wired ports receive is spread over (RPS; empty: none, it stays where it
@@ -140,7 +148,7 @@ function steering() {
 			realtime = true;
 	}
 	for (let dev in lsdir('/sys/class/net') ?? [])
-		if (wired(dev))
+		if (wired(dev) || dsa_port(dev))
 			for (let q in lsdir(`/sys/class/net/${dev}/queues`) ?? [])
 				if (match(q, /^rx-/))
 					add_all(rps, cpu_mask(readfile(`/sys/class/net/${dev}/queues/${q}/rps_cpus`)));
@@ -183,28 +191,40 @@ function flag(path) {
 // The CPUs the switch port (the frame engine's MAC with dsa/, the DSA
 // conduit) hands on what its first receive queue gets (RPS), where
 // everything the LAN ports receive lands with RSS: [] for none; null
-// without such a port (a VM)
+// without such a port (a VM). With mtk_eth's dsa_gro on, packet-steering.sh
+// moves that to the LAN ports' own first queues (the ports stacked on the
+// switch port), so it's read from the first of them.
 function lan_rps() {
-	for (let dev in lsdir('/sys/class/net') ?? []) {
+	const devs = sort(lsdir('/sys/class/net') ?? []);
+	for (let dev in devs) {
 		const p = `/sys/class/net/${dev}`;
-		if (access(`${p}/dsa`) == true && readlink(`${p}/device/driver`) != null)
-			return cpu_mask(readfile(`${p}/queues/rx-0/rps_cpus`));
+		if (access(`${p}/dsa`) != true || readlink(`${p}/device/driver`) == null)
+			continue;
+		if (flag('/sys/module/mtk_eth/parameters/dsa_gro') == true)
+			for (let port in devs)
+				if (access(`/sys/class/net/${port}/lower_${dev}`) == true)
+					return cpu_mask(readfile(`/sys/class/net/${port}/queues/rx-0/rps_cpus`));
+		return cpu_mask(readfile(`${p}/queues/rx-0/rps_cpus`));
 	}
 	return null;
 }
 
 // the drivers' latency settings as they are now: the Ethernet's longest RX
-// interrupt delay (µs, 0: no limit), its moderation's experimental
-// switches, sch_cake's count at which an ECN download that ignores its
-// marks is dropped (0: never; null with sch_cake not loaded, or without the
-// parameter: cake_loaded tells which), its experimental download settings
-// and the count of what one of them dropped (the same), and the Wi-Fi driver's sends of a data frame
+// interrupt delay (µs, 0: no limit), its moderation's and the LAN ports'
+// experimental switches, sch_cake's count at which an ECN download that
+// ignores its marks is dropped (0: never; null with sch_cake not loaded, or
+// without the parameter: cake_loaded tells which), its experimental
+// download settings and the count of what one of them dropped (the same),
+// ifb's experimental hand-back (null with ifb not loaded, or without it:
+// ifb_loaded tells which), and the Wi-Fi driver's sends of a data frame
 function knobs() {
 	return {
 		rx_delay: param('/sys/module/mtk_eth/parameters/rx_dim_max_us'),
 		rx_dim_per_ring: flag('/sys/module/mtk_eth/parameters/rx_dim_per_ring'),
 		qdma_tx_dim: flag('/sys/module/mtk_eth/parameters/qdma_tx_dim'),
 		lan_rps: lan_rps(),
+		pdma_stag: flag('/sys/module/mtk_eth/parameters/pdma_stag'),
+		dsa_gro: flag('/sys/module/mtk_eth/parameters/dsa_gro'),
 		cake_drop_one_segment: flag('/sys/module/sch_cake/parameters/drop_one_segment'),
 		cake_sparse_ahead: param('/sys/module/sch_cake/parameters/sparse_ahead_us'),
 		// read-only: packets dropped one of a group since sch_cake loaded
@@ -212,6 +232,8 @@ function knobs() {
 		cake_ecn: param('/sys/module/sch_cake/parameters/ecn_fail_count'),
 		cake_l4s: param('/sys/module/sch_cake/parameters/l4s_ramp'),
 		cake_loaded: access('/sys/module/sch_cake') == true,
+		ifb_direct: flag('/sys/module/ifb/parameters/direct_xmit'),
+		ifb_loaded: access('/sys/module/ifb') == true,
 		wifi_retries: param('/sys/module/mt76_connac_lib/parameters/data_tx_count'),
 		wifi_vo_aggr: flag('/sys/module/mt76_connac_lib/parameters/vo_aggr'),
 	};

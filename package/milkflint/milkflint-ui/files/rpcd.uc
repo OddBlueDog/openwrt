@@ -219,6 +219,17 @@ function pipeline() {
 		const queues = [];
 		for (let q in sort(filter(lsdir(`/sys/class/net/${dev}/queues`) ?? [], (q) => match(q, /^rx-/))))
 			push(queues, cpu_mask(readfile(`/sys/class/net/${dev}/queues/${q}/rps_cpus`)));
+		// with mtk_eth's dsa_gro, what the switch's ports receive is handed
+		// on at their own first queues (packet-steering.sh): the switch
+		// port's first queue stands for them
+		if (length(queues) && trim(readfile('/sys/module/mtk_eth/parameters/dsa_gro') ?? '') == 'Y')
+			for (let port in lsdir('/sys/class/net') ?? [])
+				if (realpath(`/sys/class/net/${port}/lower_${dev}`) != null)
+					for (let c in cpu_mask(readfile(`/sys/class/net/${port}/queues/rx-0/rps_cpus`)))
+						if (!(c in queues[0]))
+							push(queues[0], c);
+		if (length(queues))
+			queues[0] = sort(queues[0]);
 		push(rps, { dev, queues });
 	}
 	// each multi-queue ifb's XPS: on a PPPoE line sqm-scripts gives the
