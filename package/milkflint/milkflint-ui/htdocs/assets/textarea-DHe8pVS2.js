@@ -1,0 +1,1 @@
+import{a as e,u as t}from"./button-BeAJDuEO.js";import{_ as n}from"./index-B196exfq.js";var r=t();function i({className:t,...i}){return(0,r.jsx)(`textarea`,{"data-slot":`textarea`,className:e(n,`h-auto py-2`,t),...i})}export{i as t};

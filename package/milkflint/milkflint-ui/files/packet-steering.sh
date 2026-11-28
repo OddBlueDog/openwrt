@@ -31,6 +31,14 @@
 # milkflint.steering.wifi_all=0 keeps the Wi-Fi threads on CPUs 1-3, and
 # milkflint.steering.rings_rt=0 the rings' threads at normal priority (the
 # Performance Tuning page's switches).
+# The MT7986 hashes either the switch's tagged packets or the untagged
+# MAC's, not both (the CDMP special tag, mtk_eth_soc 990-06), and the image
+# hashes eth1's, the WAN. Everything the LAN ports receive (eth0) lands on
+# ring 0 unhashed, on CPU0. milkflint.steering.lan_rps=1 (the page's
+# experimental switch) keeps the RPS hand-off to CPUs 1-3 on the switch
+# port's ring 0 with RSS too, so a wired upload, or a wired device sending
+# to Wi-Fi, is spread as before RSS instead of all handled on CPU0. Unset,
+# nothing is handed on with RSS.
 # milkflint.steering.rss=0 keeps every flow on ring 0 with the RPS layout
 # above. Without the rings (an older image), that layout is all there is.
 #
@@ -231,6 +239,12 @@ done
 # RSS chosen on a PPPoE line, the PPPoE port's ring 0, where the session's
 # packets arrive (the kernel's own flow hash reads PPPoE); rings 1-3 stay as
 # RSS has them. Other drivers' ports (a VM's) get it as a PPPoE port only.
+# With RSS and lan_rps=1, the switch port's ring 0 too, where everything the
+# LAN ports receive lands. Not RSS_DEV's: what Smart Queue's ifb hands back
+# to it from its tx queue N comes in as rx queue N-1, so ring 1's downloads
+# would be steered again after CAKE.
+lan_rps=
+[ -n "$rss" ] && [ "$(uci -q get milkflint.steering.lan_rps)" = 1 ] && lan_rps=1
 for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
 	dev=${q#/sys/class/net/}
 	dev=${dev%%/*}
@@ -238,7 +252,12 @@ for q in /sys/class/net/*/queues/rx-*/rps_cpus; do
 	mtk_soc_eth) m=$WORK_CPUS ;;
 	*) m=0 ;;
 	esac
-	[ -n "$off" ] || [ -n "$rss" ] && m=0
+	if [ -n "$lan_rps" ]; then
+		case "$dev/${q#*/queues/}" in "$RSS_DEV"/* | */rx-[1-9]*/*) m=0 ;; esac
+	elif [ -n "$rss" ]; then
+		m=0
+	fi
+	[ -n "$off" ] && m=0
 	if [ -z "$off" ]; then
 		for p in $pppoe_ports; do
 			[ "$q" = "/sys/class/net/$p/queues/rx-0/rps_cpus" ] && m=$WORK_CPUS

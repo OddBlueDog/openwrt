@@ -180,14 +180,35 @@ function flag(path) {
 	return (v == 'Y' || v == '1') ? true : ((v == 'N' || v == '0') ? false : null);
 }
 
+// The CPUs the switch port (the frame engine's MAC with dsa/, the DSA
+// conduit) hands on what its first receive queue gets (RPS), where
+// everything the LAN ports receive lands with RSS: [] for none; null
+// without such a port (a VM)
+function lan_rps() {
+	for (let dev in lsdir('/sys/class/net') ?? []) {
+		const p = `/sys/class/net/${dev}`;
+		if (access(`${p}/dsa`) == true && readlink(`${p}/device/driver`) != null)
+			return cpu_mask(readfile(`${p}/queues/rx-0/rps_cpus`));
+	}
+	return null;
+}
+
 // the drivers' latency settings as they are now: the Ethernet's longest RX
-// interrupt delay (µs, 0: no limit), sch_cake's count at which an ECN
-// download that ignores its marks is dropped (0: never; null with sch_cake
-// not loaded, or without the parameter: cake_loaded tells which), and the
-// Wi-Fi driver's sends of a data frame
+// interrupt delay (µs, 0: no limit), its moderation's experimental
+// switches, sch_cake's count at which an ECN download that ignores its
+// marks is dropped (0: never; null with sch_cake not loaded, or without the
+// parameter: cake_loaded tells which), its experimental download settings
+// and the count of what one of them dropped (the same), and the Wi-Fi driver's sends of a data frame
 function knobs() {
 	return {
 		rx_delay: param('/sys/module/mtk_eth/parameters/rx_dim_max_us'),
+		rx_dim_per_ring: flag('/sys/module/mtk_eth/parameters/rx_dim_per_ring'),
+		qdma_tx_dim: flag('/sys/module/mtk_eth/parameters/qdma_tx_dim'),
+		lan_rps: lan_rps(),
+		cake_drop_one_segment: flag('/sys/module/sch_cake/parameters/drop_one_segment'),
+		cake_sparse_ahead: param('/sys/module/sch_cake/parameters/sparse_ahead_us'),
+		// read-only: packets dropped one of a group since sch_cake loaded
+		cake_one_segment_drops: param('/sys/module/sch_cake/parameters/one_segment_drops'),
 		cake_ecn: param('/sys/module/sch_cake/parameters/ecn_fail_count'),
 		cake_l4s: param('/sys/module/sch_cake/parameters/l4s_ramp'),
 		cake_loaded: access('/sys/module/sch_cake') == true,

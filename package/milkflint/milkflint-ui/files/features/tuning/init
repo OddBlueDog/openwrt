@@ -14,9 +14,14 @@
 #   packet_steering by themselves;
 #   milkflint.steering.wifi_all "0" keeps the Wi-Fi driver's threads on the
 #   RSS rings' CPUs, and milkflint.steering.rings_rt "0" runs the rings'
-#   receive threads at normal priority (packet-steering.sh too);
+#   receive threads at normal priority (packet-steering.sh too), and
+#   milkflint.steering.lan_rps "1" hands what the LAN ports receive on to
+#   CPUs 1-3 with RSS (packet-steering.sh again);
 # - milkflint.steering.rx_delay: the longest the Ethernet's receive
 #   interrupt waits, in µs (/usr/libexec/milkflint/rx-delay);
+# - milkflint.steering.rx_dim_per_ring and .qdma_tx_dim: how the Ethernet's
+#   adaptive interrupt moderation works, "1" on
+#   (/usr/libexec/milkflint/eth-dim);
 # - milkflint.cake.ecn_drop: after how many ignored marks Smart Queue drops
 #   from an ECN download that ignores them, "0" never (it always marks)
 #   (/usr/libexec/milkflint/cake-ecn; the iface hotplug 12-milkflint-cake-ecn
@@ -26,6 +31,9 @@
 # - milkflint.cake.l4s: where L4S traffic starts to be marked by how long each
 #   packet has waited, in percent of Smart Queue's target, "0" not at all (the
 #   same script);
+# - milkflint.cake.drop_one_segment and .sparse_ahead: the Smart Queue
+#   page's experimental download settings (/usr/libexec/milkflint/cake-shaper;
+#   the same iface hotplug, and put_done, as cake-ecn);
 # - milkflint.cake.dscp_restore: downloads get back the DSCP their connection
 #   sends with (/usr/libexec/milkflint/cake-dscp; the same iface hotplug too);
 # - milkflint.wifi.vo_aggr: whether the Wi-Fi driver aggregates the voice queue,
@@ -97,9 +105,11 @@ apply() {
 	# first, every time: it may change sqm and firewall, which the rest reads
 	/usr/libexec/milkflint/wed guard
 	put aql "$(uci -q get milkflint.wifi.aql_be) $(uci -q get milkflint.wifi.aql_threshold)" /usr/libexec/milkflint/wifi-aql
-	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss) $(uci -q get milkflint.steering.wifi_all) $(uci -q get milkflint.steering.rings_rt)" reload_if_enabled packet_steering
+	put steering "$(uci -q get milkflint.steering.layout) $(uci -q get milkflint.steering.rss) $(uci -q get milkflint.steering.wifi_all) $(uci -q get milkflint.steering.rings_rt) $(uci -q get milkflint.steering.lan_rps)" reload_if_enabled packet_steering
 	put rx_delay "$(uci -q get milkflint.steering.rx_delay)" /usr/libexec/milkflint/rx-delay
+	put eth_dim "$(uci -q get milkflint.steering.rx_dim_per_ring) $(uci -q get milkflint.steering.qdma_tx_dim)" /usr/libexec/milkflint/eth-dim
 	put_done cake_ecn "$(uci -q get milkflint.cake.ecn_drop) $(uci -q get milkflint.cake.l4s)" /usr/libexec/milkflint/cake-ecn
+	put_done cake_shaper "$(uci -q get milkflint.cake.drop_one_segment) $(uci -q get milkflint.cake.sparse_ahead)" /usr/libexec/milkflint/cake-shaper
 	put_done cake_dscp "$(uci -q get milkflint.cake.dscp_restore)" /usr/libexec/milkflint/cake-dscp
 	put vo_aggr "$(uci -q get milkflint.wifi.vo_aggr)" /usr/libexec/milkflint/wifi-vo-aggr
 	put spr "$(uci -q get milkflint.wifi.spr_2g) $(uci -q get milkflint.wifi.spr_5g) $(uci -q get milkflint.wifi.spr_6g)" /usr/libexec/milkflint/wifi-spr

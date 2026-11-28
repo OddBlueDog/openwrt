@@ -1,0 +1,28 @@
+#!/bin/sh
+# The Ethernet's adaptive interrupt moderation (mtk_eth's Net DIM), from two
+# of the Performance Tuning page's experimental switches; each "1" on,
+# unset (or anything else) off, as the driver has it by default:
+# - milkflint.steering.rx_dim_per_ring: each receive ring picks its own
+#   interrupt delay from its own traffic (rx_dim_per_ring);
+# - milkflint.steering.qdma_tx_dim: the interrupts for packets sent (TX
+#   done) are held back by sending's own moderation, as upstream lays out
+#   QDMA's register, rather than by receiving's, as MediaTek's SDK does
+#   (qdma_tx_dim, 990-16).
+# The driver takes each at its next moderation step. milkflint-tuning runs
+# this at boot and when a setting changes.
+#
+#   eth-dim
+#
+# An image without a parameter has nothing to set for it.
+
+P=/sys/module/mtk_eth/parameters
+
+# <parameter>: Y when milkflint.steering.<parameter> is "1", N otherwise
+flag() {
+	[ -w "$P/$1" ] || return 0
+	if [ "$(uci -q get "milkflint.steering.$1")" = 1 ]; then echo Y; else echo N; fi > "$P/$1"
+}
+
+flag rx_dim_per_ring
+flag qdma_tx_dim
+exit 0

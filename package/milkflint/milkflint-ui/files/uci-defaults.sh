@@ -323,6 +323,51 @@ if [ -z "$(uci -q get milkflint.defaults.sqm_link)" ]; then
 	UCI
 fi
 
+# Smart Queue's home defaults for a queue that isn't in use yet (off, as sqm
+# ships it), as the web interface gives a new one: a fair share per device
+# and the upload's ACK filter. Per device is CAKE's dual-dsthost on the
+# download and dual-srchost on the upload, with nat to find each device
+# behind the router's address and ingress mode on the download, whose
+# dropped packets have crossed the line already. CAKE's own triple-isolate
+# counts the servers' connections too, so a device downloading from a
+# server another device uses gets the smaller share. The ACK filter drops
+# a download's acknowledgements a newer one has replaced, when they queue
+# up in a busy upload. Not a queue that's on (it runs as someone set it
+# up), nor one with any of these options of its own, nor a guest network's
+# or the VPN's, which have their own. Once, like sqm_link.
+if [ -z "$(uci -q get milkflint.defaults.sqm_fair)" ]; then
+	for queue in $(uci -q show sqm | sed -n "s/^sqm\.\([^.=]*\)=queue$/\1/p"); do
+		case "$(uci -q get "sqm.$queue.interface")" in br-guest* | wg_out) continue ;; esac
+		[ "$(uci -q get "sqm.$queue.enabled")" = 1 ] && continue
+		iq=$(uci -q get "sqm.$queue.iqdisc_opts")
+		eq=$(uci -q get "sqm.$queue.eqdisc_opts")
+		own=
+		for word in $iq $eq; do
+			case "$word" in
+				flowblind | srchost | dsthost | hosts | flows | dual-srchost | dual-dsthost | triple-isolate) own=1 ;;
+				nonat | ingress | egress | ack-filter | ack-filter-aggressive | no-ack-filter) own=1 ;;
+			esac
+		done
+		[ -z "$own" ] || continue
+		# as the web interface writes them: its keywords last, nat with them
+		down= up=
+		for word in $iq; do [ "$word" = nat ] || down="$down$word "; done
+		for word in $eq; do [ "$word" = nat ] || up="$up$word "; done
+		uci -q batch <<-UCI
+			set sqm.$queue.iqdisc_opts='${down}nat dual-dsthost ingress'
+			set sqm.$queue.eqdisc_opts='${up}nat dual-srchost ack-filter'
+			set sqm.$queue.qdisc_advanced='1'
+			set sqm.$queue.qdisc_really_really_advanced='1'
+		UCI
+	done
+	uci -q commit sqm
+	uci -q batch <<-UCI
+		set milkflint.defaults=defaults
+		set milkflint.defaults.sqm_fair='1'
+		commit milkflint
+	UCI
+fi
+
 # 5 GHz Wi-Fi: under a big download the router fills the air with long
 # transmissions, and a client's own packets (its TCP ACKs, a speed test's
 # latency probes) wait for a turn, which can be most of the latency a

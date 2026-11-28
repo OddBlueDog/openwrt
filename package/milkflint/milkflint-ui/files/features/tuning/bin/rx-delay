@@ -2,14 +2,19 @@
 # The longest the Ethernet's receive interrupt is held back for more
 # packets, from milkflint.steering.rx_delay: microseconds, 0 for no limit
 # (the driver's adaptive moderation picks, up to 260 µs), unset for
-# MilkFlint's 40. Shorter: received packets wait less for their CPU, for a
-# few more interrupts under load. The driver (mtk_eth's rx_dim_max_us) takes
-# it at its next moderation step, within milliseconds under traffic.
+# MilkFlint's 80 (the driver's own default is 40, which this sets aside at
+# boot: 80 takes fewer interrupts under load than 40, so less CPU, with
+# pings as low; longer limits save a little more and let pings rise).
+# Shorter: received packets wait less for their CPU, for a few more
+# interrupts under load. The driver (mtk_eth's rx_dim_max_us) takes
+# it at its next moderation step, within milliseconds under traffic. The
+# hardware counts the delay in 20 µs steps and the driver rounds up, so only
+# a multiple of 20 means what it says (64 acts as 80).
 # milkflint-tuning runs this at boot and when the setting changes.
 #
 #   rx-delay
 
-DEFAULT=40
+DEFAULT=80
 P=/sys/module/mtk_eth/parameters/rx_dim_max_us
 
 # an image without the parameter (mtk_eth_soc 990-14) has nothing to set

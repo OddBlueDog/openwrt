@@ -1,0 +1,49 @@
+#!/bin/sh
+# Two experimental settings of Smart Queue's download CAKE (the Smart Queue
+# page's Advanced sheet), for sch_cake:
+#
+# Whether CAKE drops one packet of a grouped (GRO) packet it takes whole,
+# rather than the whole group, from milkflint.cake.drop_one_segment: "1" on,
+# unset (or anything else) off. Only a CAKE that takes grouped packets
+# whole (no-split-gso) has groups to drop from (sch_cake's
+# drop_one_segment).
+#
+# How far ahead of the shaper a new flow's packet may go on a download, from
+# milkflint.cake.sparse_ahead: microseconds, 1 to 1000; unset (or anything
+# else) 0, off, as upstream. A download's packets have already crossed the
+# line, so a new flow's first ones need not wait behind the shaper; what
+# goes ahead is charged to it, so the rate holds over time (sch_cake's
+# sparse_ahead_us).
+#
+# sch_cake takes both at once and keeps them while it stays loaded.
+# milkflint-tuning runs this at boot and when a setting changes, and the
+# iface hotplug 12-milkflint-cake-ecn after sqm.
+#
+#   cake-shaper
+#
+# Exits 1 when sch_cake isn't loaded, so nothing was set: milkflint-tuning
+# then doesn't count it as done. A sch_cake without a parameter has nothing
+# to set for it.
+
+P=/sys/module/sch_cake/parameters
+
+[ -d "$P" ] || exit 1
+
+if [ -w "$P/drop_one_segment" ]; then
+	if [ "$(uci -q get milkflint.cake.drop_one_segment)" = 1 ]; then echo Y; else echo N; fi > "$P/drop_one_segment"
+fi
+
+if [ -w "$P/sparse_ahead_us" ]; then
+	v=$(uci -q get milkflint.cake.sparse_ahead)
+	case "$v" in
+		'' | *[!0-9]* | ?????*) n=0 ;;
+		*)
+			# no leading zeros: sch_cake would read them as octal
+			n=${v#"${v%%[!0]*}"}
+			n=${n:-0}
+			[ "$n" -le 1000 ] || n=0
+			;;
+	esac
+	echo "$n" > "$P/sparse_ahead_us"
+fi
+exit 0
