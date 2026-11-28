@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 11:12:00 +0000
+Subject: [PATCH] net: ethernet: mtk_eth_soc: pdma_stag switch, the CDMP
+ special tag on netsys v2 and later
+
+990-06 left the CDMP special tag as upstream (netsys v1 only) because an
+MT7986's RSS sent every packet of the untagged MAC (eth1, the GL-MT6000's
+WAN) to ring 0 with it on. The same patch also stopped ORing the RSS
+rings' PSE mode into their auto-learn reset value, and only the two
+together were tried: whether the tag on its own keeps eth1 on ring 0
+isn't known. With it on, RSS may also hash what the switch's ports
+receive (eth0's tagged frames), all on ring 0 without it.
+
+pdma_stag (module parameter, off by default: the register as it comes
+up, as before; writable at runtime) sets the tag on netsys v2 and later
+with RSS. A ring's next poll writes the change (mtk_pdma_stag(): a
+compare per poll while it's settled), and mtk_hw_init() writes it again
+after a reset once it has ever been on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 35 +++++++++++++++++++++
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h |  4 +++
+ 2 files changed, 39 insertions(+)
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.c b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+index 28257c5..9385967 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2463,6 +2463,32 @@ static void mtk_dim_rx_apply(struct dim *dim)
+ 	schedule_work(&dim->work);
+ }
+ 
++/* The CDMP special tag on netsys v2 and later (the MT7986), as netsys v1
++ * always has it (upstream). 990-06 left it off when RSS spread eth1 (the
++ * untagged MAC, the GL-MT6000's WAN) with it off, but fixed the RSS rings'
++ * mode in the same build, so whether the tag on its own sends eth1 to ring 0
++ * was never tried. With it on, RSS may hash what the switch's ports receive
++ * (eth0's tagged frames, all on ring 0 otherwise). Writable at runtime: a
++ * ring's next poll writes it (mtk_pdma_stag()), and mtk_hw_init() again
++ * after a reset. Off by default: the register as it comes up.
++ */
++static bool pdma_stag;
++module_param(pdma_stag, bool, 0644);
++MODULE_PARM_DESC(pdma_stag, "The CDMP special tag on netsys v2 and later, as netsys v1 has it, for RSS on the DSA switch's frames");
++
++static void mtk_pdma_stag(struct mtk_eth *eth)
++{
++	bool want = READ_ONCE(pdma_stag);
++
++	if (likely(READ_ONCE(eth->pdma_stag_hw) == want) ||
++	    mtk_is_netsys_v1(eth) || !MTK_HAS_CAPS(eth->soc->caps, MTK_RSS))
++		return;
++	/* two rings' polls may both get here: both write the same */
++	WRITE_ONCE(eth->pdma_stag_hw, want);
++	mtk_m32(eth, MTK_CDMP_STAG_EN, want ? MTK_CDMP_STAG_EN : 0,
++		MTK_CDMP_IG_CTRL);
++}
++
+ static int mtk_poll_rx(struct napi_struct *napi, int budget,
+ 		       struct mtk_eth *eth)
+ {
+@@ -2482,6 +2508,8 @@ static int mtk_poll_rx(struct napi_struct *napi, int budget,
+ 	if (unlikely(!ring))
+ 		goto rx_done;
+ 
++	mtk_pdma_stag(eth);
++
+ 	while (done < budget) {
+ 		unsigned int pktlen, *rxdcsum;
+ 		struct net_device *netdev;
+@@ -4930,6 +4958,13 @@ static int mtk_hw_init(struct mtk_eth *eth, bool reset)
+ 		mtk_w32(eth, val | MTK_CDMP_STAG_EN, MTK_CDMP_IG_CTRL);
+ 
+ 		mtk_w32(eth, 1, MTK_CDMP_EG_CTRL);
++	} else if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSS) &&
++		   (READ_ONCE(pdma_stag) || eth->pdma_stag_hw)) {
++		/* pdma_stag's, if it was ever on: whatever a reset left */
++		eth->pdma_stag_hw = READ_ONCE(pdma_stag);
++		mtk_m32(eth, MTK_CDMP_STAG_EN,
++			eth->pdma_stag_hw ? MTK_CDMP_STAG_EN : 0,
++			MTK_CDMP_IG_CTRL);
+ 	}
+ 
+ 	/* set interrupt delays based on current Net DIM sample */
+diff --git a/drivers/net/ethernet/mediatek/mtk_eth_soc.h b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+index 8262266..753fb1a 100644
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1499,6 +1499,10 @@ struct mtk_eth {
+ 	 */
+ 	u32				rx_dim_gen;
+ 	bool				rx_dim_ring_regs;
++	/* What pdma_stag last wrote to the CDMP special tag (netsys v2 and
++	 * later): false until it turns it on, as the register comes up
++	 */
++	bool				pdma_stag_hw;
+ 
+ 	u32				tx_events;
+ 	u32				tx_packets;
