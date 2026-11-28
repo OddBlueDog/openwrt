@@ -16,6 +16,7 @@ import {
   type AdvancedErrors,
 } from '../src/features/sqm/advanced.ts';
 import {
+  type CakeExtrasLive,
   cakeExtrasDefaults,
   cakeExtrasOf,
   cakeExtrasOptions,
@@ -23,6 +24,8 @@ import {
   dropOneSegmentIdle,
   dropOneSegmentNow,
   fraglistNow,
+  ifbDirectNow,
+  ifbParamMissing,
   oneSegmentDropsNow,
   sparseAheadChoices,
   sparseAheadLabel,
@@ -315,6 +318,7 @@ test('a save loads back as the sheet that made it', () => {
     verbosity: '8',
     dropOneSegment: true,
     sparseAhead: '250',
+    ifbDirect: true,
   };
   assert.deepEqual(validateAdvanced(form, data), {});
   const out = after(data, advancedChanges(form, data));
@@ -407,8 +411,9 @@ test('Multi-queue in the sheet writes use_mq for the speed and the choice in mil
 
 test('the experimental settings: unset is off, and only what cake-shaper takes reads as set', () => {
   assert.deepEqual(cakeExtrasOf(undefined, undefined), cakeExtrasDefaults);
-  assert.deepEqual(cakeExtrasDefaults, { dropOneSegment: false, sparseAhead: '' });
-  assert.deepEqual(cakeExtrasOf('1', '250'), { dropOneSegment: true, sparseAhead: '250' });
+  assert.deepEqual(cakeExtrasDefaults, { dropOneSegment: false, sparseAhead: '', ifbDirect: false });
+  assert.deepEqual(cakeExtrasOf('1', '250'), { dropOneSegment: true, sparseAhead: '250', ifbDirect: false });
+  assert.deepEqual(cakeExtrasOf(undefined, undefined, '1'), { ...cakeExtrasDefaults, ifbDirect: true });
   for (const v of ['0', 'Y', 'yes', 'on', '01', '']) assert.equal(cakeExtrasOf(v, undefined).dropOneSegment, false, v);
   // µs, 1 to 1000, without leading zeros once read
   assert.equal(cakeExtrasOf(undefined, '0500').sparseAhead, '500');
@@ -417,10 +422,15 @@ test('the experimental settings: unset is off, and only what cake-shaper takes r
   for (const v of ['0', '00', '1001', '01000', '-1', '2.5', '250us', 'off', '']) {
     assert.equal(cakeExtrasOf(undefined, v).sparseAhead, '', v);
   }
-  assert.deepEqual(cakeExtrasOptions(cakeExtrasDefaults), { drop_one_segment: undefined, sparse_ahead: undefined });
-  assert.deepEqual(cakeExtrasOptions({ dropOneSegment: true, sparseAhead: '100' }), {
+  assert.deepEqual(cakeExtrasOptions(cakeExtrasDefaults), {
+    drop_one_segment: undefined,
+    sparse_ahead: undefined,
+    ifb_direct: undefined,
+  });
+  assert.deepEqual(cakeExtrasOptions({ dropOneSegment: true, sparseAhead: '100', ifbDirect: true }), {
     drop_one_segment: '1',
     sparse_ahead: '100',
+    ifb_direct: '1',
   });
 });
 
@@ -497,10 +507,13 @@ test('the experimental settings’ choices and labels', () => {
 });
 
 test('the experimental settings against what sch_cake has now', () => {
-  const loaded = { dropOneSegment: false, sparseAhead: 0, oneSegmentDrops: 0, loaded: true };
+  const loaded = { dropOneSegment: false, sparseAhead: 0, oneSegmentDrops: 0, loaded: true, ifbDirect: false, ifbLoaded: true };
   // a parameter is missing only when sch_cake is loaded without it
   assert.equal(cakeParamMissing(null, { ...loaded, dropOneSegment: null }), true);
-  assert.equal(cakeParamMissing(null, { dropOneSegment: null, sparseAhead: null, oneSegmentDrops: null, loaded: false }), false);
+  assert.equal(
+    cakeParamMissing(null, { ...loaded, dropOneSegment: null, sparseAhead: null, oneSegmentDrops: null, loaded: false }),
+    false,
+  );
   assert.equal(cakeParamMissing(false, loaded), false);
   assert.equal(cakeParamMissing(undefined, undefined), false);
   // said only where they differ
@@ -542,13 +555,13 @@ test('why dropping one packet of a group does nothing now: each reason its own l
 });
 
 test('what dropping one packet of a group has done: while on, or once it has dropped any', () => {
-  const live = (
-    n: number | null,
-  ): { dropOneSegment: boolean; sparseAhead: number; oneSegmentDrops: number | null; loaded: boolean } => ({
+  const live = (n: number | null): CakeExtrasLive => ({
     dropOneSegment: true,
     sparseAhead: 0,
     oneSegmentDrops: n,
     loaded: true,
+    ifbDirect: false,
+    ifbLoaded: true,
   });
   assert.equal(oneSegmentDropsNow(true, live(0)), 'Dropped this way since Smart Queue started: 0 packets.');
   assert.equal(oneSegmentDropsNow(true, live(1)), 'Dropped this way since Smart Queue started: 1 packet.');
@@ -559,4 +572,95 @@ test('what dropping one packet of a group has done: while on, or once it has dro
   // without the counter, or before the router said
   assert.equal(oneSegmentDropsNow(true, live(null)), undefined);
   assert.equal(oneSegmentDropsNow(true, undefined), undefined);
+});
+
+test('ifb’s hand-back: unset is off, only "1" (as ifb-direct takes it) is on, and on writes "1"', () => {
+  for (const v of ['0', 'Y', 'yes', 'on', '01', '1 ', ''])
+    assert.equal(cakeExtrasOf(undefined, undefined, v).ifbDirect, false, v);
+  assert.equal(cakeExtrasOf(undefined, undefined, undefined).ifbDirect, false);
+  assert.equal(cakeExtrasOf(undefined, undefined).ifbDirect, false);
+  assert.equal(cakeExtrasOf(undefined, undefined, '1').ifbDirect, true);
+  assert.equal(cakeExtrasOptions({ ...cakeExtrasDefaults, ifbDirect: true }).ifb_direct, '1');
+  // off is unset, not "0"
+  assert.equal(cakeExtrasOptions(cakeExtrasDefaults).ifb_direct, undefined);
+  // read into the sheet from milkflint.cake, junk as off
+  assert.equal(advancedData(queue(), [section('cake', 'cake', { ifb_direct: '1' })], false).form.ifbDirect, true);
+  assert.equal(advancedData(queue(), [section('cake', 'cake', { ifb_direct: 'yes' })], false).form.ifbDirect, false);
+  assert.equal(advancedData(queue(), [], false).form.ifbDirect, false);
+});
+
+test('ifb’s hand-back writes milkflint.cake only, and only when it changed', () => {
+  const data = advancedData(queue(), [], false);
+  assert.deepEqual(
+    save(data, (f) => ({ ...f, ifbDirect: true })),
+    [{ op: 'add', config: 'milkflint', type: 'cake', name: 'cake', values: { ifb_direct: '1' } }],
+  );
+  // beside the other experimental settings, which are left as they are
+  const other = advancedData(
+    queue(),
+    [section('cake', 'cake', { drop_one_segment: '1', sparse_ahead: '250', ifb_direct: '1' })],
+    false,
+  );
+  assert.deepEqual(
+    save(other, (f) => ({ ...f, ifbDirect: false })),
+    [{ op: 'unset', config: 'milkflint', section: 'cake', options: ['ifb_direct'] }],
+  );
+  assert.deepEqual(
+    save(other, (f) => ({ ...f, sparseAhead: '100' })),
+    [{ op: 'set', config: 'milkflint', section: 'cake', values: { sparse_ahead: '100' } }],
+  );
+  // all three at once: one change to the section
+  assert.deepEqual(
+    save(data, (f) => ({ ...f, dropOneSegment: true, sparseAhead: '500', ifbDirect: true })),
+    [
+      {
+        op: 'add',
+        config: 'milkflint',
+        type: 'cake',
+        name: 'cake',
+        values: { drop_one_segment: '1', sparse_ahead: '500', ifb_direct: '1' },
+      },
+    ],
+  );
+  // the only option in the section: off deletes it
+  const alone = advancedData(queue(), [section('cake', 'cake', { ifb_direct: '1' })], false);
+  assert.deepEqual(
+    save(alone, (f) => ({ ...f, ifbDirect: false })),
+    [{ op: 'delete', config: 'milkflint', section: 'cake' }],
+  );
+  // a junk value read as off isn't rewritten by a save that didn't touch it
+  const junk = advancedData(queue(), [section('cake', 'cake', { ifb_direct: 'on' })], false);
+  assert.deepEqual(
+    save(junk, (f) => ({ ...f, overhead: '18' })),
+    [{ op: 'set', config: 'sqm', section: 'wan', values: { overhead: '18' } }],
+  );
+  // no sqm option, so nothing restarts Smart Queue, and CAKE's command is the same
+  assert.ok(save(data, (f) => ({ ...f, ifbDirect: true })).every((c) => c.config === 'milkflint'));
+  assert.deepEqual(cakeArgs({ ...data.form, ifbDirect: true }, data, 'down'), cakeArgs(data.form, data, 'down'));
+});
+
+test('ifb’s hand-back against what ifb has now', () => {
+  const live: CakeExtrasLive = {
+    dropOneSegment: false,
+    sparseAhead: 0,
+    oneSegmentDrops: 0,
+    loaded: true,
+    ifbDirect: false,
+    ifbLoaded: true,
+  };
+  // missing only when ifb is loaded without it
+  assert.equal(ifbParamMissing({ ...live, ifbDirect: null }), true);
+  assert.equal(ifbParamMissing({ ...live, ifbDirect: null, ifbLoaded: false }), false);
+  assert.equal(ifbParamMissing(live), false);
+  assert.equal(ifbParamMissing(undefined), false);
+  // sch_cake's parameters say nothing of ifb's, nor ifb's of sch_cake's
+  assert.equal(ifbParamMissing({ ...live, loaded: false, ifbDirect: null }), true);
+  assert.equal(cakeParamMissing(live.dropOneSegment, { ...live, ifbDirect: null }), false);
+  // said only where it differs from what's saved
+  assert.equal(ifbDirectNow(false, live), undefined);
+  assert.equal(ifbDirectNow(true, live), 'In use now: off.');
+  assert.equal(ifbDirectNow(false, { ...live, ifbDirect: true }), 'In use now: on.');
+  assert.equal(ifbDirectNow(true, { ...live, ifbDirect: true }), undefined);
+  assert.equal(ifbDirectNow(true, { ...live, ifbDirect: null }), undefined);
+  assert.equal(ifbDirectNow(true, undefined), undefined);
 });

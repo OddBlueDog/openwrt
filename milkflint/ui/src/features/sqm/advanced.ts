@@ -13,9 +13,9 @@
 // the download while squash_dscp is on (its default). The opts come last.
 // The fq_codel-only options (limits, targets, ECN) don't apply to CAKE.
 //
-// The sheet's experimental download settings are sch_cake module parameters,
-// saved in milkflint.cake (./cake-extras.ts): they change no sqm option, and
-// CAKE takes them without a restart.
+// The sheet's experimental download settings are sch_cake's and ifb's module
+// parameters, saved in milkflint.cake (./cake-extras.ts): they change no sqm
+// option, and take effect without a restart.
 import { z } from 'zod';
 import { bool, type Change, type Section, sectionChanges, str } from '@/lib/api/uci';
 import { cakeExtrasOf, cakeExtrasOptions } from './cake-extras';
@@ -96,6 +96,8 @@ const advancedFields = z.object({
   dropOneSegment: z.boolean(),
   /** experimental: how far ahead of the shaper a new flow's packet may go, µs; '' off (milkflint.cake.sparse_ahead) */
   sparseAhead: z.string(),
+  /** experimental: ifb hands the download back straight from CAKE's dequeue (milkflint.cake.ifb_direct) */
+  ifbDirect: z.boolean(),
   script: z.string(),
   /** squash_dscp: the download's CAKE clears DSCP marks (sqm's default) */
   squashDscp: z.boolean(),
@@ -250,7 +252,7 @@ export function advancedData(queue: Section, milkflint: Section[], pppoe: boolea
         downloadKbit,
       ),
       multiQueue: multiQueueOf(str(cake, 'multi_queue'), bool(queue, 'use_mq'), downloadKbit, pppoe),
-      ...cakeExtrasOf(str(cake, 'drop_one_segment'), str(cake, 'sparse_ahead')),
+      ...cakeExtrasOf(str(cake, 'drop_one_segment'), str(cake, 'sparse_ahead'), str(cake, 'ifb_direct')),
       script: str(queue, 'script') ?? '',
       squashDscp: str(queue, 'squash_dscp') !== '0',
       squashIngress: str(queue, 'squash_ingress') !== '0',
@@ -388,6 +390,7 @@ export function advancedChanges(f: AdvancedForm, data: AdvancedData): Change[] {
     ...(f.multiQueue === was.multiQueue ? {} : { multi_queue: multiQueueValue(f.multiQueue) }),
     ...(f.dropOneSegment === was.dropOneSegment ? {} : { drop_one_segment: extras.drop_one_segment }),
     ...(f.sparseAhead === was.sparseAhead ? {} : { sparse_ahead: extras.sparse_ahead }),
+    ...(f.ifbDirect === was.ifbDirect ? {} : { ifb_direct: extras.ifb_direct }),
   };
   if (Object.keys(cake).length > 0) changes.push(...sectionChanges('milkflint', data.milkflint, 'cake', cake));
   return changes;

@@ -99,6 +99,8 @@ export function CpuCard({
   const now = knobs?.rx_delay;
   const choices = rxDelayOptions(saved.rxDelay, form.rxDelay);
   // where the image lacks a parameter: only known once the router said
+  const pdmaStagMissing = knobs?.pdma_stag === null;
+  const dsaGroMissing = knobs?.dsa_gro === null;
   const perRingMissing = knobs?.rx_dim_per_ring === null;
   const qdmaMissing = knobs?.qdma_tx_dim === null;
   return (
@@ -160,11 +162,53 @@ export function CpuCard({
               />
             </Field>
             {knobs !== undefined && <NowRow label="LAN ports in use now">{lanRpsNow(knobs.lan_rps)}</NowRow>}
+            <Field
+              id="pdmaStag"
+              label="Let RSS spread what the LAN ports receive"
+              status={pdmaStagMissing ? NOT_YET : undefined}
+              {...explain(
+                'With RSS, everything the LAN ports receive arrives on one receive ring, on CPU 0, as the hardware’s hash can’t see past the switch’s tag. On, the frame engine reads that tag (its CDMP special tag), so RSS may spread wired traffic from the LAN ports over CPUs 1–3 too: in hardware, where Spread what the LAN ports receive hands it on in software. Never tried on this hardware: it was last on together with another register bug, and then all the internet port’s downloads stayed on ring 0. If downloads from the internet land on CPU 0 again with it on (one CPU busy, the others idle), turn it off. The driver takes it at once (mtk_eth’s pdma_stag).',
+                [mf('steering', 'pdma_stag')],
+              )}
+            >
+              <ExperimentalSwitch
+                id="pdmaStag"
+                checked={form.pdmaStag}
+                missing={pdmaStagMissing}
+                onChange={(v) => {
+                  set('pdmaStag', v);
+                }}
+              />
+            </Field>
+            {knobs !== undefined && !pdmaStagMissing && (
+              <NowRow label="Switch tag in use now">{switchNow(knobs.pdma_stag)}</NowRow>
+            )}
           </>
         ) : (
           <p className="py-3.5 text-sm text-muted-foreground">
-            The Wi-Fi thread, receive thread and LAN port settings are for RSS packet steering, which isn’t in use.
+            The Wi-Fi thread, receive thread and LAN port spreading settings are for RSS packet steering, which isn’t in use.
           </p>
+        )}
+        <Field
+          id="dsaGro"
+          label="Group what the LAN ports receive in one pass"
+          status={dsaGroMissing ? NOT_YET : undefined}
+          {...explain(
+            'What the LAN ports receive takes two passes now: the Ethernet driver’s, then a second grouping (GRO) pass on the LAN port, as a softirq (with RSS, on CPU 0). On, the driver hands each packet straight to GRO on its LAN port: one pass, for less CPU under wired traffic, such as a wired device’s upload or what it sends to Wi-Fi. Not yet measured on the router. Anything watching the switch port, eth0, itself (tcpdump -i eth0, tc or nft ingress on it) puts its packets back on the usual path by itself. Spread what the LAN ports receive keeps working: the steering script then hands them on at the LAN ports. The driver takes it at once (mtk_eth’s dsa_gro).',
+            [mf('steering', 'dsa_gro')],
+          )}
+        >
+          <ExperimentalSwitch
+            id="dsaGro"
+            checked={form.dsaGro}
+            missing={dsaGroMissing}
+            onChange={(v) => {
+              set('dsaGro', v);
+            }}
+          />
+        </Field>
+        {knobs !== undefined && !dsaGroMissing && (
+          <NowRow label="One-pass grouping in use now">{switchNow(knobs.dsa_gro)}</NowRow>
         )}
         <Field
           id="rxDelay"

@@ -54,6 +54,8 @@ interface Result {
   openwrt: string | undefined;
   /** xps_cpus of every ifb's queues, as "<ifb>/<queue>" */
   xps: Record<string, string>;
+  /** mtk_eth's parameters after the run (those the image has) */
+  ethParams: Record<string, string>;
 }
 
 interface Setup {
@@ -78,6 +80,10 @@ interface Setup {
   openwrtRps?: boolean;
   /** the four-queue ifb of a device made by vlans (a VLAN WAN's) */
   vlanIfb?: string;
+  /** lan1 a DSA port of eth0, as on the router: lan1's lower is eth0, which has DSA's tagging attribute */
+  dsa?: boolean;
+  /** mtk_eth's parameters the image has (pdma_stag, dsa_gro), with what they hold before the run */
+  ethParams?: Record<string, string>;
 }
 
 function run(setup: Setup = {}): Result {
@@ -120,6 +126,14 @@ function run(setup: Setup = {}): Result {
         symlinkSync(driver, join(root, 'sys/class/net', dev, 'device/driver'));
       }
     }
+    if (setup.dsa === true) {
+      mkdirSync(join(root, 'sys/class/net/eth0/dsa'));
+      writeFileSync(join(root, 'sys/class/net/eth0/dsa/tagging'), 'mtk\n');
+      symlinkSync(join(root, 'sys/class/net/eth0'), join(root, 'sys/class/net/lan1/lower_eth0'));
+    }
+    const ethParams = join(root, 'sys/module/mtk_eth/parameters');
+    mkdirSync(ethParams, { recursive: true });
+    for (const [name, v] of Object.entries(setup.ethParams ?? {})) writeFileSync(join(ethParams, name), `${v}\n`);
     for (const [vlan, under] of Object.entries(setup.vlans ?? {})) {
       mkdirSync(join(root, 'sys/class/net', vlan, 'queues/rx-0'), { recursive: true });
       writeFileSync(join(root, 'sys/class/net', vlan, 'queues/rx-0/rps_cpus'), 'unset\n');
@@ -177,6 +191,7 @@ esac`,
     const text = readFileSync(script, 'utf8')
       .replaceAll('/proc/', `${root}/proc/`)
       .replaceAll('/sys/class/net', `${root}/sys/class/net`)
+      .replaceAll('/sys/module/', `${root}/sys/module/`)
       .replaceAll('/usr/libexec/', `${root}/usr/libexec/`);
     const scriptCopy = join(root, 'steer.sh');
     writeFileSync(scriptCopy, text);
@@ -225,6 +240,9 @@ esac`,
             readFileSync(join(root, 'sys/class/net', ifb, 'queues', `tx-${String(q)}`, 'xps_cpus'), 'utf8').trim(),
           ]),
         ),
+      ),
+      ethParams: Object.fromEntries(
+        Object.keys(setup.ethParams ?? {}).map((name) => [name, readFileSync(join(ethParams, name), 'utf8').trim()]),
       ),
     };
   } finally {
@@ -347,6 +365,59 @@ test('LAN ports’ RPS without RSS: the RPS layout as before, and off is off', (
 test('LAN ports’ RPS with RSS chosen on a PPPoE WAN: the switch port’s ring 0 and the PPPoE port’s', () => {
   const r = run({ uci: { ...PPPOE, ...RSS, ...LAN_RPS } });
   assert.deepEqual(r.rps, { ...NO_RPS, 'eth0/0': 'e', 'eth1/0': 'e' });
+});
+
+// the Ethernet driver's experimental switches (990-18, 990-19), set by the script
+const ETH_PARAMS = { pdma_stag: 'N', dsa_gro: 'N' };
+const DSA_GRO = { 'milkflint.steering.dsa_gro': '1' };
+
+test('the Ethernet driver’s switches: on only with "1", as the page writes it, off otherwise, in every layout', () => {
+  assert.deepEqual(run({ ethParams: ETH_PARAMS, uci: { 'milkflint.steering.pdma_stag': '1' } }).ethParams, {
+    pdma_stag: 'Y',
+    dsa_gro: 'N',
+  });
+  assert.deepEqual(run({ ethParams: ETH_PARAMS, uci: DSA_GRO }).ethParams, { pdma_stag: 'N', dsa_gro: 'Y' });
+  for (const v of ['0', 'yes', 'on', 'Y', '']) {
+    const both = { 'milkflint.steering.pdma_stag': v, 'milkflint.steering.dsa_gro': v };
+    assert.deepEqual(run({ ethParams: { pdma_stag: 'Y', dsa_gro: 'Y' }, uci: both }).ethParams, ETH_PARAMS, v);
+  }
+  // set whatever the layout, steering off and OpenWrt's included
+  const on = { 'milkflint.steering.pdma_stag': '1', ...DSA_GRO };
+  assert.deepEqual(run({ ethParams: ETH_PARAMS, uci: on, arg: '0' }).ethParams, { pdma_stag: 'Y', dsa_gro: 'Y' });
+  assert.deepEqual(run({ ethParams: ETH_PARAMS, uci: { ...on, 'milkflint.steering.layout': 'openwrt' } }).ethParams, {
+    pdma_stag: 'Y',
+    dsa_gro: 'Y',
+  });
+});
+
+test('an image without the Ethernet driver’s switches: nothing made, the LAN ports’ RPS as before', () => {
+  const r = run({ dsa: true, ethParams: { pdma_stag: 'N' }, uci: { ...LAN_RPS, ...DSA_GRO } });
+  assert.deepEqual(r.ethParams, { pdma_stag: 'N' });
+  assert.deepEqual(r.rps, { ...NO_RPS, 'eth0/0': 'e' });
+});
+
+test('one-pass LAN receive (dsa_gro) with the LAN ports’ RPS: the LAN port’s rx-0 is handed on, not the switch port’s', () => {
+  const r = run({ dsa: true, ethParams: ETH_PARAMS, uci: { ...LAN_RPS, ...DSA_GRO } });
+  assert.deepEqual(r.rps, { ...NO_RPS, 'lan1/0': 'e' });
+  // off, as before
+  assert.deepEqual(run({ dsa: true, ethParams: ETH_PARAMS, uci: LAN_RPS }).rps, { ...NO_RPS, 'eth0/0': 'e' });
+});
+
+test('one-pass LAN receive with RSS alone: nothing handed on, as without it', () => {
+  assert.deepEqual(run({ dsa: true, ethParams: ETH_PARAMS, uci: DSA_GRO }).rps, NO_RPS);
+});
+
+test('one-pass LAN receive in the RPS layout: the LAN port gets the switch port’s rx-0 mask, which gets none', () => {
+  const r = run({ dsa: true, ethParams: ETH_PARAMS, uci: { ...DSA_GRO, 'milkflint.steering.rss': '0' } });
+  assert.deepEqual(r.rps, { 'eth0/0': '0', 'eth0/1': 'e', 'eth1/0': 'e', 'eth1/3': 'e', 'lan1/0': 'e', 'phy1-ap0/0': '0' });
+  assert.deepEqual(run({ dsa: true, ethParams: ETH_PARAMS, uci: DSA_GRO, arg: '0' }).rps, NO_RPS);
+});
+
+test('one-pass LAN receive: a device that isn’t a DSA port keeps its own mask', () => {
+  // lan1 without a switch port under it (no DSA tagging on eth0)
+  const r = run({ ethParams: ETH_PARAMS, uci: { ...DSA_GRO, 'milkflint.steering.rss': '0' } });
+  assert.equal(r.rps['lan1/0'], '0');
+  assert.equal(r.rps['eth0/0'], 'e');
 });
 
 test('a PPPoE WAN, automatic: the RPS layout, as RSS would spread nothing', () => {

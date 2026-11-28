@@ -223,6 +223,8 @@ export function RestoreDialog({
               from={data.form.rxDelay === defaults.rxDelay ? undefined : rxDelayLabel(data.form.rxDelay)}
             />
             {data.form.lanRps && <RestoreItem label="Spread what the LAN ports receive" to="Off" from="On" />}
+            {data.form.pdmaStag && <RestoreItem label="Let RSS spread what the LAN ports receive" to="Off" from="On" />}
+            {data.form.dsaGro && <RestoreItem label="Group what the LAN ports receive in one pass" to="Off" from="On" />}
             {data.form.rxDimPerRing && <RestoreItem label="Each receive ring picks its own interrupt delay" to="Off" from="On" />}
             {data.form.qdmaTxDim && (
               <RestoreItem label="Send-complete interrupts follow sending’s own moderation" to="Off" from="On" />

@@ -46,7 +46,8 @@ import { type WedConfig, wedOffChanges, wedOn, wedOnChanges } from './wed';
 //   Automatic is plain GRO up to 16 KB when the download CAKE takes GRO
 //   packets whole, fraglist GRO otherwise;
 // - the latency settings in ./knobs.ts: milkflint.steering.wifi_all,
-//   .rings_rt and .rx_delay, the experimental .lan_rps, .rx_dim_per_ring and
+//   .rings_rt and .rx_delay, the experimental .lan_rps, .pdma_stag, .dsa_gro
+//   (these two packet-steering.sh applies), .rx_dim_per_ring and
 //   .qdma_tx_dim, milkflint.cake.ecn_drop and .l4s, milkflint.wifi.retries;
 // - firewall's defaults flow_offloading: software flow offloading, as the
 //   Firewall page sets it ("1" in the image). Turning it off turns hardware
@@ -332,6 +333,8 @@ export function meaning(f: TuningForm, data: TuningData | undefined): string {
     f.wifiAll,
     f.ringsRt,
     f.lanRps,
+    f.pdmaStag,
+    f.dsaGro,
     f.rxDimPerRing,
     f.qdmaTxDim,
     f.rxDelay,
@@ -510,6 +513,8 @@ export function changedSettings(f: TuningForm, data: Pick<TuningData, 'firewall'
     ['expert', 'Wi-Fi threads on every CPU', f.wifiAll !== defaults.wifiAll],
     ['expert', 'Internet receive threads first', f.ringsRt !== defaults.ringsRt],
     ['expert', 'Spread what the LAN ports receive', f.lanRps !== defaults.lanRps],
+    ['expert', 'Let RSS spread what the LAN ports receive', f.pdmaStag !== defaults.pdmaStag],
+    ['expert', 'Group what the LAN ports receive in one pass', f.dsaGro !== defaults.dsaGro],
     ['expert', 'Receive interrupt delay', f.rxDelay !== defaults.rxDelay],
     ['expert', 'Each receive ring picks its own interrupt delay', f.rxDimPerRing !== defaults.rxDimPerRing],
     ['expert', 'Send-complete interrupts follow sending’s own moderation', f.qdmaTxDim !== defaults.qdmaTxDim],

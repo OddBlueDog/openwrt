@@ -3,8 +3,8 @@
 // them, by direction, with what CAKE will get and the file as it will be.
 // The expert choices the page used to show (multi-queue, the upload's ACK
 // filter and memory limit) are here too, and the download's experimental
-// sch_cake settings (./cake-extras.ts), with what sch_cake has now. It saves
-// on its own, and only what changed (./advanced.ts).
+// sch_cake and ifb settings (./cake-extras.ts), with what they have now. It
+// saves on its own, and only what changed (./advanced.ts).
 import { Link } from '@tanstack/react-router';
 import { pageLink } from '@/lib/router';
 import { ArrowDownIcon, ArrowUpIcon, CableIcon, ListIcon, type LucideIcon } from 'lucide-react';
@@ -46,6 +46,8 @@ import {
   dropOneSegmentIdle,
   dropOneSegmentNow,
   fraglistNow,
+  ifbDirectNow,
+  ifbParamMissing,
   oneSegmentDropsNow,
   sparseAheadChoices,
   sparseAheadLabel,
@@ -311,7 +313,7 @@ function DirectionTab({
   errors: AdvancedErrors;
   /** why the download's queues don't spread over the CPUs now, when they don't */
   rssNote: string | undefined;
-  /** what sch_cake has now, for the experimental settings; undefined until the router said */
+  /** what sch_cake and ifb have now, for the experimental settings; undefined until the router said */
   cakeLive: CakeExtrasLive | undefined;
   /** whether the internet port groups with fraglist GRO now; undefined while it isn't known */
   fraglist: boolean | undefined;
@@ -727,12 +729,12 @@ function DirectionTab({
 
 const NOT_YET = 'This image doesn’t have it yet.';
 
-/** A line under an experimental setting: why it can't be switched, or what sch_cake has now when that isn't what's saved. */
+/** A line under an experimental setting: why it can't be switched, or what sch_cake (or ifb) has now when that isn't what's saved. */
 function Note({ children }: { children: ReactNode }): ReactElement {
   return <span className="mt-1 block font-medium text-foreground">{children}</span>;
 }
 
-/** The download's experimental sch_cake settings, which CAKE takes at once, without a restart. */
+/** The download's experimental settings, sch_cake's and ifb's, which take effect at once, without a restart. */
 function ExperimentalGroup({
   id,
   f,
@@ -756,11 +758,13 @@ function ExperimentalGroup({
   const dropIdle = dropOneSegmentIdle(whole, fraglist);
   const dropped = oneSegmentDropsNow(live?.dropOneSegment === true || was.dropOneSegment, live);
   const aheadNow = sparseAheadNow(was.sparseAhead, live);
+  const ifbMissing = ifbParamMissing(live);
+  const ifbNow = ifbDirectNow(was.ifbDirect, live);
   return (
     <Group title="Experimental">
       <p className="-mt-2 text-xs text-muted-foreground">
-        Off by default, for trying out. CAKE takes them at once, without a restart.
-        {live !== undefined && !live.loaded && ' Smart Queue hasn’t run since the router started: CAKE takes them when it does.'}
+        Off by default, for trying out. Each takes effect at once, without a restart.
+        {live !== undefined && !live.loaded && ' Smart Queue hasn’t run since the router started: they take effect when it does.'}
       </p>
       <SwitchField
         id={`${id}-down-dropOne`}
@@ -820,6 +824,28 @@ function ExperimentalGroup({
           }}
         />
       </Row>
+      <SwitchField
+        id={`${id}-down-ifbDirect`}
+        label="Hand what CAKE lets through straight back to the router"
+        opt="ifb_direct"
+        checked={f.ifbDirect}
+        changed={f.ifbDirect !== was.ifbDirect}
+        // one already on can still be turned off
+        disabled={ifbMissing && !f.ifbDirect}
+        hint={
+          <>
+            Smart Queue shapes downloads on a device of its own (an ifb), which hands each packet CAKE lets through back to the
+            router a step later, from a tasklet: one more softirq round for each batch. With this, the ifb hands it on straight
+            from CAKE’s dequeue whenever nothing is queued ahead of it; only under CAKE, not other qdiscs. It should save a little
+            CPU on a shaped download, and perhaps a hair of delay; not yet measured on the router. ifb’s direct_xmit.
+            {ifbMissing && <Note>{NOT_YET}</Note>}
+            {ifbNow !== undefined && <Note>{ifbNow}</Note>}
+          </>
+        }
+        onChange={(v) => {
+          set('ifbDirect', v);
+        }}
+      />
     </Group>
   );
 }
@@ -1108,7 +1134,7 @@ export function AdvancedSheet({
   onSubmit: (changes: Change[]) => Promise<string | undefined>;
 }): ReactElement {
   const id = useId();
-  // what sch_cake has now, for the experimental settings: read only while the sheet is open
+  // what sch_cake and ifb have now, for the experimental settings: read only while the sheet is open
   const status = useLive(tuningQueries.status());
   const knobs = status.data?.knobs;
   const cakeLive: CakeExtrasLive | undefined =
@@ -1119,6 +1145,8 @@ export function AdvancedSheet({
           sparseAhead: knobs.cake_sparse_ahead,
           oneSegmentDrops: knobs.cake_one_segment_drops,
           loaded: knobs.cake_loaded,
+          ifbDirect: knobs.ifb_direct,
+          ifbLoaded: knobs.ifb_loaded,
         };
   const fraglist = fraglistNow(status.data?.gro);
   const schema = useMemo(() => advancedFormSchema(data), [data]);
@@ -1163,8 +1191,9 @@ export function AdvancedSheet({
     ...(f.multiQueue === data.form.multiQueue ? [] : ['milkflint.cake.multi_queue (Multi-queue)']),
     ...(f.dropOneSegment === data.form.dropOneSegment ? [] : ['milkflint.cake.drop_one_segment']),
     ...(f.sparseAhead === data.form.sparseAhead ? [] : ['milkflint.cake.sparse_ahead']),
+    ...(f.ifbDirect === data.form.ifbDirect ? [] : ['milkflint.cake.ifb_direct']),
   ];
-  // only sqm's own options restart Smart Queue; the experimental settings go to sch_cake as they are
+  // only sqm's own options restart Smart Queue; the experimental settings go to sch_cake and ifb as they are
   const restarts = changes.some((c) => c.config === 'sqm');
   const prefix = `${id}-sqm`;
 

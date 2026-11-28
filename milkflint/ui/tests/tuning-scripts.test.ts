@@ -22,11 +22,15 @@ const cakeParams = join(root, 'sch_cake');
 const ctParams = join(root, 'nf_conntrack');
 const wifiParams = join(root, 'mt76_connac_lib');
 const ethParams = join(root, 'mtk_eth');
+// ifb's module folder (/sys/module/ifb), its parameters in it
+const ifbModule = join(root, 'ifb');
+const ifbParams = join(ifbModule, 'parameters');
 const radio = join(root, 'ieee80211', 'phy0');
 mkdirSync(cakeParams);
 mkdirSync(ctParams);
 mkdirSync(wifiParams);
 mkdirSync(ethParams);
+mkdirSync(ifbParams, { recursive: true });
 mkdirSync(radio, { recursive: true });
 mkdirSync(join(root, 'bin'));
 // uci -q get <option>: from the environment, failing if unset, as uci does;
@@ -69,6 +73,7 @@ function stage(name: string, dir = scripts): string {
     .replaceAll('/sys/module/nf_conntrack/parameters', ctParams)
     .replaceAll('/sys/module/mt76_connac_lib/parameters', wifiParams)
     .replaceAll('/sys/module/mtk_eth/parameters', ethParams)
+    .replaceAll('/sys/module/ifb', ifbModule)
     .replaceAll('/sys/kernel/debug/ieee80211', join(root, 'ieee80211'));
   const path = join(root, name);
   writeFileSync(path, text);
@@ -296,6 +301,36 @@ test('cake-shaper: a sch_cake without a parameter: the other is still set, and n
   assert.equal(readFileSync(join(cakeParams, 'sparse_ahead_us'), 'utf8').trim(), '100');
 });
 
+function ifbDirect(settings: Record<string, string>): string {
+  writeFileSync(join(ifbParams, 'direct_xmit'), '');
+  run('ifb-direct', settings);
+  return readFileSync(join(ifbParams, 'direct_xmit'), 'utf8').trim();
+}
+
+test('ifb-direct: on only with "1", as the page reads it; off otherwise, so clearing it takes', () => {
+  assert.equal(ifbDirect({}), 'N');
+  assert.equal(ifbDirect({ 'milkflint.cake.ifb_direct': '1' }), 'Y');
+  assert.equal(cakeExtrasOf(undefined, undefined, '1').ifbDirect, true);
+  for (const v of ['0', 'Y', 'yes', 'on', '1 ', '1; reboot', '']) {
+    assert.equal(ifbDirect({ 'milkflint.cake.ifb_direct': v }), 'N', v);
+    assert.equal(cakeExtrasOf(undefined, undefined, v).ifbDirect, false, `page, ${v}`);
+  }
+});
+
+test('ifb-direct: ifb not loaded, nothing set (exit 1); loaded without the parameter, done and nothing made', () => {
+  const away = `${ifbModule}.away`;
+  renameSync(ifbModule, away);
+  try {
+    assert.equal(status('ifb-direct', { 'milkflint.cake.ifb_direct': '1' }), 1);
+    assert.equal(existsSync(ifbModule), false);
+  } finally {
+    renameSync(away, ifbModule);
+  }
+  rmSync(join(ifbParams, 'direct_xmit'), { force: true });
+  assert.equal(status('ifb-direct', { 'milkflint.cake.ifb_direct': '1' }), 0);
+  assert.equal(existsSync(join(ifbParams, 'direct_xmit')), false);
+});
+
 function dscp(settings: Record<string, string>): { learn: string; restore: string } {
   writeFileSync(join(ctParams, 'dscp_learn'), '');
   writeFileSync(join(cakeParams, 'dscp_restore'), '');
@@ -423,7 +458,7 @@ function tuningApply(settings: Record<string, string>, force = false): void {
   const initd = join(root, 'init.d');
   mkdirSync(libexec, { recursive: true });
   mkdirSync(initd, { recursive: true });
-  for (const name of ['cake-ecn', 'cake-dscp', 'cake-shaper', 'eth-dim']) {
+  for (const name of ['cake-ecn', 'cake-dscp', 'cake-shaper', 'eth-dim', 'ifb-direct']) {
     writeFileSync(join(libexec, name), readFileSync(stage(name), 'utf8'));
     chmodSync(join(libexec, name), 0o755);
   }
@@ -520,6 +555,30 @@ test('milkflint-tuning: the Ethernet’s moderation switches go in when they cha
   assert.deepEqual(eth(), ['N', 'untouched']);
   tuningApply({ 'milkflint.steering.rx_dim_per_ring': '1' });
   assert.deepEqual(eth(), ['Y', 'N']);
+});
+
+// ifb autoloads at boot (/etc/modules.d/34-ifb), before milkflint-tuning;
+// were it loaded later, a run before then must not count as done
+test('milkflint-tuning: the ifb hand-back from a run without ifb isn’t kept as done; the next reload puts it in', () => {
+  rmSync(join(root, 'tuning-run'), { recursive: true, force: true });
+  const away = `${ifbModule}.away`;
+  renameSync(ifbModule, away);
+  try {
+    tuningApply({ 'milkflint.cake.ifb_direct': '1' }, true);
+  } finally {
+    renameSync(away, ifbModule);
+  }
+  assert.equal(existsSync(join(root, 'tuning-run', 'ifb_direct')), false);
+  writeFileSync(join(ifbParams, 'direct_xmit'), 'N');
+  tuningApply({ 'milkflint.cake.ifb_direct': '1' });
+  assert.equal(readFileSync(join(ifbParams, 'direct_xmit'), 'utf8').trim(), 'Y');
+  assert.equal(readFileSync(join(root, 'tuning-run', 'ifb_direct'), 'utf8').trim(), '1');
+  // kept as done: unchanged, not written again; cleared, off
+  writeFileSync(join(ifbParams, 'direct_xmit'), 'untouched');
+  tuningApply({ 'milkflint.cake.ifb_direct': '1' });
+  assert.equal(readFileSync(join(ifbParams, 'direct_xmit'), 'utf8').trim(), 'untouched');
+  tuningApply({});
+  assert.equal(readFileSync(join(ifbParams, 'direct_xmit'), 'utf8').trim(), 'N');
 });
 
 const wifiBin = fileURLToPath(new URL('../../../package/milkflint/milkflint-ui/files/features/wifi/bin/', import.meta.url));

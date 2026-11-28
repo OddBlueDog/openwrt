@@ -7,6 +7,13 @@
 //   (unset: real-time);
 // - steering.lan_rps "1": with RSS, what the LAN ports receive (all on the
 //   switch port's ring 0) is handed on to CPUs 1-3 (unset: it isn't);
+// - steering.pdma_stag "1": the frame engine reads the switch's tag (its
+//   CDMP special tag), so RSS may spread what the LAN ports receive over the
+//   rings too (mtk_eth's pdma_stag; unset: off);
+// - steering.dsa_gro "1": the Ethernet driver hands what the LAN ports
+//   receive straight to GRO on its port, one pass rather than two (mtk_eth's
+//   dsa_gro; unset: off). packet-steering.sh sets both, and with dsa_gro
+//   moves lan_rps's hand-off onto the LAN ports themselves;
 // - steering.rx_delay: the longest the Ethernet's receive interrupt waits,
 //   in µs; "0" no limit (the driver's adaptive choice, up to 260 µs); unset 80;
 // - steering.rx_dim_per_ring "1": each receive ring's interrupt delay from
@@ -35,6 +42,10 @@ export const knobFields = z.object({
   ringsRt: z.boolean(),
   /** experimental: with RSS, the LAN ports' packets handed on to CPUs 1-3 */
   lanRps: z.boolean(),
+  /** experimental: the frame engine reads the switch's tag, so RSS may spread the LAN ports */
+  pdmaStag: z.boolean(),
+  /** experimental: what the LAN ports receive goes to GRO on its port in one pass */
+  dsaGro: z.boolean(),
   /** experimental: each receive ring picks its own interrupt delay */
   rxDimPerRing: z.boolean(),
   /** experimental: send-complete interrupts follow sending's own moderation */
@@ -57,6 +68,8 @@ export const knobDefaults: Knobs = {
   wifiAll: true,
   ringsRt: true,
   lanRps: false,
+  pdmaStag: false,
+  dsaGro: false,
   rxDimPerRing: false,
   qdmaTxDim: false,
   rxDelay: '',
@@ -133,6 +146,8 @@ export function readKnobs(get: Get): Knobs {
     ringsRt: get('steering', 'rings_rt') !== '0',
     // only "1", as packet-steering.sh and eth-dim take them
     lanRps: get('steering', 'lan_rps') === '1',
+    pdmaStag: get('steering', 'pdma_stag') === '1',
+    dsaGro: get('steering', 'dsa_gro') === '1',
     rxDimPerRing: get('steering', 'rx_dim_per_ring') === '1',
     qdmaTxDim: get('steering', 'qdma_tx_dim') === '1',
     rxDelay: numberOrDefault(get('steering', 'rx_delay'), 0, 1000, RX_DELAY_DEFAULT),
@@ -149,6 +164,8 @@ export interface KnobOptions {
     wifi_all: string | undefined;
     rings_rt: string | undefined;
     lan_rps: string | undefined;
+    pdma_stag: string | undefined;
+    dsa_gro: string | undefined;
     rx_delay: string | undefined;
     rx_dim_per_ring: string | undefined;
     qdma_tx_dim: string | undefined;
@@ -163,6 +180,8 @@ export function knobOptions(k: Knobs): KnobOptions {
       wifi_all: k.wifiAll ? undefined : '0',
       rings_rt: k.ringsRt ? undefined : '0',
       lan_rps: k.lanRps ? '1' : undefined,
+      pdma_stag: k.pdmaStag ? '1' : undefined,
+      dsa_gro: k.dsaGro ? '1' : undefined,
       rx_delay: k.rxDelay === '' ? undefined : k.rxDelay,
       rx_dim_per_ring: k.rxDimPerRing ? '1' : undefined,
       qdma_tx_dim: k.qdmaTxDim ? '1' : undefined,

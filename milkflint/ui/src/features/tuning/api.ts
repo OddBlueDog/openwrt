@@ -63,8 +63,12 @@ const statusSchema = z.object({
       rx_dim_per_ring: z.boolean().nullable().default(null),
       /** experimental: send-complete interrupts follow sending's moderation (mtk_eth's qdma_tx_dim); null without it */
       qdma_tx_dim: z.boolean().nullable().default(null),
-      /** the CPUs the switch port's first receive queue hands its packets on to (RPS); null without a switch port */
+      /** the CPUs what the LAN ports receive is handed on to (RPS): the switch port's first receive queue's, or with dsa_gro on the LAN ports'; null without a switch port */
       lan_rps: z.array(z.number()).nullable().default(null),
+      /** experimental: the frame engine reads the switch's tag (CDMP special tag), so RSS may spread the LAN ports (mtk_eth's pdma_stag); null without it */
+      pdma_stag: z.boolean().nullable().default(null),
+      /** experimental: the Ethernet driver hands what the LAN ports receive straight to GRO on its port (mtk_eth's dsa_gro); null without it */
+      dsa_gro: z.boolean().nullable().default(null),
       /** sch_cake's ecn_fail_count: 0 always marks */
       cake_ecn: z.number().nullable(),
       /** sch_cake's l4s_ramp: where L4S traffic starts to be marked, in percent of its target; 0 not at all */
@@ -77,6 +81,10 @@ const statusSchema = z.object({
       cake_sparse_ahead: z.number().nullable().default(null),
       /** experimental: packets sch_cake dropped one of a group since it loaded (one_segment_drops); null without the counter */
       cake_one_segment_drops: z.number().nullable().default(null),
+      /** experimental: ifb hands a shaped download back straight from CAKE's dequeue (ifb's direct_xmit); null without it, or with ifb not loaded */
+      ifb_direct: z.boolean().nullable().default(null),
+      /** whether ifb is loaded: sqm loads it for a download it shapes; false on an older router */
+      ifb_loaded: z.boolean().default(false),
       /** the Wi-Fi driver's sends of a data frame */
       wifi_retries: z.number().nullable(),
       /** whether the Wi-Fi driver aggregates the voice queue; null without the setting, or on an older router */
@@ -87,12 +95,16 @@ const statusSchema = z.object({
       rx_dim_per_ring: null,
       qdma_tx_dim: null,
       lan_rps: null,
+      pdma_stag: null,
+      dsa_gro: null,
       cake_ecn: null,
       cake_l4s: null,
       cake_loaded: false,
       cake_drop_one_segment: null,
       cake_sparse_ahead: null,
       cake_one_segment_drops: null,
+      ifb_direct: null,
+      ifb_loaded: false,
       wifi_retries: null,
       wifi_vo_aggr: null,
     }),

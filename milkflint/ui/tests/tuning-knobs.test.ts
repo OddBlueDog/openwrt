@@ -40,6 +40,8 @@ test('nothing set is the image’s defaults, and writes nothing', () => {
       wifi_all: undefined,
       rings_rt: undefined,
       lan_rps: undefined,
+      pdma_stag: undefined,
+      dsa_gro: undefined,
       rx_delay: undefined,
       rx_dim_per_ring: undefined,
       qdma_tx_dim: undefined,
@@ -74,6 +76,8 @@ test('each setting read back as set', () => {
       wifi_all: '0',
       rings_rt: '0',
       lan_rps: undefined,
+      pdma_stag: undefined,
+      dsa_gro: undefined,
       rx_delay: '100',
       rx_dim_per_ring: undefined,
       qdma_tx_dim: undefined,
@@ -300,4 +304,39 @@ test('a receive interrupt delay the page no longer offers is kept, and stays a c
   assert.deepEqual(rxDelayOptions('160', '0'), rxDelayChoices);
   // saving another leaves the knobs' steering section alone otherwise
   assert.deepEqual([...knobSectionsChanged(k, { ...k, rxDelay: '' })], ['steering']);
+});
+
+test('the switch tag and one-pass grouping: unset is off, only "1" (as packet-steering.sh takes them) is on, and on writes "1"', () => {
+  assert.equal(knobDefaults.pdmaStag || knobDefaults.dsaGro, false);
+  const k = readKnobs(getter({ 'steering.pdma_stag': '1', 'steering.dsa_gro': '1' }));
+  assert.deepEqual([k.pdmaStag, k.dsaGro], [true, true]);
+  // each on its own, the other left off
+  assert.deepEqual(readKnobs(getter({ 'steering.pdma_stag': '1' })), { ...knobDefaults, pdmaStag: true });
+  assert.deepEqual(readKnobs(getter({ 'steering.dsa_gro': '1' })), { ...knobDefaults, dsaGro: true });
+  const o = knobOptions(k).steering;
+  assert.deepEqual([o.pdma_stag, o.dsa_gro], ['1', '1']);
+  // only these two of the steering section
+  assert.deepEqual(o, { ...knobOptions(knobDefaults).steering, pdma_stag: '1', dsa_gro: '1' });
+  for (const v of ['0', 'Y', 'yes', 'on', '01', '1 ', '1; reboot', '']) {
+    const j = readKnobs(getter({ 'steering.pdma_stag': v, 'steering.dsa_gro': v }));
+    assert.deepEqual([j.pdmaStag, j.dsaGro], [false, false], v);
+  }
+  // off is unset, not "0"
+  const off = knobOptions(knobDefaults).steering;
+  assert.deepEqual([off.pdma_stag, off.dsa_gro], [undefined, undefined]);
+});
+
+test('the switch tag and one-pass grouping change the steering section only', () => {
+  for (const key of ['pdmaStag', 'dsaGro'] as const) {
+    assert.deepEqual([...knobSectionsChanged(knobDefaults, { ...knobDefaults, [key]: true })], ['steering'], key);
+    assert.deepEqual([...knobSectionsChanged({ ...knobDefaults, [key]: true }, knobDefaults)], ['steering'], key);
+    assert.deepEqual([...knobSectionsChanged({ ...knobDefaults, [key]: true }, { ...knobDefaults, [key]: true })], [], key);
+  }
+  // nor does one stand in for the other, or for the LAN ports' RPS
+  const both = { ...knobDefaults, pdmaStag: true, dsaGro: true };
+  assert.deepEqual([...knobSectionsChanged(both, { ...both, lanRps: true })], ['steering']);
+  assert.deepEqual(
+    [...knobSectionsChanged({ ...knobDefaults, pdmaStag: true }, { ...knobDefaults, dsaGro: true })],
+    ['steering'],
+  );
 });
