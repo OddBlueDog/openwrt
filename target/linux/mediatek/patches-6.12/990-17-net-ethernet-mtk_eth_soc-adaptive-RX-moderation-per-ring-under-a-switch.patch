@@ -1,0 +1,297 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: OddBlueDog <3959851+OddBlueDog@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 10:00:00 +0000
+Subject: [PATCH] net: ethernet: mtk_eth_soc: adaptive RX moderation per ring under a switch
+
+The MT7986 has a delay interrupt register for each of its four RX rings,
+but one Net DIM serves them all: whichever ring's NAPI takes
+rx_dim_sample_lock samples every ring's events, packets and bytes, and
+mtk_dim_rx() writes the one setting to all four registers. A quiet ring
+(ring 0 takes what the LAN ports receive while RSS puts WAN flows on
+rings 1-3) is then held back as long as the busiest ring drove the
+setting to.
+
+rx_dim_per_ring (module parameter, off by default, writable at runtime)
+gives each ring its own DIM: a ring's NAPI samples only its own
+counters, without rx_dim_sample_lock, and its DIM work writes only its
+own register, capped by rx_dim_max_us. It applies on SoCs with RSS and a
+delay register per ring (the MT7986) and changes nothing on others. Off,
+the driver writes the same registers with the same values as before.
+
+QDMA's delay interrupt register has a half that mtk_dim_rx() fills with
+the RX setting (TX completions as the SDK lays it out, QDMA's RX with
+qdma_tx_dim). With the switch on, ring 0's DIM writes that half. Every
+flow is on ring 0 until RSS is asked to spread them, so QDMA then gets
+the setting it gets with the switch off; with flows spread, it follows
+what the LAN ports receive. Taking it from all the rings' settings would
+tie each ring's work to the others' again, and qdma_tx_dim already takes
+RX's moderation off TX completions altogether.
+
+A switch at runtime, in either direction:
+
+- On to off: a ring's own DIM that writes its register sets
+  rx_dim_ring_regs. The shared DIM's next sample sees it and, instead of
+  a decision, has mtk_dim_rx() write its setting to all four registers
+  and QDMA's half, which clears it.
+
+- Off to on: each time mtk_dim_rx() writes all four (mtk_hw_init() too)
+  it counts rx_dim_gen. A ring's NAPI that sees a count it hasn't taken
+  starts its DIM from the shared setting and has its work write that as
+  its own, measuring afresh after it.
+
+A ring's DIM work checks the switch under dim_lock before it writes, so
+one queued before a switch to off writes nothing. An mtk_dim_rx() queued
+before a switch to on still writes all four, and its count has the rings
+write their own again. mtk_stop() cancels every ring's DIM work with the
+shared one's.
+
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2432,8 +2432,37 @@ out:
+ 	rcu_read_unlock();
+ 
+ 	return act;
++}
++
++/* Adaptive RX interrupt moderation per RX ring. Off, one DIM (eth->rx_dim)
++ * takes every ring's samples and writes one delay to all the rings'
++ * registers, so a quiet ring is held back as long as the busiest one. On,
++ * where each ring has its own NAPI and delay register (the MT7986), each
++ * ring's DIM takes its own samples and writes its own register; ring 0's
++ * also writes QDMA's half that eth->rx_dim writes when off. Writable at
++ * runtime: after a switch, the first poll of each ring has its registers
++ * written by the DIM that now runs (see mtk_poll_rx()).
++ */
++static bool rx_dim_per_ring;
++module_param(rx_dim_per_ring, bool, 0644);
++MODULE_PARM_DESC(rx_dim_per_ring, "Adaptive RX interrupt moderation for each RX ring from its own traffic (Y), or one for all the rings (N)");
++
++static bool mtk_rx_dim_per_ring(const struct mtk_eth *eth)
++{
++	return MTK_HAS_CAPS(eth->soc->caps, MTK_RSS) &&
++	       RX_DESC_OFS(eth, 1) == sizeof(struct mtk_rx_dma) &&
++	       READ_ONCE(rx_dim_per_ring);
+ }
+ 
++/* Have @dim's work write its current profile, whatever net_dim decides:
++ * the work measures afresh after it
++ */
++static void mtk_dim_rx_apply(struct dim *dim)
++{
++	dim->state = DIM_APPLY_NEW_PROFILE;
++	schedule_work(&dim->work);
++}
++
+ static int mtk_poll_rx(struct napi_struct *napi, int budget,
+ 		       struct mtk_eth *eth)
+ {
+@@ -2652,10 +2681,30 @@ rx_done:
+ 
+ 	WRITE_ONCE(rx_napi->rx_packets, rx_napi->rx_packets + done);
+ 	WRITE_ONCE(rx_napi->rx_bytes, rx_napi->rx_bytes + bytes);
+-	/* The rings share one interrupt delay, so one DIM samples them all:
+-	 * whichever ring's NAPI gets here first, the others skip a sample.
++	/* With rx_dim_per_ring, each ring's DIM samples only its own ring.
++	 * Otherwise the rings share one interrupt delay, so one DIM samples
++	 * them all: whichever ring's NAPI gets here first, the others skip a
++	 * sample.
+ 	 */
+-	if (spin_trylock(&eth->rx_dim_sample_lock)) {
++	if (mtk_rx_dim_per_ring(eth)) {
++		u32 gen = READ_ONCE(eth->rx_dim_gen);
++
++		/* eth->rx_dim wrote this ring's register since this ring
++		 * last looked (rx_dim_per_ring was off, or mtk_hw_init()):
++		 * carry on from that setting, written as this ring's own
++		 */
++		if (unlikely(rx_napi->rx_dim_gen != gen)) {
++			rx_napi->rx_dim_gen = gen;
++			rx_napi->rx_dim.profile_ix =
++				READ_ONCE(eth->rx_dim.profile_ix);
++			mtk_dim_rx_apply(&rx_napi->rx_dim);
++		} else {
++			dim_update_sample(READ_ONCE(rx_napi->rx_events),
++					  rx_napi->rx_packets,
++					  rx_napi->rx_bytes, &dim_sample);
++			net_dim(&rx_napi->rx_dim, dim_sample);
++		}
++	} else if (spin_trylock(&eth->rx_dim_sample_lock)) {
+ 		u32 events = 0, packets = 0, rbytes = 0;
+ 		int i;
+ 
+@@ -2665,7 +2714,13 @@ rx_done:
+ 			rbytes += READ_ONCE(eth->rx_napi[i].rx_bytes);
+ 		}
+ 		dim_update_sample(events, packets, rbytes, &dim_sample);
+-		net_dim(&eth->rx_dim, dim_sample);
++		/* rx_dim_per_ring was on: the rings' own DIMs wrote their
++		 * registers, so write this one's to them all first
++		 */
++		if (unlikely(READ_ONCE(eth->rx_dim_ring_regs)))
++			mtk_dim_rx_apply(&eth->rx_dim);
++		else
++			net_dim(&eth->rx_dim, dim_sample);
+ 		spin_unlock(&eth->rx_dim_sample_lock);
+ 	}
+ 
+@@ -4205,6 +4260,8 @@ static int mtk_stop(struct net_device *dev)
+ 	}
+ 
+ 	cancel_work_sync(&eth->rx_dim.work);
++	for (i = 0; i < MTK_RX_NAPI_NUM; i++)
++		cancel_work_sync(&eth->rx_napi[i].rx_dim.work);
+ 	cancel_work_sync(&eth->tx_dim.work);
+ 
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA))
+@@ -4340,20 +4397,16 @@ MODULE_PARM_DESC(qdma_tx_dim, "QDMA's TX completion de
+ module_param(qdma_tx_dim, bool, 0644);
+ MODULE_PARM_DESC(qdma_tx_dim, "QDMA's TX completion delay from TX's adaptive moderation, as upstream (Y), or from RX's, as MediaTek's SDK (N)");
+ 
+-static void mtk_dim_rx(struct work_struct *work)
++/* An RX delay interrupt setting from @dim's profile */
++static u32 mtk_dim_rx_val(const struct dim *dim)
+ {
+-	struct dim *dim = container_of(work, struct dim, work);
+-	struct mtk_eth *eth = container_of(dim, struct mtk_eth, rx_dim);
+-	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+ 	unsigned int cap = READ_ONCE(rx_dim_max_us);
+ 	struct dim_cq_moder cur_profile;
+ 	u32 val, cur;
+ 
+-	cur_profile = net_dim_get_rx_moderation(eth->rx_dim.mode,
+-						dim->profile_ix);
++	cur_profile = net_dim_get_rx_moderation(dim->mode, dim->profile_ix);
+ 	if (cap && cur_profile.usec > cap)
+ 		cur_profile.usec = cap;
+-	spin_lock_bh(&eth->dim_lock);
+ 
+ 	val = MTK_PDMA_DELAY_RX_EN;
+ 
+@@ -4363,6 +4416,14 @@ static void mtk_dim_rx(struct work_struct *work)
+ 	cur = min_t(u32, cur_profile.pkts, MTK_PDMA_DELAY_PINT_MASK);
+ 	val |= cur << MTK_PDMA_DELAY_RX_PINT_SHIFT;
+ 
++	return val;
++}
++
++/* RX's half of QDMA's delay interrupt register: called under dim_lock */
++static void mtk_dim_rx_qdma(struct mtk_eth *eth, u32 val)
++{
++	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
++
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
+ 		if (READ_ONCE(qdma_tx_dim))
+ 			mtk_m32(eth, MTK_PDMA_DELAY_RX_MASK, val, reg_map->qdma.delay_irq);
+@@ -4370,15 +4431,64 @@ static void mtk_dim_rx(struct work_struct *work)
+ 			mtk_m32(eth, MTK_PDMA_DELAY_TX_MASK,
+ 				val << MTK_PDMA_DELAY_TX_PTIME_SHIFT, reg_map->qdma.delay_irq);
+ 	}
++}
+ 
++static void mtk_dim_rx(struct work_struct *work)
++{
++	struct dim *dim = container_of(work, struct dim, work);
++	struct mtk_eth *eth = container_of(dim, struct mtk_eth, rx_dim);
++	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
++	u32 val = mtk_dim_rx_val(dim);
++
++	spin_lock_bh(&eth->dim_lock);
++
++	mtk_dim_rx_qdma(eth, val);
++
+ 	if (RX_DESC_OFS(eth, 1) == sizeof(struct mtk_rx_dma)) {
+ 		mtk_m32(eth, MTK_PDMA_DELAY_RX_MASK, val, reg_map->pdma.delay_irq);
+ 		mtk_w32(eth, val, reg_map->pdma.lro_rx1_dly_int);
+ 		mtk_w32(eth, val, reg_map->pdma.lro_rx1_dly_int + 0x4);
+ 		mtk_w32(eth, val, reg_map->pdma.lro_rx1_dly_int + 0x8);
++		/* the rings' own DIMs take it up at their next poll */
++		WRITE_ONCE(eth->rx_dim_gen, eth->rx_dim_gen + 1);
++		WRITE_ONCE(eth->rx_dim_ring_regs, false);
+ 	} else {
+ 		val = val | (val << MTK_PDMA_DELAY_RX_RING_SHIFT);
+ 		mtk_w32(eth, val, reg_map->pdma.rx_delay_irq);
++	}
++
++	spin_unlock_bh(&eth->dim_lock);
++
++	dim->state = DIM_START_MEASURE;
++}
++
++/* One ring's own DIM (rx_dim_per_ring): its ring's register only, and for
++ * ring 0 also QDMA's half that mtk_dim_rx() writes. Ring 0 is the ring
++ * every flow is on while RSS spreads none, so QDMA then gets what it would
++ * with rx_dim_per_ring off.
++ */
++static void mtk_dim_rx_ring(struct work_struct *work)
++{
++	struct dim *dim = container_of(work, struct dim, work);
++	struct mtk_napi *rx_napi = container_of(dim, struct mtk_napi, rx_dim);
++	struct mtk_eth *eth = rx_napi->eth;
++	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
++	unsigned int ring_no = rx_napi->rx_ring->ring_no;
++	u32 val = mtk_dim_rx_val(dim);
++
++	spin_lock_bh(&eth->dim_lock);
++
++	/* switched off since this was queued: mtk_dim_rx() writes them all */
++	if (mtk_rx_dim_per_ring(eth)) {
++		if (!ring_no) {
++			mtk_dim_rx_qdma(eth, val);
++			mtk_m32(eth, MTK_PDMA_DELAY_RX_MASK, val,
++				reg_map->pdma.delay_irq);
++		} else {
++			mtk_w32(eth, val, reg_map->pdma.lro_rx1_dly_int +
++					  (ring_no - 1) * 0x4);
++		}
++		WRITE_ONCE(eth->rx_dim_ring_regs, true);
+ 	}
+ 
+ 	spin_unlock_bh(&eth->dim_lock);
+@@ -5985,6 +6095,10 @@ static int mtk_probe(struct platform_device *pdev)
+ 
+ 	eth->rx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+ 	INIT_WORK(&eth->rx_dim.work, mtk_dim_rx);
++	for (i = 0; i < MTK_RX_NAPI_NUM; i++) {
++		eth->rx_napi[i].rx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
++		INIT_WORK(&eth->rx_napi[i].rx_dim.work, mtk_dim_rx_ring);
++	}
+ 	INIT_DELAYED_WORK(&eth->reset.monitor_work, mtk_hw_reset_monitor_work);
+ 
+ 	eth->tx_dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1060,12 +1060,18 @@ struct mtk_napi {
+ 	struct napi_struct	napi;
+ 	struct mtk_eth		*eth;
+ 	struct mtk_rx_ring	*rx_ring;
+-	/* Net DIM counters of this ring, summed for the one RX DIM: each is
+-	 * written only by its ring's IRQ handler or NAPI
++	/* Net DIM counters of this ring, summed for the one RX DIM or, with
++	 * rx_dim_per_ring, its own: each is written only by its ring's IRQ
++	 * handler or NAPI
+ 	 */
+ 	u32			rx_events;
+ 	u32			rx_packets;
+ 	u32			rx_bytes;
++	/* This ring's own RX DIM (rx_dim_per_ring), and the rx_dim_gen of
++	 * mtk_eth it last took: both used only by its NAPI and DIM work
++	 */
++	struct dim		rx_dim;
++	u32			rx_dim_gen;
+ };
+ 
+ enum mkt_eth_capabilities {
+@@ -1487,6 +1493,12 @@ struct mtk_eth {
+ 	u32				rx_packets;
+ 	u32				rx_bytes;
+ 	struct dim			rx_dim;
++	/* Written under dim_lock. rx_dim_gen: counts rx_dim's writes of
++	 * the RX rings' delay registers. rx_dim_ring_regs: a ring's own DIM
++	 * wrote its register since rx_dim last wrote them all.
++	 */
++	u32				rx_dim_gen;
++	bool				rx_dim_ring_regs;
+ 
+ 	u32				tx_events;
+ 	u32				tx_packets;
